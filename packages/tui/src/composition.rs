@@ -122,6 +122,10 @@ pub struct TextProjectionRow {
 pub struct TextBlock {
     id: LayoutId,
     text: Text,
+    /// Byte offsets into the immutable newline-separated source text.
+    source_line_offsets: Vec<usize>,
+    text_revision: ComponentRevision,
+    intrinsic_width: usize,
     style: Style,
     alignment: Alignment,
     wrap: TextWrap,
@@ -133,9 +137,46 @@ impl TextBlock {
     /// Create rich text content.
     #[must_use]
     pub fn new(text: impl Into<Text>) -> Self {
+        let text = text.into();
+        let intrinsic_width = text.width();
+        let mut offset = 0usize;
+        let source_line_offsets = text
+            .lines
+            .iter()
+            .map(|line| {
+                let start = offset;
+                offset = line
+                    .spans
+                    .iter()
+                    .fold(offset, |base, span| base.saturating_add(span.content.len()));
+                offset = offset.saturating_add(1);
+                start
+            })
+            .collect();
+        let text_revision = ComponentRevision::new(
+            stable_revision(|state| {
+                text.lines.len().hash(state);
+                for line in &text.lines {
+                    line.spans.len().hash(state);
+                    for span in &line.spans {
+                        span.content.hash(state);
+                    }
+                }
+            }),
+            stable_revision(|state| {
+                for line in &text.lines {
+                    for span in &line.spans {
+                        span.style.hash(state);
+                    }
+                }
+            }),
+        );
         Self {
             id: LayoutId::new("text"),
-            text: text.into(),
+            text,
+            source_line_offsets,
+            text_revision,
+            intrinsic_width,
             style: Style::new(),
             alignment: Alignment::Left,
             wrap: TextWrap::Word,
@@ -195,12 +236,7 @@ impl TextBlock {
     fn own_revision(&self) -> ComponentRevision {
         let layout = stable_revision(|state| {
             self.id.as_str().hash(state);
-            self.text.lines.len().hash(state);
-            for line in &self.text.lines {
-                for span in &line.spans {
-                    span.content.hash(state);
-                }
-            }
+            self.text_revision.layout.hash(state);
             (match self.wrap {
                 TextWrap::None => 0u8,
                 TextWrap::Character => 1,
@@ -211,11 +247,7 @@ impl TextBlock {
         });
         let paint = stable_revision(|state| {
             self.style.hash(state);
-            for line in &self.text.lines {
-                for span in &line.spans {
-                    span.style.hash(state);
-                }
-            }
+            self.text_revision.paint.hash(state);
             (match self.alignment {
                 Alignment::Left => 0u8,
                 Alignment::Center => 1,
@@ -233,41 +265,81 @@ impl TextBlock {
     /// newline separators and whitespace consumed by a word-wrap boundary.
     #[must_use]
     pub fn projection(&self, width: u16) -> Vec<TextProjectionRow> {
-        let width = usize::from(width.max(1));
-        let mut source_base = 0usize;
-        let mut output = Vec::new();
-        for (source_line, line) in self.text.lines.iter().enumerate() {
-            let source = line.plain_text();
-            let mut search_start = 0usize;
-            for rendered in line.wrap(TextWrapGeometry::uniform(width), self.wrap) {
-                let rendered = if self.trim {
-                    trim_line_end(&rendered)
-                } else {
-                    rendered
-                };
-                let text = rendered.plain_text();
-                let relative = if text.is_empty() {
-                    search_start
-                } else {
-                    source
-                        .get(search_start..)
-                        .and_then(|remaining| remaining.find(&text))
-                        .map_or(search_start, |found| search_start.saturating_add(found))
-                };
-                let start = source_base.saturating_add(relative);
-                output.push(TextProjectionRow {
-                    line: rendered,
-                    source_line,
-                    source_range: start..start.saturating_add(text.len()),
-                });
-                search_start = relative.saturating_add(text.len());
-            }
-            source_base = source_base.saturating_add(source.len());
-            if source_line + 1 < self.text.lines.len() {
-                source_base = source_base.saturating_add(1);
-            }
-        }
-        output
+        self.projection_rows(width).collect()
+    }
+
+    fn rendered_line_rows<'a>(
+        &'a self,
+        line: &'a Line,
+        width: u16,
+    ) -> impl Iterator<Item = Line> + 'a {
+        self.raw_line_rows(line, width)
+            .map(|row| if self.trim { trim_line_end(row) } else { row })
+    }
+
+    fn raw_line_rows<'a>(&'a self, line: &'a Line, width: u16) -> impl Iterator<Item = Line> + 'a {
+        let geometry = TextWrapGeometry::uniform(usize::from(width.max(1)));
+        let mut character = crate::text::character_rows(line, geometry);
+        let mut word =
+            (self.wrap == TextWrap::Word).then(|| crate::text::word_rows(line, geometry));
+        let mut unwrapped = Some(line);
+        std::iter::from_fn(move || match self.wrap {
+            TextWrap::Character => character.next(),
+            TextWrap::Word => word.as_mut().and_then(Iterator::next),
+            TextWrap::None => unwrapped.take().cloned(),
+        })
+    }
+
+    fn projection_rows(&self, width: u16) -> impl Iterator<Item = TextProjectionRow> + '_ {
+        self.projection_rows_from(width, 0)
+    }
+
+    fn projection_rows_from(
+        &self,
+        width: u16,
+        first_line: usize,
+    ) -> impl Iterator<Item = TextProjectionRow> + '_ {
+        self.text
+            .lines
+            .iter()
+            .enumerate()
+            .skip(first_line)
+            .flat_map(move |(source_line, line)| {
+                let mut source = line.spans.iter().flat_map(|span| span.content.bytes());
+                let line_base = self.source_line_offsets[source_line];
+                let mut search_start = 0usize;
+                self.raw_line_rows(line, width).map(move |raw| {
+                    let raw_len = raw
+                        .spans
+                        .iter()
+                        .map(|span| span.content.len())
+                        .sum::<usize>();
+                    let rendered = if self.trim { trim_line_end(raw) } else { raw };
+                    let rendered_len = rendered
+                        .spans
+                        .iter()
+                        .map(|span| span.content.len())
+                        .sum::<usize>();
+                    let mut relative = search_start;
+                    if self.wrap == TextWrap::Word && rendered_len > 0 {
+                        relative = relative.saturating_add(advance_to_match(
+                            &mut source,
+                            rendered.spans.iter().flat_map(|span| span.content.bytes()),
+                        ));
+                    }
+                    let start = line_base.saturating_add(relative);
+                    if self.wrap == TextWrap::Word {
+                        search_start = relative.saturating_add(rendered_len);
+                    } else {
+                        search_start = search_start.saturating_add(raw_len);
+                    }
+                    TextProjectionRow {
+                        line: rendered,
+                        source_line,
+                        source_range: start..start.saturating_add(rendered_len),
+                    }
+                })
+            })
     }
 
     /// Register selectable grapheme geometry from the authoritative projection.
@@ -286,13 +358,19 @@ impl TextBlock {
     ) {
         let scope_id = scope_id.into();
         let content_id = content_id.into();
-        let height = layout.size.height;
-        for (row_index, row) in self
-            .projection(layout.size.width)
-            .into_iter()
-            .take(height)
+        let visible = Self::visible_rows(layout, cx.area());
+        if visible.is_empty() {
+            return;
+        }
+        let first = self.vertical_scroll.saturating_add(visible.start);
+        let (source_skip, row_skip) = self.source_start(layout.size.width, first);
+        for (index, row) in self
+            .projection_rows_from(layout.size.width, source_skip)
+            .skip(row_skip)
+            .take(visible.len())
             .enumerate()
         {
+            let row_index = visible.start.saturating_add(index);
             let text = row.line.plain_text();
             let line_width = u16::try_from(row.line.width()).unwrap_or(u16::MAX);
             let x = match self.alignment {
@@ -300,32 +378,122 @@ impl TextBlock {
                 Alignment::Center => layout.size.width.saturating_sub(line_width) / 2,
                 Alignment::Right => layout.size.width.saturating_sub(line_width),
             };
-            let y = u16::try_from(row_index).unwrap_or(u16::MAX);
-            for fragment in plain_text_fragments(
-                scope_id.clone(),
-                content_id.clone(),
-                Rect::new(x, y, layout.size.width.saturating_sub(x), 1),
-                order.saturating_add(u64::try_from(row_index).unwrap_or(u64::MAX)),
-                &text,
-                row.source_range.start,
-                revision,
-            ) {
-                cx.push_selection_fragment(fragment);
-            }
+            let y = i64::try_from(row_index).unwrap_or(i64::MAX);
+            cx.with_child(0, y, LocalRect::new(0, 0, layout.size.width, 1), |cx| {
+                for fragment in plain_text_fragments(
+                    scope_id.clone(),
+                    content_id.clone(),
+                    Rect::new(x, 0, layout.size.width.saturating_sub(x), 1),
+                    order.saturating_add(u64::try_from(row_index).unwrap_or(u64::MAX)),
+                    &text,
+                    row.source_range.start,
+                    revision,
+                ) {
+                    cx.push_selection_fragment(fragment);
+                }
+            });
         }
     }
 
-    fn rows(&self, width: u16) -> Vec<Line> {
-        self.projection(width)
-            .into_iter()
-            .map(|row| row.line)
-            .collect()
+    fn visible_rows(layout: &LayoutNode, visible: LocalRect) -> std::ops::Range<usize> {
+        if visible.width == 0
+            || visible.height == 0
+            || visible.x >= i32::from(layout.size.width)
+            || visible.x.saturating_add(i32::from(visible.width)) <= 0
+        {
+            return 0..0;
+        }
+        let first = usize::try_from(visible.y.max(0))
+            .unwrap_or(usize::MAX)
+            .min(layout.size.height);
+        let end = usize::try_from(visible.y.saturating_add(i64::from(visible.height)).max(0))
+            .unwrap_or(usize::MAX)
+            .min(layout.size.height);
+        first..end
+    }
+
+    fn line_row_count(&self, line: &Line, width: u16) -> usize {
+        let geometry = TextWrapGeometry::uniform(usize::from(width.max(1)));
+        match self.wrap {
+            TextWrap::Character => crate::text::character_row_count(line, geometry),
+            TextWrap::Word => crate::text::word_row_count(line, geometry),
+            TextWrap::None => 1,
+        }
+    }
+
+    /// Locate a display row without constructing preceding rendered lines.
+    /// The returned offset is relative to the first retained source line.
+    fn source_start(&self, width: u16, mut row: usize) -> (usize, usize) {
+        if self.wrap == TextWrap::None {
+            return (row.min(self.text.lines.len()), 0);
+        }
+        for (index, line) in self.text.lines.iter().enumerate() {
+            // Every source line produces at least one row, including empty lines.
+            // At a line boundary no measurement of the retained line is needed.
+            if row == 0 {
+                return (index, 0);
+            }
+            let geometry = TextWrapGeometry::uniform(usize::from(width.max(1)));
+            let limit = row.saturating_add(1);
+            let count = match self.wrap {
+                TextWrap::Character => {
+                    crate::text::character_row_count_up_to(line, geometry, limit)
+                }
+                TextWrap::Word => crate::text::word_row_count_up_to(line, geometry, limit),
+                TextWrap::None => 1,
+            };
+            if row < count {
+                return (index, row);
+            }
+            row = row.saturating_sub(count);
+        }
+        (self.text.lines.len(), 0)
+    }
+
+    fn row_count(&self, width: u16) -> usize {
+        if self.wrap == TextWrap::None {
+            return self.text.lines.len();
+        }
+        self.text.lines.iter().fold(0usize, |count, line| {
+            count.saturating_add(self.line_row_count(line, width))
+        })
     }
 }
 
-fn trim_line_end(line: &Line) -> Line {
-    let mut spans = line.spans.clone();
-    while let Some(last) = spans.last_mut() {
+/// Advance past a matching row, returning the number of skipped source bytes.
+fn advance_to_match(
+    source: &mut (impl Iterator<Item = u8> + Clone),
+    mut needle: impl Iterator<Item = u8> + Clone,
+) -> usize {
+    let Some(first) = needle.next() else {
+        return 0;
+    };
+    let mut candidate = source.clone();
+    let mut skipped = 0usize;
+    while let Some(byte) = candidate.next() {
+        if byte == first {
+            let mut comparison = candidate.clone();
+            if needle
+                .clone()
+                .all(|expected| comparison.next() == Some(expected))
+            {
+                *source = comparison;
+                return skipped;
+            }
+        }
+        skipped = skipped.saturating_add(1);
+    }
+    // Preserve the existing fallback if a projected row cannot be located.
+    for _ in std::iter::once(first).chain(needle) {
+        if source.next().is_none() {
+            break;
+        }
+    }
+    0
+}
+
+fn trim_line_end(mut line: Line) -> Line {
+    while let Some(last) = line.spans.last_mut() {
         let trimmed_len = last.content.trim_end().len();
         if trimmed_len == last.content.len() {
             break;
@@ -334,9 +502,9 @@ fn trim_line_end(line: &Line) -> Line {
         if !last.content.is_empty() {
             break;
         }
-        spans.pop();
+        line.spans.pop();
     }
-    Line::from_spans(spans)
+    line
 }
 
 impl Component for TextBlock {
@@ -349,28 +517,31 @@ impl Component for TextBlock {
         let width = if constraints.min_width() == constraints.max_width() {
             constraints.max_width()
         } else {
-            u16::try_from(self.text.width())
+            u16::try_from(self.intrinsic_width)
                 .unwrap_or(u16::MAX)
                 .clamp(constraints.min_width(), constraints.max_width())
         };
-        let rows = self.rows(width);
-        let size = constraints.constrain(LogicalSize::new(width, rows.len()));
+        let size = constraints.constrain(LogicalSize::new(width, self.row_count(width)));
         LayoutNode::leaf(self.id.clone(), size)
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let visible = cx.area();
-        let first = usize::try_from(visible.y.max(0)).unwrap_or(usize::MAX);
-        let end = usize::try_from(visible.y.saturating_add(i64::from(visible.height)).max(0))
-            .unwrap_or(usize::MAX)
-            .min(layout.size.height);
-        for (index, line) in self
-            .rows(layout.size.width)
+        let visible = Self::visible_rows(layout, cx.area());
+        if visible.is_empty() {
+            return;
+        }
+        // Skip complete source lines before cloning, wrapping, or trimming output.
+        let first = self.vertical_scroll.saturating_add(visible.start);
+        let (source_skip, row_skip) = self.source_start(layout.size.width, first);
+        for (index, mut line) in self
+            .text
+            .lines
             .iter()
-            .skip(self.vertical_scroll)
+            .skip(source_skip)
+            .flat_map(|line| self.rendered_line_rows(line, layout.size.width))
+            .skip(row_skip)
+            .take(visible.len())
             .enumerate()
-            .skip(first)
-            .take(end.saturating_sub(first))
         {
             let line_width = u16::try_from(line.width()).unwrap_or(u16::MAX);
             let x = match self.alignment {
@@ -378,14 +549,14 @@ impl Component for TextBlock {
                 Alignment::Center => layout.size.width.saturating_sub(line_width) / 2,
                 Alignment::Right => layout.size.width.saturating_sub(line_width),
             };
-            let row = i64::try_from(index).unwrap_or(i64::MAX);
+            if x > 0 {
+                line.spans
+                    .insert(0, crate::text::Span::raw(" ".repeat(usize::from(x))));
+            }
+            let row = i64::try_from(visible.start.saturating_add(index)).unwrap_or(i64::MAX);
             cx.write_line_with_fallback_style(
                 LocalRect::new(0, row, layout.size.width, 1),
-                &Line::from_spans(
-                    std::iter::once(crate::text::Span::raw(" ".repeat(usize::from(x))))
-                        .chain(line.spans.iter().cloned())
-                        .collect::<Vec<_>>(),
-                ),
+                &line,
                 self.style,
             );
         }
@@ -1884,6 +2055,218 @@ mod tests {
     }
 
     #[test]
+    fn incremental_projection_preserves_offsets_across_source_lines() {
+        let component = TextBlock::new("abcd\né🙂\nz").wrap(crate::text::TextWrap::Character);
+        let mut rows = component.projection_rows(2);
+        for (text, source_line, range) in [
+            ("ab", 0, 0..2),
+            ("cd", 0, 2..4),
+            ("é", 1, 5..7),
+            ("🙂", 1, 7..11),
+            ("z", 2, 12..13),
+        ] {
+            let row = rows.next().unwrap();
+            assert_eq!(row.line.plain_text(), text);
+            assert_eq!(row.source_line, source_line);
+            assert_eq!(row.source_range, range);
+        }
+        assert!(rows.next().is_none());
+    }
+
+    #[test]
+    fn measured_height_matches_projection_for_text_policies() {
+        for text in [
+            "",
+            "\n",
+            "a\n\n",
+            "one two  three",
+            "é🙂中 a",
+            "a\t b\nlast  ",
+        ] {
+            for wrap in [
+                crate::text::TextWrap::None,
+                crate::text::TextWrap::Word,
+                crate::text::TextWrap::Character,
+            ] {
+                for trim in [false, true] {
+                    for width in [0, 1, 2, 5, 20] {
+                        let component = TextBlock::new(text).wrap(wrap).trim(trim);
+                        let layout =
+                            component.layout(Constraints::for_width(width), &mut LayoutCx::new());
+                        assert_eq!(
+                            layout.size.height,
+                            component.projection(width).len(),
+                            "text={text:?}, wrap={wrap:?}, trim={trim}, width={width}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_start_preserves_projection_suffixes() {
+        use crate::text::TextWrap;
+
+        for text in ["", "\n", "a\n\n", "one two   three\n界🙂 abcdef\n  last  "] {
+            for wrap in [TextWrap::None, TextWrap::Character, TextWrap::Word] {
+                for trim in [false, true] {
+                    for width in [0, 1, 2, 5, 20] {
+                        let block = TextBlock::new(text).wrap(wrap).trim(trim);
+                        let all = block.projection(width);
+                        for first in (0..=all.len()).chain([usize::MAX]) {
+                            let (source, offset) = block.source_start(width, first);
+                            let suffix: Vec<_> = block
+                                .projection_rows_from(width, source)
+                                .skip(offset)
+                                .collect();
+                            let expected = &all[first.min(all.len())..];
+                            assert_eq!(suffix.len(), expected.len());
+                            for (actual, expected) in suffix.iter().zip(expected) {
+                                assert_eq!(actual.line, expected.line);
+                                assert_eq!(actual.source_line, expected.source_line);
+                                assert_eq!(actual.source_range, expected.source_range);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_visible_rows_intersect_layout_and_parent_clip() {
+        let component = TextBlock::new("a\nb\nc\nd");
+        let layout = component.layout(Constraints::for_width(2), &mut LayoutCx::new());
+        for (clip, expected) in [
+            (crate::paint::LocalRect::new(0, 2, 2, 1), 2..3),
+            (crate::paint::LocalRect::new(0, -2, 2, 3), 0..1),
+            (crate::paint::LocalRect::new(0, 3, 2, 8), 3..4),
+            (crate::paint::LocalRect::new(2, 0, 1, 4), 0..0),
+            (crate::paint::LocalRect::new(-2, 0, 2, 4), 0..0),
+            (crate::paint::LocalRect::new(0, 0, 2, 0), 0..0),
+        ] {
+            assert_eq!(TextBlock::visible_rows(&layout, clip), expected);
+        }
+    }
+
+    #[test]
+    fn unwrapped_text_scroll_at_usize_limit_paints_nothing() {
+        let component = TextBlock::new("a\nb")
+            .wrap(crate::text::TextWrap::None)
+            .vertical_scroll(usize::MAX);
+        let layout = component.layout(Constraints::for_width(1), &mut LayoutCx::new());
+        assert_eq!(layout.size.height, 2);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(
+            0,
+            -1,
+            crate::paint::LocalRect::new(0, 1, 1, 1),
+            |cx| component.paint(&layout, cx),
+        );
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn selection_matches_scrolled_text_beyond_terminal_row_limit() {
+        let component = TextBlock::new(format!("{}z", "a\n".repeat(70_000))).vertical_scroll(1);
+        let layout = component.layout(Constraints::for_width(1), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(
+            0,
+            -69_999,
+            crate::paint::LocalRect::new(0, 69_999, 1, 1),
+            |cx| {
+                component.paint(&layout, cx);
+                component.register_selection(&layout, cx, "scope", "content", 0, 1);
+            },
+        );
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("z"));
+        let fragments = frame.selection().fragments();
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].area, Rect::new(0, 0, 1, 1));
+        assert_eq!(fragments[0].source_range, 140_000..140_001);
+    }
+
+    #[test]
+    fn scrolled_text_matches_full_paint_and_selection_for_all_policies() {
+        use crate::text::TextWrap;
+        use crate::text_block::Alignment;
+
+        for wrap in [TextWrap::None, TextWrap::Character, TextWrap::Word] {
+            for trim in [false, true] {
+                for alignment in [Alignment::Left, Alignment::Center, Alignment::Right] {
+                    let component = TextBlock::new("head\n界ab cd  \n\ne\u{301}fg hi\ntail")
+                        .wrap(wrap)
+                        .trim(trim)
+                        .alignment(alignment);
+                    let layout = component.layout(Constraints::for_width(5), &mut LayoutCx::new());
+                    let height = u16::try_from(layout.size.height).unwrap();
+                    let mut full_buffer = Buffer::empty(Rect::new(0, 0, 5, height));
+                    let mut full = Frame::new(&mut full_buffer);
+                    component.paint(&layout, &mut PaintCx::new(&mut full));
+                    component.register_selection(
+                        &layout,
+                        &mut PaintCx::new(&mut full),
+                        "scope",
+                        "content",
+                        0,
+                        1,
+                    );
+                    for first in 1..height {
+                        let scrolled = component.clone().vertical_scroll(1);
+                        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
+                        let mut frame = Frame::new(&mut buffer);
+                        let local_row = i64::from(first - 1);
+                        PaintCx::new(&mut frame).with_child(
+                            0,
+                            -local_row,
+                            crate::paint::LocalRect::new(0, local_row, 5, 1),
+                            |cx| {
+                                scrolled.paint(&layout, cx);
+                                scrolled.register_selection(&layout, cx, "scope", "content", 0, 1);
+                            },
+                        );
+                        assert_eq!(
+                            frame.buffer().row_symbols(0),
+                            full.buffer().row_symbols(first)
+                        );
+                        let expected: Vec<_> = full
+                            .selection()
+                            .fragments()
+                            .iter()
+                            .filter(|fragment| fragment.area.y == first)
+                            .map(|fragment| {
+                                (
+                                    fragment.area.x,
+                                    fragment.area.width,
+                                    fragment.source_range.clone(),
+                                )
+                            })
+                            .collect();
+                        let actual: Vec<_> = frame
+                            .selection()
+                            .fragments()
+                            .iter()
+                            .map(|fragment| {
+                                assert_eq!(fragment.area.y, 0);
+                                (
+                                    fragment.area.x,
+                                    fragment.area.width,
+                                    fragment.source_range.clone(),
+                                )
+                            })
+                            .collect();
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn text_selection_uses_authoritative_projection_and_alignment() {
         let component = TextBlock::new("one two").alignment(crate::text_block::Alignment::Right);
         let layout = component.layout(Constraints::for_width(6), &mut LayoutCx::new());
@@ -1927,6 +2310,143 @@ mod tests {
     }
 
     #[test]
+    fn trimmed_character_rows_advance_over_consumed_whitespace() {
+        let component = TextBlock::new("a   b")
+            .wrap(crate::text::TextWrap::Character)
+            .trim(true);
+        let rows = component.projection(2);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.line.plain_text())
+                .collect::<Vec<_>>(),
+            ["a", "", "b"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.source_range.clone())
+                .collect::<Vec<_>>(),
+            [0..1, 2..2, 4..5]
+        );
+    }
+
+    #[test]
+    fn character_measurement_preserves_large_logical_height() {
+        let component = TextBlock::new("界".repeat(70_000)).wrap(crate::text::TextWrap::Character);
+        for (width, expected) in [(1, 70_000), (2, 70_000), (4, 35_000), (3, 70_000)] {
+            let layout = component.layout(Constraints::for_width(width), &mut LayoutCx::new());
+            assert_eq!(layout.size.height, expected);
+            assert_eq!(layout.size.width, width);
+        }
+        let empty = TextBlock::new(crate::text::Text::from_lines(vec![]))
+            .wrap(crate::text::TextWrap::Character);
+        assert_eq!(empty.row_count(0), 0);
+        assert_eq!(
+            TextBlock::new("")
+                .wrap(crate::text::TextWrap::Character)
+                .row_count(0),
+            1
+        );
+    }
+
+    #[test]
+    fn intrinsic_text_width_respects_changing_constraints() {
+        let component = TextBlock::new("界ab\nx").wrap(crate::text::TextWrap::None);
+        for (min, max, expected) in [(0, 10, 4), (0, 2, 2), (6, 10, 6), (0, 10, 4)] {
+            let layout =
+                component.layout(Constraints::new(min, max, 0, None), &mut LayoutCx::new());
+            assert_eq!(layout.size.width, expected);
+            assert_eq!(layout.size.height, 2);
+        }
+        let wide = TextBlock::new("x".repeat(70_000)).wrap(crate::text::TextWrap::None);
+        assert_eq!(
+            wide.layout(Constraints::new(0, u16::MAX, 0, None), &mut LayoutCx::new())
+                .size
+                .width,
+            u16::MAX
+        );
+    }
+
+    #[test]
+    fn immutable_text_fingerprints_preserve_revision_channels() {
+        let plain = TextBlock::new("hello");
+        let changed = TextBlock::new("world");
+        let styled = TextBlock::new(crate::text::Text::from_lines(vec![
+            crate::text::Line::from_spans(vec![crate::text::Span::styled(
+                "hello",
+                Style::new().fg(Color::Green),
+            )]),
+        ]));
+        let restyled = plain.clone().style(Style::new().fg(Color::Blue));
+        assert_eq!(plain.revision().layout, restyled.revision().layout);
+        assert_ne!(plain.revision().paint, restyled.revision().paint);
+        assert_eq!(plain.revision(), TextBlock::new("hello").revision());
+        assert_ne!(plain.revision().layout, changed.revision().layout);
+        assert_eq!(plain.revision().paint, changed.revision().paint);
+        assert_eq!(plain.revision().layout, styled.revision().layout);
+        assert_ne!(plain.revision().paint, styled.revision().paint);
+    }
+
+    #[test]
+    fn source_line_index_handles_empty_and_trailing_lines() {
+        for source in ["", "\n", "界\n\n", "a\ne\u{301}\nlast"] {
+            let component = TextBlock::new(source).wrap(crate::text::TextWrap::None);
+            let rows = component.projection(10);
+            let mut expected_offset = 0;
+            for (index, line) in component.text().lines.iter().enumerate() {
+                assert_eq!(rows[index].source_range.start, expected_offset);
+                assert_eq!(
+                    component
+                        .projection_rows_from(10, index)
+                        .next()
+                        .unwrap()
+                        .source_range,
+                    rows[index].source_range
+                );
+                expected_offset += line.plain_text().len() + 1;
+            }
+            assert!(
+                component
+                    .projection_rows_from(10, rows.len())
+                    .next()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn projection_suffix_preserves_styled_unicode_source_offsets() {
+        let component = TextBlock::new(crate::text::Text::from_lines(vec![
+            crate::text::Line::from_spans(vec![
+                crate::text::Span::raw("界"),
+                crate::text::Span::styled("e\u{301}", Style::new().fg(Color::Green)),
+            ]),
+            crate::text::Line::raw(""),
+            crate::text::Line::raw("hello  "),
+            crate::text::Line::raw("end"),
+        ]))
+        .wrap(crate::text::TextWrap::None)
+        .trim(true);
+        let all = component.projection(3);
+        for first in 0..=5 {
+            let suffix: Vec<_> = component.projection_rows_from(3, first).collect();
+            let expected: Vec<_> = all.iter().skip(first).collect();
+            assert_eq!(suffix.len(), expected.len());
+            for (actual, expected) in suffix.iter().zip(expected) {
+                assert_eq!(actual.line, expected.line);
+                assert_eq!(actual.source_line, expected.source_line);
+                assert_eq!(actual.source_range, expected.source_range);
+            }
+        }
+        assert_eq!(all[2].source_range, 8..13);
+        assert!(
+            component
+                .projection_rows_from(3, usize::MAX)
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn text_trim_preserves_styles_and_projects_trimmed_source_ranges() {
         let component = TextBlock::new(crate::text::Text::from_lines(vec![
             crate::text::Line::from_spans(vec![
@@ -1956,6 +2476,141 @@ mod tests {
         assert_eq!(rows[1].source_range, 5..7);
         assert_eq!(rows[2].line.plain_text(), "ef");
         assert_eq!(rows[2].source_range, 9..11);
+    }
+
+    #[test]
+    fn word_projection_matches_across_spans_and_skipped_whitespace() {
+        let component = TextBlock::new(crate::text::Text::from_lines(vec![
+            crate::text::Line::from_spans(vec![
+                crate::text::Span::raw("ab  "),
+                crate::text::Span::styled("界", Style::new().fg(Color::Green)),
+                crate::text::Span::raw("xy  ab"),
+            ]),
+        ]))
+        .wrap(crate::text::TextWrap::Word)
+        .trim(true);
+        let rows = component.projection(4);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.line.plain_text())
+                .collect::<Vec<_>>(),
+            ["ab", "界xy", "ab"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.source_range.clone())
+                .collect::<Vec<_>>(),
+            [0..2, 4..9, 11..13]
+        );
+    }
+
+    #[test]
+    fn projection_match_preserves_overlapping_candidates_and_fallback() {
+        let mut source = b"aaaab tail".iter().copied();
+        assert_eq!(
+            super::advance_to_match(&mut source, b"aaab".iter().copied()),
+            1
+        );
+        assert_eq!(source.collect::<Vec<_>>(), b" tail");
+
+        let mut source = b"abcdef".iter().copied();
+        assert_eq!(
+            super::advance_to_match(&mut source, b"xyz".iter().copied()),
+            0
+        );
+        assert_eq!(source.collect::<Vec<_>>(), b"def");
+
+        let mut source = b"ab".iter().copied();
+        assert_eq!(
+            super::advance_to_match(&mut source, b"abc".iter().copied()),
+            0
+        );
+        assert_eq!(source.next(), None);
+        assert_eq!(
+            super::advance_to_match(&mut source, b"a".iter().copied()),
+            0
+        );
+        assert_eq!(source.next(), None);
+    }
+
+    #[test]
+    fn projection_match_consumes_successful_bytes_once() {
+        let reads = std::cell::Cell::new(0usize);
+        let mut source = b"   hello tail"
+            .iter()
+            .copied()
+            .inspect(|_| reads.set(reads.get() + 1));
+        assert_eq!(
+            super::advance_to_match(&mut source, b"hello".iter().copied()),
+            3
+        );
+        assert_eq!(reads.get(), 8);
+        assert_eq!(source.next(), Some(b' '));
+        assert_eq!(reads.get(), 9);
+        assert_eq!(super::advance_to_match(&mut source, std::iter::empty()), 0);
+        assert_eq!(reads.get(), 9);
+        assert_eq!(source.collect::<Vec<_>>(), b"tail");
+    }
+
+    #[test]
+    fn borrowed_projection_search_matches_contiguous_reference() {
+        use crate::text::{Line, Span, Text, TextWrap};
+        for input in [
+            "",
+            "   ",
+            "  ab ab   ab",
+            "界界 xy 界",
+            "e\u{301}  e\u{301}x",
+            "a\u{2003}\u{2003}b",
+            // EM SPACE and EURO SIGN share their first two UTF-8 bytes.
+            "a\u{2003}\u{2003}€ €",
+            "       a        a",
+            "a\u{2003}\u{2003}\u{2003}",
+            "abcdefgh ij",
+        ] {
+            let spans: Vec<Span> = input
+                .chars()
+                .enumerate()
+                .flat_map(|(index, ch)| {
+                    [
+                        Span::raw(""),
+                        Span::styled(
+                            ch.to_string(),
+                            Style::new().fg(if index % 2 == 0 {
+                                Color::Green
+                            } else {
+                                Color::Blue
+                            }),
+                        ),
+                    ]
+                })
+                .collect();
+            let text = Text::from_lines(vec![Line::from_spans(spans)]);
+            for trim in [false, true] {
+                for width in 1..=8 {
+                    let block = TextBlock::new(text.clone()).wrap(TextWrap::Word).trim(trim);
+                    let mut cursor = 0;
+                    for row in block.projection(width) {
+                        let rendered = row.line.plain_text();
+                        let start = if rendered.is_empty() {
+                            cursor
+                        } else {
+                            cursor
+                                + input[cursor..]
+                                    .find(&rendered)
+                                    .expect("wrapped row must occur in source")
+                        };
+                        let end = start + rendered.len();
+                        assert_eq!(
+                            row.source_range,
+                            start..end,
+                            "input={input:?}, width={width}, trim={trim}"
+                        );
+                        cursor = end;
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2175,6 +2830,37 @@ mod tests {
 
         let padded = Surface::new(TextBlock::new("x")).padding(Insets::all(1));
         assert_ne!(plain.revision().layout, padded.revision().layout);
+    }
+
+    #[test]
+    fn moving_spans_between_lines_invalidates_cached_layout() {
+        use crate::component::LayoutId;
+        use crate::text::{Line, Text};
+        let first = TextBlock::new(Text::from_lines(vec![
+            Line::from_spans(vec![
+                crate::text::Span::raw("ab"),
+                crate::text::Span::raw("cd"),
+            ]),
+            Line::from_spans(vec![]),
+        ]));
+        let second = TextBlock::new(Text::from_lines(vec![Line::raw("ab"), Line::raw("cd")]));
+        let constraints = Constraints::for_width(2);
+        let mut cache = crate::component::LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        let id = LayoutId::new("text");
+        assert_eq!(
+            cache
+                .layout(id.clone(), &first, constraints, &mut cx)
+                .size
+                .height,
+            3
+        );
+        assert_eq!(
+            cache.layout(id, &second, constraints, &mut cx).size.height,
+            2
+        );
+        assert_eq!(cache.stats().misses, 2);
+        assert_ne!(first.revision().layout, second.revision().layout);
     }
 
     #[test]

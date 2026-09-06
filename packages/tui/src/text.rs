@@ -333,16 +333,16 @@ impl From<usize> for TextWrapGeometry {
 ///
 /// Segments are collected across span boundaries so word wrapping can keep a
 /// word intact even when its graphemes carry different styles.
-struct WordSegment {
-    /// Styled grapheme pieces in source order.
-    pieces: Vec<(String, Style)>,
+struct WordSegment<'a> {
+    /// Styled source slices, or owned pieces supplied by tests.
+    pieces: Vec<(std::borrow::Cow<'a, str>, Style)>,
     /// Total display width of this segment.
     width: usize,
     /// Whether this segment is whitespace.
     whitespace: bool,
 }
 
-impl WordSegment {
+impl WordSegment<'_> {
     const fn new(whitespace: bool) -> Self {
         Self {
             pieces: Vec::new(),
@@ -351,54 +351,67 @@ impl WordSegment {
         }
     }
 
+    #[cfg(test)]
     fn push(&mut self, grapheme: &str, style: Style) {
         self.width = self.width.saturating_add(display_width(grapheme));
         if let Some((content, last_style)) = self.pieces.last_mut()
             && *last_style == style
         {
-            content.push_str(grapheme);
+            content.to_mut().push_str(grapheme);
             return;
         }
-        self.pieces.push((grapheme.to_owned(), style));
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.pieces.is_empty()
+        self.pieces.push((grapheme.to_owned().into(), style));
     }
 }
 
-/// Split a line into whitespace and non-whitespace segments across all spans.
-fn word_segments(line: &Line) -> Vec<WordSegment> {
-    let mut segments: Vec<WordSegment> = Vec::new();
-    let mut current: Option<WordSegment> = None;
-
-    for span in &line.spans {
-        for grapheme in span.content.graphemes(true) {
-            let whitespace = !grapheme.is_empty() && grapheme.chars().all(char::is_whitespace);
-            match &mut current {
-                Some(segment) if segment.whitespace == whitespace => {
-                    segment.push(grapheme, span.style);
-                }
-                Some(_) => {
-                    if let Some(finished) = current.take() {
-                        segments.push(finished);
-                    }
-                    let mut segment = WordSegment::new(whitespace);
-                    segment.push(grapheme, span.style);
-                    current = Some(segment);
-                }
-                None => {
-                    let mut segment = WordSegment::new(whitespace);
-                    segment.push(grapheme, span.style);
-                    current = Some(segment);
-                }
+/// Yield whitespace and non-whitespace segments across all spans, retaining
+/// only the current segment rather than materializing the entire source line.
+fn word_segments(line: &Line) -> impl Iterator<Item = WordSegment<'_>> + '_ {
+    let mut graphemes = line
+        .spans
+        .iter()
+        .enumerate()
+        .flat_map(|(index, span)| {
+            span.content
+                .grapheme_indices(true)
+                .map(move |(offset, grapheme)| {
+                    (
+                        index,
+                        offset,
+                        grapheme,
+                        grapheme.chars().all(char::is_whitespace),
+                    )
+                })
+        })
+        .peekable();
+    std::iter::from_fn(move || {
+        let &(first_span, first_offset, _, whitespace) = graphemes.peek()?;
+        let mut segment = WordSegment::new(whitespace);
+        let mut piece_span = first_span;
+        let mut start = first_offset;
+        let mut end = start;
+        while let Some((index, offset, grapheme, _)) =
+            graphemes.next_if(|(_, _, _, is_whitespace)| *is_whitespace == whitespace)
+        {
+            if index != piece_span {
+                let span = &line.spans[piece_span];
+                segment.pieces.push((
+                    std::borrow::Cow::Borrowed(&span.content[start..end]),
+                    span.style,
+                ));
+                piece_span = index;
+                start = offset;
             }
+            end = offset + grapheme.len();
+            segment.width = segment.width.saturating_add(display_width(grapheme));
         }
-    }
-    if let Some(finished) = current {
-        segments.push(finished);
-    }
-    segments
+        let span = &line.spans[piece_span];
+        segment.pieces.push((
+            std::borrow::Cow::Borrowed(&span.content[start..end]),
+            span.style,
+        ));
+        Some(segment)
+    })
 }
 
 /// Wrapping accumulator shared by every policy.
@@ -406,35 +419,77 @@ struct WrapSink {
     lines: Vec<Line>,
     column: usize,
     geometry: TextWrapGeometry,
+    emitted_rows: usize,
+    measure_only: bool,
+    pending_rows: usize,
 }
 
 impl WrapSink {
+    #[cfg(test)]
     fn new(geometry: TextWrapGeometry) -> Self {
+        Self::with_mode(geometry, false)
+    }
+
+    fn with_mode(geometry: TextWrapGeometry, measure_only: bool) -> Self {
         Self {
-            lines: vec![Line::new()],
+            lines: if measure_only {
+                Vec::new()
+            } else {
+                vec![Line::new()]
+            },
             column: 0,
             geometry,
+            emitted_rows: 0,
+            measure_only,
+            pending_rows: 1,
         }
     }
 
     const fn current_width(&self) -> usize {
-        self.geometry
-            .width_for_row(self.lines.len().saturating_sub(1))
+        self.geometry.width_for_row(
+            self.emitted_rows
+                .saturating_add(self.pending_rows.saturating_sub(1)),
+        )
     }
 
     fn break_row(&mut self) {
-        self.lines.push(Line::new());
+        self.pending_rows = self.pending_rows.saturating_add(1);
+        if !self.measure_only {
+            self.lines.push(Line::new());
+        }
         self.column = 0;
     }
 
-    fn push_piece(&mut self, content: &str, style: Style) {
-        if let Some(last) = self.lines.last_mut() {
-            push_or_merge_span(&mut last.spans, content.to_owned(), style);
+    fn take_row(&mut self) -> Option<Line> {
+        if self.pending_rows == 0 {
+            return None;
         }
-        self.column = self.column.saturating_add(display_width(content));
+        self.pending_rows -= 1;
+        self.emitted_rows = self.emitted_rows.saturating_add(1);
+        Some(if self.measure_only {
+            Line::new()
+        } else {
+            self.lines.remove(0)
+        })
+    }
+
+    fn push_measured_piece(&mut self, content: &str, style: Style, width: usize) {
+        if !self.measure_only
+            && let Some(last) = self.lines.last_mut()
+        {
+            if let Some(span) = last.spans.last_mut()
+                && span.style == style
+            {
+                span.content.push_str(content);
+            } else {
+                last.spans.push(Span::styled(content, style));
+            }
+        }
+        self.column = self.column.saturating_add(width);
     }
 
     /// Emit graphemes, breaking whenever the current row is full.
+    #[cfg(test)]
     fn push_graphemes(&mut self, content: &str, style: Style) {
         for grapheme in content.graphemes(true) {
             let grapheme_width = display_width(grapheme);
@@ -442,13 +497,227 @@ impl WrapSink {
             {
                 self.break_row();
             }
-            self.push_piece(grapheme, style);
+            self.push_measured_piece(grapheme, style, grapheme_width);
         }
     }
 
+    fn push_segment(&mut self, segment: WordSegment<'_>) {
+        if self.measure_only {
+            self.column = self.column.saturating_add(segment.width);
+            return;
+        }
+        for (content, style) in segment.pieces {
+            if let Some(last) = self.lines.last_mut() {
+                if let Some(span) = last.spans.last_mut()
+                    && span.style == style
+                {
+                    span.content.push_str(&content);
+                } else {
+                    last.spans.push(Span::styled(content.into_owned(), style));
+                }
+            }
+        }
+        self.column = self.column.saturating_add(segment.width);
+    }
+
+    #[cfg(test)]
     fn finish(self) -> Vec<Line> {
         self.lines
     }
+}
+
+/// Count character-wrapped rows without allocating rendered spans or strings.
+pub(crate) fn character_row_count(line: &Line, geometry: TextWrapGeometry) -> usize {
+    character_row_count_up_to(line, geometry, usize::MAX)
+}
+
+/// Count at most `limit` rows, stopping traversal once that bound is reached.
+pub(crate) fn character_row_count_up_to(
+    line: &Line,
+    geometry: TextWrapGeometry,
+    limit: usize,
+) -> usize {
+    character_rows_fold(
+        line.spans.iter().flat_map(|span| {
+            span.content
+                .graphemes(true)
+                .map(move |text| (text, span.style))
+        }),
+        geometry,
+        || (),
+        |(), _, _| {},
+    )
+    .take(limit)
+    .count()
+}
+
+/// Produce character-wrapped rows on demand, retaining only the current row.
+pub(crate) fn character_rows(
+    line: &Line,
+    geometry: TextWrapGeometry,
+) -> impl Iterator<Item = Line> + '_ {
+    let graphemes = line.spans.iter().flat_map(|span| {
+        span.content
+            .graphemes(true)
+            .map(move |text| (text, span.style))
+    });
+    character_rows_from(graphemes, geometry)
+}
+
+fn character_rows_from<'a>(
+    graphemes: impl Iterator<Item = (&'a str, Style)> + 'a,
+    geometry: TextWrapGeometry,
+) -> impl Iterator<Item = Line> + 'a {
+    character_rows_fold(graphemes, geometry, Line::new, |row, text, style| {
+        if let Some(span) = row.spans.last_mut()
+            && span.style == style
+        {
+            span.content.push_str(text);
+        } else {
+            row.spans.push(Span::styled(text, style));
+        }
+    })
+}
+
+fn character_rows_fold<'a, R>(
+    graphemes: impl Iterator<Item = (&'a str, Style)> + 'a,
+    geometry: TextWrapGeometry,
+    mut new_row: impl FnMut() -> R + 'a,
+    mut append: impl FnMut(&mut R, &str, Style) + 'a,
+) -> impl Iterator<Item = R> + 'a {
+    let mut graphemes = graphemes
+        .map(|(text, style)| (text, style, display_width(text)))
+        .peekable();
+    let mut row_index = 0usize;
+    let mut finished = false;
+    std::iter::from_fn(move || {
+        if finished {
+            return None;
+        }
+        let mut row = new_row();
+        let mut column = 0usize;
+        let width = geometry.width_for_row(row_index);
+        while let Some(&(text, style, text_width)) = graphemes.peek() {
+            if column > 0 && column.saturating_add(text_width) > width {
+                break;
+            }
+            graphemes.next();
+            append(&mut row, text, style);
+            column = column.saturating_add(text_width);
+        }
+        finished = graphemes.peek().is_none();
+        row_index = row_index.saturating_add(1);
+        Some(row)
+    })
+}
+
+/// Yield completed word-wrapped rows without retaining preceding output.
+/// Source segments are buffered, but oversized segments produce rows on demand.
+pub(crate) fn word_rows(
+    line: &Line,
+    geometry: TextWrapGeometry,
+) -> impl Iterator<Item = Line> + '_ {
+    word_rows_from_segments(word_segments(line), geometry)
+}
+
+/// Count word-wrapped rows without constructing rendered text.
+pub(crate) fn word_row_count(line: &Line, geometry: TextWrapGeometry) -> usize {
+    word_row_count_up_to(line, geometry, usize::MAX)
+}
+
+/// Count at most `limit` rows without constructing rendered text.
+pub(crate) fn word_row_count_up_to(line: &Line, geometry: TextWrapGeometry, limit: usize) -> usize {
+    word_rows_with_mode(word_segments(line), geometry, true)
+        .take(limit)
+        .count()
+}
+
+fn word_rows_from_segments<'a>(
+    segments: impl Iterator<Item = WordSegment<'a>>,
+    geometry: TextWrapGeometry,
+) -> impl Iterator<Item = Line> {
+    word_rows_with_mode(segments, geometry, false)
+}
+
+fn word_rows_with_mode<'a>(
+    mut segments: impl Iterator<Item = WordSegment<'a>>,
+    geometry: TextWrapGeometry,
+    measure_only: bool,
+) -> impl Iterator<Item = Line> {
+    let mut sink = WrapSink::with_mode(geometry, measure_only);
+    let mut pending: Option<(WordSegment<'a>, usize, usize)> = None;
+    let mut fitting = None;
+    let mut boundary_grapheme = None;
+    let mut wrapped_any = false;
+    let mut finished = false;
+    std::iter::from_fn(move || {
+        loop {
+            if sink.pending_rows > 1 {
+                return sink.take_row();
+            }
+            if let Some(segment) = fitting.take() {
+                sink.push_segment(segment);
+            }
+            if let Some((segment, piece, offset)) = pending.as_mut() {
+                if let Some((content, style)) = segment.pieces.get(*piece) {
+                    let measured = boundary_grapheme.take().or_else(|| {
+                        content[*offset..]
+                            .graphemes(true)
+                            .next()
+                            .map(|grapheme| (grapheme.len(), display_width(grapheme)))
+                    });
+                    if let Some((length, width)) = measured {
+                        if sink.column > 0
+                            && sink.column.saturating_add(width) > sink.current_width()
+                        {
+                            boundary_grapheme = Some((length, width));
+                            sink.break_row();
+                            continue;
+                        }
+                        sink.push_measured_piece(
+                            &content[*offset..*offset + length],
+                            *style,
+                            width,
+                        );
+                        *offset += length;
+                    } else {
+                        *piece += 1;
+                        *offset = 0;
+                    }
+                    continue;
+                }
+                pending = None;
+            }
+            if finished {
+                return None;
+            }
+            let Some(segment) = segments.next() else {
+                finished = true;
+                return sink.take_row();
+            };
+            // Preserve source indentation, but discard whitespace consumed by wrapping.
+            if segment.whitespace && sink.column == 0 && wrapped_any {
+                continue;
+            }
+            let breaks =
+                sink.column > 0 && sink.column.saturating_add(segment.width) > sink.current_width();
+            if breaks {
+                sink.break_row();
+                wrapped_any = true;
+            }
+            if !(breaks && segment.whitespace) {
+                if segment.width > sink.current_width() {
+                    pending = Some((segment, 0, 0));
+                    wrapped_any = true;
+                } else if breaks {
+                    // Yield the completed row before allocating the next row's spans.
+                    fitting = Some(segment);
+                } else {
+                    sink.push_segment(segment);
+                }
+            }
+        }
+    })
 }
 
 /// Return a styled line wrapped at grapheme boundaries.
@@ -479,47 +748,8 @@ pub fn wrap_line_with_geometry(
 ) -> Vec<Line> {
     match wrap {
         TextWrap::None => vec![line.clone()],
-        TextWrap::Character => {
-            let mut sink = WrapSink::new(geometry);
-            for span in &line.spans {
-                sink.push_graphemes(&span.content, span.style);
-            }
-            sink.finish()
-        }
-        TextWrap::Word => {
-            let mut sink = WrapSink::new(geometry);
-            let mut wrapped_any = false;
-            for segment in word_segments(line) {
-                if segment.is_empty() {
-                    continue;
-                }
-                // Leading indentation is meaningful, so only whitespace that a
-                // wrap break consumed is dropped.
-                if segment.whitespace && sink.column == 0 && wrapped_any {
-                    continue;
-                }
-                if sink.column > 0
-                    && sink.column.saturating_add(segment.width) > sink.current_width()
-                {
-                    sink.break_row();
-                    wrapped_any = true;
-                    if segment.whitespace {
-                        continue;
-                    }
-                }
-                if segment.width > sink.current_width() {
-                    for (content, style) in &segment.pieces {
-                        sink.push_graphemes(content, *style);
-                    }
-                    wrapped_any = true;
-                    continue;
-                }
-                for (content, style) in &segment.pieces {
-                    sink.push_piece(content, *style);
-                }
-            }
-            sink.finish()
-        }
+        TextWrap::Character => character_rows(line, geometry).collect(),
+        TextWrap::Word => word_rows(line, geometry).collect(),
     }
 }
 
@@ -710,6 +940,434 @@ mod tests {
         wrap_line_with_geometry, wrap_line_word,
     };
     use crate::style::{Color, Style};
+
+    #[test]
+    fn word_segments_preserve_unicode_and_styles_across_empty_spans() {
+        let green = Style::new().fg(Color::Green);
+        let line = Line::from_spans(vec![
+            Span::raw(""),
+            Span::raw("he"),
+            Span::styled("llo", green),
+            Span::raw(""),
+            Span::raw("\t\u{2003}"),
+            Span::styled("界e\u{301}", green),
+        ]);
+        let mut segments = super::word_segments(&line);
+        let word = segments.next().unwrap();
+        assert!(!word.whitespace);
+        assert_eq!(word.width, 5);
+        assert_eq!(
+            word.pieces,
+            vec![("he".into(), Style::new()), ("llo".into(), green)]
+        );
+        let space = segments.next().unwrap();
+        assert!(space.whitespace);
+        assert_eq!(space.pieces, vec![("\t\u{2003}".into(), Style::new())]);
+        let unicode = segments.next().unwrap();
+        assert!(!unicode.whitespace);
+        assert_eq!(unicode.width, 3);
+        assert_eq!(unicode.pieces, vec![("界e\u{301}".into(), green)]);
+        assert!(segments.next().is_none());
+        assert!(super::word_segments(&Line::new()).next().is_none());
+    }
+
+    #[test]
+    fn character_wrap_merges_matching_styles_without_crossing_row_boundaries() {
+        let green = Style::new().fg(Color::Green);
+        let blue = Style::new().fg(Color::Blue);
+        let line = Line::from_spans(vec![
+            Span::styled("ab", green),
+            Span::styled("界", green),
+            Span::styled("e\u{301}f", blue),
+            Span::styled("gh", blue),
+        ]);
+        assert_eq!(
+            line.wrap_character(5),
+            vec![
+                Line::from_spans(vec![
+                    Span::styled("ab界", green),
+                    Span::styled("e\u{301}", blue)
+                ]),
+                Line::from_spans(vec![Span::styled("fgh", blue)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn fitting_segment_moves_storage_and_merges_adjacent_style() {
+        let style = Style::new().fg(Color::Green);
+        let mut segment = super::WordSegment::new(false);
+        segment.push("hello", style);
+        let storage = segment.pieces[0].0.as_ptr();
+        let mut sink = super::WrapSink::new(TextWrapGeometry::uniform(20));
+        sink.push_segment(segment);
+        assert_eq!(sink.lines[0].spans[0].content.as_ptr(), storage);
+        assert_eq!(sink.column, 5);
+        let mut space = super::WordSegment::new(true);
+        space.push(" ", style);
+        sink.push_segment(space);
+        assert_eq!(sink.column, 6);
+        assert_eq!(
+            sink.finish(),
+            vec![Line::from_spans(vec![Span::styled("hello ", style)])]
+        );
+    }
+
+    #[test]
+    fn borrowed_segments_merge_into_existing_output_storage() {
+        let mut content = String::with_capacity(32);
+        content.push_str("prefix ");
+        let storage = content.as_ptr();
+        let mut sink = super::WrapSink::new(TextWrapGeometry::uniform(32));
+        sink.lines[0] = Line::raw(content);
+        sink.column = 7;
+        let source = Line::raw("hello world");
+        for segment in super::word_segments(&source) {
+            sink.push_segment(segment);
+        }
+        assert_eq!(sink.column, 18);
+        assert_eq!(sink.lines[0].spans.len(), 1);
+        assert_eq!(sink.lines[0].spans[0].content, "prefix hello world");
+        assert_eq!(sink.lines[0].spans[0].content.as_ptr(), storage);
+    }
+
+    #[test]
+    fn bounded_measurement_matches_full_row_counts() {
+        for text in ["", "   ", "one two three", "界🙂abcdef\u{301}   last"] {
+            let line = Line::raw(text);
+            for first in 0..=5 {
+                for continuation in 0..=5 {
+                    let geometry = TextWrapGeometry::with_continuation(first, continuation);
+                    let characters = super::character_row_count(&line, geometry);
+                    let words = super::word_row_count(&line, geometry);
+                    for limit in (0..=characters.max(words).saturating_add(1)).chain([usize::MAX]) {
+                        assert_eq!(
+                            super::character_row_count_up_to(&line, geometry, limit),
+                            characters.min(limit)
+                        );
+                        assert_eq!(
+                            super::word_row_count_up_to(&line, geometry, limit),
+                            words.min(limit)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn word_row_count_matches_rendered_geometry() {
+        for text in [
+            "",
+            "   ",
+            "ab   cd",
+            "界界 abcdefgh ij",
+            "  e\u{301} e\u{301}x",
+            "a\u{2003}b",
+        ] {
+            let line = Line::raw(text);
+            for first in 0..=6 {
+                for continuation in 0..=6 {
+                    let geometry = TextWrapGeometry::with_continuation(first, continuation);
+                    assert_eq!(
+                        super::word_row_count(&line, geometry),
+                        super::word_rows(&line, geometry).count(),
+                        "{text:?}: {geometry:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn character_row_count_matches_rendered_geometry() {
+        for text in ["", "abc def", "界界a", "e\u{301}x", "\u{200d}", "  a  "] {
+            let line = Line::raw(text);
+            for first in 0..=5 {
+                for continuation in 0..=5 {
+                    let geometry = TextWrapGeometry::with_continuation(first, continuation);
+                    assert_eq!(
+                        super::character_row_count(&line, geometry),
+                        super::character_rows(&line, geometry).count(),
+                        "{text:?}: {geometry:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn word_segments_classify_entire_unicode_graphemes() {
+        let line = Line::raw("a\u{2003}b \u{301}c\t");
+        let segments: Vec<_> = super::word_segments(&line)
+            .map(|segment| {
+                (
+                    segment.whitespace,
+                    segment
+                        .pieces
+                        .iter()
+                        .map(|(text, _)| text.as_ref())
+                        .collect::<String>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            segments,
+            vec![
+                (false, "a".to_string()),
+                (true, "\u{2003}".to_string()),
+                (false, "b \u{301}c".to_string()),
+                (true, "\t".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn word_segments_borrow_source_storage() {
+        let line = Line::raw("hello world");
+        let segments: Vec<_> = super::word_segments(&line).collect();
+        for (segment, offset) in segments.iter().zip([0, 5, 6]) {
+            assert!(matches!(segment.pieces[0].0, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(
+                segment.pieces[0].0.as_ptr(),
+                line.spans[0].content[offset..].as_ptr()
+            );
+        }
+        assert_eq!(segments.len(), 3);
+    }
+
+    #[test]
+    fn bounded_character_measurement_stops_after_boundary_lookahead() {
+        for limit in 0..=3 {
+            let consumed = std::cell::Cell::new(0usize);
+            let graphemes = std::iter::repeat_n(("界", Style::new()), 10_000).inspect(|_| {
+                consumed.set(consumed.get() + 1);
+            });
+            let rows = super::character_rows_fold(
+                graphemes,
+                TextWrapGeometry::uniform(4),
+                || (),
+                |(), _, _| {},
+            );
+            assert_eq!(rows.take(limit).count(), limit);
+            let expected = if limit == 0 { 0 } else { limit * 2 + 1 };
+            assert_eq!(consumed.get(), expected);
+        }
+    }
+
+    #[test]
+    fn measurement_sink_tracks_boundaries_without_row_storage() {
+        let mut sink = super::WrapSink::with_mode(TextWrapGeometry::with_continuation(3, 5), true);
+        assert_eq!(sink.current_width(), 3);
+        sink.push_measured_piece("ab", Style::new(), 2);
+        sink.break_row();
+        assert_eq!(sink.current_width(), 5);
+        assert_eq!(sink.take_row(), Some(Line::new()));
+        sink.push_measured_piece("界", Style::new(), 2);
+        assert_eq!(sink.column, 2);
+        assert_eq!(sink.take_row(), Some(Line::new()));
+        assert_eq!(sink.take_row(), None);
+        assert_eq!(sink.lines.capacity(), 0);
+    }
+
+    #[test]
+    fn bounded_word_measurement_emits_no_spans_and_leaves_tail_unread() {
+        let line = Line::from_spans(vec![
+            Span::styled("ab ", Style::new().fg(Color::Green)),
+            Span::styled("abcdefgh", Style::new().fg(Color::Blue)),
+            Span::raw(" tail"),
+        ]);
+        for limit in 0..=3 {
+            let consumed = std::cell::Cell::new(0usize);
+            let segments = super::word_segments(&line).inspect(|_| {
+                consumed.set(consumed.get() + 1);
+            });
+            let rows = super::word_rows_with_mode(segments, TextWrapGeometry::uniform(3), true);
+            let mut count = 0;
+            for row in rows.take(limit) {
+                assert!(row.spans.is_empty());
+                count += 1;
+            }
+            assert_eq!(count, limit);
+            assert_eq!(consumed.get(), if limit == 0 { 0 } else { 3 });
+        }
+    }
+
+    #[test]
+    fn word_rows_consume_segments_only_as_output_is_requested() {
+        let consumed = std::cell::Cell::new(0usize);
+        let line = Line::raw("ab abcdefgh tail");
+        let segments = super::word_segments(&line).inspect(|_| {
+            consumed.set(consumed.get() + 1);
+        });
+        let mut rows = super::word_rows_from_segments(segments, TextWrapGeometry::uniform(3));
+        assert_eq!(consumed.get(), 0);
+        assert_eq!(rows.next(), Some(Line::raw("ab ")));
+        assert_eq!(consumed.get(), 3);
+        assert_eq!(rows.next(), Some(Line::raw("abc")));
+        assert_eq!(consumed.get(), 3);
+        assert_eq!(rows.next(), Some(Line::raw("def")));
+        assert_eq!(consumed.get(), 3);
+        assert_eq!(rows.next(), Some(Line::raw("gh ")));
+        assert_eq!(consumed.get(), 5);
+        assert_eq!(rows.next(), Some(Line::raw("tai")));
+        assert_eq!(consumed.get(), 5);
+        assert_eq!(rows.next(), Some(Line::raw("l")));
+        assert_eq!(rows.next(), None);
+    }
+
+    #[test]
+    fn oversized_word_boundary_preserves_wide_and_combining_graphemes() {
+        let green = Style::new().fg(Color::Green);
+        let line = Line::from_spans(vec![Span::raw("a"), Span::styled("界e\u{301}🙂", green)]);
+        let geometry = TextWrapGeometry::with_continuation(1, 2);
+        let expected = vec![
+            Line::raw("a"),
+            Line::from_spans(vec![Span::styled("界", green)]),
+            Line::from_spans(vec![Span::styled("e\u{301}", green)]),
+            Line::from_spans(vec![Span::styled("🙂", green)]),
+        ];
+        assert_eq!(
+            super::word_rows(&line, geometry).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(super::word_row_count(&line, geometry), expected.len());
+    }
+
+    #[test]
+    fn word_rows_resume_fitting_segment_after_yield() {
+        let green = Style::new().fg(Color::Green);
+        let line = Line::from_spans(vec![Span::raw("ab "), Span::styled("cde", green)]);
+        for measure_only in [false, true] {
+            let mut rows = super::word_rows_with_mode(
+                super::word_segments(&line),
+                TextWrapGeometry::with_continuation(3, 5),
+                measure_only,
+            );
+            let expected = if measure_only {
+                Line::new()
+            } else {
+                Line::raw("ab ")
+            };
+            assert_eq!(rows.next(), Some(expected));
+            let expected = if measure_only {
+                Line::new()
+            } else {
+                Line::from_spans(vec![Span::styled("cde", green)])
+            };
+            assert_eq!(rows.next(), Some(expected));
+            assert_eq!(rows.next(), None);
+            assert_eq!(rows.next(), None);
+        }
+    }
+
+    #[test]
+    fn oversized_word_resumes_when_continuation_cannot_fit_wide_graphemes() {
+        let green = Style::new().fg(Color::Green);
+        let line = Line::from_spans(vec![Span::styled("ab界🙂e\u{301}", green)]);
+        for continuation in [0, 1] {
+            let geometry = TextWrapGeometry::with_continuation(3, continuation);
+            let expected: Vec<_> = ["ab", "界", "🙂", "e\u{301}"]
+                .into_iter()
+                .map(|text| Line::from_spans(vec![Span::styled(text, green)]))
+                .collect();
+            assert_eq!(
+                super::word_rows(&line, geometry).collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(super::word_row_count(&line, geometry), expected.len());
+        }
+    }
+
+    #[test]
+    fn word_rows_resume_inside_styled_oversized_segments() {
+        let green = Style::new().fg(Color::Green);
+        let line = Line::from_spans(vec![
+            Span::raw("a "),
+            Span::styled("界界界界", green),
+            Span::raw("xy z"),
+        ]);
+        let mut rows = super::word_rows(&line, TextWrapGeometry::with_continuation(3, 4));
+        assert_eq!(rows.next(), Some(Line::raw("a ")));
+        assert_eq!(
+            rows.next(),
+            Some(Line::from_spans(vec![Span::styled("界界", green)]))
+        );
+        assert_eq!(
+            rows.next(),
+            Some(Line::from_spans(vec![Span::styled("界界", green)]))
+        );
+        assert_eq!(rows.next(), Some(Line::raw("xy z")));
+        assert_eq!(rows.next(), None);
+        assert_eq!(rows.next(), None);
+    }
+
+    #[test]
+    fn long_styled_word_preserves_unicode_across_variable_row_widths() {
+        let green = Style::new().fg(Color::Green);
+        let blue = Style::new().fg(Color::Blue);
+        let line = Line::from_spans(vec![
+            Span::styled("界a", green),
+            Span::styled("e\u{301}🙂z", blue),
+        ]);
+        let rows = wrap_line_with_geometry(
+            &line,
+            TextWrapGeometry::with_continuation(3, 2),
+            TextWrap::Word,
+        );
+        assert_eq!(
+            rows,
+            vec![
+                Line::from_spans(vec![Span::styled("界a", green)]),
+                Line::from_spans(vec![Span::styled("e\u{301}", blue)]),
+                Line::from_spans(vec![Span::styled("🙂", blue)]),
+                Line::from_spans(vec![Span::styled("z", blue)]),
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(Line::plain_text).collect::<String>(),
+            line.plain_text()
+        );
+    }
+
+    #[test]
+    fn character_rows_consume_only_requested_rows_and_one_lookahead() {
+        let consumed = std::cell::Cell::new(0usize);
+        let source = std::iter::repeat_n(("a", Style::new()), 100_000).inspect(|_| {
+            consumed.set(consumed.get() + 1);
+        });
+        let mut rows = super::character_rows_from(source, TextWrapGeometry::uniform(4));
+        assert_eq!(consumed.get(), 0);
+        assert_eq!(rows.next().unwrap().plain_text(), "aaaa");
+        assert_eq!(consumed.get(), 5);
+        assert_eq!(rows.next().unwrap().plain_text(), "aaaa");
+        assert_eq!(consumed.get(), 9);
+        drop(rows);
+        assert_eq!(consumed.get(), 9);
+    }
+
+    #[test]
+    fn character_rows_match_accumulator_for_unicode_and_geometry() {
+        for source in ["", "abcdef", "界e\u{301}🙂 x", "\u{200b}ab", "   "] {
+            let line = Line::from_spans(vec![
+                Span::raw(source),
+                Span::styled(source, Style::new().fg(Color::Green)),
+            ]);
+            for first in 0..5 {
+                for continuation in 0..5 {
+                    let geometry = TextWrapGeometry::with_continuation(first, continuation);
+                    let mut expected = super::WrapSink::new(geometry);
+                    for span in &line.spans {
+                        expected.push_graphemes(&span.content, span.style);
+                    }
+                    let mut rows = super::character_rows(&line, geometry);
+                    assert_eq!(rows.by_ref().collect::<Vec<_>>(), expected.finish());
+                    assert!(rows.next().is_none());
+                    assert!(rows.next().is_none());
+                }
+            }
+        }
+    }
 
     #[test]
     fn line_plain_text_concatenates_span_content() {
