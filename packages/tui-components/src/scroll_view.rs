@@ -422,8 +422,8 @@ impl Component for ScrollViewComponent<'_> {
         let horizontal_offset = resolved.horizontal_offset();
         let vertical_offset = resolved.vertical_offset();
         cx.with_transform(
-            u16::try_from(horizontal_offset).unwrap_or(u16::MAX),
-            vertical_offset,
+            0,
+            0,
             -i32::try_from(horizontal_offset).unwrap_or(i32::MAX),
             -i64::try_from(vertical_offset).unwrap_or(i64::MAX),
             clip,
@@ -440,7 +440,7 @@ impl Component for ScrollViewComponent<'_> {
                     return EventOutcome::Ignored;
                 }
                 cx.with_transform(0, 0, 0, 0, clip, |cx| {
-                    self.child.event(event, &child.node, cx)
+                    cx.with_root(&child.node, |cx| self.child.event(event, &child.node, cx))
                 })
             },
         )
@@ -1400,6 +1400,143 @@ mod tests {
             .collect::<String>();
         assert_eq!(rendered, "cdef");
         assert_eq!(layout.children[0].node.size.width, 6);
+    }
+
+    #[test]
+    fn nested_scroll_identity_respects_both_offsets_and_outer_clip() {
+        struct Target;
+        impl Component for Target {
+            fn layout(&self, _constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::with_children(
+                    "content".into(),
+                    LogicalSize::new(12, 12),
+                    vec![ChildLayout::new(
+                        5,
+                        5,
+                        LayoutNode::leaf("target".into(), LogicalSize::new(3, 3)),
+                    )],
+                )
+            }
+            fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+            fn event(
+                &self,
+                event: &Event,
+                _layout: &LayoutNode,
+                cx: &mut EventCx<'_>,
+            ) -> EventOutcome {
+                let expected = if matches!(event, Event::Mouse(mouse) if mouse.position.x >= 10) {
+                    Rect::new(11, 21, 2, 2)
+                } else {
+                    Rect::new(1, 1, 2, 2)
+                };
+                assert_eq!(
+                    cx.find_visible_rect(&LayoutId::new("target")),
+                    Some(expected)
+                );
+                EventOutcome::Handled
+            }
+        }
+        let mut inner_state = ScrollViewState::new();
+        inner_state.set_horizontal_offset(3);
+        inner_state.set_vertical_offset(3);
+        let inner = ScrollViewComponent::new("inner", LogicalSize::new(6, 6), inner_state, Target)
+            .content_width(12);
+        let mut outer_state = ScrollViewState::new();
+        outer_state.set_horizontal_offset(1);
+        outer_state.set_vertical_offset(1);
+        let outer = ScrollViewComponent::new("outer", LogicalSize::new(3, 3), outer_state, inner)
+            .content_width(6);
+        let layout = outer.layout(Constraints::tight(Size::new(3, 3)), &mut LayoutCx::new());
+        for (point, expected) in [
+            (Point::new(1, 1), EventOutcome::Handled),
+            (Point::new(3, 1), EventOutcome::Ignored),
+        ] {
+            let event = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                point,
+            ));
+            assert_eq!(
+                outer.event(
+                    &event,
+                    &layout,
+                    &mut EventCx::with_clip(&layout, Rect::new(0, 0, 3, 3))
+                ),
+                expected
+            );
+        }
+        let mut translated_cx = EventCx::with_clip(&layout, Rect::new(10, 20, 4, 4));
+        let translated_event = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            Point::new(10, 20),
+        ));
+        // An off-viewport pointer must be rejected before reaching Target,
+        // even when the parent has both a logical origin and a translation.
+        let ignored = translated_cx.with_transform(10, 20, 10, 20, Rect::new(10, 20, 4, 4), |cx| {
+            let outside = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                Point::new(13, 20),
+            ));
+            outer.event(&outside, &layout, cx)
+        });
+        let handled = translated_cx.with_transform(10, 20, 10, 20, Rect::new(10, 20, 4, 4), |cx| {
+            outer.event(&translated_event, &layout, cx)
+        });
+        assert_eq!(handled, EventOutcome::Handled);
+        assert_eq!(ignored, EventOutcome::Ignored);
+        assert_eq!(translated_cx.clip(), Some(Rect::new(10, 20, 4, 4)));
+        assert_eq!(
+            outer.event(&translated_event, &layout, &mut translated_cx),
+            EventOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn scrolled_descendant_identity_is_translated_once() {
+        struct Target;
+        impl Component for Target {
+            fn layout(&self, _constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::with_children(
+                    "content".into(),
+                    LogicalSize::new(10, 10),
+                    vec![ChildLayout::new(
+                        5,
+                        5,
+                        LayoutNode::leaf("target".into(), LogicalSize::new(2, 2)),
+                    )],
+                )
+            }
+            fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+            fn event(
+                &self,
+                _event: &Event,
+                _layout: &LayoutNode,
+                cx: &mut EventCx<'_>,
+            ) -> EventOutcome {
+                assert_eq!(
+                    cx.find_visible_rect(&LayoutId::new("target")),
+                    Some(Rect::new(1, 1, 2, 2))
+                );
+                EventOutcome::Handled
+            }
+        }
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(4);
+        state.set_horizontal_offset(4);
+        let component = ScrollViewComponent::new("scroll", LogicalSize::new(4, 4), state, Target)
+            .content_width(10);
+        let layout = component.layout(Constraints::tight(Size::new(4, 4)), &mut LayoutCx::new());
+        let event = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            Point::new(1, 1),
+        ));
+        assert_eq!(
+            component.event(
+                &event,
+                &layout,
+                &mut EventCx::with_clip(&layout, Rect::new(0, 0, 4, 4))
+            ),
+            EventOutcome::Handled
+        );
     }
 
     #[test]

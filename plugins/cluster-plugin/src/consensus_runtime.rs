@@ -681,8 +681,10 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 for node in nodes {
-                    if let Some(leader) = node.raft().current_leader().await {
-                        return leader;
+                    if node.raft().current_leader().await == Some(node.node_id())
+                        && node.raft().ensure_linearizable().await.is_ok()
+                    {
+                        return node.node_id();
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -696,10 +698,11 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 for node in nodes {
-                    if let Some(leader) = node.raft().current_leader().await
-                        && leader != excluded
+                    if node.node_id() != excluded
+                        && node.raft().current_leader().await == Some(node.node_id())
+                        && node.raft().ensure_linearizable().await.is_ok()
                     {
-                        return leader;
+                        return node.node_id();
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
