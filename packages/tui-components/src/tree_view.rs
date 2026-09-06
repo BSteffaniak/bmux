@@ -333,14 +333,6 @@ impl<'a> TreeView<'a> {
         visible_indices(self.items, state)
     }
 
-    /// Return the natural size: the widest visible row and one row per
-    /// visible item under the current expansion state.
-    #[must_use]
-    pub fn size(&self, state: &TreeViewState) -> (u16, u16) {
-        let size = self.logical_size(state);
-        (size.width, u16_saturating(size.height))
-    }
-
     fn logical_size(&self, state: &TreeViewState) -> LogicalSize {
         let visible = self.visible_indices(state);
         let width = visible
@@ -1011,7 +1003,10 @@ mod tests {
                 let state = TreeViewState::new(None);
                 let expected =
                     u16::try_from(tree.row_line(&items[0], &state, 0).width()).unwrap_or(u16::MAX);
-                assert_eq!(tree.size(&state), (expected, 1));
+                assert_eq!(
+                    tree.logical_size(&state),
+                    bmux_tui::component::LogicalSize::new(expected, 1)
+                );
             }
         }
     }
@@ -1256,7 +1251,6 @@ mod tests {
         let component = TreeViewComponent::new("large-tree", &items, &state);
         let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
         assert_eq!(layout.size.height, 70_000);
-        assert_eq!(TreeView::new(&items).size(&state.borrow()).1, u16::MAX);
     }
 
     #[test]
