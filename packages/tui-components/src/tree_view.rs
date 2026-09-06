@@ -356,33 +356,6 @@ impl<'a> TreeView<'a> {
         LogicalSize::new(u16_saturating(width), visible.len())
     }
 
-    /// Paint visible tree rows through a scoped local-coordinate context whose
-    /// origin is this tree's top-left corner.
-    pub fn paint(&self, area: Rect, state: &TreeViewState, cx: &mut PaintCx<'_, '_>) {
-        if area.is_empty() {
-            return;
-        }
-        for (visible, source) in self
-            .visible_indices(state)
-            .into_iter()
-            .take(usize::from(area.height))
-            .enumerate()
-        {
-            let item = &self.items[source];
-            let row = LocalRect::new(
-                i32::from(area.x),
-                i64::from(area.y.saturating_add(u16_saturating(visible))),
-                area.width,
-                1,
-            );
-            cx.write_line_with_fallback_style(
-                row,
-                &self.row_line(item, state, visible),
-                self.row_style(item, state, visible),
-            );
-        }
-    }
-
     /// Handle one event.
     pub fn handle_event(
         &self,
@@ -671,6 +644,48 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
         }
     }
 
+    /// Handle an event using resolved geometry while preserving the typed action.
+    pub fn handle_event(
+        &self,
+        event: &Event,
+        layout: &LayoutNode,
+        cx: &mut EventCx<'_>,
+    ) -> TreeViewOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return TreeViewOutcome::Ignored;
+        };
+        let mut state = self.state.borrow_mut();
+        if let Event::Mouse(mouse) = event {
+            let handles_mouse = match mouse.kind {
+                MouseEventKind::Move => self.tree.policy.mouse.hover,
+                MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                    self.tree.policy.mouse.click
+                }
+                _ => false,
+            };
+            if state.interaction.disabled || !self.tree.policy.mouse.enabled || !handles_mouse {
+                return TreeViewOutcome::Ignored;
+            }
+            let hit = area
+                .contains(mouse.position)
+                .then(|| {
+                    (0..self.tree.visible_indices(&state).len()).find(|&row| {
+                        cx.visible_rect(bmux_tui::component::LogicalRect::new(
+                            0,
+                            row,
+                            layout.size.width,
+                            1,
+                        ))
+                        .contains(mouse.position)
+                    })
+                })
+                .flatten();
+            self.tree.handle_mouse_hit(&mut state, *mouse, hit)
+        } else {
+            self.tree.handle_event(area, &mut state, event)
+        }
+    }
+
     /// Set behavior policy.
     #[must_use]
     pub const fn policy(mut self, policy: TreeViewPolicy) -> Self {
@@ -704,10 +719,26 @@ impl Component for TreeViewComponent<'_, '_> {
         for item in self.tree.items {
             item.disabled.hash(&mut paint);
         }
-        format!("{:?}", self.tree.styles).hash(&mut paint);
-        format!("{:?}", self.tree.policy.keyboard).hash(&mut paint);
-        format!("{:?}", self.tree.policy.mouse).hash(&mut paint);
-        format!("{:?}", *state).hash(&mut paint);
+        self.tree.styles.normal.hash(&mut paint);
+        self.tree.styles.selected.hash(&mut paint);
+        self.tree.styles.hovered.hash(&mut paint);
+        self.tree.styles.pressed.hash(&mut paint);
+        self.tree.styles.disabled.hash(&mut paint);
+        self.tree.styles.marker.hash(&mut paint);
+        self.tree.policy.keyboard.enabled.hash(&mut paint);
+        self.tree.policy.keyboard.enter_selects.hash(&mut paint);
+        self.tree.policy.keyboard.space_toggles.hash(&mut paint);
+        self.tree.policy.mouse.enabled.hash(&mut paint);
+        self.tree.policy.mouse.hover.hash(&mut paint);
+        self.tree.policy.mouse.click.hash(&mut paint);
+        state.selected_visible.hash(&mut paint);
+        state.expanded.hash(&mut paint);
+        state.hovered_visible.hash(&mut paint);
+        state.pressed_visible.hash(&mut paint);
+        state.interaction.focused.hash(&mut paint);
+        state.interaction.hovered.hash(&mut paint);
+        state.interaction.pressed.hash(&mut paint);
+        state.interaction.disabled.hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
 
@@ -762,8 +793,8 @@ impl Component for TreeViewComponent<'_, '_> {
                 {
                     let item = &self.tree.items[source];
                     let row = Rect::new(0, u16_saturating(visible - start), area.width, 1);
+                    let item_id = format!("{}.{}", self.id.as_str(), item.id);
                     if interactive {
-                        let item_id = format!("{}.{}", self.id.as_str(), item.id);
                         cx.push_hit(
                             SceneRegion::new(item_id.clone(), row)
                                 .role(HitRole::ListItem)
@@ -771,8 +802,8 @@ impl Component for TreeViewComponent<'_, '_> {
                                 .hoverable(self.tree.policy.mouse.hover)
                                 .enabled(!state.interaction.disabled && !item.disabled),
                         );
-                        cx.push_semantic(SemanticRegion::new(item_id, row, "tree-item"));
                     }
+                    cx.push_semantic(SemanticRegion::new(item_id, row, "tree-item"));
                     cx.write_line_with_fallback_style(
                         LocalRect::new(0, i64::from(row.y), row.width, 1),
                         &self.tree.row_line(item, &state, visible),
@@ -786,40 +817,7 @@ impl Component for TreeViewComponent<'_, '_> {
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
-        let Some(area) = cx.find_rect(&layout.id) else {
-            return EventOutcome::Ignored;
-        };
-        let mut state = self.state.borrow_mut();
-        let outcome = if let Event::Mouse(mouse) = event {
-            let handles_mouse = match mouse.kind {
-                MouseEventKind::Move => self.tree.policy.mouse.hover,
-                MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
-                    self.tree.policy.mouse.click
-                }
-                _ => false,
-            };
-            if state.interaction.disabled || !self.tree.policy.mouse.enabled || !handles_mouse {
-                return EventOutcome::Ignored;
-            }
-            let hit = area
-                .contains(mouse.position)
-                .then(|| {
-                    (0..self.tree.visible_indices(&state).len()).find(|&row| {
-                        cx.visible_rect(bmux_tui::component::LogicalRect::new(
-                            0,
-                            row,
-                            layout.size.width,
-                            1,
-                        ))
-                        .contains(mouse.position)
-                    })
-                })
-                .flatten();
-            self.tree.handle_mouse_hit(&mut state, *mouse, hit)
-        } else {
-            self.tree.handle_event(area, &mut state, event)
-        };
-        match outcome {
+        match self.handle_event(event, layout, cx) {
             TreeViewOutcome::Ignored => EventOutcome::Ignored,
             TreeViewOutcome::Redraw
             | TreeViewOutcome::Focused { .. }
@@ -876,6 +874,79 @@ mod tests {
             LocalRect::new(0, 0, area.width, area.height),
             |cx| component.paint(&layout, cx),
         );
+    }
+
+    #[test]
+    fn noninteractive_rows_keep_semantic_identity_without_hits() {
+        for disabled in [false, true] {
+            let items = [TreeViewItem::new("row", "Row", 0).disabled(disabled)];
+            let state = RefCell::new(TreeViewState::new(None));
+            let policy = if disabled {
+                TreeViewPolicy::interactive()
+            } else {
+                TreeViewPolicy::bare()
+            };
+            let component = TreeViewComponent::new("tree", &items, &state).policy(policy);
+            let area = Rect::new(0, 0, 20, 1);
+            let mut buffer = Buffer::empty(area);
+            let mut frame = Frame::new(&mut buffer);
+            render_component(&component, area, &mut frame);
+            assert!(frame.hits().regions().is_empty());
+            assert!(
+                frame
+                    .semantics()
+                    .regions()
+                    .iter()
+                    .any(|region| region.id == "tree.row" && region.role == "tree-item")
+            );
+        }
+    }
+
+    #[test]
+    fn interaction_state_changes_invalidate_tree_paint() {
+        let items = [TreeViewItem::new("row", "Row", 0)];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let initial = component.revision();
+        for field in 0..7 {
+            *state.borrow_mut() = TreeViewState::new(None);
+            {
+                let mut state = state.borrow_mut();
+                match field {
+                    0 => state.selected_visible = Some(0),
+                    1 => state.hovered_visible = Some(0),
+                    2 => state.pressed_visible = Some(0),
+                    3 => state.interaction.focused = true,
+                    4 => state.interaction.hovered = true,
+                    5 => state.interaction.pressed = true,
+                    _ => state.interaction.disabled = true,
+                }
+            }
+            assert_ne!(component.revision(), initial);
+        }
+    }
+
+    #[test]
+    fn disabled_component_paints_entire_row_surface() {
+        let items = [TreeViewItem::new("branch", "Branch", 0).expandable(true)];
+        let state = RefCell::new(TreeViewState::new(Some(0)));
+        state.borrow_mut().set_disabled(true);
+        let disabled = bmux_tui::style::Style::new().bg(bmux_tui::style::Color::Red);
+        let styles = super::TreeViewStyles {
+            disabled,
+            ..super::TreeViewStyles::default()
+        };
+        let component = TreeViewComponent::new("tree", &items, &state).styles(styles);
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        render_component(&component, area, &mut frame);
+        for x in 0..20 {
+            assert_eq!(
+                frame.buffer().get(Point::new(x, 0)).unwrap().style.bg,
+                disabled.bg
+            );
+        }
     }
 
     #[test]
@@ -1364,6 +1435,17 @@ mod tests {
             EventOutcome::Redraw
         );
         assert!(state.borrow().is_expanded("src"));
+        assert_eq!(
+            component.handle_event(
+                &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            TreeViewOutcome::Selected {
+                visible: 0,
+                source: 0
+            }
+        );
         assert_eq!(
             component.event(&Event::Tick, &layout, &mut EventCx::new(&layout)),
             EventOutcome::Ignored
