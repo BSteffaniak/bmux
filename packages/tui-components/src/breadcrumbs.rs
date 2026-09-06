@@ -20,7 +20,6 @@ use bmux_tui::text_width::display_width;
 use crate::common::u16_saturating;
 
 use crate::common::ComponentMousePolicy;
-use crate::hit_test::{HitRegion, hit_region_at};
 
 /// One breadcrumb item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,26 +467,24 @@ impl<'a> Breadcrumbs<'a> {
         })
     }
 
-    fn item_hit_regions(&self, area: Rect) -> Vec<HitRegion<usize>> {
-        let mut x = area.x;
-        let mut regions = Vec::new();
-        for (index, item) in self.items.iter().enumerate() {
-            let width = u16_saturating(display_width(item.label));
-            regions.push(HitRegion::new(index, Rect::new(x, area.y, width, 1)));
-            x = x
-                .saturating_add(width)
-                .saturating_add(u16_saturating(display_width(self.policy.separator)));
-        }
-        regions
-    }
-
     fn item_at(&self, area: Rect, position: Point) -> Option<usize> {
         if !area.contains(position) || position.y != area.y {
             return None;
         }
-        hit_region_at(&self.item_hit_regions(area), position)
-            .map(|region| region.key)
-            .filter(|&index| !self.items[index].disabled)
+        let mut offset = usize::from(position.x - area.x);
+        let separator_width = display_width(self.policy.separator);
+        for (index, item) in self.items.iter().enumerate() {
+            let width = display_width(item.label);
+            if offset < width {
+                return (!item.disabled).then_some(index);
+            }
+            offset -= width;
+            if offset < separator_width {
+                return None;
+            }
+            offset -= separator_width;
+        }
+        None
     }
 
     fn line(&self, state: &BreadcrumbsState) -> Line {
@@ -735,6 +732,37 @@ mod tests {
     }
 
     #[test]
+    fn pointer_scan_respects_wide_labels_separators_and_empty_items() {
+        let items = [
+            BreadcrumbItem::new("empty", ""),
+            BreadcrumbItem::new("wide", "界"),
+            BreadcrumbItem::new("last", "X"),
+        ];
+        let breadcrumbs = Breadcrumbs::new(&items);
+        let area = Rect::new(10, 2, 10, 1);
+        for (offset, expected) in [
+            None,
+            None,
+            None,
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+            Some(2),
+            None,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                breadcrumbs.item_at(area, Point::new(10 + u16::try_from(offset).unwrap(), 2)),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn renders_breadcrumbs() {
         let items = [
             BreadcrumbItem::new("home", "Home"),
@@ -928,6 +956,47 @@ mod tests {
         Breadcrumbs::new(&items).render(Rect::new(0, 0, 8, 1), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("Home / …"));
+    }
+
+    #[test]
+    fn component_pointer_activation_uses_translated_layout() {
+        let items = [
+            BreadcrumbItem::new("home", "Home"),
+            BreadcrumbItem::new("docs", "Docs"),
+        ];
+        let state = Cell::new(BreadcrumbsState::new(None));
+        let component = BreadcrumbsComponent::new("trail", &items, &state);
+        let layout = component.layout(Constraints::tight(Size::new(11, 1)), &mut LayoutCx::new());
+        let dispatch = |kind, position| {
+            bmux_tui::component::EventCx::new(&layout).with_transform(
+                0,
+                0,
+                20,
+                3,
+                Rect::new(20, 3, 11, 1),
+                |cx| {
+                    component.handle_event(
+                        &Event::Mouse(MouseEvent::new(kind, position)),
+                        &layout,
+                        cx,
+                    )
+                },
+            )
+        };
+        dispatch(MouseEventKind::Down(MouseButton::Left), Point::new(27, 3));
+        assert_eq!(
+            dispatch(MouseEventKind::Up(MouseButton::Left), Point::new(27, 3)),
+            BreadcrumbsOutcome::Activated {
+                index: 1,
+                id: "docs"
+            }
+        );
+        dispatch(MouseEventKind::Down(MouseButton::Left), Point::new(7, 0));
+        assert!(!matches!(
+            dispatch(MouseEventKind::Up(MouseButton::Left), Point::new(7, 0)),
+            BreadcrumbsOutcome::Activated { .. }
+        ));
+        assert_eq!(state.get().pressed, None);
     }
 
     #[test]
