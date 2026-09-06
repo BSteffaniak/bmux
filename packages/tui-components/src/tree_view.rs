@@ -235,13 +235,17 @@ impl TreeViewState {
 
     /// Set expansion for an id.
     pub fn set_expanded(&mut self, id: &str, expanded: bool) {
+        if self.is_expanded(id) == expanded {
+            return;
+        }
         if expanded {
-            if !self.is_expanded(id) {
-                self.expanded.push(id.to_owned());
-            }
+            self.expanded.push(id.to_owned());
         } else {
             self.expanded.retain(|expanded| expanded != id);
         }
+        // Visible row indices can now identify different items.
+        self.hovered_visible = None;
+        self.pressed_visible = None;
     }
 
     /// Toggle expansion for an id and return true when the state changed.
@@ -341,20 +345,15 @@ impl<'a> TreeView<'a> {
         let visible = self.visible_indices(state);
         let width = visible
             .iter()
-            .enumerate()
-            .map(|(row, source)| self.row_line(&self.items[*source], state, row).width())
+            .map(|source| {
+                let item = &self.items[*source];
+                usize::from(item.depth.saturating_mul(self.policy.indent_width))
+                    .saturating_add(2) // disclosure marker and separating space
+                    .saturating_add(bmux_tui::text_width::display_width(&item.label))
+            })
             .max()
             .unwrap_or(0);
         LogicalSize::new(u16_saturating(width), visible.len())
-    }
-
-    /// Whether this tree currently exposes any interactive row.
-    fn is_interactive(&self, state: &TreeViewState) -> bool {
-        let usable = self
-            .visible_indices(state)
-            .into_iter()
-            .any(|source| !self.items[source].disabled);
-        usable && (self.policy.keyboard.enabled || self.policy.mouse.enabled)
     }
 
     /// Paint visible tree rows through a scoped local-coordinate context whose
@@ -437,16 +436,21 @@ impl<'a> TreeView<'a> {
             " "
         };
         let style = self.row_style(item, state, visible);
+        let marker_style = if item.disabled || state.interaction.disabled {
+            self.styles.disabled
+        } else {
+            self.styles.marker
+        };
         Line::from_spans([
             Span::styled(indent, style),
-            Span::styled(marker, self.styles.marker),
+            Span::styled(marker, marker_style),
             Span::styled(" ", style),
             Span::styled(item.label.clone(), style),
         ])
     }
 
     fn row_style(&self, item: &TreeViewItem, state: &TreeViewState, visible: usize) -> Style {
-        if item.disabled {
+        if item.disabled || state.interaction.disabled {
             self.styles.disabled
         } else if state.pressed_visible == Some(visible) {
             self.styles.pressed
@@ -486,16 +490,19 @@ impl<'a> TreeView<'a> {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click => {
+                let previous = state.pressed_visible;
                 state.pressed_visible = hit;
-                if state.pressed_visible.is_some() {
+                if hit.is_some() || previous != hit {
                     TreeViewOutcome::Redraw
                 } else {
                     TreeViewOutcome::Ignored
                 }
             }
             MouseEventKind::Up(MouseButton::Left) if self.policy.mouse.click => {
-                let pressed = state.pressed_visible.take();
-                if let (Some(pressed), Some(hit)) = (pressed, hit)
+                let Some(pressed) = state.pressed_visible.take() else {
+                    return TreeViewOutcome::Ignored;
+                };
+                if let Some(hit) = hit
                     && pressed == hit
                     && let Some(source) = self.visible_indices(state).get(hit).copied()
                 {
@@ -534,18 +541,15 @@ impl<'a> TreeView<'a> {
         if visible.is_empty() {
             return TreeViewOutcome::Ignored;
         }
-        let current = state
-            .selected_visible
-            .unwrap_or(0)
-            .min(visible.len().saturating_sub(1));
-        let next = if delta.is_negative() {
-            current.saturating_sub(1)
-        } else {
-            current
-                .saturating_add(1)
-                .min(visible.len().saturating_sub(1))
-        };
-        if next == current {
+        let current = state.selected_visible.filter(|&row| row < visible.len());
+        let next = current.map_or(0, |current| {
+            if delta.is_negative() {
+                current.saturating_sub(1)
+            } else {
+                current.saturating_add(1).min(visible.len() - 1)
+            }
+        });
+        if current == Some(next) {
             return TreeViewOutcome::Ignored;
         }
         state.selected_visible = Some(next);
@@ -626,7 +630,8 @@ fn visible_indices(items: &[TreeViewItem], state: &TreeViewState) -> Vec<usize> 
     let mut ancestor_visible = Vec::<bool>::new();
     for (index, item) in items.iter().enumerate() {
         ancestor_visible.truncate(usize::from(item.depth));
-        let parents_visible = ancestor_visible.iter().all(|visible| *visible);
+        // Each entry already includes all of its ancestors' visibility.
+        let parents_visible = ancestor_visible.last().copied().unwrap_or(true);
         if parents_visible {
             visible.push(index);
         }
@@ -733,7 +738,12 @@ impl Component for TreeViewComponent<'_, '_> {
             i64::try_from(start).unwrap_or(i64::MAX),
             LocalRect::new(clip.x, 0, clip.width, area.height),
             |cx| {
-                let interactive = self.tree.is_interactive(&state);
+                let visible_rows = self.tree.visible_indices(&state);
+                let interactive = (self.tree.policy.keyboard.enabled
+                    || self.tree.policy.mouse.enabled)
+                    && visible_rows
+                        .iter()
+                        .any(|&source| !self.tree.items[source].disabled);
                 if interactive {
                     cx.push_hit(
                         SceneRegion::new(self.id.as_str(), area)
@@ -744,9 +754,7 @@ impl Component for TreeViewComponent<'_, '_> {
                             .enabled(!state.interaction.disabled),
                     );
                 }
-                for (visible, source) in self
-                    .tree
-                    .visible_indices(&state)
+                for (visible, source) in visible_rows
                     .into_iter()
                     .enumerate()
                     .skip(start)
@@ -783,7 +791,14 @@ impl Component for TreeViewComponent<'_, '_> {
         };
         let mut state = self.state.borrow_mut();
         let outcome = if let Event::Mouse(mouse) = event {
-            if state.interaction.disabled || !self.tree.policy.mouse.enabled {
+            let handles_mouse = match mouse.kind {
+                MouseEventKind::Move => self.tree.policy.mouse.hover,
+                MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                    self.tree.policy.mouse.click
+                }
+                _ => false,
+            };
+            if state.interaction.disabled || !self.tree.policy.mouse.enabled || !handles_mouse {
                 return EventOutcome::Ignored;
             }
             let hit = area
@@ -861,6 +876,214 @@ mod tests {
             LocalRect::new(0, 0, area.width, area.height),
             |cx| component.paint(&layout, cx),
         );
+    }
+
+    #[test]
+    fn disabled_disclosure_marker_uses_disabled_style() {
+        for disabled_item in [false, true] {
+            for disabled_tree in [false, true] {
+                let items = [TreeViewItem::new("branch", "Branch", 0)
+                    .expandable(true)
+                    .disabled(disabled_item)];
+                let tree = TreeView::new(&items);
+                let mut state = TreeViewState::new(None);
+                state.set_disabled(disabled_tree);
+                for expanded in [false, true] {
+                    state.set_expanded("branch", expanded);
+                    let line = tree.row_line(&items[0], &state, 0);
+                    let expected = if disabled_item || disabled_tree {
+                        tree.styles.disabled
+                    } else {
+                        tree.styles.marker
+                    };
+                    assert_eq!(line.spans[1].style, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_mouse_events_preserve_tree_state() {
+        let items = [TreeViewItem::new("row", "Row", 0)];
+        let state = RefCell::new(TreeViewState::new(Some(0)));
+        state.borrow_mut().pressed_visible = Some(0);
+        state.borrow_mut().hovered_visible = Some(0);
+        let before = state.borrow().clone();
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+        for kind in [
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+        ] {
+            let event = Event::Mouse(MouseEvent {
+                kind,
+                position: Point::new(0, 0),
+                modifiers: bmux_tui::event::MouseModifiers::default(),
+            });
+            assert_eq!(
+                component.event(&event, &layout, &mut EventCx::new(&layout)),
+                EventOutcome::Ignored
+            );
+            assert_eq!(*state.borrow(), before);
+        }
+    }
+
+    #[test]
+    fn direct_measurement_matches_painted_unicode_row_widths() {
+        for label in ["plain", "界界", "e\u{301}", "👩‍💻", ""] {
+            for depth in [0, 3, u16::MAX] {
+                let items = [TreeViewItem::new("row", label, depth)];
+                let tree = TreeView::new(&items);
+                let state = TreeViewState::new(None);
+                let expected =
+                    u16::try_from(tree.row_line(&items[0], &state, 0).width()).unwrap_or(u16::MAX);
+                assert_eq!(tree.size(&state), (expected, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn release_without_press_is_ignored() {
+        let items = [TreeViewItem::new("row", "Row", 0)];
+        let tree = TreeView::new(&items);
+        let mut state = TreeViewState::new(None);
+        let area = Rect::new(0, 0, 20, 1);
+        for y in [0, 2] {
+            let event = Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                position: Point::new(2, y),
+                modifiers: bmux_tui::event::MouseModifiers::default(),
+            });
+            assert_eq!(
+                tree.handle_event(area, &mut state, &event),
+                TreeViewOutcome::Ignored
+            );
+            assert_eq!(state.selected_visible(), None);
+        }
+    }
+
+    #[test]
+    fn expansion_change_cancels_stale_pointer_activation() {
+        let items = [
+            TreeViewItem::new("root", "Root", 0).expandable(true),
+            TreeViewItem::new("child", "Child", 1),
+            TreeViewItem::new("sibling", "Sibling", 0),
+        ];
+        let tree = TreeView::new(&items);
+        let mut state = TreeViewState::new(Some(0));
+        state.set_expanded("root", true);
+        state.hovered_visible = Some(1);
+        state.pressed_visible = Some(1);
+        state.set_expanded("root", true);
+        assert_eq!(state.pressed_visible, Some(1));
+        state.set_expanded("root", false);
+        assert_eq!(state.hovered_visible, None);
+        assert_eq!(state.pressed_visible, None);
+        let outcome = tree.handle_event(
+            Rect::new(0, 0, 20, 2),
+            &mut state,
+            &Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                position: Point::new(2, 1),
+                modifiers: bmux_tui::event::MouseModifiers::default(),
+            }),
+        );
+        assert_eq!(outcome, TreeViewOutcome::Ignored);
+        assert_eq!(state.selected_visible(), Some(0));
+    }
+
+    #[test]
+    fn whole_tree_disabled_style_overrides_row_interaction() {
+        let items = [TreeViewItem::new("row", "Row", 0)];
+        let tree = TreeView::new(&items);
+        let mut state = TreeViewState::new(None);
+        state.interaction.disabled = true;
+        assert_eq!(tree.row_style(&items[0], &state, 0), tree.styles.disabled);
+        state.selected_visible = Some(0);
+        assert_eq!(tree.row_style(&items[0], &state, 0), tree.styles.disabled);
+        state.hovered_visible = Some(0);
+        state.pressed_visible = Some(0);
+        assert_eq!(tree.row_style(&items[0], &state, 0), tree.styles.disabled);
+        state.interaction.disabled = false;
+        assert_eq!(tree.row_style(&items[0], &state, 0), tree.styles.pressed);
+    }
+
+    #[test]
+    fn nested_visibility_recovers_at_siblings_and_roots() {
+        let items = [
+            TreeViewItem::new("root", "Root", 0).expandable(true),
+            TreeViewItem::new("branch", "Branch", 1).expandable(true),
+            TreeViewItem::new("leaf", "Leaf", 2),
+            TreeViewItem::new("sibling", "Sibling", 1),
+            TreeViewItem::new("other", "Other", 0),
+        ];
+        let mut state = TreeViewState::new(None);
+        let tree = TreeView::new(&items);
+        assert_eq!(tree.visible_indices(&state), vec![0, 4]);
+        state.set_expanded("branch", true);
+        assert_eq!(tree.visible_indices(&state), vec![0, 4]);
+        state.set_expanded("root", true);
+        assert_eq!(tree.visible_indices(&state), vec![0, 1, 2, 3, 4]);
+        state.set_expanded("branch", false);
+        assert_eq!(tree.visible_indices(&state), vec![0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn outside_press_redraws_when_clearing_pressed_row() {
+        let items = [TreeViewItem::new("row", "Row", 0)];
+        let state = RefCell::new(TreeViewState::new(None));
+        let component = TreeViewComponent::new("tree", &items, &state);
+        let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+        let mut cx = EventCx::new(&layout);
+        let press = |y| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                position: Point::new(0, y),
+                modifiers: bmux_tui::event::MouseModifiers::default(),
+            })
+        };
+        assert_eq!(
+            component.event(&press(0), &layout, &mut cx),
+            EventOutcome::Redraw
+        );
+        assert_eq!(state.borrow().pressed_visible, Some(0));
+        assert_eq!(
+            component.event(&press(2), &layout, &mut cx),
+            EventOutcome::Redraw
+        );
+        assert_eq!(state.borrow().pressed_visible, None);
+        assert_eq!(
+            component.event(&press(2), &layout, &mut cx),
+            EventOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn navigation_initializes_missing_and_stale_selection() {
+        for count in [1, 3] {
+            let items = (0..count)
+                .map(|index| TreeViewItem::new(index.to_string(), "row", 0))
+                .collect::<Vec<_>>();
+            for selected in [None, Some(count)] {
+                for key in [KeyCode::Up, KeyCode::Down] {
+                    let state = RefCell::new(TreeViewState::new(selected));
+                    let component = TreeViewComponent::new("tree", &items, &state);
+                    let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
+                    assert_eq!(
+                        component.event(
+                            &Event::Key(KeyStroke::simple(key)),
+                            &layout,
+                            &mut EventCx::new(&layout)
+                        ),
+                        EventOutcome::Redraw
+                    );
+                    assert_eq!(state.borrow().selected_visible, Some(0));
+                }
+            }
+        }
     }
 
     #[test]
