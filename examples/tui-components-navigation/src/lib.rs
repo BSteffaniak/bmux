@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::buffer::Buffer;
-use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
 use bmux_tui::composition::TextBlock;
 use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
@@ -39,7 +39,7 @@ use bmux_tui_components::text_view::{
     TextViewComponent, TextViewCursor, TextViewHighlight, TextViewSelection,
 };
 use bmux_tui_components::tree_view::{
-    TreeView, TreeViewComponent, TreeViewItem, TreeViewOutcome, TreeViewState, TreeViewStyles,
+    TreeViewComponent, TreeViewItem, TreeViewOutcome, TreeViewState, TreeViewStyles,
 };
 
 pub const WIDTH: u16 = 72;
@@ -109,11 +109,20 @@ impl NavigationDemo {
         }
 
         let tree_items = tree_items();
-        match TreeView::new(&tree_items).handle_event(
-            Rect::new(48, 1, 22, 6),
-            &mut self.tree,
-            event,
-        ) {
+        let tree_state = RefCell::new(std::mem::take(&mut self.tree));
+        let component = TreeViewComponent::new("navigation.tree", &tree_items, &tree_state);
+        let area = TREE_AREA;
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let outcome = EventCx::new(&layout).with_transform(
+            0,
+            0,
+            i32::from(area.x),
+            i64::from(area.y),
+            area,
+            |cx| component.handle_event(event, &layout, cx),
+        );
+        self.tree = tree_state.into_inner();
+        match outcome {
             TreeViewOutcome::Selected { source, .. } => {
                 self.message = format!("Tree selected: {}", tree_items[source].label);
                 return false;
@@ -273,6 +282,8 @@ fn scroll_layout(
     .layout(Constraints::tight(area.size()), &mut LayoutCx::new())
 }
 
+const TREE_AREA: Rect = Rect::new(48, 1, 22, 6);
+
 fn render_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
     let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
     cx.with_child(
@@ -347,7 +358,7 @@ fn render_navigation_with_state(cx: &mut PaintCx<'_, '_>, demo: &NavigationDemo)
                 marker: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             },
         ),
-        Rect::new(48, 1, 22, 6),
+        TREE_AREA,
         cx,
     );
 
