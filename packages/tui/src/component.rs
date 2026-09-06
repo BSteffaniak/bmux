@@ -484,6 +484,18 @@ impl<'a> EventCx<'a> {
         self.clip
     }
 
+    /// Route a resolved child using its logical bounds projected into terminal space.
+    pub fn with_child<R>(&mut self, child: &ChildLayout, f: impl FnOnce(&mut Self) -> R) -> R {
+        let dx = i32::from(child.x);
+        let dy = i64::try_from(child.y).unwrap_or(i64::MAX);
+        let clip = translate_logical_rect(
+            LogicalRect::new(0, 0, child.node.size.width, child.node.size.height),
+            self.translation_x.saturating_add(dx),
+            self.translation_y.saturating_add(dy),
+        );
+        self.with_transform(child.x, child.y, dx, dy, clip, f)
+    }
+
     /// Route a transformed child event with a terminal-space clip.
     pub fn with_transform<R>(
         &mut self,
@@ -528,6 +540,13 @@ impl<'a> EventCx<'a> {
         f(&mut nested)
     }
 
+    /// Project local logical geometry through the current translation and clip.
+    #[must_use]
+    pub fn visible_rect(&self, rect: LogicalRect) -> Rect {
+        let rect = translate_logical_rect(rect, self.translation_x, self.translation_y);
+        self.clip.map_or(rect, |clip| clip.intersection(rect))
+    }
+
     /// Look up translated, clipped terminal geometry by stable identity.
     #[must_use]
     pub fn find_visible_rect(&self, id: &LayoutId) -> Option<Rect> {
@@ -538,8 +557,7 @@ impl<'a> EventCx<'a> {
             logical.width,
             logical.height,
         );
-        let rect = translate_logical_rect(local, self.translation_x, self.translation_y);
-        Some(self.clip.map_or(rect, |clip| clip.intersection(rect)))
+        Some(self.visible_rect(local))
     }
 
     /// Look up root-relative terminal geometry by stable identity.

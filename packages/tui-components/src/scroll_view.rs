@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutId, LayoutNode,
-    LogicalSize,
+    LogicalRect, LogicalSize,
 };
 use bmux_tui::event::{Event, EventOutcome, MouseEventKind};
 use bmux_tui::geometry::Rect;
@@ -353,46 +353,66 @@ impl Component for ScrollViewComponent<'_> {
         let Some(child) = layout.children.first() else {
             return;
         };
-        let viewport_height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
         let offset = self.effective_offset(layout);
         if let Some(state) = self.retained_state {
             let mut value = state.get();
             value.set_vertical_offset(offset);
             state.set(value);
         }
-        cx.with_child(
-            -i32::try_from(self.offset_x).unwrap_or(i32::MAX),
-            -i64::try_from(offset).unwrap_or(i64::MAX),
-            LocalRect::new(
-                i32::try_from(self.offset_x).unwrap_or(i32::MAX),
-                i64::try_from(offset).unwrap_or(i64::MAX),
-                layout.size.width,
-                viewport_height,
-            ),
-            |cx| self.child.paint(&child.node, cx),
-        );
+        cx.with_child_size(0, 0, layout.size, |cx| {
+            let viewport = cx.area();
+            let dx = i32::try_from(self.offset_x).unwrap_or(i32::MAX);
+            let dy = i64::try_from(offset).unwrap_or(i64::MAX);
+            cx.with_child(
+                -dx,
+                -dy,
+                LocalRect::new(
+                    viewport.x.saturating_add(dx),
+                    viewport.y.saturating_add(dy),
+                    viewport.width,
+                    viewport.height,
+                ),
+                |cx| {
+                    cx.with_child_size(0, 0, child.node.size, |cx| {
+                        self.child.paint(&child.node, cx);
+                    });
+                },
+            );
+        });
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
         let Some(child) = layout.children.first() else {
             return EventOutcome::Ignored;
         };
-        let viewport = Rect::new(
+        let clip = cx.visible_rect(LogicalRect::new(
             0,
             0,
             layout.size.width,
-            u16::try_from(layout.size.height).unwrap_or(u16::MAX),
-        );
-        let clip = cx
-            .clip()
-            .map_or(viewport, |parent| parent.intersection(viewport));
+            layout.size.height,
+        ));
         cx.with_transform(
             u16::try_from(self.offset_x).unwrap_or(u16::MAX),
             self.effective_offset(layout),
             -i32::try_from(self.offset_x).unwrap_or(i32::MAX),
             -i64::try_from(self.effective_offset(layout)).unwrap_or(i64::MAX),
             clip,
-            |cx| self.child.event(event, &child.node, cx),
+            |cx| {
+                let clip = cx.visible_rect(LogicalRect::new(
+                    0,
+                    0,
+                    child.node.size.width,
+                    child.node.size.height,
+                ));
+                if clip.is_empty()
+                    || matches!(event, Event::Mouse(mouse) if !clip.contains(mouse.position))
+                {
+                    return EventOutcome::Ignored;
+                }
+                cx.with_transform(0, 0, 0, 0, clip, |cx| {
+                    self.child.event(event, &child.node, cx)
+                })
+            },
         )
     }
 }
@@ -689,11 +709,7 @@ impl ScrollView {
     ) -> ScrollViewOutcome {
         let old = state.horizontal_offset;
         let viewport = usize::from(layout.size.width);
-        if start < old {
-            state.horizontal_offset = start;
-        } else if start.saturating_add(width) > old.saturating_add(viewport) {
-            state.horizontal_offset = start.saturating_add(width).saturating_sub(viewport);
-        }
+        state.horizontal_offset = reveal_offset(old, viewport, start, width);
         state.horizontal_offset = state
             .horizontal_offset
             .min(Self::max_horizontal_offset(layout));
@@ -764,12 +780,7 @@ impl ScrollView {
     ) -> ScrollViewOutcome {
         let old = state.vertical_offset;
         let viewport = layout.size.height;
-        let end = start.saturating_add(height);
-        if start < state.vertical_offset {
-            state.vertical_offset = start;
-        } else if end > state.vertical_offset.saturating_add(viewport) {
-            state.vertical_offset = end.saturating_sub(viewport);
-        }
+        state.vertical_offset = reveal_offset(old, viewport, start, height);
         state.follow_bottom = false;
         self.reconcile(layout, state);
         outcome(old, state.vertical_offset)
@@ -1083,8 +1094,43 @@ const fn horizontal_outcome(old: usize, current: usize) -> ScrollViewOutcome {
     }
 }
 
+/// Resolve row-range visibility before the caller clamps to its content extent.
+/// Both subtree and keyed-list scrolling use this exact movement policy.
+pub(crate) const fn reveal_offset(
+    offset: usize,
+    viewport: usize,
+    start: usize,
+    height: usize,
+) -> usize {
+    let end = start.saturating_add(height);
+    if start < offset {
+        start
+    } else if end > offset.saturating_add(viewport) {
+        end.saturating_sub(viewport)
+    } else {
+        offset
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_reveal_offset_handles_edges_and_saturation() {
+        for (offset, viewport, start, height, expected) in [
+            (5, 4, 2, 1, 2),
+            (5, 4, 6, 2, 5),
+            (5, 4, 9, 2, 7),
+            (5, 0, 8, 1, 9),
+            (0, 4, 0, 10, 6),
+            (usize::MAX - 2, 8, usize::MAX - 1, 10, usize::MAX - 2),
+            (0, 1, usize::MAX, 10, usize::MAX - 1),
+        ] {
+            assert_eq!(
+                super::reveal_offset(offset, viewport, start, height),
+                expected
+            );
+        }
+    }
     use super::{
         NestedScrollOutcome, ScrollView, ScrollViewComponent, ScrollViewOutcome, ScrollViewPolicy,
         ScrollViewState, logical_offset_from_scrollbar, scrollbar_state,
@@ -1127,6 +1173,28 @@ mod tests {
             } else {
                 EventOutcome::Ignored
             }
+        }
+    }
+
+    #[test]
+    fn horizontal_reveal_preserves_vertical_state_and_bottom_follow() {
+        let layout = LayoutNode::with_children(
+            "viewport".into(),
+            LogicalSize::new(5, 2),
+            vec![ChildLayout::new(
+                0,
+                0,
+                LayoutNode::leaf("content".into(), LogicalSize::new(20, 100)),
+            )],
+        );
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(98);
+        state.set_follow_bottom(true);
+        for (start, width, expected) in [(10, 2, 7), (8, 1, 7), (1, 1, 1), (usize::MAX, 5, 15)] {
+            ScrollView::ensure_horizontal_visible(&layout, &mut state, start, width);
+            assert_eq!(state.horizontal_offset(), expected);
+            assert_eq!(state.vertical_offset(), 98);
+            assert!(state.follows_bottom());
         }
     }
 
@@ -1266,6 +1334,140 @@ mod tests {
             .collect::<String>();
         assert_eq!(rendered, "cdef");
         assert_eq!(layout.children[0].node.size.width, 6);
+    }
+
+    #[test]
+    fn scroll_content_events_are_bounded_by_child_and_parent() {
+        struct ClipHandler;
+        impl Component for ClipHandler {
+            fn layout(&self, _constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::leaf("handler".into(), LogicalSize::new(2, 1))
+            }
+            fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+            fn event(
+                &self,
+                _event: &Event,
+                _layout: &LayoutNode,
+                cx: &mut EventCx<'_>,
+            ) -> EventOutcome {
+                assert_eq!(cx.clip(), Some(Rect::new(0, 0, 2, 1)));
+                EventOutcome::Handled
+            }
+        }
+        let component = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(4, 3),
+            ScrollViewState::new(),
+            ClipHandler,
+        )
+        .content_width(2);
+        let layout = component.layout(Constraints::tight(Size::new(4, 3)), &mut LayoutCx::new());
+        let mut cx = EventCx::with_clip(&layout, Rect::new(0, 0, 4, 3));
+        for (x, y, expected) in [
+            (1, 0, EventOutcome::Handled),
+            (2, 0, EventOutcome::Ignored),
+            (0, 1, EventOutcome::Ignored),
+        ] {
+            let event = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                Point::new(x, y),
+            ));
+            assert_eq!(component.event(&event, &layout, &mut cx), expected);
+        }
+        let mut cx = EventCx::with_clip(&layout, Rect::new(0, 1, 4, 2));
+        assert_eq!(
+            component.event(&Event::Paste("input".into()), &layout, &mut cx),
+            EventOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn scroll_content_paint_is_bounded_by_resolved_child_size() {
+        struct Fill;
+        impl Component for Fill {
+            fn layout(&self, _constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::leaf("fill".into(), LogicalSize::new(2, 1))
+            }
+            fn paint(&self, _layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+                cx.fill(cx.area(), "x", bmux_tui::style::Style::default());
+            }
+        }
+        let component = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(4, 3),
+            ScrollViewState::new(),
+            Fill,
+        )
+        .content_width(2);
+        let layout = component.layout(Constraints::tight(Size::new(4, 3)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 3));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("xx  "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("    "));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("    "));
+    }
+
+    #[test]
+    fn tall_scroll_view_paints_inside_deep_parent_viewport() {
+        let text = bmux_tui::text::Text::from_lines(
+            (0..70_003)
+                .map(|row| bmux_tui::text::Line::raw(format!("{row:05}")))
+                .collect::<Vec<_>>(),
+        );
+        let component = ScrollViewComponent::new(
+            "scroll",
+            LogicalSize::new(5, 70_003),
+            ScrollViewState::new(),
+            TextBlock::new(text),
+        );
+        let layout = component.layout(Constraints::for_width(5), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 3));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(
+            0,
+            -70_000,
+            bmux_tui::paint::LocalRect::new(0, 70_000, 5, 3),
+            |cx| component.paint(&layout, cx),
+        );
+        for row in 0..3 {
+            assert_eq!(
+                frame.buffer().row_symbols(row),
+                Some(format!("{}", 70_000 + usize::from(row)))
+            );
+        }
+    }
+
+    #[test]
+    fn translated_scroll_view_events_use_terminal_space_clip() {
+        let mut state = ScrollViewState::new();
+        state.set_vertical_offset(1);
+        let component =
+            ScrollViewComponent::new("scroll", LogicalSize::new(6, 2), state, EventProbe);
+        let layout = component.layout(Constraints::tight(Size::new(6, 2)), &mut LayoutCx::new());
+        let root = LayoutNode::with_children(
+            "root".into(),
+            LogicalSize::new(20, 20),
+            vec![ChildLayout::new(4, 8, layout)],
+        );
+        let child = &root.children[0];
+        let mut cx = EventCx::with_clip(&root, Rect::new(0, 0, 20, 20));
+        for (x, y, expected) in [
+            (5, 8, EventOutcome::Handled),
+            (5, 9, EventOutcome::Handled),
+            (5, 10, EventOutcome::Ignored),
+            (3, 8, EventOutcome::Ignored),
+            (1, 1, EventOutcome::Ignored),
+        ] {
+            let event = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                Point::new(x, y),
+            ));
+            assert_eq!(
+                cx.with_child(child, |cx| component.event(&event, &child.node, cx)),
+                expected
+            );
+        }
     }
 
     #[test]

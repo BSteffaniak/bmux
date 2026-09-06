@@ -159,6 +159,32 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         paint(&mut child);
     }
 
+    /// Paint a child with logical dimensions, clipping before terminal conversion.
+    /// Unlike a terminal-sized clip, this preserves visible rows deep inside a
+    /// document taller than `u16::MAX`.
+    pub fn with_child_size(
+        &mut self,
+        offset_x: i32,
+        offset_y: i64,
+        size: crate::component::LogicalSize,
+        paint: impl FnOnce(&mut PaintCx<'_, 'buffer>),
+    ) {
+        let area = self.area();
+        let top = area.y.saturating_sub(offset_y).max(0);
+        let bottom = area
+            .y
+            .saturating_sub(offset_y)
+            .saturating_add(i64::from(area.height))
+            .min(i64::try_from(size.height).unwrap_or(i64::MAX));
+        let height = u16::try_from(bottom.saturating_sub(top)).unwrap_or(0);
+        self.with_child(
+            offset_x,
+            offset_y,
+            LocalRect::new(0, top, size.width, height),
+            paint,
+        );
+    }
+
     /// Paint with an additional inherited style.
     pub fn with_style(&mut self, style: Style, paint: impl FnOnce(&mut PaintCx<'_, 'buffer>)) {
         let mut child = PaintCx {

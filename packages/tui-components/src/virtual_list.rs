@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use bmux_tui::component::{
     Component, Constraints, Element, EventCx, LayoutCache, LayoutCx, LayoutEnvironment, LayoutId,
+    LogicalRect,
 };
 use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::geometry::Rect;
@@ -80,9 +81,11 @@ where
             return;
         };
         let start = self.index.item_offset(index).unwrap_or(0);
+        let height = self.index.item(index).map_or(0, |item| item.height);
+        let row = (*row).min(height.saturating_sub(1));
         let maximum = self.index.total_height().saturating_sub(viewport_height);
         self.scroll
-            .set_vertical_offset(start.saturating_add(*row).min(maximum));
+            .set_vertical_offset(start.saturating_add(row).min(maximum));
         self.capture_anchor();
     }
 
@@ -106,14 +109,8 @@ where
             return false;
         };
         let start = self.index.item_offset(index).unwrap_or(0);
-        let end = start.saturating_add(item.height);
         let old = self.scroll.vertical_offset();
-        let mut offset = old;
-        if start < offset {
-            offset = start;
-        } else if end > offset.saturating_add(viewport_height) {
-            offset = end.saturating_sub(viewport_height);
-        }
+        let offset = crate::scroll_view::reveal_offset(old, viewport_height, start, item.height);
         let maximum = self.index.total_height().saturating_sub(viewport_height);
         self.scroll.set_vertical_offset(offset.min(maximum));
         self.scroll.vertical_offset() != old
@@ -248,7 +245,7 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if duplicate stable item keys are supplied.
+    /// Panics if stable item keys or their string representations are duplicated.
     pub fn sync(&self, width: u16, state: &mut VirtualListState<K>, cx: &mut LayoutCx) {
         self.sync_with_environment(width, LayoutEnvironment::default(), state, cx);
     }
@@ -258,7 +255,7 @@ where
     ///
     /// # Panics
     ///
-    /// Panics if duplicate stable item keys are supplied.
+    /// Panics if stable item keys or their string representations are duplicated.
     pub fn sync_with_environment(
         &self,
         width: u16,
@@ -266,6 +263,16 @@ where
         state: &mut VirtualListState<K>,
         cx: &mut LayoutCx,
     ) {
+        let active = self
+            .items
+            .iter()
+            .map(|item| item_layout_id(&self.id, &item.key))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            active.len(),
+            self.items.len(),
+            "virtual list keys must have unique string representations"
+        );
         let by_key = self
             .items
             .iter()
@@ -293,11 +300,6 @@ where
                     .height
             },
         );
-        let active = self
-            .items
-            .iter()
-            .map(|item| item_layout_id(&self.id, &item.key))
-            .collect::<BTreeSet<_>>();
         state.layouts.retain_ids(&active);
     }
 
@@ -313,8 +315,24 @@ where
         cx: &mut PaintCx<'_, '_>,
     ) -> VirtualListRenderStats {
         let offset = state.scroll.vertical_offset();
-        let range = state.index.visible_range(offset, usize::from(area.height));
+        let clip = cx.area();
+        let first = usize::try_from(clip.y.max(0))
+            .unwrap_or(usize::MAX)
+            .min(usize::from(area.height));
+        let end = usize::try_from(clip.y.saturating_add(i64::from(clip.height)).max(0))
+            .unwrap_or(usize::MAX)
+            .min(usize::from(area.height));
         let mut report = VirtualListRenderStats::default();
+        if end <= first
+            || clip.width == 0
+            || clip.x >= i32::from(area.width)
+            || clip.x.saturating_add(i32::from(clip.width)) <= 0
+        {
+            return report;
+        }
+        let range = state
+            .index
+            .visible_range(offset.saturating_add(first), end - first);
         for index in range.start..range.end {
             let Some(item) = self.items.get(index) else {
                 continue;
@@ -335,33 +353,28 @@ where
             let local_y = i64::try_from(start)
                 .unwrap_or(i64::MAX)
                 .saturating_sub(i64::try_from(offset).unwrap_or(i64::MAX));
-            let item_height = u16::try_from(measured.height).unwrap_or(u16::MAX);
+            let visible = translated_item_area(
+                Rect::new(0, 0, area.width, area.height),
+                local_y,
+                measured.height,
+            );
             cx.with_child(
                 0,
                 local_y,
                 LocalRect::new(0, -local_y, area.width, area.height),
-                |cx| {
-                    item.component.paint(layout, cx);
-                    let semantic_id = format!("{}.item.{}", self.id, item.key.to_string());
-                    cx.push_hit(
-                        HitRegion::new(
-                            semantic_id.clone(),
-                            Rect::new(0, 0, area.width, item_height),
-                        )
-                        .role(HitRole::ListItem),
-                    );
-                    cx.push_focus(
-                        semantic_id.clone(),
-                        LocalRect::new(0, 0, area.width, item_height),
-                    );
-                    cx.push_semantic(SemanticRegion::new(
-                        semantic_id,
-                        Rect::new(0, 0, area.width, item_height),
-                        "list-item",
-                    ));
-                    cx.push_damage(LocalRect::new(0, 0, area.width, item_height));
-                },
+                |cx| cx.with_child_size(0, 0, layout.size, |cx| item.component.paint(layout, cx)),
             );
+            let semantic_id = format!("{}.item.{}", self.id, item.key.to_string());
+            cx.push_hit(HitRegion::new(semantic_id.clone(), visible).role(HitRole::ListItem));
+            let visible_local = LocalRect::new(
+                i32::from(visible.x),
+                i64::from(visible.y),
+                visible.width,
+                visible.height,
+            );
+            cx.push_focus(semantic_id.clone(), visible_local);
+            cx.push_semantic(SemanticRegion::new(semantic_id, visible, "list-item"));
+            cx.push_damage(visible_local);
             report.painted_items = report.painted_items.saturating_add(1);
             report.registered_items = report.registered_items.saturating_add(1);
         }
@@ -387,8 +400,19 @@ where
     ) -> EventOutcome {
         let offset = state.scroll.vertical_offset();
         let range = state.index.visible_range(offset, usize::from(area.height));
+        let viewport = cx.visible_rect(LogicalRect::new(
+            area.x,
+            usize::from(area.y),
+            area.width,
+            usize::from(area.height),
+        ));
+        if viewport.is_empty() {
+            return EventOutcome::Ignored;
+        }
         let pointer = match event {
-            Event::Mouse(mouse) if !area.contains(mouse.position) => return EventOutcome::Ignored,
+            Event::Mouse(mouse) if !viewport.contains(mouse.position) => {
+                return EventOutcome::Ignored;
+            }
             Event::Mouse(mouse) => Some(mouse.position),
             _ => None,
         };
@@ -412,9 +436,14 @@ where
             let local_y = i64::try_from(start)
                 .unwrap_or(i64::MAX)
                 .saturating_sub(i64::try_from(offset).unwrap_or(i64::MAX));
-            let item_height = u16::try_from(measured.height).unwrap_or(u16::MAX);
-            let item_area = translated_item_area(area, local_y, item_height);
-            if pointer.is_some_and(|point| !item_area.contains(point)) {
+            let local_area = translated_item_area(area, local_y, measured.height);
+            let item_area = cx.visible_rect(LogicalRect::new(
+                local_area.x,
+                usize::from(local_area.y),
+                local_area.width,
+                usize::from(local_area.height),
+            ));
+            if item_area.is_empty() || pointer.is_some_and(|point| !item_area.contains(point)) {
                 continue;
             }
             let outcome = cx.with_transform(
@@ -436,30 +465,18 @@ where
     }
 
     /// Scroll so the keyed item is visible with the minimum movement.
+    ///
+    /// Returns whether the key exists, even if its viewport offset is unchanged.
     pub fn ensure_item_visible(
         &self,
         state: &mut VirtualListState<K>,
         key: &K,
         viewport_height: usize,
     ) -> bool {
-        let Some(index) = state.index.index_of(key) else {
+        if state.index.index_of(key).is_none() {
             return false;
-        };
-        let Some(start) = state.index.item_offset(index) else {
-            return false;
-        };
-        let height = state.index.item(index).map_or(0, |item| item.height);
-        let offset = state.scroll.vertical_offset();
-        let end = start.saturating_add(height);
-        let next = if start < offset {
-            start
-        } else if end > offset.saturating_add(viewport_height) {
-            end.saturating_sub(viewport_height)
-        } else {
-            offset
-        };
-        state.scroll.set_vertical_offset(next);
-        state.clamp_scroll(viewport_height);
+        }
+        state.ensure_key_visible(key, viewport_height);
         true
     }
 
@@ -483,11 +500,11 @@ fn item_layout_id<K: ToString>(list_id: &str, key: &K) -> LayoutId {
     LayoutId::new(format!("{list_id}.item.{}", key.to_string()))
 }
 
-fn translated_item_area(area: Rect, local_y: i64, item_height: u16) -> Rect {
+fn translated_item_area(area: Rect, local_y: i64, item_height: usize) -> Rect {
     let top = i64::from(area.y).saturating_add(local_y);
-    let bottom = top.saturating_add(i64::from(item_height));
-    let visible_top = top.max(i64::from(area.y));
-    let visible_bottom = bottom.min(i64::from(area.bottom()));
+    let bottom = top.saturating_add(i64::try_from(item_height).unwrap_or(i64::MAX));
+    let visible_top = top.clamp(i64::from(area.y), i64::from(area.bottom()));
+    let visible_bottom = bottom.clamp(visible_top, i64::from(area.bottom()));
     Rect::new(
         area.x,
         u16::try_from(visible_top).unwrap_or(area.y),
@@ -518,6 +535,39 @@ mod tests {
     use bmux_tui::selection::{SelectionFragment, SelectionScope};
     use bmux_tui::style::Style;
     use bmux_tui::text::{Line, Text};
+
+    #[test]
+    fn rejects_colliding_key_strings_before_changing_retained_state() {
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+        struct Key(u8);
+
+        impl std::fmt::Display for Key {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("same")
+            }
+        }
+
+        let mut state = VirtualListState::new(0);
+        let mut cx = LayoutCx::new();
+        VirtualList::new("keys")
+            .item(Key(0), 0, TextBlock::new("original"))
+            .sync(8, &mut state, &mut cx);
+        let measurements = cx.measured_nodes();
+        let height = state.total_height();
+        for second in [0, 1] {
+            let invalid = VirtualList::new("keys")
+                .item(Key(0), 1, TextBlock::new("changed text wraps"))
+                .item(Key(second), 0, TextBlock::new("collision"));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                invalid.sync(8, &mut state, &mut cx);
+            }));
+            assert!(result.is_err());
+            assert_eq!(state.total_height(), height);
+            assert_eq!(cx.measured_nodes(), measurements);
+            assert_eq!(state.item_offset(&Key(0)), Some(0));
+            assert_eq!(state.item_offset(&Key(1)), None);
+        }
+    }
 
     struct ExternallyRevisedItem;
 
@@ -619,6 +669,64 @@ mod tests {
                 EventOutcome::Ignored
             }
         }
+    }
+
+    #[test]
+    fn tall_item_metadata_clips_before_terminal_conversion() {
+        let list = VirtualList::new("tall").item(
+            "item",
+            0,
+            MetadataItem {
+                id: "tall-child",
+                height: 100_000,
+                cursor_row: None,
+            },
+        );
+        let mut state = VirtualListState::new(0);
+        list.sync(8, &mut state, &mut LayoutCx::new());
+        state.scroll.set_vertical_offset(90_000);
+        let viewport = Rect::new(4, 5, 8, 4);
+        let area = Rect::new(0, 0, 8, 4);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 12));
+        let mut frame = Frame::new(&mut buffer);
+        let mut report = super::VirtualListRenderStats::default();
+        PaintCx::new(&mut frame).with_child(
+            i32::from(viewport.x),
+            i64::from(viewport.y),
+            LocalRect::new(0, 0, area.width, area.height),
+            |cx| report = list.paint(area, &state, cx),
+        );
+        assert_eq!(report.registered_items, 1);
+        assert_eq!(frame.hits().regions().len(), 2);
+        for region in frame.hits().regions() {
+            assert_eq!(region.area, viewport);
+        }
+        assert_eq!(frame.semantics().regions().len(), 1);
+        assert_eq!(frame.semantics().regions()[0].area, viewport);
+        assert_eq!(frame.semantics().regions()[0].id, "tall.item.item");
+        let root = LayoutNode::leaf(LayoutId::new("root"), LogicalSize::new(20, 12));
+        let mut event_cx = EventCx::with_clip(&root, viewport);
+        for (point, expected) in [
+            (Point::new(4, 5), EventOutcome::Handled),
+            (Point::new(11, 8), EventOutcome::Handled),
+            (Point::new(3, 5), EventOutcome::Ignored),
+            (Point::new(4, 9), EventOutcome::Ignored),
+        ] {
+            let event = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                point,
+            ));
+            assert_eq!(
+                list.event(viewport, &state, &event, &mut event_cx),
+                expected
+            );
+        }
+        assert_eq!(super::translated_item_area(area, -90_000, 100_000), area);
+        assert_eq!(
+            super::translated_item_area(area, -100_000, 100_000).height,
+            0
+        );
+        assert_eq!(super::translated_item_area(area, 10, 100_000).height, 0);
     }
 
     #[test]
@@ -774,6 +882,97 @@ mod tests {
                 EventOutcome::Ignored
             }
         }
+    }
+
+    #[test]
+    fn nonpositional_events_skip_parent_clipped_items() {
+        struct Handler(EventOutcome);
+        impl Component for Handler {
+            fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::leaf(
+                    "handler".into(),
+                    constraints.constrain(LogicalSize::new(8, 2)),
+                )
+            }
+            fn paint(&self, _layout: &LayoutNode, _cx: &mut PaintCx<'_, '_>) {}
+            fn event(
+                &self,
+                _event: &Event,
+                _layout: &LayoutNode,
+                _cx: &mut EventCx<'_>,
+            ) -> EventOutcome {
+                self.0
+            }
+        }
+        let list = VirtualList::new("list")
+            .item("visible", 0, Handler(EventOutcome::Handled))
+            .item("hidden", 0, Handler(EventOutcome::Redraw));
+        let mut state = VirtualListState::new(0);
+        list.sync(8, &mut state, &mut LayoutCx::new());
+        let root = LayoutNode::leaf("root".into(), LogicalSize::new(8, 4));
+        let area = Rect::new(0, 0, 8, 4);
+        let event = Event::Paste("input".into());
+        let mut cx = EventCx::with_clip(&root, Rect::new(0, 0, 8, 2));
+        assert_eq!(
+            list.event(area, &state, &event, &mut cx),
+            EventOutcome::Handled
+        );
+        let mut cx = EventCx::with_clip(&root, Rect::new(10, 10, 2, 2));
+        assert_eq!(
+            list.event(area, &state, &event, &mut cx),
+            EventOutcome::Ignored
+        );
+        let mut cx = EventCx::with_clip(&root, area);
+        assert_eq!(
+            list.event(area, &state, &event, &mut cx),
+            EventOutcome::Redraw
+        );
+    }
+
+    #[test]
+    fn translated_list_routes_pointer_using_parent_clip() {
+        let list = VirtualList::new("messages")
+            .item(
+                "a",
+                0,
+                EventItem {
+                    id: "a",
+                    height: 3,
+                    outcome: EventOutcome::Handled,
+                },
+            )
+            .item(
+                "b",
+                0,
+                EventItem {
+                    id: "b",
+                    height: 3,
+                    outcome: EventOutcome::Redraw,
+                },
+            );
+        let mut state = VirtualListState::new(0);
+        list.sync(8, &mut state, &mut LayoutCx::new());
+        state.scroll.set_vertical_offset(2);
+        let root = LayoutNode::leaf("root".into(), LogicalSize::new(30, 30));
+        let mut cx = EventCx::with_clip(&root, Rect::new(0, 0, 30, 30));
+        // Local area (2, 1) is presented at (12, 11), with its final row clipped.
+        let area = Rect::new(2, 1, 8, 4);
+        cx.with_transform(0, 0, 10, 10, Rect::new(12, 11, 8, 3), |cx| {
+            for (x, y, expected) in [
+                (13, 11, EventOutcome::Handled),
+                (13, 12, EventOutcome::Redraw),
+                (13, 13, EventOutcome::Redraw),
+                (13, 14, EventOutcome::Ignored),
+                (11, 11, EventOutcome::Ignored),
+                (3, 1, EventOutcome::Ignored),
+            ] {
+                let event = Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(x, y),
+                ));
+                assert_eq!(list.event(area, &state, &event, cx), expected);
+            }
+        });
     }
 
     #[test]
@@ -1163,6 +1362,63 @@ mod tests {
     }
 
     #[test]
+    fn item_paint_scope_cannot_fill_gaps_or_neighbors() {
+        struct FillItem;
+        impl Component for FillItem {
+            fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::leaf("fill".into(), constraints.constrain(LogicalSize::new(4, 1)))
+            }
+            fn paint(&self, _layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+                cx.fill(cx.area(), "x", bmux_tui::style::Style::default());
+            }
+        }
+        let list = VirtualList::new("list")
+            .item("first", 0, TextBlock::new("a"))
+            .item("fill", 0, FillItem)
+            .item("last", 0, TextBlock::new("b"));
+        let mut state = VirtualListState::new(1);
+        list.sync(4, &mut state, &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 5));
+        let mut frame = Frame::new(&mut buffer);
+        list.paint(Rect::new(0, 0, 4, 5), &state, &mut PaintCx::new(&mut frame));
+        for (row, expected) in ["a   ", "    ", "xxxx", "    ", "b   "].iter().enumerate() {
+            assert_eq!(
+                frame
+                    .buffer()
+                    .row_symbols(u16::try_from(row).unwrap())
+                    .as_deref(),
+                Some(*expected)
+            );
+        }
+    }
+
+    #[test]
+    fn parent_clip_limits_virtual_list_paint_work() {
+        let list = VirtualList::new("list")
+            .item("a", 0, TextBlock::new("a"))
+            .item("b", 0, TextBlock::new("b"))
+            .item("c", 0, TextBlock::new("c"))
+            .item("d", 0, TextBlock::new("d"));
+        let mut state = VirtualListState::new(0);
+        list.sync(4, &mut state, &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(0, -2, LocalRect::new(0, 0, 4, 4), |cx| {
+            let report = list.paint(Rect::new(0, 0, 4, 4), &state, cx);
+            assert_eq!(report.painted_items, 1);
+            assert_eq!(report.registered_items, 1);
+        });
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("c   "));
+        assert_eq!(frame.semantics().regions().len(), 1);
+        PaintCx::new(&mut frame).with_child(10, 0, LocalRect::new(0, 0, 4, 4), |cx| {
+            assert_eq!(
+                list.paint(Rect::new(0, 0, 4, 4), &state, cx).painted_items,
+                0
+            );
+        });
+    }
+
+    #[test]
     fn paints_and_registers_only_intersecting_variable_height_items() {
         let list = VirtualList::new("messages")
             .item("a", 0, TextBlock::new("a"))
@@ -1472,6 +1728,67 @@ mod tests {
         assert_eq!(scrollbar.max_offset(), 3);
         assert!(list.ensure_item_visible(&mut state, &"a", 2));
         assert_eq!(state.scroll.vertical_offset(), 0);
+    }
+
+    #[test]
+    fn list_and_state_visibility_share_offsets_and_follow_policy() {
+        let list = VirtualList::new("messages")
+            .item("a", 0, TextBlock::new("first"))
+            .item("b", 0, TextBlock::new("several wrapped words"))
+            .item("c", 0, TextBlock::new("last"));
+        for viewport in [0, 1, 3, 100] {
+            for offset in [0, 2, usize::MAX] {
+                for key in ["a", "b", "c", "missing"] {
+                    let mut through_list = VirtualListState::new(1);
+                    let mut through_state = VirtualListState::new(1);
+                    for state in [&mut through_list, &mut through_state] {
+                        list.sync(5, state, &mut LayoutCx::new());
+                        state.scroll.set_vertical_offset(offset);
+                        state.scroll.set_follow_bottom(true);
+                    }
+                    let found = list.ensure_item_visible(&mut through_list, &key, viewport);
+                    let changed = through_state.ensure_key_visible(&key, viewport);
+                    assert_eq!(found, key != "missing");
+                    assert_eq!(changed, through_state.scroll.vertical_offset() != offset);
+                    assert_eq!(
+                        through_list.scroll.vertical_offset(),
+                        through_state.scroll.vertical_offset()
+                    );
+                    assert_eq!(
+                        through_list.scroll.follows_bottom(),
+                        through_state.scroll.follows_bottom()
+                    );
+                    if !found {
+                        assert_eq!(through_list.scroll.vertical_offset(), offset);
+                        assert!(through_list.scroll.follows_bottom());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shrinking_anchor_item_keeps_the_surviving_key_visible() {
+        let mut state = VirtualListState::new(1);
+        let mut cx = LayoutCx::new();
+        let initial = VirtualList::new("reflow")
+            .item("anchor", 0, TextBlock::new("a\nb\nc\nd\ne"))
+            .item("following", 0, TextBlock::new("1\n2\n3\n4\n5\n6"));
+        initial.sync(8, &mut state, &mut cx);
+        state.scroll.set_vertical_offset(4);
+        state.capture_anchor();
+        let shorter = VirtualList::new("reflow")
+            .item("anchor", 1, TextBlock::new("a\nb"))
+            .item("following", 0, TextBlock::new("1\n2\n3\n4\n5\n6"));
+        shorter.sync(8, &mut state, &mut cx);
+        state.restore_anchor(2);
+        assert_eq!(state.scroll.vertical_offset(), 1);
+        assert_eq!(state.key_at_offset(1), Some(&"anchor"));
+        assert!(!state.scroll.follows_bottom());
+        // Subsequent reflow retains the clamped row, not the stale original row.
+        initial.sync(8, &mut state, &mut cx);
+        state.restore_anchor(2);
+        assert_eq!(state.scroll.vertical_offset(), 1);
     }
 
     #[test]

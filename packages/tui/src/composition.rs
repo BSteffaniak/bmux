@@ -31,15 +31,7 @@ fn event_single_child(
         .children
         .first()
         .map_or(crate::event::EventOutcome::Ignored, |resolved| {
-            let height = u16::try_from(resolved.node.size.height).unwrap_or(u16::MAX);
-            cx.with_transform(
-                resolved.x,
-                resolved.y,
-                i32::from(resolved.x),
-                i64::try_from(resolved.y).unwrap_or(i64::MAX),
-                Rect::new(0, 0, resolved.node.size.width, height),
-                |cx| child.event(event, &resolved.node, cx),
-            )
+            cx.with_child(resolved, |cx| child.event(event, &resolved.node, cx))
         })
 }
 
@@ -54,15 +46,7 @@ fn event_children(
         .rev()
         .zip(layout.children.iter().rev())
         .find_map(|(child, resolved)| {
-            let height = u16::try_from(resolved.node.size.height).unwrap_or(u16::MAX);
-            let outcome = cx.with_transform(
-                resolved.x,
-                resolved.y,
-                i32::from(resolved.x),
-                i64::try_from(resolved.y).unwrap_or(i64::MAX),
-                Rect::new(0, 0, resolved.node.size.width, height),
-                |cx| child.event(event, &resolved.node, cx),
-            );
+            let outcome = cx.with_child(resolved, |cx| child.event(event, &resolved.node, cx));
             outcome.is_handled().then_some(outcome)
         })
         .unwrap_or(crate::event::EventOutcome::Ignored)
@@ -375,13 +359,18 @@ impl Component for TextBlock {
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let visible = cx.area();
+        let first = usize::try_from(visible.y.max(0)).unwrap_or(usize::MAX);
+        let end = usize::try_from(visible.y.saturating_add(i64::from(visible.height)).max(0))
+            .unwrap_or(usize::MAX)
+            .min(layout.size.height);
         for (index, line) in self
             .rows(layout.size.width)
             .iter()
             .skip(self.vertical_scroll)
-            .take(usize::from(height))
             .enumerate()
+            .skip(first)
+            .take(end.saturating_sub(first))
         {
             let line_width = u16::try_from(line.width()).unwrap_or(u16::MAX);
             let x = match self.alignment {
@@ -389,9 +378,9 @@ impl Component for TextBlock {
                 Alignment::Center => layout.size.width.saturating_sub(line_width) / 2,
                 Alignment::Right => layout.size.width.saturating_sub(line_width),
             };
-            let row = u16::try_from(index).unwrap_or(u16::MAX);
+            let row = i64::try_from(index).unwrap_or(i64::MAX);
             cx.write_line_with_fallback_style(
-                LocalRect::new(0, i64::from(row), layout.size.width, 1),
+                LocalRect::new(0, row, layout.size.width, 1),
                 &Line::from_spans(
                     std::iter::once(crate::text::Span::raw(" ".repeat(usize::from(x))))
                         .chain(line.spans.iter().cloned())
@@ -530,28 +519,30 @@ impl Component for Surface<'_> {
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        cx.fill(
-            LocalRect::new(0, 0, layout.size.width, height),
-            " ",
-            self.background,
-        );
-        if self.paint_border
-            && let Some(border) = &self.border
-        {
-            paint_border(layout.size.width, height, border, self.background, cx);
-        }
-        let Some(child_layout) = layout.children.first() else {
-            return;
-        };
-        let clip_height = u16::try_from(child_layout.node.size.height).unwrap_or(u16::MAX);
-        cx.with_style(self.content_style, |cx| {
-            cx.with_child(
-                i32::from(child_layout.x),
-                i64::try_from(child_layout.y).unwrap_or(i64::MAX),
-                LocalRect::new(0, 0, child_layout.node.size.width, clip_height),
-                |cx| self.child.paint(&child_layout.node, cx),
-            );
+        cx.with_child_size(0, 0, layout.size, |cx| {
+            cx.fill(cx.area(), " ", self.background);
+            if self.paint_border
+                && let Some(border) = &self.border
+            {
+                paint_border(
+                    layout.size.width,
+                    layout.size.height,
+                    border,
+                    self.background,
+                    cx,
+                );
+            }
+            let Some(child_layout) = layout.children.first() else {
+                return;
+            };
+            cx.with_style(self.content_style, |cx| {
+                cx.with_child_size(
+                    i32::from(child_layout.x),
+                    i64::try_from(child_layout.y).unwrap_or(i64::MAX),
+                    child_layout.node.size,
+                    |cx| self.child.paint(&child_layout.node, cx),
+                );
+            });
         });
     }
 
@@ -567,7 +558,7 @@ impl Component for Surface<'_> {
 
 fn paint_border(
     width: u16,
-    height: u16,
+    height: usize,
     border: &Border,
     background: Style,
     cx: &mut PaintCx<'_, '_>,
@@ -577,7 +568,13 @@ fn paint_border(
     }
     let style = background.patch(border.style);
     let right = width.saturating_sub(1);
-    let bottom = height.saturating_sub(1);
+    let bottom = i64::try_from(height.saturating_sub(1)).unwrap_or(i64::MAX);
+    let visible = cx.area();
+    let first_row = visible.y.max(0);
+    let end_row = visible
+        .y
+        .saturating_add(i64::from(visible.height))
+        .min(bottom.saturating_add(1));
     let sides = border.sides;
     if sides.top {
         for x in 0..width {
@@ -588,25 +585,20 @@ fn paint_border(
         for x in 0..width {
             cx.set_cell(
                 i32::from(x),
-                i64::from(bottom),
+                bottom,
                 &border.set.horizontal.to_string(),
                 style,
             );
         }
     }
     if sides.left {
-        for y in 0..height {
-            cx.set_cell(0, i64::from(y), &border.set.vertical.to_string(), style);
+        for y in first_row..end_row {
+            cx.set_cell(0, y, &border.set.vertical.to_string(), style);
         }
     }
     if sides.right && right != 0 {
-        for y in 0..height {
-            cx.set_cell(
-                i32::from(right),
-                i64::from(y),
-                &border.set.vertical.to_string(),
-                style,
-            );
+        for y in first_row..end_row {
+            cx.set_cell(i32::from(right), y, &border.set.vertical.to_string(), style);
         }
     }
     if width > 1 && height > 1 {
@@ -622,17 +614,12 @@ fn paint_border(
             );
         }
         if sides.bottom && sides.left {
-            cx.set_cell(
-                0,
-                i64::from(bottom),
-                &border.set.bottom_left.to_string(),
-                style,
-            );
+            cx.set_cell(0, bottom, &border.set.bottom_left.to_string(), style);
         }
         if sides.bottom && sides.right {
             cx.set_cell(
                 i32::from(right),
-                i64::from(bottom),
+                bottom,
                 &border.set.bottom_right.to_string(),
                 style,
             );
@@ -1327,11 +1314,10 @@ fn paint_single_child(child: &Element<'_>, layout: &LayoutNode, cx: &mut PaintCx
 }
 
 fn paint_child(child: &Element<'_>, resolved: &ChildLayout, cx: &mut PaintCx<'_, '_>) {
-    let height = u16::try_from(resolved.node.size.height).unwrap_or(u16::MAX);
-    cx.with_child(
+    cx.with_child_size(
         i32::from(resolved.x),
         i64::try_from(resolved.y).unwrap_or(i64::MAX),
-        LocalRect::new(0, 0, resolved.node.size.width, height),
+        resolved.node.size,
         |cx| child.paint(&resolved.node, cx),
     );
 }
@@ -1541,13 +1527,7 @@ impl Component for Row<'_> {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         for (child, resolved) in self.children.iter().zip(&layout.children) {
-            let height = u16::try_from(resolved.node.size.height).unwrap_or(u16::MAX);
-            cx.with_child(
-                i32::from(resolved.x),
-                i64::try_from(resolved.y).unwrap_or(i64::MAX),
-                LocalRect::new(0, 0, resolved.node.size.width, height),
-                |cx| child.component.paint(&resolved.node, cx),
-            );
+            paint_child(&child.component, resolved, cx);
         }
     }
 
@@ -1562,15 +1542,9 @@ impl Component for Row<'_> {
             .rev()
             .zip(layout.children.iter().rev())
             .find_map(|(child, resolved)| {
-                let height = u16::try_from(resolved.node.size.height).unwrap_or(u16::MAX);
-                let outcome = cx.with_transform(
-                    resolved.x,
-                    resolved.y,
-                    i32::from(resolved.x),
-                    i64::try_from(resolved.y).unwrap_or(i64::MAX),
-                    Rect::new(0, 0, resolved.node.size.width, height),
-                    |cx| child.component.event(event, &resolved.node, cx),
-                );
+                let outcome = cx.with_child(resolved, |cx| {
+                    child.component.event(event, &resolved.node, cx)
+                });
                 outcome.is_handled().then_some(outcome)
             })
             .unwrap_or(crate::event::EventOutcome::Ignored)
@@ -1733,13 +1707,7 @@ impl Component for Column<'_> {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         for (component, child) in self.children.iter().zip(&layout.children) {
-            let height = u16::try_from(child.node.size.height).unwrap_or(u16::MAX);
-            cx.with_child(
-                i32::from(child.x),
-                i64::try_from(child.y).unwrap_or(i64::MAX),
-                LocalRect::new(0, 0, child.node.size.width, height),
-                |cx| component.paint(&child.node, cx),
-            );
+            paint_child(component, child, cx);
         }
     }
 
