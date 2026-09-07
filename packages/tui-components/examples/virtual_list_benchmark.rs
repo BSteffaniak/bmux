@@ -24,6 +24,16 @@ unsafe impl GlobalAlloc for CountingAllocator {
         pointer
     }
 
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: Preserve the system allocator's zero-initialization contract.
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() && COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
+            ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+            ALLOCATION_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        }
+        pointer
+    }
+
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         // SAFETY: Delegates the exact deallocation request to the system allocator.
         unsafe { System.dealloc(pointer, layout) };
@@ -55,11 +65,58 @@ use bmux_tui::{damage::Damage, damage::DamagePolicy};
 use bmux_tui_components::virtual_list::{VirtualList, VirtualListState};
 
 fn main() {
+    benchmark_empty();
     benchmark_index_strategies();
     for count in [100usize, 1_000, 10_000] {
         benchmark_count(count);
         benchmark_composed_cards(count);
     }
+}
+
+fn benchmark_empty() {
+    let list = VirtualList::<usize>::new("empty");
+    let mut state = VirtualListState::default();
+    let mut cx = LayoutCx::new();
+    list.sync(40, &mut state, &mut cx);
+    assert_eq!(cx.measured_nodes(), 0);
+    assert_eq!(state.total_height(), 0);
+    for direction in [-1, 1] {
+        assert!(!state.scroll_by(direction, 20));
+        assert_eq!(state.scroll.vertical_offset(), 0);
+    }
+    let report = paint_once(&list, &state, Rect::new(0, 0, 40, 20));
+    assert_eq!(report.rendered.painted_items, 0);
+    assert_eq!(report.rendered.registered_items, 0);
+    assert_eq!(report.hit_regions, 0);
+    assert_eq!(report.focus_targets, 0);
+    assert_eq!(report.semantic_regions, 0);
+    assert_eq!(report.selection_fragments, 0);
+    assert_eq!(report.image_contributions, 0);
+    println!(
+        "empty paint_us={} allocations={} allocation_bytes={}",
+        micros(report.elapsed),
+        report.allocations,
+        report.allocation_bytes,
+    );
+
+    let populated = build_list(100, 0);
+    populated.sync(40, &mut state, &mut cx);
+    assert!(state.scroll_by(10, 20));
+    state.capture_anchor();
+    let measured = cx.measured_nodes();
+    list.sync(40, &mut state, &mut cx);
+    state.restore_anchor(20);
+    assert_eq!(cx.measured_nodes(), measured);
+    assert_eq!(state.total_height(), 0);
+    assert_eq!(state.scroll.vertical_offset(), 0);
+    assert!(state.item_offset(&0).is_none());
+    assert!(state.key_at_offset(0).is_none());
+    let cleared = paint_once(&list, &state, Rect::new(0, 0, 40, 20));
+    assert_eq!(cleared.rendered.painted_items, 0);
+    assert_eq!(cleared.rendered.registered_items, 0);
+    assert_eq!(cleared.hit_regions, 0);
+    assert_eq!(cleared.selection_fragments, 0);
+    assert_eq!(cleared.semantic_regions, 0);
 }
 
 fn benchmark_composed_cards(count: usize) {
@@ -113,6 +170,49 @@ fn benchmark_composed_cards(count: usize) {
     );
     assert!(row_scroll.rendered.painted_items > 0);
     assert!(row_scroll.rendered.painted_items <= 6);
+    let mut scroll_elapsed = Duration::ZERO;
+    let mut scroll_allocations = 0usize;
+    let mut scroll_allocation_bytes = 0usize;
+    let mut scroll_max_painted = 0usize;
+    let scroll_start = state.scroll.vertical_offset();
+    for direction in [1, -1] {
+        for _ in 0..64 {
+            assert!(state.scroll_by(direction, usize::from(viewport.height)));
+            let report = paint_once(&list, &state, viewport);
+            assert!(report.rendered.painted_items > 0);
+            assert!(report.rendered.painted_items <= 6);
+            assert_eq!(
+                report.rendered.registered_items,
+                report.rendered.painted_items
+            );
+            scroll_elapsed += report.elapsed;
+            scroll_allocations += report.allocations;
+            scroll_allocation_bytes += report.allocation_bytes;
+            scroll_max_painted = scroll_max_painted.max(report.rendered.painted_items);
+        }
+    }
+    assert_eq!(state.scroll.vertical_offset(), scroll_start);
+    assert_eq!(cx.measured_nodes(), measured);
+    println!(
+        "cards_scroll count={count} steps=128 paint_us={} allocations={scroll_allocations} allocation_bytes={scroll_allocation_bytes} max_painted={scroll_max_painted}",
+        micros(scroll_elapsed),
+    );
+    for (offset, direction) in [
+        (0, -1),
+        (state.total_height() - usize::from(viewport.height), 1),
+    ] {
+        state.scroll.set_vertical_offset(offset);
+        assert!(!state.scroll_by(direction, usize::from(viewport.height)));
+        assert_eq!(state.scroll.vertical_offset(), offset);
+        let boundary = paint_once(&list, &state, viewport);
+        assert!(boundary.rendered.painted_items > 0);
+        assert!(boundary.rendered.painted_items <= 6);
+        assert_eq!(
+            boundary.rendered.registered_items,
+            boundary.rendered.painted_items
+        );
+    }
+    state.scroll.set_vertical_offset(scroll_start);
     state.capture_anchor();
     let anchor_key = *state
         .key_at_offset(state.scroll.vertical_offset())
@@ -139,8 +239,14 @@ fn benchmark_composed_cards(count: usize) {
     let resized_paint = paint_once(&list, &state, Rect::new(0, 0, 24, 20));
     assert!(resized_paint.rendered.painted_items > 0);
     assert!(resized_paint.rendered.painted_items <= 6);
+    for report in [&paint, &row_scroll, &resized_paint] {
+        assert_eq!(
+            report.rendered.registered_items, report.rendered.painted_items,
+            "composed card registration must remain visible-item bounded"
+        );
+    }
     println!(
-        "cards count={count} measured={measured} paint_us={} painted={} allocations={} allocation_bytes={} row_sync_us={} row_paint_us={} row_sync_and_paint_us={} row_painted={} resize_us={} resize_measured={resize_measured} resized_painted={}",
+        "cards count={count} measured={measured} paint_us={} painted={} allocations={} allocation_bytes={} row_sync_us={} row_paint_us={} row_sync_and_paint_us={} row_painted={} row_allocations={} row_allocation_bytes={} resize_us={} resize_measured={resize_measured} resized_painted={} resized_allocations={} resized_allocation_bytes={}",
         micros(paint.elapsed),
         paint.rendered.painted_items,
         paint.allocations,
@@ -149,8 +255,12 @@ fn benchmark_composed_cards(count: usize) {
         micros(row_scroll.elapsed),
         micros(row_sync + row_scroll.elapsed),
         row_scroll.rendered.painted_items,
+        row_scroll.allocations,
+        row_scroll.allocation_bytes,
         micros(resize),
         resized_paint.rendered.painted_items,
+        resized_paint.allocations,
+        resized_paint.allocation_bytes,
     );
 }
 
