@@ -1332,6 +1332,7 @@ impl RustPlugin for WindowsPlugin {
         // typed registration context that `activate` does not receive.
         let subscriber_started = Instant::now();
         spawn_contexts_events_subscriber(shared.clone());
+        spawn_workspace_events_subscriber(shared.clone());
         let subscriber_us = subscriber_started.elapsed().as_micros();
 
         // Publish the initial window-list snapshot populated from the
@@ -1375,6 +1376,29 @@ impl RustPlugin for WindowsPlugin {
 /// The thread owns a current-thread tokio runtime so it can `await`
 /// on the subscription's `recv` without interfering with host
 /// scheduling. It runs until the plugin process terminates.
+fn spawn_workspace_events_subscriber(shared: WindowsSharedState) {
+    use bmux_workspaces_plugin_api::workspaces_events::{self, WorkspaceEvent};
+
+    std::thread::spawn(move || {
+        let Ok(mut receiver) = bmux_plugin::global_event_bus()
+            .subscribe::<WorkspaceEvent>(&workspaces_events::EVENT_KIND)
+        else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        runtime.block_on(async move {
+            while let Ok(_event) = receiver.recv().await {
+                publish_window_list_snapshot(shared.caller.as_ref(), &shared.runtime_state);
+            }
+        });
+    });
+}
+
 fn spawn_contexts_events_subscriber(shared: WindowsSharedState) {
     use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
 
@@ -2205,6 +2229,15 @@ fn publish_window_list_ordered_contexts(
     contexts: Vec<ContextSummary>,
     active_context_id: Option<Uuid>,
 ) {
+    // A shared catalog must never become a single caller's workspace view.
+    let mut contexts = contexts;
+    if let Ok(all) = list_contexts(caller) {
+        for context in all {
+            if !contexts.iter().any(|known| known.id == context.id) {
+                contexts.push(context);
+            }
+        }
+    }
     let workspace_names = workspace_names(caller);
     let entries = contexts
         .into_iter()

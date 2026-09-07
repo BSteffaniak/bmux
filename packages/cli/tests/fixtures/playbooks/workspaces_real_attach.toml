@@ -1,4 +1,4 @@
-[status_bar]
+[plugins.settings."bmux.tab_strip"]
 tab_template = "<{name}>"
 
 [keybindings]

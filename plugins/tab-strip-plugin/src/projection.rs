@@ -230,6 +230,7 @@ pub struct ProjectionInteraction<'a> {
     pub(super) menu_window_id: Option<Uuid>,
     pub(super) menu_selected: usize,
     pub(super) drag_marker_col: Option<u16>,
+    pub(super) workspace_label: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_lines)] // Projection is one ordered width-budgeting pass; splitting obscures shared constraints.
@@ -250,7 +251,15 @@ pub fn project_bar(
     } else {
         usize::from(local.viewport_cols)
     };
+    let workspace_label = interaction
+        .workspace_label
+        .or_else(|| windows.first().map(|window| window.workspace.as_str()))
+        .map_or_else(String::new, |name| {
+            let budget = width.saturating_sub(right_width + tail_width + 20).min(24);
+            format!("{} │ ", truncate_cells(name, budget))
+        });
     let tab_budget = width
+        .saturating_sub(UnicodeWidthStr::width(workspace_label.as_str()))
         .saturating_sub(right_width)
         .saturating_sub(usize::from(!right.is_empty()))
         .saturating_sub(settings.left_padding)
@@ -296,6 +305,12 @@ pub fn project_bar(
         window_id: None,
         edit_cursor_offset: None,
     }];
+    left.push(ProjectedSegment {
+        text: workspace_label,
+        kind: SegmentKind::Base,
+        window_id: None,
+        edit_cursor_offset: None,
+    });
     if tokens.is_empty() {
         left.push(ProjectedSegment {
             text: "[no tabs]".to_string(),
@@ -766,6 +781,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_workspace_keeps_noninteractive_label() {
+        let projected = project_bar(
+            &Settings::default(),
+            &[],
+            &local(80),
+            None,
+            &ProjectionInteraction {
+                workspace_label: Some("project"),
+                ..ProjectionInteraction::default()
+            },
+        );
+        assert!(projected.plain_text().contains("project │"));
+        assert!(projected.plain_text().contains("[no tabs]"));
+        assert!(
+            projected
+                .segments
+                .iter()
+                .all(|segment| segment.window_id.is_none())
+        );
+    }
+
+    #[test]
     fn narrow_projection_keeps_active_tab_and_uses_overflow() {
         let windows = (0..8)
             .map(|index| window(index + 1, &format!("window-{index}"), index == 7))
@@ -773,12 +810,13 @@ mod tests {
         let projected = project_bar(
             &Settings::default(),
             &windows,
-            &local(40),
+            &local(50),
             None,
             &ProjectionInteraction::default(),
         );
         let text = projected.plain_text();
-        assert_eq!(UnicodeWidthStr::width(text.as_str()), 40);
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 50);
+        assert!(text.contains("default"));
         assert!(text.contains("window-7"));
         assert!(text.contains('◀'));
     }

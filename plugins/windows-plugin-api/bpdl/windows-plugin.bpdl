@@ -372,6 +372,15 @@ interface windows-events {
 //   `false` otherwise.
 // - `revision` is a monotonic counter advancing on every publish;
 //   consumers can use it to deduplicate or order updates.
+// Client-local selection, published by attach rather than the shared catalog.
+interface windows-local-view {
+    record window-selection {
+        context-id: uuid?,
+    }
+
+    @state events window-selection;
+}
+
 interface windows-list {
     record window-list-snapshot {
         windows: list<window-list-entry>,

@@ -45,6 +45,7 @@ struct WorkspaceState {
     records: Vec<WorkspaceRecord>,
     active_by_client: HashMap<Uuid, Uuid>,
     previous_by_client: HashMap<Uuid, Uuid>,
+    selected_context_by_client_workspace: HashMap<(Uuid, Uuid), Uuid>,
 }
 
 impl WorkspaceState {
@@ -132,6 +133,7 @@ impl RustPlugin for WorkspacesPlugin {
             records,
             active_by_client,
             previous_by_client,
+            selected_context_by_client_workspace: HashMap::new(),
         };
         state.ensure_default();
         let state = Arc::new(RwLock::new(state));
@@ -294,6 +296,28 @@ fn list_contexts(
         .map_err(|error| format!("contexts-state/list-contexts failed: {error}"))
 }
 
+fn create_workspace_context(
+    caller: &(impl ServiceCaller + Sync),
+    workspace_id: Uuid,
+) -> Result<Uuid, WorkspaceCommandError> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(contexts_commands::client::create_context(
+        &mut client,
+        Some("tab-1".to_string()),
+        std::collections::BTreeMap::from([(
+            "workspace".to_string(),
+            workspace_attribute(workspace_id),
+        )]),
+    ))
+    .map_err(|error| WorkspaceCommandError::Failed {
+        reason: format!("contexts-commands/create-context failed: {error}"),
+    })?
+    .map(|ack| ack.id)
+    .map_err(|error| WorkspaceCommandError::Failed {
+        reason: format!("create-context failed: {error:?}"),
+    })
+}
+
 fn select_context(
     caller: &(impl ServiceCaller + Sync),
     context_id: Uuid,
@@ -427,6 +451,14 @@ fn new_workspace(
     name: Option<String>,
 ) -> Result<WorkspaceAck, WorkspaceCommandError> {
     let client_id = client_id(resolve_client_id(caller))?;
+    new_workspace_for_client(caller, name, client_id)
+}
+
+fn new_workspace_for_client(
+    caller: &(impl HostRuntimeApi + Sync),
+    name: Option<String>,
+    client_id: Uuid,
+) -> Result<WorkspaceAck, WorkspaceCommandError> {
     let state = state().map_err(|reason| WorkspaceCommandError::Failed { reason })?;
     let (record, records) = {
         let mut guard = state.write().map_err(|_| WorkspaceCommandError::Failed {
@@ -438,8 +470,6 @@ fn new_workspace(
             name,
         };
         guard.records.push(record.clone());
-        guard.select(client_id, record.id);
-        persist_client_selection(caller, &guard)?;
         (record, guard.records.clone())
     };
     save_catalog(caller, &records)?;
@@ -450,10 +480,14 @@ fn new_workspace(
             name: record.name,
         },
     );
-    Ok(WorkspaceAck {
-        id: record.id,
-        selected_context_id: None,
-    })
+    switch_workspace_for_client(
+        caller,
+        &WorkspaceSelector {
+            id: Some(record.id),
+            name: None,
+        },
+        client_id,
+    )
 }
 
 fn rename_workspace(
@@ -555,16 +589,45 @@ fn switch_workspace_for_client(
     let contexts =
         list_contexts(caller).map_err(|reason| WorkspaceCommandError::Failed { reason })?;
     let state = state().map_err(|reason| WorkspaceCommandError::Failed { reason })?;
+    let mut context_client = dispatch_client(caller);
+    let current_context = bmux_plugin::block_on_typed_dispatch(
+        contexts_state::client::current_context(&mut context_client),
+    )
+    .ok()
+    .flatten();
     let workspace_id = {
-        let guard = state.read().map_err(|_| WorkspaceCommandError::Failed {
+        let mut guard = state.write().map_err(|_| WorkspaceCommandError::Failed {
             reason: "workspace state lock poisoned".to_string(),
         })?;
+        if let Some(context) = current_context {
+            guard
+                .selected_context_by_client_workspace
+                .insert((client_id, context_workspace_id(&context)), context.id);
+        }
         guard
             .resolve(selector)
             .map(|record| record.id)
             .ok_or(WorkspaceCommandError::NotFound)?
     };
-    let context_id = most_recent_context_in_workspace(&contexts, workspace_id);
+    let remembered = state
+        .read()
+        .map_err(|_| WorkspaceCommandError::Failed {
+            reason: "workspace state lock poisoned".to_string(),
+        })?
+        .selected_context_by_client_workspace
+        .get(&(client_id, workspace_id))
+        .copied()
+        .filter(|id| {
+            contexts
+                .iter()
+                .any(|context| context.id == *id && context_workspace_id(context) == workspace_id)
+        });
+    let context_id = Some(
+        match remembered.or_else(|| most_recent_context_in_workspace(&contexts, workspace_id)) {
+            Some(id) => id,
+            None => create_workspace_context(caller, workspace_id)?,
+        },
+    );
     if let Some(context_id) = context_id {
         select_context(caller, context_id)?;
     }
@@ -831,34 +894,7 @@ fn new_workspace_for_context(
     let client_id = context
         .caller_client_id
         .ok_or_else(|| "workspace operation requires caller client id".to_string())?;
-    let state = state()?;
-    let (record, records) = {
-        let mut guard = state
-            .write()
-            .map_err(|_| "workspace state lock poisoned".to_string())?;
-        let name = validate_name(name, guard.records.len().saturating_add(1))
-            .map_err(|error| format!("{error:?}"))?;
-        let record = WorkspaceRecord {
-            id: Uuid::new_v4(),
-            name,
-        };
-        guard.records.push(record.clone());
-        guard.select(client_id, record.id);
-        persist_client_selection(context, &guard).map_err(|error| format!("{error:?}"))?;
-        (record, guard.records.clone())
-    };
-    save_catalog(context, &records).map_err(|error| format!("{error:?}"))?;
-    let _ = global_event_bus().emit(
-        &workspaces_events::EVENT_KIND,
-        WorkspaceEvent::Created {
-            workspace_id: record.id,
-            name: record.name,
-        },
-    );
-    Ok(WorkspaceAck {
-        id: record.id,
-        selected_context_id: None,
-    })
+    new_workspace_for_client(context, name, client_id).map_err(|error| format!("{error:?}"))
 }
 
 fn command_switch(
@@ -1333,6 +1369,7 @@ mod tests {
             ],
             active_by_client: HashMap::from([(first_client, removed), (second_client, fallback)]),
             previous_by_client: HashMap::from([(first_client, fallback), (second_client, removed)]),
+            selected_context_by_client_workspace: HashMap::new(),
         };
 
         let actual_fallback = state.remove(removed);
@@ -1353,6 +1390,7 @@ mod tests {
             }],
             active_by_client: HashMap::from([(client, removed)]),
             previous_by_client: HashMap::from([(client, removed)]),
+            selected_context_by_client_workspace: HashMap::new(),
         };
         let replacement = state.remove(removed);
 
@@ -1393,6 +1431,7 @@ mod tests {
             ],
             active_by_client: HashMap::new(),
             previous_by_client: HashMap::new(),
+            selected_context_by_client_workspace: HashMap::new(),
         });
 
         let first_ack = switch_workspace(
@@ -1472,6 +1511,7 @@ mod tests {
                 (deleting_client, removed_workspace),
                 (viewing_client, fallback_workspace),
             ]),
+            selected_context_by_client_workspace: HashMap::new(),
         });
 
         let ack = kill_workspace(

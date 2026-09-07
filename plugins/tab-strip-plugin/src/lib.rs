@@ -216,6 +216,9 @@ struct CompanionState {
     menu_window_id: Option<Uuid>,
     menu_selected: usize,
     local_presentation: AttachLocalPresentationSnapshot,
+    catalog: windows_list::WindowListSnapshot,
+    selected_context_id: Option<Uuid>,
+    workspace_label: Option<String>,
 }
 
 impl CompanionState {
@@ -240,6 +243,12 @@ impl CompanionState {
             menu_window_id: None,
             menu_selected: 0,
             local_presentation: AttachLocalPresentationSnapshot::initial(),
+            catalog: windows_list::WindowListSnapshot {
+                windows: Vec::new(),
+                revision: 0,
+            },
+            selected_context_id: None,
+            workspace_label: None,
         }
     }
 
@@ -247,7 +256,30 @@ impl CompanionState {
         self.settings.maximum_visible_tabs.unwrap_or(usize::MAX)
     }
 
-    fn replace_windows(&mut self, snapshot: windows_list::WindowListSnapshot) {
+    fn replace_windows(&mut self, mut snapshot: windows_list::WindowListSnapshot) {
+        self.catalog = snapshot.clone();
+        let selected = self.selected_context_id;
+        let workspace_id = snapshot
+            .windows
+            .iter()
+            .find(|window| selected.map_or(window.active, |id| window.id == id))
+            .map(|window| window.workspace_id)
+            .or_else(|| selected.is_none().then_some(Uuid::nil()));
+        if let Some(window) = snapshot
+            .windows
+            .iter()
+            .find(|window| Some(window.workspace_id) == workspace_id)
+        {
+            self.workspace_label = Some(window.workspace.clone());
+        }
+        snapshot
+            .windows
+            .retain(|window| Some(window.workspace_id) == workspace_id);
+        if let Some(selected) = selected {
+            for window in &mut snapshot.windows {
+                window.active = window.id == selected;
+            }
+        }
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
             let visible_limit = self.visible_limit();
@@ -371,10 +403,26 @@ pub fn start() -> Result<(), String> {
                 &ATTACH_LOCAL_PRESENTATION_STATE_KIND,
             )
             .map_err(|error| format!("subscribing to attach-local presentation: {error}"))?;
+    let (initial_selection, mut selection_receiver) = bmux_plugin::global_event_bus()
+        .subscribe_state::<bmux_windows_plugin_api::windows_local_view::WindowSelection>(
+            &bmux_windows_plugin_api::windows_local_view::STATE_KIND,
+        )
+        .map_err(|error| format!("subscribing to local selection: {error}"))?;
+    publish_selection(initial_selection.context_id)?;
     publish(initial.as_ref().clone())?;
     publish_local_presentation(initial_local_presentation.as_ref().clone())?;
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("tab-strip companion requires an async runtime: {error}"))?;
+    handle.spawn(async move {
+        while ATTACH_GENERATION.load(Ordering::Acquire) == generation
+            && selection_receiver.changed().await.is_ok()
+        {
+            let selected = selection_receiver.borrow_and_update().context_id;
+            if let Err(error) = publish_selection(selected) {
+                tracing::warn!(%error, "tab-strip selection publication failed");
+            }
+        }
+    });
     handle.spawn(async move {
         while ATTACH_GENERATION.load(Ordering::Acquire) == generation
             && receiver.changed().await.is_ok()
@@ -453,6 +501,28 @@ fn publish_local_presentation(snapshot: AttachLocalPresentationSnapshot) -> Resu
         (revision, build_surface(companion, revision))
     };
     publish_surface(revision, &surface)
+}
+
+#[allow(clippy::significant_drop_tightening)] // Serialize selection and surface publication with catalog updates.
+fn publish_selection(context_id: Option<Uuid>) -> Result<(), String> {
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "tab-strip state lock poisoned".to_string())?;
+    let Some(companion) = guard.as_mut() else {
+        return Ok(());
+    };
+    if companion.selected_context_id == context_id {
+        return Ok(());
+    }
+    companion.selected_context_id = context_id;
+    companion.hovered_window_id = None;
+    companion.editing_window_id = None;
+    companion.menu_window_id = None;
+    companion.pointer_source = None;
+    companion.drag_target = None;
+    companion.scroll_offset = 0;
+    companion.replace_windows(companion.catalog.clone());
+    publish_companion(companion)
 }
 
 fn publish_surface(revision: u64, surface: &PluginSurface) -> Result<(), String> {
@@ -701,6 +771,7 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
             .map(|selection| (selection.start, selection.end)),
         menu_window_id: state.menu_window_id,
         menu_selected: state.menu_selected,
+        workspace_label: state.workspace_label.as_deref(),
         drag_marker_col: state.drag_target.and_then(|(target, placement)| {
             let projected = projection::project_bar(
                 &state.settings,
@@ -858,6 +929,7 @@ fn projection_interaction_without_marker(
         menu_window_id: state.menu_window_id,
         menu_selected: state.menu_selected,
         drag_marker_col: None,
+        workspace_label: state.workspace_label.as_deref(),
     }
 }
 
@@ -1605,6 +1677,41 @@ bar_bg = "#112233"
         assert!(state.revision > initial_revision);
         assert_eq!(state.local_presentation.mode_label, "SCROLL");
         assert_eq!(state.local_presentation.role_label, "read-only");
+    }
+
+    #[test]
+    fn local_selection_scopes_catalog_and_ignores_other_clients_active_marker() {
+        let mut state = CompanionState::new(Settings::default());
+        let first = Uuid::from_u128(11);
+        let second = Uuid::from_u128(12);
+        let catalog = windows_list::WindowListSnapshot {
+            windows: vec![
+                windows_list::WindowListEntry {
+                    id: first,
+                    name: "old-tab".to_string(),
+                    active: true,
+                    workspace: "old-workspace".to_string(),
+                    workspace_id: Uuid::nil(),
+                },
+                windows_list::WindowListEntry {
+                    id: second,
+                    name: "new-tab".to_string(),
+                    active: false,
+                    workspace: "new-workspace".to_string(),
+                    workspace_id: Uuid::from_u128(2),
+                },
+            ],
+            revision: 1,
+        };
+        state.selected_context_id = Some(second);
+        state.replace_windows(catalog.clone());
+        assert_eq!(state.snapshot.windows.len(), 1);
+        assert_eq!(state.snapshot.windows[0].id, second);
+        assert!(state.snapshot.windows[0].active);
+        state.selected_context_id = Some(first);
+        state.replace_windows(catalog);
+        assert_eq!(state.snapshot.windows.len(), 1);
+        assert_eq!(state.snapshot.windows[0].id, first);
     }
 
     #[test]

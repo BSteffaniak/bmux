@@ -3536,6 +3536,12 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
             revision: 0,
         },
     );
+    let _ = bmux_plugin::global_event_bus().register_state_channel(
+        bmux_windows_plugin_api::windows_local_view::STATE_KIND,
+        bmux_windows_plugin_api::windows_local_view::WindowSelection {
+            context_id: view_state.attached_context_id,
+        },
+    );
     for companion in bmux_plugin::registered_attach_companions() {
         if let Err(error) = companion.start() {
             tracing::warn!(companion_id = companion.id(), %error, "failed starting attach companion");
@@ -3991,6 +3997,21 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
 
         let _ = view_state.clear_expired_transient_status(Instant::now());
         let geometry = terminal.geometry();
+        let selection = bmux_windows_plugin_api::windows_local_view::WindowSelection {
+            context_id: view_state.attached_context_id,
+        };
+        let bus = bmux_plugin::global_event_bus();
+        if bus
+            .subscribe_state::<bmux_windows_plugin_api::windows_local_view::WindowSelection>(
+                &bmux_windows_plugin_api::windows_local_view::STATE_KIND,
+            )
+            .is_ok_and(|(current, _)| *current != selection)
+        {
+            let _ = bus.publish_state(
+                &bmux_windows_plugin_api::windows_local_view::STATE_KIND,
+                selection,
+            );
+        }
         publish_attach_local_presentation(
             &mut view_state,
             &attach_keymap,
