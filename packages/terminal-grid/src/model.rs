@@ -455,36 +455,32 @@ impl TerminalGrid {
             _ => return Err(TerminalGridError::InvalidSnapshot("unknown screen mode")),
         };
         let palette = StylePalette::from_styles(snapshot.styles.clone());
-        let rows = snapshot
-            .rows
+        let main_snapshot_rows = match mode {
+            GridMode::Main => snapshot.rows.as_slice(),
+            GridMode::Alternate => snapshot.main_rows.as_deref().unwrap_or_default(),
+        };
+        let rows = main_snapshot_rows
             .iter()
             .map(|row| row_from_snapshot(row, width))
             .collect::<Vec<_>>();
         let mut main_history = VecDeque::new();
         let mut pending_history_cells = Vec::new();
         let mut main_rows = VecDeque::new();
+        let viewport_start = rows.len().saturating_sub(height);
+        hydrate_logical_history(
+            &rows[..viewport_start],
+            width,
+            &mut main_history,
+            &mut pending_history_cells,
+        );
+        main_rows.extend(rows.into_iter().skip(viewport_start));
+        while main_rows.len() < height {
+            main_rows.push_front(PhysicalRow::new());
+        }
         let mut alt_rows = vec![PhysicalRow::new(); height];
-        match mode {
-            GridMode::Main => {
-                let viewport_start = rows.len().saturating_sub(height);
-                hydrate_logical_history(
-                    &rows[..viewport_start],
-                    width,
-                    &mut main_history,
-                    &mut pending_history_cells,
-                );
-                main_rows.extend(rows.into_iter().skip(viewport_start));
-                while main_rows.len() < height {
-                    main_rows.push_front(PhysicalRow::new());
-                }
-            }
-            GridMode::Alternate => {
-                for (index, row) in rows.into_iter().take(height).enumerate() {
-                    alt_rows[index] = row;
-                }
-                for _ in 0..height {
-                    main_rows.push_back(PhysicalRow::new());
-                }
+        if mode == GridMode::Alternate {
+            for (target, row) in alt_rows.iter_mut().zip(&snapshot.rows) {
+                *target = row_from_snapshot(row, width);
             }
         }
         let main_history_projected_rows = main_history
@@ -1309,7 +1305,7 @@ impl TerminalGrid {
             .sum()
     }
 
-    fn main_display_rows(
+    pub(crate) fn main_display_rows(
         &self,
         scrollback_offset: usize,
         requested_rows: usize,

@@ -10028,6 +10028,7 @@ mod tests {
             pending_bytes: Vec::new(),
             styles: Vec::new(),
             reset_rows: false,
+            main_rows: None,
             row_updates: vec![bmux_terminal_grid::RowUpdateSnapshot {
                 row_index: 0,
                 row: bmux_terminal_grid::RowSnapshot {

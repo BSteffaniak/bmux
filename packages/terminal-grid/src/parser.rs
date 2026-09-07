@@ -939,6 +939,54 @@ mod tests {
     }
 
     #[test]
+    fn alternate_snapshot_and_delta_preserve_main_screen_for_independent_sizes() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 6, limits).unwrap();
+        producer.process(b"first line\r\nsecond line\r\nthird line");
+        producer.process(b"\x1b[?1049happ");
+        let snapshot = producer.snapshot(0, 6);
+        assert!(snapshot.main_rows.is_some());
+        let mut replica = TerminalGridStream::from_snapshot(&snapshot, limits).unwrap();
+        let delta = producer.process_delta(b" updated").unwrap();
+        // Normal alternate-screen frames must not retransmit the hidden screen.
+        assert!(delta.main_rows.is_none());
+        replica.apply_delta(&delta, limits).unwrap();
+
+        for (width, height) in [(20, 6), (10, 8), (30, 4)] {
+            let mut expected = TerminalGridStream::new(20, 6, limits).unwrap();
+            expected.process(b"first line\r\nsecond line\r\nthird line");
+            expected.process(b"\x1b[?1049happ updated");
+            let mut actual =
+                TerminalGridStream::from_snapshot(&replica.snapshot(0, 6), limits).unwrap();
+            expected.resize(width, height).unwrap();
+            actual.resize(width, height).unwrap();
+            expected.process(b"\x1b[?1049l\r\nprompt> ");
+            actual.process(b"\x1b[?1049l\r\nprompt> ");
+            assert_eq!(
+                actual.grid().viewport_rows(),
+                expected.grid().viewport_rows()
+            );
+            assert_eq!(actual.grid().cursor(), expected.grid().cursor());
+        }
+        assert_eq!((replica.grid().width(), replica.grid().height()), (20, 6));
+    }
+
+    #[test]
+    fn alternate_entry_delta_preserves_main_screen_on_raw_exit() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 6, limits).unwrap();
+        producer.process(b"retained main content");
+        let mut replica =
+            TerminalGridStream::from_snapshot(&producer.snapshot(0, 6), limits).unwrap();
+        let delta = producer.process_delta(b"\x1b[?1049happ").unwrap();
+        assert!(delta.main_rows.is_some());
+        replica.apply_delta(&delta, limits).unwrap();
+        producer.process(b"\x1b[?1049l");
+        replica.process(b"\x1b[?1049l");
+        assert_eq!(replica.snapshot(0, 6), producer.snapshot(0, 6));
+    }
+
+    #[test]
     fn snapshot_and_delta_converge_after_content_resize() {
         let limits = GridLimits::default();
         let mut producer = TerminalGridStream::new(20, 6, limits).unwrap();

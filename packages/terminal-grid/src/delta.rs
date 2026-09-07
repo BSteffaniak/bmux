@@ -55,6 +55,9 @@ pub struct GridDeltaBatch {
     /// discard their local row set before applying `row_updates`.
     pub reset_rows: bool,
     pub row_updates: Vec<RowUpdateSnapshot>,
+    /// Replace hidden main-screen rows only when they change, not on each frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_rows: Option<Vec<RowSnapshot>>,
 }
 
 impl GridDeltaBatch {
@@ -114,6 +117,9 @@ impl GridDeltaBatch {
             styles: after.styles.clone(),
             reset_rows,
             row_updates,
+            main_rows: (before.main_rows != after.main_rows)
+                .then(|| after.main_rows.clone())
+                .flatten(),
         })
     }
 
@@ -147,6 +153,11 @@ impl GridDeltaBatch {
                 };
                 *row = update.row.clone();
             }
+        }
+        if self.mode != "alternate" {
+            snapshot.main_rows = None;
+        } else if let Some(rows) = &self.main_rows {
+            snapshot.main_rows = Some(rows.clone());
         }
         snapshot.revision = self.revision;
         snapshot.content_revision = self.content_revision;

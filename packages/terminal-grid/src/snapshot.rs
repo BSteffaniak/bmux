@@ -60,6 +60,10 @@ pub struct GridSnapshot {
     pub pending_bytes: Vec<u8>,
     pub styles: Vec<Style>,
     pub rows: Vec<RowSnapshot>,
+    /// Bounded main-screen backing rows while the alternate screen is active.
+    /// Viewport snapshots are also used to resume raw terminal output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_rows: Option<Vec<RowSnapshot>>,
 }
 
 impl GridSnapshot {
@@ -105,6 +109,12 @@ impl GridSnapshot {
             pending_bytes: Vec::new(),
             styles: grid.palette().styles().to_vec(),
             rows: selected_rows,
+            main_rows: (grid.mode() == GridMode::Alternate).then(|| {
+                grid.main_display_rows(0, requested_rows)
+                    .iter()
+                    .map(|row| row_snapshot(row, grid.width()))
+                    .collect()
+            }),
         }
     }
 }
