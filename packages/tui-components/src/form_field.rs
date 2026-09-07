@@ -136,8 +136,12 @@ impl Component for FormFieldComponent<'_> {
             width,
             control.size.height.saturating_add(chrome_height),
         ));
-        LayoutNode::with_children(self.id.clone(), size, vec![ChildLayout::new(0, 1, control)])
-            .with_metadata(LayoutMetadata::new().semantic("form-field"))
+        LayoutNode::with_children(
+            self.id.clone(),
+            size,
+            vec![ChildLayout::new(0, size.height.min(1), control)],
+        )
+        .with_metadata(LayoutMetadata::new().semantic("form-field"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -151,11 +155,10 @@ impl Component for FormFieldComponent<'_> {
         let Some(child) = layout.children.first() else {
             return;
         };
-        let child_height = u16::try_from(child.node.size.height).unwrap_or(u16::MAX);
-        cx.with_child(
-            0,
-            1,
-            LocalRect::new(0, 0, child.node.size.width, child_height),
+        cx.with_child_size(
+            i32::from(child.x),
+            i64::try_from(child.y).unwrap_or(i64::MAX),
+            child.node.size,
             |cx| self.control.paint(&child.node, cx),
         );
         let mut row = child.node.size.height.saturating_add(1);
@@ -186,21 +189,21 @@ impl Component for FormFieldComponent<'_> {
                 &Line::from_spans([Span::styled(error, self.field.styles.error)]),
             );
         }
-        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let area = LocalRect::new(0, 0, layout.size.width, height);
-        cx.push_semantic(SemanticRegion::new(
-            self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, height),
-            "form-field",
-        ));
-        cx.push_damage(area);
+        cx.with_child_size(0, 0, layout.size, |cx| {
+            let area = cx.area();
+            cx.push_semantic_in(
+                area,
+                SemanticRegion::new(self.id.as_str(), Rect::default(), "form-field"),
+            );
+            cx.push_damage(area);
+        });
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
         let Some(child) = layout.children.first() else {
             return EventOutcome::Ignored;
         };
-        self.control.event(event, &child.node, cx)
+        cx.with_child(child, |cx| self.control.event(event, &child.node, cx))
     }
 }
 
@@ -332,6 +335,98 @@ mod tests {
             Some("Missing             ")
         );
         assert_eq!(frame.semantics().regions().len(), 1);
+    }
+
+    #[test]
+    fn tall_control_keeps_last_row_and_footer_visible() {
+        use bmux_tui::prelude::{Line, Text};
+
+        let control = TextBlock::new(Text::from_lines(vec![Line::from("input"); 70_001]));
+        let component = FormFieldComponent::new("field", "Label", control).help("Help");
+        let layout = component.layout(Constraints::new(5, 5, 0, None), &mut LayoutCx::new());
+        assert_eq!(layout.size.height, 70_003);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child_size(0, -70_001, layout.size, |cx| {
+            component.paint(&layout, cx);
+        });
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("input"));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("Help "));
+        let region = &frame.semantics().regions()[0];
+        assert_eq!(region.id, "field");
+        assert_eq!(region.area, Rect::new(0, 0, 5, 2));
+        assert!(
+            frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .is_full()
+        );
+    }
+
+    #[test]
+    fn control_events_use_translated_child_clip() {
+        use bmux_tui::component::{EventCx, LayoutNode};
+        use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::Point;
+
+        struct Control;
+        impl Component for Control {
+            fn layout(&self, constraints: Constraints, _: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::leaf(
+                    "control".into(),
+                    constraints.constrain(LogicalSize::new(8, 1)),
+                )
+            }
+            fn paint(&self, _: &LayoutNode, _: &mut PaintCx<'_, '_>) {}
+            fn event(&self, event: &Event, _: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+                let Event::Mouse(mouse) = event else {
+                    return EventOutcome::Ignored;
+                };
+                if cx.clip().is_some_and(|clip| clip.contains(mouse.position)) {
+                    EventOutcome::Handled
+                } else {
+                    EventOutcome::Ignored
+                }
+            }
+        }
+
+        let component = FormFieldComponent::new("field", "Label", Control);
+        let layout = component.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let mut cx = EventCx::new(&layout);
+        for (y, handled) in [(3, false), (4, true), (5, false)] {
+            let event = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(6, y),
+            ));
+            let outcome = cx.with_transform(0, 0, 5, 3, Rect::new(5, 3, 8, 3), |cx| {
+                component.event(&event, &layout, cx)
+            });
+            assert_eq!(outcome.is_handled(), handled);
+        }
+    }
+
+    #[test]
+    fn empty_and_label_only_fields_keep_control_inside_bounds() {
+        let component = FormFieldComponent::new("field", "Label", TextBlock::new("input"))
+            .help("Help")
+            .error("Error");
+        for height in 0..=1 {
+            let layout = component.layout(
+                Constraints::new(5, 5, 0, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            assert_eq!(layout.size.height, height);
+            let child = &layout.children[0];
+            assert_eq!(child.node.size.height, 0);
+            assert!(child.y + child.node.size.height <= layout.size.height);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 2));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("     "));
+            assert_eq!(
+                frame.buffer().row_symbols(0).as_deref(),
+                Some(if height == 0 { "     " } else { "Label" })
+            );
+        }
     }
 
     #[test]

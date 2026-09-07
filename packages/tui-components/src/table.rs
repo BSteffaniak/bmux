@@ -1538,6 +1538,25 @@ pub struct TableComponent<'a, 'state> {
 }
 
 impl<'a, 'state> TableComponent<'a, 'state> {
+    /// Dispatch through component geometry while retaining table selection details.
+    pub fn handle_event(
+        &self,
+        event: &Event,
+        layout: &LayoutNode,
+        cx: &mut EventCx<'_>,
+    ) -> TableOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return TableOutcome::Ignored;
+        };
+        let table_layout = self.table.layout_with_id(&self.id, area);
+        self.table.handle_event_with_layout(
+            &table_layout,
+            area,
+            &mut self.state.borrow_mut(),
+            event,
+        )
+    }
+
     /// Create a table with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -1600,6 +1619,7 @@ impl Component for TableComponent<'_, '_> {
         format!("{:?}", self.table.policy.horizontal_scrollbar).hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.table.policy).hash(&mut paint);
         for row in self.table.rows {
             row.disabled.hash(&mut paint);
         }
@@ -1645,7 +1665,8 @@ impl Component for TableComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), area)
                 .role(HitRole::ListItem)
-                .hoverable(self.table.policy.mouse.hover)
+                .pointer_events(self.table.policy.mouse.enabled)
+                .hoverable(self.table.policy.mouse.enabled && self.table.policy.mouse.hover)
                 .focusable(true)
                 .enabled(!state.interaction.disabled),
         );
@@ -1659,7 +1680,8 @@ impl Component for TableComponent<'_, '_> {
             cx.push_hit(
                 SceneRegion::new(row_id.clone(), region.rect)
                     .role(HitRole::ListItem)
-                    .hoverable(self.table.policy.mouse.hover)
+                    .pointer_events(self.table.policy.mouse.enabled)
+                    .hoverable(self.table.policy.mouse.enabled && self.table.policy.mouse.hover)
                     .enabled(!state.interaction.disabled && !disabled),
             );
             cx.push_semantic(SemanticRegion::new(row_id, region.rect, "row"));
@@ -1670,17 +1692,7 @@ impl Component for TableComponent<'_, '_> {
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
-        let Some(area) = cx.find_rect(&layout.id) else {
-            return EventOutcome::Ignored;
-        };
-        let table_layout = self.table.layout_with_id(&self.id, area);
-        let outcome = self.table.handle_event_with_layout(
-            &table_layout,
-            area,
-            &mut self.state.borrow_mut(),
-            event,
-        );
-        match outcome {
+        match self.handle_event(event, layout, cx) {
             TableOutcome::Ignored => EventOutcome::Ignored,
             TableOutcome::Redraw | TableOutcome::Focused(_) | TableOutcome::Selected(_) => {
                 EventOutcome::Redraw
@@ -1711,6 +1723,69 @@ mod tests {
         Table, TableAlign, TableColumn, TableComponent, TableHit, TableOutcome, TablePolicy,
         TableRow, TableSortDirection, TableState, TableStyles, format_cell,
     };
+
+    #[test]
+    fn table_paint_revision_tracks_hover_and_sticky_columns() {
+        let columns = [TableColumn::new("Name")];
+        let rows = [TableRow::new(["alpha"])];
+        let state = RefCell::new(TableState::new(Some(0)));
+        let mut policy = TablePolicy::default();
+        policy.mouse.hover = false;
+        let before = TableComponent::new("policy.table", &columns, &rows, &state)
+            .policy(policy)
+            .revision();
+        policy.mouse.hover = true;
+        let hovered = TableComponent::new("policy.table", &columns, &rows, &state)
+            .policy(policy)
+            .revision();
+        assert_eq!(before.layout, hovered.layout);
+        assert_ne!(before.paint, hovered.paint);
+        policy.sticky_left_columns = 1;
+        let sticky = TableComponent::new("policy.table", &columns, &rows, &state)
+            .policy(policy)
+            .revision();
+        assert_eq!(hovered.layout, sticky.layout);
+        assert_ne!(hovered.paint, sticky.paint);
+        policy.sort_ascending_symbol = "ASC";
+        policy.sort_descending_symbol = "DESC";
+        let custom_sort = TableComponent::new("policy.table", &columns, &rows, &state)
+            .policy(policy)
+            .revision();
+        assert_eq!(sticky.layout, custom_sort.layout);
+        assert_ne!(sticky.paint, custom_sort.paint);
+    }
+
+    #[test]
+    fn mouse_disabled_table_retains_keyboard_target() {
+        let columns = [TableColumn::new("Name")];
+        let rows = [TableRow::new(["alpha"])];
+        let state = RefCell::new(TableState::new(Some(0)));
+        let mut policy = TablePolicy::default();
+        policy.mouse.enabled = false;
+        policy.mouse.hover = true;
+        let component = TableComponent::new("table", &columns, &rows, &state).policy(policy);
+        let area = Rect::new(0, 0, 12, 4);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert!(regions[0].focusable);
+        for region in regions {
+            assert!(region.enabled);
+            assert!(!region.pointer_events);
+            assert!(!region.hoverable);
+        }
+        assert_eq!(
+            component.handle_event(
+                &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            TableOutcome::Selected(0),
+        );
+    }
 
     fn render_component(component: &TableComponent<'_, '_>, area: Rect, frame: &mut Frame<'_>) {
         let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
@@ -2211,6 +2286,30 @@ mod tests {
             ),
             Some(TableHit::Cell { row: 0, column: 0 })
         );
+    }
+
+    #[test]
+    fn component_paints_custom_sort_symbol() {
+        let rows = [TableRow::new(["alpha"])];
+        let state = RefCell::new(TableState::new(None));
+        let area = Rect::new(0, 0, 12, 2);
+        let mut buffer = Buffer::empty(area);
+        for (sort, header) in [
+            (Some(TableSortDirection::Descending), "Name DESC   "),
+            (Some(TableSortDirection::Ascending), "Name ASC    "),
+            (None, "Name        "),
+        ] {
+            let columns = [TableColumn::new("Name").sort(sort)];
+            let component = TableComponent::new("sort.table", &columns, &rows, &state)
+                .policy(TablePolicy::bare().sort_symbols("ASC", "DESC"));
+            let mut frame = Frame::new(&mut buffer);
+            render_component(&component, area, &mut frame);
+            assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(header));
+            assert_eq!(
+                frame.buffer().row_symbols(1).as_deref(),
+                Some("alpha       ")
+            );
+        }
     }
 
     #[test]

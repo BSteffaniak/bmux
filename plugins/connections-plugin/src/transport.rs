@@ -93,7 +93,7 @@ async fn connect_ssh(
     paths: &ConfigPaths,
     target: &SshTarget,
 ) -> Result<BmuxClient, ConnectionError> {
-    ensure_ssh_server_ready(target)?;
+    ensure_ssh_server_ready(target).await?;
     let mut command = ssh_command(target);
     command.arg(&target.remote_bmux_path);
     command.args(["server", "bridge", "--stdio"]);
@@ -126,8 +126,8 @@ async fn connect_ssh(
     .map_err(|error| connection_error(target, error))
 }
 
-fn ensure_ssh_server_ready(target: &SshTarget) -> Result<(), ConnectionError> {
-    let status = ssh_bmux_status(target, &["server", "status"])?;
+async fn ensure_ssh_server_ready(target: &SshTarget) -> Result<(), ConnectionError> {
+    let status = ssh_bmux_status(target, &["server", "status"]).await?;
     if status.success() {
         return Ok(());
     }
@@ -137,14 +137,14 @@ fn ensure_ssh_server_ready(target: &SshTarget) -> Result<(), ConnectionError> {
             "remote bmux server is not running and server_start_mode=require_running",
         ));
     }
-    let status = ssh_bmux_status(target, &["server", "start", "--daemon"])?;
+    let status = ssh_bmux_status(target, &["server", "start", "--daemon"]).await?;
     if !status.success() {
         return Err(connection_failure(
             target,
             "remote bmux server failed to start automatically",
         ));
     }
-    let status = ssh_bmux_status(target, &["server", "status"])?;
+    let status = ssh_bmux_status(target, &["server", "status"]).await?;
     if status.success() {
         Ok(())
     } else {
@@ -155,7 +155,7 @@ fn ensure_ssh_server_ready(target: &SshTarget) -> Result<(), ConnectionError> {
     }
 }
 
-fn ssh_bmux_status(
+async fn ssh_bmux_status(
     target: &SshTarget,
     arguments: &[&str],
 ) -> Result<std::process::ExitStatus, ConnectionError> {
@@ -164,14 +164,20 @@ fn ssh_bmux_status(
     command.stdin(Stdio::null());
     command.stdout(Stdio::null());
     command.stderr(Stdio::null());
-    command
-        .as_std_mut()
-        .status()
-        .map_err(|error| connection_error(target, error))
+    tokio::time::timeout(
+        Duration::from_millis(target.connect_timeout_ms),
+        command.status(),
+    )
+    .await
+    .map_err(|_| connection_failure(target, "SSH readiness command timed out"))?
+    .map_err(|error| connection_error(target, error))
 }
 
 fn ssh_command(target: &SshTarget) -> Command {
     let mut command = Command::new("ssh");
+    // Invocation timeouts cancel readiness checks and bridge setup. Do not
+    // leave their SSH processes running after the owning future is dropped.
+    command.kill_on_drop(true);
     command.arg("-T");
     if let Some(port) = target.port {
         command.args(["-p", &port.to_string()]);
@@ -854,6 +860,82 @@ mod tests {
         assert!(remote_compression_enabled(&config));
         config.behavior.compression.enabled = false;
         assert!(!remote_compression_enabled(&config));
+    }
+
+    #[tokio::test]
+    async fn ssh_readiness_timeout_closes_stalled_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = SshTarget {
+            reference: "timeout-test".to_string(),
+            label: "timeout-test".to_string(),
+            host: "127.0.0.1".to_string(),
+            user: None,
+            port: Some(listener.local_addr().unwrap().port()),
+            identity_file: None,
+            known_hosts_file: None,
+            strict_host_key_checking: true,
+            jump: None,
+            remote_bmux_path: "bmux".to_string(),
+            connect_timeout_ms: 500,
+            server_start_mode: RemoteServerStartMode::RequireRunning,
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(ensure_ssh_server_ready(&target), async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes).await.unwrap();
+                assert!(bytes.starts_with(b"SSH-2.0-"));
+            })
+        })
+        .await
+        .expect("readiness timeout terminates SSH");
+        let error = result.expect_err("stalled handshake must time out");
+        assert!(format!("{error:?}").contains("SSH readiness command timed out"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_ssh_readiness_closes_pending_handshake() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind handshake listener");
+        let target = SshTarget {
+            reference: "cancel-test".to_string(),
+            label: "cancel-test".to_string(),
+            host: "127.0.0.1".to_string(),
+            user: None,
+            port: Some(listener.local_addr().expect("listener address").port()),
+            identity_file: None,
+            known_hosts_file: None,
+            strict_host_key_checking: true,
+            jump: None,
+            remote_bmux_path: "bmux".to_string(),
+            connect_timeout_ms: 60_000,
+            server_start_mode: RemoteServerStartMode::RequireRunning,
+        };
+        let mut readiness = Box::pin(ensure_ssh_server_ready(&target));
+        let (stream, _) = tokio::select! {
+            result = &mut readiness => panic!("readiness completed before handshake: {result:?}"),
+            accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()) => {
+                accepted.expect("SSH connects").expect("accept SSH")
+            }
+        };
+        let mut reader = BufReader::new(stream);
+        let mut banner = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut banner))
+            .await
+            .expect("SSH sends banner")
+            .expect("read SSH banner");
+        assert!(banner.starts_with("SSH-2.0-"));
+        drop(readiness);
+        let mut remaining = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_to_end(&mut remaining))
+            .await
+            .expect("cancelling SSH readiness closes the connection before its connect timeout")
+            .expect("read EOF after cancellation");
     }
 
     #[test]

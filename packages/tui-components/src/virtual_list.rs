@@ -244,7 +244,9 @@ where
     }
 
     /// Synchronize exact current-width measurements, retaining unchanged keyed
-    /// layouts across reorder.
+    /// layouts across reorder. This checks the collection's keys and revisions;
+    /// reuse retained state for pure scrolling without calling this again. Sync
+    /// before painting after item, layout revision, width, or environment changes.
     ///
     /// # Panics
     ///
@@ -538,6 +540,125 @@ mod tests {
     use bmux_tui::selection::{SelectionFragment, SelectionScope};
     use bmux_tui::style::Style;
     use bmux_tui::text::{Line, Text};
+
+    #[test]
+    fn retained_card_scrolling_matches_full_render_without_resync() {
+        use bmux_tui::composition::{Column, Surface};
+        use bmux_tui::geometry::Insets;
+        use bmux_tui::style::Color;
+
+        let list = (0..8).fold(VirtualList::new("cards"), |list, index| {
+            let style = Style::new().bg(Color::Blue);
+            list.component(
+                index,
+                Surface::new(
+                    Column::new()
+                        .child(TextBlock::new(format!("Author {index}")))
+                        .child(TextBlock::new("界 wrapped body ".repeat(index % 3 + 1))),
+                )
+                .padding(Insets::all(1))
+                .background(style)
+                .content_style(style),
+            )
+        });
+        let mut state = VirtualListState::new(1);
+        list.sync(12, &mut state, &mut LayoutCx::new());
+        let height = u16::try_from(state.total_height()).unwrap();
+        let mut full = Buffer::empty(Rect::new(0, 0, 12, height));
+        list.paint(
+            Rect::new(0, 0, 12, height),
+            &state,
+            &mut PaintCx::new(&mut Frame::new(&mut full)),
+        );
+        let viewport = Rect::new(0, 0, 12, 4);
+        loop {
+            let mut clipped = Buffer::empty(viewport);
+            list.paint(
+                viewport,
+                &state,
+                &mut PaintCx::new(&mut Frame::new(&mut clipped)),
+            );
+            let offset = u16::try_from(state.scroll.vertical_offset()).unwrap();
+            for y in 0..viewport.height {
+                for x in 0..viewport.width {
+                    assert_eq!(
+                        clipped.get(Point::new(x, y)),
+                        full.get(Point::new(x, y + offset)),
+                        "cell ({x}, {y}) at offset {offset}"
+                    );
+                }
+            }
+            let mut nested = Buffer::empty(Rect::new(0, 0, 16, 8));
+            let mut frame = Frame::new(&mut nested);
+            PaintCx::new(&mut frame).with_child(2, 2, LocalRect::new(0, 1, 12, 2), |cx| {
+                list.paint(viewport, &state, cx);
+            });
+            let parent_clip = Rect::new(2, 3, 12, 2);
+            let expected_areas = clipped_card_areas(&state, offset);
+            assert_eq!(
+                frame
+                    .semantics()
+                    .regions()
+                    .iter()
+                    .map(|region| region.area)
+                    .collect::<Vec<_>>(),
+                expected_areas,
+                "semantic coverage at offset {offset}"
+            );
+            for region in frame.hits().regions() {
+                assert!(!region.area.is_empty());
+                assert_eq!(region.area.intersection(parent_clip), region.area);
+            }
+            assert_eq!(
+                frame
+                    .hits()
+                    .regions()
+                    .iter()
+                    .filter(|region| region.focusable)
+                    .map(|region| region.area)
+                    .collect::<Vec<_>>(),
+                expected_areas,
+                "focus coverage at offset {offset}"
+            );
+            let untouched = Buffer::empty(Rect::new(0, 0, 16, 8));
+            for y in 0..8 {
+                for x in 0..16 {
+                    let expected = if (2..14).contains(&x) && (3..5).contains(&y) {
+                        full.get(Point::new(x - 2, y - 2 + offset))
+                    } else {
+                        untouched.get(Point::new(x, y))
+                    };
+                    assert_eq!(
+                        nested.get(Point::new(x, y)),
+                        expected,
+                        "nested cell ({x}, {y}) at offset {offset}"
+                    );
+                }
+            }
+            if !state.scroll_by(1, usize::from(viewport.height)) {
+                break;
+            }
+        }
+    }
+
+    fn clipped_card_areas(state: &VirtualListState<usize>, offset: u16) -> Vec<Rect> {
+        (0..8)
+            .filter_map(|index| {
+                let start = state.item_offset(&index).unwrap();
+                let height = state.index.item(index).unwrap().height;
+                let visible_start = start.max(usize::from(offset) + 1);
+                let visible_end = (start + height).min(usize::from(offset) + 3);
+                (visible_start < visible_end).then(|| {
+                    Rect::new(
+                        2,
+                        u16::try_from(visible_start - usize::from(offset) + 2).unwrap(),
+                        12,
+                        u16::try_from(visible_end - visible_start).unwrap(),
+                    )
+                })
+            })
+            .collect()
+    }
 
     #[test]
     fn rejects_colliding_key_strings_before_changing_retained_state() {
@@ -885,6 +1006,68 @@ mod tests {
                 EventOutcome::Ignored
             }
         }
+    }
+
+    #[test]
+    fn translated_pointer_routing_respects_parent_clip_and_item_gaps() {
+        let list = VirtualList::new("events")
+            .component(
+                0,
+                EventItem {
+                    id: "first",
+                    height: 3,
+                    outcome: EventOutcome::Handled,
+                },
+            )
+            .component(
+                1,
+                EventItem {
+                    id: "second",
+                    height: 2,
+                    outcome: EventOutcome::Redraw,
+                },
+            );
+        let mut state = VirtualListState::new(1);
+        list.sync(8, &mut state, &mut LayoutCx::new());
+        state.scroll.set_vertical_offset(1);
+        let area = Rect::new(0, 0, 8, 5);
+        let root = LayoutNode::leaf("root".into(), LogicalSize::new(8, 5));
+        let clip = Rect::new(4, 7, 8, 3);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 12));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(4, 6, LocalRect::new(0, 1, 8, 3), |cx| {
+            list.paint(area, &state, cx);
+        });
+        assert_eq!(
+            frame
+                .semantics()
+                .regions()
+                .iter()
+                .map(|region| region.area)
+                .collect::<Vec<_>>(),
+            vec![Rect::new(4, 7, 8, 1), Rect::new(4, 9, 8, 1)]
+        );
+        EventCx::new(&root).with_transform(0, 0, 4, 6, clip, |cx| {
+            for (point, expected) in [
+                (Point::new(4, 6), EventOutcome::Ignored),
+                (Point::new(4, 7), EventOutcome::Handled),
+                (Point::new(4, 8), EventOutcome::Ignored),
+                (Point::new(4, 9), EventOutcome::Redraw),
+                (Point::new(4, 10), EventOutcome::Ignored),
+                (Point::new(3, 7), EventOutcome::Ignored),
+                (Point::new(12, 9), EventOutcome::Ignored),
+            ] {
+                let event = Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    point,
+                ));
+                assert_eq!(
+                    list.event(area, &state, &event, cx),
+                    expected,
+                    "pointer {point:?}"
+                );
+            }
+        });
     }
 
     #[test]

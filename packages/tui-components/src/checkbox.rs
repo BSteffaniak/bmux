@@ -228,7 +228,8 @@ impl Component for CheckboxComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), Rect::new(0, 0, layout.size.width, 1))
                 .role(HitRole::Action)
-                .hoverable(self.checkbox.policy.mouse.hover)
+                .pointer_events(self.checkbox.policy.mouse.enabled)
+                .hoverable(self.checkbox.policy.mouse.enabled && self.checkbox.policy.mouse.hover)
                 .focusable(true)
                 .enabled(!state.interaction.disabled),
         );
@@ -244,7 +245,21 @@ impl Component for CheckboxComponent<'_, '_> {
         let Some(area) = cx.find_rect(&layout.id) else {
             return EventOutcome::Ignored;
         };
+        let area = cx
+            .visible_rect(bmux_tui::component::LogicalRect::new(
+                0,
+                0,
+                layout.size.width,
+                1,
+            ))
+            .intersection(area);
         let mut state = self.state.get();
+        // Hidden controls still reconcile input policy, but cannot activate.
+        let event = if area.is_empty() && !matches!(event, Event::Focus(_) | Event::Resize(_)) {
+            &Event::Tick
+        } else {
+            event
+        };
         let outcome = self.checkbox.handle_event(area, &mut state, event);
         self.state.set(state);
         match outcome {
@@ -294,15 +309,49 @@ impl<'a> Checkbox<'a> {
         state: &mut CheckboxState,
         event: &Event,
     ) -> CheckboxOutcome {
-        if state.interaction.disabled {
-            return CheckboxOutcome::Ignored;
+        let mut cancelled = false;
+        if state.interaction.disabled || !self.policy.mouse.enabled {
+            cancelled = state.interaction.hovered || state.interaction.pressed;
+            state.interaction.hovered = false;
+            state.interaction.pressed = false;
+        } else {
+            if !self.policy.mouse.hover {
+                cancelled |= state.interaction.hovered;
+                state.interaction.hovered = false;
+            }
+            if !self.policy.mouse.click {
+                cancelled |= state.interaction.pressed;
+                state.interaction.pressed = false;
+            }
         }
-        match event {
+        if state.interaction.disabled {
+            return if cancelled {
+                CheckboxOutcome::Redraw
+            } else {
+                CheckboxOutcome::Ignored
+            };
+        }
+        let outcome = match event {
             Event::Key(stroke) => self.handle_key(state, *stroke),
             Event::Mouse(mouse) => self.handle_mouse(area, state, *mouse),
-            Event::Resize(_) | Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
+            Event::Focus(bmux_tui::event::FocusEvent::Lost) | Event::Resize(_) => {
+                let changed = state.interaction.hovered || state.interaction.pressed;
+                state.interaction.hovered = false;
+                state.interaction.pressed = false;
+                if changed {
+                    CheckboxOutcome::Redraw
+                } else {
+                    CheckboxOutcome::Ignored
+                }
+            }
+            Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
                 CheckboxOutcome::Ignored
             }
+        };
+        if cancelled && matches!(outcome, CheckboxOutcome::Ignored) {
+            CheckboxOutcome::Redraw
+        } else {
+            outcome
         }
     }
 
@@ -376,13 +425,13 @@ impl<'a> Checkbox<'a> {
             }
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click && inside => {
                 state.interaction.pressed = true;
-                state.interaction.hovered = true;
+                state.interaction.hovered = self.policy.mouse.hover;
                 CheckboxOutcome::Redraw
             }
-            MouseEventKind::Up(MouseButton::Left) if self.policy.mouse.click => {
+            MouseEventKind::Up(MouseButton::Left) => {
                 let was_pressed = state.interaction.pressed;
                 state.interaction.pressed = false;
-                if was_pressed && inside {
+                if was_pressed && inside && self.policy.mouse.click {
                     toggle(state)
                 } else if was_pressed {
                     CheckboxOutcome::Redraw
@@ -392,8 +441,9 @@ impl<'a> Checkbox<'a> {
             }
             MouseEventKind::Drag(MouseButton::Left) if self.policy.mouse.click => {
                 let pressed = state.interaction.pressed && inside;
-                if state.interaction.hovered != inside || state.interaction.pressed != pressed {
-                    state.interaction.hovered = inside;
+                let hovered = inside && self.policy.mouse.hover;
+                if state.interaction.hovered != hovered || state.interaction.pressed != pressed {
+                    state.interaction.hovered = hovered;
                     state.interaction.pressed = pressed;
                     CheckboxOutcome::Redraw
                 } else {
@@ -444,8 +494,8 @@ mod tests {
 
     use bmux_keyboard::{KeyCode, KeyStroke};
     use bmux_tui::buffer::Buffer;
-    use bmux_tui::component::{Component, Constraints, LayoutCx};
-    use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+    use bmux_tui::component::{Component, Constraints, EventCx, LayoutCx};
+    use bmux_tui::event::{Event, EventOutcome, MouseButton, MouseEvent, MouseEventKind};
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Rect, Size};
     use bmux_tui::hit::HitRole;
@@ -463,6 +513,339 @@ mod tests {
             LocalRect::new(0, 0, area.width, area.height),
             |cx| checkbox.paint(&layout, cx),
         );
+    }
+
+    #[test]
+    fn tall_layout_only_toggles_the_painted_checkbox_row() {
+        let state = Cell::new(CheckboxState::new(false));
+        let checkbox = CheckboxComponent::new("enable", "Enable", &state);
+        let layout = checkbox.layout(Constraints::new(10, 10, 3, Some(3)), &mut LayoutCx::new());
+        for (dy, clip, point) in [
+            (2, Rect::new(4, 2, 10, 3), Point::new(5, 3)),
+            (1, Rect::new(4, 2, 10, 2), Point::new(5, 2)),
+        ] {
+            bmux_tui::component::EventCx::new(&layout).with_transform(0, 0, 4, dy, clip, |cx| {
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    checkbox.event(&Event::Mouse(MouseEvent::new(kind, point)), &layout, cx);
+                    assert_eq!(state.get(), CheckboxState::new(false));
+                }
+            });
+        }
+        bmux_tui::component::EventCx::new(&layout).with_transform(
+            0,
+            0,
+            4,
+            2,
+            Rect::new(4, 2, 10, 3),
+            |cx| {
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    checkbox.event(
+                        &Event::Mouse(MouseEvent::new(kind, Point::new(5, 2))),
+                        &layout,
+                        cx,
+                    );
+                }
+            },
+        );
+        assert!(state.get().checked());
+    }
+
+    #[test]
+    fn mouse_disabled_checkbox_preserves_keyboard_toggle() {
+        let mut initial = CheckboxState::new(false);
+        initial.interaction.focused = true;
+        let state = Cell::new(initial);
+        let mut policy = CheckboxPolicy::interactive();
+        policy.mouse.enabled = false;
+        let checkbox = CheckboxComponent::new("enable", "Enable", &state).policy(policy);
+        let layout = checkbox.layout(Constraints::for_width(10), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut frame = Frame::new(&mut buffer);
+        checkbox.paint(&layout, &mut PaintCx::new(&mut frame));
+        let hit = &frame.hits().regions()[0];
+        assert!(hit.enabled && hit.focusable);
+        assert!(!hit.pointer_events && !hit.hoverable);
+        let mut cx = bmux_tui::component::EventCx::new(&layout);
+        assert!(
+            !checkbox
+                .event(
+                    &Event::Mouse(MouseEvent::new(
+                        MouseEventKind::Down(MouseButton::Left),
+                        Point::new(1, 0)
+                    )),
+                    &layout,
+                    &mut cx,
+                )
+                .is_handled()
+        );
+        assert_eq!(state.get(), initial);
+        assert!(
+            checkbox
+                .event(
+                    &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                    &layout,
+                    &mut cx,
+                )
+                .is_handled()
+        );
+        assert!(state.get().checked());
+    }
+
+    #[test]
+    fn focus_loss_and_resize_cancel_click_even_in_empty_layouts() {
+        let mut initial = CheckboxState::new(false);
+        initial.interaction.pressed = true;
+        initial.interaction.hovered = true;
+        let state = Cell::new(initial);
+        let component = CheckboxComponent::new("check", "Enable", &state);
+        let visible = component.layout(Constraints::tight(Size::new(10, 1)), &mut LayoutCx::new());
+        for (width, height) in [(10, 1), (0, 1), (10, 0), (0, 0)] {
+            let layout = component.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            for event in [
+                Event::Focus(bmux_tui::event::FocusEvent::Lost),
+                Event::Resize(Size::new(10, 1)),
+            ] {
+                state.set(initial);
+                let mut cx = bmux_tui::component::EventCx::new(&layout);
+                assert_eq!(
+                    component.event(&event, &layout, &mut cx),
+                    bmux_tui::event::EventOutcome::Redraw
+                );
+                assert!(!state.get().interaction.pressed);
+                assert!(!state.get().interaction.hovered);
+                let release = Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(1, 0),
+                ));
+                component.event(
+                    &release,
+                    &visible,
+                    &mut bmux_tui::component::EventCx::new(&visible),
+                );
+                assert!(!state.get().checked);
+            }
+        }
+    }
+
+    #[test]
+    fn clipped_checkbox_row_cannot_toggle_through_blank_layout_rows() {
+        let mut initial = CheckboxState::new(false);
+        initial.interaction.focused = true;
+        let state = Cell::new(initial);
+        let component = CheckboxComponent::new("enable", "Enable", &state);
+        let layout = component.layout(Constraints::new(10, 10, 3, Some(3)), &mut LayoutCx::new());
+        EventCx::new(&layout).with_transform(0, 0, 0, 0, Rect::new(0, 1, 10, 2), |cx| {
+            assert!(
+                cx.find_rect(&layout.id)
+                    .is_some_and(|rect| !rect.is_empty())
+            );
+            assert!(
+                !component
+                    .event(&Event::Key(KeyStroke::simple(KeyCode::Enter)), &layout, cx)
+                    .is_handled()
+            );
+        });
+        assert_eq!(state.get(), initial);
+    }
+
+    #[test]
+    fn hidden_checkbox_reconciles_pointer_policy_without_activating() {
+        for (width, height) in [(0, 1), (10, 0), (0, 0)] {
+            let mut initial = CheckboxState::new(false);
+            initial.interaction.focused = true;
+            initial.interaction.pressed = true;
+            initial.interaction.hovered = true;
+            let state = Cell::new(initial);
+            let mut policy = CheckboxPolicy::default();
+            policy.mouse.enabled = false;
+            let checkbox = CheckboxComponent::new("enable", "Enable", &state).policy(policy);
+            let layout = checkbox.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            assert_eq!(
+                checkbox.event(
+                    &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                    &layout,
+                    &mut EventCx::new(&layout),
+                ),
+                EventOutcome::Redraw
+            );
+            assert!(!state.get().checked);
+            assert!(!state.get().interaction.pressed);
+            assert!(!state.get().interaction.hovered);
+            assert!(state.get().interaction.focused);
+            let enabled = CheckboxComponent::new("enable", "Enable", &state);
+            let visible = enabled.layout(Constraints::for_width(10), &mut LayoutCx::new());
+            enabled.event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(1, 0),
+                )),
+                &visible,
+                &mut EventCx::new(&visible),
+            );
+            assert!(!state.get().checked);
+        }
+    }
+
+    #[test]
+    fn hover_disabled_checkbox_press_and_drag_still_toggle() {
+        let area = Rect::new(0, 0, 10, 1);
+        let mut policy = CheckboxPolicy::default();
+        policy.mouse.hover = false;
+        let checkbox = Checkbox::new("Enable").policy(policy);
+        let mut state = CheckboxState::new(false);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        ] {
+            checkbox.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(kind, Point::new(1, 0))),
+            );
+            assert!(state.interaction.pressed);
+            assert!(!state.interaction.hovered);
+            assert!(!state.checked);
+        }
+        assert_eq!(
+            checkbox.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(1, 0),
+                )),
+            ),
+            CheckboxOutcome::Toggled(true)
+        );
+        assert!(!state.interaction.pressed);
+        assert!(!state.interaction.hovered);
+    }
+
+    #[test]
+    fn disabling_pointer_input_cancels_pending_checkbox_press() {
+        let area = Rect::new(0, 0, 10, 1);
+        for disable in 0..3 {
+            let mut state = CheckboxState::new(false);
+            state.interaction.focused = true;
+            let checkbox = Checkbox::new("Enable");
+            checkbox.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(1, 0),
+                )),
+            );
+            assert!(state.interaction.pressed);
+            let mut policy = CheckboxPolicy::default();
+            match disable {
+                0 => policy.mouse.enabled = false,
+                1 => policy.mouse.click = false,
+                _ => state.interaction.disabled = true,
+            }
+            assert_eq!(
+                checkbox
+                    .policy(policy)
+                    .handle_event(area, &mut state, &Event::Tick),
+                CheckboxOutcome::Redraw
+            );
+            assert!(!state.interaction.pressed);
+            assert!(!state.checked);
+            state.interaction.disabled = false;
+            assert_eq!(
+                checkbox.handle_event(
+                    area,
+                    &mut state,
+                    &Event::Mouse(MouseEvent::new(
+                        MouseEventKind::Up(MouseButton::Left),
+                        Point::new(1, 0),
+                    )),
+                ),
+                CheckboxOutcome::Ignored
+            );
+            assert!(!state.checked);
+            assert_eq!(
+                checkbox.policy(policy).handle_event(
+                    area,
+                    &mut state,
+                    &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                ),
+                CheckboxOutcome::Toggled(true)
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_click_before_release_cancels_pending_toggle() {
+        let area = Rect::new(0, 0, 10, 1);
+        let mut state = CheckboxState::new(false);
+        let down = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(1, 0),
+        ));
+        Checkbox::new("Enable").handle_event(area, &mut state, &down);
+        assert!(state.interaction.pressed);
+        let mut policy = CheckboxPolicy::default();
+        policy.mouse.click = false;
+        let release = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            Point::new(1, 0),
+        ));
+        assert_eq!(
+            Checkbox::new("Enable")
+                .policy(policy)
+                .handle_event(area, &mut state, &release),
+            CheckboxOutcome::Redraw
+        );
+        assert!(!state.interaction.pressed);
+        assert!(!state.checked);
+        assert_eq!(
+            Checkbox::new("Enable").handle_event(area, &mut state, &release),
+            CheckboxOutcome::Ignored
+        );
+        assert!(!state.checked);
+    }
+
+    #[test]
+    fn empty_checkbox_does_not_toggle_or_publish_regions() {
+        let mut initial = CheckboxState::new(false);
+        initial.interaction.focused = true;
+        let state = Cell::new(initial);
+        let checkbox = CheckboxComponent::new("enable", "Enable", &state);
+        for (width, height) in [(0, 1), (10, 0), (0, 0)] {
+            let layout = checkbox.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+            let mut frame = Frame::new(&mut buffer);
+            checkbox.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert!(frame.hits().regions().is_empty());
+            assert!(frame.semantics().regions().is_empty());
+            assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("          "));
+            assert!(
+                !checkbox
+                    .event(
+                        &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                        &layout,
+                        &mut bmux_tui::component::EventCx::new(&layout),
+                    )
+                    .is_handled()
+            );
+            assert_eq!(state.get(), initial);
+        }
     }
 
     #[test]

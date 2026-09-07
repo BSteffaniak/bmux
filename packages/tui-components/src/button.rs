@@ -224,6 +224,9 @@ impl Component for ButtonComponent<'_, '_> {
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if layout.size.width == 0 || layout.size.height == 0 {
+            return;
+        }
         let state = self.state.get();
         let line = Line::from_spans(vec![Span::styled(
             format!("[ {} ]", self.button.label),
@@ -233,7 +236,8 @@ impl Component for ButtonComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), Rect::new(0, 0, layout.size.width, 1))
                 .role(HitRole::Action)
-                .hoverable(self.button.policy.mouse.hover)
+                .pointer_events(self.button.policy.mouse.enabled)
+                .hoverable(self.button.policy.mouse.enabled && self.button.policy.mouse.hover)
                 .focusable(true)
                 .enabled(!state.interaction.disabled),
         );
@@ -248,6 +252,20 @@ impl Component for ButtonComponent<'_, '_> {
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
         let Some(area) = cx.find_rect(&layout.id) else {
             return EventOutcome::Ignored;
+        };
+        let area = cx
+            .visible_rect(bmux_tui::component::LogicalRect::new(
+                0,
+                0,
+                layout.size.width,
+                1,
+            ))
+            .intersection(area);
+        // Visibility follows the painted row, not unused rows in a tall layout.
+        let event = if area.is_empty() && !matches!(event, Event::Focus(_) | Event::Resize(_)) {
+            &Event::Tick
+        } else {
+            event
         };
         let mut state = self.state.get();
         let outcome = self.button.handle_event(area, &mut state, event);
@@ -306,15 +324,44 @@ impl<'a> Button<'a> {
         state: &mut ButtonState,
         event: &Event,
     ) -> ButtonOutcome {
-        if state.interaction.disabled {
-            return ButtonOutcome::Ignored;
+        let initial_hovered = state.interaction.hovered;
+        let initial_pressed = state.interaction.pressed;
+        if state.interaction.disabled || !self.policy.mouse.enabled || !self.policy.mouse.hover {
+            state.interaction.hovered = false;
         }
-        match event {
+        if state.interaction.disabled || !self.policy.mouse.enabled || !self.policy.mouse.click {
+            state.interaction.pressed = false;
+        }
+        let cancelled = initial_hovered != state.interaction.hovered
+            || initial_pressed != state.interaction.pressed;
+        if state.interaction.disabled {
+            return if cancelled {
+                ButtonOutcome::Redraw
+            } else {
+                ButtonOutcome::Ignored
+            };
+        }
+        let outcome = match event {
             Event::Key(stroke) => self.handle_key(*stroke),
             Event::Mouse(mouse) => self.handle_mouse(area, state, *mouse),
-            Event::Resize(_) | Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
+            Event::Focus(bmux_tui::event::FocusEvent::Lost) | Event::Resize(_) => {
+                let changed = state.interaction.hovered || state.interaction.pressed;
+                state.interaction.hovered = false;
+                state.interaction.pressed = false;
+                if changed {
+                    ButtonOutcome::Redraw
+                } else {
+                    ButtonOutcome::Ignored
+                }
+            }
+            Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
                 ButtonOutcome::Ignored
             }
+        };
+        if cancelled && matches!(outcome, ButtonOutcome::Ignored | ButtonOutcome::Handled) {
+            ButtonOutcome::Redraw
+        } else {
+            outcome
         }
     }
 
@@ -377,15 +424,15 @@ impl<'a> Button<'a> {
             }
             MouseEventKind::Up(MouseButton::Left) if state.interaction.pressed => {
                 state.interaction.pressed = false;
-                state.interaction.hovered = contains;
-                if contains {
+                state.interaction.hovered = contains && self.policy.mouse.hover;
+                if contains && self.policy.mouse.click {
                     ButtonOutcome::Pressed
                 } else {
                     ButtonOutcome::Redraw
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if state.interaction.pressed => {
-                set_hovered(state, contains)
+                set_hovered(state, contains && self.policy.mouse.hover)
             }
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
@@ -442,6 +489,325 @@ mod tests {
     use bmux_tui::paint::PaintCx;
 
     use super::{Button, ButtonComponent, ButtonOutcome, ButtonState};
+
+    #[test]
+    fn clipped_button_row_cannot_activate_through_blank_layout_rows() {
+        let state = Cell::new(ButtonState::new());
+        let component = ButtonComponent::new("save", "Save", &state);
+        let layout = component.layout(Constraints::new(10, 10, 3, Some(3)), &mut LayoutCx::new());
+        EventCx::new(&layout).with_transform(0, 0, 0, 0, Rect::new(0, 1, 10, 2), |cx| {
+            assert!(
+                cx.find_rect(&layout.id)
+                    .is_some_and(|rect| !rect.is_empty())
+            );
+            assert!(
+                !component
+                    .event(&Event::Key(KeyStroke::simple(KeyCode::Enter)), &layout, cx)
+                    .is_handled()
+            );
+        });
+        assert_eq!(state.get(), ButtonState::new());
+    }
+
+    #[test]
+    fn hidden_button_cancels_disabled_pointer_without_activation() {
+        for (width, height) in [(0, 1), (10, 0), (0, 0)] {
+            let mut initial = ButtonState::new();
+            initial.interaction.pressed = true;
+            initial.interaction.hovered = true;
+            initial.interaction.focused = true;
+            let state = Cell::new(initial);
+            let mut component = ButtonComponent::new("save", "Save", &state);
+            component.button.policy.mouse.enabled = false;
+            let layout = component.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            let enter = Event::Key(KeyStroke::simple(KeyCode::Enter));
+            assert!(
+                component
+                    .event(&enter, &layout, &mut EventCx::new(&layout))
+                    .is_handled()
+            );
+            assert!(!state.get().interaction.pressed);
+            assert!(!state.get().interaction.hovered);
+            assert!(state.get().interaction.focused);
+            assert!(
+                !component
+                    .event(&enter, &layout, &mut EventCx::new(&layout))
+                    .is_handled()
+            );
+            component.button.policy.mouse.enabled = true;
+            let visible = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
+            assert!(
+                !component
+                    .event(
+                        &Event::Mouse(MouseEvent::new(
+                            MouseEventKind::Up(MouseButton::Left),
+                            Point::new(1, 0),
+                        )),
+                        &visible,
+                        &mut EventCx::new(&visible),
+                    )
+                    .is_handled()
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_button_pointer_cancels_press_without_blocking_keyboard() {
+        let area = Rect::new(0, 0, 10, 1);
+        for disable in 0..3 {
+            let mut button = Button::new("Save");
+            let mut state = ButtonState::new();
+            button.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(1, 0),
+                )),
+            );
+            assert!(state.interaction.pressed);
+            match disable {
+                0 => button.policy.mouse.enabled = false,
+                1 => button.policy.mouse.click = false,
+                _ => state.interaction.disabled = true,
+            }
+            assert_eq!(
+                button.handle_event(area, &mut state, &Event::Tick),
+                ButtonOutcome::Redraw
+            );
+            assert!(!state.interaction.pressed);
+            state.interaction.disabled = false;
+            assert_eq!(
+                button.handle_event(
+                    area,
+                    &mut state,
+                    &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                ),
+                ButtonOutcome::Pressed
+            );
+            assert_eq!(
+                Button::new("Save").handle_event(
+                    area,
+                    &mut state,
+                    &Event::Mouse(MouseEvent::new(
+                        MouseEventKind::Up(MouseButton::Left),
+                        Point::new(1, 0),
+                    )),
+                ),
+                ButtonOutcome::Ignored
+            );
+        }
+    }
+
+    #[test]
+    fn hover_disabled_button_drag_and_release_still_activate() {
+        let area = Rect::new(0, 0, 10, 1);
+        let mut button = Button::new("Save");
+        button.policy.mouse.hover = false;
+        let mut state = ButtonState::new();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        ] {
+            button.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(kind, Point::new(1, 0))),
+            );
+            assert!(state.interaction.pressed);
+            assert!(!state.interaction.hovered);
+        }
+        assert_eq!(
+            button.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(1, 0),
+                )),
+            ),
+            ButtonOutcome::Pressed
+        );
+        assert!(!state.interaction.pressed);
+        assert!(!state.interaction.hovered);
+    }
+
+    #[test]
+    fn tall_layout_only_activates_the_painted_button_row() {
+        let state = Cell::new(ButtonState::new());
+        let button = ButtonComponent::new("save", "Save", &state);
+        let layout = button.layout(Constraints::new(8, 8, 3, Some(3)), &mut LayoutCx::new());
+        for (dy, clip, point) in [
+            (2, Rect::new(4, 2, 8, 3), Point::new(5, 3)),
+            (1, Rect::new(4, 2, 8, 2), Point::new(5, 2)),
+        ] {
+            EventCx::new(&layout).with_transform(0, 0, 4, dy, clip, |cx| {
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    button.event(&Event::Mouse(MouseEvent::new(kind, point)), &layout, cx);
+                    assert_eq!(state.get(), ButtonState::new());
+                }
+            });
+        }
+        EventCx::new(&layout).with_transform(0, 0, 4, 2, Rect::new(4, 2, 8, 3), |cx| {
+            assert!(
+                button
+                    .event(
+                        &Event::Mouse(MouseEvent::new(
+                            MouseEventKind::Down(MouseButton::Left),
+                            Point::new(5, 2)
+                        )),
+                        &layout,
+                        cx
+                    )
+                    .is_handled()
+            );
+        });
+    }
+
+    #[test]
+    fn focus_loss_and_resize_cancel_pending_button_click() {
+        let mut initial = ButtonState::new();
+        initial.interaction.pressed = true;
+        initial.interaction.hovered = true;
+        let state = Cell::new(initial);
+        let component = ButtonComponent::new("save", "Save", &state);
+        for (width, height) in [(8, 1), (0, 1), (8, 0), (0, 0)] {
+            let layout = component.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            for event in [
+                Event::Focus(bmux_tui::event::FocusEvent::Lost),
+                Event::Resize(Rect::new(0, 0, 8, 1).size()),
+            ] {
+                state.set(initial);
+                let mut cx = EventCx::new(&layout);
+                assert_eq!(
+                    component.event(&event, &layout, &mut cx),
+                    bmux_tui::event::EventOutcome::Redraw
+                );
+                assert!(!state.get().interaction.pressed);
+                assert!(!state.get().interaction.hovered);
+                let mut released = state.get();
+                let outcome = Button::new("Save").handle_event(
+                    Rect::new(0, 0, 8, 1),
+                    &mut released,
+                    &Event::Mouse(MouseEvent::new(
+                        MouseEventKind::Up(MouseButton::Left),
+                        Point::new(1, 0),
+                    )),
+                );
+                assert_ne!(outcome, ButtonOutcome::Pressed);
+            }
+        }
+    }
+
+    #[test]
+    fn disabling_click_before_release_cancels_activation() {
+        let area = Rect::new(0, 0, 8, 1);
+        let mut state = ButtonState::new();
+        let down = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(1, 0),
+        ));
+        Button::new("Save").handle_event(area, &mut state, &down);
+        assert!(state.interaction.pressed);
+        let mut policy = super::ButtonPolicy::default();
+        policy.mouse.click = false;
+        let release = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            Point::new(1, 0),
+        ));
+        assert_eq!(
+            Button::new("Save")
+                .policy(policy)
+                .handle_event(area, &mut state, &release),
+            ButtonOutcome::Redraw
+        );
+        assert!(!state.interaction.pressed);
+        assert_ne!(
+            Button::new("Save").handle_event(area, &mut state, &release),
+            ButtonOutcome::Pressed
+        );
+    }
+
+    #[test]
+    fn empty_button_neither_paints_nor_activates() {
+        let initial = ButtonState {
+            interaction: crate::common::InteractionState::new().focused(true),
+        };
+        let state = Cell::new(initial);
+        let button = ButtonComponent::new("save", "Save", &state);
+        for (width, height) in [(0, 1), (8, 0), (0, 0)] {
+            let layout = button.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+            let mut frame = Frame::new(&mut buffer);
+            button.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("        "));
+            assert!(frame.hits().regions().is_empty());
+            assert!(frame.semantics().regions().is_empty());
+            assert!(
+                !button
+                    .event(
+                        &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                        &layout,
+                        &mut EventCx::new(&layout),
+                    )
+                    .is_handled()
+            );
+            assert_eq!(state.get(), initial);
+        }
+    }
+
+    #[test]
+    fn mouse_disabled_button_retains_only_keyboard_target() {
+        let state = Cell::new(ButtonState::new());
+        let mut policy = super::ButtonPolicy::interactive();
+        policy.mouse.enabled = false;
+        let button = ButtonComponent::new("save", "Save", &state).policy(policy);
+        let layout = button.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let mut frame = Frame::new(&mut buffer);
+        button.paint(&layout, &mut PaintCx::new(&mut frame));
+        let hit = &frame.hits().regions()[0];
+        assert!(hit.enabled && hit.focusable);
+        assert!(!hit.pointer_events && !hit.hoverable);
+        let mut cx = EventCx::new(&layout);
+        assert!(
+            !button
+                .event(
+                    &Event::Mouse(MouseEvent::new(
+                        MouseEventKind::Down(MouseButton::Left),
+                        Point::new(1, 0),
+                    )),
+                    &layout,
+                    &mut cx,
+                )
+                .is_handled()
+        );
+        assert_eq!(state.get(), ButtonState::new());
+        state.set(ButtonState {
+            interaction: crate::common::InteractionState::new().focused(true),
+        });
+        assert!(
+            button
+                .event(
+                    &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                    &layout,
+                    &mut cx,
+                )
+                .is_handled()
+        );
+    }
 
     #[test]
     fn canonical_component_separates_layout_and_paint_revisions() {

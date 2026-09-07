@@ -221,10 +221,45 @@ impl<'a, 'state> BreadcrumbsComponent<'a, 'state> {
         let Some(area) = cx.find_rect(&layout.id) else {
             return BreadcrumbsOutcome::Ignored;
         };
+        if area.is_empty() && matches!(event, Event::Key(_)) {
+            return BreadcrumbsOutcome::Ignored;
+        }
         let mut state = self.state.get();
-        let outcome = self.breadcrumbs.handle_event(area, &mut state, event);
+        let pointer_changed = self.breadcrumbs.cancel_invalid_pointer_targets(&mut state);
+        let outcome = if let Event::Mouse(mouse) = event {
+            if self.breadcrumbs.policy.mouse.enabled {
+                let mut x = 0_u16;
+                let hit =
+                    self.breadcrumbs
+                        .items
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, item)| {
+                            let width = u16_saturating(display_width(item.label));
+                            let visible = cx.visible_rect(bmux_tui::component::LogicalRect::new(
+                                x,
+                                0,
+                                width.min(layout.size.width.saturating_sub(x)),
+                                usize::from(layout.size.height > 0),
+                            ));
+                            x = x.saturating_add(width).saturating_add(u16_saturating(
+                                display_width(self.breadcrumbs.policy.separator),
+                            ));
+                            (!item.disabled && visible.contains(mouse.position)).then_some(index)
+                        });
+                self.breadcrumbs.handle_mouse_hit(&mut state, *mouse, hit)
+            } else {
+                BreadcrumbsOutcome::Ignored
+            }
+        } else {
+            self.breadcrumbs.handle_event(area, &mut state, event)
+        };
         self.state.set(state);
-        outcome
+        if pointer_changed && outcome == BreadcrumbsOutcome::Ignored {
+            BreadcrumbsOutcome::Redraw
+        } else {
+            outcome
+        }
     }
 
     /// Set behavior policy.
@@ -305,7 +340,10 @@ impl Component for BreadcrumbsComponent<'_, '_> {
                 SceneRegion::new(self.id.as_str(), Rect::new(0, 0, layout.size.width, 1))
                     .role(HitRole::ListItem)
                     .pointer_events(self.breadcrumbs.policy.mouse.enabled)
-                    .hoverable(self.breadcrumbs.policy.mouse.hover)
+                    .hoverable(
+                        self.breadcrumbs.policy.mouse.enabled
+                            && self.breadcrumbs.policy.mouse.hover,
+                    )
                     .focusable(self.breadcrumbs.policy.keyboard),
             );
         }
@@ -361,7 +399,8 @@ impl<'a> Breadcrumbs<'a> {
         state: &mut BreadcrumbsState,
         event: &Event,
     ) -> BreadcrumbsOutcome<'a> {
-        match event {
+        let pointer_changed = self.cancel_invalid_pointer_targets(state);
+        let outcome = match event {
             Event::Key(stroke) if self.policy.keyboard && stroke.modifiers.is_empty() => {
                 match stroke.key {
                     KeyCode::Left => self.move_current(state, -1),
@@ -390,7 +429,22 @@ impl<'a> Breadcrumbs<'a> {
             | Event::Focus(bmux_tui::event::FocusEvent::Gained)
             | Event::Tick
             | Event::User(_) => BreadcrumbsOutcome::Ignored,
+        };
+        if pointer_changed && outcome == BreadcrumbsOutcome::Ignored {
+            BreadcrumbsOutcome::Redraw
+        } else {
+            outcome
         }
+    }
+
+    fn cancel_invalid_pointer_targets(&self, state: &mut BreadcrumbsState) -> bool {
+        let previous = (state.pressed, state.hovered);
+        let enabled = |index: usize| {
+            self.policy.mouse.enabled && self.items.get(index).is_some_and(|item| !item.disabled)
+        };
+        state.pressed = state.pressed.filter(|&index| enabled(index));
+        state.hovered = state.hovered.filter(|&index| enabled(index));
+        previous != (state.pressed, state.hovered)
     }
 
     fn handle_mouse(
@@ -399,9 +453,18 @@ impl<'a> Breadcrumbs<'a> {
         state: &mut BreadcrumbsState,
         mouse: MouseEvent,
     ) -> BreadcrumbsOutcome<'a> {
+        self.handle_mouse_hit(state, mouse, self.item_at(area, mouse.position))
+    }
+
+    fn handle_mouse_hit(
+        &self,
+        state: &mut BreadcrumbsState,
+        mouse: MouseEvent,
+        hit: Option<usize>,
+    ) -> BreadcrumbsOutcome<'a> {
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => {
-                let hovered = self.item_at(area, mouse.position);
+                let hovered = hit;
                 if hovered == state.hovered {
                     BreadcrumbsOutcome::Ignored
                 } else {
@@ -410,18 +473,23 @@ impl<'a> Breadcrumbs<'a> {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click => {
-                state.pressed = self.item_at(area, mouse.position);
+                state.pressed = hit;
                 BreadcrumbsOutcome::Redraw
             }
-            MouseEventKind::Up(MouseButton::Left) if self.policy.mouse.click => {
-                let released = self.item_at(area, mouse.position);
+            MouseEventKind::Up(MouseButton::Left) => {
+                let released = hit;
                 let pressed = state.pressed.take();
-                if released == pressed
+                if self.policy.mouse.click
+                    && released == pressed
                     && let Some(index) = released
                 {
                     return self.activate(index).unwrap_or(BreadcrumbsOutcome::Ignored);
                 }
-                BreadcrumbsOutcome::Redraw
+                if pressed.is_some() {
+                    BreadcrumbsOutcome::Redraw
+                } else {
+                    BreadcrumbsOutcome::Ignored
+                }
             }
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
@@ -694,7 +762,93 @@ mod tests {
                     modifiers: bmux_tui::event::MouseModifiers::default(),
                 })
             ),
+            BreadcrumbsOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn disabling_click_before_release_cancels_breadcrumb_activation() {
+        let items = [BreadcrumbItem::new("home", "Home")];
+        let area = Rect::new(0, 0, 8, 1);
+        let mut state = BreadcrumbsState::new(Some(0));
+        let mouse = |kind| Event::Mouse(bmux_tui::event::MouseEvent::new(kind, Point::new(1, 0)));
+        Breadcrumbs::new(&items).handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+        );
+        assert_eq!(state.pressed, Some(0));
+        let mut policy = super::BreadcrumbsPolicy::default();
+        policy.mouse.click = false;
+        let release = mouse(MouseEventKind::Up(MouseButton::Left));
+        assert_eq!(
+            Breadcrumbs {
+                policy,
+                ..Breadcrumbs::new(&items)
+            }
+            .handle_event(area, &mut state, &release),
             BreadcrumbsOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert!(!matches!(
+            Breadcrumbs::new(&items).handle_event(area, &mut state, &release),
+            BreadcrumbsOutcome::Activated { .. }
+        ));
+    }
+
+    #[test]
+    fn release_without_pending_press_is_ignored() {
+        let items = [BreadcrumbItem::new("home", "Home")];
+        let breadcrumbs = Breadcrumbs::new(&items);
+        let mut state = BreadcrumbsState::new(Some(0));
+        let initial = state;
+        for position in [Point::new(1, 0), Point::new(20, 0)] {
+            assert_eq!(
+                breadcrumbs.handle_event(
+                    Rect::new(0, 0, 8, 1),
+                    &mut state,
+                    &Event::Mouse(bmux_tui::event::MouseEvent::new(
+                        MouseEventKind::Up(MouseButton::Left),
+                        position
+                    ))
+                ),
+                BreadcrumbsOutcome::Ignored
+            );
+            assert_eq!(state, initial);
+        }
+    }
+
+    #[test]
+    fn disabling_item_cancels_pending_press_and_requests_redraw() {
+        let mut items = [BreadcrumbItem::new("home", "Home")];
+        let area = Rect::new(0, 0, 10, 1);
+        let mut state = BreadcrumbsState::new(None);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(0, 0)));
+        Breadcrumbs::new(&items).handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+        );
+        assert_eq!(state.pressed, Some(0));
+        items[0].disabled = true;
+        assert_eq!(
+            Breadcrumbs::new(&items).handle_event(area, &mut state, &Event::Tick),
+            BreadcrumbsOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.hovered(), None);
+        assert_eq!(
+            Breadcrumbs::new(&items).handle_event(area, &mut state, &Event::Tick),
+            BreadcrumbsOutcome::Ignored
+        );
+        items[0].disabled = false;
+        assert_eq!(
+            Breadcrumbs::new(&items).handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            BreadcrumbsOutcome::Ignored
         );
     }
 
@@ -829,6 +983,204 @@ mod tests {
         assert_eq!(
             frame.buffer().row_symbols(0).as_deref(),
             Some("Home / Docs     ")
+        );
+    }
+
+    #[test]
+    fn empty_breadcrumbs_ignore_keys_but_clear_pointer_state_on_focus_loss() {
+        let items = [
+            BreadcrumbItem::new("home", "Home"),
+            BreadcrumbItem::new("docs", "Docs"),
+        ];
+        let initial = BreadcrumbsState {
+            current: Some(0),
+            hovered: Some(0),
+            pressed: Some(0),
+            focused: true,
+        };
+        let state = Cell::new(initial);
+        let component = BreadcrumbsComponent::new("location", &items, &state);
+        for (width, height) in [(0, 1), (10, 0), (0, 0)] {
+            state.set(initial);
+            let layout = component.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            let mut cx = bmux_tui::component::EventCx::new(&layout);
+            for key in [KeyCode::Enter, KeyCode::Right] {
+                assert_eq!(
+                    component.handle_event(&Event::Key(KeyStroke::simple(key)), &layout, &mut cx),
+                    BreadcrumbsOutcome::Ignored
+                );
+                assert_eq!(state.get(), initial);
+            }
+            component.handle_event(
+                &Event::Focus(bmux_tui::event::FocusEvent::Lost),
+                &layout,
+                &mut cx,
+            );
+            assert_eq!(state.get().hovered, None);
+            assert_eq!(state.get().pressed, None);
+            assert_eq!(state.get().current, Some(0));
+        }
+    }
+
+    #[test]
+    fn clipped_breadcrumb_click_activates_visible_item() {
+        let items = [
+            BreadcrumbItem::new("home", "Home"),
+            BreadcrumbItem::new("docs", "Docs"),
+        ];
+        let state = Cell::new(BreadcrumbsState::new(Some(0)));
+        let component = BreadcrumbsComponent::new("location", &items, &state);
+        let layout = component.layout(Constraints::for_width(11), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 4));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(
+            -3,
+            2,
+            bmux_tui::paint::LocalRect::new(7, 0, 4, 1),
+            |cx| component.paint(&layout, cx),
+        );
+        assert!(frame.buffer().row_symbols(2).unwrap().contains("Docs"));
+        bmux_tui::component::EventCx::new(&layout).with_transform(
+            0,
+            0,
+            -3,
+            2,
+            Rect::new(4, 2, 4, 1),
+            |cx| {
+                component.handle_event(
+                    &Event::Mouse(MouseEvent::new(
+                        MouseEventKind::Down(MouseButton::Left),
+                        Point::new(4, 2),
+                    )),
+                    &layout,
+                    cx,
+                );
+                assert_eq!(
+                    component.handle_event(
+                        &Event::Mouse(MouseEvent::new(
+                            MouseEventKind::Up(MouseButton::Left),
+                            Point::new(4, 2)
+                        )),
+                        &layout,
+                        cx
+                    ),
+                    BreadcrumbsOutcome::Activated {
+                        index: 1,
+                        id: "docs"
+                    }
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn keyboard_only_breadcrumbs_have_no_pointer_or_hover_metadata() {
+        let items = [BreadcrumbItem::new("home", "Home")];
+        let mut initial = BreadcrumbsState::new(Some(0));
+        initial.set_focused(true);
+        let state = Cell::new(initial);
+        let mut policy = BreadcrumbsPolicy::default();
+        policy.mouse.enabled = false;
+        let component = BreadcrumbsComponent::new("location", &items, &state).policy(policy);
+        let layout = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let hit = &frame.hits().regions()[0];
+        assert!(hit.focusable);
+        assert!(!hit.pointer_events && !hit.hoverable);
+        let mut cx = bmux_tui::component::EventCx::new(&layout);
+        component.event(
+            &Event::Mouse(MouseEvent::new(MouseEventKind::Move, Point::new(1, 0))),
+            &layout,
+            &mut cx,
+        );
+        assert_eq!(state.get(), initial);
+        assert!(matches!(
+            component.handle_event(
+                &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                &layout,
+                &mut cx
+            ),
+            BreadcrumbsOutcome::Activated { .. }
+        ));
+    }
+
+    #[test]
+    fn composed_pointer_routing_cancels_invalid_targets() {
+        for removed in [false, true] {
+            let enabled = [BreadcrumbItem::new("home", "Home")];
+            let disabled = [BreadcrumbItem::new("home", "Home").disabled(true)];
+            let state = Cell::new(BreadcrumbsState::new(None));
+            let component = BreadcrumbsComponent::new("crumbs", &enabled, &state);
+            let layout = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
+            let mut cx = bmux_tui::component::EventCx::new(&layout);
+            let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(0, 0)));
+            component.handle_event(
+                &mouse(MouseEventKind::Down(MouseButton::Left)),
+                &layout,
+                &mut cx,
+            );
+            assert_eq!(state.get().pressed, Some(0));
+            let changed =
+                BreadcrumbsComponent::new("crumbs", if removed { &[] } else { &disabled }, &state);
+            assert_eq!(
+                changed.handle_event(&mouse(MouseEventKind::Move), &layout, &mut cx),
+                BreadcrumbsOutcome::Redraw
+            );
+            assert_eq!(state.get().pressed, None);
+            assert_eq!(state.get().hovered(), None);
+            assert_eq!(
+                changed.handle_event(&mouse(MouseEventKind::Move), &layout, &mut cx),
+                BreadcrumbsOutcome::Ignored
+            );
+            assert_eq!(
+                component.handle_event(
+                    &mouse(MouseEventKind::Up(MouseButton::Left)),
+                    &layout,
+                    &mut cx
+                ),
+                BreadcrumbsOutcome::Ignored
+            );
+        }
+    }
+
+    #[test]
+    fn composed_mouse_disable_cancels_pending_press() {
+        let items = [BreadcrumbItem::new("home", "Home")];
+        let state = Cell::new(BreadcrumbsState::new(None));
+        let component = BreadcrumbsComponent::new("crumbs", &items, &state);
+        let layout = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
+        let mut cx = bmux_tui::component::EventCx::new(&layout);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(0, 0)));
+        component.handle_event(
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+            &layout,
+            &mut cx,
+        );
+        assert_eq!(state.get().pressed, Some(0));
+        let mut disabled = BreadcrumbsComponent::new("crumbs", &items, &state);
+        disabled.breadcrumbs.policy.mouse.enabled = false;
+        assert_eq!(
+            disabled.handle_event(&mouse(MouseEventKind::Move), &layout, &mut cx),
+            BreadcrumbsOutcome::Redraw
+        );
+        assert_eq!(state.get().pressed, None);
+        assert_eq!(state.get().hovered(), None);
+        assert_eq!(
+            disabled.handle_event(&Event::Tick, &layout, &mut cx),
+            BreadcrumbsOutcome::Ignored
+        );
+        assert_eq!(
+            component.handle_event(
+                &mouse(MouseEventKind::Up(MouseButton::Left)),
+                &layout,
+                &mut cx
+            ),
+            BreadcrumbsOutcome::Ignored
         );
     }
 

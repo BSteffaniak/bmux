@@ -332,8 +332,14 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
     }
 
     /// Register a local semantic region after translation and clipping.
-    pub fn push_semantic(&mut self, mut region: SemanticRegion) {
-        let Some(area) = self.project_rect(LocalRect::terminal(region.area)) else {
+    pub fn push_semantic(&mut self, region: SemanticRegion) {
+        let area = LocalRect::terminal(region.area);
+        self.push_semantic_in(area, region);
+    }
+
+    /// Register semantic metadata for a local rectangle with a logical row offset.
+    pub fn push_semantic_in(&mut self, area: LocalRect, mut region: SemanticRegion) {
+        let Some(area) = self.project_rect(area) else {
             return;
         };
         region.area = area;
@@ -549,6 +555,29 @@ mod tests {
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("        "));
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("xxxx    "));
         assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("xxxx    "));
+    }
+
+    #[test]
+    fn logical_semantics_follow_nested_clips_and_omit_offscreen_regions() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 5));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(3, 1, LocalRect::new(0, 0, 4, 3), |cx| {
+            cx.with_child(0, -70_000, LocalRect::new(0, 70_000, 4, 3), |cx| {
+                cx.push_semantic_in(
+                    LocalRect::new(-1, 69_999, 8, 3),
+                    SemanticRegion::new("visible", Rect::default(), "status"),
+                );
+                cx.push_semantic_in(
+                    LocalRect::new(0, 70_003, 4, 1),
+                    SemanticRegion::new("hidden", Rect::default(), "status"),
+                );
+            });
+        });
+        let regions = frame.semantics().regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].id, "visible");
+        assert_eq!(regions[0].role, "status");
+        assert_eq!(regions[0].area, Rect::new(3, 1, 4, 2));
     }
 
     #[test]

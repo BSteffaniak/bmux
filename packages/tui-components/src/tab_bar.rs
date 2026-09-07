@@ -356,7 +356,8 @@ impl Component for TabBarComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), area)
                 .role(HitRole::Action)
-                .hoverable(self.bar.policy.mouse.hover)
+                .pointer_events(self.bar.policy.mouse.enabled)
+                .hoverable(self.bar.policy.mouse.enabled && self.bar.policy.mouse.hover)
                 .focusable(true)
                 .enabled(!state.interaction.disabled),
         );
@@ -367,7 +368,8 @@ impl Component for TabBarComponent<'_, '_> {
             cx.push_hit(
                 SceneRegion::new(format!("{}.{}", self.id.as_str(), item.id), item_area)
                     .role(HitRole::Action)
-                    .hoverable(self.bar.policy.mouse.hover)
+                    .pointer_events(self.bar.policy.mouse.enabled)
+                    .hoverable(self.bar.policy.mouse.enabled && self.bar.policy.mouse.hover)
                     .enabled(!state.interaction.disabled && !item.disabled),
             );
         }
@@ -387,9 +389,49 @@ impl Component for TabBarComponent<'_, '_> {
         let Some(area) = cx.find_rect(&layout.id) else {
             return EventOutcome::Ignored;
         };
-        let outcome = self
-            .bar
-            .handle_event(area, &mut self.state.borrow_mut(), event);
+        let area = cx
+            .visible_rect(bmux_tui::component::LogicalRect::new(
+                0,
+                0,
+                layout.size.width,
+                usize::from(!self.bar.items.is_empty()).min(layout.size.height),
+            ))
+            .intersection(area);
+        // Hidden tabs reconcile policy and lifecycle without handling activation.
+        let event = if area.is_empty() && !matches!(event, Event::Focus(_) | Event::Resize(_)) {
+            &Event::Tick
+        } else {
+            event
+        };
+        let mut state = self.state.borrow_mut();
+        let outcome = if let Event::Mouse(mouse) = event {
+            let fallback = self.bar.handle_event(area, &mut state, &Event::Tick);
+            let hit = self
+                .bar
+                .hit_rects(Rect::new(0, 0, layout.size.width, 1))
+                .iter()
+                .position(|rect| {
+                    cx.visible_rect(bmux_tui::component::LogicalRect::new(
+                        rect.x,
+                        usize::from(rect.y),
+                        rect.width,
+                        usize::from(rect.height),
+                    ))
+                    .contains(mouse.position)
+                });
+            let outcome = if state.interaction.disabled || !self.bar.policy.mouse.enabled {
+                TabBarOutcome::Ignored
+            } else {
+                self.bar.handle_mouse_hit(&mut state, *mouse, hit)
+            };
+            if outcome == TabBarOutcome::Ignored {
+                fallback
+            } else {
+                outcome
+            }
+        } else {
+            self.bar.handle_event(area, &mut state, event)
+        };
         match outcome {
             TabBarOutcome::Ignored => EventOutcome::Ignored,
             TabBarOutcome::Redraw | TabBarOutcome::Selected(_) => EventOutcome::Redraw,
@@ -493,10 +535,38 @@ impl<'a> TabBar<'a> {
         state: &mut TabBarState,
         event: &Event,
     ) -> TabBarOutcome {
-        if state.interaction.disabled {
-            return TabBarOutcome::Ignored;
+        if matches!(
+            event,
+            Event::Focus(bmux_tui::event::FocusEvent::Lost) | Event::Resize(_)
+        ) {
+            let changed = state.pressed.take().is_some() | state.hovered.take().is_some();
+            return if changed {
+                TabBarOutcome::Redraw
+            } else {
+                TabBarOutcome::Ignored
+            };
         }
-        match event {
+        let previous_pointer = (state.pressed, state.hovered);
+        let enabled = |index: usize| {
+            !state.interaction.disabled
+                && self.policy.mouse.enabled
+                && self.items.get(index).is_some_and(|item| !item.disabled)
+        };
+        state.pressed = state
+            .pressed
+            .filter(|&index| enabled(index) && self.policy.mouse.click);
+        state.hovered = state
+            .hovered
+            .filter(|&index| enabled(index) && self.policy.mouse.hover);
+        let fallback = if previous_pointer == (state.pressed, state.hovered) {
+            TabBarOutcome::Ignored
+        } else {
+            TabBarOutcome::Redraw
+        };
+        if state.interaction.disabled {
+            return fallback;
+        }
+        let outcome = match event {
             Event::Key(stroke) if self.policy.keyboard.enabled && stroke.modifiers.is_empty() => {
                 match stroke.key {
                     KeyCode::Left => self.select_relative(state, -1),
@@ -520,6 +590,11 @@ impl<'a> TabBar<'a> {
             | Event::Focus(_)
             | Event::Tick
             | Event::User(_) => TabBarOutcome::Ignored,
+        };
+        if outcome == TabBarOutcome::Ignored {
+            fallback
+        } else {
+            outcome
         }
     }
 
@@ -564,9 +639,19 @@ impl<'a> TabBar<'a> {
         state: &mut TabBarState,
         mouse: MouseEvent,
     ) -> TabBarOutcome {
+        let hit = self.hit_index(area, mouse.position.x, mouse.position.y);
+        self.handle_mouse_hit(state, mouse, hit)
+    }
+
+    fn handle_mouse_hit(
+        &self,
+        state: &mut TabBarState,
+        mouse: MouseEvent,
+        hit: Option<usize>,
+    ) -> TabBarOutcome {
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => {
-                let hovered = self.hit_index(area, mouse.position.x, mouse.position.y);
+                let hovered = hit.filter(|index| !self.items[*index].disabled);
                 if hovered == state.hovered {
                     TabBarOutcome::Ignored
                 } else {
@@ -575,25 +660,30 @@ impl<'a> TabBar<'a> {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click => {
-                let pressed = self.hit_index(area, mouse.position.x, mouse.position.y);
-                if let Some(index) = pressed.filter(|index| !self.items[*index].disabled) {
-                    state.pressed = Some(index);
+                let pressed = hit.filter(|index| !self.items[*index].disabled);
+                let previous = state.pressed;
+                state.pressed = pressed;
+                if pressed.is_some() || previous != pressed {
                     TabBarOutcome::Redraw
                 } else {
                     TabBarOutcome::Ignored
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) if self.policy.mouse.click => {
-                let hit = self.hit_index(area, mouse.position.x, mouse.position.y);
+            MouseEventKind::Up(MouseButton::Left) => {
                 let pressed = state.pressed.take();
-                if let (Some(pressed), Some(hit)) = (pressed, hit)
+                if self.policy.mouse.click
+                    && let (Some(pressed), Some(hit)) = (pressed, hit)
                     && pressed == hit
                     && !self.items[hit].disabled
                 {
                     state.selected = Some(hit);
                     return TabBarOutcome::Selected(hit);
                 }
-                TabBarOutcome::Redraw
+                if pressed.is_some() {
+                    TabBarOutcome::Redraw
+                } else {
+                    TabBarOutcome::Ignored
+                }
             }
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
@@ -728,6 +818,171 @@ mod tests {
     use super::{TabBar, TabBarComponent, TabBarOutcome, TabBarPolicy};
     use crate::tab_bar::{TabBarKeyboardPolicy, TabBarState, TabItem};
 
+    #[test]
+    fn left_clipped_disabled_tab_cannot_be_selected() {
+        let items = [
+            TabItem::new("one", "One"),
+            TabItem::new("two", "Two").disabled(true),
+        ];
+        let state = std::cell::RefCell::new(TabBarState::new(Some(0)));
+        let component = TabBarComponent {
+            id: "tabs".into(),
+            bar: TabBar::new(&items),
+            state: &state,
+        };
+        let layout = component.layout(Constraints::for_width(11), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(-6, 0, LocalRect::new(0, 0, 11, 1), |cx| {
+            component.paint(&layout, cx);
+        });
+        assert_eq!(frame.hits().regions().len(), 2);
+        assert!(!frame.hits().regions()[1].enabled);
+        EventCx::new(&layout).with_transform(0, 0, -6, 0, Rect::new(0, 0, 5, 1), |cx| {
+            for kind in [
+                MouseEventKind::Move,
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                assert_eq!(
+                    component.event(
+                        &Event::Mouse(MouseEvent::new(kind, Point::new(1, 0))),
+                        &layout,
+                        cx
+                    ),
+                    EventOutcome::Ignored
+                );
+            }
+        });
+        assert_eq!(state.borrow().selected, Some(0));
+        assert_eq!(state.borrow().pressed, None);
+        assert_eq!(state.borrow().hovered, None);
+    }
+
+    #[test]
+    fn left_clipped_tabs_keep_original_mouse_boundaries() {
+        let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
+        let state = std::cell::RefCell::new(TabBarState::new(Some(0)));
+        let component = TabBarComponent {
+            id: "tabs".into(),
+            bar: TabBar::new(&items),
+            state: &state,
+        };
+        let layout = component.layout(Constraints::for_width(11), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(-6, 0, LocalRect::new(0, 0, 11, 1), |cx| {
+            component.paint(&layout, cx);
+        });
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2, "only the bar and second tab are visible");
+        assert_eq!(regions[1].area, Rect::new(0, 0, 5, 1));
+        assert!(regions[1].area.contains(Point::new(1, 0)));
+        EventCx::new(&layout).with_transform(0, 0, -6, 0, Rect::new(0, 0, 5, 1), |cx| {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                component.event(
+                    &Event::Mouse(MouseEvent::new(kind, Point::new(1, 0))),
+                    &layout,
+                    cx,
+                );
+            }
+        });
+        assert_eq!(state.borrow().selected, Some(1));
+    }
+
+    #[test]
+    fn clipped_tab_row_cannot_navigate_through_blank_layout_rows() {
+        let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
+        let state = std::cell::RefCell::new(TabBarState::new(Some(0)));
+        let component = TabBarComponent {
+            id: "tabs".into(),
+            bar: TabBar::new(&items),
+            state: &state,
+        };
+        let layout = component.layout(Constraints::new(10, 10, 3, Some(3)), &mut LayoutCx::new());
+        let right = Event::Key(KeyStroke::simple(KeyCode::Right));
+        EventCx::new(&layout).with_transform(0, 0, 0, 0, Rect::new(0, 1, 10, 2), |cx| {
+            assert!(
+                cx.find_rect(&layout.id)
+                    .is_some_and(|rect| !rect.is_empty())
+            );
+            assert_eq!(component.event(&right, &layout, cx), EventOutcome::Ignored);
+        });
+        assert_eq!(state.borrow().selected, Some(0));
+        assert_eq!(
+            component.event(&right, &layout, &mut EventCx::new(&layout)),
+            EventOutcome::Redraw
+        );
+        assert_eq!(state.borrow().selected, Some(1));
+    }
+
+    #[test]
+    fn hidden_tabs_do_not_navigate_but_cancel_disabled_pointer() {
+        let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
+        for (width, height) in [(0, 1), (10, 0), (0, 0)] {
+            let state = std::cell::RefCell::new(TabBarState::new(Some(0)));
+            let mut component = TabBarComponent {
+                id: "tabs".into(),
+                bar: TabBar::new(&items),
+                state: &state,
+            };
+            let layout = component.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            let right = Event::Key(KeyStroke::simple(KeyCode::Right));
+            assert_eq!(
+                component.event(&right, &layout, &mut EventCx::new(&layout)),
+                EventOutcome::Ignored
+            );
+            assert_eq!(state.borrow().selected, Some(0));
+            state.borrow_mut().pressed = Some(1);
+            component.bar.policy.mouse.enabled = false;
+            assert_eq!(
+                component.event(&right, &layout, &mut EventCx::new(&layout)),
+                EventOutcome::Redraw
+            );
+            assert_eq!(state.borrow().pressed, None);
+            assert_eq!(state.borrow().selected, Some(0));
+        }
+    }
+
+    #[test]
+    fn disabling_tab_pointer_policy_cancels_stale_state() {
+        let items = [TabItem::new("one", "One")];
+        let mut bar = TabBar::new(&items);
+        let mut state = TabBarState::new(None);
+        state.pressed = Some(0);
+        state.hovered = Some(0);
+        let area = Rect::new(0, 0, 10, 1);
+        bar.policy.mouse.click = false;
+        bar.policy.mouse.hover = false;
+        assert_eq!(
+            bar.handle_event(area, &mut state, &Event::Tick),
+            TabBarOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.hovered, None);
+        assert_eq!(
+            bar.handle_event(area, &mut state, &Event::Tick),
+            TabBarOutcome::Ignored
+        );
+        bar.policy.mouse.click = true;
+        bar.policy.mouse.hover = true;
+        bar.handle_event(
+            area,
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Up(MouseButton::Left),
+                Point::new(1, 0),
+            )),
+        );
+        assert_eq!(state.selected, None);
+    }
+
     trait TabBarTestRender {
         fn render(&self, area: Rect, state: &TabBarState, frame: &mut Frame<'_>);
     }
@@ -748,6 +1003,184 @@ mod tests {
                 |cx| component.paint(&layout, cx),
             );
         }
+    }
+
+    #[test]
+    fn disabling_click_before_release_cancels_tab_selection() {
+        let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
+        let mut bar = TabBar::new(&items);
+        let mut state = TabBarState::new(Some(1));
+        let area = Rect::new(0, 0, 20, 1);
+        let mouse = |kind| MouseEvent::new(kind, Point::new(1, 0));
+        assert_eq!(
+            bar.handle_mouse(
+                area,
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Left))
+            ),
+            TabBarOutcome::Redraw
+        );
+        assert_eq!(state.pressed, Some(0));
+        bar.policy.mouse.click = false;
+        assert_eq!(
+            bar.handle_mouse(
+                area,
+                &mut state,
+                mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            TabBarOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.selected, Some(1));
+        bar.policy.mouse.click = true;
+        assert_eq!(
+            bar.handle_mouse(
+                area,
+                &mut state,
+                mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            TabBarOutcome::Ignored
+        );
+        assert_eq!(state.selected, Some(1));
+    }
+
+    #[test]
+    fn focus_loss_cancels_tab_pointer_selection() {
+        let items = [TabItem::new("one", "One"), TabItem::new("two", "Two")];
+        let bar = TabBar::new(&items);
+        let mut state = TabBarState::new(Some(1));
+        let area = Rect::new(0, 0, 20, 1);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 0)));
+        bar.handle_event(area, &mut state, &mouse(MouseEventKind::Move));
+        bar.handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+        );
+        assert_eq!(state.pressed, Some(0));
+        assert_eq!(state.hovered, Some(0));
+        let focus_event = Event::Focus(bmux_tui::event::FocusEvent::Lost);
+        assert_eq!(
+            bar.handle_event(area, &mut state, &focus_event),
+            TabBarOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.hovered, None);
+        assert_eq!(
+            bar.handle_event(area, &mut state, &focus_event),
+            TabBarOutcome::Ignored
+        );
+        assert_eq!(
+            bar.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            TabBarOutcome::Ignored
+        );
+        assert_eq!(state.selected, Some(1));
+    }
+
+    #[test]
+    fn blank_press_cancels_previous_tab_press() {
+        let items = [TabItem::new("one", "One")];
+        let bar = TabBar::new(&items);
+        let mut state = TabBarState::new(None);
+        let area = Rect::new(0, 0, 20, 1);
+        let mouse = |kind, x| Event::Mouse(MouseEvent::new(kind, Point::new(x, 0)));
+        bar.handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left), 1),
+        );
+        assert_eq!(state.pressed, Some(0));
+        assert_eq!(
+            bar.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left), 19)
+            ),
+            TabBarOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(
+            bar.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left), 1)
+            ),
+            TabBarOutcome::Ignored
+        );
+        assert_eq!(state.selected, None);
+    }
+
+    #[test]
+    fn disabled_tab_clears_previous_hover() {
+        let items = [
+            TabItem::new("one", "One"),
+            TabItem::new("two", "Two").disabled(true),
+        ];
+        let bar = TabBar::new(&items);
+        let mut state = TabBarState::new(Some(0));
+        let area = Rect::new(0, 0, 20, 1);
+        let regions = bar.hit_rects(area);
+        let mouse = |index: usize| {
+            Event::Mouse(MouseEvent::new(
+                MouseEventKind::Move,
+                Point::new(regions[index].x, 0),
+            ))
+        };
+        assert_eq!(
+            bar.handle_event(area, &mut state, &mouse(0)),
+            TabBarOutcome::Redraw
+        );
+        assert_eq!(state.hovered, Some(0));
+        assert_eq!(
+            bar.handle_event(area, &mut state, &mouse(1)),
+            TabBarOutcome::Redraw
+        );
+        assert_eq!(state.hovered, None);
+        assert_eq!(
+            bar.handle_event(area, &mut state, &mouse(1)),
+            TabBarOutcome::Ignored
+        );
+        assert_eq!(state.selected, Some(0));
+    }
+
+    #[test]
+    fn resize_cancels_pending_tab_press() {
+        let items = [TabItem::new("one", "One")];
+        let bar = TabBar::new(&items);
+        let mut state = TabBarState::new(None);
+        let area = Rect::new(0, 0, 20, 1);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 0)));
+        bar.handle_event(area, &mut state, &mouse(MouseEventKind::Move));
+        bar.handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+        );
+        assert_eq!(state.pressed, Some(0));
+        let resize = Event::Resize(area.size());
+        assert_eq!(
+            bar.handle_event(area, &mut state, &resize),
+            TabBarOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.hovered, None);
+        assert_eq!(
+            bar.handle_event(area, &mut state, &resize),
+            TabBarOutcome::Ignored
+        );
+        assert_eq!(
+            bar.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            TabBarOutcome::Ignored
+        );
+        assert_eq!(state.selected, None);
     }
 
     #[test]
@@ -785,6 +1218,27 @@ mod tests {
     }
 
     #[test]
+    fn mouse_disabled_component_retains_keyboard_target() {
+        let items = [TabItem::new("one", "One")];
+        let state = std::cell::RefCell::new(TabBarState::new(Some(0)));
+        let mut policy = TabBarPolicy::default();
+        policy.mouse.enabled = false;
+        let component = TabBarComponent::new("tabs", &items, &state).policy(policy);
+        let layout = component.layout(Constraints::for_width(5), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 5, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert!(regions[0].focusable);
+        for region in regions {
+            assert!(region.enabled);
+            assert!(!region.pointer_events);
+            assert!(!region.hoverable);
+        }
+    }
+
+    #[test]
     fn component_disabled_tab_is_not_enabled_in_scene() {
         let items = [
             TabItem::new("one", "One"),
@@ -798,6 +1252,84 @@ mod tests {
         component.paint(&layout, &mut PaintCx::new(&mut frame));
         assert!(frame.hits().regions()[1].enabled);
         assert!(!frame.hits().regions()[2].enabled);
+    }
+
+    #[test]
+    fn disabling_tab_cancels_pointer_state_and_requests_redraw() {
+        let mut items = [TabItem::new("one", "One")];
+        let mut state = TabBarState::new(None);
+        let area = Rect::new(0, 0, 5, 1);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 0)));
+        TabBar::new(&items).handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+        );
+        assert_eq!(state.pressed, Some(0));
+        items[0].disabled = true;
+        assert_eq!(
+            TabBar::new(&items).handle_event(area, &mut state, &Event::Tick),
+            TabBarOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.hovered, None);
+        assert_eq!(
+            TabBar::new(&items).handle_event(area, &mut state, &Event::Tick),
+            TabBarOutcome::Ignored
+        );
+        items[0].disabled = false;
+        assert_eq!(
+            TabBar::new(&items).handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            TabBarOutcome::Ignored
+        );
+        assert_eq!(state.selected(), None);
+    }
+
+    #[test]
+    fn disabling_pointer_input_cancels_pending_tab_press() {
+        let items = [TabItem::new("one", "One")];
+        let area = Rect::new(0, 0, 5, 1);
+        for disable_control in [false, true] {
+            let mut bar = TabBar::new(&items);
+            let mut state = TabBarState::new(None);
+            let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 0)));
+            bar.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left)),
+            );
+            assert_eq!(state.pressed, Some(0));
+            if disable_control {
+                state.interaction.disabled = true;
+            } else {
+                bar.policy.mouse.enabled = false;
+            }
+            assert_eq!(
+                bar.handle_event(area, &mut state, &Event::Tick),
+                TabBarOutcome::Redraw
+            );
+            assert_eq!(state.pressed, None);
+            assert_eq!(state.hovered, None);
+            assert_eq!(
+                bar.handle_event(area, &mut state, &Event::Tick),
+                TabBarOutcome::Ignored
+            );
+            state.interaction.disabled = false;
+            bar.policy.mouse.enabled = true;
+            assert_eq!(
+                bar.handle_event(
+                    area,
+                    &mut state,
+                    &mouse(MouseEventKind::Up(MouseButton::Left))
+                ),
+                TabBarOutcome::Ignored
+            );
+            assert_eq!(state.selected(), None);
+        }
     }
 
     #[test]

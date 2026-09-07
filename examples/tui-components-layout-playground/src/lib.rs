@@ -203,7 +203,14 @@ fn render_playground(
         &ModalFrameComponent::new(
             "playground.modal",
             modal,
-            TextBlock::new("Modal placement").id("playground.modal.body"),
+            Surface::new(
+                TextBlock::new("Modal placement\nMeasured message 界 wraps")
+                    .id("playground.modal.body"),
+            )
+            .id("playground.modal.surface")
+            .background(Style::new().bg(Color::Blue))
+            .content_style(Style::new().bg(Color::Blue))
+            .padding(Insets::new(0, 1, 0, 1)),
         ),
         modal_area,
         cx,
@@ -419,6 +426,34 @@ mod tests {
         assert!(rendered.contains("local layout"));
         assert!(rendered.contains("Panel 0"));
         assert!(rendered.contains("Drag pane title/border or panel-group divider"));
+    }
+
+    #[test]
+    fn modal_surface_fills_wrapped_rows_and_padding() {
+        let buffer = render_layout_playground();
+        let mut filled_rows = Vec::new();
+        for y in 0..super::HEIGHT {
+            let columns: Vec<_> = (0..super::WIDTH)
+                .filter(|&x| {
+                    buffer
+                        .get(bmux_tui::geometry::Point::new(x, y))
+                        .unwrap()
+                        .style
+                        .bg
+                        == Some(bmux_tui::style::Color::Blue)
+                })
+                .collect();
+            if !columns.is_empty() {
+                assert_eq!(columns.len(), 20);
+                assert_eq!(columns.last().unwrap() - columns[0] + 1, 20);
+                filled_rows.push(y);
+            }
+        }
+        assert_eq!(filled_rows.len(), 3);
+        assert_eq!(filled_rows[2] - filled_rows[0], 2);
+        let rendered = rows(&buffer).join("\n");
+        assert!(rendered.contains("Measured message"));
+        assert!(rendered.contains('界'));
     }
 
     #[test]

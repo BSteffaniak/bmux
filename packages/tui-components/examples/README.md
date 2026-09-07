@@ -29,6 +29,21 @@ damage, frame-byte, and layout-cache counters. Its assertions demonstrate:
 - width reflow remeasures exact width-dependent layouts and restores the stable
   semantic anchor.
 
+A composed-card scenario at the same collection sizes uses padded `Surface`
+children containing a `Column` with an author and wrapped Unicode message body.
+It asserts unchanged-layout reuse, viewport-bounded painting, and stable-key
+anchor restoration after narrowing from 40 to 24 columns. It reports paint
+latency and allocations plus width-reflow latency and measurement counts
+separately from the bare-text baseline. One-row scrolling uses `scroll_by` and
+paints retained geometry before any new synchronization. Callers must synchronize
+after item, layout revision, width, or environment changes, not merely because
+the scroll offset changed. For comparison, `row_sync_us`
+measures the unchanged-collection synchronization, `row_paint_us` measures only
+painting, and `row_sync_and_paint_us` sums those two operations. The sum excludes
+buffer setup, metadata inspection, and ANSI encoding in the benchmark harness;
+it is not an end-to-end frame latency. Zero remeasurement does not imply that
+synchronization is constant-time or sublinear.
+
 The additional 100,000-item lookup probe measures prefix/visible-range lookup
 without presenting the collection. Estimated heights and application-owned row
 caches are deliberately absent.

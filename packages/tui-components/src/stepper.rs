@@ -198,7 +198,6 @@ impl Component for StepperComponent<'_> {
         self.id.as_str().hash(&mut layout);
         self.policy.orientation.hash(&mut layout);
         self.policy.connector.hash(&mut layout);
-        self.policy.truncate.hash(&mut layout);
         self.policy.markers.hash(&mut layout);
         for step in self.steps {
             step.id.hash(&mut layout);
@@ -206,6 +205,7 @@ impl Component for StepperComponent<'_> {
         }
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        self.policy.truncate.hash(&mut paint);
         for step in self.steps {
             step.status.hash(&mut paint);
         }
@@ -222,16 +222,17 @@ impl Component for StepperComponent<'_> {
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
         let intrinsic_width = match self.policy.orientation {
-            StepperOrientation::Horizontal => self
-                .steps
-                .iter()
-                .enumerate()
-                .map(|(index, step)| {
-                    display_width(&self.step_text(step))
-                        + usize::from(index > 0)
-                            * display_width(&format!(" {} ", self.policy.connector))
-                })
-                .sum(),
+            StepperOrientation::Horizontal => {
+                let connector_width = display_width(&format!(" {} ", self.policy.connector));
+                self.steps
+                    .iter()
+                    .enumerate()
+                    .map(|(index, step)| {
+                        display_width(&self.step_text(step))
+                            + usize::from(index > 0) * connector_width
+                    })
+                    .sum()
+            }
             StepperOrientation::Vertical => self
                 .steps
                 .iter()
@@ -269,6 +270,19 @@ impl Component for StepperComponent<'_> {
         if layout.size.width == 0 || layout.size.height == 0 || self.steps.is_empty() {
             return;
         }
+        let viewport = cx.area();
+        let content_height = match self.policy.orientation {
+            StepperOrientation::Horizontal => 1,
+            StepperOrientation::Vertical => self.steps.len(),
+        };
+        if viewport.width == 0
+            || viewport.height == 0
+            || viewport.y.saturating_add(i64::from(viewport.height)) <= 0
+            || usize::try_from(viewport.y.max(0)).unwrap_or(usize::MAX)
+                >= content_height.min(layout.size.height)
+        {
+            return;
+        }
         match self.policy.orientation {
             StepperOrientation::Horizontal => {
                 let mut spans = Vec::new();
@@ -291,16 +305,24 @@ impl Component for StepperComponent<'_> {
                 cx.write_line(LocalRect::new(0, 0, layout.size.width, 1), &line);
             }
             StepperOrientation::Vertical => {
-                for (index, step) in self.steps.iter().take(layout.size.height).enumerate() {
+                let viewport = cx.area();
+                let start = usize::try_from(viewport.y.max(0)).unwrap_or(usize::MAX);
+                let end =
+                    usize::try_from(viewport.y.saturating_add(i64::from(viewport.height)).max(0))
+                        .unwrap_or(usize::MAX)
+                        .min(layout.size.height)
+                        .min(self.steps.len());
+                for index in start..end {
+                    let step = &self.steps[index];
                     let prefix = if index > 0 {
                         format!("{} ", self.policy.connector)
                     } else {
                         "  ".to_owned()
                     };
-                    let mut line = Line::from_spans([Span::styled(
-                        format!("{prefix}{}", self.step_text(step)),
-                        self.style_for(step.status),
-                    )]);
+                    let mut line = Line::from_spans([
+                        Span::styled(prefix, self.styles.connector),
+                        Span::styled(self.step_text(step), self.style_for(step.status)),
+                    ]);
                     if self.policy.truncate {
                         line = line.truncate(usize::from(layout.size.width));
                     }
@@ -316,14 +338,26 @@ impl Component for StepperComponent<'_> {
                 }
             }
         }
-        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let area = LocalRect::new(0, 0, layout.size.width, height);
-        cx.push_semantic(SemanticRegion::new(
-            self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, height),
-            "progress",
-        ));
-        cx.push_damage(area);
+        let viewport = cx.area();
+        let start = usize::try_from(viewport.y.max(0)).unwrap_or(usize::MAX);
+        let end = usize::try_from(viewport.y.saturating_add(i64::from(viewport.height)).max(0))
+            .unwrap_or(usize::MAX)
+            .min(layout.size.height)
+            .min(content_height);
+        let height = u16::try_from(end.saturating_sub(start)).unwrap_or(u16::MAX);
+        cx.with_child(
+            0,
+            i64::try_from(start).unwrap_or(i64::MAX),
+            LocalRect::new(0, 0, layout.size.width, height),
+            |cx| {
+                cx.push_semantic(SemanticRegion::new(
+                    self.id.as_str(),
+                    Rect::new(0, 0, layout.size.width, height),
+                    "progress",
+                ));
+                cx.push_damage(LocalRect::new(0, 0, layout.size.width, height));
+            },
+        );
     }
 }
 
@@ -394,6 +428,200 @@ mod tests {
     use super::{
         StepItem, StepStatus, StepperComponent, StepperOrientation, StepperPolicy, StepperStyles,
     };
+
+    #[test]
+    fn truncation_changes_paint_revision_without_remeasurement() {
+        let steps = [
+            StepItem::new("one", "Long first step"),
+            StepItem::new("two", "Second"),
+        ];
+        for orientation in [StepperOrientation::Horizontal, StepperOrientation::Vertical] {
+            let policy = StepperPolicy {
+                orientation,
+                ..StepperPolicy::horizontal()
+            };
+            let truncated = StepperComponent::new("steps", &steps).policy(StepperPolicy {
+                truncate: true,
+                ..policy
+            });
+            let clipped = StepperComponent::new("steps", &steps).policy(StepperPolicy {
+                truncate: false,
+                ..policy
+            });
+            assert_eq!(truncated.revision().layout, clipped.revision().layout);
+            assert_ne!(truncated.revision().paint, clipped.revision().paint);
+            for width in [0, 4, 80] {
+                let constraints = Constraints::for_width(width);
+                assert_eq!(
+                    truncated.layout(constraints, &mut LayoutCx::new()).size,
+                    clipped.layout(constraints, &mut LayoutCx::new()).size
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vertical_connector_uses_connector_style_not_step_status() {
+        let steps = [StepItem::new("one", "One"), StepItem::new("two", "Two")];
+        let connector = Style::new().fg(Color::Red);
+        let pending = Style::new().fg(Color::Blue);
+        let component = StepperComponent::new("steps", &steps)
+            .policy(StepperPolicy::vertical())
+            .styles(StepperStyles {
+                pending,
+                connector,
+                ..StepperStyles::default()
+            });
+        let layout = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let at = |x| {
+            frame
+                .buffer()
+                .get(bmux_tui::geometry::Point::new(x, 1))
+                .unwrap()
+        };
+        assert_eq!(at(0).symbol, "│");
+        assert_eq!(at(0).style, connector);
+        assert_eq!(at(2).style, pending);
+        assert_eq!(at(4).symbol, "T");
+        assert_eq!(at(4).style, pending);
+    }
+
+    #[test]
+    fn oversized_layout_metadata_covers_only_content_rows() {
+        let steps = [StepItem::new("one", "One"), StepItem::new("two", "Two")];
+        for (orientation, height) in [
+            (StepperOrientation::Horizontal, 1),
+            (StepperOrientation::Vertical, 2),
+        ] {
+            let component = StepperComponent::new("steps", &steps).policy(StepperPolicy {
+                orientation,
+                ..StepperPolicy::horizontal()
+            });
+            let layout = component.layout(
+                Constraints::tight(Rect::new(0, 0, 30, 5).size()),
+                &mut LayoutCx::new(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 5));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(
+                frame.semantics().regions()[0].area,
+                Rect::new(0, 0, 30, height)
+            );
+            assert_eq!(
+                frame
+                    .damage(bmux_tui::damage::DamagePolicy::default())
+                    .retained_regions(),
+                &[Rect::new(0, 0, 30, height)]
+            );
+            assert_eq!(
+                frame.buffer().row_symbols(height).as_deref(),
+                Some("                              ")
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_custom_connector_measurement_matches_rendering() {
+        let steps = [
+            StepItem::new("one", "One"),
+            StepItem::new("two", "Two"),
+            StepItem::new("three", "Three"),
+        ];
+        for connector in ["", "中", "->"] {
+            let component = StepperComponent::new("steps", &steps).policy(StepperPolicy {
+                connector,
+                markers: false,
+                ..StepperPolicy::horizontal()
+            });
+            let expected = format!("One {connector} Two {connector} Three");
+            let layout = component.layout(
+                Constraints::loose(Rect::new(0, 0, 80, 1).size()),
+                &mut LayoutCx::new(),
+            );
+            assert_eq!(
+                usize::from(layout.size.width),
+                bmux_tui::text_width::display_width(&expected)
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, layout.size.width, 1));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(
+                frame.buffer().row_symbols(0).as_deref(),
+                Some(expected.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn scrolling_past_content_publishes_no_paint_metadata() {
+        let steps = [StepItem::new("one", "One"), StepItem::new("two", "Two")];
+        for orientation in [StepperOrientation::Horizontal, StepperOrientation::Vertical] {
+            let component = StepperComponent::new("steps", &steps).policy(StepperPolicy {
+                orientation,
+                ..StepperPolicy::horizontal()
+            });
+            let layout = component.layout(
+                Constraints::tight(Rect::new(0, 0, 20, 8).size()),
+                &mut LayoutCx::new(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 2));
+            let mut frame = Frame::new(&mut buffer);
+            PaintCx::new(&mut frame).with_child(
+                0,
+                -3,
+                bmux_tui::paint::LocalRect::new(0, 0, 20, 8),
+                |cx| component.paint(&layout, cx),
+            );
+            assert!(frame.semantics().regions().is_empty());
+            assert!(
+                frame
+                    .damage(bmux_tui::damage::DamagePolicy::default())
+                    .retained_regions()
+                    .is_empty()
+            );
+            assert_eq!(
+                frame.buffer().row_symbols(0).as_deref(),
+                Some("                    ")
+            );
+        }
+    }
+
+    #[test]
+    fn deep_scroll_keeps_vertical_steps_and_semantics_visible() {
+        let mut steps = vec![StepItem::new("earlier", "Earlier"); 70_000];
+        steps.extend([
+            StepItem::new("one", "One"),
+            StepItem::new("two", "Two"),
+            StepItem::new("three", "Three"),
+        ]);
+        let component = StepperComponent::new("setup", &steps).policy(StepperPolicy::vertical());
+        let layout = component.layout(Constraints::for_width(12), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 5));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(
+            2,
+            -69_999,
+            bmux_tui::paint::LocalRect::new(0, 70_000, 12, 3),
+            |cx| component.paint(&layout, cx),
+        );
+        for (row, label) in [(1, "│ ○ One"), (2, "│ ○ Two"), (3, "│ ○ Three")] {
+            assert!(frame.buffer().row_symbols(row).unwrap().contains(label));
+        }
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("                ")
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(4).as_deref(),
+            Some("                ")
+        );
+        assert_eq!(frame.semantics().regions().len(), 1);
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(2, 1, 12, 3));
+    }
 
     #[test]
     fn component_measures_and_paints_horizontal_progress() {

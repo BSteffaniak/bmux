@@ -8,8 +8,8 @@ use bmux_tui::component::{
 };
 use bmux_tui::composition::TextBlock;
 use bmux_tui::event::{Event, EventOutcome};
-use bmux_tui::geometry::{Insets, Rect, Size};
-use bmux_tui::paint::{LocalRect, PaintCx};
+use bmux_tui::geometry::{Insets, Size};
+use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Line, Text};
 
 use crate::action_row::{ActionButton, ActionRowComponent, ActionRowState};
@@ -77,7 +77,8 @@ impl Component for DialogContent<'_, '_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let action_height = usize::from(self.actions.is_some());
+        let action_height =
+            usize::from(self.actions.is_some()).min(constraints.max_height().unwrap_or(usize::MAX));
         let body = self.body.layout(
             Constraints::new(
                 constraints.min_width(),
@@ -89,10 +90,28 @@ impl Component for DialogContent<'_, '_> {
             ),
             cx,
         );
-        let width = body.size.width.max(constraints.min_width());
+        let actions = self.actions.as_ref().map(|actions| {
+            actions.layout(
+                Constraints::new(
+                    0,
+                    constraints.max_width(),
+                    action_height,
+                    Some(action_height),
+                ),
+                cx,
+            )
+        });
+        let width = body
+            .size
+            .width
+            .max(constraints.min_width())
+            .max(actions.as_ref().map_or(0, |node| node.size.width));
         let mut children = vec![ChildLayout::new(0, 0, body)];
         if let Some(actions) = &self.actions {
-            let actions = actions.layout(Constraints::tight(Size::new(width, 1)), cx);
+            let actions = actions.layout(
+                Constraints::new(width, width, action_height, Some(action_height)),
+                cx,
+            );
             let y = children[0].node.size.height;
             children.push(ChildLayout::new(0, y, actions));
         }
@@ -117,15 +136,10 @@ impl Component for DialogContent<'_, '_> {
             } else {
                 continue;
             };
-            cx.with_child(
+            cx.with_child_size(
                 i32::from(child.x),
                 i64::try_from(child.y).unwrap_or(i64::MAX),
-                LocalRect::new(
-                    0,
-                    0,
-                    child.node.size.width,
-                    u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
-                ),
+                child.node.size,
                 |cx| component.paint(&child.node, cx),
             );
         }
@@ -138,20 +152,7 @@ impl Component for DialogContent<'_, '_> {
         let Some(child) = layout.children.get(1) else {
             return EventOutcome::Ignored;
         };
-        let clip = Rect::new(
-            child.x,
-            u16::try_from(child.y).unwrap_or(u16::MAX),
-            child.node.size.width,
-            u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
-        );
-        cx.with_transform(
-            child.x,
-            child.y,
-            i32::from(child.x),
-            i64::try_from(child.y).unwrap_or(i64::MAX),
-            clip,
-            |cx| actions.event(event, &child.node, cx),
-        )
+        cx.with_child(child, |cx| actions.event(event, &child.node, cx))
     }
 }
 
@@ -276,6 +277,105 @@ mod tests {
     use crate::modal_frame::{ModalSizing, ModalTheme};
 
     use super::{Dialog, DialogComponent};
+
+    #[test]
+    fn content_intrinsic_width_includes_actions() {
+        let body = [Line::from("?")];
+        let actions = [ActionButton::new("confirm", "Confirm")];
+        let state = Cell::new(ActionRowState::new());
+        let dialog = Dialog::new(&body, &actions, ModalTheme::dark(Color::Cyan));
+        let content = super::DialogContent::new(&"dialog".into(), &dialog, &state);
+        for (maximum, expected) in [(20, 11), (5, 5)] {
+            let layout =
+                content.layout(Constraints::new(0, maximum, 0, None), &mut LayoutCx::new());
+            assert_eq!(layout.size.width, expected);
+            assert_eq!(layout.children[1].node.size.width, expected);
+        }
+        let layout = content.layout(Constraints::new(0, 20, 0, None), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 11, 2));
+        let mut frame = Frame::new(&mut buffer);
+        content.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame.buffer().row_symbols(1).as_deref(),
+            Some("[ Confirm ]")
+        );
+    }
+
+    #[test]
+    fn content_respects_tiny_height_constraints() {
+        let body = [Line::from("Proceed?")];
+        let actions = [ActionButton::new("ok", "OK")];
+        let state = Cell::new(ActionRowState::new());
+        let dialog = Dialog::new(&body, &actions, ModalTheme::dark(Color::Cyan));
+        let content = super::DialogContent::new(&"dialog".into(), &dialog, &state);
+        for height in 0..=2 {
+            let layout = content.layout(
+                Constraints::new(12, 12, 0, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            assert_eq!(layout.size.height, height);
+            for child in &layout.children {
+                assert!(child.y + child.node.size.height <= height);
+            }
+            assert_eq!(layout.children[1].node.size.height, height.min(1));
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 3));
+            let mut frame = Frame::new(&mut buffer);
+            content.paint(&layout, &mut PaintCx::new(&mut frame));
+            if height == 0 {
+                assert!(frame.hits().regions().is_empty());
+                assert_eq!(
+                    frame.buffer().row_symbols(0).as_deref(),
+                    Some("            ")
+                );
+            } else {
+                assert!(
+                    frame
+                        .buffer()
+                        .row_symbols(u16::try_from(height - 1).unwrap())
+                        .is_some_and(|row| row.contains("[ OK ]"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn content_paints_body_beyond_terminal_coordinate_height() {
+        let body = vec![Line::from("visible"); 70_001];
+        let state = Cell::new(ActionRowState::new());
+        let dialog = Dialog::new(&body, &[], ModalTheme::dark(Color::Cyan));
+        let content = super::DialogContent::new(&"dialog".into(), &dialog, &state);
+        let layout = content.layout(Constraints::new(7, 7, 0, None), &mut LayoutCx::new());
+        assert_eq!(layout.size.height, 70_001);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 7, 1));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame)
+            .with_child_size(0, -70_000, layout.size, |cx| content.paint(&layout, cx));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("visible"));
+    }
+
+    #[test]
+    fn translated_content_routes_only_visible_action_clicks() {
+        use bmux_tui::event::{MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::Point;
+
+        let body = [Line::from("Proceed?")];
+        let actions = [ActionButton::new("ok", "OK")];
+        let state = Cell::new(ActionRowState::new());
+        let dialog = Dialog::new(&body, &actions, ModalTheme::dark(Color::Cyan));
+        let content = super::DialogContent::new(&"dialog".into(), &dialog, &state);
+        let layout = content.layout(Constraints::new(12, 12, 0, None), &mut LayoutCx::new());
+        let mut cx = EventCx::new(&layout);
+        for (point, handled) in [(Point::new(5, 4), true), (Point::new(5, 3), false)] {
+            let event = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                point,
+            ));
+            let outcome = cx.with_transform(0, 0, 5, 3, Rect::new(5, 3, 12, 2), |cx| {
+                content.event(&event, &layout, cx)
+            });
+            assert_eq!(outcome.is_handled(), handled);
+        }
+    }
 
     #[test]
     fn component_composes_modal_body_actions_and_routes_events() {

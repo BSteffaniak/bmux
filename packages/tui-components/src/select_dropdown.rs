@@ -311,16 +311,53 @@ impl<'a> SelectDropdown<'a> {
         state: &mut SelectDropdownState,
         event: &Event,
     ) -> SelectDropdownOutcome {
+        if matches!(
+            event,
+            Event::Focus(bmux_tui::event::FocusEvent::Lost) | Event::Resize(_)
+        ) {
+            return self.cancel_pointer_input(area, state);
+        }
+        let pointer_outcome = if state.interaction.disabled || !self.policy.mouse.enabled {
+            self.cancel_pointer_input(area, state)
+        } else {
+            SelectDropdownOutcome::Ignored
+        };
         self.normalize_state(state);
         if state.interaction.disabled {
-            return SelectDropdownOutcome::Ignored;
+            return pointer_outcome;
         }
-        match event {
+        let outcome = match event {
             Event::Key(stroke) => self.handle_key(area, state, *stroke),
             Event::Mouse(mouse) => self.handle_mouse(area, state, *mouse),
             Event::Resize(_) | Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
                 SelectDropdownOutcome::Ignored
             }
+        };
+        if outcome == SelectDropdownOutcome::Ignored {
+            pointer_outcome
+        } else {
+            outcome
+        }
+    }
+
+    fn cancel_pointer_input(
+        &self,
+        area: Rect,
+        state: &mut SelectDropdownState,
+    ) -> SelectDropdownOutcome {
+        let changed = state.interaction.pressed || state.interaction.hovered;
+        state.interaction.pressed = false;
+        state.interaction.hovered = false;
+        let items = self.list_items();
+        let list_outcome = SelectableList::new(&items).handle_event(
+            self.list_area(area),
+            &mut state.list,
+            &Event::Focus(bmux_tui::event::FocusEvent::Lost),
+        );
+        if changed || list_outcome != crate::selectable_list::SelectableListOutcome::Ignored {
+            SelectDropdownOutcome::Redraw
+        } else {
+            SelectDropdownOutcome::Ignored
         }
     }
 
@@ -400,7 +437,8 @@ impl<'a> SelectDropdown<'a> {
         if !self.policy.mouse.enabled {
             return SelectDropdownOutcome::Ignored;
         }
-        if state.open && self.list_area(area).contains(mouse.position) {
+        if state.open && !state.interaction.pressed && self.list_area(area).contains(mouse.position)
+        {
             return self.delegate_mouse_to_list(area, state, mouse);
         }
         let closed_area = Rect::new(area.x, area.y, area.width, 1);
@@ -419,10 +457,10 @@ impl<'a> SelectDropdown<'a> {
                 state.interaction.focused = true;
                 SelectDropdownOutcome::Redraw
             }
-            MouseEventKind::Up(MouseButton::Left) if self.policy.mouse.click => {
+            MouseEventKind::Up(MouseButton::Left) => {
                 let was_pressed = state.interaction.pressed;
                 state.interaction.pressed = false;
-                if was_pressed && hit {
+                if self.policy.mouse.click && was_pressed && hit {
                     self.toggle(state)
                 } else if was_pressed {
                     SelectDropdownOutcome::Redraw
@@ -488,11 +526,13 @@ impl<'a> SelectDropdown<'a> {
         mouse: MouseEvent,
     ) -> SelectDropdownOutcome {
         let items = self.list_items();
-        match SelectableList::new(&items).handle_event(
-            self.list_area(area),
-            &mut state.list,
-            &Event::Mouse(mouse),
-        ) {
+        match SelectableList::new(&items)
+            .policy(crate::selectable_list::SelectableListPolicy {
+                mouse: self.policy.mouse,
+                ..crate::selectable_list::SelectableListPolicy::default()
+            })
+            .handle_event(self.list_area(area), &mut state.list, &Event::Mouse(mouse))
+        {
             crate::selectable_list::SelectableListOutcome::Ignored => {
                 SelectDropdownOutcome::Ignored
             }
@@ -668,7 +708,8 @@ impl Component for SelectDropdownComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), closed_area)
                 .role(HitRole::ListItem)
-                .hoverable(self.select.policy.mouse.hover)
+                .pointer_events(self.select.policy.mouse.enabled)
+                .hoverable(self.select.policy.mouse.enabled && self.select.policy.mouse.hover)
                 .focusable(true)
                 .enabled(!state.interaction.disabled),
         );
@@ -678,7 +719,10 @@ impl Component for SelectDropdownComponent<'_, '_> {
                 cx.push_hit(
                     SceneRegion::new(format!("{}.options", self.id.as_str()), list_area)
                         .role(HitRole::ListItem)
-                        .hoverable(self.select.policy.mouse.hover)
+                        .pointer_events(self.select.policy.mouse.enabled)
+                        .hoverable(
+                            self.select.policy.mouse.enabled && self.select.policy.mouse.hover,
+                        )
                         .focusable(false)
                         .enabled(!state.interaction.disabled),
                 );
@@ -695,7 +739,10 @@ impl Component for SelectDropdownComponent<'_, '_> {
                     cx.push_hit(
                         SceneRegion::new(option_id.clone(), region.rect)
                             .role(HitRole::ListItem)
-                            .hoverable(self.select.policy.mouse.hover)
+                            .pointer_events(self.select.policy.mouse.enabled)
+                            .hoverable(
+                                self.select.policy.mouse.enabled && self.select.policy.mouse.hover,
+                            )
                             .enabled(!state.interaction.disabled && !disabled),
                     );
                     cx.push_semantic(SemanticRegion::new(option_id, region.rect, "option"));
@@ -760,8 +807,8 @@ mod tests {
     use bmux_tui::paint::{LocalRect, PaintCx};
 
     use super::{
-        SelectDropdown, SelectDropdownComponent, SelectDropdownOutcome, SelectDropdownState,
-        SelectOption,
+        SelectDropdown, SelectDropdownComponent, SelectDropdownOutcome, SelectDropdownPolicy,
+        SelectDropdownState, SelectOption,
     };
 
     fn render_component(
@@ -958,6 +1005,46 @@ mod tests {
     }
 
     #[test]
+    fn mouse_disable_cancels_press_without_blocking_keyboard_selection() {
+        let options = options();
+        let mut select = SelectDropdown::new(&options);
+        let mut state = SelectDropdownState::new(Some(0));
+        state.interaction.focused = true;
+        select.open(&mut state);
+        let area = Rect::new(0, 0, 14, 4);
+        select.handle_event(
+            area,
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(1, 0),
+            )),
+        );
+        assert!(state.interaction.pressed);
+        select.policy.mouse.enabled = false;
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Down))
+            ),
+            SelectDropdownOutcome::Focused(1)
+        );
+        assert!(!state.interaction.pressed);
+        assert!(state.interaction.focused);
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Enter))
+            ),
+            SelectDropdownOutcome::Selected(1)
+        );
+        assert_eq!(state.selected(), Some(1));
+        assert!(!state.is_open());
+    }
+
+    #[test]
     fn enter_opens_focused_dropdown() {
         let options = options();
         let select = SelectDropdown::new(&options);
@@ -1026,6 +1113,273 @@ mod tests {
         assert_eq!(down, SelectDropdownOutcome::Redraw);
         assert_eq!(up, SelectDropdownOutcome::Opened);
         assert!(state.is_open());
+    }
+
+    #[test]
+    fn disabling_click_before_release_cancels_dropdown_toggle() {
+        let options = options();
+        let mut select = SelectDropdown::new(&options);
+        let mut state = SelectDropdownState::new(Some(0));
+        let area = Rect::new(0, 0, 14, 3);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 0)));
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left))
+            ),
+            SelectDropdownOutcome::Redraw
+        );
+        assert!(state.interaction.pressed);
+        select.policy.mouse.click = false;
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            SelectDropdownOutcome::Redraw
+        );
+        assert!(!state.interaction.pressed);
+        assert!(!state.is_open());
+        select.policy.mouse.click = true;
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            SelectDropdownOutcome::Ignored
+        );
+        assert!(!state.is_open());
+    }
+
+    #[test]
+    fn open_list_respects_click_policy_changes() {
+        let options = options();
+        let mut select = SelectDropdown::new(&options);
+        let mut state = SelectDropdownState::new(Some(0));
+        select.open(&mut state);
+        let area = Rect::new(0, 0, 14, 4);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 2)));
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left))
+            ),
+            SelectDropdownOutcome::Redraw
+        );
+        select.policy.mouse.click = false;
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            SelectDropdownOutcome::Redraw
+        );
+        assert!(state.is_open());
+        assert_eq!(state.selected, Some(0));
+        select.policy.mouse.click = true;
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            SelectDropdownOutcome::Ignored
+        );
+        assert!(state.is_open());
+        assert_eq!(state.selected, Some(0));
+    }
+
+    #[test]
+    fn trigger_release_over_open_list_cancels_trigger_press() {
+        let options = options();
+        let select = SelectDropdown::new(&options);
+        let mut state = SelectDropdownState::new(Some(0));
+        select.open(&mut state);
+        let area = Rect::new(0, 0, 14, 4);
+        let mouse = |kind, y| Event::Mouse(MouseEvent::new(kind, Point::new(1, y)));
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left), 0)
+            ),
+            SelectDropdownOutcome::Redraw
+        );
+        assert!(state.interaction.pressed);
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left), 2)
+            ),
+            SelectDropdownOutcome::Redraw
+        );
+        assert!(!state.interaction.pressed);
+        assert!(state.is_open());
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(
+            select.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left), 0)
+            ),
+            SelectDropdownOutcome::Ignored
+        );
+        assert!(state.is_open());
+    }
+
+    #[test]
+    fn focus_loss_cancels_trigger_and_list_presses() {
+        let options = options();
+        let select = SelectDropdown::new(&options);
+        let area = Rect::new(0, 0, 14, 4);
+        for row in [0, 2] {
+            let mut state = SelectDropdownState::new(Some(0));
+            select.open(&mut state);
+            let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, row)));
+            assert_eq!(
+                select.handle_event(
+                    area,
+                    &mut state,
+                    &mouse(MouseEventKind::Down(MouseButton::Left))
+                ),
+                SelectDropdownOutcome::Redraw
+            );
+            let focus_event = Event::Focus(bmux_tui::event::FocusEvent::Lost);
+            assert_eq!(
+                select.handle_event(area, &mut state, &focus_event),
+                SelectDropdownOutcome::Redraw
+            );
+            assert!(!state.interaction.pressed);
+            assert!(!state.interaction.hovered);
+            assert_eq!(
+                select.handle_event(area, &mut state, &focus_event),
+                SelectDropdownOutcome::Ignored
+            );
+            assert_eq!(
+                select.handle_event(
+                    area,
+                    &mut state,
+                    &mouse(MouseEventKind::Up(MouseButton::Left))
+                ),
+                SelectDropdownOutcome::Ignored
+            );
+            assert!(state.is_open());
+            assert_eq!(state.selected, Some(0));
+        }
+    }
+
+    #[test]
+    fn resize_cancels_trigger_and_list_presses() {
+        let options = options();
+        let select = SelectDropdown::new(&options);
+        let area = Rect::new(0, 0, 14, 4);
+        for row in [0, 2] {
+            let mut state = SelectDropdownState::new(Some(0));
+            select.open(&mut state);
+            let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, row)));
+            select.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left)),
+            );
+            let resize = Event::Resize(area.size());
+            assert_eq!(
+                select.handle_event(area, &mut state, &resize),
+                SelectDropdownOutcome::Redraw
+            );
+            assert!(!state.interaction.pressed);
+            assert_eq!(
+                select.handle_event(area, &mut state, &resize),
+                SelectDropdownOutcome::Ignored
+            );
+            assert_eq!(
+                select.handle_event(
+                    area,
+                    &mut state,
+                    &mouse(MouseEventKind::Up(MouseButton::Left))
+                ),
+                SelectDropdownOutcome::Ignored
+            );
+            assert!(state.is_open());
+            assert_eq!(state.selected, Some(0));
+        }
+    }
+
+    #[test]
+    fn mouse_disabled_component_retains_only_keyboard_target() {
+        let options = options();
+        for open in [false, true] {
+            let mut initial = SelectDropdownState::new(Some(0));
+            if open {
+                SelectDropdown::new(&options).open(&mut initial);
+            }
+            let state = Cell::new(initial);
+            let mut policy = SelectDropdownPolicy::default();
+            policy.mouse.enabled = false;
+            let component = SelectDropdownComponent::new("select", &options, &state).policy(policy);
+            let layout = component.layout(Constraints::for_width(14), &mut LayoutCx::new());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 14, 10));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            let regions = frame.hits().regions();
+            assert_eq!(regions.len(), if open { options.len() + 2 } else { 1 });
+            assert!(regions[0].enabled);
+            assert!(regions[0].focusable);
+            for region in regions {
+                assert!(!region.pointer_events);
+                assert!(!region.hoverable);
+            }
+        }
+    }
+
+    #[test]
+    fn disabling_pointer_input_cancels_trigger_and_list_presses() {
+        let options = options();
+        let area = Rect::new(0, 0, 14, 4);
+        for disable_control in [false, true] {
+            for row in [0, 2] {
+                let mut select = SelectDropdown::new(&options);
+                let mut state = SelectDropdownState::new(Some(0));
+                select.open(&mut state);
+                let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, row)));
+                select.handle_event(
+                    area,
+                    &mut state,
+                    &mouse(MouseEventKind::Down(MouseButton::Left)),
+                );
+                if disable_control {
+                    state.interaction.disabled = true;
+                } else {
+                    select.policy.mouse.enabled = false;
+                }
+                assert_eq!(
+                    select.handle_event(area, &mut state, &Event::Tick),
+                    SelectDropdownOutcome::Redraw
+                );
+                assert_eq!(
+                    select.handle_event(area, &mut state, &Event::Tick),
+                    SelectDropdownOutcome::Ignored
+                );
+                state.interaction.disabled = false;
+                select.policy.mouse.enabled = true;
+                assert_eq!(
+                    select.handle_event(
+                        area,
+                        &mut state,
+                        &mouse(MouseEventKind::Up(MouseButton::Left))
+                    ),
+                    SelectDropdownOutcome::Ignored
+                );
+                assert!(state.is_open());
+                assert_eq!(state.selected(), Some(0));
+            }
+        }
     }
 
     #[test]

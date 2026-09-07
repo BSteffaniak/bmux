@@ -16,25 +16,20 @@ use bmux_tui_components::breadcrumbs::{
 use bmux_tui_components::key_hint_bar::{
     KeyHint, KeyHintBarComponent, KeyHintBarPolicy, KeyHintBarStyles,
 };
-use bmux_tui_components::menu::{Menu, MenuComponent, MenuItem, MenuOutcome, MenuState};
+use bmux_tui_components::menu::{MenuComponent, MenuItem, MenuOutcome, MenuState};
 use bmux_tui_components::pane::{
     Pane, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
 };
 use bmux_tui_components::scroll_view::{ScrollView, ScrollViewComponent, ScrollViewState};
 use bmux_tui_components::selectable_list::{
-    SelectableList, SelectableListComponent, SelectableListItem, SelectableListOutcome,
-    SelectableListState,
+    SelectableListComponent, SelectableListItem, SelectableListOutcome, SelectableListState,
 };
 use bmux_tui_components::status_bar::{
     MessageBarComponent, StatusBarComponent, StatusBarPolicy, StatusBarStyles, StatusSegment,
     StatusSeverity,
 };
-use bmux_tui_components::tab_bar::{
-    TabBar, TabBarComponent, TabBarOutcome, TabBarState, TabBarStyles, TabItem,
-};
-use bmux_tui_components::table::{
-    Table, TableColumn, TableComponent, TableOutcome, TableRow, TableState,
-};
+use bmux_tui_components::tab_bar::{TabBarComponent, TabBarState, TabBarStyles, TabItem};
+use bmux_tui_components::table::{TableColumn, TableComponent, TableOutcome, TableRow, TableState};
 use bmux_tui_components::text_view::{
     TextViewComponent, TextViewCursor, TextViewHighlight, TextViewSelection,
 };
@@ -115,12 +110,25 @@ impl NavigationDemo {
         }
 
         let tab_items = tab_items();
-        match TabBar::new(&tab_items).handle_event(Rect::new(1, 0, 42, 1), &mut self.tabs, event) {
-            TabBarOutcome::Selected(index) => {
-                self.message = format!("Tab selected: {}", tab_items[index].label());
-                return false;
-            }
-            TabBarOutcome::Ignored | TabBarOutcome::Redraw => {}
+        let previous_selection = self.tabs.selected();
+        let tab_state = RefCell::new(std::mem::take(&mut self.tabs));
+        let component = TabBarComponent::new("navigation.tabs", &tab_items, &tab_state);
+        let area = Rect::new(1, 0, 42, 1);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        EventCx::new(&layout).with_transform(
+            0,
+            0,
+            i32::from(area.x),
+            i64::from(area.y),
+            area,
+            |cx| component.event(event, &layout, cx),
+        );
+        self.tabs = tab_state.into_inner();
+        if self.tabs.selected() != previous_selection
+            && let Some(index) = self.tabs.selected()
+        {
+            self.message = format!("Tab selected: {}", tab_items[index].label());
+            return false;
         }
 
         let tree_items = tree_items();
@@ -156,11 +164,20 @@ impl NavigationDemo {
         }
 
         let list_items = list_items();
-        match SelectableList::new(&list_items).handle_event(
-            Rect::new(1, 1, 24, 3),
-            &mut self.list,
-            event,
-        ) {
+        let list_state = Cell::new(self.list);
+        let component = SelectableListComponent::new("navigation.list", &list_items, &list_state);
+        let area = Rect::new(1, 1, 24, 3);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let outcome = EventCx::new(&layout).with_transform(
+            0,
+            0,
+            i32::from(area.x),
+            i64::from(area.y),
+            area,
+            |cx| component.handle_event(event, &layout, cx),
+        );
+        self.list = list_state.get();
+        match outcome {
             SelectableListOutcome::Selected(index) => {
                 self.message = format!("List selected: {}", list_item_text(&list_items[index]));
                 return false;
@@ -173,7 +190,20 @@ impl NavigationDemo {
         }
 
         let menu_items = menu_items();
-        match Menu::new(&menu_items).handle_event(Rect::new(30, 1, 18, 2), &mut self.menu, event) {
+        let menu_state = Cell::new(self.menu);
+        let component = MenuComponent::new("navigation.menu", &menu_items, &menu_state);
+        let area = Rect::new(30, 1, 18, 2);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let outcome = EventCx::new(&layout).with_transform(
+            0,
+            0,
+            i32::from(area.x),
+            i64::from(area.y),
+            area,
+            |cx| component.handle_event(event, &layout, cx),
+        );
+        self.menu = menu_state.get();
+        match outcome {
             MenuOutcome::Activated { id, .. } => self.message = format!("Menu action: {id}"),
             MenuOutcome::Cancelled => self.message = "Menu cancelled".to_string(),
             MenuOutcome::Ignored
@@ -193,11 +223,25 @@ impl NavigationDemo {
 
         let table_columns = table_columns();
         let table_rows = table_rows();
-        match Table::new(&table_columns, &table_rows).handle_event(
-            Rect::new(1, 9, 24, 4),
-            &mut self.table,
-            event,
-        ) {
+        let table_state = RefCell::new(std::mem::take(&mut self.table));
+        let component = TableComponent::new(
+            "navigation.table",
+            &table_columns,
+            &table_rows,
+            &table_state,
+        );
+        let area = Rect::new(1, 9, 24, 4);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let outcome = EventCx::new(&layout).with_transform(
+            0,
+            0,
+            i32::from(area.x),
+            i64::from(area.y),
+            area,
+            |cx| component.handle_event(event, &layout, cx),
+        );
+        self.table = table_state.into_inner();
+        match outcome {
             TableOutcome::Selected(index) => {
                 self.message = format!("Table selected: {}", table_rows[index].cell_plain_text(0));
                 return false;
@@ -517,12 +561,16 @@ fn render_navigation_with_state(cx: &mut PaintCx<'_, '_>, demo: &NavigationDemo)
 
 pub fn demonstrate_menu_activation() -> MenuOutcome {
     let items = menu_items();
-    let menu = Menu::new(&items);
-    let mut state = MenuState::new(Some(0));
+    let state = Cell::new(MenuState::new(Some(0)));
+    let menu = MenuComponent::new("navigation.menu.demo", &items, &state);
+    let layout = menu.layout(
+        Constraints::tight(Rect::new(0, 0, 16, 2).size()),
+        &mut LayoutCx::new(),
+    );
     menu.handle_event(
-        Rect::new(0, 0, 16, 2),
-        &mut state,
         &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+        &layout,
+        &mut EventCx::new(&layout),
     )
 }
 
@@ -578,17 +626,26 @@ pub fn demonstrate_text_view_scroll() -> usize {
 pub fn demonstrate_table_selection() -> String {
     let columns = table_columns();
     let rows = table_rows();
-    let table = Table::new(&columns, &rows);
-    let mut state = TableState::new(Some(0));
+    let state = RefCell::new(TableState::new(Some(0)));
+    let table = TableComponent::new("navigation.table.demo", &columns, &rows, &state);
+    let layout = table.layout(
+        Constraints::tight(Rect::new(0, 0, 24, 4).size()),
+        &mut LayoutCx::new(),
+    );
     let _ = table.handle_event(
-        Rect::new(1, 9, 24, 4),
-        &mut state,
         &Event::Key(KeyStroke::simple(KeyCode::Down)),
+        &layout,
+        &mut EventCx::new(&layout),
+    );
+    // Resolve again after selection changes, as a component host does before dispatch.
+    let layout = table.layout(
+        Constraints::tight(Rect::new(0, 0, 24, 4).size()),
+        &mut LayoutCx::new(),
     );
     match table.handle_event(
-        Rect::new(1, 9, 24, 4),
-        &mut state,
         &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+        &layout,
+        &mut EventCx::new(&layout),
     ) {
         TableOutcome::Selected(index) => {
             format!("Table selected: {}", rows[index].cell_plain_text(0))
@@ -786,6 +843,41 @@ mod tests {
     };
 
     #[test]
+    fn tab_mouse_selection_updates_navigation_message() {
+        let mut demo = super::NavigationDemo::new();
+        for kind in [
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+        ] {
+            assert!(!demo.handle_event(&bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(kind, bmux_tui::geometry::Point::new(9, 0)),
+            )));
+        }
+        assert_eq!(demo.tabs.selected(), Some(1));
+        assert_eq!(demo.message, "Tab selected: Tree");
+        assert!(!demo.handle_event(&bmux_tui::event::Event::Key(
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Right),
+        )));
+        assert_eq!(demo.tabs.selected(), Some(2));
+        assert_eq!(demo.message, "Tab selected: Scroll");
+    }
+
+    #[test]
+    fn list_mouse_selection_updates_navigation_message() {
+        let mut demo = super::NavigationDemo::new();
+        for kind in [
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+        ] {
+            assert!(!demo.handle_event(&bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(kind, bmux_tui::geometry::Point::new(2, 1)),
+            )));
+        }
+        assert_eq!(demo.list.selected(), Some(0));
+        assert_eq!(demo.message, "List selected: First item");
+    }
+
+    #[test]
     fn navigation_renders_lists_menus_and_scroll_content() {
         let rendered = rows(&render_navigation()).join("\n");
 
@@ -836,6 +928,21 @@ mod tests {
     #[test]
     fn text_view_mouse_wheel_updates_scroll() {
         assert_eq!(demonstrate_text_view_scroll(), 1);
+    }
+
+    #[test]
+    fn table_mouse_selection_updates_navigation_message() {
+        let mut demo = super::NavigationDemo::new();
+        for kind in [
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+        ] {
+            assert!(!demo.handle_event(&bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(kind, bmux_tui::geometry::Point::new(2, 11)),
+            )));
+        }
+        assert_eq!(demo.table.selected(), Some(1));
+        assert_eq!(demo.message, "Table focus: beta");
     }
 
     #[test]

@@ -447,11 +447,12 @@ impl<'a> TreeView<'a> {
                     TreeViewOutcome::Ignored
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) if self.policy.mouse.click => {
+            MouseEventKind::Up(MouseButton::Left) => {
                 let Some(pressed) = state.pressed_visible.take() else {
                     return TreeViewOutcome::Ignored;
                 };
-                if let Some(hit) = hit
+                if self.policy.mouse.click
+                    && let Some(hit) = hit
                     && pressed == hit
                     && let Some(source) = self.visible_indices(state).get(hit).copied()
                 {
@@ -748,7 +749,9 @@ impl Component for TreeViewComponent<'_, '_> {
                         SceneRegion::new(self.id.as_str(), area)
                             .role(HitRole::ListItem)
                             .pointer_events(self.tree.policy.mouse.enabled)
-                            .hoverable(self.tree.policy.mouse.hover)
+                            .hoverable(
+                                self.tree.policy.mouse.enabled && self.tree.policy.mouse.hover,
+                            )
                             .focusable(self.tree.policy.keyboard.enabled)
                             .enabled(!state.interaction.disabled),
                     );
@@ -767,7 +770,9 @@ impl Component for TreeViewComponent<'_, '_> {
                             SceneRegion::new(item_id.clone(), row)
                                 .role(HitRole::ListItem)
                                 .pointer_events(self.tree.policy.mouse.enabled)
-                                .hoverable(self.tree.policy.mouse.hover)
+                                .hoverable(
+                                    self.tree.policy.mouse.enabled && self.tree.policy.mouse.hover,
+                                )
                                 .enabled(!state.interaction.disabled && !item.disabled),
                         );
                     }
@@ -1263,6 +1268,44 @@ mod tests {
     }
 
     #[test]
+    fn disabling_click_before_release_cancels_tree_selection() {
+        let items = [TreeViewItem::new("one", "One", 0)];
+        let mut tree = super::TreeView::new(&items);
+        let mut state = TreeViewState::new(None);
+        let mouse = |kind| MouseEvent::new(kind, Point::new(0, 0));
+        assert_eq!(
+            tree.handle_mouse_hit(
+                &mut state,
+                mouse(MouseEventKind::Down(MouseButton::Left)),
+                Some(0)
+            ),
+            TreeViewOutcome::Redraw
+        );
+        assert_eq!(state.pressed_visible, Some(0));
+        tree.policy.mouse.click = false;
+        assert_eq!(
+            tree.handle_mouse_hit(
+                &mut state,
+                mouse(MouseEventKind::Up(MouseButton::Left)),
+                Some(0)
+            ),
+            TreeViewOutcome::Redraw
+        );
+        assert_eq!(state.pressed_visible, None);
+        assert_eq!(state.selected_visible, None);
+        tree.policy.mouse.click = true;
+        assert_eq!(
+            tree.handle_mouse_hit(
+                &mut state,
+                mouse(MouseEventKind::Up(MouseButton::Left)),
+                Some(0)
+            ),
+            TreeViewOutcome::Ignored
+        );
+        assert_eq!(state.selected_visible, None);
+    }
+
+    #[test]
     fn navigation_initializes_missing_and_stale_selection() {
         for count in [1, 3] {
             let items = (0..count)
@@ -1386,6 +1429,27 @@ mod tests {
         let component = TreeViewComponent::new("large-tree", &items, &state);
         let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
         assert_eq!(layout.size.height, 70_000);
+    }
+
+    #[test]
+    fn mouse_disabled_scene_retains_keyboard_target_without_hover() {
+        let items = [TreeViewItem::new("row", "Row", 0)];
+        let state = RefCell::new(TreeViewState::new(None));
+        let mut policy = TreeViewPolicy::interactive();
+        policy.mouse.enabled = false;
+        let component = TreeViewComponent::new("tree", &items, &state).policy(policy);
+        let layout = component.layout(Constraints::for_width(12), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert!(regions[0].focusable);
+        for region in regions {
+            assert!(region.enabled);
+            assert!(!region.pointer_events);
+            assert!(!region.hoverable);
+        }
     }
 
     #[test]

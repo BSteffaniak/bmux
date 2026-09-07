@@ -215,10 +215,16 @@ impl Component for StatusBarComponent<'_> {
     fn revision(&self) -> ComponentRevision {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
-        format!("{:?}", (self.bar.left, self.bar.center, self.bar.right)).hash(&mut layout);
+        for segments in [self.bar.left, self.bar.center, self.bar.right] {
+            segments.len().hash(&mut layout);
+            for segment in segments {
+                segment.text.hash(&mut layout);
+            }
+        }
         self.bar.policy.separator.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", (self.bar.left, self.bar.center, self.bar.right)).hash(&mut paint);
         format!("{:?}", self.bar.policy).hash(&mut paint);
         format!("{:?}", self.bar.styles).hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
@@ -226,16 +232,18 @@ impl Component for StatusBarComponent<'_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let width = [self.bar.left, self.bar.center, self.bar.right]
-            .into_iter()
-            .map(|segments| {
+        let [left, center, right] =
+            [self.bar.left, self.bar.center, self.bar.right].map(|segments| {
                 u16_saturating(display_width(&segments_text(
                     segments,
                     self.bar.policy.separator,
                 )))
-            })
-            .max()
-            .unwrap_or(0);
+            });
+        let width = if center == 0 {
+            left.saturating_add(right)
+        } else {
+            center.saturating_add(left.max(right).saturating_mul(2))
+        };
         LayoutNode::leaf(
             self.id.clone(),
             constraints.constrain(LogicalSize::new(width, 1)),
@@ -538,11 +546,19 @@ impl<'a> MessageBar<'a> {
 }
 
 fn segments_text(segments: &[StatusSegment<'_>], separator: &str) -> String {
-    segments
+    let capacity = segments
         .iter()
-        .map(|segment| segment.text)
-        .collect::<Vec<_>>()
-        .join(separator)
+        .map(|segment| segment.text.len())
+        .sum::<usize>()
+        + separator.len() * segments.len().saturating_sub(1);
+    let mut text = String::with_capacity(capacity);
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            text.push_str(separator);
+        }
+        text.push_str(segment.text);
+    }
+    text
 }
 
 impl crate::theme::ComponentTheme {
@@ -583,6 +599,58 @@ mod tests {
     };
 
     #[test]
+    fn severity_is_paint_only_but_text_and_group_placement_change_layout() {
+        let normal = [StatusSegment::new("ready")];
+        let warning = [StatusSegment::new("ready").severity(StatusSeverity::Warning)];
+        let longer = [StatusSegment::new("waiting")];
+        let base = StatusBarComponent::new("status").left(&normal).revision();
+        let styled = StatusBarComponent::new("status").left(&warning).revision();
+        assert_eq!(base.layout, styled.layout);
+        assert_ne!(base.paint, styled.paint);
+        assert_ne!(
+            base.layout,
+            StatusBarComponent::new("status")
+                .left(&longer)
+                .revision()
+                .layout
+        );
+        assert_ne!(
+            base.layout,
+            StatusBarComponent::new("status")
+                .right(&normal)
+                .revision()
+                .layout
+        );
+    }
+
+    #[test]
+    fn natural_width_preserves_all_aligned_groups() {
+        for (left_text, center_text, right_text, expected) in [
+            ("LEFT", "C", "R", "LEFTC   R"),
+            ("L", "C", "RIGHT", "L    CRIGHT"),
+            ("LEFT", "", "RIGHT", "LEFTRIGHT"),
+            ("", "中", "", "中"),
+        ] {
+            let left = [StatusSegment::new(left_text)];
+            let center = [StatusSegment::new(center_text)];
+            let right = [StatusSegment::new(right_text)];
+            let bar = StatusBarComponent::new("status")
+                .left(&left)
+                .center(&center)
+                .right(&right);
+            let layout = bar.layout(Constraints::new(0, 80, 0, Some(1)), &mut LayoutCx::new());
+            assert_eq!(
+                usize::from(layout.size.width),
+                bmux_tui::text_width::display_width(expected)
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, layout.size.width, 1));
+            let mut frame = Frame::new(&mut buffer);
+            bar.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
     fn renders_left_center_and_right_segments() {
         let left = [StatusSegment::new("NORMAL")];
         let center = [StatusSegment::new("CENTER")];
@@ -601,6 +669,27 @@ mod tests {
             frame.buffer().row_symbols(0).as_deref(),
             Some("NORMAL      CENTER       RIGHT")
         );
+    }
+
+    #[test]
+    fn segment_join_preserves_empty_segments_and_unicode_boundaries() {
+        for (texts, separator, expected) in [
+            (vec![], " | ", ""),
+            (vec!["", "", ""], " | ", " |  | "),
+            (vec!["e", "\u{301}"], "", "e\u{301}"),
+            (vec!["👩", "\u{200d}💻"], "", "👩\u{200d}💻"),
+        ] {
+            let segments: Vec<_> = texts.into_iter().map(StatusSegment::new).collect();
+            assert_eq!(super::segments_text(&segments, separator), expected);
+            let bar = StatusBarComponent::new("status")
+                .left(&segments)
+                .policy(StatusBarPolicy::compact().separator(separator));
+            let layout = bar.layout(Constraints::loose(Size::new(80, 1)), &mut LayoutCx::new());
+            assert_eq!(
+                usize::from(layout.size.width),
+                bmux_tui::text_width::display_width(expected)
+            );
+        }
     }
 
     #[test]
@@ -741,18 +830,18 @@ mod tests {
         let bar = StatusBarComponent::new("footer").left(&left).right(&right);
         let mut layout_cx = LayoutCx::new();
         let layout = bar.layout(Constraints::loose(Size::new(20, 2)), &mut layout_cx);
-        assert_eq!(layout.size, bmux_tui::component::LogicalSize::new(6, 1));
+        assert_eq!(layout.size, bmux_tui::component::LogicalSize::new(11, 1));
         assert_eq!(layout.metadata.semantics, ["status"]);
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 2));
         let mut frame = Frame::new(&mut buffer);
         bar.paint(&layout, &mut PaintCx::new(&mut frame));
-        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 6, 1));
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 11, 1));
         assert_eq!(
             frame
                 .damage(bmux_tui::damage::DamagePolicy::default())
                 .retained_regions(),
-            &[Rect::new(0, 0, 6, 1)]
+            &[Rect::new(0, 0, 11, 1)]
         );
     }
 

@@ -45,7 +45,7 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 use bmux_tui::buffer::Buffer;
 use bmux_tui::component::{Component, LayoutCx};
-use bmux_tui::composition::TextBlock;
+use bmux_tui::composition::{Column, Surface, TextBlock};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::measured_list::MeasuredListIndex;
@@ -58,7 +58,100 @@ fn main() {
     benchmark_index_strategies();
     for count in [100usize, 1_000, 10_000] {
         benchmark_count(count);
+        benchmark_composed_cards(count);
     }
+}
+
+fn benchmark_composed_cards(count: usize) {
+    let list = (0..count).fold(VirtualList::new("cards"), |list, index| {
+        let background = bmux_tui::style::Style::new().bg(bmux_tui::style::Color::Blue);
+        list.component(
+            index,
+            Surface::new(
+                Column::new()
+                    .child(TextBlock::new(format!("Author {index}")))
+                    .child(TextBlock::new(
+                        "Wrapped Unicode 界 message body. ".repeat(index % 3 + 1),
+                    )),
+            )
+            .padding(bmux_tui::geometry::Insets::all(1))
+            .background(background)
+            .content_style(background),
+        )
+    });
+    let mut state = VirtualListState::default();
+    let mut cx = LayoutCx::new();
+    list.sync(40, &mut state, &mut cx);
+    let measured = cx.measured_nodes();
+    list.sync(40, &mut state, &mut cx);
+    assert_eq!(
+        cx.measured_nodes(),
+        measured,
+        "unchanged cards must reuse layout"
+    );
+    let viewport = Rect::new(0, 0, 40, 20);
+    state.scroll.set_vertical_offset(state.total_height() / 2);
+    let paint = paint_once(&list, &state, viewport);
+    assert!(paint.rendered.painted_items > 0);
+    assert!(
+        paint.rendered.painted_items <= 6,
+        "paint must remain viewport bounded"
+    );
+    let old_offset = state.scroll.vertical_offset();
+    assert!(state.scroll_by(1, usize::from(viewport.height)));
+    assert_eq!(state.scroll.vertical_offset(), old_offset + 1);
+    // Pure scrolling consumes retained geometry; synchronization is a separate
+    // diagnostic for callers that check unchanged models on every frame.
+    let row_scroll = paint_once(&list, &state, viewport);
+    let row_sync_started = Instant::now();
+    list.sync(40, &mut state, &mut cx);
+    let row_sync = row_sync_started.elapsed();
+    assert_eq!(
+        cx.measured_nodes(),
+        measured,
+        "unchanged synchronization must not remeasure cards"
+    );
+    assert!(row_scroll.rendered.painted_items > 0);
+    assert!(row_scroll.rendered.painted_items <= 6);
+    state.capture_anchor();
+    let anchor_key = *state
+        .key_at_offset(state.scroll.vertical_offset())
+        .expect("middle card must exist");
+    let anchor_row = state.scroll.vertical_offset() - state.item_offset(&anchor_key).unwrap();
+    let before_resize = cx.measured_nodes();
+    let started = Instant::now();
+    list.sync(24, &mut state, &mut cx);
+    state.restore_anchor(usize::from(viewport.height));
+    let resize = started.elapsed();
+    let resize_measured = cx.measured_nodes() - before_resize;
+    assert_eq!(
+        resize_measured,
+        count * 4,
+        "each card descendant must reflow"
+    );
+    assert_eq!(
+        state.scroll.vertical_offset(),
+        state.item_offset(&anchor_key).unwrap() + anchor_row,
+        "narrowing cards must preserve the stable key and intra-card row"
+    );
+    list.sync(24, &mut state, &mut cx);
+    assert_eq!(cx.measured_nodes(), before_resize + resize_measured);
+    let resized_paint = paint_once(&list, &state, Rect::new(0, 0, 24, 20));
+    assert!(resized_paint.rendered.painted_items > 0);
+    assert!(resized_paint.rendered.painted_items <= 6);
+    println!(
+        "cards count={count} measured={measured} paint_us={} painted={} allocations={} allocation_bytes={} row_sync_us={} row_paint_us={} row_sync_and_paint_us={} row_painted={} resize_us={} resize_measured={resize_measured} resized_painted={}",
+        micros(paint.elapsed),
+        paint.rendered.painted_items,
+        paint.allocations,
+        paint.allocation_bytes,
+        micros(row_sync),
+        micros(row_scroll.elapsed),
+        micros(row_sync + row_scroll.elapsed),
+        row_scroll.rendered.painted_items,
+        micros(resize),
+        resized_paint.rendered.painted_items,
+    );
 }
 
 fn benchmark_index_strategies() {

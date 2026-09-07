@@ -545,19 +545,42 @@ impl<'a> SelectableList<'a> {
         state: &mut SelectableListState,
         event: &Event,
     ) -> SelectableListOutcome {
+        if matches!(
+            event,
+            Event::Focus(bmux_tui::event::FocusEvent::Lost) | Event::Resize(_)
+        ) {
+            let changed = state.pressed.take().is_some() | state.hovered.take().is_some();
+            return if changed {
+                SelectableListOutcome::Redraw
+            } else {
+                SelectableListOutcome::Ignored
+            };
+        }
+        let pointer_state = (state.pressed, state.hovered);
         self.normalize_state(state);
+        let pointer_changed = pointer_state != (state.pressed, state.hovered);
+        let fallback = if pointer_changed {
+            SelectableListOutcome::Redraw
+        } else {
+            SelectableListOutcome::Ignored
+        };
         if state.interaction.disabled {
-            return SelectableListOutcome::Ignored;
+            return fallback;
         }
         let Some(viewport) = resolved_viewport(layout) else {
-            return SelectableListOutcome::Ignored;
+            return fallback;
         };
-        match event {
+        let outcome = match event {
             Event::Key(stroke) => self.handle_key(viewport, state, *stroke),
             Event::Mouse(mouse) => self.handle_mouse(viewport, area, state, *mouse),
             Event::Resize(_) | Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
                 SelectableListOutcome::Ignored
             }
+        };
+        if pointer_changed && outcome == SelectableListOutcome::Ignored {
+            SelectableListOutcome::Redraw
+        } else {
+            outcome
         }
     }
 
@@ -737,9 +760,7 @@ impl<'a> SelectableList<'a> {
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click => {
                 Self::press(state, hit)
             }
-            MouseEventKind::Up(MouseButton::Left) if self.policy.mouse.click => {
-                self.release(viewport, state, hit)
-            }
+            MouseEventKind::Up(MouseButton::Left) => self.release(viewport, state, hit),
             MouseEventKind::Drag(MouseButton::Left) if self.policy.mouse.click => {
                 Self::drag(state, hit)
             }
@@ -765,7 +786,11 @@ impl<'a> SelectableList<'a> {
 
     const fn press(state: &mut SelectableListState, hit: Option<usize>) -> SelectableListOutcome {
         let Some(index) = hit else {
-            return SelectableListOutcome::Ignored;
+            return if state.pressed.take().is_some() {
+                SelectableListOutcome::Redraw
+            } else {
+                SelectableListOutcome::Ignored
+            };
         };
         state.pressed = Some(index);
         state.hovered = Some(index);
@@ -781,7 +806,9 @@ impl<'a> SelectableList<'a> {
     ) -> SelectableListOutcome {
         let was_pressed = state.pressed;
         state.pressed = None;
-        if let Some(index) = hit.filter(|hit_index| was_pressed == Some(*hit_index)) {
+        if self.policy.mouse.click
+            && let Some(index) = hit.filter(|hit_index| was_pressed == Some(*hit_index))
+        {
             return self.select_index(viewport, state, index);
         }
         if was_pressed.is_some() {
@@ -998,6 +1025,10 @@ impl<'a> SelectableList<'a> {
     }
 
     fn normalize_state(&self, state: &mut SelectableListState) {
+        if state.interaction.disabled || !self.policy.mouse.enabled {
+            state.pressed = None;
+            state.hovered = None;
+        }
         if state
             .selected
             .is_some_and(|index| index >= self.items.len())
@@ -1007,10 +1038,16 @@ impl<'a> SelectableList<'a> {
         if state.focused.is_some_and(|index| index >= self.items.len()) {
             state.set_focused(None);
         }
-        if state.hovered.is_some_and(|index| index >= self.items.len()) {
+        if state
+            .hovered
+            .is_some_and(|index| !self.is_enabled_item(index))
+        {
             state.hovered = None;
         }
-        if state.pressed.is_some_and(|index| index >= self.items.len()) {
+        if state
+            .pressed
+            .is_some_and(|index| !self.is_enabled_item(index))
+        {
             state.pressed = None;
         }
     }
@@ -1078,6 +1115,24 @@ pub struct SelectableListComponent<'a, 'state> {
 }
 
 impl<'a, 'state> SelectableListComponent<'a, 'state> {
+    /// Dispatch through resolved component geometry while retaining selection details.
+    pub fn handle_event(
+        &self,
+        event: &Event,
+        layout: &LayoutNode,
+        cx: &mut EventCx<'_>,
+    ) -> SelectableListOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return SelectableListOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self
+            .list
+            .handle_event_with_layout(layout, area, &mut state, event);
+        self.state.set(state);
+        outcome
+    }
+
     /// Create a selectable list with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -1148,6 +1203,7 @@ impl Component for SelectableListComponent<'_, '_> {
         self.list.policy.scrollbar.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.list.policy.mouse).hash(&mut paint);
         for item in self.list.items {
             item.disabled.hash(&mut paint);
         }
@@ -1171,7 +1227,8 @@ impl Component for SelectableListComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), area)
                 .role(HitRole::ListItem)
-                .hoverable(self.list.policy.mouse.hover)
+                .pointer_events(self.list.policy.mouse.enabled)
+                .hoverable(self.list.policy.mouse.enabled && self.list.policy.mouse.hover)
                 .focusable(true)
                 .enabled(!state.interaction.disabled),
         );
@@ -1184,7 +1241,8 @@ impl Component for SelectableListComponent<'_, '_> {
             cx.push_hit(
                 SceneRegion::new(item_id.clone(), region.rect)
                     .role(HitRole::ListItem)
-                    .hoverable(self.list.policy.mouse.hover)
+                    .pointer_events(self.list.policy.mouse.enabled)
+                    .hoverable(self.list.policy.mouse.enabled && self.list.policy.mouse.hover)
                     .enabled(!state.interaction.disabled && !item.disabled),
             );
             cx.push_semantic(SemanticRegion::new(item_id, region.rect, "list-item"));
@@ -1201,15 +1259,7 @@ impl Component for SelectableListComponent<'_, '_> {
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
-        let Some(area) = cx.find_rect(&layout.id) else {
-            return EventOutcome::Ignored;
-        };
-        let mut state = self.state.get();
-        let outcome = self
-            .list
-            .handle_event_with_layout(layout, area, &mut state, event);
-        self.state.set(state);
-        match outcome {
+        match self.handle_event(event, layout, cx) {
             SelectableListOutcome::Ignored => EventOutcome::Ignored,
             SelectableListOutcome::Redraw
             | SelectableListOutcome::Focused(_)
@@ -1298,6 +1348,30 @@ mod tests {
         SelectableList, SelectableListComponent, SelectableListHighlightPolicy, SelectableListItem,
         SelectableListOutcome, SelectableListPolicy, SelectableListState, SelectableListStyles,
     };
+
+    #[test]
+    fn mouse_policy_invalidates_list_paint_without_invalidating_layout() {
+        let items = [SelectableListItem::new("one", "One")];
+        let state = Cell::new(SelectableListState::new(Some(0)));
+        let mut policy = SelectableListPolicy::default();
+        policy.mouse.enabled = true;
+        policy.mouse.hover = false;
+        let before = SelectableListComponent::new("policy.list", &items, &state)
+            .policy(policy)
+            .revision();
+        policy.mouse.hover = true;
+        let hovered = SelectableListComponent::new("policy.list", &items, &state)
+            .policy(policy)
+            .revision();
+        assert_eq!(before.layout, hovered.layout);
+        assert_ne!(before.paint, hovered.paint);
+        policy.mouse.enabled = false;
+        let disabled = SelectableListComponent::new("policy.list", &items, &state)
+            .policy(policy)
+            .revision();
+        assert_eq!(hovered.layout, disabled.layout);
+        assert_ne!(hovered.paint, disabled.paint);
+    }
 
     trait SelectableListTestRender {
         fn render(&self, area: Rect, state: &SelectableListState, frame: &mut Frame<'_>);
@@ -1870,6 +1944,253 @@ mod tests {
         assert_eq!(up, SelectableListOutcome::Selected(1));
         assert_eq!(state.focused(), Some(1));
         assert_eq!(state.selected(), Some(1));
+    }
+
+    #[test]
+    fn disabling_click_before_release_cancels_list_selection() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+        ];
+        let mut list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(Some(0));
+        let area = Rect::new(0, 0, 14, 2);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 1)));
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left))
+            ),
+            SelectableListOutcome::Redraw
+        );
+        assert_eq!(state.pressed, Some(1));
+        list.policy.mouse.click = false;
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            SelectableListOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.selected(), Some(0));
+        list.policy.mouse.click = true;
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            SelectableListOutcome::Ignored
+        );
+        assert_eq!(state.selected(), Some(0));
+    }
+
+    #[test]
+    fn focus_loss_cancels_list_pointer_selection() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+        ];
+        let list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(Some(0));
+        let area = Rect::new(0, 0, 14, 2);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 1)));
+        list.handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+        );
+        assert_eq!(state.pressed, Some(1));
+        let focus_event = Event::Focus(bmux_tui::event::FocusEvent::Lost);
+        assert_eq!(
+            list.handle_event(area, &mut state, &focus_event),
+            SelectableListOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.hovered, None);
+        assert_eq!(
+            list.handle_event(area, &mut state, &focus_event),
+            SelectableListOutcome::Ignored
+        );
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            SelectableListOutcome::Ignored
+        );
+        assert_eq!(state.selected(), Some(0));
+    }
+
+    #[test]
+    fn blank_press_cancels_previous_list_press() {
+        let items = [SelectableListItem::new("one", "One")];
+        let list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(None);
+        let area = Rect::new(0, 0, 14, 3);
+        let mouse = |kind, row| Event::Mouse(MouseEvent::new(kind, Point::new(1, row)));
+        list.handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left), 0),
+        );
+        assert_eq!(state.pressed, Some(0));
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left), 2)
+            ),
+            SelectableListOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left), 0)
+            ),
+            SelectableListOutcome::Ignored
+        );
+        assert_eq!(state.selected(), None);
+    }
+
+    #[test]
+    fn resize_cancels_pending_list_press() {
+        let items = [SelectableListItem::new("one", "One")];
+        let list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(None);
+        let area = Rect::new(0, 0, 14, 3);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 0)));
+        list.handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+        );
+        assert_eq!(state.pressed, Some(0));
+        let resize = Event::Resize(area.size());
+        assert_eq!(
+            list.handle_event(area, &mut state, &resize),
+            SelectableListOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.hovered, None);
+        assert_eq!(
+            list.handle_event(area, &mut state, &resize),
+            SelectableListOutcome::Ignored
+        );
+        assert_eq!(
+            list.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            SelectableListOutcome::Ignored
+        );
+        assert_eq!(state.selected(), None);
+    }
+
+    #[test]
+    fn disabling_item_cancels_pending_pointer_state() {
+        let mut items = [SelectableListItem::new("one", "One")];
+        let mut state = SelectableListState::new(None);
+        let area = Rect::new(0, 0, 14, 3);
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 0)));
+        SelectableList::new(&items).handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+        );
+        assert_eq!(state.pressed, Some(0));
+        items[0].disabled = true;
+        assert_eq!(
+            SelectableList::new(&items).handle_event(area, &mut state, &Event::Tick),
+            SelectableListOutcome::Redraw
+        );
+        assert_eq!(
+            SelectableList::new(&items).handle_event(area, &mut state, &Event::Tick),
+            SelectableListOutcome::Ignored
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.hovered, None);
+        items[0].disabled = false;
+        assert_eq!(
+            SelectableList::new(&items).handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Up(MouseButton::Left))
+            ),
+            SelectableListOutcome::Ignored
+        );
+        assert_eq!(state.selected(), None);
+    }
+
+    #[test]
+    fn mouse_disabled_component_retains_keyboard_target() {
+        let items = [SelectableListItem::new("one", "One")];
+        let state = Cell::new(SelectableListState::new(None));
+        let mut policy = SelectableListPolicy::default();
+        policy.mouse.enabled = false;
+        let component = SelectableListComponent::new("list", &items, &state).policy(policy);
+        let layout = component.layout(Constraints::for_width(12), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert!(regions[0].focusable);
+        for region in regions {
+            assert!(region.enabled);
+            assert!(!region.pointer_events);
+            assert!(!region.hoverable);
+        }
+    }
+
+    #[test]
+    fn disabling_pointer_input_cancels_pending_list_press() {
+        let items = [SelectableListItem::new("one", "One")];
+        let area = Rect::new(0, 0, 14, 3);
+        for disable_control in [false, true] {
+            let mut list = SelectableList::new(&items);
+            let mut state = SelectableListState::new(None);
+            let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 0)));
+            list.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left)),
+            );
+            assert_eq!(state.pressed, Some(0));
+            if disable_control {
+                state.interaction.disabled = true;
+            } else {
+                list.policy.mouse.enabled = false;
+            }
+            assert_eq!(
+                list.handle_event(area, &mut state, &Event::Tick),
+                SelectableListOutcome::Redraw
+            );
+            assert_eq!(state.pressed, None);
+            assert_eq!(state.hovered, None);
+            assert_eq!(
+                list.handle_event(area, &mut state, &Event::Tick),
+                SelectableListOutcome::Ignored
+            );
+            state.interaction.disabled = false;
+            list.policy.mouse.enabled = true;
+            assert_eq!(
+                list.handle_event(
+                    area,
+                    &mut state,
+                    &mouse(MouseEventKind::Up(MouseButton::Left))
+                ),
+                SelectableListOutcome::Ignored
+            );
+            assert_eq!(state.selected(), None);
+        }
     }
 
     #[test]

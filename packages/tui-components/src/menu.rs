@@ -210,7 +210,7 @@ impl<'a> Menu<'a> {
     #[must_use]
     pub fn size(&self) -> (u16, u16) {
         let items = self.list_items();
-        SelectableList::new(&items).size()
+        SelectableList::new(&items).policy(self.policy.list).size()
     }
 
     /// Paint visible menu rows through a scoped local-coordinate context whose
@@ -233,17 +233,22 @@ impl<'a> Menu<'a> {
         point: bmux_tui::geometry::Point,
     ) -> Option<usize> {
         let items = self.list_items();
-        let id = SelectableList::new(&items).semantic_id_at(area, &state.list, point)?;
+        let id = SelectableList::new(&items)
+            .policy(self.policy.list)
+            .semantic_id_at(area, &state.list, point)?;
         self.items.iter().position(|item| item.id == id)
     }
 
     /// Handle one input event.
     pub fn handle_event(&self, area: Rect, state: &mut MenuState, event: &Event) -> MenuOutcome {
+        if state.list.interaction.disabled {
+            return MenuOutcome::Ignored;
+        }
         let keyboard_event = matches!(event, Event::Key(_));
         if keyboard_event && matches!(event, Event::Key(stroke) if self.is_cancel_key(*stroke)) {
             return MenuOutcome::Cancelled;
         }
-        if keyboard_event && matches!(event, Event::Key(stroke) if Self::is_activation_key(*stroke))
+        if keyboard_event && matches!(event, Event::Key(stroke) if self.is_activation_key(*stroke))
         {
             return state
                 .focused()
@@ -293,12 +298,13 @@ impl<'a> Menu<'a> {
         self.policy.escape_cancels && stroke.modifiers.is_empty() && stroke.key == KeyCode::Escape
     }
 
-    const fn is_activation_key(stroke: KeyStroke) -> bool {
+    const fn is_activation_key(&self, stroke: KeyStroke) -> bool {
         stroke.modifiers.is_empty()
-            && matches!(
-                stroke.key,
-                KeyCode::Enter | KeyCode::Space | KeyCode::Char(' ')
-            )
+            && match stroke.key {
+                KeyCode::Enter => self.policy.list.keyboard.enter_selects,
+                KeyCode::Space | KeyCode::Char(' ') => self.policy.list.keyboard.space_selects,
+                _ => false,
+            }
     }
 
     fn list_items(&self) -> Vec<SelectableListItem> {
@@ -328,8 +334,7 @@ impl<'a> Menu<'a> {
 /// region plus one visible region per stable item id, and routes events
 /// through the same resolved layout. Menu state remains caller-owned through
 /// an interior-mutable `Cell`; semantic outcomes such as activation and
-/// cancellation are read by callers from [`Menu::handle_event`] or by
-/// comparing caller state before and after the event.
+/// cancellation are returned by [`MenuComponent::handle_event`].
 pub struct MenuComponent<'a, 'state> {
     id: LayoutId,
     menu: Menu<'a>,
@@ -338,6 +343,22 @@ pub struct MenuComponent<'a, 'state> {
 }
 
 impl<'a, 'state> MenuComponent<'a, 'state> {
+    /// Dispatch through component geometry while retaining menu action details.
+    pub fn handle_event(
+        &self,
+        event: &Event,
+        layout: &LayoutNode,
+        cx: &mut EventCx<'_>,
+    ) -> MenuOutcome {
+        let Some(area) = cx.find_rect(&layout.id) else {
+            return MenuOutcome::Ignored;
+        };
+        let mut state = self.state.get();
+        let outcome = self.menu.handle_event(area, &mut state, event);
+        self.state.set(state);
+        outcome
+    }
+
     /// Create a menu with stable identity and caller-owned state.
     #[must_use]
     pub fn new(
@@ -398,6 +419,7 @@ impl Component for MenuComponent<'_, '_> {
         format!("{:?}", self.menu.policy.list.scrollbar).hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", self.menu.policy.list.mouse).hash(&mut paint);
         for item in self.menu.items {
             item.disabled.hash(&mut paint);
             item.section.hash(&mut paint);
@@ -434,7 +456,8 @@ impl Component for MenuComponent<'_, '_> {
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), area)
                 .role(HitRole::ListItem)
-                .hoverable(self.menu.policy.list.mouse.hover)
+                .pointer_events(self.menu.policy.list.mouse.enabled)
+                .hoverable(self.menu.policy.list.mouse.enabled && self.menu.policy.list.mouse.hover)
                 .focusable(true)
                 .enabled(!state.list.interaction.disabled),
         );
@@ -453,7 +476,10 @@ impl Component for MenuComponent<'_, '_> {
             cx.push_hit(
                 SceneRegion::new(item_id.clone(), region.rect)
                     .role(HitRole::ListItem)
-                    .hoverable(self.menu.policy.list.mouse.hover)
+                    .pointer_events(self.menu.policy.list.mouse.enabled)
+                    .hoverable(
+                        self.menu.policy.list.mouse.enabled && self.menu.policy.list.mouse.hover,
+                    )
                     .enabled(!state.list.interaction.disabled && !disabled),
             );
             cx.push_semantic(SemanticRegion::new(item_id, region.rect, "menu-item"));
@@ -464,13 +490,7 @@ impl Component for MenuComponent<'_, '_> {
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
-        let Some(area) = cx.find_rect(&layout.id) else {
-            return EventOutcome::Ignored;
-        };
-        let mut state = self.state.get();
-        let outcome = self.menu.handle_event(area, &mut state, event);
-        self.state.set(state);
-        match outcome {
+        match self.handle_event(event, layout, cx) {
             MenuOutcome::Ignored => EventOutcome::Ignored,
             MenuOutcome::Typeahead(_) | MenuOutcome::Cancelled => EventOutcome::Handled,
             MenuOutcome::Redraw | MenuOutcome::Focused(_) | MenuOutcome::Activated { .. } => {
@@ -696,6 +716,208 @@ mod tests {
                 index: 0,
                 id: "open".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn disabled_component_ignores_keyboard_actions_without_mutating_state() {
+        let items = items();
+        let mut initial = MenuState::new(Some(0));
+        initial.set_focused(Some(0));
+        initial.set_disabled(true);
+        let state = Cell::new(initial);
+        let menu = MenuComponent::new("disabled.menu", &items, &state).policy(MenuPolicy {
+            typeahead: true,
+            ..MenuPolicy::default()
+        });
+        let layout = menu.layout(
+            Constraints::tight(Rect::new(0, 0, 12, 2).size()),
+            &mut LayoutCx::new(),
+        );
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Escape,
+            KeyCode::Char('a'),
+            KeyCode::Down,
+        ] {
+            let event = Event::Key(KeyStroke::simple(key));
+            assert_eq!(
+                menu.handle_event(&event, &layout, &mut EventCx::new(&layout)),
+                MenuOutcome::Ignored,
+            );
+            assert_eq!(
+                menu.event(&event, &layout, &mut EventCx::new(&layout)),
+                EventOutcome::Ignored,
+            );
+            assert_eq!(state.get(), initial);
+        }
+
+        let mut enabled = state.get();
+        enabled.set_disabled(false);
+        state.set(enabled);
+        for (key, expected) in [
+            (KeyCode::Char('a'), MenuOutcome::Typeahead('a')),
+            (KeyCode::Escape, MenuOutcome::Cancelled),
+            (
+                KeyCode::Enter,
+                MenuOutcome::Activated {
+                    index: 0,
+                    id: "open".to_string(),
+                },
+            ),
+        ] {
+            assert_eq!(
+                menu.handle_event(
+                    &Event::Key(KeyStroke::simple(key)),
+                    &layout,
+                    &mut EventCx::new(&layout),
+                ),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn component_respects_independent_activation_key_policies() {
+        let items = items();
+        for enter_selects in [false, true] {
+            for space_selects in [false, true] {
+                let mut policy = MenuPolicy::default();
+                policy.list.keyboard.enter_selects = enter_selects;
+                policy.list.keyboard.space_selects = space_selects;
+                let mut initial = MenuState::new(Some(0));
+                initial.set_focused(Some(0));
+                let state = Cell::new(initial);
+                let menu = MenuComponent::new("policy.menu", &items, &state).policy(policy);
+                let layout = menu.layout(
+                    Constraints::tight(Rect::new(0, 0, 12, 2).size()),
+                    &mut LayoutCx::new(),
+                );
+                for (key, enabled) in [
+                    (KeyCode::Enter, enter_selects),
+                    (KeyCode::Space, space_selects),
+                    (KeyCode::Char(' '), space_selects),
+                ] {
+                    let expected = if enabled {
+                        MenuOutcome::Activated {
+                            index: 0,
+                            id: "open".to_string(),
+                        }
+                    } else {
+                        MenuOutcome::Ignored
+                    };
+                    assert_eq!(
+                        menu.handle_event(
+                            &Event::Key(KeyStroke::simple(key)),
+                            &layout,
+                            &mut EventCx::new(&layout),
+                        ),
+                        expected,
+                    );
+                    assert_eq!(state.get(), initial);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn menu_size_includes_configured_highlight_prefix() {
+        let items = [MenuItem::new("open", "Open")];
+        let mut policy = MenuPolicy::default();
+        policy.list.highlight.symbol = ">>>>";
+        let menu = Menu::new(&items).policy(policy);
+        assert_eq!(menu.size(), (11, 1));
+        let state = Cell::new(MenuState::new(Some(0)));
+        let component = MenuComponent::new("sized.menu", &items, &state).policy(policy);
+        let layout = component.layout(
+            Constraints::loose(Rect::new(0, 0, 40, 10).size()),
+            &mut LayoutCx::new(),
+        );
+        assert_eq!((layout.size.width, layout.size.height), (11, 1));
+        let constrained = component.layout(
+            Constraints::tight(Rect::new(0, 0, 5, 2).size()),
+            &mut LayoutCx::new(),
+        );
+        assert_eq!((constrained.size.width, constrained.size.height), (5, 2));
+
+        policy.list.highlight.symbol = "";
+        policy.list.highlight.repeat_spacing = false;
+        assert_eq!(Menu::new(&items).policy(policy).size(), (6, 1));
+    }
+
+    #[test]
+    fn menu_hit_lookup_excludes_configured_scrollbar_gutter() {
+        let items = items();
+        let mut policy = MenuPolicy::default();
+        policy.list.scrollbar = crate::scrollbar_layout::ScrollbarAxisLayoutMode::Gutter;
+        let menu = Menu::new(&items).policy(policy);
+        let state = MenuState::new(Some(0));
+        let area = Rect::new(4, 3, 12, 2);
+        assert_eq!(menu.item_index_at(area, &state, Point::new(4, 3)), Some(0));
+        assert_eq!(menu.item_index_at(area, &state, Point::new(14, 4)), Some(1));
+        assert_eq!(menu.item_index_at(area, &state, Point::new(15, 3)), None);
+        assert_eq!(menu.item_index_at(area, &state, Point::new(15, 4)), None);
+        assert_eq!(menu.item_index_at(area, &state, Point::new(3, 3)), None);
+
+        policy.list.scrollbar = crate::scrollbar_layout::ScrollbarAxisLayoutMode::Hidden;
+        assert_eq!(
+            Menu::new(&items)
+                .policy(policy)
+                .item_index_at(area, &state, Point::new(15, 3)),
+            Some(0),
+        );
+    }
+
+    #[test]
+    fn hover_policy_invalidates_paint_without_invalidating_layout() {
+        let items = items();
+        let state = Cell::new(MenuState::new(Some(0)));
+        let mut policy = MenuPolicy::default();
+        policy.list.mouse.hover = false;
+        let before = MenuComponent::new("policy.menu", &items, &state)
+            .policy(policy)
+            .revision();
+        policy.list.mouse.hover = true;
+        let after = MenuComponent::new("policy.menu", &items, &state)
+            .policy(policy)
+            .revision();
+        assert_eq!(before.layout, after.layout);
+        assert_ne!(before.paint, after.paint);
+    }
+
+    #[test]
+    fn mouse_disabled_menu_retains_keyboard_activation() {
+        let items = [MenuItem::new("open", "Open")];
+        let mut initial = MenuState::new(Some(0));
+        initial.set_focused(Some(0));
+        let state = Cell::new(initial);
+        let mut policy = MenuPolicy::default();
+        policy.list.mouse.enabled = false;
+        policy.list.mouse.hover = true;
+        let component = MenuComponent::new("menu", &items, &state).policy(policy);
+        let area = Rect::new(0, 0, 12, 2);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let regions = frame.hits().regions();
+        assert_eq!(regions.len(), 2);
+        assert!(regions[0].focusable);
+        for region in regions {
+            assert!(region.enabled);
+            assert!(!region.pointer_events);
+            assert!(!region.hoverable);
+        }
+        assert_eq!(
+            component.handle_event(
+                &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            MenuOutcome::Activated {
+                index: 0,
+                id: "open".to_string()
+            },
         );
     }
 

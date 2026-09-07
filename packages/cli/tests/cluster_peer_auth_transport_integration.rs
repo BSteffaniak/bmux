@@ -95,7 +95,9 @@ fn ssh_join_and_leave_require_real_mutual_peer_authentication() {
     }
     let port = reserve_tcp_port();
     let mut issuer = ServerEnv::new("ssh-issuer");
-    issuer.write_config("");
+    // Match the TLS fixture's integration budget: SSH startup and enrollment
+    // redemption must fit inside the outer IPC request under full-suite load.
+    issuer.write_config("[general]\nserver_timeout = 30000\n");
     let mut joiner = ServerEnv::new("ssh-joiner");
     let ssh_root = joiner.root().join("sshd");
     std::fs::create_dir_all(&ssh_root).expect("create SSH test root");
@@ -164,7 +166,7 @@ fn ssh_join_and_leave_require_real_mutual_peer_authentication() {
             .expect("set remote wrapper permissions");
     }
     joiner.write_config(&format!(
-        "[connections.targets.issuer]\ntransport = \"ssh\"\nhost = \"127.0.0.1\"\nuser = \"{}\"\nport = {port}\nidentity_file = \"{}\"\nknown_hosts_file = \"{}\"\nstrict_host_key_checking = false\nremote_bmux_path = \"{}\"\nserver_start_mode = \"require_running\"\n",
+        "[general]\nserver_timeout = 30000\n\n[connections.targets.issuer]\ntransport = \"ssh\"\nhost = \"127.0.0.1\"\nuser = \"{}\"\nport = {port}\nidentity_file = \"{}\"\nknown_hosts_file = \"{}\"\nstrict_host_key_checking = false\nremote_bmux_path = \"{}\"\nserver_start_mode = \"require_running\"\n",
         std::env::var("USER").expect("USER is set"),
         client_key.display(),
         known_hosts.display(),

@@ -97,7 +97,7 @@ impl Default for BadgePolicy {
 }
 
 /// Badge visual styles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BadgeStyles {
     /// Default style.
     pub default: Style,
@@ -215,11 +215,15 @@ impl Component for BadgeComponent<'_> {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
         self.label.hash(&mut layout);
-        self.policy.hash(&mut layout);
+        self.policy.left.hash(&mut layout);
+        self.policy.right.hash(&mut layout);
+        self.policy.padding.hash(&mut layout);
+        self.policy.uppercase.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         self.severity.hash(&mut paint);
-        format!("{:?}", self.styles).hash(&mut paint);
+        self.policy.truncate.hash(&mut paint);
+        self.styles.hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
 
@@ -355,6 +359,26 @@ mod tests {
                 .retained_regions(),
             &[Rect::new(0, 0, 6, 1)]
         );
+    }
+
+    #[test]
+    fn truncation_changes_paint_without_invalidating_measurement() {
+        let badge = BadgeComponent::new("health", "healthy");
+        let untruncated = BadgeComponent::new("health", "healthy").policy(BadgePolicy {
+            truncate: false,
+            ..BadgePolicy::bracketed()
+        });
+        assert_eq!(badge.revision().layout, untruncated.revision().layout);
+        assert_ne!(badge.revision().paint, untruncated.revision().paint);
+
+        let constraints = Constraints::loose(Size::new(5, 1));
+        let mut cache = bmux_tui::component::LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        let layout = cache.layout("health".into(), &badge, constraints, &mut cx);
+        let retained = cache.layout("health".into(), &untruncated, constraints, &mut cx);
+        assert_eq!(layout.size, retained.size);
+        assert_eq!(cx.measured_nodes(), 1);
+        assert_eq!(cache.stats().hits, 1);
     }
 
     #[test]

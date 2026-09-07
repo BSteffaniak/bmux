@@ -271,6 +271,43 @@ impl<'a, 'state> RadioGroupComponent<'a, 'state> {
     }
 }
 
+impl RadioGroupComponent<'_, '_> {
+    fn mouse_hit(
+        &self,
+        layout: &LayoutNode,
+        cx: &EventCx<'_>,
+        area: Rect,
+        position: bmux_tui::geometry::Point,
+    ) -> Option<usize> {
+        if !area.contains(position) {
+            return None;
+        }
+        let row_rect = |index| {
+            cx.visible_rect(bmux_tui::component::LogicalRect::new(
+                0,
+                index,
+                layout.size.width,
+                1,
+            ))
+        };
+        let count = self.group.options.len().min(layout.size.height);
+        let mut low = 0;
+        let mut high = count;
+        // Projected row bottoms are monotonic, including rows clipped above
+        // the viewport. Find the first row extending below the pointer.
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if row_rect(middle).bottom() <= position.y {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        (low < count && self.group.is_enabled_option(low) && row_rect(low).contains(position))
+            .then_some(low)
+    }
+}
+
 impl Component for RadioGroupComponent<'_, '_> {
     fn revision(&self) -> ComponentRevision {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
@@ -316,49 +353,86 @@ impl Component for RadioGroupComponent<'_, '_> {
             return;
         }
         let state = self.state.get();
-        for (index, option) in self
-            .group
-            .options
-            .iter()
-            .take(layout.size.height)
-            .enumerate()
-        {
-            let row = u16::try_from(index).unwrap_or(u16::MAX);
-            let area = LocalRect::new(0, i64::from(row), layout.size.width, 1);
-            cx.write_line_with_fallback_style(
-                area,
-                &self.group.line(index, option, state),
-                self.fallback,
-            );
-            cx.push_hit(
-                SceneRegion::new(
-                    format!("{}:{}", self.id.as_str(), option.id),
-                    Rect::new(0, row, layout.size.width, 1),
-                )
-                .role(HitRole::Action)
-                .hoverable(self.group.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled && !option.disabled),
-            );
+        let viewport = cx.area();
+        let start = usize::try_from(viewport.y.max(0)).unwrap_or(usize::MAX);
+        let end = usize::try_from(viewport.y.saturating_add(i64::from(viewport.height)).max(0))
+            .unwrap_or(usize::MAX)
+            .min(layout.size.height)
+            .min(self.group.options.len());
+        for index in start..end {
+            let option = &self.group.options[index];
+            let row = i64::try_from(index).unwrap_or(i64::MAX);
+            cx.with_child(0, row, LocalRect::new(0, 0, layout.size.width, 1), |cx| {
+                cx.write_line_with_fallback_style(
+                    LocalRect::new(0, 0, layout.size.width, 1),
+                    &self.group.line(index, option, state),
+                    self.fallback,
+                );
+                cx.push_hit(
+                    SceneRegion::new(
+                        format!("{}:{}", self.id.as_str(), option.id),
+                        Rect::new(0, 0, layout.size.width, 1),
+                    )
+                    .role(HitRole::Action)
+                    .pointer_events(self.group.policy.mouse.enabled)
+                    .hoverable(self.group.policy.mouse.enabled && self.group.policy.mouse.hover)
+                    .focusable(true)
+                    .enabled(!state.interaction.disabled && !option.disabled),
+                );
+            });
         }
-        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let area = LocalRect::new(0, 0, layout.size.width, height);
-        cx.push_semantic(SemanticRegion::new(
-            self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, height),
-            "radio-group",
-        ));
-        cx.push_damage(area);
+        if start >= end {
+            return;
+        }
+        let height = u16::try_from(end - start).unwrap_or(u16::MAX);
+        cx.with_child(
+            0,
+            i64::try_from(start).unwrap_or(i64::MAX),
+            LocalRect::new(0, 0, layout.size.width, height),
+            |cx| {
+                cx.push_semantic(SemanticRegion::new(
+                    self.id.as_str(),
+                    Rect::new(0, 0, layout.size.width, height),
+                    "radio-group",
+                ));
+                cx.push_damage(LocalRect::new(0, 0, layout.size.width, height));
+            },
+        );
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
         let Some(area) = cx.find_rect(&layout.id) else {
             return EventOutcome::Ignored;
         };
-        let mut state = self.state.get();
-        let outcome = self.group.handle_event(area, &mut state, event);
+        let area = cx
+            .visible_rect(bmux_tui::component::LogicalRect::new(
+                0,
+                0,
+                layout.size.width,
+                self.group.options.len().min(layout.size.height),
+            ))
+            .intersection(area);
+        // Reconcile caller-owned state even while hidden, without activating.
+        let event = if area.is_empty() && !matches!(event, Event::Focus(_) | Event::Resize(_)) {
+            &Event::Tick
+        } else {
+            event
+        };
+        let initial = self.state.get();
+        let mut state = initial;
+        let outcome = if let Event::Mouse(mouse) = event {
+            self.group.normalize_state(&mut state);
+            if state.interaction.disabled {
+                RadioGroupOutcome::Ignored
+            } else {
+                let hit = self.mouse_hit(layout, cx, area, mouse.position);
+                self.group.handle_mouse_hit(&mut state, *mouse, hit)
+            }
+        } else {
+            self.group.handle_event(area, &mut state, event)
+        };
         self.state.set(state);
-        match outcome {
+        match RadioGroup::normalized_outcome(initial, state, outcome) {
             RadioGroupOutcome::Ignored => EventOutcome::Ignored,
             RadioGroupOutcome::Redraw
             | RadioGroupOutcome::Focused(_)
@@ -422,16 +496,38 @@ impl<'a> RadioGroup<'a> {
         state: &mut RadioGroupState,
         event: &Event,
     ) -> RadioGroupOutcome {
+        let initial = *state;
         self.normalize_state(state);
         if state.interaction.disabled {
-            return RadioGroupOutcome::Ignored;
+            return Self::normalized_outcome(initial, *state, RadioGroupOutcome::Ignored);
         }
-        match event {
+        let outcome = match event {
             Event::Key(stroke) => self.handle_key(state, *stroke),
             Event::Mouse(mouse) => self.handle_mouse(area, state, *mouse),
-            Event::Resize(_) | Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
+            Event::Focus(bmux_tui::event::FocusEvent::Lost) | Event::Resize(_) => {
+                let changed = state.hovered.take().is_some() | state.pressed.take().is_some();
+                if changed {
+                    RadioGroupOutcome::Redraw
+                } else {
+                    RadioGroupOutcome::Ignored
+                }
+            }
+            Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_) => {
                 RadioGroupOutcome::Ignored
             }
+        };
+        Self::normalized_outcome(initial, *state, outcome)
+    }
+
+    fn normalized_outcome(
+        initial: RadioGroupState,
+        state: RadioGroupState,
+        outcome: RadioGroupOutcome,
+    ) -> RadioGroupOutcome {
+        if outcome == RadioGroupOutcome::Ignored && initial != state {
+            RadioGroupOutcome::Redraw
+        } else {
+            outcome
         }
     }
 
@@ -502,20 +598,29 @@ impl<'a> RadioGroup<'a> {
         state: &mut RadioGroupState,
         mouse: MouseEvent,
     ) -> RadioGroupOutcome {
+        let hit = self.hit_index(area, mouse);
+        self.handle_mouse_hit(state, mouse, hit)
+    }
+
+    fn handle_mouse_hit(
+        &self,
+        state: &mut RadioGroupState,
+        mouse: MouseEvent,
+        hit: Option<usize>,
+    ) -> RadioGroupOutcome {
         if !self.policy.mouse.enabled {
             return RadioGroupOutcome::Ignored;
         }
-        let hit = self.hit_index(area, mouse);
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => Self::hover(state, hit),
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click => {
-                Self::press(state, hit)
+                Self::press(state, hit, self.policy.mouse.hover)
             }
-            MouseEventKind::Up(MouseButton::Left) if self.policy.mouse.click => {
-                self.release(state, hit)
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.release(state, hit.filter(|_| self.policy.mouse.click))
             }
             MouseEventKind::Drag(MouseButton::Left) if self.policy.mouse.click => {
-                Self::drag(state, hit)
+                Self::drag(state, hit, self.policy.mouse.hover)
             }
             MouseEventKind::Down(_)
             | MouseEventKind::Up(_)
@@ -537,12 +642,16 @@ impl<'a> RadioGroup<'a> {
         }
     }
 
-    const fn press(state: &mut RadioGroupState, hit: Option<usize>) -> RadioGroupOutcome {
+    const fn press(
+        state: &mut RadioGroupState,
+        hit: Option<usize>,
+        hover: bool,
+    ) -> RadioGroupOutcome {
         let Some(index) = hit else {
             return RadioGroupOutcome::Ignored;
         };
         state.pressed = Some(index);
-        state.hovered = Some(index);
+        state.hovered = if hover { Some(index) } else { None };
         state.set_focused(Some(index));
         RadioGroupOutcome::Redraw
     }
@@ -560,12 +669,13 @@ impl<'a> RadioGroup<'a> {
         }
     }
 
-    fn drag(state: &mut RadioGroupState, hit: Option<usize>) -> RadioGroupOutcome {
+    fn drag(state: &mut RadioGroupState, hit: Option<usize>, hover: bool) -> RadioGroupOutcome {
         let pressed = if state.pressed.is_some() { hit } else { None };
-        if state.hovered == hit && state.pressed == pressed {
+        let hovered = hit.filter(|_| hover);
+        if state.hovered == hovered && state.pressed == pressed {
             RadioGroupOutcome::Ignored
         } else {
-            state.hovered = hit;
+            state.hovered = hovered;
             state.pressed = pressed;
             RadioGroupOutcome::Redraw
         }
@@ -638,6 +748,12 @@ impl<'a> RadioGroup<'a> {
     }
 
     fn normalize_state(&self, state: &mut RadioGroupState) {
+        if state.interaction.disabled || !self.policy.mouse.enabled || !self.policy.mouse.click {
+            state.pressed = None;
+        }
+        if state.interaction.disabled || !self.policy.mouse.enabled || !self.policy.mouse.hover {
+            state.hovered = None;
+        }
         if state
             .selected
             .is_some_and(|index| index >= self.options.len())
@@ -652,13 +768,13 @@ impl<'a> RadioGroup<'a> {
         }
         if state
             .hovered
-            .is_some_and(|index| index >= self.options.len())
+            .is_some_and(|index| !self.is_enabled_option(index))
         {
             state.hovered = None;
         }
         if state
             .pressed
-            .is_some_and(|index| index >= self.options.len())
+            .is_some_and(|index| !self.is_enabled_option(index))
         {
             state.pressed = None;
         }
@@ -711,6 +827,216 @@ mod tests {
     use bmux_tui::paint::PaintCx;
 
     use super::{RadioGroup, RadioGroupComponent, RadioGroupOutcome, RadioGroupState, RadioOption};
+
+    #[test]
+    fn deep_scroll_preserves_radio_rows_and_metadata() {
+        let options: Vec<_> = (0..70_003)
+            .map(|index| RadioOption::new(format!("option-{index}"), format!("Row {index}")))
+            .collect();
+        let state = std::cell::Cell::new(RadioGroupState::new(Some(70_001)));
+        let component = RadioGroupComponent::new("choice", &options, &state);
+        let layout = component.layout(Constraints::for_width(16), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 3));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(
+            0,
+            -70_000,
+            bmux_tui::paint::LocalRect::new(0, 70_000, 16, 3),
+            |cx| component.paint(&layout, cx),
+        );
+        for (row, expected) in ["( ) Row 70000", "(*) Row 70001", "( ) Row 70002"]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                frame
+                    .buffer()
+                    .row_symbols(u16::try_from(row).unwrap())
+                    .unwrap()
+                    .starts_with(expected)
+            );
+        }
+        assert_eq!(frame.hits().regions().len(), 3);
+        assert_eq!(frame.hits().regions()[2].area, Rect::new(0, 2, 16, 1));
+        assert_eq!(frame.semantics().regions().len(), 1);
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 16, 3));
+        EventCx::new(&layout).with_transform(0, 0, 0, -70_000, Rect::new(0, 0, 16, 3), |cx| {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                assert!(
+                    component
+                        .event(
+                            &Event::Mouse(MouseEvent::new(kind, Point::new(1, 2))),
+                            &layout,
+                            cx
+                        )
+                        .is_handled()
+                );
+            }
+        });
+        assert_eq!(state.get().selected(), Some(70_002));
+    }
+
+    #[test]
+    fn clipped_group_mouse_selects_the_visible_logical_option() {
+        let options = [
+            RadioOption::new("a", "A"),
+            RadioOption::new("b", "B"),
+            RadioOption::new("c", "C"),
+        ];
+        let state = std::cell::Cell::new(RadioGroupState::new(Some(0)));
+        let component = RadioGroupComponent::new("choice", &options, &state);
+        let layout = component.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let clip = Rect::new(4, 3, 8, 1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 16, 6));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(
+            4,
+            2,
+            bmux_tui::paint::LocalRect::new(0, 1, 8, 1),
+            |cx| component.paint(&layout, cx),
+        );
+        assert_eq!(frame.hits().regions().len(), 1);
+        assert_eq!(frame.hits().regions()[0].area, clip);
+        assert!(frame.buffer().row_symbols(3).unwrap().contains("( ) B"));
+        let mut cx = EventCx::new(&layout);
+        cx.with_transform(0, 0, 4, 2, clip, |cx| {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                assert!(
+                    component
+                        .event(
+                            &Event::Mouse(MouseEvent::new(kind, Point::new(5, 3))),
+                            &layout,
+                            cx
+                        )
+                        .is_handled()
+                );
+            }
+        });
+        assert_eq!(state.get().selected(), Some(1));
+    }
+
+    #[test]
+    fn mouse_disabled_group_keeps_keyboard_selection() {
+        let options = [RadioOption::new("a", "A"), RadioOption::new("b", "B")];
+        let initial = RadioGroupState::new(Some(0));
+        let state = std::cell::Cell::new(initial);
+        let mut policy = super::RadioGroupPolicy::interactive();
+        policy.mouse.enabled = false;
+        let component = RadioGroupComponent::new("choice", &options, &state).policy(policy);
+        let layout = component.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.hits().focus_targets(None).len(), 2);
+        for hit in frame.hits().regions() {
+            assert!(hit.enabled && hit.focusable);
+            assert!(!hit.pointer_events && !hit.hoverable);
+        }
+        let mut cx = EventCx::new(&layout);
+        for kind in [
+            MouseEventKind::Move,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert_eq!(
+                component.event(
+                    &Event::Mouse(MouseEvent::new(kind, Point::new(1, 1))),
+                    &layout,
+                    &mut cx
+                ),
+                EventOutcome::Ignored
+            );
+            assert_eq!(state.get(), initial);
+        }
+        assert!(
+            component
+                .event(
+                    &Event::Key(KeyStroke::simple(KeyCode::Down)),
+                    &layout,
+                    &mut cx
+                )
+                .is_handled()
+        );
+        assert!(
+            component
+                .event(
+                    &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                    &layout,
+                    &mut cx
+                )
+                .is_handled()
+        );
+        assert_eq!(state.get().selected(), Some(1));
+    }
+
+    #[test]
+    fn empty_group_neither_paints_nor_changes_selection() {
+        let options = [RadioOption::new("a", "A"), RadioOption::new("b", "B")];
+        let initial = RadioGroupState::new(Some(0));
+        let state = std::cell::Cell::new(initial);
+        let component = RadioGroupComponent::new("choice", &options, &state);
+        for (width, height) in [(0, 2), (8, 0), (0, 0)] {
+            let layout = component.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert!(frame.hits().regions().is_empty());
+            assert!(frame.semantics().regions().is_empty());
+            assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("        "));
+            let mut cx = EventCx::new(&layout);
+            for key in [KeyCode::Down, KeyCode::Enter] {
+                assert_eq!(
+                    component.event(&Event::Key(KeyStroke::simple(key)), &layout, &mut cx),
+                    EventOutcome::Ignored
+                );
+                assert_eq!(state.get(), initial);
+            }
+        }
+    }
+
+    #[test]
+    fn focus_loss_and_resize_clear_pointer_state_even_in_empty_layouts() {
+        let options = [RadioOption::new("a", "A"), RadioOption::new("b", "B")];
+        let mut initial = RadioGroupState::new(Some(0));
+        initial.hovered = Some(1);
+        initial.pressed = Some(1);
+        let state = std::cell::Cell::new(initial);
+        let component = RadioGroupComponent::new("choice", &options, &state);
+        for (width, height) in [(8, 2), (0, 2), (8, 0), (0, 0)] {
+            let layout = component.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            for event in [
+                Event::Focus(bmux_tui::event::FocusEvent::Lost),
+                Event::Resize(Rect::new(0, 0, 8, 2).size()),
+            ] {
+                state.set(initial);
+                let mut cx = EventCx::new(&layout);
+                assert_eq!(
+                    component.event(&event, &layout, &mut cx),
+                    EventOutcome::Redraw
+                );
+                assert_eq!(state.get().hovered, None);
+                assert_eq!(state.get().pressed, None);
+                assert_eq!(state.get().selected, initial.selected);
+                assert_eq!(state.get().focused, initial.focused);
+                assert_eq!(
+                    component.event(&event, &layout, &mut cx),
+                    EventOutcome::Ignored
+                );
+            }
+        }
+    }
 
     #[test]
     fn renders_selected_option() {
@@ -779,6 +1105,109 @@ mod tests {
 
         assert_eq!(outcome, RadioGroupOutcome::Selected(1));
         assert_eq!(state.selected(), Some(1));
+    }
+
+    #[test]
+    fn normalization_requests_redraw_for_keyboard_and_projected_mouse_paths() {
+        let options = [RadioOption::new("a", "A")];
+        let initial = RadioGroupState::new(Some(9));
+        let state = std::cell::Cell::new(initial);
+        let component = RadioGroupComponent::new("choice", &options, &state);
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 8, 1).size()),
+            &mut LayoutCx::new(),
+        );
+        for event in [
+            Event::Tick,
+            Event::Mouse(MouseEvent::new(
+                MouseEventKind::ScrollDown,
+                Point::new(1, 0),
+            )),
+        ] {
+            state.set(initial);
+            let mut cx = EventCx::new(&layout);
+            assert_eq!(
+                component.event(&event, &layout, &mut cx),
+                EventOutcome::Redraw
+            );
+            assert_eq!(state.get().selected(), None);
+            assert_eq!(
+                component.event(&event, &layout, &mut cx),
+                EventOutcome::Ignored
+            );
+        }
+    }
+
+    #[test]
+    fn disabling_pressed_option_cancels_activation_after_reenable() {
+        let options = [RadioOption::new("a", "A"), RadioOption::new("b", "B")];
+        let disabled = [
+            RadioOption::new("a", "A"),
+            RadioOption::new("b", "B").disabled(true),
+        ];
+        let group = RadioGroup::new(&options);
+        let area = Rect::new(0, 0, 8, 2);
+        let mut state = RadioGroupState::new(Some(0));
+        group.handle_event(
+            area,
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(1, 1),
+            )),
+        );
+        assert_eq!(state.pressed, Some(1));
+        RadioGroup::new(&disabled).handle_event(area, &mut state, &Event::Tick);
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.hovered, None);
+        assert_eq!(
+            group.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(1, 1),
+                ))
+            ),
+            RadioGroupOutcome::Ignored
+        );
+        assert_eq!(state.selected(), Some(0));
+    }
+
+    #[test]
+    fn disabling_click_before_release_cancels_pending_selection() {
+        let options = [RadioOption::new("a", "A"), RadioOption::new("b", "B")];
+        let area = Rect::new(0, 0, 8, 2);
+        let mut state = RadioGroupState::new(Some(0));
+        let group = RadioGroup::new(&options);
+        group.handle_event(
+            area,
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(1, 1),
+            )),
+        );
+        assert_eq!(state.pressed, Some(1));
+        let mut policy = super::RadioGroupPolicy::default();
+        policy.mouse.click = false;
+        let release = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            Point::new(1, 1),
+        ));
+        assert_eq!(
+            RadioGroup::new(&options)
+                .policy(policy)
+                .handle_event(area, &mut state, &release),
+            RadioGroupOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.selected(), Some(0));
+        assert_eq!(
+            group.handle_event(area, &mut state, &release),
+            RadioGroupOutcome::Ignored
+        );
+        assert_eq!(state.selected(), Some(0));
     }
 
     #[test]
@@ -857,6 +1286,211 @@ mod tests {
         );
         assert_eq!(outcome, EventOutcome::Redraw);
         assert_eq!(state.get().focused(), Some(1));
+    }
+
+    #[test]
+    fn radio_semantics_exclude_blank_layout_rows() {
+        let options = [RadioOption::new("a", "A")];
+        let state = std::cell::Cell::new(RadioGroupState::new(None));
+        let component = RadioGroupComponent::new("choice", &options, &state);
+        let layout = component.layout(Constraints::new(10, 10, 3, Some(3)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.semantics().regions().len(), 1);
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(0, 0, 10, 1));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(
+            0,
+            -1,
+            bmux_tui::paint::LocalRect::new(0, 1, 10, 2),
+            |cx| component.paint(&layout, cx),
+        );
+        assert!(frame.hits().regions().is_empty());
+        assert!(frame.semantics().regions().is_empty());
+    }
+
+    #[test]
+    fn clipped_radio_options_cannot_select_through_blank_layout_rows() {
+        let options = [RadioOption::new("a", "A")];
+        let mut initial = RadioGroupState::new(None);
+        initial.set_focused(Some(0));
+        let state = std::cell::Cell::new(initial);
+        let component = RadioGroupComponent::new("choice", &options, &state);
+        let layout = component.layout(Constraints::new(10, 10, 3, Some(3)), &mut LayoutCx::new());
+        EventCx::new(&layout).with_transform(0, 0, 0, 0, Rect::new(0, 1, 10, 2), |cx| {
+            assert!(
+                cx.find_rect(&layout.id)
+                    .is_some_and(|rect| !rect.is_empty())
+            );
+            assert_eq!(
+                component.event(&Event::Key(KeyStroke::simple(KeyCode::Enter)), &layout, cx),
+                EventOutcome::Ignored
+            );
+        });
+        assert_eq!(state.get(), initial);
+        assert_eq!(
+            component.event(
+                &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                &layout,
+                &mut EventCx::new(&layout),
+            ),
+            EventOutcome::Redraw
+        );
+        assert_eq!(state.get().selected, Some(0));
+    }
+
+    #[test]
+    fn hidden_radio_group_cancels_disabled_pointer_without_selection() {
+        let options = [RadioOption::new("a", "A")];
+        for (width, height) in [(0, 1), (10, 0), (0, 0)] {
+            let mut initial = RadioGroupState::new(None);
+            initial.pressed = Some(0);
+            initial.hovered = Some(0);
+            initial.set_focused(Some(0));
+            let state = std::cell::Cell::new(initial);
+            let mut component = RadioGroupComponent::new("choice", &options, &state);
+            component.group.policy.mouse.enabled = false;
+            let layout = component.layout(
+                Constraints::new(width, width, height, Some(height)),
+                &mut LayoutCx::new(),
+            );
+            assert_eq!(
+                component.event(
+                    &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                    &layout,
+                    &mut EventCx::new(&layout),
+                ),
+                EventOutcome::Redraw
+            );
+            assert_eq!(state.get().pressed, None);
+            assert_eq!(state.get().hovered, None);
+            assert_eq!(state.get().selected, None);
+            component.group.policy.mouse.enabled = true;
+            let visible = component.layout(Constraints::for_width(10), &mut LayoutCx::new());
+            component.event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(1, 0),
+                )),
+                &visible,
+                &mut EventCx::new(&visible),
+            );
+            assert_eq!(state.get().selected, None);
+        }
+    }
+
+    #[test]
+    fn hover_disabled_radio_press_and_drag_still_select() {
+        let options = [RadioOption::new("a", "A"), RadioOption::new("b", "B")];
+        let area = Rect::new(0, 0, 10, 2);
+        let mut group = RadioGroup::new(&options);
+        group.policy.mouse.hover = false;
+        let mut state = RadioGroupState::new(None);
+        for (kind, row, pressed) in [
+            (MouseEventKind::Down(MouseButton::Left), 0, Some(0)),
+            (MouseEventKind::Drag(MouseButton::Left), 1, Some(1)),
+            (MouseEventKind::Up(MouseButton::Left), 1, None),
+        ] {
+            group.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(kind, Point::new(1, row))),
+            );
+            assert_eq!(state.hovered, None);
+            assert_eq!(state.pressed, pressed);
+        }
+        assert_eq!(state.selected, Some(1));
+    }
+
+    #[test]
+    fn disabling_radio_click_cancels_press_and_preserves_keyboard_selection() {
+        let options = [RadioOption::new("a", "A")];
+        let area = Rect::new(0, 0, 10, 1);
+        let mut group = RadioGroup::new(&options);
+        let mut state = RadioGroupState::new(None);
+        state.set_focused(Some(0));
+        let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 0)));
+        group.handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Down(MouseButton::Left)),
+        );
+        assert_eq!(state.pressed, Some(0));
+        group.policy.mouse.click = false;
+        assert_eq!(
+            group.handle_event(area, &mut state, &Event::Tick),
+            RadioGroupOutcome::Redraw
+        );
+        assert_eq!(state.pressed, None);
+        group.policy.mouse.click = true;
+        group.handle_event(
+            area,
+            &mut state,
+            &mouse(MouseEventKind::Up(MouseButton::Left)),
+        );
+        assert_eq!(state.selected, None);
+        group.policy.mouse.click = false;
+        assert_eq!(
+            group.handle_event(
+                area,
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+            ),
+            RadioGroupOutcome::Selected(0)
+        );
+        state.hovered = Some(0);
+        group.policy.mouse.hover = false;
+        assert_eq!(
+            group.handle_event(area, &mut state, &Event::Tick),
+            RadioGroupOutcome::Redraw
+        );
+        assert_eq!(state.hovered, None);
+        assert_eq!(state.selected, Some(0));
+    }
+
+    #[test]
+    fn disabling_pointer_input_cancels_pending_radio_press() {
+        let options = [RadioOption::new("a", "A")];
+        let area = Rect::new(0, 0, 10, 1);
+        for disable_control in [false, true] {
+            let mut group = RadioGroup::new(&options);
+            let mut state = RadioGroupState::new(None);
+            let mouse = |kind| Event::Mouse(MouseEvent::new(kind, Point::new(1, 0)));
+            group.handle_event(
+                area,
+                &mut state,
+                &mouse(MouseEventKind::Down(MouseButton::Left)),
+            );
+            assert_eq!(state.pressed, Some(0));
+            if disable_control {
+                state.interaction.disabled = true;
+            } else {
+                group.policy.mouse.enabled = false;
+            }
+            assert_eq!(
+                group.handle_event(area, &mut state, &Event::Tick),
+                RadioGroupOutcome::Redraw
+            );
+            assert_eq!(state.pressed, None);
+            assert_eq!(state.hovered, None);
+            assert_eq!(
+                group.handle_event(area, &mut state, &Event::Tick),
+                RadioGroupOutcome::Ignored
+            );
+            state.interaction.disabled = false;
+            group.policy.mouse.enabled = true;
+            assert_eq!(
+                group.handle_event(
+                    area,
+                    &mut state,
+                    &mouse(MouseEventKind::Up(MouseButton::Left))
+                ),
+                RadioGroupOutcome::Ignored
+            );
+            assert_eq!(state.selected(), None);
+        }
     }
 
     #[test]
