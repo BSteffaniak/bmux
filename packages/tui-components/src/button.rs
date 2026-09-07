@@ -20,7 +20,7 @@ use crate::common::{ComponentMousePolicy, InteractionState, InteractionStyles};
 use crate::hit_test::HitRegion;
 
 /// Visual styles for a button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ButtonStyles {
     /// Style used when the button is enabled and inactive.
     pub normal: Style,
@@ -200,9 +200,17 @@ impl Component for ButtonComponent<'_, '_> {
         self.button.label.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
-        format!("{:?}", self.button.policy).hash(&mut paint);
-        format!("{:?}", self.button.styles).hash(&mut paint);
-        format!("{:?}", self.state.get()).hash(&mut paint);
+        let policy = self.button.policy;
+        (
+            policy.mouse.enabled,
+            policy.mouse.hover,
+            policy.mouse.click,
+            policy.enter_activates,
+            policy.space_activates,
+        )
+            .hash(&mut paint);
+        self.button.styles.hash(&mut paint);
+        self.state.get().interaction.hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
 
@@ -470,6 +478,27 @@ mod tests {
                 .revision()
                 .paint
         );
+    }
+
+    #[test]
+    fn canonical_policy_fields_invalidate_paint_independently() {
+        let state = Cell::new(ButtonState::new());
+        let baseline = ButtonComponent::new("save", "Save", &state).revision();
+        for field in 0..5 {
+            let mut policy = super::ButtonPolicy::default();
+            match field {
+                0 => policy.mouse.enabled = !policy.mouse.enabled,
+                1 => policy.mouse.hover = !policy.mouse.hover,
+                2 => policy.mouse.click = !policy.mouse.click,
+                3 => policy.enter_activates = !policy.enter_activates,
+                _ => policy.space_activates = !policy.space_activates,
+            }
+            let changed = ButtonComponent::new("save", "Save", &state)
+                .policy(policy)
+                .revision();
+            assert_eq!(baseline.layout, changed.layout);
+            assert_ne!(baseline.paint, changed.paint, "policy field {field}");
+        }
     }
 
     #[test]

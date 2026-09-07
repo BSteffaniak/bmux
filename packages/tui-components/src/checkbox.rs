@@ -19,7 +19,7 @@ use bmux_tui::style::Modifier;
 use crate::common::{ComponentMousePolicy, InteractionState};
 
 /// Visual styles for a checkbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CheckboxStyles {
     /// Style used when the checkbox is enabled and inactive.
     pub normal: Style,
@@ -75,7 +75,7 @@ impl Default for CheckboxPolicy {
 }
 
 /// Runtime checkbox state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CheckboxState {
     checked: bool,
     interaction: InteractionState,
@@ -191,10 +191,18 @@ impl Component for CheckboxComponent<'_, '_> {
         self.checkbox.label.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
-        format!("{:?}", self.checkbox.policy).hash(&mut paint);
-        format!("{:?}", self.checkbox.styles).hash(&mut paint);
-        format!("{:?}", self.fallback).hash(&mut paint);
-        format!("{:?}", self.state.get()).hash(&mut paint);
+        let policy = self.checkbox.policy;
+        (
+            policy.mouse.enabled,
+            policy.mouse.hover,
+            policy.mouse.click,
+            policy.enter_toggles,
+            policy.space_toggles,
+        )
+            .hash(&mut paint);
+        self.checkbox.styles.hash(&mut paint);
+        self.fallback.hash(&mut paint);
+        self.state.get().hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
 
@@ -613,6 +621,61 @@ mod tests {
                 .retained_regions(),
             &[Rect::new(0, 0, 10, 1)]
         );
+    }
+
+    #[test]
+    fn canonical_revision_tracks_each_policy_state_and_style_field() {
+        let state = Cell::new(CheckboxState::new(false));
+        let baseline = CheckboxComponent::new("enable", "Enable", &state).revision();
+        for field in 0..5 {
+            let mut policy = CheckboxPolicy::default();
+            match field {
+                0 => policy.mouse.enabled = !policy.mouse.enabled,
+                1 => policy.mouse.hover = !policy.mouse.hover,
+                2 => policy.mouse.click = !policy.mouse.click,
+                3 => policy.enter_toggles = !policy.enter_toggles,
+                _ => policy.space_toggles = !policy.space_toggles,
+            }
+            let changed = CheckboxComponent::new("enable", "Enable", &state)
+                .policy(policy)
+                .revision();
+            assert_eq!(baseline.layout, changed.layout);
+            assert_ne!(baseline.paint, changed.paint, "policy field {field}");
+        }
+        for field in 0..5 {
+            let mut changed_state = CheckboxState::new(false);
+            match field {
+                0 => changed_state.checked = true,
+                1 => changed_state.interaction.focused = true,
+                2 => changed_state.interaction.hovered = true,
+                3 => changed_state.interaction.pressed = true,
+                _ => changed_state.interaction.disabled = true,
+            }
+            state.set(changed_state);
+            let changed = CheckboxComponent::new("enable", "Enable", &state).revision();
+            assert_eq!(baseline.layout, changed.layout);
+            assert_ne!(baseline.paint, changed.paint, "state field {field}");
+        }
+        state.set(CheckboxState::new(false));
+        for field in 0..6 {
+            let mut styles = super::CheckboxStyles::default();
+            let accent = bmux_tui::style::Style::new().fg(bmux_tui::style::Color::Red);
+            match field {
+                0 => styles.normal = accent,
+                1 => styles.focused = accent,
+                2 => styles.hovered = accent,
+                3 => styles.pressed = accent,
+                4 => styles.disabled = accent,
+                _ => {}
+            }
+            let mut checkbox = CheckboxComponent::new("enable", "Enable", &state).styles(styles);
+            if field == 5 {
+                checkbox = checkbox.fallback_style(accent);
+            }
+            let changed = checkbox.revision();
+            assert_eq!(baseline.layout, changed.layout);
+            assert_ne!(baseline.paint, changed.paint, "style field {field}");
+        }
     }
 
     #[test]
