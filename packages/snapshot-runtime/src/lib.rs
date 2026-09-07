@@ -306,6 +306,15 @@ pub struct DryRunReport {
 /// IPC handlers so pane-runtime shutdowns (which are inherently
 /// async) can be driven by the restore path.
 pub trait SnapshotOrchestrator: Send + Sync {
+    /// Save the final state and permanently stop writes before host teardown.
+    /// Implementations must wait for in-flight saves and prevent later saves,
+    /// even if the final write fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the final snapshot cannot be saved.
+    fn finalize(&self) -> SnapshotOrchestratorResult<Option<PathBuf>>;
+
     /// Restore from the on-disk snapshot if one exists. Returns
     /// `Ok(None)` when persistence is disabled or no snapshot file is
     /// present.
@@ -412,6 +421,12 @@ impl SnapshotOrchestratorHandle {
 /// reach the async methods by awaiting the returned
 /// `Pin<Box<dyn Future + Send>>`.
 pub trait SnapshotOrchestratorApi: Send + Sync {
+    /// Synchronous counterpart of [`SnapshotOrchestrator::finalize`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the final snapshot cannot be saved.
+    fn finalize(&self) -> SnapshotOrchestratorResult<Option<PathBuf>>;
     /// Boxed counterpart of [`SnapshotOrchestrator::restore_if_present`].
     fn restore_if_present_boxed(
         &self,
@@ -447,6 +462,9 @@ struct OrchestratorAdapter<O: SnapshotOrchestrator> {
 }
 
 impl<O: SnapshotOrchestrator> SnapshotOrchestratorApi for OrchestratorAdapter<O> {
+    fn finalize(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
+        self.inner.finalize()
+    }
     fn restore_if_present_boxed(
         &self,
     ) -> std::pin::Pin<
@@ -488,6 +506,9 @@ struct SharedOrchestratorAdapter<O: SnapshotOrchestrator> {
 }
 
 impl<O: SnapshotOrchestrator> SnapshotOrchestratorApi for SharedOrchestratorAdapter<O> {
+    fn finalize(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
+        self.inner.finalize()
+    }
     fn restore_if_present_boxed(
         &self,
     ) -> std::pin::Pin<
@@ -533,6 +554,9 @@ impl<O: SnapshotOrchestrator> SnapshotOrchestratorApi for SharedOrchestratorAdap
 pub struct NoopSnapshotOrchestrator;
 
 impl SnapshotOrchestrator for NoopSnapshotOrchestrator {
+    fn finalize(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
+        Ok(None)
+    }
     async fn restore_if_present(&self) -> SnapshotOrchestratorResult<Option<RestoreSummary>> {
         Ok(None)
     }

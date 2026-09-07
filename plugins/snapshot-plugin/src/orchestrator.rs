@@ -48,6 +48,9 @@ pub struct BmuxSnapshotOrchestrator {
     dirty_flag: Arc<SnapshotDirtyFlag>,
     stateful_registry: Arc<RwLock<StatefulPluginRegistry>>,
     status: Mutex<Status>,
+    // Serializes collection and replacement, not just file IO. Once finalized,
+    // no writer may observe host teardown state or reopen persistence.
+    finalized: Mutex<bool>,
 }
 
 impl BmuxSnapshotOrchestrator {
@@ -64,6 +67,7 @@ impl BmuxSnapshotOrchestrator {
             path,
             dirty_flag,
             stateful_registry,
+            finalized: Mutex::new(false),
             status: Mutex::new(Status {
                 writes_allowed,
                 ..Status::default()
@@ -75,6 +79,17 @@ impl BmuxSnapshotOrchestrator {
     /// background thread. Returns the written path (or `None` if
     /// persistence is disabled) / a `SnapshotOrchestratorError`.
     pub(crate) fn save_now_blocking(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
+        let finalized = self.finalized.lock().map_err(|_| {
+            SnapshotOrchestratorError::Other("snapshot lifecycle lock poisoned".into())
+        })?;
+        if *finalized {
+            return Ok(None);
+        }
+        self.save_locked()
+    }
+
+    // Caller holds the lifecycle lock across collection and atomic replacement.
+    fn save_locked(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
         let Some(path) = self.path.clone() else {
             return Ok(None);
         };
@@ -321,6 +336,17 @@ fn restore_order(
 }
 
 impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
+    fn finalize(&self) -> SnapshotOrchestratorResult<Option<PathBuf>> {
+        let mut finalized = self.finalized.lock().map_err(|_| {
+            SnapshotOrchestratorError::Other("snapshot lifecycle lock poisoned".into())
+        })?;
+        if *finalized {
+            return Ok(None);
+        }
+        // Seal even on failure: teardown must never replace the last good file.
+        *finalized = true;
+        self.save_locked()
+    }
     async fn restore_if_present(&self) -> SnapshotOrchestratorResult<Option<RestoreSummary>> {
         if self.path.is_none() {
             return Ok(None);
@@ -739,6 +765,106 @@ mod tests {
         assert_eq!(summary.restored_plugins, 1);
         assert_eq!(summary.failed_plugins, 0);
         assert_eq!(*counter.value.lock().unwrap(), 7);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn final_snapshot_survives_dirty_teardown_and_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(DEFAULT_SNAPSHOT_FILENAME);
+        let (registry, counter) = new_registry_with_counter(33);
+        let dirty = Arc::new(SnapshotDirtyFlag::new());
+        let orchestrator =
+            BmuxSnapshotOrchestrator::new(Some(path.clone()), Arc::clone(&dirty), registry);
+        orchestrator.restore_if_present().await.unwrap();
+        orchestrator.finalize().unwrap();
+        let saved = std::fs::read(&path).unwrap();
+
+        // Teardown mutations must not reach disk, whether a debounced save,
+        // explicit save, or duplicate finalization follows them.
+        *counter.value.lock().unwrap() = 0;
+        dirty.mark_dirty();
+        assert!(orchestrator.save_now_blocking().unwrap().is_none());
+        assert!(orchestrator.save_now().await.unwrap().is_none());
+        assert!(orchestrator.finalize().unwrap().is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+        let (registry, restored) = new_registry_with_counter(0);
+        let restarted = BmuxSnapshotOrchestrator::new(Some(path), dirty, registry);
+        restarted.restore_if_present().await.unwrap();
+        assert_eq!(*restored.value.lock().unwrap(), 33);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finalization_waits_for_in_flight_collection() {
+        struct BlockingParticipant {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            first: std::sync::atomic::AtomicBool,
+        }
+        impl StatefulPlugin for BlockingParticipant {
+            fn id(&self) -> PluginEventKind {
+                TEST_ID
+            }
+            fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
+                if self.first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    self.entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+                Ok(StatefulPluginSnapshot::new(TEST_ID, 1, vec![33]))
+            }
+            fn restore_snapshot(&self, _: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+                Ok(())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut registry = StatefulPluginRegistry::new();
+        registry.push(StatefulPluginHandle::new(BlockingParticipant {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            first: std::sync::atomic::AtomicBool::new(true),
+        }));
+        let orchestrator = Arc::new(BmuxSnapshotOrchestrator::new(
+            Some(tmp.path().join(DEFAULT_SNAPSHOT_FILENAME)),
+            Arc::new(SnapshotDirtyFlag::new()),
+            Arc::new(RwLock::new(registry)),
+        ));
+        orchestrator.restore_if_present().await.unwrap();
+        let saving = Arc::clone(&orchestrator);
+        let save = std::thread::spawn(move || saving.save_now_blocking());
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        // Collection holds the same gate that finalization must acquire.
+        assert!(matches!(
+            orchestrator.finalized.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        let finalizing = Arc::clone(&orchestrator);
+        let finalize = std::thread::spawn(move || finalizing.finalize());
+        release_tx.send(()).unwrap();
+        save.join().unwrap().unwrap();
+        finalize.join().unwrap().unwrap();
+        assert!(orchestrator.save_now_blocking().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_final_snapshot_still_seals_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(DEFAULT_SNAPSHOT_FILENAME);
+        let (registry, _) = new_registry_with_counter(33);
+        let orchestrator = BmuxSnapshotOrchestrator::new(
+            Some(path.clone()),
+            Arc::new(SnapshotDirtyFlag::new()),
+            registry,
+        );
+        orchestrator.restore_if_present().await.unwrap();
+        // A directory at the destination makes atomic replacement fail.
+        std::fs::create_dir(&path).unwrap();
+        assert!(orchestrator.finalize().is_err());
+        assert!(orchestrator.save_now_blocking().unwrap().is_none());
+        assert!(orchestrator.finalize().unwrap().is_none());
     }
 
     #[tokio::test]

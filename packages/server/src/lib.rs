@@ -1358,7 +1358,12 @@ impl BmuxServer {
             self.endpoint
         );
 
-        let _ = maybe_flush_snapshot(&self.state, true);
+        // Drain in-flight writes and seal persistence before destroying state.
+        if let Err(error) =
+            tokio::task::block_in_place(|| snapshot_orchestrator_handle().as_dyn().finalize())
+        {
+            warn!("final snapshot flush failed: {error}");
+        }
 
         let removed_runtimes = session_runtime_handle().0.remove_all_runtimes();
         for removed_runtime in removed_runtimes {
