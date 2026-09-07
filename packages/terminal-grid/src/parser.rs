@@ -142,6 +142,19 @@ impl TerminalGridStream {
         }
         let mut snapshot = self.snapshot(0, self.grid.height());
         delta.apply_to_snapshot(&mut snapshot)?;
+        if !delta.reset_rows && snapshot.mode == "main" && snapshot.scrollback_rows > 0 {
+            // Sparse wire indexes address the viewport, not retained history.
+            // Apply them above before restoring the unchanged local prefix so
+            // row zero cannot overwrite the oldest retained history row.
+            let retained_rows = self
+                .grid
+                .height()
+                .saturating_add(self.grid.scrollback_rows_hint());
+            let mut retained = self.snapshot(0, retained_rows).rows;
+            retained.truncate(retained.len().saturating_sub(self.grid.height()));
+            retained.append(&mut snapshot.rows);
+            snapshot.rows = retained;
+        }
         // A main-screen snapshot needs backing rows in addition to its viewport.
         // Reject obvious truncation before allocating a replacement grid; the
         // post-hydration check below also catches reflow and retention losses.
@@ -1166,6 +1179,113 @@ mod tests {
         assert!(tracker.alternate_screen());
         assert!(tracker.process(b"\x1b[?1049l").toggled_alternate);
         assert!(!tracker.alternate_screen());
+    }
+
+    #[test]
+    fn incomplete_main_backing_rejects_atomically_on_entry_and_sparse_updates() {
+        for already_alternate in [false, true] {
+            let limits = GridLimits::default();
+            let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+            producer.process(b"retained main");
+            if already_alternate {
+                producer.process(b"\x1b[?1049halt");
+            }
+            let before = producer.snapshot(0, 3);
+            let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+            if already_alternate {
+                producer.process(b" update");
+            } else {
+                producer.process(b"\x1b[?1049halt");
+            }
+            let after = producer.snapshot(0, 3);
+            let valid = crate::GridDeltaBatch::between(&before, &after).unwrap();
+            assert_eq!(valid.reset_rows, !already_alternate);
+            for count in [0, 2] {
+                let mut malformed = valid.clone();
+                malformed.main_rows = after.main_rows.clone();
+                malformed.main_rows.as_mut().unwrap().truncate(count);
+                let mut snapshot = before.clone();
+                assert!(matches!(
+                    malformed.apply_to_snapshot(&mut snapshot),
+                    Err(crate::GridDeltaApplyError::IncompleteMainViewport { .. })
+                ));
+                assert_eq!(snapshot, before);
+                assert!(matches!(
+                    consumer.apply_delta(&malformed, limits),
+                    Err(super::TerminalGridStreamDeltaError::Delta(
+                        crate::GridDeltaApplyError::IncompleteMainViewport { .. }
+                    ))
+                ));
+                assert_eq!(consumer.snapshot(0, 3), before);
+            }
+            consumer.apply_delta(&valid, limits).unwrap();
+            assert_eq!(consumer.snapshot(0, 3), after);
+            producer.process(b"\x1b[?1049l continued");
+            consumer.process(b"\x1b[?1049l continued");
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+        }
+    }
+
+    #[test]
+    fn incomplete_replacement_viewport_preserves_state_and_allows_retry() {
+        for alternate in [false, true] {
+            let limits = GridLimits::default();
+            let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+            producer.process(b"retained main\x1b[");
+            let before = producer.snapshot(0, 3);
+            let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+            producer.process(b"31m");
+            if alternate {
+                producer.process(b"\x1b[?1049halt");
+            } else {
+                producer.resize(21, 3).unwrap();
+            }
+            let after = producer.snapshot(0, 3);
+            let valid = crate::GridDeltaBatch::between(&before, &after).unwrap();
+            assert!(valid.reset_rows);
+            for rows in [0, 2] {
+                let mut malformed = valid.clone();
+                malformed.row_updates.truncate(rows);
+                let mut snapshot = before.clone();
+                assert!(matches!(
+                    malformed.apply_to_snapshot(&mut snapshot),
+                    Err(crate::GridDeltaApplyError::IncompleteViewport { .. })
+                ));
+                assert_eq!(snapshot, before);
+                assert!(matches!(
+                    consumer.apply_delta(&malformed, limits),
+                    Err(super::TerminalGridStreamDeltaError::Delta(
+                        crate::GridDeltaApplyError::IncompleteViewport { .. }
+                    ))
+                ));
+                assert_eq!(consumer.snapshot(0, 3), before);
+            }
+            consumer.apply_delta(&valid, limits).unwrap();
+            assert_eq!(consumer.snapshot(0, 3), after);
+            producer.process(b"\x1b[?1049lcontinued");
+            consumer.process(b"\x1b[?1049lcontinued");
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+        }
+    }
+
+    #[test]
+    fn sparse_viewport_deltas_preserve_hydrated_history() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+        producer.process(b"history\r\nsecond\r\nthird");
+        let snapshot = producer.snapshot(0, 3);
+        let mut consumer = TerminalGridStream::from_snapshot(&snapshot, limits).unwrap();
+        for bytes in [b"\x1b[Hchanged".as_slice(), b"\x1b[", b"31mred", b"\x1b7"] {
+            let delta = producer.process_delta(bytes).unwrap();
+            assert!(!delta.reset_rows);
+            assert!(delta.row_updates.iter().all(|update| update.row_index < 2));
+            consumer.apply_delta(&delta, limits).unwrap();
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+            assert_eq!(consumer.snapshot(0, 3).rows[0], snapshot.rows[0]);
+        }
+        producer.process(b"\r\ncontinued");
+        consumer.process(b"\r\ncontinued");
+        assert_eq!(consumer.snapshot(0, 5), producer.snapshot(0, 5));
     }
 
     #[test]

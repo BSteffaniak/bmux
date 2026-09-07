@@ -159,12 +159,29 @@ impl GridDeltaBatch {
         if !matches!(self.mode.as_str(), "main" | "alternate") {
             return Err(GridDeltaApplyError::InvalidScreenMode);
         }
+        // Omitted backing preserves the receiver's state for legacy and sparse
+        // updates. Explicit replacement backing must contain its full viewport.
+        if self.mode == "alternate"
+            && let Some(rows) = &self.main_rows
+            && rows.len() < usize::from(self.height)
+        {
+            return Err(GridDeltaApplyError::IncompleteMainViewport {
+                expected: self.height,
+                actual: rows.len(),
+            });
+        }
         Ok(())
     }
 
     /// Validate replacement indexes without allocating the replacement row set.
     pub(crate) fn validate_replacement_indexes(&self) -> Result<(), GridDeltaApplyError> {
         if self.reset_rows {
+            if self.row_updates.len() < usize::from(self.height) {
+                return Err(GridDeltaApplyError::IncompleteViewport {
+                    expected: self.height,
+                    actual: self.row_updates.len(),
+                });
+            }
             for (expected, update) in self.row_updates.iter().enumerate() {
                 if usize::try_from(update.row_index).ok() != Some(expected) {
                     return Err(GridDeltaApplyError::InvalidReplacementRowIndex {
@@ -276,6 +293,10 @@ pub enum GridDeltaApplyError {
     RegressingContentRevision { current: u64, received: u64 },
     #[error("grid delta row index {0} is outside the retained row set")]
     RowIndexOutOfBounds(u32),
+    #[error("replacement main backing needs at least {expected} rows, received {actual}")]
+    IncompleteMainViewport { expected: u16, actual: usize },
+    #[error("replacement viewport needs at least {expected} rows, received {actual}")]
+    IncompleteViewport { expected: u16, actual: usize },
     #[error("replacement row index mismatch: expected {expected}, actual {actual}")]
     InvalidReplacementRowIndex { expected: usize, actual: u32 },
 }
