@@ -22,7 +22,7 @@ use crate::common::u16_saturating;
 use crate::common::ComponentMousePolicy;
 
 /// One breadcrumb item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BreadcrumbItem<'a> {
     /// Stable item id.
     pub id: &'a str,
@@ -52,7 +52,7 @@ impl<'a> BreadcrumbItem<'a> {
 }
 
 /// Runtime breadcrumbs state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct BreadcrumbsState {
     current: Option<usize>,
     hovered: Option<usize>,
@@ -139,7 +139,7 @@ impl Default for BreadcrumbsPolicy {
 }
 
 /// Breadcrumb styles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BreadcrumbsStyles {
     /// Normal item style.
     pub normal: Style,
@@ -183,7 +183,7 @@ pub enum BreadcrumbsOutcome<'a> {
 
 /// Generic breadcrumbs component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Breadcrumbs<'a> {
+struct Breadcrumbs<'a> {
     items: &'a [BreadcrumbItem<'a>],
     policy: BreadcrumbsPolicy,
     styles: BreadcrumbsStyles,
@@ -246,13 +246,22 @@ impl Component for BreadcrumbsComponent<'_, '_> {
     fn revision(&self) -> ComponentRevision {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
-        format!("{:?}", self.breadcrumbs.items).hash(&mut layout);
+        self.breadcrumbs.items.hash(&mut layout);
         self.breadcrumbs.policy.separator.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
-        format!("{:?}", self.breadcrumbs.policy).hash(&mut paint);
-        format!("{:?}", self.breadcrumbs.styles).hash(&mut paint);
-        format!("{:?}", self.state.get()).hash(&mut paint);
+        let policy = self.breadcrumbs.policy;
+        (
+            policy.separator,
+            policy.keyboard,
+            policy.truncate,
+            policy.mouse.enabled,
+            policy.mouse.hover,
+            policy.mouse.click,
+        )
+            .hash(&mut paint);
+        self.breadcrumbs.styles.hash(&mut paint);
+        self.state.get().hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
 
@@ -345,20 +354,6 @@ impl<'a> Breadcrumbs<'a> {
         }
     }
 
-    /// Set policy.
-    #[must_use]
-    pub const fn policy(mut self, policy: BreadcrumbsPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    /// Set styles.
-    #[must_use]
-    pub const fn styles(mut self, styles: BreadcrumbsStyles) -> Self {
-        self.styles = styles;
-        self
-    }
-
     /// Handle one event.
     pub fn handle_event(
         &self,
@@ -381,7 +376,7 @@ impl<'a> Breadcrumbs<'a> {
             Event::Mouse(mouse) if self.policy.mouse.enabled => {
                 self.handle_mouse(area, state, *mouse)
             }
-            Event::Focus(bmux_tui::event::FocusEvent::Lost) => {
+            Event::Focus(bmux_tui::event::FocusEvent::Lost) | Event::Resize(_) => {
                 let changed = state.pressed.take().is_some() | state.hovered.take().is_some();
                 if changed {
                     BreadcrumbsOutcome::Redraw
@@ -391,7 +386,6 @@ impl<'a> Breadcrumbs<'a> {
             }
             Event::Key(_)
             | Event::Mouse(_)
-            | Event::Resize(_)
             | Event::Paste(_)
             | Event::Focus(bmux_tui::event::FocusEvent::Gained)
             | Event::Tick
@@ -760,6 +754,64 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn resize_cancels_pending_pointer_activation() {
+        let items = [BreadcrumbItem::new("home", "Home")];
+        let breadcrumbs = Breadcrumbs::new(&items);
+        let area = Rect::new(0, 0, 10, 1);
+        let mut state = BreadcrumbsState::new(Some(0));
+        for kind in [
+            MouseEventKind::Move,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            breadcrumbs.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(kind, Point::new(0, 0))),
+            );
+        }
+        assert_eq!(
+            breadcrumbs.handle_event(area, &mut state, &Event::Resize(Size::new(20, 2))),
+            BreadcrumbsOutcome::Redraw
+        );
+        assert_eq!(state.hovered(), None);
+        assert_eq!(state.pressed, None);
+        assert_eq!(state.current(), Some(0));
+        assert!(!matches!(
+            breadcrumbs.handle_event(
+                area,
+                &mut state,
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(0, 0)
+                ))
+            ),
+            BreadcrumbsOutcome::Activated { .. }
+        ));
+    }
+
+    #[test]
+    fn item_revision_tracks_identity_label_and_disabled_state() {
+        let state = Cell::new(BreadcrumbsState::new(None));
+        let original = [BreadcrumbItem::new("home", "Home")];
+        let revision = BreadcrumbsComponent::new("trail", &original, &state).revision();
+        for item in [
+            BreadcrumbItem::new("other", "Home"),
+            BreadcrumbItem::new("home", "Other"),
+            BreadcrumbItem::new("home", "Home").disabled(true),
+        ] {
+            let items = [item];
+            assert_ne!(
+                BreadcrumbsComponent::new("trail", &items, &state).revision(),
+                revision
+            );
+        }
+        assert_eq!(
+            BreadcrumbsComponent::new("trail", &original, &state).revision(),
+            revision
+        );
     }
 
     #[test]
