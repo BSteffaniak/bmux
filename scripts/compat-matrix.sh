@@ -110,6 +110,10 @@ write_config() {
   local pane_term="$1"
   local default_shell="$2"
   cat >"$CONFIG_FILE" <<EOF
+# The harness detaches with Ctrl+A, D, which is a normal-mode binding.
+[keybindings]
+initial_mode = "normal"
+
 [general]
 scrollback_limit = 10000
 server_timeout = 5000

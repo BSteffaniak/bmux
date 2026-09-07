@@ -187,6 +187,75 @@ mod tests {
     use crate::model::{GridLimits, TerminalGrid};
 
     #[test]
+    fn alternate_snapshot_bounds_backing_rows_independently_of_scrollback_offset() {
+        let mut grid = TerminalGrid::new(
+            20,
+            3,
+            GridLimits {
+                scrollback_rows: 100,
+            },
+        )
+        .unwrap();
+        for _ in 0..50 {
+            grid.process(b"history\r\n");
+        }
+        grid.process(b"main");
+        let main = grid.snapshot(0, 3);
+        grid.process(b"\x1b[?1049halt");
+        for requested in [0, 1, 3, 7, usize::MAX] {
+            let bound = if requested == usize::MAX {
+                3
+            } else {
+                requested.max(3)
+            };
+            let snapshot = grid.snapshot(30, requested);
+            assert!(snapshot.rows.len() <= 3);
+            let backing = snapshot.main_rows.as_ref().unwrap();
+            assert_eq!(backing.len(), bound);
+            assert_eq!(&backing[backing.len() - 3..], main.rows.as_slice());
+            let mut hydrated =
+                TerminalGrid::from_snapshot(&snapshot, GridLimits::default()).unwrap();
+            hydrated.process(b"\x1b[?1049l");
+            assert_eq!(hydrated.snapshot(0, 3).rows, main.rows);
+        }
+    }
+
+    #[test]
+    fn legacy_alternate_snapshot_decodes_without_inventing_main_content() {
+        let mut grid = TerminalGrid::new(20, 3, GridLimits::default()).unwrap();
+        grid.process(b"hidden main\x1b[?1049halt");
+        let snapshot = grid.snapshot(0, 3);
+        let mut wire = serde_json::to_value(&snapshot).unwrap();
+        wire.as_object_mut().unwrap().remove("main_rows");
+        let legacy: crate::GridSnapshot = serde_json::from_value(wire).unwrap();
+        assert!(legacy.main_rows.is_none());
+        let mut hydrated = TerminalGrid::from_snapshot(&legacy, GridLimits::default()).unwrap();
+        assert_eq!(hydrated.snapshot(0, 3).rows, snapshot.rows);
+        hydrated.process(b"\x1b[?1049l");
+        // Old snapshots never transmitted the hidden screen; decoding cannot restore it.
+        assert!(
+            hydrated
+                .snapshot(0, 3)
+                .rows
+                .iter()
+                .all(|row| row.runs.is_empty())
+        );
+    }
+
+    #[test]
+    fn alternate_snapshot_wire_round_trip_preserves_hidden_screen() {
+        let mut grid = TerminalGrid::new(20, 3, GridLimits::default()).unwrap();
+        grid.process("\x1b[31mwide 界\r\nmain\x1b[?1049halt".as_bytes());
+        let snapshot = grid.snapshot(0, 3);
+        let decoded = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert_eq!(snapshot, decoded);
+        let mut hydrated = TerminalGrid::from_snapshot(&decoded, GridLimits::default()).unwrap();
+        grid.process(b"\x1b[?1049l!");
+        hydrated.process(b"\x1b[?1049l!");
+        assert_eq!(hydrated.snapshot(0, 3), grid.snapshot(0, 3));
+    }
+
+    #[test]
     fn snapshot_encodes_style_runs() {
         let mut grid = TerminalGrid::new(20, 2, GridLimits::default()).unwrap();
         grid.process(b"plain \x1b[31mred");

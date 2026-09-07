@@ -1814,7 +1814,23 @@ fn ordered_gateway_candidates_for_cluster(
 }
 
 fn gateway_paths() -> &'static ConfigPaths {
-    CLUSTER_GATEWAY_PATHS.get_or_init(ConfigPaths::default)
+    CLUSTER_GATEWAY_PATHS.get_or_init(|| {
+        #[cfg(test)]
+        {
+            // Nextest runs tests in separate processes; serial_test only locks
+            // within one process. Never share persisted gateway state via HOME.
+            static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
+            let root = ROOT.get_or_init(|| tempfile::tempdir().expect("gateway test directory"));
+            ConfigPaths::new(
+                root.path().join("config"),
+                root.path().join("runtime"),
+                root.path().join("data"),
+                root.path().join("state"),
+            )
+        }
+        #[cfg(not(test))]
+        ConfigPaths::default()
+    })
 }
 
 fn cluster_gateway_state_map() -> &'static Mutex<BTreeMap<String, ClusterGatewayRuntimeState>> {

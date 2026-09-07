@@ -681,6 +681,7 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 for node in nodes {
+                    // Election hints may precede a working quorum after links recover.
                     if node.raft().current_leader().await == Some(node.node_id())
                         && node.raft().ensure_linearizable().await.is_ok()
                     {
@@ -1305,21 +1306,24 @@ pub(crate) mod tests {
                 nodes[index].raft().clone(),
             );
         }
+        // Restored peers may have elected a different leader during isolation.
+        let leader_id = wait_for_leader(&nodes.iter().collect::<Vec<_>>()).await;
+        let leader = &nodes[ids.iter().position(|id| *id == leader_id).unwrap()];
         crate::consensus_membership::publish_members(
-            nodes[0].clone(),
+            leader.clone(),
             &member.node_id,
             [member.clone()],
         )
         .await
         .unwrap();
         crate::consensus_membership::publish_members(
-            nodes[0].clone(),
+            leader.clone(),
             &member.node_id,
             [member.clone()],
         )
         .await
         .unwrap();
-        let view = nodes[0].read_linearizable_view().await.unwrap();
+        let view = leader.read_linearizable_view().await.unwrap();
         assert_eq!(view.members, vec![member]);
 
         for node in nodes {

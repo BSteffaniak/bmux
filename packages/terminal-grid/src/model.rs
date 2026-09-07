@@ -3,7 +3,7 @@ use crate::snapshot::{GridSnapshot, RowSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 use unicode_width::UnicodeWidthChar;
 
@@ -312,7 +312,7 @@ pub struct TerminalGrid {
     height: usize,
     limits: GridLimits,
     main_history: VecDeque<LogicalLine>,
-    main_history_projected_rows: usize,
+    main_history_projected_rows: OnceLock<usize>,
     pending_history_cells: Vec<Cell>,
     main_rows: VecDeque<PhysicalRow>,
     alt_rows: Vec<PhysicalRow>,
@@ -336,19 +336,18 @@ pub struct TerminalGrid {
 #[derive(Debug, Default)]
 struct LogicalLine {
     cells: Vec<Cell>,
-    cached_projection_width: AtomicUsize,
-    cached_projected_rows: AtomicUsize,
+    cached_projection: Mutex<Option<(usize, usize)>>,
 }
 
 impl Clone for LogicalLine {
     fn clone(&self) -> Self {
         Self {
             cells: self.cells.clone(),
-            cached_projection_width: AtomicUsize::new(
-                self.cached_projection_width.load(Ordering::Relaxed),
-            ),
-            cached_projected_rows: AtomicUsize::new(
-                self.cached_projected_rows.load(Ordering::Relaxed),
+            cached_projection: Mutex::new(
+                *self
+                    .cached_projection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
             ),
         }
     }
@@ -358,21 +357,27 @@ impl LogicalLine {
     fn new(cells: Vec<Cell>) -> Self {
         Self {
             cells,
-            cached_projection_width: AtomicUsize::new(0),
-            cached_projected_rows: AtomicUsize::new(0),
+            cached_projection: Mutex::new(None),
         }
     }
 
     fn projected_row_count(&self, width: usize) -> usize {
-        if self.cached_projection_width.load(Ordering::Relaxed) == width {
-            let rows = self.cached_projected_rows.load(Ordering::Relaxed);
-            if rows != 0 {
-                return rows;
-            }
+        let cached = *self
+            .cached_projection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_width, rows)) = cached
+            && cached_width == width
+        {
+            return rows;
         }
+        // Cells are immutable, so concurrent misses may compute independently.
+        // Only publishing the width/count pair needs the cache lock.
         let rows = projected_logical_line_row_count(&self.cells, width);
-        self.cached_projected_rows.store(rows, Ordering::Relaxed);
-        self.cached_projection_width.store(width, Ordering::Relaxed);
+        *self
+            .cached_projection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((width, rows));
         rows
     }
 }
@@ -404,7 +409,7 @@ impl TerminalGrid {
             height,
             limits,
             main_history: VecDeque::new(),
-            main_history_projected_rows: 0,
+            main_history_projected_rows: OnceLock::from(0),
             pending_history_cells: Vec::new(),
             main_rows,
             alt_rows: vec![PhysicalRow::new(); height],
@@ -483,7 +488,7 @@ impl TerminalGrid {
                 *target = row_from_snapshot(row, width);
             }
         }
-        let main_history_projected_rows = main_history
+        let main_history_projected_rows: usize = main_history
             .iter()
             .map(|line| line.projected_row_count(width))
             .sum();
@@ -492,7 +497,7 @@ impl TerminalGrid {
             height,
             limits,
             main_history,
-            main_history_projected_rows,
+            main_history_projected_rows: OnceLock::from(main_history_projected_rows),
             pending_history_cells,
             main_rows,
             alt_rows,
@@ -615,6 +620,9 @@ impl TerminalGrid {
                 self.saved_pending_wrap = false;
             }
         }
+        if self.width != width {
+            self.main_history_projected_rows.take();
+        }
         self.width = width;
         self.height = height;
         self.pending_wrap = false;
@@ -661,6 +669,7 @@ impl TerminalGrid {
         self.saved_cursor = self.cursor;
         self.saved_characters = self.characters;
         self.saved_pending_wrap = self.pending_wrap;
+        self.bump_revision();
     }
 
     pub(crate) fn restore_cursor(&mut self) {
@@ -870,7 +879,7 @@ impl TerminalGrid {
                 }
                 if mode == 3 && self.mode == GridMode::Main {
                     self.main_history.clear();
-                    self.main_history_projected_rows = 0;
+                    self.main_history_projected_rows = OnceLock::from(0);
                     self.pending_history_cells.clear();
                 }
             }
@@ -1096,8 +1105,7 @@ impl TerminalGrid {
     pub fn scrollback_rows_hint(&self) -> usize {
         match self.mode {
             GridMode::Main => self
-                .main_history
-                .len()
+                .history_projected_row_count()
                 .saturating_add(projected_pending_row_count(
                     &self.pending_history_cells,
                     self.width,
@@ -1162,6 +1170,17 @@ impl TerminalGrid {
     #[must_use]
     pub fn snapshot(&self, scrollback_offset: usize, rows: usize) -> GridSnapshot {
         GridSnapshot::from_grid(self, scrollback_offset, rows)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        let width = u16::try_from(self.width).unwrap_or(u16::MAX);
+        let height = u16::try_from(self.height).unwrap_or(u16::MAX);
+        if let Ok(mut reset) = Self::new(width, height, self.limits) {
+            reset.revision = self.revision;
+            reset.content_revision = self.content_revision;
+            reset.bump_content_revision();
+            *self = reset;
+        }
     }
 
     pub(crate) fn bump_revision(&mut self) {
@@ -1292,17 +1311,19 @@ impl TerminalGrid {
     }
 
     fn push_history_line(&mut self, line: LogicalLine) {
-        self.main_history_projected_rows = self
-            .main_history_projected_rows
-            .saturating_add(line.projected_row_count(self.width));
+        if let Some(count) = self.main_history_projected_rows.get_mut() {
+            *count = count.saturating_add(line.projected_row_count(self.width));
+        }
         self.main_history.push_back(line);
     }
 
     fn history_projected_row_count(&self) -> usize {
-        self.main_history
-            .iter()
-            .map(|line| line.projected_row_count(self.width))
-            .sum()
+        *self.main_history_projected_rows.get_or_init(|| {
+            self.main_history
+                .iter()
+                .map(|line| line.projected_row_count(self.width))
+                .sum()
+        })
     }
 
     pub(crate) fn main_display_rows(
@@ -1350,15 +1371,22 @@ impl TerminalGrid {
             }
         }
         if selected.len() < requested_rows && !self.pending_history_cells.is_empty() {
+            let pending_rows = projected_row_count(&self.pending_history_cells, self.width);
+            let selected_start = selected.len();
             collect_projected_line_reversed(
                 &self.pending_history_cells,
-                projected_row_count(&self.pending_history_cells, self.width),
+                pending_rows,
                 self.width,
                 scrollback_offset,
                 requested_rows,
                 skipped,
                 selected,
             );
+            // Every pending-history row continues, including its final row
+            // into the live rows. A clipped window must not create a hard break.
+            for row in &mut selected[selected_start..] {
+                row.set_wrapped(true);
+            }
         }
         for line in self.main_history.iter().rev() {
             if selected.len() >= requested_rows {
@@ -1550,9 +1578,9 @@ impl TerminalGrid {
     fn evict_excess_history(&mut self) {
         while self.main_history.len() > self.limits.scrollback_rows {
             if let Some(line) = self.main_history.pop_front() {
-                self.main_history_projected_rows = self
-                    .main_history_projected_rows
-                    .saturating_sub(line.projected_row_count(self.width));
+                if let Some(count) = self.main_history_projected_rows.get_mut() {
+                    *count = count.saturating_sub(line.projected_row_count(self.width));
+                }
             } else {
                 self.pending_history_cells.clear();
                 break;
@@ -1729,13 +1757,14 @@ fn collect_projected_line_reversed(
         *skipped = skipped.saturating_add(projected_rows);
         return;
     }
-    let rows = project_logical_line(cells, width);
-    for row in rows.into_iter().rev() {
-        collect_reversed_row(row, scrollback_offset, requested_rows, skipped, selected);
-        if selected.len() >= requested_rows {
-            break;
-        }
-    }
+    let skip = scrollback_offset
+        .saturating_sub(*skipped)
+        .min(projected_rows);
+    let end = projected_rows.saturating_sub(skip);
+    let start = end.saturating_sub(requested_rows.saturating_sub(selected.len()));
+    *skipped = skipped.saturating_add(skip);
+    let rows = crate::reflow::project_logical_line_window(cells, width, start..end);
+    selected.extend(rows.into_iter().rev());
 }
 
 fn indexed_color(index: i64) -> Option<Color> {
@@ -1760,6 +1789,22 @@ fn parse_extended_color(params: &[i64]) -> Option<(Color, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logical_line_projection_cache_keeps_width_and_count_coherent() {
+        let line = LogicalLine::new(vec![Cell::new("x".to_owned(), StyleId::DEFAULT, 1); 120]);
+        std::thread::scope(|scope| {
+            for width in [2, 3, 5, 8, 12] {
+                let line = &line;
+                scope.spawn(move || {
+                    for _ in 0..1_000 {
+                        assert_eq!(line.projected_row_count(width), 120 / width);
+                        assert_eq!(line.clone().projected_row_count(width), 120 / width);
+                    }
+                });
+            }
+        });
+    }
 
     #[test]
     fn content_revision_ignores_cursor_only_changes() {
@@ -1806,6 +1851,171 @@ mod tests {
         let rows = grid.main_content_rows();
         let text = rows.iter().map(row_text).collect::<Vec<_>>();
         assert_eq!(text, vec!["before", "", "after"]);
+    }
+
+    #[test]
+    fn projected_history_count_cache_tracks_resize_append_and_eviction() {
+        let mut grid = TerminalGrid::new(5, 2, GridLimits { scrollback_rows: 2 }).unwrap();
+        grid.process(b"abcdefghij\r\nk\r\nl");
+        assert_eq!(grid.history_projected_row_count(), 2);
+        grid.resize(3, 2).unwrap();
+        assert!(grid.main_history_projected_rows.get().is_none());
+        for chunk in [b"m\r\n".as_slice(), b"nopqrst\r\n", b"u\r\n", b"v\r\n"] {
+            grid.process(chunk);
+            let expected: usize = grid
+                .main_history
+                .iter()
+                .map(|line| line.projected_row_count(grid.width))
+                .sum();
+            assert_eq!(grid.history_projected_row_count(), expected);
+            assert_eq!(grid.main_history_projected_rows.get(), Some(&expected));
+            assert_eq!(
+                grid.scrollback_rows_hint(),
+                grid.all_main_rows_slow().len().saturating_sub(2)
+            );
+        }
+        grid.resize(3, 4).unwrap();
+        assert!(grid.main_history_projected_rows.get().is_some());
+        grid.process(b"\x1b[3J");
+        assert_eq!(grid.history_projected_row_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_long_history_projects_only_requested_window() {
+        let mut grid = TerminalGrid::new(
+            10,
+            2,
+            GridLimits {
+                scrollback_rows: 20_000,
+            },
+        )
+        .unwrap();
+        let mut original_text = String::new();
+        for index in 0..10_000 {
+            let row = format!("{index:010}");
+            original_text.push_str(&row);
+            grid.process(row.as_bytes());
+        }
+        for completed in [false, true] {
+            if completed {
+                grid.process(b"\r\nend\r\nlast");
+            }
+            for offset in [10, 5_000] {
+                crate::reflow::reset_projection_stats();
+                let snapshot = grid.snapshot(offset, 2);
+                assert_eq!(snapshot.rows.len(), 2);
+                assert!(snapshot.rows.iter().all(|row| row.wrapped));
+                for (index, row) in snapshot.rows.iter().enumerate() {
+                    let text: String = row.runs.iter().map(|run| run.text.as_str()).collect();
+                    let expected = 10_000 + usize::from(completed) * 2 - offset - 2 + index;
+                    assert_eq!(
+                        text,
+                        format!("{expected:010}"),
+                        "completed={completed}, offset={offset}"
+                    );
+                }
+                assert_eq!(crate::reflow::projection_stats().physical_rows_projected, 2);
+            }
+            let mut resized = grid.clone();
+            for width in [5, 20, 10] {
+                resized.resize(width, 2).unwrap();
+                let full = resized.snapshot(0, 20_010);
+                let projected_text: String = full
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.runs)
+                    .map(|run| run.text.as_str())
+                    .collect();
+                let expected_text = if completed {
+                    format!("{original_text}endlast")
+                } else {
+                    original_text.clone()
+                };
+                assert_eq!(
+                    projected_text, expected_text,
+                    "completed={completed}, width={width}"
+                );
+                let mut recovered = TerminalGrid::from_snapshot(
+                    &full,
+                    GridLimits {
+                        scrollback_rows: 20_000,
+                    },
+                )
+                .unwrap();
+                assert_eq!(recovered.snapshot(0, 20_010), full);
+                for offset in [10, 1_000] {
+                    crate::reflow::reset_projection_stats();
+                    let window = resized.snapshot(offset, 2);
+                    let end = full.rows.len() - offset;
+                    assert_eq!(
+                        window.rows,
+                        full.rows[end - 2..end],
+                        "completed={completed}, width={width}, offset={offset}"
+                    );
+                    assert_eq!(crate::reflow::projection_stats().physical_rows_projected, 2);
+                    assert_eq!(recovered.snapshot(offset, 2).rows, window.rows);
+                }
+                let mut continued = resized.clone();
+                let mut replica = full.clone();
+                for output in [
+                    b"more\r\nnext".as_slice(),
+                    b"\x1b[?1049htui",
+                    b"\x1b[?1049ltail",
+                ] {
+                    continued.process(output);
+                    recovered.process(output);
+                    let after = continued.snapshot(0, 20_010);
+                    let delta = crate::GridDeltaBatch::between(&replica, &after).unwrap();
+                    delta.apply_to_snapshot(&mut replica).unwrap();
+                    assert_eq!(replica, after);
+                    assert_eq!(recovered.snapshot(0, 20_010), after);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_history_windows_preserve_rows_and_wrap_boundaries() {
+        let mut grid = TerminalGrid::new(5, 2, GridLimits::default()).unwrap();
+        grid.process(b"old\r\nolder\r\nabcdefghijklmnop");
+        let full = grid.snapshot(0, 20);
+        assert!(full.rows.len() > 4);
+        assert!(full.rows.iter().any(|row| row.wrapped));
+        for offset in 0..full.rows.len() {
+            for requested in [2, 3, 4] {
+                let window = grid.snapshot(offset, requested);
+                let end = full.rows.len().saturating_sub(offset);
+                let start = end.saturating_sub(requested);
+                assert_eq!(
+                    window.rows,
+                    full.rows[start..end],
+                    "offset={offset}, requested={requested}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scrollback_hint_counts_projected_rows_across_reflow_and_hydration() {
+        let limits = GridLimits {
+            scrollback_rows: 20,
+        };
+        let mut grid = TerminalGrid::new(5, 2, limits).unwrap();
+        grid.process(b"abcdefghij\r\nk\r\nl");
+        assert_eq!(grid.scrollback_rows_hint(), 2);
+        for width in [5, 10, 3, 7] {
+            grid.resize(width, 2).unwrap();
+            let expected = grid.all_main_rows_slow().len().saturating_sub(2);
+            assert_eq!(grid.scrollback_rows_hint(), expected);
+            let snapshot = grid.snapshot(0, expected.saturating_add(2));
+            assert_eq!(usize::try_from(snapshot.scrollback_rows).unwrap(), expected);
+            let hydrated = TerminalGrid::from_snapshot(&snapshot, limits).unwrap();
+            assert_eq!(hydrated.scrollback_rows_hint(), expected);
+            grid.process(b"\x1b[?1049h");
+            assert_eq!(grid.scrollback_rows_hint(), 0);
+            grid.process(b"\x1b[?1049l");
+            assert_eq!(grid.scrollback_rows_hint(), expected);
+        }
     }
 
     #[test]

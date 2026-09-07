@@ -12,7 +12,7 @@ use crate::types::{
     AttachCursorState, PaneRenderBuffer, PaneScrollbackViews, TerminalGraphicsCache,
 };
 use crate::update_protocol_hints_from_state;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::{
     AttachInputModeState, AttachMouseProtocolState, AttachPaneChunk,
 };
@@ -47,6 +47,7 @@ pub struct AttachScenePipeline {
     viewport: AttachViewport,
     pub layout_state: Option<AttachLayoutState>,
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+    hydrated_grid_panes: BTreeSet<Uuid>,
     terminal_graphics_cache: TerminalGraphicsCache,
     pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
     pane_input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
@@ -66,6 +67,7 @@ impl AttachScenePipeline {
             viewport,
             layout_state: None,
             pane_buffers: BTreeMap::new(),
+            hydrated_grid_panes: BTreeSet::new(),
             terminal_graphics_cache: TerminalGraphicsCache::new(),
             pane_mouse_protocol_hints: BTreeMap::new(),
             pane_input_mode_hints: BTreeMap::new(),
@@ -106,6 +108,7 @@ impl AttachScenePipeline {
         } = snapshot;
 
         self.pane_buffers.clear();
+        self.hydrated_grid_panes.clear();
         self.pane_mouse_protocol_hints.clear();
         self.pane_input_mode_hints.clear();
         self.layout_state = Some(AttachLayoutState {
@@ -165,16 +168,25 @@ impl AttachScenePipeline {
     ) -> Result<()> {
         for pane_snapshot in snapshots {
             let stream =
-                TerminalGridStream::from_snapshot(&pane_snapshot.snapshot, GridLimits::default())?;
+                TerminalGridStream::from_snapshot(&pane_snapshot.snapshot, GridLimits::default())
+                    .with_context(|| {
+                    format!(
+                        "hydrating grid snapshot for pane {} (revision {}, stream end {})",
+                        pane_snapshot.pane_id,
+                        pane_snapshot.snapshot.revision,
+                        pane_snapshot.stream_end
+                    )
+                })?;
             let protocol = stream.grid().protocol_state();
             let alternate_screen = stream.grid().mode() == GridMode::Alternate;
             let buffer = self.pane_buffers.entry(pane_snapshot.pane_id).or_default();
             buffer.terminal_grid = stream;
             buffer.visual_row_fingerprints.clear();
-            buffer.protocol_tracker.set_protocol_state(protocol);
-            buffer
-                .protocol_tracker
-                .set_alternate_screen(alternate_screen);
+            buffer.protocol_tracker.restore(
+                protocol,
+                alternate_screen,
+                &pane_snapshot.snapshot.pending_bytes,
+            );
             buffer.expected_stream_start = Some(pane_snapshot.stream_end);
             buffer.prev_rows.clear();
             sync_protocol_hints_from_buffer(
@@ -183,17 +195,23 @@ impl AttachScenePipeline {
                 pane_snapshot.pane_id,
                 buffer,
             );
+            self.hydrated_grid_panes.insert(pane_snapshot.pane_id);
             self.dirty_pane_ids.insert(pane_snapshot.pane_id);
+            self.full_pane_redraw = true;
         }
-        self.full_pane_redraw = true;
         Ok(())
     }
 
     pub fn hydrate_pane_snapshot(&mut self, pane_ids: &[Uuid], snapshot: AttachPaneSnapshotState) {
         let requested = pane_ids.iter().copied().collect::<BTreeSet<_>>();
         for pane_id in pane_ids {
+            self.hydrated_grid_panes.remove(pane_id);
+            self.pane_mouse_protocol_hints.remove(pane_id);
+            self.pane_input_mode_hints.remove(pane_id);
             self.pane_buffers
                 .insert(*pane_id, PaneRenderBuffer::default());
+            self.dirty_pane_ids.insert(*pane_id);
+            self.full_pane_redraw = true;
         }
 
         if let Some(layout_state) = self.layout_state.as_ref() {
@@ -250,6 +268,8 @@ impl AttachScenePipeline {
         }
 
         let active_pane_ids = attach_layout_pane_id_set(&next_layout);
+        self.hydrated_grid_panes
+            .retain(|pane_id| active_pane_ids.contains(pane_id));
         self.pane_buffers
             .retain(|pane_id, _| active_pane_ids.contains(pane_id));
         self.pane_mouse_protocol_hints
@@ -351,31 +371,58 @@ impl AttachScenePipeline {
     /// Returns an error when any delta cannot be applied to the local grid.
     pub fn apply_pane_grid_deltas(&mut self, deltas: Vec<AttachPaneGridDeltaState>) -> Result<()> {
         for pane_delta in deltas {
-            let buffer = self.pane_buffers.entry(pane_delta.pane_id).or_default();
-            let mut applied = false;
+            if pane_delta.batches.is_empty() {
+                continue;
+            }
+            anyhow::ensure!(
+                self.hydrated_grid_panes.contains(&pane_delta.pane_id),
+                "grid delta for unhydrated pane {}; snapshot required",
+                pane_delta.pane_id,
+            );
+            let buffer = self
+                .pane_buffers
+                .get_mut(&pane_delta.pane_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "grid delta for unknown pane {}; snapshot required",
+                        pane_delta.pane_id
+                    )
+                })?;
             for batch in &pane_delta.batches {
+                let previous_mode = buffer.terminal_grid.grid().mode();
                 buffer
                     .terminal_grid
-                    .apply_delta(batch, GridLimits::default())?;
-                let updated_rows = batch
-                    .row_updates
-                    .iter()
-                    .map(|update| update.row_index)
-                    .collect::<Vec<_>>();
+                    .apply_delta(batch, GridLimits::default())
+                    .with_context(|| {
+                        format!(
+                            "applying grid delta for pane {} (revision {} -> {})",
+                            pane_delta.pane_id, batch.base_revision, batch.revision
+                        )
+                    })?;
+                if buffer.terminal_grid.grid().mode() != previous_mode {
+                    self.full_pane_redraw = true;
+                }
+                let updated_rows = if batch.reset_rows {
+                    Vec::new()
+                } else {
+                    batch
+                        .row_updates
+                        .iter()
+                        .map(|update| update.row_index)
+                        .collect::<Vec<_>>()
+                };
                 buffer.visual_row_fingerprints.invalidate_rows(
                     batch.reset_rows,
                     batch.content_revision,
                     &updated_rows,
                 );
-                applied = true;
-            }
-            if applied {
+                // Commit metadata with each accepted batch: a later malformed
+                // batch must not leave this revision invisible to the renderer.
                 let protocol = buffer.terminal_grid.grid().protocol_state();
                 let alternate_screen = buffer.terminal_grid.grid().mode() == GridMode::Alternate;
-                buffer.protocol_tracker.set_protocol_state(protocol);
                 buffer
                     .protocol_tracker
-                    .set_alternate_screen(alternate_screen);
+                    .restore(protocol, alternate_screen, &batch.pending_bytes);
                 buffer.prev_rows.clear();
                 sync_protocol_hints_from_buffer(
                     &mut self.pane_mouse_protocol_hints,
@@ -394,6 +441,9 @@ impl AttachScenePipeline {
         pane_ids
             .iter()
             .map(|pane_id| {
+                if !self.hydrated_grid_panes.contains(pane_id) {
+                    return 0;
+                }
                 self.pane_buffers
                     .get(pane_id)
                     .map_or(0, |buffer| buffer.terminal_grid.grid().revision())
@@ -585,6 +635,546 @@ mod tests {
         assert_eq!(
             grid.palette().get(red).fg,
             Some(bmux_terminal_grid::Color::Indexed(1))
+        );
+    }
+
+    #[test]
+    fn empty_raw_resync_clears_only_requested_protocol_hints() {
+        let pane_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        producer.process(b"\x1b[?1000h\x1b[?2004h\x1b[?1h");
+        let snapshot = producer.snapshot(0, 2);
+        for id in [pane_id, other_id] {
+            pipeline
+                .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                    pane_id: id,
+                    stream_end: 24,
+                    snapshot: snapshot.clone(),
+                }])
+                .unwrap();
+        }
+        let mouse = pipeline.pane_mouse_protocol_hints[&other_id];
+        let input = pipeline.pane_input_mode_hints[&other_id];
+        assert!(pipeline.pane_mouse_protocol_hints.contains_key(&pane_id));
+        assert!(pipeline.pane_input_mode_hints.contains_key(&pane_id));
+        pipeline.dirty_pane_ids.clear();
+        pipeline.full_pane_redraw = false;
+        pipeline.hydrate_pane_snapshot(
+            &[pane_id],
+            AttachPaneSnapshotState {
+                chunks: vec![],
+                pane_mouse_protocols: vec![],
+                pane_input_modes: vec![],
+            },
+        );
+        assert_eq!(pipeline.dirty_pane_ids, BTreeSet::from([pane_id]));
+        assert!(pipeline.full_pane_redraw);
+        assert!(!pipeline.pane_mouse_protocol_hints.contains_key(&pane_id));
+        assert!(!pipeline.pane_input_mode_hints.contains_key(&pane_id));
+        assert_eq!(pipeline.pane_mouse_protocol_hints[&other_id], mouse);
+        assert_eq!(pipeline.pane_input_mode_hints[&other_id], input);
+        assert_eq!(
+            pipeline.pane_grid_revisions(&[pane_id, other_id]),
+            vec![0, snapshot.revision]
+        );
+    }
+
+    #[test]
+    fn partial_snapshot_hydration_marks_accepted_pane_for_full_redraw() {
+        let pane_id = Uuid::new_v4();
+        let rejected_id = Uuid::new_v4();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        pipeline.full_pane_redraw = false;
+        pipeline.hydrate_pane_grid_snapshots(vec![]).unwrap();
+        assert!(!pipeline.full_pane_redraw);
+        let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        producer.process(b"main\x1b[?1049halt");
+        let snapshot = producer.snapshot(0, 2);
+        let mut invalid = snapshot.clone();
+        invalid.height = 0;
+        let error = pipeline
+            .hydrate_pane_grid_snapshots(vec![
+                AttachPaneGridSnapshotState {
+                    pane_id,
+                    stream_end: 20,
+                    snapshot: snapshot.clone(),
+                },
+                AttachPaneGridSnapshotState {
+                    pane_id: rejected_id,
+                    stream_end: 20,
+                    snapshot: invalid,
+                },
+            ])
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<bmux_terminal_grid::TerminalGridError>(),
+            Some(bmux_terminal_grid::TerminalGridError::ZeroDimensions)
+        ));
+        assert!(pipeline.full_pane_redraw);
+        assert!(pipeline.dirty_pane_ids.contains(&pane_id));
+        assert!(!pipeline.pane_buffers.contains_key(&rejected_id));
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id].terminal_grid.snapshot(0, 2),
+            snapshot
+        );
+        assert_eq!(
+            pipeline.pane_grid_revisions(&[pane_id, rejected_id]),
+            vec![snapshot.revision, 0]
+        );
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id: rejected_id,
+                stream_end: 20,
+                snapshot: snapshot.clone(),
+            }])
+            .unwrap();
+        assert_eq!(
+            pipeline.pane_grid_revisions(&[pane_id, rejected_id]),
+            vec![snapshot.revision, snapshot.revision]
+        );
+        for id in [pane_id, rejected_id] {
+            assert_eq!(
+                pipeline.pane_buffers[&id].terminal_grid.snapshot(0, 2),
+                snapshot
+            );
+            assert_eq!(pipeline.pane_buffers[&id].expected_stream_start, Some(20));
+        }
+        let delta = producer.process_delta(b"\x1b[?1049l restored").unwrap();
+        pipeline
+            .apply_pane_grid_deltas(
+                [pane_id, rejected_id]
+                    .into_iter()
+                    .map(|pane_id| AttachPaneGridDeltaState {
+                        pane_id,
+                        batches: vec![delta.clone()],
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        for id in [pane_id, rejected_id] {
+            assert_eq!(
+                pipeline.pane_buffers[&id].terminal_grid.snapshot(0, 2),
+                producer.snapshot(0, 2)
+            );
+            assert_eq!(pipeline.pane_buffers[&id].expected_stream_start, Some(20));
+        }
+    }
+
+    #[test]
+    fn invalid_replacement_preserves_hydrated_replica_and_continuity() {
+        let pane_id = Uuid::new_v4();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        producer.process(b"main\x1b[?1049halt\x1b[?1000");
+        let snapshot = producer.snapshot(0, 2);
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 24,
+                snapshot: snapshot.clone(),
+            }])
+            .unwrap();
+        let mut invalid = snapshot.clone();
+        invalid.mode = "invalid".to_owned();
+        invalid.pending_bytes.clear();
+        assert!(
+            pipeline
+                .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                    pane_id,
+                    stream_end: 100,
+                    snapshot: invalid,
+                }])
+                .is_err()
+        );
+        let buffer = &pipeline.pane_buffers[&pane_id];
+        assert_eq!(buffer.terminal_grid.snapshot(0, 2), snapshot);
+        assert_eq!(buffer.expected_stream_start, Some(24));
+        assert_eq!(
+            pipeline.pane_grid_revisions(&[pane_id]),
+            vec![snapshot.revision]
+        );
+        let batch = producer.process_delta(b"h").unwrap();
+        let tracker = &mut pipeline
+            .pane_buffers
+            .get_mut(&pane_id)
+            .unwrap()
+            .protocol_tracker;
+        let _ = tracker.process(b"h");
+        assert_eq!(tracker.protocol_state(), producer.grid().protocol_state());
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![batch],
+            }])
+            .unwrap();
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id].terminal_grid.snapshot(0, 2),
+            producer.snapshot(0, 2)
+        );
+    }
+
+    #[test]
+    fn raw_resync_invalidates_structured_hydration_until_replaced() {
+        let pane_id = Uuid::new_v4();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        producer.process(b"before");
+        let snapshot = producer.snapshot(0, 2);
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 6,
+                snapshot: snapshot.clone(),
+            }])
+            .unwrap();
+        let batch = producer.process_delta(b" after").unwrap();
+        pipeline.hydrate_pane_snapshot(
+            &[pane_id],
+            AttachPaneSnapshotState {
+                chunks: vec![],
+                pane_mouse_protocols: vec![],
+                pane_input_modes: vec![],
+            },
+        );
+        assert_eq!(pipeline.pane_grid_revisions(&[pane_id]), vec![0]);
+        assert!(
+            pipeline
+                .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                    pane_id,
+                    batches: vec![batch.clone()],
+                }])
+                .is_err()
+        );
+        // Failed replacement must not promote the new default buffer to hydrated.
+        let mut invalid = snapshot.clone();
+        invalid.width = 0;
+        assert!(
+            pipeline
+                .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                    pane_id,
+                    stream_end: 6,
+                    snapshot: invalid,
+                }])
+                .is_err()
+        );
+        assert_eq!(pipeline.pane_grid_revisions(&[pane_id]), vec![0]);
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 6,
+                snapshot,
+            }])
+            .unwrap();
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![batch],
+            }])
+            .unwrap();
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id].terminal_grid.snapshot(0, 2),
+            producer.snapshot(0, 2)
+        );
+    }
+
+    #[test]
+    fn unhydrated_local_grid_does_not_advertise_replication_revision() {
+        let pane_id = Uuid::new_v4();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        let buffer = pipeline.pane_buffers.entry(pane_id).or_default();
+        buffer.terminal_grid.resize(10, 2).unwrap();
+        buffer.terminal_grid.process(b"local");
+        assert!(buffer.terminal_grid.grid().revision() > 0);
+        assert_eq!(pipeline.pane_grid_revisions(&[pane_id]), vec![0]);
+        let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        producer.process(b"authoritative");
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 13,
+                snapshot: producer.snapshot(0, 2),
+            }])
+            .unwrap();
+        assert_eq!(
+            pipeline.pane_grid_revisions(&[pane_id, Uuid::new_v4()]),
+            vec![producer.grid().revision(), 0]
+        );
+    }
+
+    #[test]
+    fn delta_for_unknown_pane_does_not_create_buffer() {
+        let pane_id = Uuid::new_v4();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![],
+            }])
+            .unwrap();
+        assert!(!pipeline.pane_buffers.contains_key(&pane_id));
+        let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        let snapshot = producer.snapshot(0, 2);
+        let batch = producer.process_delta(b"hello").unwrap();
+        assert!(
+            pipeline
+                .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                    pane_id,
+                    batches: vec![batch.clone()],
+                }])
+                .is_err()
+        );
+        assert!(!pipeline.pane_buffers.contains_key(&pane_id));
+        pipeline
+            .pane_buffers
+            .insert(pane_id, PaneRenderBuffer::default());
+        assert!(
+            pipeline
+                .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                    pane_id,
+                    batches: vec![batch.clone()],
+                }])
+                .is_err()
+        );
+        assert!(!pipeline.hydrated_grid_panes.contains(&pane_id));
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 0,
+                snapshot,
+            }])
+            .unwrap();
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![batch],
+            }])
+            .unwrap();
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id].terminal_grid.snapshot(0, 2),
+            producer.snapshot(0, 2)
+        );
+    }
+
+    #[test]
+    fn snapshot_restores_protocol_parser_prefix_and_discards_old_prefix() {
+        let pane_id = Uuid::new_v4();
+        let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        let _ = pipeline
+            .pane_buffers
+            .entry(pane_id)
+            .or_default()
+            .protocol_tracker
+            .process(b"\x1b]old title");
+        producer.process(b"\x1b[?1000");
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 7,
+                snapshot: producer.snapshot(0, 2),
+            }])
+            .unwrap();
+        producer.process(b"h");
+        let tracker = &mut pipeline
+            .pane_buffers
+            .get_mut(&pane_id)
+            .unwrap()
+            .protocol_tracker;
+        let _ = tracker.process(b"h");
+        assert_eq!(tracker.protocol_state(), producer.grid().protocol_state());
+        assert_ne!(
+            tracker.protocol_state(),
+            bmux_terminal_grid::ProtocolState::default()
+        );
+    }
+
+    #[test]
+    fn grid_delta_restores_protocol_parser_prefix() {
+        let pane_id = Uuid::new_v4();
+        let mut producer =
+            bmux_terminal_grid::TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 0,
+                snapshot: producer.snapshot(0, 2),
+            }])
+            .unwrap();
+        pipeline
+            .pane_buffers
+            .get_mut(&pane_id)
+            .unwrap()
+            .protocol_tracker
+            .process(b"\x1b]stale title");
+        let delta = producer.process_delta(b"\x1b[?1000").unwrap();
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![delta.clone()],
+            }])
+            .unwrap();
+        assert!(
+            pipeline
+                .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                    pane_id,
+                    batches: vec![delta],
+                }])
+                .is_err()
+        );
+        assert_eq!(
+            pipeline.pane_grid_revisions(&[pane_id]),
+            vec![producer.grid().revision()]
+        );
+        producer.process(b"h");
+        let tracker = &mut pipeline
+            .pane_buffers
+            .get_mut(&pane_id)
+            .unwrap()
+            .protocol_tracker;
+        let _ = tracker.process(b"h");
+        assert_eq!(tracker.protocol_state(), producer.grid().protocol_state());
+        assert_ne!(
+            tracker.protocol_state(),
+            bmux_terminal_grid::ProtocolState::default()
+        );
+    }
+
+    #[test]
+    fn malformed_delta_suffix_preserves_accepted_batch_render_state() {
+        let pane_id = Uuid::new_v4();
+        let mut producer =
+            bmux_terminal_grid::TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 10,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 0,
+                snapshot: producer.snapshot(0, 2),
+            }])
+            .unwrap();
+        pipeline.dirty_pane_ids.clear();
+        pipeline.full_pane_redraw = false;
+        let first = producer
+            .process_delta(b"\x1b[?1049h\x1b[?1000halt")
+            .unwrap();
+        let second = producer.process_delta(b" next").unwrap();
+        let mut invalid = second.clone();
+        invalid.base_revision = 0;
+        let error = pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![first.clone(), invalid],
+            }])
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<bmux_terminal_grid::TerminalGridStreamDeltaError>(),
+            Some(bmux_terminal_grid::TerminalGridStreamDeltaError::Delta(
+                bmux_terminal_grid::GridDeltaApplyError::RevisionMismatch {
+                    expected: 0,
+                    actual,
+                }
+            )) if *actual == first.revision
+        ));
+        let buffer = &pipeline.pane_buffers[&pane_id];
+        assert_eq!(buffer.terminal_grid.grid().revision(), first.revision);
+        assert_eq!(buffer.protocol_tracker.protocol_state(), first.protocol);
+        assert!(buffer.protocol_tracker.alternate_screen());
+        assert!(pipeline.full_pane_redraw);
+        assert!(pipeline.dirty_pane_ids.contains(&pane_id));
+        pipeline.full_pane_redraw = false;
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![second],
+            }])
+            .unwrap();
+        assert!(!pipeline.full_pane_redraw);
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id].terminal_grid.snapshot(0, 2),
+            producer.snapshot(0, 2)
+        );
+        let exit = producer.process_delta(b"\x1b[?1049lmain").unwrap();
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![exit],
+            }])
+            .unwrap();
+        assert!(pipeline.full_pane_redraw);
+        assert!(
+            !pipeline.pane_buffers[&pane_id]
+                .protocol_tracker
+                .alternate_screen()
+        );
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id].terminal_grid.snapshot(0, 2),
+            producer.snapshot(0, 2)
         );
     }
 

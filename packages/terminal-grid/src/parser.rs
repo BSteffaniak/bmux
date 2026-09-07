@@ -79,13 +79,29 @@ impl TerminalGridStream {
 
     /// Process one chunk of PTY output.
     pub fn process(&mut self, bytes: &[u8]) {
-        let mut continuity = self.pending_bytes.clone();
-        continuity.extend_from_slice(bytes);
-        self.pending_bytes = trailing_incomplete_sequence(&continuity);
+        if bytes.is_empty() {
+            return;
+        }
+        let revision = self.grid.revision();
+        let mut previous_pending = std::mem::take(&mut self.pending_bytes);
+        let previous_pending_len = previous_pending.len();
+        self.pending_bytes = if previous_pending.is_empty() {
+            trailing_incomplete_sequence(bytes)
+        } else {
+            previous_pending.extend_from_slice(bytes);
+            trailing_incomplete_sequence(&previous_pending)
+        };
         let mut performer = GridPerformer {
             grid: &mut self.grid,
         };
         self.parser.advance(&mut performer, bytes);
+        // Parser prefixes are replicated state even when no terminal operation
+        // completed. Do not mark visible content dirty for a prefix-only update.
+        if self.pending_bytes != previous_pending[..previous_pending_len]
+            && self.grid.revision() == revision
+        {
+            self.grid.bump_revision();
+        }
     }
 
     /// Snapshot the grid plus parser-prefix bytes needed to continue a split
@@ -109,17 +125,62 @@ impl TerminalGridStream {
         delta: &GridDeltaBatch,
         limits: GridLimits,
     ) -> Result<(), TerminalGridStreamDeltaError> {
+        delta.validate_revisions(self.grid.revision(), self.grid.content_revision())?;
+        delta.validate_geometry()?;
+        delta.validate_replacement_indexes()?;
+        if delta.reset_rows && delta.mode == "main" {
+            let supplied_history = delta
+                .row_updates
+                .len()
+                .saturating_sub(usize::from(delta.height));
+            if supplied_history < usize::try_from(delta.scrollback_rows).unwrap_or(usize::MAX) {
+                return Err(TerminalGridStreamDeltaError::IncompleteHistory {
+                    expected_rows: delta.scrollback_rows,
+                    reconstructed_rows: supplied_history,
+                });
+            }
+        }
         let mut snapshot = self.snapshot(0, self.grid.height());
         delta.apply_to_snapshot(&mut snapshot)?;
-        *self = Self::from_snapshot(&snapshot, limits)?;
+        // A main-screen snapshot needs backing rows in addition to its viewport.
+        // Reject obvious truncation before allocating a replacement grid; the
+        // post-hydration check below also catches reflow and retention losses.
+        let supplied_history = snapshot
+            .rows
+            .len()
+            .saturating_sub(usize::from(snapshot.height));
+        if snapshot.mode == "main"
+            && supplied_history < usize::try_from(snapshot.scrollback_rows).unwrap_or(usize::MAX)
+        {
+            return Err(TerminalGridStreamDeltaError::IncompleteHistory {
+                expected_rows: snapshot.scrollback_rows,
+                reconstructed_rows: supplied_history,
+            });
+        }
+        let replacement = Self::from_snapshot(&snapshot, limits)?;
+        if replacement.grid.scrollback_rows_hint()
+            != usize::try_from(snapshot.scrollback_rows).unwrap_or(usize::MAX)
+        {
+            return Err(TerminalGridStreamDeltaError::IncompleteHistory {
+                expected_rows: snapshot.scrollback_rows,
+                reconstructed_rows: replacement.grid.scrollback_rows_hint(),
+            });
+        }
+        *self = replacement;
         Ok(())
     }
 
     /// Process one chunk and return a structured row delta when state changed.
     #[must_use]
     pub fn process_delta(&mut self, bytes: &[u8]) -> Option<GridDeltaBatch> {
+        if bytes.is_empty() {
+            return None;
+        }
         let before = self.snapshot(0, self.grid.height());
         self.process(bytes);
+        if self.grid.revision() == before.revision {
+            return None;
+        }
         let after = self.snapshot(0, self.grid.height());
         GridDeltaBatch::between(&before, &after)
     }
@@ -143,6 +204,9 @@ impl TerminalGridStream {
         width: u16,
         height: u16,
     ) -> Result<Option<GridDeltaBatch>, TerminalGridError> {
+        if width == 0 || height == 0 {
+            return Err(TerminalGridError::ZeroDimensions);
+        }
         if self.grid.width() == usize::from(width) && self.grid.height() == usize::from(height) {
             return Ok(None);
         }
@@ -193,6 +257,20 @@ impl TerminalProtocolTracker {
         self.alternate_screen
     }
 
+    /// Replace protocol state and parser continuity at an authoritative watermark.
+    /// `pending_bytes` must be the incomplete sequence prefix from that watermark.
+    pub fn restore(
+        &mut self,
+        protocol: ProtocolState,
+        alternate_screen: bool,
+        pending_bytes: &[u8],
+    ) {
+        *self = Self::new();
+        let _ = self.process(pending_bytes);
+        self.protocol = protocol;
+        self.alternate_screen = alternate_screen;
+    }
+
     pub fn set_protocol_state(&mut self, protocol: ProtocolState) {
         self.protocol = protocol;
     }
@@ -202,9 +280,18 @@ impl TerminalProtocolTracker {
     }
 
     pub fn process(&mut self, bytes: &[u8]) -> ProtocolProcessOutcome {
-        let mut continuity = self.pending_bytes.clone();
-        continuity.extend_from_slice(bytes);
-        self.pending_bytes = trailing_incomplete_sequence(&continuity);
+        if bytes.is_empty() {
+            return ProtocolProcessOutcome {
+                toggled_alternate: false,
+            };
+        }
+        self.pending_bytes = if self.pending_bytes.is_empty() {
+            trailing_incomplete_sequence(bytes)
+        } else {
+            let mut continuity = std::mem::take(&mut self.pending_bytes);
+            continuity.extend_from_slice(bytes);
+            trailing_incomplete_sequence(&continuity)
+        };
         let mut performer = ProtocolPerformer {
             protocol: &mut self.protocol,
             alternate_screen: &mut self.alternate_screen,
@@ -219,6 +306,14 @@ impl TerminalProtocolTracker {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalGridStreamDeltaError {
+    /// Applying the update would discard retained history during hydration.
+    #[error(
+        "delta history is incomplete: expected {expected_rows} rows, reconstructed {reconstructed_rows}"
+    )]
+    IncompleteHistory {
+        expected_rows: u32,
+        reconstructed_rows: usize,
+    },
     #[error(transparent)]
     Delta(#[from] GridDeltaApplyError),
     #[error(transparent)]
@@ -512,15 +607,7 @@ impl Perform for GridPerformer<'_> {
             b'M' => self.grid.reverse_index(),
             b'=' => self.grid.set_application_keypad(true),
             b'>' => self.grid.set_application_keypad(false),
-            b'c' => {
-                let width = u16::try_from(self.grid.width()).unwrap_or(u16::MAX);
-                let height = u16::try_from(self.grid.height()).unwrap_or(u16::MAX);
-                if let Ok(reset) =
-                    TerminalGrid::new(width, height, crate::model::GridLimits::default())
-                {
-                    *self.grid = reset;
-                }
-            }
+            b'c' => self.grid.reset(),
             _ => {}
         }
     }
@@ -558,8 +645,15 @@ fn default_zero(value: Option<&i64>) -> usize {
 }
 
 fn trailing_incomplete_sequence(bytes: &[u8]) -> Vec<u8> {
-    let utf8_pending_start = match std::str::from_utf8(bytes) {
-        Err(error) if error.error_len().is_none() => error.valid_up_to(),
+    // Earlier invalid bytes do not invalidate an incomplete character at the
+    // end of the chunk. Inspect only the final leading byte and its suffix.
+    let utf8_window_start = bytes.len().saturating_sub(4);
+    let utf8_start = bytes[utf8_window_start..]
+        .iter()
+        .rposition(|byte| byte & 0xc0 != 0x80)
+        .map_or(bytes.len(), |index| utf8_window_start + index);
+    let utf8_pending_start = match std::str::from_utf8(&bytes[utf8_start..]) {
+        Err(error) if error.error_len().is_none() => utf8_start + error.valid_up_to(),
         Ok(_) | Err(_) => bytes.len(),
     };
     let esc_pending_start = bytes
@@ -759,6 +853,511 @@ mod tests {
         grid.process(b"\x1b[1;4mabc\x1b[2K");
 
         assert!(grid.viewport_rows()[0].cells().is_empty());
+    }
+
+    #[test]
+    fn terminal_reset_preserves_revision_order_and_retention_limits() {
+        let limits = GridLimits { scrollback_rows: 2 };
+        let mut producer = TerminalGridStream::new(10, 3, limits).unwrap();
+        producer.process(b"main\x1b[?1049h\x1b[31malt");
+        let before = producer.snapshot(0, 3);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        let delta = producer.process_delta(b"\x1bc").unwrap();
+        assert!(delta.revision > before.revision);
+        assert!(delta.content_revision > before.content_revision);
+        consumer.apply_delta(&delta, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+        assert_eq!(producer.grid().mode(), crate::GridMode::Main);
+        assert!(producer.snapshot(0, 3).main_rows.is_none());
+        for _ in 0..20 {
+            producer.process(b"line\r\n");
+        }
+        assert!(producer.grid().max_scrollback_offset() <= limits.scrollback_rows);
+        let before = producer.snapshot(0, 3);
+        let delta = producer.process_delta(b"\x1bc").unwrap();
+        assert!(delta.revision > before.revision);
+        assert_eq!(producer.grid().max_scrollback_offset(), 0);
+    }
+
+    #[test]
+    fn failed_delta_hydration_preserves_grid_and_parser_for_retry() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+        producer.process(b"main\x1b[?1049halt\x1b[");
+        let before = producer.snapshot(0, 3);
+        let delta = producer.process_delta(b"31mred").unwrap();
+        let after = producer.snapshot(0, 3);
+        for invalid in 0..9 {
+            let mut malformed = delta.clone();
+            match invalid {
+                0 => malformed.width = 0,
+                1 => malformed.height = 0,
+                2 => malformed.mode = "invalid".to_string(),
+                3 => malformed.content_revision = before.content_revision - 1,
+                4 => malformed.base_revision = before.revision + 1,
+                5 => malformed.revision = before.revision,
+                6 => malformed.revision = before.revision - 1,
+                7 => {
+                    assert!(!malformed.reset_rows);
+                    malformed.scrollback_rows += 1;
+                }
+                _ => {
+                    malformed.reset_rows = true;
+                    assert!(!malformed.row_updates.is_empty());
+                    malformed.row_updates[0].row_index = 1;
+                }
+            }
+            let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+            assert!(consumer.apply_delta(&malformed, limits).is_err());
+            assert_eq!(consumer.snapshot(0, 3), before);
+            consumer.apply_delta(&delta, limits).unwrap();
+            assert_eq!(consumer.snapshot(0, 3), after);
+
+            // The live parser, not just its serialized prefix, must survive a
+            // rejected hydration so subsequent bytes complete the same sequence.
+            let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+            assert!(consumer.apply_delta(&malformed, limits).is_err());
+            consumer.process(b"31mred");
+            assert_eq!(consumer.snapshot(0, 3), after);
+            consumer.process(b"\x1b[?1049l!");
+            let mut expected = TerminalGridStream::from_snapshot(&after, limits).unwrap();
+            expected.process(b"\x1b[?1049l!");
+            assert_eq!(consumer.snapshot(0, 3), expected.snapshot(0, 3));
+        }
+    }
+
+    #[test]
+    fn every_split_preserves_mixed_stream_state_after_hydration() {
+        let bytes = "main\x1b[?1049h\x1b[31m界é\x1b[0m\x1b[?1049l!".as_bytes();
+        let limits = GridLimits::default();
+        let mut whole = TerminalGridStream::new(20, 3, limits).unwrap();
+        whole.process(bytes);
+        let expected = whole.snapshot(0, 3);
+        for split in 0..=bytes.len() {
+            let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+            let mut replica =
+                TerminalGridStream::from_snapshot(&producer.snapshot(0, 3), limits).unwrap();
+            if let Some(delta) = producer.process_delta(&bytes[..split]) {
+                replica.apply_delta(&delta, limits).unwrap();
+            }
+            assert_eq!(
+                replica.snapshot(0, 3),
+                producer.snapshot(0, 3),
+                "prefix {split}"
+            );
+            let mut consumer =
+                TerminalGridStream::from_snapshot(&producer.snapshot(0, 3), limits).unwrap();
+            if let Some(delta) = producer.process_delta(&bytes[split..]) {
+                replica.apply_delta(&delta, limits).unwrap();
+            }
+            assert_eq!(
+                replica.snapshot(0, 3),
+                producer.snapshot(0, 3),
+                "suffix {split}"
+            );
+            consumer.process(&bytes[split..]);
+            let mut actual = consumer.snapshot(0, 3);
+            assert_eq!(actual, producer.snapshot(0, 3), "split {split}");
+            // Prefix-only chunks legitimately add replication revisions.
+            actual.revision = expected.revision;
+            assert_eq!(actual, expected, "split {split}");
+        }
+    }
+
+    #[test]
+    fn utf8_boundary_prefixes_match_stream_hydration() {
+        let limits = GridLimits::default();
+        for (prefix, suffix) in [
+            (&b"\xc2"[..], &b"\x80"[..]),
+            (&b"\xe0\xa0"[..], &b"\x80"[..]),
+            (&b"\xed\x9f"[..], &b"\xbf"[..]),
+            (&b"\xf0\x90\x80"[..], &b"\x80"[..]),
+            (&b"\xf4\x8f\xbf"[..], &b"\xbf"[..]),
+        ] {
+            let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+            producer.process(prefix);
+            let snapshot = producer.snapshot(0, 3);
+            assert_eq!(snapshot.pending_bytes, prefix);
+            let mut consumer = TerminalGridStream::from_snapshot(&snapshot, limits).unwrap();
+            producer.process(suffix);
+            consumer.process(suffix);
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+            assert!(producer.snapshot(0, 3).pending_bytes.is_empty());
+        }
+        for invalid in [
+            &b"\xc0"[..],
+            &b"\xc1"[..],
+            &b"\xe0\x9f"[..],
+            &b"\xed\xa0"[..],
+            &b"\xf0\x8f"[..],
+            &b"\xf4\x90"[..],
+            &b"\xf5"[..],
+        ] {
+            assert!(super::trailing_incomplete_sequence(invalid).is_empty());
+            let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+            producer.process(invalid);
+            let snapshot = producer.snapshot(0, 3);
+            let mut consumer = TerminalGridStream::from_snapshot(&snapshot, limits).unwrap();
+            for suffix in [&b"\x80"[..], &b"ok\x1b[31mred"[..]] {
+                producer.process(suffix);
+                consumer.process(suffix);
+                assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_utf8_tails_do_not_retain_false_prefixes() {
+        for leading in [0xc2, 0xe7, 0xf0, 0xff] {
+            for count in [4, 8, 4096] {
+                let mut bytes = vec![leading];
+                bytes.extend(std::iter::repeat_n(0x80, count));
+                assert!(super::trailing_incomplete_sequence(&bytes).is_empty());
+                bytes.extend_from_slice(b"\xf0\x9f\x98");
+                assert_eq!(super::trailing_incomplete_sequence(&bytes), b"\xf0\x9f\x98");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_before_split_character_preserves_continuity() {
+        let limits = GridLimits::default();
+        for invalid in [&b"\xfftext"[..], &b"\x80\x80"[..], &b"\xc0\xaf"[..]] {
+            for character in ["é", "界", "😀"] {
+                let bytes = character.as_bytes();
+                let mut complete = invalid.to_vec();
+                complete.extend_from_slice(bytes);
+                let mut uninterrupted = TerminalGridStream::new(20, 3, limits).unwrap();
+                uninterrupted.process(&complete);
+                let expected = uninterrupted.snapshot(0, 3);
+                for split in 1..bytes.len() {
+                    let mut prefix = invalid.to_vec();
+                    prefix.extend_from_slice(&bytes[..split]);
+                    let suffix = &bytes[split..];
+                    let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+                    let mut replica = TerminalGridStream::new(20, 3, limits).unwrap();
+                    let delta = producer.process_delta(&prefix).unwrap();
+                    assert_eq!(delta.pending_bytes, bytes[..split]);
+                    replica.apply_delta(&delta, limits).unwrap();
+                    let mut hydrated =
+                        TerminalGridStream::from_snapshot(&producer.snapshot(0, 3), limits)
+                            .unwrap();
+                    let delta = producer.process_delta(suffix).unwrap();
+                    replica.apply_delta(&delta, limits).unwrap();
+                    hydrated.process(suffix);
+                    let mut actual = producer.snapshot(0, 3);
+                    assert_eq!(replica.snapshot(0, 3), actual);
+                    assert_eq!(hydrated.snapshot(0, 3), actual);
+                    // Chunk boundaries may add parser-prefix revisions only.
+                    actual.revision = expected.revision;
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reordered_stream_deltas_preserve_pending_parser_and_allow_recovery() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+        producer.process(b"main\x1b[?1049halt");
+        let before = producer.snapshot(0, 3);
+        let first = producer.process_delta(b"\x1b[").unwrap();
+        let first: crate::GridDeltaBatch =
+            serde_json::from_slice(&serde_json::to_vec(&first).unwrap()).unwrap();
+        let middle = producer.snapshot(0, 3);
+        let second = producer.process_delta(b"31mred").unwrap();
+        let second: crate::GridDeltaBatch =
+            serde_json::from_slice(&serde_json::to_vec(&second).unwrap()).unwrap();
+        let after = producer.snapshot(0, 3);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        assert!(consumer.apply_delta(&second, limits).is_err());
+        assert_eq!(consumer.snapshot(0, 3), before);
+        consumer.apply_delta(&first, limits).unwrap();
+        assert!(consumer.apply_delta(&first, limits).is_err());
+        assert_eq!(consumer.snapshot(0, 3), middle);
+        let mut malformed = second.clone();
+        malformed.width = 0;
+        assert!(matches!(
+            consumer.apply_delta(&malformed, limits),
+            Err(super::TerminalGridStreamDeltaError::Delta(
+                crate::GridDeltaApplyError::ZeroDimensions
+            ))
+        ));
+        assert_eq!(consumer.snapshot(0, 3), middle);
+        let mut invalid_mode = second.clone();
+        invalid_mode.mode = "unknown".to_owned();
+        assert!(matches!(
+            consumer.apply_delta(&invalid_mode, limits),
+            Err(super::TerminalGridStreamDeltaError::Delta(
+                crate::GridDeltaApplyError::InvalidScreenMode
+            ))
+        ));
+        assert_eq!(consumer.snapshot(0, 3), middle);
+        consumer.apply_delta(&second, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 3), after);
+
+        // Recover through raw continuation instead of applying the second delta.
+        // This exercises the live parser prefix after rejecting both a duplicate
+        // and a malformed update, rather than replacing it from a valid delta.
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        consumer.apply_delta(&first, limits).unwrap();
+        assert!(consumer.apply_delta(&first, limits).is_err());
+        assert!(consumer.apply_delta(&malformed, limits).is_err());
+        consumer.process(b"31mred");
+        assert_eq!(consumer.snapshot(0, 3), after);
+        producer.process(b"\x1b[?1049l!");
+        consumer.process(b"\x1b[?1049l!");
+        assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+    }
+
+    #[test]
+    fn resize_delta_preserves_split_stream_continuity() {
+        let bytes = "main\x1b[?1049h\x1b[31m界é\x1b[0m\x1b[?1049l!".as_bytes();
+        let limits = GridLimits::default();
+        for split in 0..=bytes.len() {
+            for (width, height) in [(10, 2), (30, 5)] {
+                let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+                producer.process(&bytes[..split]);
+                let mut replica =
+                    TerminalGridStream::from_snapshot(&producer.snapshot(0, 3), limits).unwrap();
+                let delta = producer.resize_delta(width, height).unwrap().unwrap();
+                replica.apply_delta(&delta, limits).unwrap();
+                assert_eq!(
+                    replica.snapshot(0, usize::from(height)),
+                    producer.snapshot(0, usize::from(height)),
+                    "resize at {split}"
+                );
+                let mut structured = TerminalGridStream::from_snapshot(
+                    &replica.snapshot(0, usize::from(height)),
+                    limits,
+                )
+                .unwrap();
+                // Both live parsers must resume from the same incomplete sequence.
+                if let Some(delta) = producer.process_delta(&bytes[split..]) {
+                    structured.apply_delta(&delta, limits).unwrap();
+                }
+                assert_eq!(
+                    structured.snapshot(0, usize::from(height)),
+                    producer.snapshot(0, usize::from(height)),
+                    "output delta at {split}"
+                );
+                replica.process(&bytes[split..]);
+                assert_eq!(
+                    replica.snapshot(0, usize::from(height)),
+                    producer.snapshot(0, usize::from(height)),
+                    "continuation at {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_protocol_input_preserves_split_alternate_transition() {
+        let mut tracker = super::TerminalProtocolTracker::new();
+        assert!(!tracker.process(b"\x1b[?1049").toggled_alternate);
+        let protocol = tracker.protocol_state();
+        assert!(!tracker.process(b"").toggled_alternate);
+        assert_eq!(tracker.protocol_state(), protocol);
+        assert!(!tracker.alternate_screen());
+        assert!(tracker.process(b"h").toggled_alternate);
+        assert!(tracker.alternate_screen());
+        assert!(!tracker.process(b"").toggled_alternate);
+        assert!(tracker.alternate_screen());
+        assert!(tracker.process(b"\x1b[?1049l").toggled_alternate);
+        assert!(!tracker.alternate_screen());
+    }
+
+    #[test]
+    fn incomplete_scrolling_delta_preserves_consumer_state() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+        producer.process(&[b'x'; 40]);
+        let before = producer.snapshot(0, 2);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        let delta = producer.process_delta(b"x").unwrap();
+        assert!(delta.scrollback_rows > 0);
+        assert!(matches!(
+            consumer.apply_delta(&delta, limits),
+            Err(super::TerminalGridStreamDeltaError::IncompleteHistory {
+                expected_rows: 1,
+                reconstructed_rows: 0,
+            })
+        ));
+        assert_eq!(consumer.snapshot(0, 2), before);
+        let complete = crate::GridDeltaBatch::between(&before, &producer.snapshot(0, 3)).unwrap();
+        assert!(complete.reset_rows);
+        consumer.apply_delta(&complete, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+
+        // Rejection preserves parser/grid continuity, including pending wrap.
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        assert!(consumer.apply_delta(&delta, limits).is_err());
+        consumer.process(b"x");
+        assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+    }
+
+    #[test]
+    fn complete_scrolling_replacement_preserves_backing_history() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+        producer.process(&[b'x'; 40]);
+        let before = producer.snapshot(0, 2);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        producer.process(b"y");
+        let after = producer.snapshot(0, 3);
+        let delta = crate::GridDeltaBatch::between(&before, &after).unwrap();
+        assert!(delta.reset_rows);
+        assert_eq!(delta.scrollback_rows, 1);
+        consumer.apply_delta(&delta, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 3), after);
+        // Hydration must preserve the backing content, not just its count.
+        for bytes in [b"z".as_slice(), b"\r\nnext"] {
+            producer.process(bytes);
+            consumer.process(bytes);
+            assert_eq!(consumer.snapshot(0, 5), producer.snapshot(0, 5));
+        }
+    }
+
+    #[test]
+    fn replacement_exceeding_history_retention_preserves_consumer() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+        producer.process(b"first\r\nsecond\x1b[");
+        let before = producer.snapshot(0, 2);
+        producer.process(b"31m\r\nthird");
+        let after = producer.snapshot(0, 3);
+        let delta = crate::GridDeltaBatch::between(&before, &after).unwrap();
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        assert!(matches!(
+            consumer.apply_delta(&delta, GridLimits { scrollback_rows: 0 }),
+            Err(super::TerminalGridStreamDeltaError::IncompleteHistory {
+                expected_rows: 1,
+                reconstructed_rows: 0,
+            })
+        ));
+        assert_eq!(consumer.snapshot(0, 2), before);
+        consumer.apply_delta(&delta, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 3), after);
+
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        assert!(
+            consumer
+                .apply_delta(&delta, GridLimits { scrollback_rows: 0 })
+                .is_err()
+        );
+        consumer.process(b"31m\r\nthird");
+        assert_eq!(consumer.snapshot(0, 3), after);
+        producer.process(b"\r\nfourth\r\nfifth");
+        consumer.process(b"\r\nfourth\r\nfifth");
+        assert_eq!(consumer.snapshot(0, 5), producer.snapshot(0, 5));
+        assert_eq!(consumer.snapshot(0, 5).scrollback_rows, 3);
+    }
+
+    #[test]
+    fn ignored_input_does_not_publish_delta_but_prefix_changes_do() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+        producer.process(b"main");
+        let before = producer.snapshot(0, 3);
+        assert!(producer.process_delta(b"\x00").is_none());
+        assert_eq!(producer.snapshot(0, 3), before);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        for bytes in [b"\x1b[".as_slice(), b"31mred"] {
+            let delta = producer.process_delta(bytes).unwrap();
+            consumer.apply_delta(&delta, limits).unwrap();
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+        }
+    }
+
+    #[test]
+    fn empty_input_preserves_pending_sequence_and_revision() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+        producer.process(b"main\x1b[?1049halt\x1b[");
+        let before = producer.snapshot(0, 3);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        assert!(producer.process_delta(b"").is_none());
+        assert_eq!(producer.snapshot(0, 3), before);
+        let delta = producer.process_delta(b"31mred").unwrap();
+        consumer.apply_delta(&delta, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+    }
+
+    #[test]
+    fn failed_resize_preserves_replication_and_parser_continuity() {
+        let limits = GridLimits::default();
+        for (width, height) in [(0, 3), (20, 0), (0, 0)] {
+            let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+            producer.process(b"main\x1b[?1049halt\x1b[");
+            let before = producer.snapshot(0, 3);
+            let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+            assert!(matches!(
+                producer.resize_delta(width, height),
+                Err(crate::TerminalGridError::ZeroDimensions)
+            ));
+            assert_eq!(producer.snapshot(0, 3), before);
+            let delta = producer.process_delta(b"31mred").unwrap();
+            assert_eq!(delta.base_revision, before.revision);
+            consumer.apply_delta(&delta, limits).unwrap();
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+            producer.process(b"\x1b[?1049l!");
+            consumer.process(b"\x1b[?1049l!");
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+        }
+    }
+
+    #[test]
+    fn standalone_cursor_save_replicates_without_content_damage() {
+        for (save, restore) in [
+            (b"\x1b7".as_slice(), b"\x1b8".as_slice()),
+            (b"\x1b[s", b"\x1b[u"),
+        ] {
+            let limits = GridLimits::default();
+            let mut producer = TerminalGridStream::new(10, 3, limits).unwrap();
+            producer.process(b"1234567890");
+            let before = producer.snapshot(0, 3);
+            let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+            let delta = producer
+                .process_delta(save)
+                .expect("saving cursor changes replicated state");
+            assert_eq!(delta.content_revision, before.content_revision);
+            assert!(delta.row_updates.is_empty());
+            consumer.apply_delta(&delta, limits).unwrap();
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+            for stream in [&mut producer, &mut consumer] {
+                stream.process(b"\x1b[3;1Hother");
+                stream.process(restore);
+                stream.process(b"X");
+            }
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+        }
+    }
+
+    #[test]
+    fn prefix_only_deltas_preserve_split_sequence_continuity() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 3, limits).unwrap();
+        let mut consumer = TerminalGridStream::new(20, 3, limits).unwrap();
+        let initial_content_revision = producer.grid().content_revision();
+        for prefix in [b"\x1b".as_slice(), b"[", b"31"] {
+            let delta = producer
+                .process_delta(prefix)
+                .expect("prefix changes replication state");
+            assert_eq!(producer.grid().content_revision(), initial_content_revision);
+            consumer.apply_delta(&delta, limits).unwrap();
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+        }
+        let delta = producer.process_delta(b"mred").unwrap();
+        consumer.apply_delta(&delta, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+        assert!(producer.process_delta(b"").is_none());
+        // Hydration must preserve enough parser state to continue raw input too.
+        let delta = producer.process_delta(b"\x1b[").unwrap();
+        consumer.apply_delta(&delta, limits).unwrap();
+        producer.process(b"0mplain");
+        consumer.process(b"0mplain");
+        assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
     }
 
     #[test]

@@ -160,8 +160,11 @@ impl PaneScrollbackView {
             return;
         }
         if let Some(anchor) = self.selection_anchor.as_mut() {
-            let offset_from_top = anchor.line.saturating_sub(from.top_line());
-            anchor.line = to.top_line().saturating_add(offset_from_top);
+            anchor.line = if anchor.line >= from.top_line() {
+                to.top_line().saturating_add(anchor.line - from.top_line())
+            } else {
+                to.top_line().saturating_sub(from.top_line() - anchor.line)
+            };
         }
     }
 }
@@ -435,6 +438,52 @@ pub struct AttachPaneMouseProtocolHints {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn selection_rebase_preserves_offsets_on_both_sides_of_viewport() {
+        for (line, expected) in [(7, 97), (10, 100), (14, 104)] {
+            let mut view = PaneScrollbackView {
+                selection_anchor: Some(AttachScrollbackPosition { line, col: 5 }),
+                offset: 0,
+                cursor: AttachScrollbackCursor { row: 0, col: 0 },
+                pin: None,
+            };
+            view.rebase_selection_anchor(
+                ScrollbackViewportBase::from_scrolled_rows(10, 0),
+                ScrollbackViewportBase::from_scrolled_rows(100, 0),
+            );
+            assert_eq!(
+                view.selection_anchor,
+                Some(AttachScrollbackPosition {
+                    line: expected,
+                    col: 5,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn selection_rebase_saturates_at_history_numbering_bounds() {
+        for (line, new_top, expected) in [(0, 2, 0), (20, u64::MAX, u64::MAX)] {
+            let mut view = PaneScrollbackView {
+                selection_anchor: Some(AttachScrollbackPosition { line, col: 3 }),
+                offset: 0,
+                cursor: AttachScrollbackCursor { row: 0, col: 0 },
+                pin: None,
+            };
+            view.rebase_selection_anchor(
+                ScrollbackViewportBase::from_scrolled_rows(10, 0),
+                ScrollbackViewportBase::from_scrolled_rows(new_top, 0),
+            );
+            assert_eq!(
+                view.selection_anchor,
+                Some(AttachScrollbackPosition {
+                    line: expected,
+                    col: 3,
+                })
+            );
+        }
+    }
 
     #[test]
     fn visual_row_fingerprint_cache_reuses_rows_and_invalidates_precisely() {

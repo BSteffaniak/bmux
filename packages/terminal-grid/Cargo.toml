@@ -16,6 +16,9 @@ thiserror     = { workspace = true }
 unicode-width = { workspace = true }
 vte           = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []
