@@ -6903,7 +6903,12 @@ pub fn extract_attach_text(
         return Some(String::new());
     }
 
+    // Physical rows that soft-wrapped (the application wrote past the right
+    // edge) are joined back into one logical line so the copied text matches
+    // what was originally written, not how the viewport happened to break it.
+    // Only rows that ended with an explicit newline produce a `\n`.
     let mut lines = Vec::new();
+    let mut logical_line = String::new();
     for line in first_line..=last_line {
         let Some(row_index) = base.viewport_row_for_line(line, height) else {
             continue;
@@ -6917,11 +6922,19 @@ pub fn extract_attach_text(
         } else {
             width
         };
-        lines.push(grid_row_text_range(row, width, start_col, end_col));
+        logical_line.push_str(&grid_row_text_range(row, width, start_col, end_col));
+        let continues_on_next_row = row.wrapped() && line < last_line;
+        if !continues_on_next_row {
+            lines.push(std::mem::take(&mut logical_line).trim_end().to_string());
+        }
     }
     Some(lines.join("\n"))
 }
 
+/// Text of `row` between `start_col` and `end_col`, padded with spaces for
+/// columns the row never wrote. Trailing whitespace is intentionally kept so
+/// soft-wrapped rows can be concatenated back into their logical line; callers
+/// trim once per logical line.
 fn grid_row_text_range(
     row: &bmux_terminal_grid::PhysicalRow,
     width: usize,
@@ -6940,7 +6953,7 @@ fn grid_row_text_range(
             text.push_str(cell.text());
         }
     }
-    text.trim_end().to_string()
+    text
 }
 
 pub fn adjust_attach_scrollback_offset(current: usize, delta: isize, max_offset: usize) -> usize {
@@ -19255,7 +19268,11 @@ mod tests {
                 } else {
                     width
                 };
-                expected_lines.push(grid_row_text_range(row, width, start_col, end_col));
+                expected_lines.push(
+                    grid_row_text_range(row, width, start_col, end_col)
+                        .trim_end()
+                        .to_string(),
+                );
             }
 
             assert_eq!(
@@ -19265,6 +19282,70 @@ mod tests {
                  anchor ({anchor_row},{anchor_col}) head ({head_row},{head_col})"
             );
         }
+    }
+
+    /// A logical line the application wrote longer than the pane width is
+    /// soft-wrapped onto several physical rows. Copying across those rows must
+    /// yield the original single line, with `\n` only where the application
+    /// actually emitted a line break.
+    #[test]
+    fn selected_attach_text_joins_soft_wrapped_rows_into_logical_lines() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
+        {
+            let buffer = view_state
+                .pane_buffers
+                .get_mut(&pane_id)
+                .expect("pane render buffer");
+            // 20-col grid: the 45-char line wraps as 20 + 20 + 5 rows, then a
+            // hard newline and a short line filling the 4-row viewport. Clear
+            // first so the viewport is deterministic.
+            append_pane_output(
+                buffer,
+                b"\x1b[2J\x1b[H0123456789abcdefghijABCDEFGHIJklmnopqrstUVWXY\r\nnext",
+            );
+        }
+        assert!(enter_attach_scrollback(&mut view_state));
+        let base = attach_scrollback_viewport_base(&view_state, pane_id).expect("base");
+        let (rows, _) = {
+            let view = view_state.scrollback_for(pane_id);
+            let buffer = view_state
+                .pane_buffers
+                .get(&pane_id)
+                .expect("pane render buffer");
+            buffer.scrollback_render_window(view.as_ref(), 4)
+        };
+        assert!(rows[0].wrapped(), "first physical row soft-wraps");
+        assert!(rows[1].wrapped(), "second physical row soft-wraps");
+        assert!(!rows[2].wrapped(), "third row ends with a hard newline");
+
+        if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+            view.offset = 0;
+            view.selection_anchor = Some(AttachScrollbackPosition {
+                line: base.line_for_viewport_row(0),
+                col: 0,
+            });
+            view.cursor = AttachScrollbackCursor { row: 3, col: 3 };
+        }
+
+        assert_eq!(
+            selected_attach_text(&mut view_state),
+            Some("0123456789abcdefghijABCDEFGHIJklmnopqrstUVWXY\nnext".to_string())
+        );
+
+        // A partial selection that starts mid-way through a wrapped row still
+        // joins across the soft break.
+        if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+            view.selection_anchor = Some(AttachScrollbackPosition {
+                line: base.line_for_viewport_row(0),
+                col: 15,
+            });
+            view.cursor = AttachScrollbackCursor { row: 1, col: 4 };
+        }
+        assert_eq!(
+            selected_attach_text(&mut view_state),
+            Some("fghijABCDE".to_string())
+        );
     }
 
     #[test]
