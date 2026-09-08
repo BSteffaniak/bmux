@@ -2757,6 +2757,16 @@ impl OutputFanoutBuffer {
         self.cursors.insert(client_id, clamped);
     }
 
+    fn acknowledge_snapshot(&mut self, client_id: ClientId, offset: u64) {
+        let offset = self
+            .cursors
+            .get(&client_id)
+            .copied()
+            .unwrap_or(0)
+            .max(offset);
+        self.set_client_cursor(client_id, offset);
+    }
+
     fn push_chunk(&mut self, chunk: &[u8]) {
         self.push_chunk_with_node_cap(chunk, MAX_NODE_OUTPUT_BUFFER_BYTES);
     }
@@ -7135,7 +7145,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             output
                 .lock()
                 .map_err(|_| SessionRuntimeError::Closed)?
-                .set_client_cursor(client_id, stream_end);
+                .acknowledge_snapshot(client_id, stream_end);
         }
         Ok(bmux_pane_runtime_state::AttachGridSnapshotState { snapshots })
     }
@@ -12641,6 +12651,31 @@ mod tests {
 
         assert!(replay.stream_gap);
         assert!(replay.stream_start >= output.start_offset);
+    }
+
+    #[test]
+    fn snapshot_acknowledgement_does_not_rewind_concurrent_replay() {
+        let client_id = ClientId(Uuid::new_v4());
+        let mut output = OutputFanoutBuffer::new(1024);
+        output.register_client_at_tail(client_id);
+        output.push_chunk(b"first");
+        let snapshot_end = output.end_offset();
+        output.push_chunk(b"second");
+        assert_eq!(
+            output.read_for_client(client_id, 1024).bytes,
+            b"firstsecond"
+        );
+        output.acknowledge_snapshot(client_id, snapshot_end);
+        assert!(output.read_for_client(client_id, 1024).bytes.is_empty());
+        output.push_chunk(b"third");
+        assert_eq!(output.read_for_client(client_id, 1024).bytes, b"third");
+        // Explicit reset remains available for intentional replay.
+        output.set_client_cursor(client_id, 0);
+        output.acknowledge_snapshot(client_id, snapshot_end);
+        assert_eq!(
+            output.read_for_client(client_id, 1024).bytes,
+            b"secondthird"
+        );
     }
 
     #[test]
