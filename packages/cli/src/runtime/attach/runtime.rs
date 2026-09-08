@@ -8076,13 +8076,36 @@ fn replace_retained_surfaces(
     viewport: DamageRect,
     damage_policy: DamageCoalescingPolicy,
 ) -> RetainedDamage {
+    let previous_focus = view_state.plugin_focus.focused().and_then(|target| {
+        view_state
+            .retained_compositor
+            .endpoint_for_region(target)
+            .cloned()
+            .map(|endpoint| {
+                (
+                    endpoint,
+                    format!(
+                        "{}:{}:{}",
+                        target.owner_plugin_id, target.surface_local_id, target.region_local_id
+                    ),
+                )
+            })
+    });
     let damage =
         view_state
             .retained_compositor
             .replace_surfaces(retained_surfaces, viewport, damage_policy);
-    let _ = view_state
+    if view_state
         .plugin_focus
-        .reconcile(&view_state.retained_compositor);
+        .reconcile(&view_state.retained_compositor)
+        && let Some((endpoint, hook)) = previous_focus
+        && bmux_plugin::global_attach_presentation_input_registry()
+            .notify_focus_lost(&endpoint, &hook)
+    {
+        view_state
+            .dirty
+            .mark_extension_dirty(AttachDirtySource::PluginCommand);
+    }
     let _ = view_state
         .plugin_pointer_router
         .reconcile(&view_state.retained_compositor);
@@ -10684,7 +10707,7 @@ pub async fn handle_attach_terminal_event(
         }
         Some(TerminalInputEvent::FocusLost | TerminalInputEvent::Resize { .. }) => {
             view_state.mouse.clear_pointer_gestures();
-            let _ = view_state.plugin_focus.clear();
+            clear_plugin_surface_focus(view_state);
         }
         Some(
             TerminalInputEvent::Key(_)
@@ -11613,11 +11636,53 @@ fn update_plugin_surface_focus(
     }
 }
 
+fn clear_plugin_surface_focus(view_state: &mut AttachViewState) {
+    let Some(target) = view_state.plugin_focus.clear() else {
+        return;
+    };
+    let Some(endpoint) = view_state.retained_compositor.endpoint_for_region(&target) else {
+        return;
+    };
+    let hook_id = format!(
+        "{}:{}:{}",
+        target.owner_plugin_id, target.surface_local_id, target.region_local_id
+    );
+    if bmux_plugin::global_attach_presentation_input_registry()
+        .notify_focus_lost(endpoint, &hook_id)
+    {
+        view_state
+            .dirty
+            .mark_extension_dirty(AttachDirtySource::PluginCommand);
+    }
+}
+
+fn dismiss_plugin_focus_on_pointer_down(view_state: &mut AttachViewState, mouse_event: MouseEvent) {
+    if matches!(mouse_event.kind, MouseEventKind::Down(_)) {
+        let hit = view_state
+            .retained_compositor
+            .hit_test(mouse_event.column, mouse_event.row);
+        let target = hit.as_ref().and_then(|hit| hit.region_id.as_ref());
+        let observes_loss = view_state
+            .plugin_focus
+            .focused()
+            .and_then(|id| view_state.retained_compositor.endpoint_for_region(id))
+            .is_some_and(|endpoint| {
+                bmux_plugin::global_attach_presentation_input_registry()
+                    .observes_focus_loss(endpoint)
+            });
+        if observes_loss && view_state.plugin_focus.focused() != target {
+            clear_plugin_surface_focus(view_state);
+        }
+    }
+}
+
 async fn try_handle_plugin_surface_mouse(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
 ) -> std::result::Result<bool, ClientError> {
+    // Dismiss the old control before the destination can acquire focus.
+    dismiss_plugin_focus_on_pointer_down(view_state, mouse_event);
     let events = view_state
         .plugin_pointer_router
         .route_terminal_mouse(&view_state.retained_compositor, mouse_event);
@@ -11636,7 +11701,7 @@ async fn try_handle_plugin_surface_mouse(
     // Consumed pointer actions may intentionally retain an existing keyboard
     // target (for example, a non-focusable control belonging to an editor).
     if !consumed && matches!(mouse_event.kind, MouseEventKind::Down(_)) {
-        let _ = view_state.plugin_focus.clear();
+        clear_plugin_surface_focus(view_state);
     }
     Ok(consumed)
 }
@@ -14868,6 +14933,75 @@ mod tests {
         let _ = focus.clear();
         update_plugin_surface_focus(&mut focus, &compositor, &move_event, true);
         assert!(focus.focused().is_none());
+    }
+
+    #[test]
+    fn opted_in_control_is_dismissed_only_by_outside_pointer_down() {
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "example.blur".to_string(),
+            interface_id: "input".to_string(),
+            operation: "handle".to_string(),
+        };
+        let notified = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = notified.clone();
+        let registry = bmux_plugin::global_attach_presentation_input_registry();
+        registry.register_focus_lost(
+            endpoint.clone(),
+            std::sync::Arc::new(move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            }),
+        );
+        let mut surface = bmux_plugin::surface::PluginSurface::layout(
+            bmux_plugin::surface::PluginSurfaceId::new(
+                "example.blur",
+                "surface",
+                Uuid::from_u128(51),
+            ),
+            1,
+            bmux_plugin::layout::PluginLayoutId::new("example.blur", "layout"),
+            Vec::new(),
+        );
+        surface.target =
+            bmux_plugin::surface::PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4));
+        let surface = surface.interactive_region(
+            bmux_plugin::surface::PluginSurfaceRegion::new("field", ExtensionRect::new(0, 0, 8, 4))
+                .endpoint(endpoint.clone())
+                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Text),
+        );
+        let mut view = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::from_u128(1),
+            can_write: true,
+        });
+        let _ = view.retained_compositor.replace_surfaces(
+            retained_surfaces_from_plugin_surfaces(
+                &[surface],
+                &BTreeMap::new(),
+                DamageRect::new(0, 0, 80, 24),
+            ),
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        let hit = view.retained_compositor.hit_test(3, 3).unwrap();
+        view.plugin_focus.focus_hit(&view.retained_compositor, &hit);
+        let mut event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        };
+        dismiss_plugin_focus_on_pointer_down(&mut view, event);
+        assert!(view.plugin_focus.focused().is_some());
+        event.column = 40;
+        event.kind = MouseEventKind::Moved;
+        dismiss_plugin_focus_on_pointer_down(&mut view, event);
+        assert!(view.plugin_focus.focused().is_some());
+        event.kind = MouseEventKind::Down(MouseButton::Left);
+        dismiss_plugin_focus_on_pointer_down(&mut view, event);
+        assert!(view.plugin_focus.focused().is_none());
+        assert_eq!(notified.load(std::sync::atomic::Ordering::SeqCst), 1);
+        registry.remove(&endpoint);
     }
 
     #[test]

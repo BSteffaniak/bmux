@@ -419,6 +419,8 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
             },
         )
         .map_err(|error| format!("publishing tab-strip layout: {error:?}"))?;
+    bmux_plugin::global_attach_presentation_input_registry()
+        .register_focus_lost(input_endpoint(), std::sync::Arc::new(handle_focus_lost));
     bmux_plugin::register_attach_presentation_input_handler(
         input_endpoint(),
         std::sync::Arc::new(handle_local_input),
@@ -1185,8 +1187,7 @@ fn update_editor(
     let key = event.key.as_deref()?;
     match key {
         "esc" => {
-            companion.editing_window_id = None;
-            companion.edit_buffer.clear();
+            cancel_rename(companion);
         }
         "left" => {
             companion
@@ -1321,9 +1322,7 @@ fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
     let mut service_invocation = None;
     match key {
         "esc" => {
-            companion.editing_window_id = None;
-            companion.editing_workspace_id = None;
-            companion.edit_buffer.clear();
+            cancel_rename(companion);
             release_capture = true;
         }
         "left" => {
@@ -1384,6 +1383,28 @@ fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
         service_invocation,
         ..AttachInputResult::default()
     })
+}
+
+fn cancel_rename(companion: &mut CompanionState) -> bool {
+    let editing = companion.editing_window_id.take().is_some()
+        | companion.editing_workspace_id.take().is_some();
+    if editing {
+        companion.edit_buffer.clear();
+        companion.last_left_click = None;
+        companion.last_workspace_click = None;
+    }
+    editing
+}
+
+#[allow(clippy::significant_drop_tightening)] // Cancellation and retained publication are serialized.
+fn handle_focus_lost(_hook_id: &str) -> bool {
+    let Ok(mut guard) = state().lock() else {
+        return false;
+    };
+    let Some(companion) = guard.as_mut() else {
+        return false;
+    };
+    cancel_rename(companion) && republish_companion(companion)
 }
 
 fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
@@ -1452,6 +1473,31 @@ bmux_plugin_sdk::export_plugin!(TabStripPlugin, include_str!("../plugin.toml"));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancel_discards_both_editor_kinds_and_click_history() {
+        for workspace in [false, true] {
+            let mut companion = CompanionState::new(Settings::default());
+            let id = Uuid::from_u128(7);
+            if workspace {
+                companion.editing_workspace_id = Some(id);
+            } else {
+                companion.editing_window_id = Some(id);
+            }
+            companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text("uncommitted draft");
+            companion.edit_buffer.select_all();
+            companion.last_left_click = Some((id, 0, 0, Instant::now()));
+            companion.last_workspace_click = companion.last_left_click;
+            assert!(cancel_rename(&mut companion));
+            assert!(companion.editing_window_id.is_none());
+            assert!(companion.editing_workspace_id.is_none());
+            assert!(companion.edit_buffer.text().is_empty());
+            assert!(companion.edit_buffer.selection().is_none());
+            assert!(companion.last_left_click.is_none());
+            assert!(companion.last_workspace_click.is_none());
+            assert!(!cancel_rename(&mut companion));
+        }
+    }
 
     #[test]
     fn republish_advances_past_retained_owner_revision() {
