@@ -135,7 +135,11 @@ mod tests {
             attach_runtime_error(SessionRuntimeError::NotAttached),
             AttachStateError::NotAttached
         ));
-        for error in [SessionRuntimeError::NotFound, SessionRuntimeError::Closed] {
+        for error in [
+            SessionRuntimeError::NotFound,
+            SessionRuntimeError::Closed,
+            SessionRuntimeError::ResponseBudgetExceeded,
+        ] {
             let AttachStateError::Failed { reason } = attach_runtime_error(error) else {
                 panic!("runtime failure must not be reported as an attachment failure");
             };

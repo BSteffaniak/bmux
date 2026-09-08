@@ -10496,6 +10496,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn attach_grid_windows_reject_aggregate_overflow_and_allow_retry() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        set_pane_grid(pane, 1000, 2);
+        pane.terminal_grid
+            .lock()
+            .unwrap()
+            .process(&vec![b'x'; 1000]);
+        let expected = pane.terminal_grid.lock().unwrap().snapshot(0, 2);
+        let encoded_size = serde_json::to_vec(&expected).unwrap().len();
+        let request = bmux_pane_runtime_state::AttachPaneGridWindowRequest {
+            pane_id,
+            scrollback_offset: 0,
+            rows: 2,
+            anchor_total_scrolled_rows: None,
+            pin_id: None,
+        };
+        let requests = vec![request; RESPONSE_OUTPUT_BUDGET / encoded_size + 1];
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let result = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_window_state(
+            &adapter, session_id, client_id, &requests,
+        );
+        assert!(matches!(
+            result,
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        ));
+        let retry = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_window_state(
+            &adapter,
+            session_id,
+            client_id,
+            &requests[..1],
+        )
+        .unwrap();
+        assert_eq!(retry.windows.len(), 1);
+        let snapshot: bmux_terminal_grid::GridSnapshot =
+            serde_json::from_slice(&retry.windows[0].encoded).unwrap();
+        assert_eq!(snapshot, expected);
+    }
+
     #[test]
     fn grid_window_encoding_enforces_shared_budget_without_truncation() {
         let mut grid = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
