@@ -1,4 +1,35 @@
-# Variable-height virtual list benchmark
+# Component examples
+
+## Selectable lists
+
+For selection-oriented controls such as pickers, use
+`bmux_tui_components::selectable_list::SelectableListComponent` with the
+`selectable-list` feature. Supply a stable component ID, a borrowed slice of
+`SelectableListItem`, and a caller-owned `Cell<SelectableListState>`. Keep item
+IDs stable across updates; visible item hit and semantic IDs are namespaced by
+the component ID.
+
+Configure behavior with `policy`, visuals with `styles`, and an optional row
+fill override with `fallback_style`. Place the component in the ordinary
+`Component` layout tree and paint its resolved layout through `PaintCx` rather
+than assigning a terminal rectangle to the legacy list renderer. The component
+uses shared `ScrollView` geometry for its viewport and content.
+
+Route input using the resolved layout and `EventCx`. Use `handle_event` when the
+application needs `SelectableListOutcome::Focused` or `Selected` to perform a
+product action. The generic `Component::event` entry point maps these outcomes
+to `EventOutcome::Redraw`; it does not deliver the selected item to application
+logic. Both routes update the supplied state cell, so retain that cell across
+frames or copy its value back to the application's authoritative state after
+dispatch. Do not dispatch the same event through both routes.
+
+This control is not a replacement for large variable-height collection
+virtualization. Use `VirtualList` and keyed child components for that case, as
+demonstrated below. Also verify the resolved dependency revision contains
+`SelectableListComponent` before migrating a downstream consumer; the API in
+this workspace may be newer than its lockfile.
+
+## Variable-height virtual list benchmark
 
 This executable is both the structural performance baseline and the public
 large-collection example for `bmux_tui_components::VirtualList`.

@@ -382,6 +382,28 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_unicode_label_remeasures_cached_geometry() {
+        let policy = BadgePolicy::bare().uppercase(true);
+        let initial = BadgeComponent::new("label", "a").policy(policy);
+        let expanded = BadgeComponent::new("label", "ß界").policy(policy);
+        let constraints = Constraints::loose(Size::new(20, 1));
+        let mut cache = bmux_tui::component::LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        let first = cache.layout("label".into(), &initial, constraints, &mut cx);
+        let changed = cache.layout("label".into(), &expanded, constraints, &mut cx);
+        assert_eq!(first.size.width, 1);
+        assert_eq!(expanded.text(), "SS界");
+        assert_eq!(changed.size.width, 4);
+        assert_eq!(cx.measured_nodes(), 2);
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let mut frame = Frame::new(&mut buffer);
+        expanded.paint(&changed, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("SS界"));
+        assert_eq!(frame.semantics().regions()[0].id, "label");
+    }
+
+    #[test]
     fn canonical_component_separates_layout_and_paint_revisions() {
         let initial = BadgeComponent::new("health", "ok").revision();
         let severity = BadgeComponent::new("health", "ok")
