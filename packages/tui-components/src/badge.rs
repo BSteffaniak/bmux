@@ -183,19 +183,25 @@ impl<'a> BadgeComponent<'a> {
 
 impl BadgeComponent<'_> {
     fn text(&self) -> String {
+        let uppercase;
         let label = if self.policy.uppercase {
-            self.label.to_uppercase()
+            uppercase = self.label.to_uppercase();
+            uppercase.as_str()
         } else {
-            self.label.to_owned()
+            self.label
         };
-        format!(
-            "{}{}{}{}{}",
-            self.policy.left,
-            " ".repeat(usize::from(self.policy.padding)),
-            label,
-            " ".repeat(usize::from(self.policy.padding)),
-            self.policy.right
-        )
+        let mut text = String::with_capacity(
+            self.policy.left.len()
+                + label.len()
+                + self.policy.right.len()
+                + usize::from(self.policy.padding) * 2,
+        );
+        text.push_str(self.policy.left);
+        text.extend(std::iter::repeat_n(' ', usize::from(self.policy.padding)));
+        text.push_str(label);
+        text.extend(std::iter::repeat_n(' ', usize::from(self.policy.padding)));
+        text.push_str(self.policy.right);
+        text
     }
 
     const fn style(&self) -> Style {
