@@ -616,7 +616,8 @@ mod tests {
             producer.snapshot(0, 3)
         );
         let before = producer.snapshot(0, 3);
-        let incomplete = producer.process_delta(b"\x1b[?1049l").unwrap();
+        producer.process(b"\x1b[?1049l");
+        let incomplete = GridDeltaBatch::between(&before, &producer.snapshot(0, 2)).unwrap();
         let revision = pipeline.pane_grid_revisions(&[pane_id]);
         assert!(
             pipeline

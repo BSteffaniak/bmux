@@ -125,42 +125,118 @@ impl TerminalGridStream {
         delta: &GridDeltaBatch,
         limits: GridLimits,
     ) -> Result<(), TerminalGridStreamDeltaError> {
+        self.validate_delta_before_capture(delta, limits)?;
+        self.apply_validated_delta(delta, limits)
+    }
+
+    fn validate_delta_before_capture(
+        &self,
+        delta: &GridDeltaBatch,
+        limits: GridLimits,
+    ) -> Result<(), TerminalGridStreamDeltaError> {
         delta.validate_revisions(self.grid.revision(), self.grid.content_revision())?;
         delta.validate_geometry()?;
         delta.validate_replacement_indexes()?;
+        if !delta.reset_rows
+            && (usize::from(delta.width) != self.grid.width()
+                || usize::from(delta.height) != self.grid.height()
+                || usize::try_from(delta.scrollback_rows).ok()
+                    != Some(self.grid.scrollback_rows_hint())
+                || delta
+                    .total_scrolled_rows
+                    .is_some_and(|position| position != self.grid.total_scrolled_rows())
+                || (delta.mode == "alternate") != (self.grid.mode() == GridMode::Alternate))
+        {
+            return Err(crate::GridDeltaApplyError::MissingReplacementRows.into());
+        }
+        delta.validate_sparse_indexes(self.grid.height())?;
+        // Limits count completed logical lines, not their width-dependent
+        // physical projection. A wrapped history prefix is retained separately.
+        let retained_lines = if delta.mode == "alternate" {
+            delta.main_rows.as_ref().map_or_else(
+                || {
+                    if self.grid.mode() == GridMode::Alternate {
+                        self.grid.retained_history_line_count()
+                    } else {
+                        0
+                    }
+                },
+                |rows| {
+                    rows.iter()
+                        .take(rows.len().saturating_sub(usize::from(delta.height)))
+                        .filter(|row| !row.wrapped)
+                        .count()
+                },
+            )
+        } else if delta.reset_rows {
+            delta
+                .row_updates
+                .iter()
+                .take(
+                    delta
+                        .row_updates
+                        .len()
+                        .saturating_sub(usize::from(delta.height)),
+                )
+                .filter(|update| !update.row.wrapped)
+                .count()
+        } else {
+            self.grid.retained_history_line_count()
+        };
+        if retained_lines > limits.scrollback_rows {
+            return Err(TerminalGridStreamDeltaError::IncompleteHistory {
+                expected_rows: u32::try_from(retained_lines).unwrap_or(u32::MAX),
+                reconstructed_rows: limits.scrollback_rows,
+            });
+        }
         if delta.reset_rows && delta.mode == "main" {
             let supplied_history = delta
                 .row_updates
                 .len()
                 .saturating_sub(usize::from(delta.height));
-            if supplied_history < usize::try_from(delta.scrollback_rows).unwrap_or(usize::MAX) {
+            if supplied_history != usize::try_from(delta.scrollback_rows).unwrap_or(usize::MAX) {
                 return Err(TerminalGridStreamDeltaError::IncompleteHistory {
                     expected_rows: delta.scrollback_rows,
                     reconstructed_rows: supplied_history,
                 });
             }
         }
-        let mut snapshot = self.snapshot(0, self.grid.height());
-        delta.apply_to_snapshot(&mut snapshot)?;
-        if delta.mode == "alternate"
-            && delta.main_rows.is_none()
-            && self.grid.mode() == GridMode::Alternate
+        Ok(())
+    }
+
+    fn apply_validated_delta(
+        &mut self,
+        delta: &GridDeltaBatch,
+        limits: GridLimits,
+    ) -> Result<(), TerminalGridStreamDeltaError> {
+        // Preserve omitted alternate-screen backing in the initial capture,
+        // rather than materializing a second snapshot of the same state.
+        let preserve_main_history = !delta.reset_rows
+            && delta.mode == "main"
+            && self.grid.mode() == GridMode::Main
+            && self.grid.scrollback_rows_hint() > 0;
+        let snapshot_rows = if preserve_main_history
+            || (delta.mode == "alternate"
+                && delta.main_rows.is_none()
+                && self.grid.mode() == GridMode::Alternate)
         {
-            // Omitted backing means unchanged backing, including retained history.
-            // Keep explicit replacements authoritative; never graft old history
-            // onto a supplied replacement or a different screen's coordinates.
-            snapshot.main_rows = self.snapshot(0, self.grid.main_row_count()).main_rows;
-        }
-        if !delta.reset_rows && snapshot.mode == "main" && snapshot.scrollback_rows > 0 {
-            // Sparse wire indexes address the viewport, not retained history.
-            // Apply them above before restoring the unchanged local prefix so
-            // row zero cannot overwrite the oldest retained history row.
-            let retained_rows = self
-                .grid
-                .height()
-                .saturating_add(self.grid.scrollback_rows_hint());
-            let mut retained = self.snapshot(0, retained_rows).rows;
-            retained.truncate(retained.len().saturating_sub(self.grid.height()));
+            self.grid.main_row_count()
+        } else {
+            self.grid.height()
+        };
+        let mut snapshot = self.snapshot(0, snapshot_rows);
+        // Sparse indexes are viewport-relative. Separate the history before
+        // applying updates, then restore it without capturing the grid again.
+        let mut retained = if preserve_main_history {
+            let viewport = snapshot
+                .rows
+                .split_off(snapshot.rows.len().saturating_sub(self.grid.height()));
+            std::mem::replace(&mut snapshot.rows, viewport)
+        } else {
+            Vec::new()
+        };
+        delta.apply_to_snapshot(&mut snapshot)?;
+        if preserve_main_history {
             retained.append(&mut snapshot.rows);
             snapshot.rows = retained;
         }
@@ -213,12 +289,27 @@ impl TerminalGridStream {
         if bytes.is_empty() {
             return None;
         }
-        let before = self.snapshot(0, self.grid.height());
+        let before_rows = if self.grid.mode() == GridMode::Alternate {
+            self.grid.main_row_count()
+        } else {
+            self.grid.height()
+        };
+        let before = self.snapshot(0, before_rows);
         self.process(bytes);
         if self.grid.revision() == before.revision {
             return None;
         }
-        let after = self.snapshot(0, self.grid.height());
+        let replacement_history = self.grid.mode() == GridMode::Main
+            && (before.mode != "main"
+                || usize::try_from(before.scrollback_rows).ok()
+                    != Some(self.grid.scrollback_rows_hint())
+                || before.total_scrolled_rows != Some(self.grid.total_scrolled_rows()));
+        let rows = if replacement_history || self.grid.mode() == GridMode::Alternate {
+            self.grid.main_row_count()
+        } else {
+            self.grid.height()
+        };
+        let after = self.snapshot(0, rows);
         GridDeltaBatch::between(&before, &after)
     }
 
@@ -249,7 +340,9 @@ impl TerminalGridStream {
         }
         let before = self.snapshot(0, self.grid.height());
         self.grid.resize(width, height)?;
-        let after = self.snapshot(0, self.grid.height());
+        // Resizing can reflow or move retained rows into the viewport. A
+        // replacement must carry that backing, not only the visible tail.
+        let after = self.snapshot(0, self.grid.main_row_count());
         Ok(GridDeltaBatch::between(&before, &after))
     }
 }
@@ -924,7 +1017,7 @@ mod tests {
         let before = producer.snapshot(0, 3);
         let delta = producer.process_delta(b"31mred").unwrap();
         let after = producer.snapshot(0, 3);
-        for invalid in 0..9 {
+        for invalid in 0..15 {
             let mut malformed = delta.clone();
             match invalid {
                 0 => malformed.width = 0,
@@ -938,6 +1031,18 @@ mod tests {
                     assert!(!malformed.reset_rows);
                     malformed.scrollback_rows += 1;
                 }
+                8 => {
+                    assert!(!malformed.reset_rows);
+                    malformed.row_updates[0].row_index = u32::MAX;
+                }
+                9 => {
+                    assert!(!malformed.reset_rows);
+                    malformed.row_updates.push(malformed.row_updates[0].clone());
+                }
+                10 => malformed.width += 1,
+                11 => malformed.height += 1,
+                12 => malformed.mode = "main".to_string(),
+                13 => malformed.total_scrolled_rows = Some(before.total_scrolled_rows.unwrap() + 1),
                 _ => {
                     malformed.reset_rows = true;
                     assert!(!malformed.row_updates.is_empty());
@@ -961,6 +1066,509 @@ mod tests {
             expected.process(b"\x1b[?1049l!");
             assert_eq!(consumer.snapshot(0, 3), expected.snapshot(0, 3));
         }
+    }
+
+    #[test]
+    fn omitted_hidden_backing_obeys_receiver_retention() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(12, 2, limits).unwrap();
+        producer.process(b"one\r\ntwo\r\nthree\r\nfour\x1b[?1049halt");
+        let before = producer.snapshot(0, producer.grid().main_row_count());
+        let mut replica = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        producer.process(b"!");
+        let after = producer.snapshot(0, producer.grid().main_row_count());
+        let delta = crate::GridDeltaBatch::between(&before, &after).unwrap();
+        assert!(delta.main_rows.is_none());
+        let history = before.main_rows.as_ref().unwrap().len() - usize::from(before.height);
+        assert!(history > 0);
+        assert!(matches!(
+            replica.apply_delta(
+                &delta,
+                GridLimits {
+                    scrollback_rows: history - 1
+                }
+            ),
+            Err(crate::TerminalGridStreamDeltaError::IncompleteHistory { .. })
+        ));
+        assert_eq!(replica.snapshot(0, replica.grid().main_row_count()), before);
+        replica
+            .apply_delta(
+                &delta,
+                GridLimits {
+                    scrollback_rows: history,
+                },
+            )
+            .unwrap();
+        assert_eq!(replica.snapshot(0, replica.grid().main_row_count()), after);
+    }
+
+    #[test]
+    fn zero_history_limit_replicates_split_wide_text() {
+        let limits = GridLimits { scrollback_rows: 0 };
+        let input = "\x1b[31m界界界界界e\u{301}\x1b[?1049halt\x1b[?1049l界".as_bytes();
+        for split in 0..=input.len() {
+            let mut producer = TerminalGridStream::new(3, 2, limits).unwrap();
+            let mut replica = TerminalGridStream::new(3, 2, limits).unwrap();
+            let mut raw = TerminalGridStream::new(3, 2, limits).unwrap();
+            for (bytes, width) in [(&input[..split], 2), (&input[split..], 7)] {
+                raw.process(bytes);
+                if let Some(delta) = producer.process_delta(bytes) {
+                    replica.apply_delta(&delta, limits).unwrap();
+                }
+                assert_eq!(
+                    replica.snapshot(0, replica.grid().main_row_count()),
+                    producer.snapshot(0, producer.grid().main_row_count()),
+                    "split {split}"
+                );
+                assert_eq!(
+                    producer.snapshot(0, producer.grid().main_row_count()),
+                    raw.snapshot(0, raw.grid().main_row_count())
+                );
+                raw.resize(width, 2).unwrap();
+                let delta = producer.resize_delta(width, 2).unwrap().unwrap();
+                replica.apply_delta(&delta, limits).unwrap();
+                assert_eq!(
+                    replica.snapshot(0, replica.grid().main_row_count()),
+                    producer.snapshot(0, producer.grid().main_row_count()),
+                    "split {split}, width {width}"
+                );
+                assert_eq!(
+                    producer.snapshot(0, producer.grid().main_row_count()),
+                    raw.snapshot(0, raw.grid().main_row_count())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_history_limit_preserves_unfinished_wrapped_line() {
+        let limits = GridLimits { scrollback_rows: 0 };
+        let mut producer = TerminalGridStream::new(3, 2, limits).unwrap();
+        let mut replica = TerminalGridStream::new(3, 2, limits).unwrap();
+        for bytes in [
+            b"abcdefghijkl".as_slice(),
+            b"m",
+            b"\x1b[?1049halt",
+            b"!",
+            b"\x1b[?1049l",
+        ] {
+            let delta = producer.process_delta(bytes).unwrap();
+            replica.apply_delta(&delta, limits).unwrap();
+            assert_eq!(
+                replica.snapshot(0, replica.grid().main_row_count()),
+                producer.snapshot(0, producer.grid().main_row_count())
+            );
+        }
+        assert!(producer.grid().scrollback_rows_hint() > 0);
+        assert_eq!(producer.grid().retained_history_line_count(), 0);
+        for width in [2, 12] {
+            let delta = producer.resize_delta(width, 2).unwrap().unwrap();
+            replica.apply_delta(&delta, limits).unwrap();
+            assert_eq!(
+                replica.snapshot(0, replica.grid().main_row_count()),
+                producer.snapshot(0, producer.grid().main_row_count())
+            );
+        }
+        let delta = producer.process_delta(b"\r\nnext\r\nlast").unwrap();
+        replica.apply_delta(&delta, limits).unwrap();
+        assert_eq!(
+            replica.snapshot(0, replica.grid().main_row_count()),
+            producer.snapshot(0, producer.grid().main_row_count())
+        );
+        assert_eq!(producer.grid().scrollback_rows_hint(), 0);
+    }
+
+    #[test]
+    fn wrapped_hidden_history_uses_logical_retention_limit() {
+        let limits = GridLimits { scrollback_rows: 2 };
+        let mut producer = TerminalGridStream::new(12, 2, limits).unwrap();
+        producer.process(b"first-line\r\nsecond-line\r\nthird\r\nfourth");
+        producer.resize(3, 2).unwrap();
+        assert!(producer.grid().scrollback_rows_hint() > limits.scrollback_rows);
+        let before = producer.snapshot(0, producer.grid().main_row_count());
+        let mut replica = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        for bytes in [b"\x1b[?1049halt".as_slice(), b"!", b"\x1b[?1049l"] {
+            let delta = producer.process_delta(bytes).unwrap();
+            if bytes == b"!" {
+                assert!(delta.main_rows.is_none());
+            }
+            let unchanged = replica.snapshot(0, replica.grid().main_row_count());
+            assert!(matches!(
+                replica.apply_delta(&delta, GridLimits { scrollback_rows: 0 }),
+                Err(crate::TerminalGridStreamDeltaError::IncompleteHistory { .. })
+            ));
+            assert_eq!(
+                replica.snapshot(0, replica.grid().main_row_count()),
+                unchanged
+            );
+            replica.apply_delta(&delta, limits).unwrap();
+            assert_eq!(
+                replica.snapshot(0, replica.grid().main_row_count()),
+                producer.snapshot(0, producer.grid().main_row_count())
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_replacement_exceeding_retention_preserves_replica() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(12, 2, limits).unwrap();
+        let before = producer.snapshot(0, 2);
+        let mut replica = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        producer.process(b"one\r\ntwo\r\nthree\r\nfour\x1b[?1049halt");
+        let after = producer.snapshot(0, producer.grid().main_row_count());
+        assert_eq!(after.scrollback_rows, 0);
+        assert!(after.main_rows.as_ref().unwrap().len() > 3);
+        let delta = crate::GridDeltaBatch::between(&before, &after).unwrap();
+        assert!(
+            replica
+                .apply_delta(&delta, GridLimits { scrollback_rows: 1 })
+                .is_err()
+        );
+        assert_eq!(replica.snapshot(0, 2), before);
+        let exact_limits = GridLimits {
+            scrollback_rows: after.main_rows.as_ref().unwrap().len() - usize::from(after.height),
+        };
+        replica.apply_delta(&delta, exact_limits).unwrap();
+        assert_eq!(replica.snapshot(0, replica.grid().main_row_count()), after);
+        producer.process(b"\x1b[?1049l");
+        replica.process(b"\x1b[?1049l");
+        assert_eq!(
+            replica.snapshot(0, replica.grid().main_row_count()),
+            producer.snapshot(0, producer.grid().main_row_count())
+        );
+    }
+
+    #[test]
+    fn replacement_exceeding_receiver_retention_leaves_replica_unchanged() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(12, 2, limits).unwrap();
+        let before = producer.snapshot(0, 2);
+        let mut replica = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        producer.process(b"one\r\ntwo\r\nthree\r\nfour");
+        let after = producer.snapshot(0, producer.grid().main_row_count());
+        let delta = crate::GridDeltaBatch::between(&before, &after).unwrap();
+        assert!(
+            replica
+                .apply_delta(&delta, GridLimits { scrollback_rows: 1 })
+                .is_err()
+        );
+        assert_eq!(replica.snapshot(0, 2), before);
+        let exact_limits = GridLimits {
+            scrollback_rows: usize::try_from(after.scrollback_rows).unwrap(),
+        };
+        replica.apply_delta(&delta, exact_limits).unwrap();
+        assert_eq!(replica.snapshot(0, replica.grid().main_row_count()), after);
+
+        // Successful hydration must install the receiver's limit, not retain
+        // the larger limit with which the replica was originally constructed.
+        let mut expected = TerminalGridStream::from_snapshot(&after, exact_limits).unwrap();
+        replica.process(b"\r\nfive");
+        expected.process(b"\r\nfive");
+        let actual = replica.snapshot(0, replica.grid().main_row_count());
+        assert_eq!(actual.scrollback_rows, after.scrollback_rows);
+        assert_eq!(
+            actual,
+            expected.snapshot(0, expected.grid().main_row_count())
+        );
+        for bytes in [b"\r\nsix".as_slice(), b"\r\nseven", b"!"] {
+            let delta = expected.process_delta(bytes).unwrap();
+            replica.apply_delta(&delta, exact_limits).unwrap();
+            let actual = replica.snapshot(0, replica.grid().main_row_count());
+            assert_eq!(actual.scrollback_rows, after.scrollback_rows);
+            assert_eq!(
+                actual,
+                expected.snapshot(0, expected.grid().main_row_count())
+            );
+        }
+        for (width, height) in [(3, 2), (12, 4), (12, 2)] {
+            let delta = expected.resize_delta(width, height).unwrap().unwrap();
+            replica.apply_delta(&delta, exact_limits).unwrap();
+            assert_eq!(
+                replica.snapshot(0, replica.grid().main_row_count()),
+                expected.snapshot(0, expected.grid().main_row_count())
+            );
+            let delta = expected.process_delta(b"\r\nnext").unwrap();
+            replica.apply_delta(&delta, exact_limits).unwrap();
+            assert_eq!(
+                replica.snapshot(0, replica.grid().main_row_count()),
+                expected.snapshot(0, expected.grid().main_row_count())
+            );
+        }
+    }
+
+    #[test]
+    fn understated_replacement_history_obeys_receiver_retention() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(12, 2, limits).unwrap();
+        let before = producer.snapshot(0, 2);
+        let mut replica = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        producer.process(b"one\r\ntwo\r\nthree\r\nfour");
+        let after = producer.snapshot(0, producer.grid().main_row_count());
+        let valid = crate::GridDeltaBatch::between(&before, &after).unwrap();
+        let mut understated = valid.clone();
+        understated.scrollback_rows = 1;
+        assert!(matches!(
+            replica.apply_delta(&understated, GridLimits { scrollback_rows: 1 }),
+            Err(crate::TerminalGridStreamDeltaError::IncompleteHistory { .. })
+        ));
+        assert_eq!(replica.snapshot(0, 2), before);
+        assert!(matches!(
+            replica.apply_delta(&understated, limits),
+            Err(crate::TerminalGridStreamDeltaError::IncompleteHistory {
+                expected_rows: 1,
+                reconstructed_rows: 2,
+            })
+        ));
+        assert_eq!(replica.snapshot(0, 2), before);
+        replica.apply_delta(&valid, limits).unwrap();
+        assert_eq!(replica.snapshot(0, replica.grid().main_row_count()), after);
+    }
+
+    #[test]
+    fn complete_scrolling_replacement_then_sparse_update_preserves_history() {
+        let limits = GridLimits { scrollback_rows: 2 };
+        let mut producer = TerminalGridStream::new(12, 2, limits).unwrap();
+        producer.process(b"one\r\ntwo\r\nthree\r\nfour");
+        let before = producer.snapshot(0, producer.grid().main_row_count());
+        let mut replica = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        producer.process(b"\r\nfive");
+        let after = producer.snapshot(0, producer.grid().main_row_count());
+        let replacement = crate::GridDeltaBatch::between(&before, &after).unwrap();
+        assert!(replacement.reset_rows);
+        replica.apply_delta(&replacement, limits).unwrap();
+        assert_eq!(replica.snapshot(0, replica.grid().main_row_count()), after);
+        let sparse = producer.process_delta(b"\x1b[1;1Hupdated").unwrap();
+        assert!(!sparse.reset_rows);
+        replica.apply_delta(&sparse, limits).unwrap();
+        assert_eq!(
+            replica.snapshot(0, replica.grid().main_row_count()),
+            producer.snapshot(0, producer.grid().main_row_count())
+        );
+    }
+
+    #[test]
+    fn sparse_viewport_updates_preserve_wrapped_styled_history() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(8, 3, limits).unwrap();
+        producer.process(
+            "\x1b[31mhistory界abcdefgh\x1b[0m\r\nsecond\r\nthird\r\nfourth\r\nfifth".as_bytes(),
+        );
+        let baseline = producer.snapshot(0, producer.grid().main_row_count());
+        let history_len = baseline.rows.len() - 3;
+        assert!(history_len > 0);
+        assert!(baseline.rows[..history_len].iter().any(|row| row.wrapped));
+        let mut replica = TerminalGridStream::from_snapshot(&baseline, limits).unwrap();
+        for bytes in [
+            b"\x1b[1;1H\x1b[32mTOP".as_slice(),
+            b"\x1b[3;1H\x1b[34mBOTTOM".as_slice(),
+        ] {
+            let delta = producer.process_delta(bytes).unwrap();
+            assert!(!delta.reset_rows);
+            replica.apply_delta(&delta, limits).unwrap();
+            let actual = replica.snapshot(0, replica.grid().main_row_count());
+            assert_eq!(&actual.rows[..history_len], &baseline.rows[..history_len]);
+            assert_eq!(
+                actual,
+                producer.snapshot(0, producer.grid().main_row_count())
+            );
+        }
+    }
+
+    #[test]
+    fn alternate_resize_deltas_preserve_backing_through_exit() {
+        let limits = GridLimits {
+            scrollback_rows: 20,
+        };
+        let mut producer = TerminalGridStream::new(12, 2, limits).unwrap();
+        producer.process(b"first line\r\nsecond line\r\nthird line\r\nfourth line\x1b[?1049halt");
+        let baseline = producer.snapshot(0, producer.grid().main_row_count());
+        let mut replica = TerminalGridStream::from_snapshot(&baseline, limits).unwrap();
+        for (width, height) in [(6, 2), (16, 3), (12, 1), (12, 2)] {
+            let delta = producer.resize_delta(width, height).unwrap().unwrap();
+            replica.apply_delta(&delta, limits).unwrap();
+            assert_eq!(
+                replica.snapshot(0, replica.grid().main_row_count()),
+                producer.snapshot(0, producer.grid().main_row_count())
+            );
+        }
+        let exit = producer.process_delta(b"\x1b[?1049l").unwrap();
+        let after_exit = producer.snapshot(0, producer.grid().main_row_count());
+        replica.apply_delta(&exit, limits).unwrap();
+        assert_eq!(
+            replica.snapshot(0, replica.grid().main_row_count()),
+            after_exit
+        );
+        let update = producer.process_delta(b"!").unwrap();
+        replica.apply_delta(&update, limits).unwrap();
+        assert_eq!(
+            replica.snapshot(0, replica.grid().main_row_count()),
+            producer.snapshot(0, producer.grid().main_row_count())
+        );
+    }
+
+    #[test]
+    fn resize_delta_with_history_applies_without_snapshot_recovery() {
+        let limits = GridLimits::default();
+        for (width, height) in [(6, 2), (16, 3), (12, 1)] {
+            let mut producer = TerminalGridStream::new(12, 2, limits).unwrap();
+            producer.process(b"first line\r\nsecond line\r\nthird line\r\nfourth line");
+            let baseline = producer.snapshot(0, producer.grid().main_row_count());
+            let mut replica = TerminalGridStream::from_snapshot(&baseline, limits).unwrap();
+            let delta = producer.resize_delta(width, height).unwrap().unwrap();
+            replica.apply_delta(&delta, limits).unwrap();
+            let complete = producer.snapshot(0, producer.grid().main_row_count());
+            assert_eq!(
+                replica.snapshot(0, replica.grid().main_row_count()),
+                complete
+            );
+        }
+    }
+
+    #[test]
+    fn scrolling_at_retention_limit_applies_without_recovery() {
+        let limits = GridLimits { scrollback_rows: 2 };
+        let mut producer = TerminalGridStream::new(12, 2, limits).unwrap();
+        producer.process(b"one\r\ntwo\r\nthree\r\nfour");
+        let baseline = producer.snapshot(0, producer.grid().main_row_count());
+        assert_eq!(baseline.scrollback_rows, 2);
+        let mut replica = TerminalGridStream::from_snapshot(&baseline, limits).unwrap();
+        let delta = producer.process_delta(b"\r\nfive").unwrap();
+        assert_eq!(delta.scrollback_rows, baseline.scrollback_rows);
+        assert_ne!(delta.total_scrolled_rows, baseline.total_scrolled_rows);
+        assert!(delta.reset_rows);
+        replica.apply_delta(&delta, limits).unwrap();
+        let complete = producer.snapshot(0, producer.grid().main_row_count());
+        assert_ne!(complete.rows, baseline.rows);
+        assert_eq!(
+            replica.snapshot(0, replica.grid().main_row_count()),
+            complete
+        );
+    }
+
+    #[test]
+    fn every_split_replicates_scrolling_and_screen_transitions() {
+        let limits = GridLimits { scrollback_rows: 3 };
+        let bytes =
+            "first\r\n\x1b[31m界é\x1b[0m\r\nthird\r\nfourth\r\nfifth\x1b[?1049halt\x1b[?1049l!"
+                .as_bytes();
+        let mut whole = TerminalGridStream::new(8, 2, limits).unwrap();
+        whole.process(bytes);
+        let expected = whole.snapshot(0, whole.grid().main_row_count());
+        for split in 0..=bytes.len() {
+            let mut producer = TerminalGridStream::new(8, 2, limits).unwrap();
+            let mut replica = TerminalGridStream::new(8, 2, limits).unwrap();
+            for chunk in [&bytes[..split], &bytes[split..]] {
+                if let Some(delta) = producer.process_delta(chunk) {
+                    replica.apply_delta(&delta, limits).unwrap();
+                }
+                assert_eq!(
+                    replica.snapshot(0, replica.grid().main_row_count()),
+                    producer.snapshot(0, producer.grid().main_row_count()),
+                    "split {split}"
+                );
+            }
+            assert_eq!(
+                replica.snapshot(0, replica.grid().main_row_count()),
+                expected
+            );
+        }
+        for chunk_size in 1..=bytes.len() {
+            let mut producer = TerminalGridStream::new(8, 2, limits).unwrap();
+            let mut replica = TerminalGridStream::new(8, 2, limits).unwrap();
+            for chunk in bytes.chunks(chunk_size) {
+                if let Some(delta) = producer.process_delta(chunk) {
+                    let encoded = serde_json::to_vec(&delta).unwrap();
+                    let decoded = serde_json::from_slice(&encoded).unwrap();
+                    replica.apply_delta(&decoded, limits).unwrap();
+                    let accepted = replica.snapshot(0, replica.grid().main_row_count());
+                    assert!(matches!(
+                        replica.apply_delta(&decoded, limits),
+                        Err(super::TerminalGridStreamDeltaError::Delta(
+                            crate::GridDeltaApplyError::RevisionMismatch { .. }
+                        ))
+                    ));
+                    assert_eq!(
+                        replica.snapshot(0, replica.grid().main_row_count()),
+                        accepted
+                    );
+                }
+                assert_eq!(
+                    replica.snapshot(0, replica.grid().main_row_count()),
+                    producer.snapshot(0, producer.grid().main_row_count()),
+                    "chunk size {chunk_size}"
+                );
+            }
+            // Prefix-only chunks advance replication without changing content.
+            // Compare presentation with the unsplit stream independently of that
+            // chunk-dependent replication counter; per-chunk checks above are exact.
+            let mut actual = replica.snapshot(0, replica.grid().main_row_count());
+            actual.revision = expected.revision;
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn missing_update_recovers_pending_sequence_from_wire_snapshot() {
+        let limits = GridLimits { scrollback_rows: 3 };
+        let mut producer = TerminalGridStream::new(8, 2, limits).unwrap();
+        let mut replica = TerminalGridStream::new(8, 2, limits).unwrap();
+        let initial = replica.snapshot(0, 2);
+        let missing = producer.process_delta(b"one\r\ntwo\r\nthree").unwrap();
+        let later = producer.process_delta(b"\x1b[?1049halt\x1b[31").unwrap();
+        assert!(replica.apply_delta(&later, limits).is_err());
+        assert_eq!(replica.snapshot(0, 2), initial);
+        let resize = producer.resize_delta(5, 3).unwrap().unwrap();
+        assert!(replica.apply_delta(&resize, limits).is_err());
+        assert_eq!(replica.snapshot(0, 2), initial);
+        let mut replay = TerminalGridStream::from_snapshot(&initial, limits).unwrap();
+        for delta in [&missing, &later, &resize] {
+            replay.apply_delta(delta, limits).unwrap();
+        }
+        assert_eq!(
+            replay.snapshot(0, replay.grid().main_row_count()),
+            producer.snapshot(0, producer.grid().main_row_count())
+        );
+        let recovery = producer.snapshot(0, producer.grid().main_row_count());
+        assert!(!recovery.pending_bytes.is_empty());
+        let wire = serde_json::to_vec(&recovery).unwrap();
+        let decoded = serde_json::from_slice(&wire).unwrap();
+        replica = TerminalGridStream::from_snapshot(&decoded, limits).unwrap();
+        assert!(replica.apply_delta(&missing, limits).is_err());
+        assert_eq!(
+            replica.snapshot(0, replica.grid().main_row_count()),
+            recovery
+        );
+        for bytes in [b"mred".as_slice(), b"\x1b[?1049l", b"\r\nfour"] {
+            let delta = producer.process_delta(bytes).unwrap();
+            replica.apply_delta(&delta, limits).unwrap();
+            assert_eq!(
+                replica.snapshot(0, replica.grid().main_row_count()),
+                producer.snapshot(0, producer.grid().main_row_count())
+            );
+        }
+    }
+
+    #[test]
+    fn scrolling_delta_then_sparse_update_preserves_history() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(12, 2, limits).unwrap();
+        producer.process(b"first\r\nsecond");
+        let baseline = producer.snapshot(0, 2);
+        let mut replica = TerminalGridStream::from_snapshot(&baseline, limits).unwrap();
+        let delta = producer.process_delta(b"\r\nthird").unwrap();
+        replica.apply_delta(&delta, limits).unwrap();
+        let complete = producer.snapshot(0, producer.grid().main_row_count());
+        assert_eq!(
+            replica.snapshot(0, replica.grid().main_row_count()),
+            complete
+        );
+        let delta = producer.process_delta(b"!").unwrap();
+        replica.apply_delta(&delta, limits).unwrap();
+        assert_eq!(
+            replica.snapshot(0, replica.grid().main_row_count()),
+            producer.snapshot(0, producer.grid().main_row_count())
+        );
     }
 
     #[test]
@@ -1432,7 +2040,8 @@ mod tests {
         producer.process(b"old\r\nretained\r\nlive");
         let before = producer.snapshot(0, 3);
         let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
-        let delta = producer.process_delta(b"\r\nnext").unwrap();
+        producer.process(b"\r\nnext");
+        let delta = crate::GridDeltaBatch::between(&before, &producer.snapshot(0, 2)).unwrap();
         assert_eq!(delta.scrollback_rows, before.scrollback_rows);
         assert_ne!(delta.total_scrolled_rows, before.total_scrolled_rows);
         assert!(delta.reset_rows);
@@ -1582,7 +2191,8 @@ mod tests {
         producer.process(&[b'x'; 40]);
         let before = producer.snapshot(0, 2);
         let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
-        let delta = producer.process_delta(b"x").unwrap();
+        producer.process(b"x");
+        let delta = crate::GridDeltaBatch::between(&before, &producer.snapshot(0, 2)).unwrap();
         assert!(delta.scrollback_rows > 0);
         assert!(matches!(
             consumer.apply_delta(&delta, limits),

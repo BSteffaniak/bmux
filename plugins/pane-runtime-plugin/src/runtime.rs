@@ -552,6 +552,37 @@ impl std::io::Write for EncodedByteCount {
     }
 }
 
+fn acknowledge_grid_snapshots(
+    client_id: ClientId,
+    updates: &mut [(Arc<std::sync::Mutex<OutputFanoutBuffer>>, u64)],
+) -> Result<(), SessionRuntimeError> {
+    // Concurrent multi-pane snapshots must acquire locks in the same order.
+    updates.sort_unstable_by_key(|(output, _)| Arc::as_ptr(output));
+    // Locking the same non-reentrant mutex twice would deadlock. Reject an
+    // aliased batch before acquiring locks or acknowledging any output.
+    if updates
+        .windows(2)
+        .any(|pair| Arc::ptr_eq(&pair[0].0, &pair[1].0))
+    {
+        return Err(SessionRuntimeError::Closed);
+    }
+    let mut guards = Vec::with_capacity(updates.len());
+    for (output, offset) in updates.iter() {
+        guards.push((
+            output.lock().map_err(|_| SessionRuntimeError::Closed)?,
+            *offset,
+        ));
+    }
+    // Acquire every lock before mutating any cursor: poison must not commit
+    // only a prefix of a response that will never reach the caller.
+    // Retain every guard until all updates are applied, so readers cannot
+    // observe a committed cursor while another cursor is still unchanged.
+    for (output, offset) in &mut guards {
+        output.acknowledge_snapshot(client_id, *offset);
+    }
+    Ok(())
+}
+
 fn encode_grid_window(
     snapshot: &bmux_terminal_grid::GridSnapshot,
     remaining: &mut usize,
@@ -1763,6 +1794,18 @@ struct TerminalGridDeltaLog {
 impl TerminalGridDeltaLog {
     #[cfg(test)]
     fn push(&mut self, delta: GridDeltaBatch) {
+        if delta.revision <= delta.base_revision
+            || self
+                .batches
+                .back()
+                .is_some_and(|previous| previous.revision != delta.base_revision)
+        {
+            self.batches.clear();
+            self.estimated_bytes = 0;
+        }
+        if delta.revision <= delta.base_revision {
+            return;
+        }
         let estimated = estimate_terminal_grid_delta_bytes(&delta);
         if estimated > MAX_TERMINAL_GRID_DELTA_BYTES {
             self.batches.clear();
@@ -2752,6 +2795,7 @@ impl OutputFanoutBuffer {
         self.cursors.remove(&client_id);
     }
 
+    #[cfg(test)]
     fn set_client_cursor(&mut self, client_id: ClientId, offset: u64) {
         let clamped = offset.clamp(self.start_offset, self.end_offset());
         self.cursors.insert(client_id, clamped);
@@ -2763,7 +2807,10 @@ impl OutputFanoutBuffer {
             // this cursor since capture; an acknowledgement cannot register it.
             return;
         };
-        self.set_client_cursor(client_id, current.max(offset));
+        // Do not clamp to the retained start: eviction during encoding must
+        // remain visible as a stream gap on the next raw-output read.
+        self.cursors
+            .insert(client_id, current.max(offset).min(self.end_offset()));
     }
 
     fn push_chunk(&mut self, chunk: &[u8]) {
@@ -7139,13 +7186,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 encoded,
             });
         }
-        // Budget rejection must not consume raw replay for any pane.
-        for (output, stream_end) in cursor_updates {
-            output
-                .lock()
-                .map_err(|_| SessionRuntimeError::Closed)?
-                .acknowledge_snapshot(client_id, stream_end);
-        }
+        acknowledge_grid_snapshots(client_id, &mut cursor_updates)?;
         Ok(bmux_pane_runtime_state::AttachGridSnapshotState { snapshots })
     }
 
@@ -10386,6 +10427,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_grid_delta_log_restarts_at_discontinuities() {
+        let mut log = TerminalGridDeltaLog::default();
+        log.push(test_delta(0, 1, 8));
+        log.push(test_delta(1, 2, 8));
+        let next = test_delta(5, 6, 8);
+        let expected_bytes = estimate_terminal_grid_delta_bytes(&next);
+        log.push(next);
+        assert_eq!(log.batches.len(), 1);
+        assert_eq!(log.estimated_bytes, expected_bytes);
+        assert!(terminal_grid_deltas_reach_revision(&log, 0, 5, 6));
+        assert!(!terminal_grid_deltas_reach_revision(&log, 0, 0, 6));
+        for (base, revision) in [(6, 6), (6, 5)] {
+            log.push(test_delta(base, revision, 8));
+            assert!(log.batches.is_empty());
+            assert_eq!(log.estimated_bytes, 0);
+            log.push(test_delta(5, 6, 8));
+        }
+    }
+
+    #[test]
     fn terminal_grid_delta_budget_counts_hidden_allocation_capacity() {
         let mut delta = test_delta(0, 1, 8);
         delta.main_rows = Some(vec![delta.row_updates[0].row.clone()]);
@@ -10608,6 +10669,33 @@ mod tests {
         let snapshot: bmux_terminal_grid::GridSnapshot =
             serde_json::from_slice(&retry.windows[0].encoded).unwrap();
         assert_eq!(snapshot, expected);
+    }
+
+    #[test]
+    fn alternate_screen_encoding_budget_includes_hidden_main_content() {
+        let mut grid = TerminalGridStream::new(80, 10, GridLimits::default()).unwrap();
+        grid.process(&vec![b'x'; 800]);
+        grid.process(b"\x1b[?1049hsmall");
+        let snapshot = grid.snapshot(0, 10);
+        assert_eq!(snapshot.mode, "alternate");
+        let expected = serde_json::to_vec(&snapshot).unwrap();
+        let mut visible_only = snapshot.clone();
+        visible_only.main_rows = None;
+        let mut remaining = serde_json::to_vec(&visible_only).unwrap().len();
+        assert!(remaining < expected.len());
+        let original_budget = remaining;
+        assert_eq!(
+            encode_grid_window(&snapshot, &mut remaining),
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        );
+        assert_eq!(remaining, original_budget);
+        remaining = expected.len();
+        assert_eq!(
+            encode_grid_window(&snapshot, &mut remaining).unwrap(),
+            expected
+        );
+        assert_eq!(remaining, 0);
+        assert_eq!(grid.snapshot(0, 10), snapshot);
     }
 
     #[test]
@@ -11471,9 +11559,13 @@ mod tests {
             {
                 let mut retained = log.lock().unwrap();
                 retained.batches.clear();
-                retained.push(test_delta(0, 1, 8));
-                retained.push(test_delta(1, revision, 8));
-                retained.push(test_delta(revision, expected.revision, 8));
+                // Inject malformed retention directly; normal insertion now
+                // discards invalid chains before they reach the reader.
+                retained.batches.push_back(test_delta(0, 1, 8));
+                retained.batches.push_back(test_delta(1, revision, 8));
+                retained
+                    .batches
+                    .push_back(test_delta(revision, expected.revision, 8));
             }
             let state = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
                 &adapter,
@@ -12653,6 +12745,114 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_snapshot_commits_preserve_newest_cursors() {
+        let client = ClientId(Uuid::new_v4());
+        let outputs = (0..3)
+            .map(|_| {
+                let mut output = OutputFanoutBuffer::new(1024);
+                output.register_client_at_tail(client);
+                output.push_chunk(b"0123456789");
+                Arc::new(std::sync::Mutex::new(output))
+            })
+            .collect::<Vec<_>>();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = [false, true].map(|reverse| {
+            let mut updates = outputs
+                .iter()
+                .map(|output| (Arc::clone(output), if reverse { 9 } else { 4 }))
+                .collect::<Vec<_>>();
+            if reverse {
+                updates.reverse();
+            }
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                acknowledge_grid_snapshots(client, &mut updates).unwrap();
+            })
+        });
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        for output in &outputs {
+            assert_eq!(output.lock().unwrap().cursors.get(&client), Some(&9));
+        }
+        // A snapshot captured earlier may finish encoding after both commits.
+        let mut stale = outputs
+            .iter()
+            .map(|output| (Arc::clone(output), 2))
+            .collect::<Vec<_>>();
+        acknowledge_grid_snapshots(client, &mut stale).unwrap();
+        for output in outputs {
+            assert_eq!(output.lock().unwrap().cursors.get(&client), Some(&9));
+        }
+    }
+
+    #[test]
+    fn snapshot_cursor_commit_rejects_aliased_outputs_without_mutation() {
+        let client = ClientId(Uuid::new_v4());
+        let mut output = OutputFanoutBuffer::new(1024);
+        output.register_client_at_tail(client);
+        output.push_chunk(b"hello");
+        let output = Arc::new(std::sync::Mutex::new(output));
+        let mut updates = [(Arc::clone(&output), 2), (Arc::clone(&output), 5)];
+        assert_eq!(
+            acknowledge_grid_snapshots(client, &mut updates),
+            Err(SessionRuntimeError::Closed)
+        );
+        assert_eq!(output.lock().unwrap().cursors.get(&client), Some(&0));
+        acknowledge_grid_snapshots(client, &mut updates[..1]).unwrap();
+        assert_eq!(
+            output.lock().unwrap().cursors.get(&client),
+            Some(&updates[0].1)
+        );
+    }
+
+    #[test]
+    fn snapshot_cursor_commit_is_atomic_on_poisoned_output() {
+        let client = ClientId(Uuid::new_v4());
+        let mut updates = (0..2)
+            .map(|_| {
+                let mut output = OutputFanoutBuffer::new(1024);
+                output.register_client_at_tail(client);
+                output.push_chunk(b"hello");
+                (Arc::new(std::sync::Mutex::new(output)), 5)
+            })
+            .collect::<Vec<_>>();
+        updates.sort_unstable_by_key(|(output, _)| Arc::as_ptr(output));
+        let poisoned = Arc::clone(&updates[1].0);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.lock().unwrap();
+                panic!("poison output for atomic commit test");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(
+            acknowledge_grid_snapshots(client, &mut updates),
+            Err(SessionRuntimeError::Closed)
+        );
+        assert_eq!(updates[0].0.lock().unwrap().cursors.get(&client), Some(&0));
+    }
+
+    #[test]
+    fn snapshot_acknowledgement_preserves_eviction_gap() {
+        let client_id = ClientId(Uuid::new_v4());
+        let mut output = OutputFanoutBuffer::new(8);
+        output.register_client_at_tail(client_id);
+        output.push_chunk(b"first");
+        let watermark = output.end_offset();
+        output.push_chunk(b"0123456789abcdef");
+        assert!(output.start_offset > watermark);
+        output.acknowledge_snapshot(client_id, watermark);
+        assert_eq!(output.cursors.get(&client_id), Some(&watermark));
+        let read = output.read_for_client(client_id, 1024);
+        assert!(read.stream_gap);
+        assert_eq!(read.bytes, b"89abcdef");
+        assert!(!output.read_for_client(client_id, 1024).stream_gap);
+    }
+
+    #[test]
     fn snapshot_acknowledgement_preserves_other_clients_unread_output() {
         let first = ClientId(Uuid::new_v4());
         let second = ClientId(Uuid::new_v4());
@@ -12811,6 +13011,28 @@ mod tests {
         assert_eq!(bounded.bytes, b"e");
         assert_eq!(output.start_offset, 2);
         assert_eq!(output.end_offset(), 6);
+    }
+
+    #[test]
+    fn delayed_snapshot_acknowledgement_recovers_after_split_escape() {
+        let client = ClientId(Uuid::new_v4());
+        let mut output = OutputFanoutBuffer::new(8);
+        output.register_client_at_tail(client);
+        output.push_chunk(b"old");
+        let watermark = output.end_offset();
+        output.push_chunk(b"\x1b[48;2;10;");
+        output.push_chunk(b"10;10mOK");
+        assert!(output.start_offset > watermark);
+        output.acknowledge_snapshot(client, watermark);
+        let read = output.read_for_client(client, 1024);
+        assert!(read.stream_gap);
+        assert_eq!(read.bytes, b"OK");
+        assert_eq!(read.stream_start, output.end_offset() - 2);
+        assert_eq!(read.stream_end, output.end_offset());
+        output.push_chunk(b"next");
+        let next = output.read_for_client(client, 1024);
+        assert!(!next.stream_gap);
+        assert_eq!(next.bytes, b"next");
     }
 
     #[test]

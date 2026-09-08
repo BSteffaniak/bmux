@@ -67,7 +67,15 @@ impl GridDeltaBatch {
     /// Build an update only when replication advances and content does not regress.
     #[must_use]
     pub fn between(before: &GridSnapshot, after: &GridSnapshot) -> Option<Self> {
-        if after.revision <= before.revision || after.content_revision < before.content_revision {
+        if after.revision <= before.revision
+            || after.content_revision < before.content_revision
+            || (after.mode == "alternate" && after.scrollback_rows != 0)
+            || after.width == 0
+            || after.height == 0
+            || !matches!(after.mode.as_str(), "main" | "alternate")
+            || after.cursor.row >= after.height
+            || after.cursor.col >= after.width
+        {
             return None;
         }
         let reset_rows = before.width != after.width
@@ -164,6 +172,9 @@ impl GridDeltaBatch {
         if !matches!(self.mode.as_str(), "main" | "alternate") {
             return Err(GridDeltaApplyError::InvalidScreenMode);
         }
+        if self.mode == "alternate" && self.scrollback_rows != 0 {
+            return Err(GridDeltaApplyError::AlternateScrollback);
+        }
         if self.cursor.row >= self.height || self.cursor.col >= self.width {
             return Err(GridDeltaApplyError::InvalidCursor);
         }
@@ -214,6 +225,28 @@ impl GridDeltaBatch {
         Ok(())
     }
 
+    /// Validate sparse indexes before materializing retained state.
+    pub(crate) fn validate_sparse_indexes(
+        &self,
+        row_count: usize,
+    ) -> Result<(), GridDeltaApplyError> {
+        if self.reset_rows {
+            return Ok(());
+        }
+        let mut previous_index = None;
+        for update in &self.row_updates {
+            let index = usize::try_from(update.row_index).unwrap_or(usize::MAX);
+            if index >= row_count {
+                return Err(GridDeltaApplyError::RowIndexOutOfBounds(update.row_index));
+            }
+            if previous_index.is_some_and(|previous| previous >= index) {
+                return Err(GridDeltaApplyError::NonIncreasingRowIndex(update.row_index));
+            }
+            previous_index = Some(index);
+        }
+        Ok(())
+    }
+
     /// Apply this delta to a retained grid snapshot.
     ///
     /// # Errors
@@ -251,17 +284,7 @@ impl GridDeltaBatch {
         } else {
             // Validate the complete batch before mutating any rows so recovery can
             // retry from the unchanged base snapshot after a malformed update.
-            let mut previous_index = None;
-            for update in &self.row_updates {
-                let index = usize::try_from(update.row_index).unwrap_or(usize::MAX);
-                if index >= snapshot.rows.len() {
-                    return Err(GridDeltaApplyError::RowIndexOutOfBounds(update.row_index));
-                }
-                if previous_index.is_some_and(|previous| previous >= index) {
-                    return Err(GridDeltaApplyError::NonIncreasingRowIndex(update.row_index));
-                }
-                previous_index = Some(index);
-            }
+            self.validate_sparse_indexes(snapshot.rows.len())?;
             for update in &self.row_updates {
                 let index = usize::try_from(update.row_index).unwrap_or(usize::MAX);
                 snapshot.rows[index].clone_from(&update.row);
@@ -309,6 +332,8 @@ pub enum GridDeltaApplyError {
     InvalidCursor,
     #[error("grid delta scroll region is empty, reversed, or outside the viewport")]
     InvalidScrollRegion,
+    #[error("alternate-screen grid delta cannot declare scrollback")]
+    AlternateScrollback,
     #[error("grid delta has an unknown screen mode")]
     InvalidScreenMode,
     #[error("grid delta changes screen, dimensions, or scrollback count without replacement rows")]
@@ -335,6 +360,63 @@ pub enum GridDeltaApplyError {
 mod tests {
     use super::*;
     use crate::{GridLimits, TerminalGrid};
+
+    #[test]
+    fn between_rejects_invalid_target_geometry() {
+        let mut grid = TerminalGrid::new(10, 3, GridLimits::default()).unwrap();
+        let before = grid.snapshot(0, 3);
+        grid.process(b"updated");
+        let after = grid.snapshot(0, 3);
+        let mut invalid = after.clone();
+        invalid.width = 0;
+        assert!(GridDeltaBatch::between(&before, &invalid).is_none());
+        invalid = after.clone();
+        invalid.height = 0;
+        assert!(GridDeltaBatch::between(&before, &invalid).is_none());
+        invalid = after.clone();
+        invalid.mode = "unknown".into();
+        assert!(GridDeltaBatch::between(&before, &invalid).is_none());
+        invalid = after.clone();
+        invalid.cursor.row = after.height;
+        assert!(GridDeltaBatch::between(&before, &invalid).is_none());
+        invalid = after.clone();
+        invalid.cursor.col = after.width;
+        assert!(GridDeltaBatch::between(&before, &invalid).is_none());
+        let mut replica = before.clone();
+        GridDeltaBatch::between(&before, &after)
+            .unwrap()
+            .apply_to_snapshot(&mut replica)
+            .unwrap();
+        assert_eq!(replica, after);
+    }
+
+    #[test]
+    fn alternate_scrollback_is_rejected_without_mutation() {
+        let limits = GridLimits::default();
+        let mut producer = crate::TerminalGridStream::new(10, 3, limits).unwrap();
+        let before = producer.snapshot(0, 3);
+        producer.process(b"\x1b[?1049halt");
+        let after = producer.snapshot(0, 3);
+        let valid = GridDeltaBatch::between(&before, &after).unwrap();
+        let mut inconsistent = after.clone();
+        inconsistent.scrollback_rows = 1;
+        assert!(GridDeltaBatch::between(&before, &inconsistent).is_none());
+        let mut invalid = valid.clone();
+        invalid.scrollback_rows = 1;
+        let mut snapshot = before.clone();
+        assert_eq!(
+            invalid.apply_to_snapshot(&mut snapshot),
+            Err(GridDeltaApplyError::AlternateScrollback)
+        );
+        assert_eq!(snapshot, before);
+        let mut stream = crate::TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        assert!(stream.apply_delta(&invalid, limits).is_err());
+        assert_eq!(stream.snapshot(0, 3), before);
+        valid.apply_to_snapshot(&mut snapshot).unwrap();
+        stream.apply_delta(&valid, limits).unwrap();
+        assert_eq!(snapshot, after);
+        assert_eq!(stream.snapshot(0, 3), after);
+    }
 
     #[test]
     fn between_rejects_content_regression_but_allows_metadata_only_updates() {
