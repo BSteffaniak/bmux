@@ -552,6 +552,20 @@ impl std::io::Write for EncodedByteCount {
     }
 }
 
+fn encode_grid_window(
+    snapshot: &bmux_terminal_grid::GridSnapshot,
+    remaining: &mut usize,
+) -> Result<Vec<u8>, SessionRuntimeError> {
+    let mut count = EncodedByteCount(0, *remaining);
+    serde_json::to_writer(&mut count, snapshot)
+        .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
+    let encoded = serde_json::to_vec(snapshot).map_err(|_| SessionRuntimeError::Closed)?;
+    *remaining = remaining
+        .checked_sub(encoded.len())
+        .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+    Ok(encoded)
+}
+
 #[derive(Debug, Clone, Default)]
 struct PaneResurrectionRuntime {
     active_command: Option<String>,
@@ -7129,6 +7143,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             .map(|pane| (pane.pane_id, pane))
             .collect::<BTreeMap<_, _>>();
         let mut snapshots = Vec::new();
+        let mut remaining = RESPONSE_OUTPUT_BUDGET;
         for window in windows {
             let Some(pane) = pane_by_id.get(&window.pane_id) else {
                 continue;
@@ -7196,7 +7211,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                         .end_offset(),
                 )
             };
-            let encoded = serde_json::to_vec(&snapshot).map_err(|_| SessionRuntimeError::Closed)?;
+            let encoded = encode_grid_window(&snapshot, &mut remaining)?;
             snapshots.push(bmux_pane_runtime_state::AttachPaneGridWindow {
                 pane_id: window.pane_id,
                 scrollback_offset: adjusted_offset,
@@ -10441,6 +10456,63 @@ mod tests {
     }
 
     #[test]
+    fn terminal_grid_delta_recovery_distinguishes_deferral_from_oversized_payload() {
+        let mut log = TerminalGridDeltaLog::default();
+        log.push(test_delta(3, 4, 8));
+        assert_eq!(
+            terminal_grid_delta_recovery_position(&log, 0, 0, 3, 4),
+            (3, false)
+        );
+        // The batch is retained and small in memory, but JSON escapes each
+        // control character to six bytes, exceeding even a fresh response.
+        let mut oversized = test_delta(4, 5, 0);
+        oversized.row_updates[0].row.runs[0].text =
+            "\u{0001}".repeat(RESPONSE_OUTPUT_BUDGET / 6 + 1);
+        assert!(estimate_terminal_grid_delta_bytes(&oversized) < RESPONSE_OUTPUT_BUDGET);
+        log.push(oversized);
+        assert_eq!(log.batches.len(), 2);
+        for remaining in [0, RESPONSE_OUTPUT_BUDGET / 2, RESPONSE_OUTPUT_BUDGET] {
+            assert!(select_terminal_grid_deltas(&log, 1, 1, remaining).is_empty());
+            assert_eq!(
+                terminal_grid_delta_recovery_position(&log, 1, remaining, 4, 5),
+                (5, true)
+            );
+        }
+        // Recovery is based on the requested batch, not an earlier small one.
+        assert_eq!(
+            terminal_grid_delta_recovery_position(&log, 0, 0, 3, 5),
+            (3, false)
+        );
+    }
+
+    #[test]
+    fn grid_window_encoding_enforces_shared_budget_without_truncation() {
+        let mut grid = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        grid.process(b"hello");
+        let snapshot = grid.snapshot(0, 2);
+        let expected = serde_json::to_vec(&snapshot).unwrap();
+        let mut remaining = expected.len() * 2;
+        for _ in 0..2 {
+            assert_eq!(
+                encode_grid_window(&snapshot, &mut remaining).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            encode_grid_window(&snapshot, &mut remaining),
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        );
+        remaining = expected.len() - 1;
+        assert_eq!(
+            encode_grid_window(&snapshot, &mut remaining),
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        );
+        assert_eq!(remaining, expected.len() - 1);
+        assert_eq!(grid.snapshot(0, 2), snapshot);
+    }
+
+    #[test]
     fn terminal_grid_delta_selection_respects_response_budget() {
         let mut log = TerminalGridDeltaLog::default();
         log.push(test_delta(0, 1, 8));
@@ -11064,6 +11136,68 @@ mod tests {
         assert!(retry.deltas[0].encoded.is_empty());
         assert!(!retry.deltas[1].desynced);
         assert!(!retry.deltas[1].encoded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_grid_oversized_delta_recovers_through_snapshot() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        set_pane_grid(pane, 10, 2);
+        let delta = pane
+            .terminal_grid
+            .lock()
+            .unwrap()
+            .process_delta(b"hello")
+            .unwrap();
+        let expected = pane.terminal_grid.lock().unwrap().snapshot(0, 2);
+        // Inject a retained batch whose encoded size requires snapshot recovery.
+        // The canonical grid remains small so the recovery snapshot is usable.
+        let mut oversized = test_delta(delta.base_revision, delta.revision, 0);
+        oversized.row_updates[0].row.runs[0].text =
+            "\u{0001}".repeat(RESPONSE_OUTPUT_BUDGET / 6 + 1);
+        push_terminal_grid_delta(&pane.terminal_grid_deltas, oversized);
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let response = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[pane_id],
+            &[delta.base_revision],
+            1,
+        )
+        .unwrap();
+        assert_eq!(response.deltas.len(), 1);
+        assert!(response.deltas[0].desynced);
+        assert_eq!(response.deltas[0].revision, expected.revision);
+        assert!(response.deltas[0].encoded.is_empty());
+        let snapshots =
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+                &adapter,
+                session_id,
+                client_id,
+                &[pane_id],
+                2,
+            )
+            .unwrap();
+        let snapshot: bmux_terminal_grid::GridSnapshot =
+            serde_json::from_slice(&snapshots.snapshots[0].encoded).unwrap();
+        assert_eq!(snapshot, expected);
+        let caught_up = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[pane_id],
+            &[snapshot.revision],
+            1,
+        )
+        .unwrap();
+        assert!(!caught_up.deltas[0].desynced);
+        assert_eq!(caught_up.deltas[0].revision, snapshot.revision);
+        assert!(caught_up.deltas[0].encoded.is_empty());
     }
 
     #[tokio::test]

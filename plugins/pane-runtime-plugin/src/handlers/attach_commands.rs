@@ -219,6 +219,7 @@ fn retarget_attach_stream(
     };
 
     match retarget_result {
+        Err(error @ SessionRuntimeError::ResponseBudgetExceeded) => Err(failed(error.to_string())),
         Ok(viewport) => {
             if let Some(prev) = previous_to_detach {
                 runtime
@@ -468,6 +469,7 @@ pub fn attach_open(
     };
 
     match begin_result {
+        Err(error @ SessionRuntimeError::ResponseBudgetExceeded) => Err(failed(error.to_string())),
         Ok(()) => {
             let can_write = session_write_allowed(ctx, session_id, client_id)?;
             runtime
@@ -518,6 +520,7 @@ pub fn attach_input(
     }
     let data_len = req.data.len();
     match runtime.0.write_input(session_id, client_id, req.data) {
+        Err(error @ SessionRuntimeError::ResponseBudgetExceeded) => Err(failed(error.to_string())),
         Ok((bytes, _pane_id)) => Ok(
             bmux_pane_runtime_plugin_api::attach_runtime_commands::AttachInputAccepted {
                 bytes: u32::try_from(bytes)
@@ -546,6 +549,7 @@ pub fn attach_output(
         .read_output(session_id, client_id, req.max_bytes as usize)
     {
         Ok(data) => Ok(AttachOutputRecord { data }),
+        Err(error @ SessionRuntimeError::ResponseBudgetExceeded) => Err(failed(error.to_string())),
         Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
             Err(AttachCommandError::SessionNotFound)
         }

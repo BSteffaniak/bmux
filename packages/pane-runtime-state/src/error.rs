@@ -13,6 +13,9 @@ pub enum SessionRuntimeError {
     /// Client is not attached to the session.
     #[error("client is not attached to this session")]
     NotAttached,
+    /// A response cannot fit within the runtime's encoded payload budget.
+    #[error("session runtime response budget exceeded")]
+    ResponseBudgetExceeded,
     /// Pane or session is closed / shutting down.
     #[error("session runtime is closed")]
     Closed,
