@@ -559,7 +559,18 @@ fn encode_grid_window(
     let mut count = EncodedByteCount(0, *remaining);
     serde_json::to_writer(&mut count, snapshot)
         .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
-    let encoded = serde_json::to_vec(snapshot).map_err(|_| SessionRuntimeError::Closed)?;
+    // The preflight gives the exact size. Avoid geometric Vec growth, which
+    // can reserve substantially more memory than the accepted payload budget.
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve_exact(count.0)
+        .map_err(|_| SessionRuntimeError::Closed)?;
+    encoded.resize(count.0, 0);
+    let mut output = encoded.as_mut_slice();
+    serde_json::to_writer(&mut output, snapshot).map_err(|_| SessionRuntimeError::Closed)?;
+    if !output.is_empty() {
+        return Err(SessionRuntimeError::Closed);
+    }
     *remaining = remaining
         .checked_sub(encoded.len())
         .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
