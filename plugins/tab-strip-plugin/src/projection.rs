@@ -256,15 +256,12 @@ impl RenderStyle {
 #[derive(Default)]
 pub struct ProjectionInteraction<'a> {
     pub(super) editing_window_id: Option<Uuid>,
-    pub(super) edit_buffer: &'a str,
-    pub(super) edit_cursor: usize,
     pub(super) edit_selection: Option<(usize, usize)>,
     pub(super) menu_window_id: Option<Uuid>,
     pub(super) menu_selected: usize,
     pub(super) drag_marker_col: Option<u16>,
     pub(super) workspace_label: Option<&'a str>,
     pub(super) editing_workspace: bool,
-    pub(super) workspace_editor: Option<&'a bmux_text_edit::TextEditBuffer>,
 }
 
 #[allow(clippy::too_many_lines)] // Projection is one ordered width-budgeting pass; splitting obscures shared constraints.
@@ -285,27 +282,12 @@ pub fn project_bar(
     } else {
         usize::from(local.viewport_cols)
     };
-    let workspace_name = if interaction.editing_workspace {
-        Some(interaction.edit_buffer)
-    } else {
-        interaction
-            .workspace_label
-            .or_else(|| windows.first().map(|window| window.workspace.as_str()))
-    };
+    let workspace_name = interaction
+        .workspace_label
+        .or_else(|| windows.first().map(|window| window.workspace.as_str()));
     let workspace_budget = width.saturating_sub(right_width + tail_width + 20).min(24);
-    let workspace_viewport = interaction
-        .workspace_editor
-        .map(|editor| editor.line_viewport(workspace_budget));
-    let workspace_label = workspace_viewport.as_ref().map_or_else(
-        || workspace_name.map_or_else(String::new, |name| truncate_cells(name, workspace_budget)),
-        |viewport| {
-            let mut text = viewport.text.clone();
-            if UnicodeWidthStr::width(text.as_str()) < workspace_budget {
-                text.push(' ');
-            }
-            text
-        },
-    );
+    let workspace_label =
+        workspace_name.map_or_else(String::new, |name| truncate_cells(name, workspace_budget));
     let tab_budget = width
         .saturating_sub(UnicodeWidthStr::width(workspace_label.as_str()))
         .saturating_sub(if workspace_name.is_some() { 3 } else { 0 })
@@ -319,11 +301,7 @@ pub fn project_bar(
         .enumerate()
         .map(|(index, window)| {
             let editing = interaction.editing_window_id == Some(window.id);
-            let label = if editing {
-                format!("[{}]", interaction.edit_buffer)
-            } else {
-                render_tab_template(settings, window, index, local)
-            };
+            let label = render_tab_template(settings, window, index, local);
             let text = style.tab(&label, window.active);
             TabToken {
                 width: UnicodeWidthStr::width(text.as_str()),
@@ -331,14 +309,7 @@ pub fn project_bar(
                 active: window.active,
                 hovered: settings.hover_highlight && hovered_window_id == Some(window.id),
                 window_id: window.id,
-                edit_cursor_offset: editing.then_some(
-                    UnicodeWidthStr::width(style.active_prefix)
-                        .saturating_add(1)
-                        .saturating_add(UnicodeWidthStr::width(
-                            &interaction.edit_buffer
-                                [..interaction.edit_cursor.min(interaction.edit_buffer.len())],
-                        )),
-                ),
+                edit_cursor_offset: editing.then_some(0),
                 edit_selection: if editing {
                     interaction.edit_selection
                 } else {
@@ -362,9 +333,7 @@ pub fn project_bar(
             SegmentKind::Workspace
         },
         window_id: None,
-        edit_cursor_offset: workspace_viewport
-            .as_ref()
-            .map(|viewport| viewport.cursor_col),
+        edit_cursor_offset: interaction.editing_workspace.then_some(0),
     });
     if workspace_name.is_some() {
         left.push(ProjectedSegment {
@@ -692,6 +661,36 @@ fn render_tab_template(
     index: usize,
     local: &AttachLocalPresentationSnapshot,
 ) -> String {
+    render_tab_template_ranges(settings, window, index, local).0
+}
+
+pub fn name_ranges(
+    settings: &Settings,
+    window: &windows_list::WindowListEntry,
+    index: usize,
+    local: &AttachLocalPresentationSnapshot,
+) -> Vec<(usize, usize)> {
+    let style = RenderStyle::from_settings(settings);
+    let prefix = if window.active {
+        style.active_prefix
+    } else {
+        style.inactive_prefix
+    };
+    let offset = UnicodeWidthStr::width(prefix);
+    render_tab_template_ranges(settings, window, index, local)
+        .1
+        .into_iter()
+        .map(|(start, width)| (start + offset, width))
+        .collect()
+}
+
+fn render_tab_template_ranges(
+    settings: &Settings,
+    window: &windows_list::WindowListEntry,
+    index: usize,
+    local: &AttachLocalPresentationSnapshot,
+) -> (String, Vec<(usize, usize)>) {
+    let mut ranges = Vec::new();
     let name = truncate_cells(&window.name, usize::from(settings.maximum_label_width));
     let session = local.session_label.as_deref().unwrap_or("");
     let mut output = String::with_capacity(settings.label_template.len());
@@ -727,6 +726,12 @@ fn render_tab_template(
                     _ => None,
                 };
                 if terminated && let Some(value) = value {
+                    if placeholder == "name" {
+                        ranges.push((
+                            UnicodeWidthStr::width(output.as_str()),
+                            UnicodeWidthStr::width(value.as_str()),
+                        ));
+                    }
                     output.push_str(&value);
                 } else {
                     output.push('{');
@@ -739,7 +744,7 @@ fn render_tab_template(
             other => output.push(other),
         }
     }
-    output
+    (output, ranges)
 }
 
 fn truncate_cells(value: &str, maximum: usize) -> String {
@@ -1068,18 +1073,78 @@ mod tests {
     }
 
     #[test]
+    fn rename_preserves_layout_across_presets_templates_and_overflow() {
+        for preset in [Preset::TabRail, Preset::Minimal, Preset::Classic] {
+            for active in [false, true] {
+                for width in [25, 40, 80] {
+                    let settings = Settings {
+                        preset,
+                        label_template: "{index}: {name} ({name})".to_string(),
+                        ..Settings::default()
+                    };
+                    let windows = [window(1, "界hello", active), window(2, "other", !active)];
+                    let normal = project_bar(
+                        &settings,
+                        &windows,
+                        &local(width),
+                        None,
+                        &ProjectionInteraction::default(),
+                    );
+                    for interaction in [
+                        ProjectionInteraction {
+                            editing_window_id: Some(windows[0].id),
+                            ..ProjectionInteraction::default()
+                        },
+                        ProjectionInteraction {
+                            editing_workspace: true,
+                            ..ProjectionInteraction::default()
+                        },
+                    ] {
+                        let edited =
+                            project_bar(&settings, &windows, &local(width), None, &interaction);
+                        assert_eq!(normal.plain_text(), edited.plain_text());
+                        let normal_ranges = normal
+                            .window_ranges()
+                            .into_iter()
+                            .map(|r| (r.window_id, r.start, r.end))
+                            .collect::<Vec<_>>();
+                        let edited_ranges = edited
+                            .window_ranges()
+                            .into_iter()
+                            .map(|r| (r.window_id, r.start, r.end))
+                            .collect::<Vec<_>>();
+                        assert_eq!(normal_ranges, edited_ranges);
+                    }
+                    let ranges = name_ranges(&settings, &windows[0], 0, &local(width));
+                    assert_eq!(ranges.len(), 2);
+                    assert_eq!(ranges[0].1, 7);
+                    assert!(ranges[1].0 > ranges[0].0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn editing_and_menu_state_are_projected() {
         let mut interaction = ProjectionInteraction {
             editing_window_id: Some(Uuid::from_u128(1)),
-            edit_buffer: "renamed",
-            edit_cursor: 4,
             edit_selection: Some((0, 7)),
             ..ProjectionInteraction::default()
         };
         let settings = Settings::default();
         let windows = [window(1, "main", true)];
         let edited = project_bar(&settings, &windows, &local(80), None, &interaction);
-        assert!(edited.plain_text().contains("[renamed]"));
+        assert_eq!(
+            edited.plain_text(),
+            project_bar(
+                &settings,
+                &windows,
+                &local(80),
+                None,
+                &ProjectionInteraction::default()
+            )
+            .plain_text()
+        );
         assert!(edited.segments.iter().any(|segment| {
             segment.kind == SegmentKind::EditingTab && segment.edit_cursor_offset.is_some()
         }));
@@ -1188,8 +1253,6 @@ mod tests {
         let (reorder_ns, reorder_bytes) = measure(&reordered, None, &default_interaction, &local);
         let editing = ProjectionInteraction {
             editing_window_id: Some(Uuid::from_u128(33)),
-            edit_buffer: "renamed-window-with-a-long-label",
-            edit_cursor: 14,
             ..ProjectionInteraction::default()
         };
         let (rename_ns, rename_bytes) = measure(&windows, None, &editing, &local);

@@ -5,6 +5,7 @@
 
 mod menu;
 mod projection;
+mod rename_input;
 mod settings;
 mod workspace_rename;
 
@@ -810,8 +811,6 @@ fn adjust_rgb(value: (u8, u8, u8), delta: i16) -> (u8, u8, u8) {
 fn projection_interaction(state: &CompanionState) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
         editing_window_id: state.editing_window_id,
-        edit_buffer: state.edit_buffer.text(),
-        edit_cursor: state.edit_buffer.cursor_byte_index(),
         edit_selection: state
             .edit_buffer
             .selection()
@@ -821,7 +820,6 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
         workspace_label: state.workspace_label.as_deref(),
         drag_marker_col: state.drag_target.map(|target| target.marker_col),
         editing_workspace: state.editing_workspace_id.is_some(),
-        workspace_editor: state.editing_workspace_id.map(|_| &state.edit_buffer),
     }
 }
 
@@ -850,32 +848,45 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     for segment in projected.segments {
         let width = u16::try_from(unicode_width::UnicodeWidthStr::width(segment.text.as_str()))
             .unwrap_or(u16::MAX);
-        if segment.kind == projection::SegmentKind::EditingWorkspace {
-            let mut col = 0_usize;
-            for grapheme in
-                unicode_segmentation::UnicodeSegmentation::graphemes(segment.text.as_str(), true)
-            {
-                let selected = state.edit_buffer.selection().is_some();
-                let style = if selected || segment.edit_cursor_offset == Some(col) {
-                    styles.editing.reverse()
-                } else {
-                    styles.editing
-                };
-                ops.push(RenderOp::text_run(
-                    x.saturating_add(u16::try_from(col).unwrap_or(u16::MAX)),
-                    0,
-                    grapheme.to_string(),
-                    style,
-                ));
-                col += unicode_width::UnicodeWidthStr::width(grapheme);
-            }
-        } else if !segment.text.is_empty() {
+        if !segment.text.is_empty() {
             ops.push(RenderOp::text_run(
                 x,
                 0,
                 segment.text,
                 styles.for_kind(segment.kind),
             ));
+        }
+        if segment.kind == projection::SegmentKind::EditingWorkspace {
+            ops.extend(rename_input::paint(
+                &state.edit_buffer,
+                "workspace-rename",
+                width,
+                x,
+                styles.editing,
+            ));
+        } else if segment.kind == projection::SegmentKind::EditingTab
+            && let Some((index, window)) = state
+                .snapshot
+                .windows
+                .iter()
+                .enumerate()
+                .find(|(_, window)| Some(window.id) == segment.window_id)
+        {
+            for (start, length) in
+                projection::name_ranges(&state.settings, window, index, &state.local_presentation)
+            {
+                let start = u16::try_from(start).unwrap_or(u16::MAX);
+                let length = u16::try_from(length)
+                    .unwrap_or(u16::MAX)
+                    .min(width.saturating_sub(start));
+                ops.extend(rename_input::paint(
+                    &state.edit_buffer,
+                    &format!("rename:{}", window.id),
+                    length,
+                    x.saturating_add(start),
+                    styles.editing,
+                ));
+            }
         }
         if width > 0
             && matches!(
@@ -993,8 +1004,6 @@ fn projection_interaction_without_marker(
 ) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
         editing_window_id: state.editing_window_id,
-        edit_buffer: state.edit_buffer.text(),
-        edit_cursor: state.edit_buffer.cursor_byte_index(),
         edit_selection: state
             .edit_buffer
             .selection()
@@ -1004,7 +1013,6 @@ fn projection_interaction_without_marker(
         drag_marker_col: None,
         workspace_label: state.workspace_label.as_deref(),
         editing_workspace: state.editing_workspace_id.is_some(),
-        workspace_editor: state.editing_workspace_id.map(|_| &state.edit_buffer),
     }
 }
 
@@ -1189,19 +1197,6 @@ fn update_editor(
         "esc" => {
             cancel_rename(companion);
         }
-        "left" => {
-            companion
-                .edit_buffer
-                .move_cursor(bmux_text_edit::TextMotion::Left);
-        }
-        "right" => {
-            companion
-                .edit_buffer
-                .move_cursor(bmux_text_edit::TextMotion::Right);
-        }
-        "backspace" => {
-            companion.edit_buffer.delete_backward();
-        }
         "enter" => {
             let name = companion.edit_buffer.text().trim().to_string();
             if name.is_empty() {
@@ -1239,15 +1234,7 @@ fn update_editor(
                 },
             );
         }
-        value if value.chars().count() == 1 && companion.edit_buffer.text().len() < 4_096 => {
-            companion.edit_buffer.insert_str(value);
-        }
-        _ => {
-            return Some(AttachInputResult {
-                consumed: true,
-                ..AttachInputResult::default()
-            });
-        }
+        value => rename_input::key(&mut companion.edit_buffer, value),
     }
     let dirty = republish_companion(companion);
     Some(AttachInputResult {
@@ -1325,19 +1312,6 @@ fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
             cancel_rename(companion);
             release_capture = true;
         }
-        "left" => {
-            companion
-                .edit_buffer
-                .move_cursor(bmux_text_edit::TextMotion::Left);
-        }
-        "right" => {
-            companion
-                .edit_buffer
-                .move_cursor(bmux_text_edit::TextMotion::Right);
-        }
-        "backspace" => {
-            companion.edit_buffer.delete_backward();
-        }
         "enter" => {
             let name = companion.edit_buffer.text().trim().to_string();
             if name.is_empty() {
@@ -1360,15 +1334,7 @@ fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
             companion.edit_buffer.clear();
             release_capture = true;
         }
-        value if value.chars().count() == 1 && companion.edit_buffer.text().len() < 4_096 => {
-            companion.edit_buffer.insert_str(value);
-        }
-        _ => {
-            return Some(AttachInputResult {
-                consumed: true,
-                ..AttachInputResult::default()
-            });
-        }
+        value => rename_input::key(&mut companion.edit_buffer, value),
     }
     let dirty = republish_companion(companion);
     Some(AttachInputResult {
