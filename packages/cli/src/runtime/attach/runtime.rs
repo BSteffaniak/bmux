@@ -8076,40 +8076,9 @@ fn replace_retained_surfaces(
     viewport: DamageRect,
     damage_policy: DamageCoalescingPolicy,
 ) -> RetainedDamage {
-    let previous_focus = view_state.plugin_focus.focused().and_then(|target| {
-        view_state
-            .retained_compositor
-            .endpoint_for_region(target)
-            .cloned()
-            .map(|endpoint| {
-                (
-                    endpoint,
-                    format!(
-                        "{}:{}:{}",
-                        target.owner_plugin_id, target.surface_local_id, target.region_local_id
-                    ),
-                )
-            })
-    });
-    let damage =
-        view_state
-            .retained_compositor
-            .replace_surfaces(retained_surfaces, viewport, damage_policy);
-    if view_state
-        .plugin_focus
-        .reconcile(&view_state.retained_compositor)
-        && let Some((endpoint, hook)) = previous_focus
-        && bmux_plugin::global_attach_presentation_input_registry()
-            .notify_focus_lost(&endpoint, &hook)
-    {
-        view_state
-            .dirty
-            .mark_extension_dirty(AttachDirtySource::PluginCommand);
-    }
-    let _ = view_state
-        .plugin_pointer_router
-        .reconcile(&view_state.retained_compositor);
-    damage
+    view_state
+        .retained_compositor
+        .replace_surfaces(retained_surfaces, viewport, damage_policy)
 }
 
 #[allow(clippy::too_many_arguments)] // Retained planning bridges frame damage, UI surfaces, and compositor state.
@@ -8241,8 +8210,81 @@ impl<'a> AttachAppearanceResolver<'a> {
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // Preserve the public render entry point while committing interaction only after flush.
 pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
+    terminal_writer: &mut W,
+    view_state: &mut AttachViewState,
+    layout_state: &AttachLayoutState,
+    runtime_appearance: &RuntimeAppearance,
+    help_lines: &[String],
+    help_scroll: usize,
+    damage_config: &bmux_config::DamageBehaviorConfig,
+    slow_terminal_write_ms: u64,
+    display_capture: &mut DisplayCaptureFanout,
+    geometry: TerminalGeometry,
+    render_trace: Option<&mut AttachRenderTrace>,
+) -> Result<AttachFrameRenderStats> {
+    let previous = view_state.retained_compositor.clone();
+    let result = render_attach_frame_inner(
+        terminal_writer,
+        view_state,
+        layout_state,
+        runtime_appearance,
+        help_lines,
+        help_scroll,
+        damage_config,
+        slow_terminal_write_ms,
+        display_capture,
+        geometry,
+        render_trace,
+    );
+    if result.is_err() {
+        view_state.retained_compositor = previous;
+        view_state
+            .dirty
+            .mark_full_frame(AttachDirtySource::PluginCommand);
+        return result;
+    }
+    let old_focus = view_state.plugin_focus.focused().and_then(|target| {
+        previous.endpoint_for_region(target).map(|endpoint| {
+            (
+                endpoint.clone(),
+                format!(
+                    "{}:{}:{}",
+                    target.owner_plugin_id, target.surface_local_id, target.region_local_id
+                ),
+            )
+        })
+    });
+    if view_state
+        .plugin_focus
+        .reconcile(&view_state.retained_compositor)
+        && let Some((endpoint, hook)) = old_focus
+    {
+        let _ = bmux_plugin::global_attach_presentation_input_registry()
+            .notify_focus_lost(&endpoint, &hook);
+    }
+    let _ = view_state
+        .plugin_pointer_router
+        .reconcile(&view_state.retained_compositor);
+    let mut published = std::collections::BTreeSet::new();
+    for surface in view_state.retained_compositor.surfaces().values() {
+        if let Some(revision) = surface.revision {
+            for region in &surface.interactive_regions {
+                if let Some(endpoint) = &region.endpoint {
+                    published.insert((endpoint.clone(), revision));
+                }
+            }
+        }
+    }
+    for (endpoint, revision) in published {
+        bmux_plugin::global_attach_presentation_input_registry().committed(&endpoint, revision);
+    }
+    result
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn render_attach_frame_inner<W: Write + ?Sized>(
     terminal_writer: &mut W,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
@@ -16005,6 +16047,16 @@ mod tests {
     #[test]
     #[serial]
     fn incremental_plugin_surface_output_stays_within_legacy_byte_budget() {
+        struct FlushFailure;
+        impl Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("injected flush failure"))
+            }
+        }
+
         use bmux_plugin::surface::{
             PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, PluginSurfaceTarget,
             global_plugin_surface_registry,
@@ -16119,6 +16171,28 @@ mod tests {
         );
         assert!(!stats.full_frame_fallback);
         assert_eq!(stats.full_surface_fallbacks, 0);
+        let previous = view_state.retained_compositor.clone();
+        publish(3, "not displayed");
+        view_state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
+        assert!(
+            render_attach_frame_to_writer(
+                &mut FlushFailure,
+                &mut view_state,
+                &layout_state,
+                &RuntimeAppearance::default(),
+                &[],
+                0,
+                &bmux_config::DamageBehaviorConfig::default(),
+                u64::MAX,
+                &mut DisplayCaptureFanout::default(),
+                geometry,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(view_state.retained_compositor, previous);
         global_plugin_surface_registry().remove_owner(OWNER);
         global_plugin_layout_registry().remove_owner(OWNER);
     }

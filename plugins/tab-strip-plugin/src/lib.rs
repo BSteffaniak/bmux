@@ -420,6 +420,16 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
             },
         )
         .map_err(|error| format!("publishing tab-strip layout: {error:?}"))?;
+    bmux_plugin::global_attach_presentation_input_registry().register_committed(
+        input_endpoint(),
+        std::sync::Arc::new(|revision| {
+            if let Ok(mut guard) = state().lock()
+                && let Some(companion) = guard.as_mut()
+            {
+                rename_input::acknowledge(&mut companion.edit_buffer, revision);
+            }
+        }),
+    );
     bmux_plugin::global_attach_presentation_input_registry()
         .register_paste(input_endpoint(), std::sync::Arc::new(handle_editor_paste));
     bmux_plugin::global_attach_presentation_input_registry()
@@ -570,11 +580,14 @@ fn publish_selection(context_id: Option<Uuid>) -> Result<(), String> {
     publish_companion(companion)
 }
 
-fn publish_surface(revision: u64, surfaces: Vec<PluginSurface>) -> Result<(), String> {
+fn publish_surface(revision: u64, surfaces: Vec<PluginSurface>) -> Result<u64, String> {
     global_plugin_surface_registry()
         .publish_advancing(OWNER, PluginSurfaceSnapshot { revision, surfaces })
         .map_err(|error| format!("publishing tab-strip surface: {error:?}"))?;
-    Ok(())
+    global_plugin_surface_registry()
+        .owner_snapshot(OWNER)
+        .map(|snapshot| snapshot.revision)
+        .ok_or_else(|| "published surface is missing".to_string())
 }
 
 fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
@@ -582,8 +595,8 @@ fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
     let (surface, viewport) = build_surface_with_editor(companion, revision);
     let mut surfaces = vec![surface];
     surfaces.extend(menu::surfaces(companion, revision));
-    publish_surface(revision, surfaces)?;
-    rename_input::commit(&mut companion.edit_buffer, viewport);
+    let revision = publish_surface(revision, surfaces)?;
+    rename_input::stage(&mut companion.edit_buffer, revision, viewport);
     Ok(())
 }
 
@@ -904,10 +917,7 @@ fn build_surface_with_editor(
             }
         }
         if width > 0
-            && matches!(
-                segment.kind,
-                projection::SegmentKind::Workspace | projection::SegmentKind::EditingWorkspace
-            )
+            && matches!(segment.kind, projection::SegmentKind::Workspace)
             && let Some(id) = state.workspace_id
         {
             regions.push(
@@ -919,7 +929,9 @@ fn build_surface_with_editor(
                 .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
             );
         }
-        if let Some(window_id) = segment.window_id {
+        if let Some(window_id) = segment.window_id
+            && segment.kind != projection::SegmentKind::EditingTab
+        {
             regions.push(
                 PluginSurfaceRegion::new(
                     format!("window:{window_id}"),
@@ -930,6 +942,23 @@ fn build_surface_with_editor(
             );
         }
         x = x.saturating_add(width);
+    }
+    if let Some(viewport) = &editor_viewport {
+        let id = state
+            .editing_window_id
+            .map(|id| format!("window:{id}"))
+            .or_else(|| {
+                state
+                    .editing_workspace_id
+                    .map(|id| format!("workspace:{id}"))
+            });
+        if let Some(id) = id {
+            regions.extend(
+                rename_input::hit_regions(&state.edit_buffer, viewport, &id)
+                    .into_iter()
+                    .map(|region| region.endpoint(input_endpoint())),
+            );
+        }
     }
     if let Some(marker_col) = projection_interaction(state).drag_marker_col {
         ops.push(RenderOp::text_run(
@@ -1672,6 +1701,12 @@ mod tests {
             handle_local_input(&event).unwrap().capture_keyboard,
             vec!["*"]
         );
+        let revision = global_plugin_surface_registry()
+            .owner_snapshot(OWNER)
+            .unwrap()
+            .revision;
+        bmux_plugin::global_attach_presentation_input_registry()
+            .committed(&input_endpoint(), revision);
         event.event_kind = "key".to_string();
         event.phase = "press".to_string();
         event.key = Some("backspace".to_string());

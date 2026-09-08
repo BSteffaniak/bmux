@@ -22,6 +22,12 @@ pub struct ComponentViewport {
 pub struct ComponentViewportPaint {
     pub buffer: Buffer,
     /// Caller-owned hit geometry in surface coordinates, lowered with the same transform.
+    /// Non-raster contributions in component-local coordinates. Consumers must
+    /// explicitly lower these using the viewport transform or reject unsupported
+    /// contributions; this raster bridge is not a general presentation transport.
+    pub semantics: bmux_tui::semantic::SemanticScene,
+    pub selection: bmux_tui::selection::SelectionScene,
+    pub images: Vec<bmux_tui::image::ImageContribution>,
     pub hits: Vec<crate::surface::PluginSurfaceRegion>,
     pub cursor: Option<Cursor>,
 }
@@ -81,6 +87,9 @@ impl ComponentViewport {
                 Some(crate::surface::PluginSurfaceRegion::from_tui(&region))
             })
             .collect();
+        let semantics = frame.semantics().clone();
+        let selection = frame.selection().clone();
+        let images = frame.images().to_vec();
         let cursor = frame.cursor().and_then(|mut cursor| {
             cursor.position = self.project(cursor.position)?;
             Some(cursor)
@@ -100,6 +109,9 @@ impl ComponentViewport {
             }
         }
         ComponentViewportPaint {
+            semantics,
+            selection,
+            images,
             hits,
             buffer: visible,
             cursor,
@@ -122,6 +134,13 @@ impl ComponentViewport {
                 .saturating_sub(self.viewport.y);
         }
         component.event(&event, &self.layout, &mut EventCx::new(&self.layout))
+    }
+
+    pub fn hit_regions(
+        &self,
+        component: &dyn Component,
+    ) -> Vec<crate::surface::PluginSurfaceRegion> {
+        self.paint(component).hits
     }
 
     #[must_use]

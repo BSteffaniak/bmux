@@ -14,12 +14,14 @@ use std::ops::{Deref, DerefMut};
 #[derive(Debug, Clone, Default)]
 pub struct RenameInput {
     state: TextInputState,
+    pending: std::collections::VecDeque<(u64, Option<ComponentViewport>)>,
     viewport: Option<ComponentViewport>,
 }
 impl From<TextEditBuffer> for RenameInput {
     fn from(buffer: TextEditBuffer) -> Self {
         Self {
             state: TextInputState::new(buffer),
+            pending: std::collections::VecDeque::new(),
             viewport: None,
         }
     }
@@ -181,6 +183,42 @@ pub fn paint(
     (ops, Some(viewport))
 }
 
+pub fn hit_regions(
+    input: &RenameInput,
+    viewport: &ComponentViewport,
+    id: &str,
+) -> Vec<bmux_plugin::surface::PluginSurfaceRegion> {
+    let state = RefCell::new(input.state.clone());
+    let policy = policy();
+    let component = TextInputComponent::new("rename", &state, &policy).focused(true);
+    viewport
+        .hit_regions(&component)
+        .into_iter()
+        .map(|mut region| {
+            region.local_id = id.to_string();
+            region
+        })
+        .collect()
+}
+
+pub fn stage(input: &mut RenameInput, revision: u64, viewport: Option<ComponentViewport>) {
+    if input.pending.len() == 32 {
+        input.pending.pop_front();
+    }
+    input.pending.push_back((revision, viewport));
+}
+
+pub fn acknowledge(input: &mut RenameInput, revision: u64) {
+    if let Some((_, viewport)) = input.pending.iter().find(|(id, _)| *id == revision) {
+        input.viewport = viewport.clone();
+    } else if input.pending.front().is_some_and(|(id, _)| revision < *id) {
+        // A superseded revision whose geometry was evicted is not safe to guess.
+        input.viewport = None;
+    }
+    input.pending.retain(|(id, _)| *id > revision);
+}
+
+#[cfg(test)]
 pub fn commit(input: &mut RenameInput, viewport: Option<ComponentViewport>) {
     input.viewport = viewport;
 }
@@ -202,6 +240,19 @@ mod tests {
     fn mouse(input: &mut RenameInput, kind: MouseEventKind, col: u16) {
         input.dispatch(&Event::Mouse(MouseEvent::new(kind, Point::new(col, 0))));
         refresh(input);
+    }
+
+    #[test]
+    fn publication_does_not_commit_editor_geometry() {
+        let mut input = mounted("hello world");
+        let old = input.visible_rect();
+        let (_, next) = paint(&input, 5, 30, bmux_plugin::RenderStyle::default());
+        stage(&mut input, 10, next);
+        assert_eq!(input.visible_rect(), old);
+        acknowledge(&mut input, 9);
+        assert!(input.visible_rect().is_none());
+        acknowledge(&mut input, 10);
+        assert_eq!(input.visible_rect(), Some(Rect::new(30, 0, 5, 1)));
     }
 
     #[test]

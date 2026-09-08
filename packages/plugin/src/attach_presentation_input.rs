@@ -16,8 +16,12 @@ pub type AttachPresentationFocusLostHandler = Arc<dyn Fn(&str) -> bool + Send + 
 pub type AttachPresentationPasteHandler =
     Arc<dyn Fn(&str, &str) -> AttachInputResult + Send + Sync>;
 
+/// Opt-in notification for a successfully flushed retained surface revision.
+pub type AttachPresentationCommittedHandler = Arc<dyn Fn(u64) + Send + Sync>;
+
 #[derive(Default)]
 pub struct AttachPresentationInputRegistry {
+    committed: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationCommittedHandler>>,
     paste: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationPasteHandler>>,
     handlers: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationInputHandler>>,
     focus_lost: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationFocusLostHandler>>,
@@ -100,7 +104,31 @@ impl AttachPresentationInputRegistry {
         handler.map(|handler| handler(hook, text))
     }
 
+    pub fn register_committed(
+        &self,
+        endpoint: AttachInputEndpoint,
+        handler: AttachPresentationCommittedHandler,
+    ) {
+        if let Ok(mut handlers) = self.committed.write() {
+            handlers.insert(endpoint, handler);
+        }
+    }
+
+    pub fn committed(&self, endpoint: &AttachInputEndpoint, revision: u64) {
+        let handler = self
+            .committed
+            .read()
+            .ok()
+            .and_then(|handlers| handlers.get(endpoint).cloned());
+        if let Some(handler) = handler {
+            handler(revision);
+        }
+    }
+
     pub fn remove(&self, endpoint: &AttachInputEndpoint) {
+        if let Ok(mut handlers) = self.committed.write() {
+            handlers.remove(endpoint);
+        }
         if let Ok(mut handlers) = self.paste.write() {
             handlers.remove(endpoint);
         }
