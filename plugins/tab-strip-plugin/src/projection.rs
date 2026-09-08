@@ -45,7 +45,56 @@ pub enum DropSide {
     After,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedInsertion {
+    pub(super) window_id: Uuid,
+    pub(super) side: DropSide,
+    pub(super) marker_col: u16,
+}
+
+/// Interaction geometry is independent of segment text, decoration, and styling.
+/// Only visible tab bounds contribute insertion anchors; clipped tabs do not.
+pub struct TabStripGeometry {
+    pub(super) tabs: Vec<ProjectedWindowRange>,
+}
+
+impl TabStripGeometry {
+    pub fn resolve_insertion(&self, col: u16) -> Option<ResolvedInsertion> {
+        // Compare cell centers to edge coordinates in half-cell units. Equal
+        // distances favor the right anchor, including a single-cell separator.
+        let pointer = u32::from(col) * 2 + 1;
+        self.tabs
+            .iter()
+            .filter(|tab| tab.start < tab.end)
+            .flat_map(|tab| {
+                [
+                    ResolvedInsertion {
+                        window_id: tab.window_id,
+                        side: DropSide::Before,
+                        marker_col: tab.start,
+                    },
+                    ResolvedInsertion {
+                        window_id: tab.window_id,
+                        side: DropSide::After,
+                        marker_col: tab.end,
+                    },
+                ]
+            })
+            .min_by_key(|anchor| {
+                (
+                    pointer.abs_diff(u32::from(anchor.marker_col) * 2),
+                    std::cmp::Reverse(anchor.marker_col),
+                )
+            })
+    }
+}
+
 impl ProjectedBar {
+    pub fn interaction_geometry(&self) -> TabStripGeometry {
+        TabStripGeometry {
+            tabs: self.window_ranges(),
+        }
+    }
     pub fn window_ranges(&self) -> Vec<ProjectedWindowRange> {
         let mut ranges: Vec<ProjectedWindowRange> = Vec::new();
         let mut x = 0_u16;
@@ -71,27 +120,8 @@ impl ProjectedBar {
         ranges
     }
 
-    pub fn drop_target_at_col(&self, col: u16) -> Option<(Uuid, DropSide, u16)> {
-        let ranges = self.window_ranges();
-        let containing = ranges
-            .iter()
-            .find(|range| col >= range.start && col < range.end);
-        if let Some(range) = containing {
-            let midpoint = range
-                .start
-                .saturating_add(range.end.saturating_sub(range.start) / 2);
-            return if col < midpoint {
-                Some((range.window_id, DropSide::Before, range.start))
-            } else {
-                Some((range.window_id, DropSide::After, range.end))
-            };
-        }
-        let first = ranges.first()?;
-        if col < first.start {
-            return Some((first.window_id, DropSide::Before, first.start));
-        }
-        let last = ranges.last()?;
-        Some((last.window_id, DropSide::After, last.end))
+    pub fn drop_target_at_col(&self, col: u16) -> Option<ResolvedInsertion> {
+        self.interaction_geometry().resolve_insertion(col)
     }
 
     #[cfg(test)]
@@ -897,12 +927,111 @@ mod tests {
         let second = &ranges[1];
         assert_eq!(
             projected.drop_target_at_col(second.start),
-            Some((second.window_id, DropSide::Before, second.start))
+            Some(ResolvedInsertion {
+                window_id: second.window_id,
+                side: DropSide::Before,
+                marker_col: second.start
+            })
         );
         assert_eq!(
             projected.drop_target_at_col(second.end.saturating_sub(1)),
-            Some((second.window_id, DropSide::After, second.end))
+            Some(ResolvedInsertion {
+                window_id: second.window_id,
+                side: DropSide::After,
+                marker_col: second.end
+            })
         );
+    }
+
+    #[test]
+    fn insertion_geometry_resolves_gaps_ties_and_outer_edges() {
+        let geometry = TabStripGeometry {
+            tabs: vec![
+                ProjectedWindowRange {
+                    window_id: Uuid::from_u128(1),
+                    start: 4,
+                    end: 10,
+                },
+                ProjectedWindowRange {
+                    window_id: Uuid::from_u128(2),
+                    start: 13,
+                    end: 19,
+                },
+                ProjectedWindowRange {
+                    window_id: Uuid::from_u128(3),
+                    start: 20,
+                    end: 26,
+                },
+            ],
+        };
+        for (col, id, side, marker_col) in [
+            (0, 1, DropSide::Before, 4),
+            (4, 1, DropSide::Before, 4),
+            (7, 1, DropSide::After, 10),
+            (10, 1, DropSide::After, 10),
+            (11, 2, DropSide::Before, 13),
+            (12, 2, DropSide::Before, 13),
+            (19, 3, DropSide::Before, 20),
+            (u16::MAX, 3, DropSide::After, 26),
+        ] {
+            assert_eq!(
+                geometry.resolve_insertion(col),
+                Some(ResolvedInsertion {
+                    window_id: Uuid::from_u128(id),
+                    side,
+                    marker_col,
+                }),
+                "column {col}"
+            );
+        }
+        assert_eq!(TabStripGeometry { tabs: vec![] }.resolve_insertion(0), None);
+    }
+
+    #[test]
+    fn insertion_ignores_separator_text_and_uses_display_cell_widths() {
+        for separator in [">", "│", "界", "   ", " → ", "", "e\u{301}"] {
+            let projected = ProjectedBar {
+                segments: vec![
+                    ProjectedSegment {
+                        text: "界ab".into(),
+                        kind: SegmentKind::ActiveTab,
+                        window_id: Some(Uuid::from_u128(1)),
+                        edit_cursor_offset: None,
+                    },
+                    ProjectedSegment {
+                        text: separator.into(),
+                        kind: SegmentKind::Base,
+                        window_id: None,
+                        edit_cursor_offset: None,
+                    },
+                    ProjectedSegment {
+                        text: "next".into(),
+                        kind: SegmentKind::InactiveTab,
+                        window_id: Some(Uuid::from_u128(2)),
+                        edit_cursor_offset: None,
+                    },
+                ],
+            };
+            let ranges = projected.window_ranges();
+            assert_eq!(ranges[0].end, 4);
+            for col in ranges[0].end..ranges[1].start {
+                let insertion = projected.drop_target_at_col(col).unwrap();
+                assert!(
+                    insertion
+                        == ResolvedInsertion {
+                            window_id: ranges[0].window_id,
+                            side: DropSide::After,
+                            marker_col: ranges[0].end
+                        }
+                        || insertion
+                            == ResolvedInsertion {
+                                window_id: ranges[1].window_id,
+                                side: DropSide::Before,
+                                marker_col: ranges[1].start
+                            }
+                );
+            }
+        }
     }
 
     #[test]

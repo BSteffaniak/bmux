@@ -210,7 +210,7 @@ struct CompanionState {
     pointer_started_col: u16,
     pointer_started_row: u16,
     pointer_moved: bool,
-    drag_target: Option<(Uuid, windows_commands::WindowMovePlacement)>,
+    drag_target: Option<projection::ResolvedInsertion>,
     last_left_click: Option<(Uuid, u16, u16, Instant)>,
     editing_window_id: Option<Uuid>,
     edit_buffer: bmux_text_edit::TextEditBuffer,
@@ -786,21 +786,7 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
         menu_window_id: state.menu_window_id,
         menu_selected: state.menu_selected,
         workspace_label: state.workspace_label.as_deref(),
-        drag_marker_col: state.drag_target.and_then(|(target, placement)| {
-            let projected = projection::project_bar(
-                &state.settings,
-                &state.snapshot.windows,
-                &state.local_presentation,
-                state.hovered_window_id,
-                &projection::ProjectionInteraction::default(),
-            );
-            projected.window_ranges().into_iter().find_map(|range| {
-                (range.window_id == target).then_some(match placement {
-                    windows_commands::WindowMovePlacement::Before => range.start,
-                    windows_commands::WindowMovePlacement::After => range.end,
-                })
-            })
-        }),
+        drag_marker_col: state.drag_target.map(|target| target.marker_col),
     }
 }
 
@@ -1032,19 +1018,9 @@ fn update_drag_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
                     .abs_diff(companion.pointer_started_col)
                     .max(row.abs_diff(companion.pointer_started_row))
                     > 1
-                || target.is_some_and(|(target, _, _)| target != source);
+                || target.is_some_and(|target| target.window_id != source);
             companion.pointer_moved = moved;
-            companion.drag_target = moved.then_some(target).flatten().map(|(target, side, _)| {
-                (
-                    target,
-                    match side {
-                        projection::DropSide::Before => {
-                            windows_commands::WindowMovePlacement::Before
-                        }
-                        projection::DropSide::After => windows_commands::WindowMovePlacement::After,
-                    },
-                )
-            });
+            companion.drag_target = moved.then_some(target).flatten();
             let dirty = republish_companion(companion);
             Some(AttachInputResult {
                 consumed: true,
@@ -1063,8 +1039,17 @@ fn update_drag_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
             let dirty = republish_companion(companion);
             let service_invocation = if moved {
                 target
-                    .filter(|(target, _)| *target != source)
-                    .and_then(|(target, placement)| {
+                    .filter(|target| target.window_id != source)
+                    .and_then(|insertion| {
+                        let target = insertion.window_id;
+                        let placement = match insertion.side {
+                            projection::DropSide::Before => {
+                                windows_commands::WindowMovePlacement::Before
+                            }
+                            projection::DropSide::After => {
+                                windows_commands::WindowMovePlacement::After
+                            }
+                        };
                         command_invocation(
                             bmux_plugin::AttachInputEndpoint {
                                 capability:
