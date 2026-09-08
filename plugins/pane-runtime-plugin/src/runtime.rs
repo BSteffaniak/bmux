@@ -7104,6 +7104,8 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             })
             .unwrap_or(Err(SessionRuntimeError::Closed))?;
         let mut snapshots = Vec::new();
+        let mut remaining = RESPONSE_OUTPUT_BUDGET;
+        let mut cursor_updates = Vec::new();
         let mut seen = BTreeSet::new();
         for pane in panes {
             if !seen.insert(pane.pane_id) {
@@ -7114,22 +7116,26 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 .lock()
                 .map_err(|_| SessionRuntimeError::Closed)?;
             let snapshot = grid.snapshot(0, max_rows_per_pane);
-            let stream_end = {
-                let mut output = pane
-                    .output_buffer
-                    .lock()
-                    .map_err(|_| SessionRuntimeError::Closed)?;
-                let stream_end = output.end_offset();
-                output.set_client_cursor(client_id, stream_end);
-                stream_end
-            };
+            let stream_end = pane
+                .output_buffer
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed)?
+                .end_offset();
             drop(grid);
-            let encoded = serde_json::to_vec(&snapshot).map_err(|_| SessionRuntimeError::Closed)?;
+            let encoded = encode_grid_window(&snapshot, &mut remaining)?;
+            cursor_updates.push((Arc::clone(&pane.output_buffer), stream_end));
             snapshots.push(bmux_pane_runtime_state::AttachPaneGridSnapshot {
                 pane_id: pane.pane_id,
                 stream_end,
                 encoded,
             });
+        }
+        // Budget rejection must not consume raw replay for any pane.
+        for (output, stream_end) in cursor_updates {
+            output
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed)?
+                .set_client_cursor(client_id, stream_end);
         }
         Ok(bmux_pane_runtime_state::AttachGridSnapshotState { snapshots })
     }
@@ -10493,6 +10499,61 @@ mod tests {
         assert_eq!(
             terminal_grid_delta_recovery_position(&log, 0, 0, 3, 5),
             (3, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_grid_snapshot_budget_rejection_preserves_replay_cursors() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let mut grid = TerminalGridStream::new(1000, 100, GridLimits::default()).unwrap();
+        grid.process(&vec![b'x'; 100_000]);
+        let size = serde_json::to_vec(&grid.snapshot(0, 100)).unwrap().len();
+        assert!(size < RESPONSE_OUTPUT_BUDGET);
+        let pane_ids = (0..=RESPONSE_OUTPUT_BUDGET / size)
+            .map(|_| Uuid::new_v4())
+            .collect::<Vec<_>>();
+        let mut runtime = runtime_with_panes(&pane_ids);
+        runtime.attached_clients.insert(client_id);
+        // Share immutable terminal content to keep this aggregate-budget fixture
+        // small; each pane still owns an independent raw replay buffer.
+        let grid = Arc::new(std::sync::Mutex::new(grid));
+        let mut buffers = Vec::new();
+        for pane in runtime.panes.values_mut() {
+            pane.terminal_grid = Arc::clone(&grid);
+            let mut output = pane.output_buffer.lock().unwrap();
+            output.push_chunk(b"hello");
+            output.set_client_cursor(client_id, 1);
+            buffers.push(Arc::clone(&pane.output_buffer));
+        }
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let rejected =
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+                &adapter, session_id, client_id, &pane_ids, 100,
+            );
+        assert!(matches!(
+            rejected,
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        ));
+        for buffer in &buffers {
+            assert_eq!(buffer.lock().unwrap().cursors.get(&client_id), Some(&1));
+        }
+        let retry = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+            &adapter,
+            session_id,
+            client_id,
+            &pane_ids[..1],
+            100,
+        )
+        .unwrap();
+        assert_eq!(retry.snapshots.len(), 1);
+        assert_eq!(retry.snapshots[0].stream_end, 5);
+        assert_eq!(
+            buffers
+                .iter()
+                .filter(|buffer| buffer.lock().unwrap().cursors.get(&client_id) == Some(&5))
+                .count(),
+            1
         );
     }
 
