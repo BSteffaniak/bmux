@@ -164,6 +164,12 @@ impl GridDeltaBatch {
         if !matches!(self.mode.as_str(), "main" | "alternate") {
             return Err(GridDeltaApplyError::InvalidScreenMode);
         }
+        if self
+            .scroll_region
+            .is_some_and(|region| region.top >= region.bottom || region.bottom >= self.height)
+        {
+            return Err(GridDeltaApplyError::InvalidScrollRegion);
+        }
         // Omitted backing preserves the receiver's state for legacy and sparse
         // updates. Explicit replacement backing must contain its full viewport.
         if self.mode == "alternate"
@@ -183,6 +189,12 @@ impl GridDeltaBatch {
         if self.reset_rows {
             if self.row_updates.len() < usize::from(self.height) {
                 return Err(GridDeltaApplyError::IncompleteViewport {
+                    expected: self.height,
+                    actual: self.row_updates.len(),
+                });
+            }
+            if self.mode == "alternate" && self.row_updates.len() > usize::from(self.height) {
+                return Err(GridDeltaApplyError::ExcessAlternateRows {
                     expected: self.height,
                     actual: self.row_updates.len(),
                 });
@@ -290,6 +302,8 @@ pub enum GridDeltaApplyError {
     NonIncreasingRowIndex(u32),
     #[error("grid delta dimensions must be nonzero")]
     ZeroDimensions,
+    #[error("grid delta scroll region is empty, reversed, or outside the viewport")]
+    InvalidScrollRegion,
     #[error("grid delta has an unknown screen mode")]
     InvalidScreenMode,
     #[error("grid delta changes screen, dimensions, or scrollback count without replacement rows")]
@@ -304,6 +318,8 @@ pub enum GridDeltaApplyError {
     RowIndexOutOfBounds(u32),
     #[error("replacement main backing needs at least {expected} rows, received {actual}")]
     IncompleteMainViewport { expected: u16, actual: usize },
+    #[error("alternate replacement requires {expected} rows, received {actual}")]
+    ExcessAlternateRows { expected: u16, actual: usize },
     #[error("replacement viewport needs at least {expected} rows, received {actual}")]
     IncompleteViewport { expected: u16, actual: usize },
     #[error("replacement row index mismatch: expected {expected}, actual {actual}")]

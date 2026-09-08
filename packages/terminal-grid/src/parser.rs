@@ -1293,6 +1293,74 @@ mod tests {
     }
 
     #[test]
+    fn malformed_scroll_regions_preserve_state_and_allow_retry() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 4, limits).unwrap();
+        producer.process(b"first\r\nsecond\r\nthird\r\nfourth");
+        let before = producer.snapshot(0, 4);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        let valid = producer.process_delta(b"\x1b[2;3r").unwrap();
+        for (top, bottom) in [(1, 1), (2, 1), (0, 4), (4, 5)] {
+            let mut malformed = valid.clone();
+            malformed.scroll_region = Some(crate::ScrollRegionSnapshot { top, bottom });
+            let mut snapshot = before.clone();
+            assert!(matches!(
+                malformed.apply_to_snapshot(&mut snapshot),
+                Err(crate::GridDeltaApplyError::InvalidScrollRegion)
+            ));
+            assert_eq!(snapshot, before);
+            assert!(matches!(
+                consumer.apply_delta(&malformed, limits),
+                Err(super::TerminalGridStreamDeltaError::Delta(
+                    crate::GridDeltaApplyError::InvalidScrollRegion
+                ))
+            ));
+            assert_eq!(consumer.snapshot(0, 4), before);
+        }
+        consumer.apply_delta(&valid, limits).unwrap();
+        for bytes in [b"\x1b[3;1H\ninside".as_slice(), b"\x1b[r"] {
+            producer.process(bytes);
+            consumer.process(bytes);
+            assert_eq!(consumer.snapshot(0, 4), producer.snapshot(0, 4));
+        }
+    }
+
+    #[test]
+    fn excess_alternate_replacement_rows_reject_atomically() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+        producer.process(b"retained main");
+        let before = producer.snapshot(0, 2);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        let valid = producer.process_delta(b"\x1b[?1049halt").unwrap();
+        let mut malformed = valid.clone();
+        let mut extra = malformed.row_updates[0].clone();
+        extra.row_index = 2;
+        malformed.row_updates.push(extra);
+        let mut snapshot = before.clone();
+        assert!(matches!(
+            malformed.apply_to_snapshot(&mut snapshot),
+            Err(crate::GridDeltaApplyError::ExcessAlternateRows {
+                expected: 2,
+                actual: 3,
+            })
+        ));
+        assert_eq!(snapshot, before);
+        assert!(matches!(
+            consumer.apply_delta(&malformed, limits),
+            Err(super::TerminalGridStreamDeltaError::Delta(
+                crate::GridDeltaApplyError::ExcessAlternateRows { .. }
+            ))
+        ));
+        assert_eq!(consumer.snapshot(0, 2), before);
+        consumer.apply_delta(&valid, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 2), producer.snapshot(0, 2));
+        producer.process(b"\x1b[?1049l continued");
+        consumer.process(b"\x1b[?1049l continued");
+        assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+    }
+
+    #[test]
     fn malformed_alternate_delta_does_not_project_retained_history() {
         let limits = GridLimits::default();
         let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
@@ -1500,6 +1568,38 @@ mod tests {
         assert!(consumer.apply_delta(&delta, limits).is_err());
         consumer.process(b"x");
         assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+    }
+
+    #[test]
+    fn sparse_wrapped_history_converges_after_independent_reflow() {
+        let limits = GridLimits::default();
+        for text in ["abcdefghijklmnopqrstuvwxyz", "界界界界界界界界界界界界界"] {
+            for alternate in [false, true] {
+                let mut producer = TerminalGridStream::new(10, 2, limits).unwrap();
+                producer.process(text.as_bytes());
+                assert!(producer.grid().scrollback_rows_hint() > 0);
+                if alternate {
+                    producer.process(b"\x1b[?1049halt");
+                }
+                let snapshot = producer.snapshot(0, 20);
+                let mut consumer = TerminalGridStream::from_snapshot(&snapshot, limits).unwrap();
+                for bytes in [b"\x1b[".as_slice(), b"31m", b"!", b"\x1b7"] {
+                    let delta = producer.process_delta(bytes).unwrap();
+                    assert!(!delta.reset_rows);
+                    consumer.apply_delta(&delta, limits).unwrap();
+                    assert_eq!(consumer.snapshot(0, 20), producer.snapshot(0, 20));
+                }
+                for width in [6, 13, 24] {
+                    let mut expected = TerminalGridStream::from_grid(producer.grid().clone());
+                    let mut actual = TerminalGridStream::from_grid(consumer.grid().clone());
+                    expected.resize(width, 4).unwrap();
+                    actual.resize(width, 4).unwrap();
+                    expected.process(b"\x1b[?1049l continued");
+                    actual.process(b"\x1b[?1049l continued");
+                    assert_eq!(actual.snapshot(0, 20), expected.snapshot(0, 20));
+                }
+            }
+        }
     }
 
     #[test]
