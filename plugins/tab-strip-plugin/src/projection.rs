@@ -10,6 +10,8 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentKind {
     Base,
+    Workspace,
+    EditingWorkspace,
     ActiveTab,
     InactiveTab,
     HoveredActiveTab,
@@ -261,6 +263,8 @@ pub struct ProjectionInteraction<'a> {
     pub(super) menu_selected: usize,
     pub(super) drag_marker_col: Option<u16>,
     pub(super) workspace_label: Option<&'a str>,
+    pub(super) editing_workspace: bool,
+    pub(super) workspace_editor: Option<&'a bmux_text_edit::TextEditBuffer>,
 }
 
 #[allow(clippy::too_many_lines)] // Projection is one ordered width-budgeting pass; splitting obscures shared constraints.
@@ -281,15 +285,30 @@ pub fn project_bar(
     } else {
         usize::from(local.viewport_cols)
     };
-    let workspace_label = interaction
-        .workspace_label
-        .or_else(|| windows.first().map(|window| window.workspace.as_str()))
-        .map_or_else(String::new, |name| {
-            let budget = width.saturating_sub(right_width + tail_width + 20).min(24);
-            format!("{} │ ", truncate_cells(name, budget))
-        });
+    let workspace_name = if interaction.editing_workspace {
+        Some(interaction.edit_buffer)
+    } else {
+        interaction
+            .workspace_label
+            .or_else(|| windows.first().map(|window| window.workspace.as_str()))
+    };
+    let workspace_budget = width.saturating_sub(right_width + tail_width + 20).min(24);
+    let workspace_viewport = interaction
+        .workspace_editor
+        .map(|editor| editor.line_viewport(workspace_budget));
+    let workspace_label = workspace_viewport.as_ref().map_or_else(
+        || workspace_name.map_or_else(String::new, |name| truncate_cells(name, workspace_budget)),
+        |viewport| {
+            let mut text = viewport.text.clone();
+            if UnicodeWidthStr::width(text.as_str()) < workspace_budget {
+                text.push(' ');
+            }
+            text
+        },
+    );
     let tab_budget = width
         .saturating_sub(UnicodeWidthStr::width(workspace_label.as_str()))
+        .saturating_sub(if workspace_name.is_some() { 3 } else { 0 })
         .saturating_sub(right_width)
         .saturating_sub(usize::from(!right.is_empty()))
         .saturating_sub(settings.left_padding)
@@ -337,10 +356,24 @@ pub fn project_bar(
     }];
     left.push(ProjectedSegment {
         text: workspace_label,
-        kind: SegmentKind::Base,
+        kind: if interaction.editing_workspace {
+            SegmentKind::EditingWorkspace
+        } else {
+            SegmentKind::Workspace
+        },
         window_id: None,
-        edit_cursor_offset: None,
+        edit_cursor_offset: workspace_viewport
+            .as_ref()
+            .map(|viewport| viewport.cursor_col),
     });
+    if workspace_name.is_some() {
+        left.push(ProjectedSegment {
+            text: " │ ".to_string(),
+            kind: SegmentKind::Base,
+            window_id: None,
+            edit_cursor_offset: None,
+        });
+    }
     if tokens.is_empty() {
         left.push(ProjectedSegment {
             text: "[no tabs]".to_string(),

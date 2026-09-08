@@ -1,13 +1,21 @@
-execution_class       = "native_fast"
-id                    = "bmux.tab_strip"
-name                  = "bmux Tab Strip"
+execution_class = "native_fast"
+id = "bmux.tab_strip"
+name = "bmux Tab Strip"
 provided_capabilities = ["bmux.tab_strip.input"]
-provided_features     = ["bmux.tab_strip"]
-required_capabilities = ["bmux.windows.read", "bmux.windows.write"]
-version               = "0.0.1-alpha.0"
+provided_features = ["bmux.tab_strip"]
+required_capabilities = [
+    "bmux.windows.read",
+    "bmux.windows.write",
+    "bmux.workspaces.write",
+]
+version = "0.0.1-alpha.0"
 
 [[dependencies]]
 plugin_id   = "bmux.windows"
+version_req = ">=0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.workspaces"
 version_req = ">=0.0.1-alpha.0"
 
 [[services]]

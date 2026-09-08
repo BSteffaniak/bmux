@@ -6,6 +6,7 @@
 mod menu;
 mod projection;
 mod settings;
+mod workspace_rename;
 
 use bmux_attach_view_protocol::AttachLocalPresentationSnapshot;
 #[cfg(test)]
@@ -29,6 +30,7 @@ use bmux_presentation_state::{
     global_presentation_fact_host_service,
 };
 use bmux_windows_plugin_api::{windows_commands, windows_list};
+use bmux_workspaces_plugin_api::{workspaces_commands, workspaces_state};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -220,6 +222,9 @@ struct CompanionState {
     catalog: windows_list::WindowListSnapshot,
     selected_context_id: Option<Uuid>,
     workspace_label: Option<String>,
+    workspace_id: Option<Uuid>,
+    editing_workspace_id: Option<Uuid>,
+    last_workspace_click: Option<(Uuid, u16, u16, Instant)>,
 }
 
 impl CompanionState {
@@ -250,6 +255,9 @@ impl CompanionState {
             },
             selected_context_id: None,
             workspace_label: None,
+            workspace_id: None,
+            editing_workspace_id: None,
+            last_workspace_click: None,
         }
     }
 
@@ -266,6 +274,16 @@ impl CompanionState {
             .find(|window| selected.map_or(window.active, |id| window.id == id))
             .map(|window| window.workspace_id)
             .or_else(|| selected.is_none().then_some(Uuid::nil()));
+        // A remembered label is not evidence of a live workspace identity.
+        self.workspace_id = snapshot
+            .windows
+            .iter()
+            .find(|window| Some(window.workspace_id) == workspace_id)
+            .map(|window| window.workspace_id);
+        if self.editing_workspace_id.is_some() && self.editing_workspace_id != self.workspace_id {
+            self.editing_workspace_id = None;
+            self.edit_buffer.clear();
+        }
         if let Some(window) = snapshot
             .windows
             .iter()
@@ -353,6 +371,14 @@ impl RustPlugin for TabStripPlugin {
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
+            "presentation-input", "rename-workspace" => |req: workspaces_commands::client::RenameWorkspaceRequest, ctx| {
+                let mut client = ServiceCallerDispatchClient::new(ctx);
+                block_on_typed_dispatch(workspaces_commands::client::rename_workspace(
+                    &mut client, req.selector, req.name,
+                ))
+                .map_err(|error| ServiceResponse::error("rename_unavailable", error.to_string()))?
+                .map_err(|error| ServiceResponse::error("rename_failed", format!("{error:?}")))
+            },
             "presentation-input", "handle-input" => |event: AttachInputEvent, ctx| {
                 Ok::<_, ServiceResponse>(handle_input(ctx, &event))
             },
@@ -530,6 +556,9 @@ fn publish_selection(context_id: Option<Uuid>) -> Result<(), String> {
         return Ok(());
     }
     companion.selected_context_id = context_id;
+    companion.editing_workspace_id = None;
+    companion.last_workspace_click = None;
+    companion.edit_buffer.clear();
     companion.hovered_window_id = None;
     companion.editing_window_id = None;
     companion.menu_window_id = None;
@@ -743,12 +772,14 @@ impl BarStyles {
 
     const fn for_kind(self, kind: projection::SegmentKind) -> RenderStyle {
         match kind {
-            projection::SegmentKind::Base => self.base,
+            projection::SegmentKind::Base | projection::SegmentKind::Workspace => self.base,
+            projection::SegmentKind::EditingWorkspace | projection::SegmentKind::EditingTab => {
+                self.editing
+            }
             projection::SegmentKind::ActiveTab => self.active,
             projection::SegmentKind::InactiveTab => self.inactive,
             projection::SegmentKind::HoveredActiveTab => self.hovered_active,
             projection::SegmentKind::HoveredInactiveTab => self.hovered_inactive,
-            projection::SegmentKind::EditingTab => self.editing,
             projection::SegmentKind::Mode => self.mode,
             projection::SegmentKind::Module => self.module,
             projection::SegmentKind::Overflow => self.overflow,
@@ -787,6 +818,8 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
         menu_selected: state.menu_selected,
         workspace_label: state.workspace_label.as_deref(),
         drag_marker_col: state.drag_target.map(|target| target.marker_col),
+        editing_workspace: state.editing_workspace_id.is_some(),
+        workspace_editor: state.editing_workspace_id.map(|_| &state.edit_buffer),
     }
 }
 
@@ -815,13 +848,48 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     for segment in projected.segments {
         let width = u16::try_from(unicode_width::UnicodeWidthStr::width(segment.text.as_str()))
             .unwrap_or(u16::MAX);
-        if !segment.text.is_empty() {
+        if segment.kind == projection::SegmentKind::EditingWorkspace {
+            let mut col = 0_usize;
+            for grapheme in
+                unicode_segmentation::UnicodeSegmentation::graphemes(segment.text.as_str(), true)
+            {
+                let selected = state.edit_buffer.selection().is_some();
+                let style = if selected || segment.edit_cursor_offset == Some(col) {
+                    styles.editing.reverse()
+                } else {
+                    styles.editing
+                };
+                ops.push(RenderOp::text_run(
+                    x.saturating_add(u16::try_from(col).unwrap_or(u16::MAX)),
+                    0,
+                    grapheme.to_string(),
+                    style,
+                ));
+                col += unicode_width::UnicodeWidthStr::width(grapheme);
+            }
+        } else if !segment.text.is_empty() {
             ops.push(RenderOp::text_run(
                 x,
                 0,
                 segment.text,
                 styles.for_kind(segment.kind),
             ));
+        }
+        if width > 0
+            && matches!(
+                segment.kind,
+                projection::SegmentKind::Workspace | projection::SegmentKind::EditingWorkspace
+            )
+            && let Some(id) = state.workspace_id
+        {
+            regions.push(
+                PluginSurfaceRegion::new(
+                    format!("workspace:{id}"),
+                    ExtensionRect::new(x, 0, width, state.settings.height),
+                )
+                .endpoint(input_endpoint())
+                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
+            );
         }
         if let Some(window_id) = segment.window_id {
             regions.push(
@@ -933,6 +1001,8 @@ fn projection_interaction_without_marker(
         menu_selected: state.menu_selected,
         drag_marker_col: None,
         workspace_label: state.workspace_label.as_deref(),
+        editing_workspace: state.editing_workspace_id.is_some(),
+        workspace_editor: state.editing_workspace_id.map(|_| &state.edit_buffer),
     }
 }
 
@@ -961,6 +1031,8 @@ fn update_drag_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
     let companion = guard.as_mut()?;
     match event.phase.as_str() {
         "down" if event.button.as_deref() == Some("left") => {
+            companion.last_workspace_click = None;
+            companion.editing_workspace_id = None;
             let double_click_window =
                 Duration::from_millis(companion.local_presentation.double_click_ms);
             let is_double = !double_click_window.is_zero()
@@ -1240,13 +1312,17 @@ fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
     }
     let mut guard = state().lock().ok()?;
     let companion = guard.as_mut()?;
-    let editing = companion.editing_window_id?;
+    let editing = companion
+        .editing_window_id
+        .or(companion.editing_workspace_id)?;
+    let workspace = companion.editing_workspace_id.is_some();
     let key = event.key.as_deref()?;
     let mut release_capture = false;
     let mut service_invocation = None;
     match key {
         "esc" => {
             companion.editing_window_id = None;
+            companion.editing_workspace_id = None;
             companion.edit_buffer.clear();
             release_capture = true;
         }
@@ -1268,12 +1344,20 @@ fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
             if name.is_empty() {
                 return Some(AttachInputResult {
                     consumed: true,
-                    status_message: Some("window name must not be empty".to_string()),
+                    status_message: Some(format!(
+                        "{} name must not be empty",
+                        if workspace { "workspace" } else { "window" }
+                    )),
                     ..AttachInputResult::default()
                 });
             }
-            service_invocation = rename_window_invocation(editing, name);
+            service_invocation = if workspace {
+                workspace_rename::invocation(editing, name)
+            } else {
+                rename_window_invocation(editing, name)
+            };
             companion.editing_window_id = None;
+            companion.editing_workspace_id = None;
             companion.edit_buffer.clear();
             release_capture = true;
         }
@@ -1319,6 +1403,9 @@ fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
             dirty: true,
             ..AttachInputResult::default()
         });
+    }
+    if let Some(result) = workspace_rename::handle_pointer(event) {
+        return Some(result);
     }
     if let Some(result) = update_drag_local(event) {
         return Some(result);
@@ -1455,7 +1542,73 @@ mod tests {
         assert!(handle_local_input(&event).is_none());
         event.key = Some("x".to_string());
         assert!(handle_local_input(&event).is_none());
+        exercise_workspace_editor(event);
         uninstall();
+    }
+
+    fn exercise_workspace_editor(mut event: AttachInputEvent) {
+        event.event_kind = "pointer".to_string();
+        event.phase = "down".to_string();
+        event.button = Some("left".to_string());
+        event.hook_id = format!("bmux.tab_strip:strip:workspace:{}", Uuid::nil());
+        state()
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .local_presentation
+            .double_click_ms = 500;
+        assert!(
+            handle_local_input(&event)
+                .unwrap()
+                .capture_keyboard
+                .is_empty()
+        );
+        assert_eq!(
+            handle_local_input(&event).unwrap().capture_keyboard,
+            vec!["*"]
+        );
+        event.event_kind = "key".to_string();
+        event.phase = "press".to_string();
+        event.key = Some("backspace".to_string());
+        assert!(handle_local_input(&event).unwrap().consumed);
+        event.key = Some("enter".to_string());
+        let empty = handle_local_input(&event).unwrap();
+        assert_eq!(
+            empty.status_message.as_deref(),
+            Some("workspace name must not be empty")
+        );
+        assert!(!empty.release_capture);
+        event.key = Some("界".to_string());
+        assert!(handle_local_input(&event).unwrap().consumed);
+        event.key = Some("enter".to_string());
+        let submitted = handle_local_input(&event).unwrap();
+        assert!(submitted.release_capture);
+        let request: workspaces_commands::client::RenameWorkspaceRequest =
+            bmux_plugin_sdk::decode_service_message(&submitted.service_invocation.unwrap().payload)
+                .unwrap();
+        assert_eq!(request.selector.id, Some(Uuid::nil()));
+        assert_eq!(request.name, "界");
+        // The catalog, not the submitted edit, remains label authority.
+        assert_eq!(
+            state()
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .workspace_label
+                .as_deref(),
+            Some("default")
+        );
+        event.event_kind = "pointer".to_string();
+        event.phase = "down".to_string();
+        handle_local_input(&event).unwrap();
+        handle_local_input(&event).unwrap();
+        event.event_kind = "key".to_string();
+        event.phase = "press".to_string();
+        event.key = Some("esc".to_string());
+        let canceled = handle_local_input(&event).unwrap();
+        assert!(canceled.release_capture && canceled.service_invocation.is_none());
     }
 
     #[test]
@@ -1719,9 +1872,9 @@ bar_bg = "#112233"
         });
         assert_eq!(state.scroll_offset, 3);
         let surface = build_surface(&state, 1);
-        assert_eq!(surface.interactive_regions.len(), 2);
+        assert_eq!(surface.interactive_regions.len(), 3);
         assert_eq!(
-            surface.interactive_regions[1].local_id,
+            surface.interactive_regions[2].local_id,
             format!("window:{}", Uuid::from_u128(4))
         );
         assert!(
@@ -1793,6 +1946,10 @@ bar_bg = "#112233"
         let surface = build_surface(&state, 1);
         assert_eq!(
             surface.interactive_regions[0].local_id,
+            format!("workspace:{}", Uuid::nil())
+        );
+        assert_eq!(
+            surface.interactive_regions[1].local_id,
             format!("window:{id}")
         );
         assert!(surface.accepts_input);
