@@ -2496,7 +2496,7 @@ fn prompt_overlay_layout(
     let capped_max = request.width.max.max(request.width.min);
     let width = if small {
         geometry.cols as usize
-    } else if compact {
+    } else if compact && request.max_height.is_none() {
         (geometry.cols as usize).saturating_sub(2)
     } else {
         (content_width + 4)
@@ -2507,11 +2507,12 @@ fn prompt_overlay_layout(
     let estimated_lines = prompt_estimated_lines(request);
     let height = if small {
         geometry.rows as usize
-    } else if compact {
+    } else if compact && request.max_height.is_none() {
         (geometry.rows as usize).saturating_sub(2)
     } else {
         (estimated_lines + 4)
             .max(7)
+            .min(usize::from(request.max_height.unwrap_or(u16::MAX).max(7)))
             .min((geometry.rows as usize).saturating_sub(2))
     };
     let x = ((geometry.cols as usize).saturating_sub(width)) / 2;
@@ -3005,6 +3006,45 @@ mod tests {
             .expect("small layout");
         assert_eq!((small.surface.rect.x, small.surface.rect.y), (0, 0));
         assert_eq!((small.surface.rect.w, small.surface.rect.h), (20, 6));
+    }
+
+    #[test]
+    fn bounded_prompt_layout_adapts_to_terminal_and_entry_count() {
+        let request = PromptRequest::search_select(
+            "Search",
+            (0..100)
+                .map(|index| PromptOption::new(index.to_string(), "Short"))
+                .collect(),
+        )
+        .width_range(90, 90)
+        .max_height(30);
+        for (cols, rows, width, height) in [
+            (200, 60, 90, 30),
+            (120, 40, 90, 30),
+            (80, 24, 78, 22),
+            (60, 18, 58, 16),
+            (200, 18, 90, 16),
+            (60, 60, 58, 30),
+            (20, 6, 20, 6),
+        ] {
+            let layout = prompt_overlay_layout(Some(&request), TerminalGeometry { cols, rows })
+                .expect("layout");
+            let rect = layout.surface.rect;
+            assert_eq!((rect.w, rect.h), (width, height));
+            assert_eq!((rect.x, rect.y), ((cols - width) / 2, (rows - height) / 2));
+        }
+        let short = PromptRequest::search_select("Search", vec![PromptOption::new("one", "One")])
+            .width_range(90, 90)
+            .max_height(30);
+        let layout = prompt_overlay_layout(
+            Some(&short),
+            TerminalGeometry {
+                cols: 200,
+                rows: 60,
+            },
+        )
+        .expect("short layout");
+        assert_eq!((layout.surface.rect.w, layout.surface.rect.h), (90, 7));
     }
 
     #[test]

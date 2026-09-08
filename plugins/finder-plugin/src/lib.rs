@@ -55,6 +55,8 @@ fn show_finder(context: &NativeCommandContext) -> Result<i32, PluginCommandError
         })
         .collect();
     let request = PromptRequest::search_select("Find Tab", options)
+        .width_range(90, 90)
+        .max_height(30)
         .message(settings.message())
         .submit_label("Switch")
         .search_match_mode(settings.match_mode.into())

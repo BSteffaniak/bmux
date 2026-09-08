@@ -377,6 +377,11 @@ pub struct PromptRequest {
     pub esc_cancels: bool,
     pub policy: PromptPolicy,
     pub width: PromptWidth,
+    /// Optional advisory cap on total overlay rows, including chrome. Hosts clamp
+    /// this to their minimum usable height and available terminal geometry.
+    /// Absent values preserve legacy sizing; older hosts may ignore this hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<u16>,
     pub field: PromptField,
 }
 
@@ -396,6 +401,7 @@ impl PromptRequest {
             esc_cancels: true,
             policy: PromptPolicy::Enqueue,
             width: PromptWidth::default(),
+            max_height: None,
             field: PromptField::Confirm {
                 default: false,
                 yes_label: "Yes".to_string(),
@@ -417,6 +423,7 @@ impl PromptRequest {
             esc_cancels: true,
             policy: PromptPolicy::Enqueue,
             width: PromptWidth::default(),
+            max_height: None,
             field: PromptField::TextInput {
                 initial_value: String::new(),
                 placeholder: None,
@@ -439,6 +446,7 @@ impl PromptRequest {
             esc_cancels: true,
             policy: PromptPolicy::Enqueue,
             width: PromptWidth::default(),
+            max_height: None,
             field: PromptField::SingleSelect {
                 options,
                 default_index: 0,
@@ -460,6 +468,7 @@ impl PromptRequest {
             esc_cancels: true,
             policy: PromptPolicy::Enqueue,
             width: PromptWidth::default(),
+            max_height: None,
             field: PromptField::SearchSelect {
                 options,
                 default_index: 0,
@@ -483,6 +492,7 @@ impl PromptRequest {
             esc_cancels: true,
             policy: PromptPolicy::Enqueue,
             width: PromptWidth::default(),
+            max_height: None,
             field: PromptField::MultiToggle {
                 options,
                 default_indices: Vec::new(),
@@ -504,6 +514,7 @@ impl PromptRequest {
             esc_cancels: true,
             policy: PromptPolicy::Enqueue,
             width: PromptWidth::default(),
+            max_height: None,
             field: PromptField::Form {
                 sections,
                 live_preview: false,
@@ -553,6 +564,13 @@ impl PromptRequest {
             PromptWidth { min: max, max: min }
         };
         self.width = normalized;
+        self
+    }
+
+    /// Cap the total overlay height while retaining content-driven sizing.
+    #[must_use]
+    pub const fn max_height(mut self, rows: u16) -> Self {
+        self.max_height = Some(rows);
         self
     }
 
@@ -785,6 +803,23 @@ impl PromptResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_height_hint_preserves_legacy_requests() {
+        let request = PromptRequest::confirm("Continue?");
+        let value = serde_json::to_value(&request).expect("serialize");
+        assert!(value.get("max_height").is_none());
+        assert_eq!(
+            serde_json::from_value::<PromptRequest>(value).expect("legacy request"),
+            request
+        );
+        let bounded = request.max_height(30);
+        let value = serde_json::to_value(&bounded).expect("serialize bounded request");
+        assert_eq!(
+            serde_json::from_value::<PromptRequest>(value).expect("bounded request"),
+            bounded
+        );
+    }
 
     #[test]
     fn validation_non_empty_rejects_blank() {
