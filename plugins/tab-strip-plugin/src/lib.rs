@@ -600,6 +600,7 @@ fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn companion_surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface> {
     let mut surfaces = vec![build_surface(companion, revision)];
     surfaces.extend(menu::surfaces(companion, revision));
