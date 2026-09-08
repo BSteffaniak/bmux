@@ -10110,6 +10110,7 @@ mod tests {
             height: 2,
             mode: "main".to_string(),
             scrollback_rows: 0,
+            total_scrolled_rows: None,
             cursor: bmux_terminal_grid::CursorSnapshot::default(),
             saved_cursor: bmux_terminal_grid::CursorSnapshot::default(),
             saved_pending_wrap: false,

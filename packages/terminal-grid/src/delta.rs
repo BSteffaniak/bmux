@@ -29,6 +29,9 @@ pub struct GridDeltaBatch {
     pub height: u16,
     pub mode: String,
     pub scrollback_rows: u32,
+    /// Authoritative cumulative scroll position; absent on legacy senders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_scrolled_rows: Option<u64>,
     pub cursor: CursorSnapshot,
     #[serde(default)]
     pub saved_cursor: CursorSnapshot,
@@ -71,6 +74,7 @@ impl GridDeltaBatch {
             || before.height != after.height
             || before.mode != after.mode
             || before.scrollback_rows != after.scrollback_rows
+            || before.total_scrolled_rows != after.total_scrolled_rows
             || before.rows.len() != after.rows.len();
         let row_updates = if reset_rows {
             after
@@ -104,6 +108,7 @@ impl GridDeltaBatch {
             height: after.height,
             mode: after.mode.clone(),
             scrollback_rows: after.scrollback_rows,
+            total_scrolled_rows: after.total_scrolled_rows,
             cursor: after.cursor,
             saved_cursor: after.saved_cursor,
             saved_pending_wrap: after.saved_pending_wrap,
@@ -214,6 +219,9 @@ impl GridDeltaBatch {
             && (self.width != snapshot.width
                 || self.height != snapshot.height
                 || self.scrollback_rows != snapshot.scrollback_rows
+                || self
+                    .total_scrolled_rows
+                    .is_some_and(|position| snapshot.total_scrolled_rows != Some(position))
                 || self.mode != snapshot.mode)
         {
             return Err(GridDeltaApplyError::MissingReplacementRows);
@@ -255,6 +263,7 @@ impl GridDeltaBatch {
         snapshot.height = self.height;
         snapshot.mode.clone_from(&self.mode);
         snapshot.scrollback_rows = self.scrollback_rows;
+        snapshot.total_scrolled_rows = self.total_scrolled_rows;
         snapshot.cursor = self.cursor;
         snapshot.saved_cursor = self.saved_cursor;
         snapshot.saved_pending_wrap = self.saved_pending_wrap;

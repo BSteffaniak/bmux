@@ -142,6 +142,15 @@ impl TerminalGridStream {
         }
         let mut snapshot = self.snapshot(0, self.grid.height());
         delta.apply_to_snapshot(&mut snapshot)?;
+        if delta.mode == "alternate"
+            && delta.main_rows.is_none()
+            && self.grid.mode() == GridMode::Alternate
+        {
+            // Omitted backing means unchanged backing, including retained history.
+            // Keep explicit replacements authoritative; never graft old history
+            // onto a supplied replacement or a different screen's coordinates.
+            snapshot.main_rows = self.snapshot(0, self.grid.main_row_count()).main_rows;
+        }
         if !delta.reset_rows && snapshot.mode == "main" && snapshot.scrollback_rows > 0 {
             // Sparse wire indexes address the viewport, not retained history.
             // Apply them above before restoring the unchanged local prefix so
@@ -171,6 +180,21 @@ impl TerminalGridStream {
             });
         }
         let replacement = Self::from_snapshot(&snapshot, limits)?;
+        if snapshot.mode == "alternate"
+            && let Some(rows) = &snapshot.main_rows
+            && replacement.grid.main_row_count() != rows.len()
+        {
+            return Err(TerminalGridStreamDeltaError::IncompleteHistory {
+                expected_rows: u32::try_from(
+                    rows.len().saturating_sub(usize::from(snapshot.height)),
+                )
+                .unwrap_or(u32::MAX),
+                reconstructed_rows: replacement
+                    .grid
+                    .main_row_count()
+                    .saturating_sub(usize::from(snapshot.height)),
+            });
+        }
         if replacement.grid.scrollback_rows_hint()
             != usize::try_from(snapshot.scrollback_rows).unwrap_or(usize::MAX)
         {
@@ -1266,6 +1290,167 @@ mod tests {
             consumer.process(b"\x1b[?1049lcontinued");
             assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
         }
+    }
+
+    #[test]
+    fn malformed_alternate_delta_does_not_project_retained_history() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+        for _ in 0..500 {
+            producer.process(b"retained\r\n");
+        }
+        producer.process(b"\x1b[?1049halt");
+        let before = producer.snapshot(0, 502);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        let valid = producer.process_delta(b"!").unwrap();
+        for duplicate in [false, true] {
+            let mut malformed = valid.clone();
+            if duplicate {
+                malformed.row_updates.push(malformed.row_updates[0].clone());
+            } else {
+                malformed.row_updates[0].row_index = 2;
+            }
+            crate::reflow::reset_projection_stats();
+            assert!(consumer.apply_delta(&malformed, limits).is_err());
+            let stats = crate::reflow::projection_stats();
+            assert!(
+                stats.logical_lines_projected <= 2,
+                "invalid viewport update projected hidden history: {stats:?}"
+            );
+            assert_eq!(consumer.snapshot(0, 502), before);
+        }
+        consumer.apply_delta(&valid, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 502), producer.snapshot(0, 502));
+    }
+
+    #[test]
+    fn capped_history_scroll_requires_complete_replacement() {
+        let limits = GridLimits { scrollback_rows: 1 };
+        let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+        producer.process(b"old\r\nretained\r\nlive");
+        let before = producer.snapshot(0, 3);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        let delta = producer.process_delta(b"\r\nnext").unwrap();
+        assert_eq!(delta.scrollback_rows, before.scrollback_rows);
+        assert_ne!(delta.total_scrolled_rows, before.total_scrolled_rows);
+        assert!(delta.reset_rows);
+        assert!(matches!(
+            consumer.apply_delta(&delta, limits),
+            Err(super::TerminalGridStreamDeltaError::IncompleteHistory { .. })
+        ));
+        assert_eq!(consumer.snapshot(0, 3), before);
+        let mut malformed = delta.clone();
+        malformed.reset_rows = false;
+        assert!(matches!(
+            consumer.apply_delta(&malformed, limits),
+            Err(super::TerminalGridStreamDeltaError::Delta(
+                crate::GridDeltaApplyError::MissingReplacementRows
+            ))
+        ));
+        assert_eq!(consumer.snapshot(0, 3), before);
+        let after = producer.snapshot(0, 3);
+        let complete = crate::GridDeltaBatch::between(&before, &after).unwrap();
+        assert!(complete.reset_rows);
+        consumer.apply_delta(&complete, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 3), after);
+        let sparse = producer.process_delta(b"!").unwrap();
+        assert!(!sparse.reset_rows);
+        consumer.apply_delta(&sparse, limits).unwrap();
+        assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+    }
+
+    #[test]
+    fn cumulative_scroll_position_survives_eviction_alternate_and_delta_hydration() {
+        let limits = GridLimits { scrollback_rows: 1 };
+        let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+        for _ in 0..10 {
+            producer.process(b"line\r\n");
+        }
+        let total = producer.grid().total_scrolled_rows();
+        assert!(total > 1);
+        for alternate in [false, true] {
+            if alternate {
+                producer.process(b"\x1b[?1049h");
+            }
+            let snapshot = producer.snapshot(0, 3);
+            let wire = serde_json::to_vec(&snapshot).unwrap();
+            let decoded = serde_json::from_slice(&wire).unwrap();
+            let mut consumer = TerminalGridStream::from_snapshot(&decoded, limits).unwrap();
+            assert_eq!(consumer.grid().total_scrolled_rows(), total);
+            let delta = producer.process_delta(b"x").unwrap();
+            let wire = serde_json::to_vec(&delta).unwrap();
+            let decoded = serde_json::from_slice(&wire).unwrap();
+            consumer.apply_delta(&decoded, limits).unwrap();
+            assert_eq!(consumer.grid().total_scrolled_rows(), total);
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+        }
+    }
+
+    #[test]
+    fn legacy_scroll_position_payloads_use_retained_count_fallback() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+        producer.process(b"one\r\ntwo\r\nthree");
+        let mut wire = serde_json::to_value(producer.snapshot(0, 3)).unwrap();
+        wire.as_object_mut().unwrap().remove("total_scrolled_rows");
+        let snapshot: crate::GridSnapshot = serde_json::from_value(wire).unwrap();
+        assert_eq!(snapshot.total_scrolled_rows, None);
+        let mut consumer = TerminalGridStream::from_snapshot(&snapshot, limits).unwrap();
+        assert_eq!(consumer.grid().total_scrolled_rows(), 1);
+        let delta = producer.process_delta(b"!").unwrap();
+        let mut wire = serde_json::to_value(delta).unwrap();
+        wire.as_object_mut().unwrap().remove("total_scrolled_rows");
+        let delta = serde_json::from_value(wire).unwrap();
+        consumer.apply_delta(&delta, limits).unwrap();
+        assert_eq!(consumer.grid().total_scrolled_rows(), 1);
+    }
+
+    #[test]
+    fn alternate_history_retention_failure_preserves_state_and_allows_retry() {
+        for supplied_backing in [false, true] {
+            let limits = GridLimits::default();
+            let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+            producer.process(b"history\r\nsecond\r\nthird\x1b[?1049halt");
+            let before = producer.snapshot(0, 3);
+            let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+            let mut delta = producer.process_delta(b" update").unwrap();
+            if supplied_backing {
+                delta.main_rows = producer.snapshot(0, 3).main_rows;
+            }
+            assert!(matches!(
+                consumer.apply_delta(&delta, GridLimits { scrollback_rows: 0 }),
+                Err(super::TerminalGridStreamDeltaError::IncompleteHistory {
+                    expected_rows: 1,
+                    reconstructed_rows: 0,
+                })
+            ));
+            assert_eq!(consumer.snapshot(0, 3), before);
+            consumer.apply_delta(&delta, limits).unwrap();
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+            producer.process(b"\x1b[?1049l continued");
+            consumer.process(b"\x1b[?1049l continued");
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+        }
+    }
+
+    #[test]
+    fn alternate_sparse_deltas_preserve_omitted_main_history() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(20, 2, limits).unwrap();
+        producer.process(b"history\r\nsecond\r\nthird\x1b[?1049halt");
+        let before = producer.snapshot(0, 3);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        for bytes in [b" update".as_slice(), b"\x1b[", b"31mred", b"\x1b7"] {
+            let delta = producer.process_delta(bytes).unwrap();
+            assert!(!delta.reset_rows);
+            assert!(delta.main_rows.is_none());
+            consumer.apply_delta(&delta, limits).unwrap();
+            assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
+            assert_eq!(consumer.snapshot(0, 3).main_rows, before.main_rows);
+        }
+        producer.process(b"\x1b[?1049l\r\ncontinued");
+        consumer.process(b"\x1b[?1049l\r\ncontinued");
+        assert_eq!(consumer.snapshot(0, 5), producer.snapshot(0, 5));
     }
 
     #[test]

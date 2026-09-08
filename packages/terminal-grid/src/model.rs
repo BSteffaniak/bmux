@@ -515,7 +515,9 @@ impl TerminalGrid {
             palette,
             revision: snapshot.revision,
             content_revision: snapshot.content_revision,
-            total_scrolled_rows: u64::from(snapshot.scrollback_rows),
+            total_scrolled_rows: snapshot
+                .total_scrolled_rows
+                .unwrap_or(u64::from(snapshot.scrollback_rows)),
             autowrap: snapshot.autowrap,
             pending_wrap: snapshot.pending_wrap,
             scroll_region: snapshot.scroll_region.map(|region| {

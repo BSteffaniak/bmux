@@ -585,6 +585,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn structured_history_survives_updates_and_alternate_exit() {
+        let pane_id = Uuid::new_v4();
+        let mut pipeline = AttachScenePipeline::new(AttachViewport {
+            cols: 20,
+            rows: 2,
+            top_inset: 0,
+            right_inset: 0,
+            bottom_inset: 0,
+            left_inset: 0,
+        });
+        let mut producer = TerminalGridStream::new(20, 2, GridLimits::default()).unwrap();
+        producer.process(b"history\r\nsecond\r\nthird\x1b[?1049halt");
+        pipeline
+            .hydrate_pane_grid_snapshots(vec![AttachPaneGridSnapshotState {
+                pane_id,
+                stream_end: 100,
+                snapshot: producer.snapshot(0, 3),
+            }])
+            .unwrap();
+        let sparse = producer.process_delta(b" update").unwrap();
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![sparse],
+            }])
+            .unwrap();
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id].terminal_grid.snapshot(0, 3),
+            producer.snapshot(0, 3)
+        );
+        let before = producer.snapshot(0, 3);
+        let incomplete = producer.process_delta(b"\x1b[?1049l").unwrap();
+        let revision = pipeline.pane_grid_revisions(&[pane_id]);
+        assert!(
+            pipeline
+                .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                    pane_id,
+                    batches: vec![incomplete],
+                }])
+                .is_err()
+        );
+        assert_eq!(pipeline.pane_grid_revisions(&[pane_id]), revision);
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id].terminal_grid.snapshot(0, 3),
+            before
+        );
+        let replacement = GridDeltaBatch::between(&before, &producer.snapshot(0, 3)).unwrap();
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![replacement],
+            }])
+            .unwrap();
+        let sparse = producer.process_delta(b"!").unwrap();
+        pipeline
+            .apply_pane_grid_deltas(vec![AttachPaneGridDeltaState {
+                pane_id,
+                batches: vec![sparse],
+            }])
+            .unwrap();
+        assert_eq!(
+            pipeline.pane_buffers[&pane_id].terminal_grid.snapshot(0, 3),
+            producer.snapshot(0, 3)
+        );
+        assert_eq!(
+            pipeline.pane_grid_revisions(&[pane_id]),
+            vec![producer.grid().revision()]
+        );
+    }
+
+    #[test]
     fn hydrate_pane_grid_snapshot_preserves_pending_escape_bytes() {
         let pane_id = Uuid::new_v4();
         let mut source = TerminalGridStream::new(10, 2, GridLimits::default())

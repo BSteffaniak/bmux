@@ -37,6 +37,10 @@ pub struct GridSnapshot {
     pub height: u16,
     pub mode: String,
     pub scrollback_rows: u32,
+    /// Cumulative scroll position, independent of retained history and screen mode.
+    /// Absent in legacy payloads, which only supplied a retained-row count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_scrolled_rows: Option<u64>,
     pub cursor: CursorSnapshot,
     #[serde(default)]
     pub saved_cursor: CursorSnapshot,
@@ -91,6 +95,7 @@ impl GridSnapshot {
                 GridMode::Alternate => "alternate".to_string(),
             },
             scrollback_rows,
+            total_scrolled_rows: Some(grid.total_scrolled_rows()),
             cursor,
             saved_cursor: cursor_snapshot(grid.saved_cursor()),
             saved_pending_wrap: grid.saved_pending_wrap(),
