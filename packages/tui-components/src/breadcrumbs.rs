@@ -228,6 +228,19 @@ impl<'a, 'state> BreadcrumbsComponent<'a, 'state> {
         let pointer_changed = self.breadcrumbs.cancel_invalid_pointer_targets(&mut state);
         let outcome = if let Event::Mouse(mouse) = event {
             if self.breadcrumbs.policy.mouse.enabled {
+                let interactive_width = if self.breadcrumbs.policy.truncate
+                    && self.breadcrumbs.intrinsic_width() > usize::from(layout.size.width)
+                {
+                    u16_saturating(
+                        self.breadcrumbs
+                            .line(&state)
+                            .truncate(usize::from(layout.size.width))
+                            .width()
+                            .saturating_sub(1),
+                    )
+                } else {
+                    layout.size.width
+                };
                 let mut x = 0_u16;
                 let hit =
                     self.breadcrumbs
@@ -239,7 +252,7 @@ impl<'a, 'state> BreadcrumbsComponent<'a, 'state> {
                             let visible = cx.visible_rect(bmux_tui::component::LogicalRect::new(
                                 x,
                                 0,
-                                width.min(layout.size.width.saturating_sub(x)),
+                                width.min(interactive_width.saturating_sub(x)),
                                 usize::from(layout.size.height > 0),
                             ));
                             x = x.saturating_add(width).saturating_add(u16_saturating(
@@ -281,10 +294,17 @@ impl Component for BreadcrumbsComponent<'_, '_> {
     fn revision(&self) -> ComponentRevision {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
-        self.breadcrumbs.items.hash(&mut layout);
+        self.breadcrumbs.items.len().hash(&mut layout);
+        for item in self.breadcrumbs.items {
+            item.id.hash(&mut layout);
+            item.label.hash(&mut layout);
+        }
         self.breadcrumbs.policy.separator.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        for item in self.breadcrumbs.items {
+            item.disabled.hash(&mut paint);
+        }
         let policy = self.breadcrumbs.policy;
         (
             policy.separator,
@@ -302,20 +322,7 @@ impl Component for BreadcrumbsComponent<'_, '_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let width =
-            self.breadcrumbs
-                .items
-                .iter()
-                .enumerate()
-                .fold(0_u16, |width, (index, item)| {
-                    width
-                        .saturating_add(u16_saturating(display_width(item.label)))
-                        .saturating_add(if index == 0 {
-                            0
-                        } else {
-                            u16_saturating(display_width(self.breadcrumbs.policy.separator))
-                        })
-                });
+        let width = u16_saturating(self.breadcrumbs.intrinsic_width());
         LayoutNode::leaf(
             self.id.clone(),
             constraints.constrain(LogicalSize::new(width, 1)),
@@ -329,7 +336,7 @@ impl Component for BreadcrumbsComponent<'_, '_> {
         }
         let state = self.state.get();
         let mut line = self.breadcrumbs.line(&state);
-        if self.breadcrumbs.policy.truncate {
+        if self.breadcrumbs.policy.truncate && line.width() > usize::from(layout.size.width) {
             line = line.truncate(usize::from(layout.size.width));
         }
         let area = LocalRect::new(0, 0, layout.size.width, 1);
@@ -366,6 +373,18 @@ impl Component for BreadcrumbsComponent<'_, '_> {
 }
 
 impl<'a> Breadcrumbs<'a> {
+    fn intrinsic_width(&self) -> usize {
+        let separator_width = display_width(self.policy.separator);
+        self.items
+            .iter()
+            .enumerate()
+            .fold(0_usize, |width, (index, item)| {
+                width
+                    .saturating_add(display_width(item.label))
+                    .saturating_add(if index == 0 { 0 } else { separator_width })
+            })
+    }
+
     /// Create breadcrumbs over caller-owned items.
     #[must_use]
     pub const fn new(items: &'a [BreadcrumbItem<'a>]) -> Self {
@@ -944,6 +963,230 @@ mod tests {
             ),
             BreadcrumbsOutcome::Activated { .. }
         ));
+    }
+
+    #[test]
+    fn exact_fit_trail_preserves_separator_and_final_item_activation() {
+        let items = [
+            BreadcrumbItem::new("home", "Home"),
+            BreadcrumbItem::new("docs", "Docs"),
+        ];
+        let state = Cell::new(BreadcrumbsState::new(None));
+        let component = BreadcrumbsComponent::new("trail", &items, &state);
+        let layout = component.layout(Constraints::for_width(11), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 11, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("Home / Docs")
+        );
+        for (x, expected) in [(5, None), (10, Some("docs"))] {
+            let mut cx = bmux_tui::component::EventCx::new(&layout);
+            component.handle_event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(x, 0),
+                )),
+                &layout,
+                &mut cx,
+            );
+            let outcome = component.handle_event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(x, 0),
+                )),
+                &layout,
+                &mut cx,
+            );
+            let activated = match outcome {
+                BreadcrumbsOutcome::Activated { id, .. } => Some(id),
+                _ => None,
+            };
+            assert_eq!(activated, expected);
+        }
+    }
+
+    #[test]
+    fn oversized_trail_truncates_at_saturated_layout_width() {
+        let label = "a".repeat(usize::from(u16::MAX) + 1);
+        let items = [BreadcrumbItem::new("long", &label)];
+        let state = Cell::new(BreadcrumbsState::new(None));
+        let component = BreadcrumbsComponent::new("trail", &items, &state);
+        assert_eq!(component.breadcrumbs.intrinsic_width(), label.len());
+        let layout = component.layout(Constraints::for_width(u16::MAX), &mut LayoutCx::new());
+        assert_eq!(layout.size.width, u16::MAX);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, u16::MAX, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert!(frame.buffer().row_symbols(0).unwrap().ends_with('…'));
+        let mut cx = bmux_tui::component::EventCx::new(&layout);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let outcome = component.handle_event(
+                &Event::Mouse(MouseEvent::new(kind, Point::new(u16::MAX - 1, 0))),
+                &layout,
+                &mut cx,
+            );
+            assert!(!matches!(outcome, BreadcrumbsOutcome::Activated { .. }));
+        }
+        assert_eq!(state.get().current(), None);
+    }
+
+    #[test]
+    fn intrinsic_width_matches_styled_trail_width() {
+        for labels in [vec![], vec!["界"], vec!["Home", "界", ""]] {
+            let items: Vec<_> = labels
+                .iter()
+                .map(|label| BreadcrumbItem::new(label, label))
+                .collect();
+            for separator in ["", " / ", "界"] {
+                let mut breadcrumbs = Breadcrumbs::new(&items);
+                breadcrumbs.policy.separator = separator;
+                assert_eq!(
+                    breadcrumbs.intrinsic_width(),
+                    breadcrumbs.line(&BreadcrumbsState::default()).width()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn untruncated_last_visible_cell_remains_clickable() {
+        let items = [BreadcrumbItem::new("home", "Home")];
+        let state = Cell::new(BreadcrumbsState::new(None));
+        let component =
+            BreadcrumbsComponent::new("trail", &items, &state).policy(BreadcrumbsPolicy {
+                truncate: false,
+                ..BreadcrumbsPolicy::default()
+            });
+        let layout = component.layout(Constraints::for_width(3), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("Hom"));
+        let mut cx = bmux_tui::component::EventCx::new(&layout);
+        component.handle_event(
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(2, 0),
+            )),
+            &layout,
+            &mut cx,
+        );
+        assert_eq!(
+            component.handle_event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(2, 0)
+                )),
+                &layout,
+                &mut cx,
+            ),
+            BreadcrumbsOutcome::Activated {
+                index: 0,
+                id: "home"
+            }
+        );
+    }
+
+    #[test]
+    fn truncated_ellipsis_does_not_activate_hidden_label() {
+        for (label, width, expected, interactive_width) in [
+            ("Home", 3, "Ho…", 2),
+            ("界abc", 4, "界a…", 3),
+            ("界界", 2, "… ", 0),
+            ("Home", 1, "…", 0),
+        ] {
+            let items = [BreadcrumbItem::new("home", label)];
+            let state = Cell::new(BreadcrumbsState::new(None));
+            let component = BreadcrumbsComponent::new("trail", &items, &state);
+            let layout = component.layout(Constraints::for_width(width), &mut LayoutCx::new());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(expected));
+            for x in 0..width {
+                bmux_tui::component::EventCx::new(&layout).with_transform(
+                    0,
+                    0,
+                    2,
+                    1,
+                    Rect::new(3, 1, width.saturating_sub(1), 1),
+                    |cx| {
+                        component.handle_event(
+                            &Event::Mouse(MouseEvent::new(
+                                MouseEventKind::Down(MouseButton::Left),
+                                Point::new(x + 2, 1),
+                            )),
+                            &layout,
+                            cx,
+                        );
+                        let outcome = component.handle_event(
+                            &Event::Mouse(MouseEvent::new(
+                                MouseEventKind::Up(MouseButton::Left),
+                                Point::new(x + 2, 1),
+                            )),
+                            &layout,
+                            cx,
+                        );
+                        assert_eq!(
+                            matches!(outcome, BreadcrumbsOutcome::Activated { .. }),
+                            x > 0 && x < interactive_width,
+                            "label={label:?}, x={x}",
+                        );
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_item_changes_reuse_measurement() {
+        let state = Cell::new(BreadcrumbsState::new(None));
+        let enabled = [BreadcrumbItem::new("home", "Home")];
+        let disabled = [BreadcrumbItem::new("home", "Home").disabled(true)];
+        let before = BreadcrumbsComponent::new("trail", &enabled, &state);
+        let after = BreadcrumbsComponent::new("trail", &disabled, &state);
+        let mut cache = bmux_tui::component::LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        let constraints = Constraints::for_width(10);
+        let first = cache.layout("trail".into(), &before, constraints, &mut cx);
+        let second = cache.layout("trail".into(), &after, constraints, &mut cx);
+        assert_ne!(before.revision(), after.revision());
+        assert_eq!(first.size, second.size);
+        assert_eq!(cx.measured_nodes(), 1);
+        assert_eq!(cache.stats().hits, 1);
+        for (component, layout, interactive) in [(&before, &first, true), (&after, &second, false)]
+        {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.hits().regions().is_empty(), !interactive);
+            let mut events = bmux_tui::component::EventCx::new(layout);
+            component.handle_event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    Point::new(0, 0),
+                )),
+                layout,
+                &mut events,
+            );
+            let outcome = component.handle_event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(0, 0),
+                )),
+                layout,
+                &mut events,
+            );
+            assert_eq!(
+                matches!(outcome, BreadcrumbsOutcome::Activated { .. }),
+                interactive
+            );
+        }
     }
 
     #[test]

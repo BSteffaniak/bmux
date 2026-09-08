@@ -112,8 +112,12 @@ where
         let old = self.scroll.vertical_offset();
         let offset = crate::scroll_view::reveal_offset(old, viewport_height, start, item.height);
         let maximum = self.index.total_height().saturating_sub(viewport_height);
-        self.scroll.set_vertical_offset(offset.min(maximum));
-        self.scroll.vertical_offset() != old
+        let next = offset.min(maximum);
+        if next == old {
+            return false;
+        }
+        self.scroll.set_vertical_offset(next);
+        true
     }
 
     /// Exact logical content extent at the synchronized width.
@@ -281,7 +285,7 @@ where
         let by_key = self
             .items
             .iter()
-            .map(|item| (item.key.clone(), item))
+            .map(|item| (&item.key, item))
             .collect::<std::collections::BTreeMap<_, _>>();
         state.index.sync(
             self.items
@@ -2154,6 +2158,155 @@ mod tests {
         assert_eq!(state.item_offset(&"panel"), Some(4));
         assert_eq!(state.key_at_offset(3), Some(&"toolbar"));
         assert_eq!(state.key_at_offset(4), Some(&"panel"));
+    }
+
+    #[test]
+    fn ensuring_visible_item_preserves_bottom_follow_without_movement() {
+        let mut state = VirtualListState::new(1);
+        let mut cx = LayoutCx::new();
+        let list = VirtualList::new("reveal")
+            .item("a", 0, TextBlock::new("a\na"))
+            .item("b", 0, TextBlock::new("b\nb"));
+        list.sync(10, &mut state, &mut cx);
+        state.scroll_to_bottom(2);
+        assert!(!state.ensure_key_visible(&"b", 2));
+        assert_eq!(state.scroll.vertical_offset(), 3);
+        assert!(state.scroll.follows_bottom());
+        assert!(list.ensure_item_visible(&mut state, &"b", 2));
+        assert!(!list.ensure_item_visible(&mut state, &"missing", 2));
+        assert_eq!(state.scroll.vertical_offset(), 3);
+        assert!(state.scroll.follows_bottom());
+        assert!(state.ensure_key_visible(&"a", 2));
+        assert_eq!(state.scroll.vertical_offset(), 0);
+        assert!(!state.scroll.follows_bottom());
+    }
+
+    #[test]
+    fn scrolling_up_stops_following_appended_content() {
+        let mut state = VirtualListState::new(1);
+        let mut cx = LayoutCx::new();
+        let populated = VirtualList::new("follow")
+            .item("a", 0, TextBlock::new("a\na\na"))
+            .item("b", 0, TextBlock::new("b\nb\nb"));
+        populated.sync(10, &mut state, &mut cx);
+        state.scroll_to_bottom(2);
+        assert!(state.scroll_by(-1, 2));
+        assert!(!state.scroll.follows_bottom());
+        state.capture_anchor();
+
+        let appended = populated.item("c", 0, TextBlock::new("c\nc\nc"));
+        appended.sync(10, &mut state, &mut cx);
+        state.restore_anchor(2);
+        assert_eq!(state.scroll.vertical_offset(), 4);
+        assert!(!state.scroll.follows_bottom());
+        state.scroll_to_bottom(2);
+        assert_eq!(state.scroll.vertical_offset(), 9);
+        assert!(state.scroll.follows_bottom());
+    }
+
+    #[test]
+    fn manual_anchor_resets_when_collection_is_cleared() {
+        let mut state = VirtualListState::new(1);
+        let mut cx = LayoutCx::new();
+        let populated = VirtualList::new("manual")
+            .item("a", 0, TextBlock::new("a\na\na"))
+            .item("b", 0, TextBlock::new("b\nb\nb"));
+        populated.sync(10, &mut state, &mut cx);
+        assert!(state.scroll_to_key(&"b", 2));
+        state.capture_anchor();
+        assert_eq!(state.scroll.vertical_offset(), 4);
+        assert!(!state.scroll.follows_bottom());
+
+        VirtualList::<&str>::new("manual").sync(10, &mut state, &mut cx);
+        state.restore_anchor(2);
+        assert_eq!(state.scroll.vertical_offset(), 0);
+        assert!(state.anchor.is_none());
+
+        populated.sync(10, &mut state, &mut cx);
+        state.restore_anchor(2);
+        assert_eq!(state.scroll.vertical_offset(), 0);
+        assert!(!state.scroll.follows_bottom());
+    }
+
+    #[test]
+    fn bottom_follow_survives_empty_collection_and_repopulation() {
+        let mut state = VirtualListState::new(1);
+        let mut cx = LayoutCx::new();
+        let populated = VirtualList::new("follow")
+            .item("a", 0, TextBlock::new("a\na\na"))
+            .item("b", 0, TextBlock::new("b\nb\nb"));
+        populated.sync(10, &mut state, &mut cx);
+        state.scroll_to_bottom(2);
+        assert_eq!(state.scroll.vertical_offset(), 5);
+        state.capture_anchor();
+
+        VirtualList::<&str>::new("follow").sync(10, &mut state, &mut cx);
+        state.restore_anchor(2);
+        assert_eq!(state.scroll.vertical_offset(), 0);
+        assert!(state.scroll.follows_bottom());
+
+        let repopulated = VirtualList::new("follow").item("c", 0, TextBlock::new("c\nc\nc\nc"));
+        repopulated.sync(10, &mut state, &mut cx);
+        state.restore_anchor(2);
+        assert_eq!(state.scroll.vertical_offset(), 2);
+        assert!(state.scroll.follows_bottom());
+
+        state.restore_anchor(10);
+        assert_eq!(state.scroll.vertical_offset(), 0);
+        assert!(state.scroll.follows_bottom());
+        state.restore_anchor(1);
+        assert_eq!(state.scroll.vertical_offset(), 3);
+        assert!(state.scroll.follows_bottom());
+    }
+
+    #[test]
+    fn owned_keys_reuse_measurements_across_rebuild_and_revision_change() {
+        let first = VirtualList::new("owned")
+            .item(String::from("a"), 0, TextBlock::new("a"))
+            .item(String::from("b"), 0, TextBlock::new("b"));
+        let mut state = VirtualListState::new(1);
+        let mut cx = LayoutCx::new();
+        first.sync(10, &mut state, &mut cx);
+        let measured = cx.measured_nodes();
+        drop(first);
+
+        let rebuilt = VirtualList::new("owned")
+            .item(String::from("b"), 0, TextBlock::new("b"))
+            .item(String::from("a"), 1, TextBlock::new("a\na"));
+        rebuilt.sync(10, &mut state, &mut cx);
+        assert_eq!(cx.measured_nodes(), measured + 1);
+        assert_eq!(state.total_height(), 4);
+        assert_eq!(state.item_offset(&String::from("b")), Some(0));
+        assert_eq!(state.item_offset(&String::from("a")), Some(2));
+        rebuilt.sync(10, &mut state, &mut cx);
+        assert_eq!(cx.measured_nodes(), measured + 1);
+
+        let removed = VirtualList::new("owned").item(String::from("b"), 0, TextBlock::new("b"));
+        removed.sync(10, &mut state, &mut cx);
+        assert_eq!(cx.measured_nodes(), measured + 1);
+        assert_eq!(state.item_offset(&String::from("a")), None);
+        assert_eq!(state.total_height(), 1);
+
+        let reinserted = VirtualList::new("owned")
+            .item(String::from("b"), 0, TextBlock::new("b"))
+            .item(String::from("a"), 1, TextBlock::new("a\na\na"));
+        reinserted.sync(10, &mut state, &mut cx);
+        assert_eq!(cx.measured_nodes(), measured + 2);
+        assert_eq!(state.total_height(), 5);
+        assert_eq!(state.item_offset(&String::from("a")), Some(2));
+
+        VirtualList::<String>::new("owned").sync(10, &mut state, &mut cx);
+        assert_eq!(cx.measured_nodes(), measured + 2);
+        assert_eq!(state.total_height(), 0);
+        assert_eq!(state.key_at_offset(0), None);
+        assert_eq!(state.item_offset(&String::from("b")), None);
+
+        let repopulated =
+            VirtualList::new("owned").item(String::from("b"), 0, TextBlock::new("b\nb"));
+        repopulated.sync(10, &mut state, &mut cx);
+        assert_eq!(cx.measured_nodes(), measured + 3);
+        assert_eq!(state.total_height(), 2);
+        assert_eq!(state.item_offset(&String::from("b")), Some(0));
     }
 
     #[test]

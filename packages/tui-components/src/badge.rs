@@ -182,7 +182,14 @@ impl<'a> BadgeComponent<'a> {
 }
 
 impl BadgeComponent<'_> {
-    fn text(&self) -> String {
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        if self.policy.left.is_empty() && self.policy.right.is_empty() && self.policy.padding == 0 {
+            return if self.policy.uppercase {
+                self.label.to_uppercase().into()
+            } else {
+                self.label.into()
+            };
+        }
         let uppercase;
         let label = if self.policy.uppercase {
             uppercase = self.label.to_uppercase();
@@ -201,7 +208,7 @@ impl BadgeComponent<'_> {
         text.push_str(label);
         text.extend(std::iter::repeat_n(' ', usize::from(self.policy.padding)));
         text.push_str(self.policy.right);
-        text
+        text.into()
     }
 
     const fn style(&self) -> Style {
@@ -249,7 +256,7 @@ impl Component for BadgeComponent<'_> {
             return;
         }
         let mut line = Line::from_spans([Span::styled(self.text(), self.style())]);
-        if self.policy.truncate {
+        if self.policy.truncate && line.width() > usize::from(layout.size.width) {
             line = line.truncate(usize::from(layout.size.width));
         }
         let area = LocalRect::new(0, 0, layout.size.width, 1);
@@ -294,6 +301,45 @@ mod tests {
     use bmux_tui::paint::PaintCx;
 
     use super::{BadgeComponent, BadgePolicy, BadgeSeverity, BadgeStyles};
+
+    #[test]
+    fn bare_label_borrows_text_and_uppercase_preserves_unicode_expansion() {
+        let badge = BadgeComponent::new("bare", "straße").policy(BadgePolicy::bare());
+        assert!(matches!(badge.text(), std::borrow::Cow::Borrowed("straße")));
+        let uppercase =
+            BadgeComponent::new("upper", "straße").policy(BadgePolicy::bare().uppercase(true));
+        assert_eq!(uppercase.text(), "STRASSE");
+        let layout = uppercase.layout(Constraints::for_width(7), &mut LayoutCx::new());
+        assert_eq!(layout.size.width, 7);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 7, 1));
+        let mut frame = Frame::new(&mut buffer);
+        uppercase.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("STRASSE"));
+    }
+
+    #[test]
+    fn truncation_preserves_exact_fit_and_marks_unicode_overflow() {
+        for (label, width, expected) in [
+            ("abc", 3, "abc"),
+            ("界a", 3, "界a"),
+            ("abcd", 3, "ab…"),
+            ("界ab", 3, "界…"),
+            ("界", 1, "…"),
+        ] {
+            let component = BadgeComponent::new("badge", label).policy(BadgePolicy {
+                truncate: true,
+                ..BadgePolicy::bare()
+            });
+            let layout = component.layout(
+                Constraints::tight(Size::new(width, 1)),
+                &mut LayoutCx::new(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(expected));
+        }
+    }
 
     #[test]
     fn computes_configured_text() {

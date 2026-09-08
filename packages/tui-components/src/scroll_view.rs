@@ -831,8 +831,11 @@ impl ScrollView {
     ) -> ScrollViewOutcome {
         let old = state.vertical_offset;
         let viewport = layout.size.height;
-        state.vertical_offset = reveal_offset(old, viewport, start, height);
-        state.follow_bottom = false;
+        state.vertical_offset =
+            reveal_offset(old, viewport, start, height).min(Self::max_vertical_offset(layout));
+        if state.vertical_offset != old {
+            state.follow_bottom = false;
+        }
         self.reconcile(layout, state);
         outcome(old, state.vertical_offset)
     }
@@ -2970,6 +2973,30 @@ mod tests {
                 horizontal_offset: 0
             }
         );
+    }
+
+    #[test]
+    fn ensure_visible_noop_preserves_bottom_follow() {
+        let view = ScrollView::new();
+        let layout = layout(20, 5);
+        let mut state = ScrollViewState::new();
+        state.set_follow_bottom(true);
+        view.reconcile(&layout, &mut state);
+        assert_eq!(state.vertical_offset(), 15);
+        assert_eq!(
+            view.ensure_visible(&layout, &mut state, 18, 1),
+            ScrollViewOutcome::Ignored
+        );
+        assert!(state.follows_bottom());
+        assert_eq!(
+            view.ensure_visible(&layout, &mut state, usize::MAX, 1),
+            ScrollViewOutcome::Ignored
+        );
+        assert_eq!(state.vertical_offset(), 15);
+        assert!(state.follows_bottom());
+        view.ensure_visible(&layout, &mut state, 2, 1);
+        assert_eq!(state.vertical_offset(), 2);
+        assert!(!state.follows_bottom());
     }
 
     #[test]

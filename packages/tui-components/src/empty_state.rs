@@ -12,7 +12,7 @@ use bmux_tui::prelude::{Alignment, Line, TextWrap, TextWrapGeometry};
 use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::{Color, Modifier, Style};
 
-/// Vertical placement for [`EmptyState`].
+/// Vertical placement for [`EmptyStateComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum EmptyStatePlacement {
     /// Place content at the top of the area.
@@ -22,7 +22,7 @@ pub enum EmptyStatePlacement {
     Center,
 }
 
-/// Behavior/layout policy for [`EmptyState`].
+/// Behavior/layout policy for [`EmptyStateComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmptyStatePolicy {
     /// Horizontal alignment.
@@ -83,7 +83,7 @@ impl Default for EmptyStatePolicy {
     }
 }
 
-/// Visual styles for [`EmptyState`].
+/// Visual styles for [`EmptyStateComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmptyStateStyles {
     /// Icon style.
@@ -186,13 +186,16 @@ impl Component for EmptyStateComponent<'_> {
         self.id.as_str().hash(&mut layout);
         self.icon.hash(&mut layout);
         self.title.hash(&mut layout);
-        for line in self.body {
-            format!("{line:?}").hash(&mut layout);
+        for lines in [self.body, self.actions] {
+            lines.len().hash(&mut layout);
+            for line in lines {
+                line.spans.len().hash(&mut layout);
+                for span in &line.spans {
+                    span.content.hash(&mut layout);
+                }
+            }
         }
-        for line in self.actions {
-            format!("{line:?}").hash(&mut layout);
-        }
-        format!("{:?}", self.policy.alignment).hash(&mut layout);
+        self.policy.alignment.hash(&mut layout);
         self.policy.placement.hash(&mut layout);
         self.policy.padding.top.hash(&mut layout);
         self.policy.padding.right.hash(&mut layout);
@@ -201,6 +204,11 @@ impl Component for EmptyStateComponent<'_> {
         self.policy.wrap.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
+        for line in self.body.iter().chain(self.actions) {
+            for span in &line.spans {
+                span.style.hash(&mut paint);
+            }
+        }
         self.policy.background.hash(&mut paint);
         self.styles.icon.hash(&mut paint);
         self.styles.title.hash(&mut paint);
@@ -363,6 +371,121 @@ mod tests {
     use bmux_tui::prelude::{Alignment, Line};
 
     use super::{EmptyStateComponent, EmptyStatePlacement, EmptyStatePolicy};
+
+    #[test]
+    fn rich_text_content_and_line_boundaries_invalidate_measurement() {
+        let original = [Line::from("abcd")];
+        let longer = [Line::from("abcdefgh")];
+        let split = [Line::from("ab"), Line::from("cd")];
+        for actions in [false, true] {
+            let mut cache = bmux_tui::component::LayoutCache::new();
+            let mut cx = LayoutCx::new();
+            for (lines, height) in [
+                (original.as_slice(), 2),
+                (longer.as_slice(), 3),
+                (split.as_slice(), 3),
+                (original.as_slice(), 2),
+            ] {
+                let component =
+                    EmptyStateComponent::new("empty", "Title").policy(EmptyStatePolicy {
+                        wrap: true,
+                        ..EmptyStatePolicy::bare()
+                    });
+                let component = if actions {
+                    component.actions(lines)
+                } else {
+                    component.body(lines)
+                };
+                let layout = cache.layout(
+                    "empty".into(),
+                    &component,
+                    Constraints::for_width(5),
+                    &mut cx,
+                );
+                assert_eq!(layout.size.height, height);
+            }
+            assert_eq!(cx.measured_nodes(), 3);
+            assert_eq!(cache.stats().hits, 1);
+        }
+    }
+
+    #[test]
+    fn rich_text_style_changes_reuse_measurement() {
+        use bmux_tui::prelude::{Color, Span, Style};
+
+        let original = [Line::from_spans([Span::styled(
+            "body",
+            Style::new().fg(Color::Red),
+        )])];
+        let restyled = [Line::from_spans([Span::styled(
+            "body",
+            Style::new().fg(Color::Blue),
+        )])];
+        for actions in [false, true] {
+            let before =
+                EmptyStateComponent::new("empty", "title").policy(EmptyStatePolicy::bare());
+            let after = EmptyStateComponent::new("empty", "title").policy(EmptyStatePolicy::bare());
+            let (before, after) = if actions {
+                (before.actions(&original), after.actions(&restyled))
+            } else {
+                (before.body(&original), after.body(&restyled))
+            };
+            assert_ne!(before.revision(), after.revision());
+            let mut cache = bmux_tui::component::LayoutCache::new();
+            let mut cx = LayoutCx::new();
+            let constraints = Constraints::for_width(10);
+            let first = cache.layout("empty".into(), &before, constraints, &mut cx);
+            let second = cache.layout("empty".into(), &after, constraints, &mut cx);
+            assert_eq!(first.size, second.size);
+            assert_eq!(cx.measured_nodes(), 1);
+            assert_eq!(cache.stats().hits, 1);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 2));
+            let mut frame = Frame::new(&mut buffer);
+            for (component, layout, color) in [
+                (&before, &first, Color::Red),
+                (&after, &second, Color::Blue),
+            ] {
+                component.paint(layout, &mut PaintCx::new(&mut frame));
+                assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("body      "));
+                for x in 0..4 {
+                    let cell = frame
+                        .buffer()
+                        .get(bmux_tui::geometry::Point::new(x, 1))
+                        .unwrap();
+                    assert_eq!(cell.style.fg, Some(color));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn width_reflow_reuses_prior_layout_without_stale_wrapping() {
+        let component = EmptyStateComponent::new("empty", "abcd efgh").policy(EmptyStatePolicy {
+            wrap: true,
+            ..EmptyStatePolicy::bare()
+        });
+        let mut cache = bmux_tui::component::LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        for (width, height, first_row) in [(9, 1, "abcd efgh"), (4, 2, "abcd"), (9, 1, "abcd efgh")]
+        {
+            let layout = cache.layout(
+                "empty".into(),
+                &component,
+                Constraints::for_width(width),
+                &mut cx,
+            );
+            assert_eq!(layout.size.height, usize::from(height));
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(first_row));
+            if height == 2 {
+                assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("efgh"));
+            }
+        }
+        assert_eq!(cx.measured_nodes(), 2);
+        assert_eq!(cache.stats().hits, 1);
+    }
 
     #[test]
     fn component_renders_full_content() {

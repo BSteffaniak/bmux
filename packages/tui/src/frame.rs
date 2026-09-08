@@ -7,8 +7,7 @@ use crate::geometry::{Point, Rect};
 use crate::hit::{HitMap, HitRegion};
 use crate::image::ImageContribution;
 use crate::selection::{
-    SelectionFragment, SelectionScene, SelectionScope, SelectionSnapshot,
-    paint_selection_highlights,
+    SelectionFragment, SelectionScene, SelectionScope, paint_selection_highlights,
 };
 use crate::semantic::{SemanticRegion, SemanticScene};
 use crate::style::Style;
@@ -179,8 +178,8 @@ impl<'buffer> Frame<'buffer> {
         self.selection.push_fragment(fragment);
     }
 
-    pub(crate) fn paint_selection(&mut self, snapshot: &SelectionSnapshot, style: Style) {
-        paint_selection_highlights(self.buffer, &snapshot.visible_highlights, style);
+    pub(crate) fn paint_selection(&mut self, highlights: &[Rect], style: Style) {
+        paint_selection_highlights(self.buffer, highlights, style);
     }
 
     pub(crate) fn fill(&mut self, area: Rect, symbol: &str, style: Style) {

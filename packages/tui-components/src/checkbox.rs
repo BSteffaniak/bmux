@@ -208,9 +208,7 @@ impl Component for CheckboxComponent<'_, '_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let width = u16::try_from(bmux_tui::text_width::display_width(self.checkbox.label))
-            .unwrap_or(u16::MAX)
-            .saturating_add(4);
+        let width = self.checkbox.width();
         LayoutNode::leaf(
             self.id.clone(),
             constraints.constrain(LogicalSize::new(width, 1)),
@@ -513,6 +511,126 @@ mod tests {
             LocalRect::new(0, 0, area.width, area.height),
             |cx| checkbox.paint(&layout, cx),
         );
+    }
+
+    #[test]
+    fn label_changes_invalidate_measurement_and_restore_cached_geometry() {
+        let state = Cell::new(CheckboxState::new(false));
+        let mut cache = bmux_tui::component::LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        for (label, width) in [("A", 5), ("界界", 8), ("A", 5)] {
+            let component = CheckboxComponent::new("check", label, &state);
+            let layout = cache.layout(
+                "check".into(),
+                &component,
+                Constraints::new(0, 20, 0, None),
+                &mut cx,
+            );
+            assert_eq!(layout.size.width, width);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.buffer().row_symbols(0), Some(format!("[ ] {label}")));
+            assert_eq!(frame.hits().regions()[0].area.width, width);
+        }
+        assert_eq!(cx.measured_nodes(), 2);
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    #[test]
+    fn component_measurement_matches_control_width() {
+        let oversized = "a".repeat(usize::from(u16::MAX));
+        for (label, width) in [
+            ("", 4),
+            ("界", 6),
+            ("e\u{301}", 5),
+            (oversized.as_str(), u16::MAX),
+        ] {
+            let state = Cell::new(CheckboxState::new(false));
+            let component = CheckboxComponent::new("check", label, &state);
+            let layout =
+                component.layout(Constraints::new(0, u16::MAX, 0, None), &mut LayoutCx::new());
+            assert_eq!(layout.size.width, width);
+            assert_eq!(layout.size.width, Checkbox::new(label).width());
+            assert_eq!(layout.size.height, 1);
+            if width < u16::MAX {
+                let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+                let mut frame = Frame::new(&mut buffer);
+                component.paint(&layout, &mut PaintCx::new(&mut frame));
+                assert_eq!(frame.buffer().row_symbols(0), Some(format!("[ ] {label}")));
+                assert_eq!(frame.hits().regions()[0].area, Rect::new(0, 0, width, 1));
+                assert_eq!(
+                    frame.semantics().regions()[0].area,
+                    Rect::new(0, 0, width, 1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn toggled_and_disabled_states_reuse_layout_without_stale_behavior() {
+        let state = Cell::new(CheckboxState::new(false));
+        let component = CheckboxComponent::new("check", "Enable", &state);
+        let mut cache = bmux_tui::component::LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        let constraints = Constraints::for_width(10);
+        let original = component.revision();
+        let layout = cache.layout("check".into(), &component, constraints, &mut cx);
+        let mut value = state.get();
+        value.set_checked(true);
+        value.set_disabled(true);
+        state.set(value);
+        assert_ne!(original, component.revision());
+        let cached = cache.layout("check".into(), &component, constraints, &mut cx);
+        assert_eq!(cached.size, layout.size);
+        assert_eq!(cx.measured_nodes(), 1);
+        assert_eq!(cache.stats().hits, 1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&cached, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("[x] Enable"));
+        assert_eq!(frame.hits().regions().len(), 1);
+        assert!(!frame.hits().regions()[0].enabled);
+        let mut events = EventCx::new(&cached);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            component.event(
+                &Event::Mouse(MouseEvent::new(kind, Point::new(0, 0))),
+                &cached,
+                &mut events,
+            );
+        }
+        assert!(state.get().checked());
+        let mut value = state.get();
+        value.set_disabled(false);
+        value.set_focused(true);
+        state.set(value);
+        let enabled = cache.layout("check".into(), &component, constraints, &mut cx);
+        assert_eq!(cx.measured_nodes(), 1);
+        assert_eq!(cache.stats().hits, 2);
+        assert_eq!(
+            component.event(
+                &Event::Key(KeyStroke::simple(KeyCode::Char(' '))),
+                &enabled,
+                &mut EventCx::new(&enabled),
+            ),
+            EventOutcome::Redraw,
+        );
+        assert!(!state.get().checked());
+        let mut next_buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut next_frame = Frame::new(&mut next_buffer);
+        component.paint(&enabled, &mut PaintCx::new(&mut next_frame));
+        assert_eq!(
+            next_frame.buffer().row_symbols(0).as_deref(),
+            Some("[ ] Enable")
+        );
+        assert_eq!(next_frame.hits().regions().len(), 1);
+        let hit = &next_frame.hits().regions()[0];
+        assert!(hit.enabled);
+        assert!(hit.focusable);
+        assert_eq!(hit.area, Rect::new(0, 0, 10, 1));
     }
 
     #[test]

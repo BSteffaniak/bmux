@@ -102,19 +102,13 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
     /// rectangles produced from committed selection geometry, so they are
     /// intersected with the effective clip rather than translated.
     pub fn paint_selection(&mut self, snapshot: &SelectionSnapshot, style: Style) {
-        let clipped = snapshot
-            .visible_highlights
-            .iter()
-            .map(|highlight| highlight.intersection(self.clip))
-            .filter(|highlight| !highlight.is_empty())
-            .collect::<Vec<_>>();
-        self.frame.paint_selection(
-            &SelectionSnapshot {
-                visible_highlights: clipped,
-                ..snapshot.clone()
-            },
-            style,
-        );
+        for highlight in &snapshot.visible_highlights {
+            let clipped = highlight.intersection(self.clip);
+            if !clipped.is_empty() {
+                self.frame
+                    .paint_selection(std::slice::from_ref(&clipped), style);
+            }
+        }
     }
 
     /// Current inherited style.
@@ -220,18 +214,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
 
     /// Write a styled line after translation and clipping.
     pub fn write_line(&mut self, area: LocalRect, line: &Line) {
-        let Some(projected) = self.project_rect(area) else {
-            return;
-        };
-        let left_clip = usize::try_from(
-            i64::from(projected.x)
-                .saturating_sub(projected_unclipped_x(self.origin_x, area.x))
-                .max(0),
-        )
-        .unwrap_or(usize::MAX);
-        let line = line.viewport(left_clip, usize::from(projected.width));
-        self.frame
-            .write_line_with_fallback_style(projected, &line, self.inherited_style);
+        self.write_line_with_fallback_style(area, line, Style::new());
     }
 
     /// Fill a local row and write a line whose spans inherit the supplied style.
@@ -416,8 +399,9 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
 
     /// Visit each visible terminal cell corresponding to a local raster area.
     ///
-    /// The callback supplies local coordinates and writes through scoped
-    /// [`PaintCx::set_cell`], preserving translation and clipping.
+    /// The callback receives coordinates relative to `area` (its top-left is
+    /// `(0, 0)`) and writes through scoped [`PaintCx::set_cell`], preserving
+    /// translation and clipping. Returning `None` leaves that cell unchanged.
     pub fn rasterize(
         &mut self,
         area: LocalRect,
@@ -502,6 +486,52 @@ mod tests {
     use crate::semantic::SemanticRegion;
     use crate::style::{Color, Style};
     use crate::text::Line;
+
+    #[test]
+    fn selection_overlay_clips_terminal_coordinates_without_mutating_snapshot() {
+        use crate::selection::{SelectionAffinity, SelectionEndpoint, SelectionSnapshot};
+        let endpoint = SelectionEndpoint {
+            scope_id: "scope".into(),
+            content_id: "content".into(),
+            offset: 0,
+            order: 0,
+            affinity: SelectionAffinity::Before,
+            revision: 0,
+        };
+        let snapshot = SelectionSnapshot {
+            scope_id: "scope".into(),
+            anchor: endpoint.clone(),
+            focus: endpoint,
+            reversed: false,
+            slices: Vec::new(),
+            visible_highlights: vec![Rect::new(0, 1, 8, 1), Rect::new(0, 0, 2, 1)],
+        };
+        let original = snapshot.clone();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 3));
+        let content_style = Style::new()
+            .fg(Color::Blue)
+            .add_modifier(crate::style::Modifier::BOLD);
+        buffer.fill(Rect::new(0, 0, 8, 3), "x", content_style);
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(2, 1, LocalRect::new(1, 0, 3, 1), |paint| {
+            paint.paint_selection(&snapshot, Style::new().bg(Color::Red));
+        });
+        for y in 0..3 {
+            assert_eq!(frame.buffer().row_symbols(y).as_deref(), Some("xxxxxxxx"));
+            for x in 0..8 {
+                let expected = if y == 1 && (3..6).contains(&x) {
+                    content_style.bg(Color::Red)
+                } else {
+                    content_style
+                };
+                assert_eq!(
+                    frame.buffer().get(Point::new(x, y)).unwrap().style,
+                    expected
+                );
+            }
+        }
+        assert_eq!(snapshot, original);
+    }
 
     #[test]
     fn focus_scope_set_through_context_is_inherited_by_later_hits() {
@@ -677,6 +707,22 @@ mod tests {
         assert!(frame.selection().scopes().is_empty());
         assert!(frame.semantics().regions().is_empty());
         assert!(frame.images().is_empty());
+    }
+
+    #[test]
+    fn raster_coordinates_are_relative_to_area_and_none_preserves_cells() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
+        let mut frame = Frame::new(&mut buffer);
+        let mut visited = Vec::new();
+        PaintCx::new(&mut frame).with_child(-2, 0, LocalRect::new(0, 0, 8, 2), |paint| {
+            paint.rasterize(LocalRect::new(3, 1, 3, 1), |x, y| {
+                visited.push((x, y));
+                (x != 1).then(|| (x.to_string(), Style::new()))
+            });
+        });
+        assert_eq!(visited, [(0, 0), (1, 0), (2, 0)]);
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("      "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some(" 0 2  "));
     }
 
     #[test]

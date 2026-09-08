@@ -135,26 +135,33 @@ impl Buffer {
                 if expanded.is_empty() || self.area != other.area {
                     return expanded;
                 }
-                for y in expanded.y..expanded.bottom() {
-                    let left = expanded.x;
-                    if [self, other].iter().any(|buffer| {
-                        buffer
-                            .get(Point::new(left, y))
-                            .is_some_and(Cell::is_wide_continuation)
-                    }) {
-                        expanded.x = expanded.x.saturating_sub(1).max(self.area.x);
-                        expanded.width = expanded.right().saturating_sub(expanded.x);
+                loop {
+                    let previous = expanded;
+                    for y in expanded.y..expanded.bottom() {
+                        let left = expanded.x;
+                        if [self, other].iter().any(|buffer| {
+                            buffer
+                                .get(Point::new(left, y))
+                                .is_some_and(Cell::is_wide_continuation)
+                        }) {
+                            let right = expanded.right();
+                            expanded.x = expanded.x.saturating_sub(1).max(self.area.x);
+                            expanded.width = right.saturating_sub(expanded.x);
+                        }
+                        let right = expanded.right().saturating_sub(1);
+                        if [self, other].iter().any(|buffer| {
+                            buffer
+                                .get(Point::new(right, y))
+                                .is_some_and(Cell::is_wide_leader)
+                        }) {
+                            expanded.width = expanded
+                                .width
+                                .saturating_add(1)
+                                .min(self.area.right().saturating_sub(expanded.x));
+                        }
                     }
-                    let right = expanded.right().saturating_sub(1);
-                    if [self, other].iter().any(|buffer| {
-                        buffer
-                            .get(Point::new(right, y))
-                            .is_some_and(Cell::is_wide_leader)
-                    }) {
-                        expanded.width = expanded
-                            .width
-                            .saturating_add(1)
-                            .min(self.area.right().saturating_sub(expanded.x));
+                    if expanded == previous {
+                        break;
                     }
                 }
                 expanded
@@ -229,7 +236,7 @@ impl Buffer {
                 cell.set_continuation(style);
             }
         } else if let Some(cell) = self.get_mut(point) {
-            cell.set(symbol, style);
+            cell.set(if width == 2 { " ".to_owned() } else { symbol }, style);
             cell.width = 1;
         }
     }
@@ -258,9 +265,22 @@ impl Buffer {
         if clip.is_empty() {
             return;
         }
+        let width = grapheme_width(symbol).max(1);
         for y in clip.y..clip.bottom() {
-            for x in clip.x..clip.right() {
+            let mut x = clip.x;
+            let clipped_columns = clip.x.saturating_sub(area.x) % width;
+            if clipped_columns != 0 {
+                self.set_cell(Point::new(x, y), " ", style);
+                x = x.saturating_add(width - clipped_columns);
+            }
+            while x < clip.right() {
+                let symbol = if width > clip.right().saturating_sub(x) {
+                    " "
+                } else {
+                    symbol
+                };
                 self.set_cell(Point::new(x, y), symbol, style);
+                x = x.saturating_add(width);
             }
         }
     }
@@ -283,7 +303,14 @@ impl Buffer {
                     return;
                 }
                 if x >= clip.x && x < clip.right() {
-                    self.set_cell(Point::new(x, area.y), grapheme.to_owned(), span.style);
+                    let symbol = if width > clip.right().saturating_sub(x) {
+                        " "
+                    } else {
+                        grapheme
+                    };
+                    self.set_cell(Point::new(x, area.y), symbol, span.style);
+                } else if x < clip.x && x.saturating_add(width) > clip.x {
+                    self.set_cell(Point::new(clip.x, area.y), " ", span.style);
                 }
                 x = x.saturating_add(width);
             }
@@ -336,6 +363,193 @@ mod tests {
     use crate::geometry::{Point, Rect};
     use crate::style::{Color, Style};
     use crate::text::{Line, Span};
+
+    #[test]
+    fn clipped_fill_matches_repeated_text_rendering() {
+        let style = Style::new().bg(Color::Red);
+        for symbol in ["a", "界", "e\u{301}"] {
+            let line = Line::from_spans([Span::styled(symbol.repeat(12), style)]);
+            for buffer_left in 0..5 {
+                for buffer_width in 0..7 {
+                    let viewport = Rect::new(buffer_left, 2, buffer_width, 1);
+                    for left in 0..5 {
+                        for width in 0..7 {
+                            let requested = Rect::new(left, 2, width, 1);
+                            let mut filled = Buffer::empty(viewport);
+                            filled.fill(viewport, "x", Style::new());
+                            let mut written = filled.clone();
+                            filled.fill(requested, symbol, style);
+                            written.write_line(requested, &line);
+                            assert_eq!(
+                                filled.cells(),
+                                written.cells(),
+                                "symbol={symbol:?}, viewport={viewport:?}, requested={requested:?}"
+                            );
+                            filled.debug_assert_valid_wide_spans();
+                            written.debug_assert_valid_wide_spans();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fill_preserves_tile_alignment_when_left_clipped() {
+        let style = Style::new().bg(Color::Red);
+        for left in 1..5 {
+            let area = Rect::new(left, 2, 4, 1);
+            let mut buffer = Buffer::empty(area);
+            buffer.fill(Rect::new(0, 2, 8, 1), "界", style);
+            let expected = if left % 2 == 0 { "界界" } else { " 界 " };
+            assert_eq!(buffer.row_symbols(2).as_deref(), Some(expected));
+            assert!(buffer.cells().iter().all(|cell| cell.style == style));
+            buffer.debug_assert_valid_wide_spans();
+        }
+    }
+
+    #[test]
+    fn fill_tiles_wide_glyphs_without_overwriting_continuations() {
+        let area = Rect::new(2, 3, 7, 2);
+        let mut buffer = Buffer::empty(area);
+        buffer.fill(area, "x", Style::new());
+        let style = Style::new().bg(Color::Red);
+        buffer.fill(Rect::new(3, 3, 5, 2), "界", style);
+        for y in 3..5 {
+            assert_eq!(buffer.row_symbols(y).as_deref(), Some("x界界 x"));
+            for x in 3..8 {
+                assert_eq!(buffer.get(Point::new(x, y)).unwrap().style, style);
+            }
+            assert_eq!(buffer.get(Point::new(8, y)).unwrap().style, Style::new());
+        }
+        buffer.debug_assert_valid_wide_spans();
+    }
+
+    #[test]
+    fn set_cell_blanks_wide_glyph_without_room_for_continuation() {
+        let mut buffer = Buffer::empty(Rect::new(4, 2, 2, 1));
+        let style = Style::new().bg(Color::Red);
+        buffer.set_cell(Point::new(4, 2), "界", Style::new());
+        buffer.set_cell(Point::new(5, 2), "界", style);
+        assert_eq!(buffer.row_symbols(2).as_deref(), Some("  "));
+        assert_eq!(buffer.get(Point::new(5, 2)).unwrap().style, style);
+        assert!(!buffer.get(Point::new(5, 2)).unwrap().is_wide_leader());
+        buffer.debug_assert_valid_wide_spans();
+    }
+
+    #[test]
+    fn write_line_blanks_visible_half_of_left_clipped_wide_glyph() {
+        let area = Rect::new(1, 0, 3, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.fill(area, "x", Style::new());
+        let style = Style::new().bg(Color::Red);
+        buffer.write_line(
+            Rect::new(0, 0, 4, 1),
+            &Line::from_spans([Span::styled("界a", style)]),
+        );
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some(" ax"));
+        assert_eq!(buffer.get(Point::new(1, 0)).unwrap().style, style);
+        assert_eq!(buffer.get(Point::new(2, 0)).unwrap().style, style);
+        assert_eq!(buffer.get(Point::new(3, 0)).unwrap().style, Style::new());
+        buffer.debug_assert_valid_wide_spans();
+    }
+
+    #[test]
+    fn write_line_does_not_extend_wide_glyph_past_requested_area() {
+        let area = Rect::new(0, 0, 4, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.fill(area, "x", Style::new());
+        let style = Style::new().bg(Color::Red);
+        buffer.write_line(
+            Rect::new(1, 0, 1, 1),
+            &Line::from_spans([Span::styled("界", style)]),
+        );
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("x xx"));
+        assert_eq!(buffer.get(Point::new(1, 0)).unwrap().style, style);
+        assert_eq!(buffer.get(Point::new(2, 0)).unwrap().style, Style::new());
+        buffer.debug_assert_valid_wide_spans();
+    }
+
+    #[test]
+    fn wide_damage_expansion_closes_all_small_row_topologies() {
+        let area = Rect::new(2, 3, 6, 1);
+        let rows = (0_u16..32)
+            .filter(|mask| mask & (mask << 1) == 0)
+            .map(|mask| {
+                let mut buffer = Buffer::empty(area);
+                for x in 0..5 {
+                    if mask & (1 << x) != 0 {
+                        buffer.set_cell(Point::new(area.x + x, area.y), "界", Style::new());
+                    }
+                }
+                buffer
+            })
+            .collect::<Vec<_>>();
+        for current in &rows {
+            for previous in &rows {
+                for left in area.x..area.right() {
+                    for right in left + 1..=area.right() {
+                        let requested = Rect::new(left, area.y, right - left, 1);
+                        let expanded = current.expand_regions_to_cell_spans(previous, &[requested]);
+                        let rect = expanded[0];
+                        assert!(rect.x <= left && rect.right() >= right);
+                        assert_eq!(rect.intersection(area), rect);
+                        for buffer in [current, previous] {
+                            assert!(
+                                !buffer
+                                    .get(Point::new(rect.x, area.y))
+                                    .unwrap()
+                                    .is_wide_continuation()
+                            );
+                            assert!(
+                                !buffer
+                                    .get(Point::new(rect.right() - 1, area.y))
+                                    .unwrap()
+                                    .is_wide_leader()
+                            );
+                        }
+                        assert_eq!(
+                            current.expand_regions_to_cell_spans(previous, &expanded),
+                            expanded
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_damage_expansion_revisits_rows_and_both_buffers_until_stable() {
+        let area = Rect::new(0, 0, 8, 2);
+        let mut current = Buffer::empty(area);
+        let mut previous = Buffer::empty(area);
+        current.write_line(Rect::new(0, 0, 8, 1), &Line::raw("界界界界"));
+        previous.write_line(Rect::new(0, 1, 8, 1), &Line::raw("a界界界b"));
+        let expanded = current.expand_regions_to_cell_spans(&previous, &[Rect::new(3, 0, 2, 2)]);
+        assert_eq!(expanded, vec![area]);
+        assert_eq!(
+            current.expand_regions_to_cell_spans(&previous, &expanded),
+            expanded
+        );
+    }
+
+    #[test]
+    fn wide_damage_expansion_preserves_original_right_edge() {
+        let area = Rect::new(2, 3, 8, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.write_line(area, &Line::raw("界ab界cd"));
+        let other = Buffer::empty(area);
+        for (current, previous) in [(&buffer, &other), (&other, &buffer)] {
+            assert_eq!(
+                current.expand_regions_to_cell_spans(previous, &[Rect::new(3, 3, 3, 1)]),
+                vec![Rect::new(2, 3, 4, 1)]
+            );
+            assert_eq!(
+                current.expand_regions_to_cell_spans(previous, &[Rect::new(3, 3, 4, 1)]),
+                vec![Rect::new(2, 3, 6, 1)]
+            );
+        }
+    }
 
     #[test]
     fn set_cell_ignores_points_outside_buffer() {
