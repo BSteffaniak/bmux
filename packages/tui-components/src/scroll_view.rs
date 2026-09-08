@@ -2994,7 +2994,14 @@ mod tests {
         );
         assert_eq!(state.vertical_offset(), 15);
         assert!(state.follows_bottom());
-        view.ensure_visible(&layout, &mut state, 2, 1);
+        let grown = self::layout(30, 5);
+        view.reconcile(&grown, &mut state);
+        assert_eq!(state.vertical_offset(), 25);
+        assert!(state.follows_bottom());
+        view.ensure_visible(&grown, &mut state, 2, 1);
+        assert_eq!(state.vertical_offset(), 2);
+        assert!(!state.follows_bottom());
+        view.reconcile(&self::layout(40, 5), &mut state);
         assert_eq!(state.vertical_offset(), 2);
         assert!(!state.follows_bottom());
     }

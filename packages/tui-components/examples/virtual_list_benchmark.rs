@@ -239,7 +239,30 @@ fn benchmark_composed_cards(count: usize) {
     let resized_paint = paint_once(&list, &state, Rect::new(0, 0, 24, 20));
     assert!(resized_paint.rendered.painted_items > 0);
     assert!(resized_paint.rendered.painted_items <= 6);
-    for report in [&paint, &row_scroll, &resized_paint] {
+    let before_widen = cx.measured_nodes();
+    list.sync(40, &mut state, &mut cx);
+    state.restore_anchor(usize::from(viewport.height));
+    assert_eq!(
+        cx.measured_nodes() - before_widen,
+        0,
+        "returning to a cached width must reuse every card layout"
+    );
+    assert_eq!(
+        state.scroll.vertical_offset(),
+        scroll_start,
+        "a width round trip must restore the original reading position"
+    );
+    assert_eq!(
+        state.scroll.vertical_offset(),
+        state.item_offset(&anchor_key).unwrap() + anchor_row
+    );
+    let after_widen = cx.measured_nodes();
+    list.sync(40, &mut state, &mut cx);
+    assert_eq!(cx.measured_nodes(), after_widen);
+    let widened_paint = paint_once(&list, &state, viewport);
+    assert!(widened_paint.rendered.painted_items > 0);
+    assert!(widened_paint.rendered.painted_items <= 6);
+    for report in [&paint, &row_scroll, &resized_paint, &widened_paint] {
         assert_eq!(
             report.rendered.registered_items, report.rendered.painted_items,
             "composed card registration must remain visible-item bounded"
