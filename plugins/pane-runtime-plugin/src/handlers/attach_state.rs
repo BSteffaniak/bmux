@@ -114,6 +114,36 @@ fn failed(reason: impl Into<String>) -> AttachStateError {
     }
 }
 
+fn attach_runtime_error(error: bmux_pane_runtime_state::SessionRuntimeError) -> AttachStateError {
+    match error {
+        bmux_pane_runtime_state::SessionRuntimeError::NotAttached => AttachStateError::NotAttached,
+        // Runtime lookup failures can refer to a pane or a session. Do not claim
+        // that the session is missing when the runtime cannot distinguish them.
+        error => failed(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attach_runtime_error;
+    use bmux_pane_runtime_plugin_api::attach_runtime_state::AttachStateError;
+    use bmux_pane_runtime_state::SessionRuntimeError;
+
+    #[test]
+    fn structured_runtime_errors_preserve_attachment_and_failure_distinction() {
+        assert!(matches!(
+            attach_runtime_error(SessionRuntimeError::NotAttached),
+            AttachStateError::NotAttached
+        ));
+        for error in [SessionRuntimeError::NotFound, SessionRuntimeError::Closed] {
+            let AttachStateError::Failed { reason } = attach_runtime_error(error) else {
+                panic!("runtime failure must not be reported as an attachment failure");
+            };
+            assert_eq!(reason, error.to_string());
+        }
+    }
+}
+
 fn caller_client_id(ctx: &NativeServiceContext) -> ClientId {
     ctx.caller_client_id
         .map_or_else(|| ClientId(Uuid::nil()), ClientId)
@@ -314,7 +344,7 @@ pub fn attach_pane_grid_snapshot_state(
             &req.pane_ids,
             req.max_rows_per_pane as usize,
         )
-        .map_err(|_| AttachStateError::NotAttached)?;
+        .map_err(attach_runtime_error)?;
     Ok(AttachPaneGridSnapshot {
         snapshots: state
             .snapshots
@@ -350,7 +380,7 @@ pub fn attach_pane_grid_window_state(
     let state = handle
         .0
         .attach_grid_window_state(SessionId(req.session_id), caller_client_id(ctx), &windows)
-        .map_err(|_| AttachStateError::NotAttached)?;
+        .map_err(attach_runtime_error)?;
     Ok(AttachPaneGridWindow {
         windows: state
             .windows
@@ -383,7 +413,7 @@ pub fn attach_pane_scrollback_pin(
             caller_client_id(ctx),
             req.pane_id,
         )
-        .map_err(|_| AttachStateError::NotAttached)?;
+        .map_err(attach_runtime_error)?;
     Ok(PaneScrollbackPin {
         pane_id: pin.pane_id,
         pin_id: pin.pin_id,
@@ -407,7 +437,7 @@ pub fn attach_pane_scrollback_unpin(
             req.pane_id,
             req.pin_id,
         )
-        .map_err(|_| AttachStateError::NotAttached)?;
+        .map_err(attach_runtime_error)?;
     Ok(PaneScrollbackUnpinAck {
         pane_id: ack.pane_id,
         pin_id: ack.pin_id,
@@ -432,7 +462,7 @@ pub fn attach_pane_grid_delta_state(
             &req.base_revisions,
             req.max_batches_per_pane as usize,
         )
-        .map_err(|_| AttachStateError::NotAttached)?;
+        .map_err(attach_runtime_error)?;
     Ok(AttachPaneGridDelta {
         deltas: state
             .deltas

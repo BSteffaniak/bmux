@@ -1803,6 +1803,38 @@ fn estimate_terminal_grid_delta_bytes(delta: &GridDeltaBatch) -> usize {
         + main_row_bytes
 }
 
+fn terminal_grid_deltas_reach_revision(
+    log: &TerminalGridDeltaLog,
+    start: usize,
+    base_revision: u64,
+    current_revision: u64,
+) -> bool {
+    let mut retained_revision = base_revision;
+    let contiguous = log.iter().skip(start).all(|delta| {
+        let follows =
+            delta.base_revision == retained_revision && delta.revision > delta.base_revision;
+        retained_revision = delta.revision;
+        follows
+    });
+    contiguous && retained_revision == current_revision
+}
+
+fn terminal_grid_delta_recovery_position(
+    log: &TerminalGridDeltaLog,
+    start: usize,
+    remaining: usize,
+    base_revision: u64,
+    current_revision: u64,
+) -> (u64, bool) {
+    let deferred = remaining < RESPONSE_OUTPUT_BUDGET
+        && !select_terminal_grid_deltas(log, start, 1, RESPONSE_OUTPUT_BUDGET).is_empty();
+    if deferred {
+        (base_revision, false)
+    } else {
+        (current_revision, true)
+    }
+}
+
 fn select_terminal_grid_deltas(
     log: &TerminalGridDeltaLog,
     start: usize,
@@ -7328,6 +7360,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             .map(|pane| (pane.pane_id, pane))
             .collect::<BTreeMap<_, _>>();
         let mut deltas = Vec::new();
+        let mut payload_budget_remaining = RESPONSE_OUTPUT_BUDGET;
         let mut seen = BTreeSet::new();
         for (index, pane_id) in pane_ids.iter().enumerate() {
             if !seen.insert(*pane_id) {
@@ -7365,14 +7398,12 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 // A bounded response may stop before the current revision without
                 // losing continuity. Validate the chain before inspecting payloads
                 // so a known gap does not spend the response serialization budget.
-                let mut retained_revision = base_revision;
-                let contiguous = log.iter().skip(start).all(|delta| {
-                    let follows = delta.base_revision == retained_revision
-                        && delta.revision > delta.base_revision;
-                    retained_revision = delta.revision;
-                    follows
-                });
-                if !contiguous || retained_revision != current_revision {
+                if !terminal_grid_deltas_reach_revision(
+                    &log,
+                    start,
+                    base_revision,
+                    current_revision,
+                ) {
                     deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
                         pane_id: *pane_id,
                         base_revision,
@@ -7386,14 +7417,25 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                     &log,
                     start,
                     max_batches_per_pane,
-                    RESPONSE_OUTPUT_BUDGET,
+                    payload_budget_remaining,
                 );
                 if selected.is_empty() {
+                    // Earlier panes can exhaust this response without invalidating
+                    // the replica. Preserve its position when a fresh response
+                    // could carry the next batch; only an intrinsically oversized
+                    // batch requires snapshot recovery.
+                    let (revision, desynced) = terminal_grid_delta_recovery_position(
+                        &log,
+                        start,
+                        payload_budget_remaining,
+                        base_revision,
+                        current_revision,
+                    );
                     deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
                         pane_id: *pane_id,
                         base_revision,
-                        revision: current_revision,
-                        desynced: true,
+                        revision,
+                        desynced,
                         encoded: Vec::new(),
                     });
                     continue;
@@ -7403,6 +7445,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                     .map_or(base_revision, |delta| delta.revision);
                 let encoded =
                     serde_json::to_vec(&selected).map_err(|_| SessionRuntimeError::Closed)?;
+                payload_budget_remaining = payload_budget_remaining.saturating_sub(encoded.len());
                 (encoded, revision, false)
             };
             deltas.push(bmux_pane_runtime_state::AttachPaneGridDelta {
@@ -10957,6 +11000,70 @@ mod tests {
             .lock()
             .expect("manager lock should be available");
         assert!(!manager.runtimes.contains_key(&session_id));
+    }
+
+    #[tokio::test]
+    async fn attach_grid_delta_state_shares_payload_budget_across_panes() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let mut runtime = runtime_with_panes(&pane_ids);
+        runtime.attached_clients.insert(client_id);
+        let mut revisions = Vec::new();
+        for pane_id in pane_ids {
+            let pane = runtime.panes.get(&pane_id).unwrap();
+            set_pane_grid(pane, 10, 2);
+            let delta = pane
+                .terminal_grid
+                .lock()
+                .unwrap()
+                .process_delta(b"x")
+                .unwrap();
+            revisions.push(delta.revision);
+            // Large synthetic payloads exercise response selection without
+            // requiring millions of terminal parser operations.
+            push_terminal_grid_delta(
+                &pane.terminal_grid_deltas,
+                test_delta(0, delta.revision, RESPONSE_OUTPUT_BUDGET / 2),
+            );
+        }
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let response = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
+            &adapter,
+            session_id,
+            client_id,
+            &pane_ids,
+            &[0, 0],
+            1,
+        )
+        .unwrap();
+        assert_eq!(response.deltas.len(), 2);
+        assert!(!response.deltas[0].desynced);
+        assert!(!response.deltas[0].encoded.is_empty());
+        assert!(!response.deltas[1].desynced);
+        assert_eq!(response.deltas[1].revision, 0);
+        assert!(response.deltas[1].encoded.is_empty());
+        assert!(
+            response
+                .deltas
+                .iter()
+                .map(|delta| delta.encoded.len())
+                .sum::<usize>()
+                <= RESPONSE_OUTPUT_BUDGET
+        );
+        // A later request with the first pane caught up can serve the second.
+        let retry = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_delta_state(
+            &adapter,
+            session_id,
+            client_id,
+            &pane_ids,
+            &[revisions[0], 0],
+            1,
+        )
+        .unwrap();
+        assert!(retry.deltas[0].encoded.is_empty());
+        assert!(!retry.deltas[1].desynced);
+        assert!(!retry.deltas[1].encoded.is_empty());
     }
 
     #[tokio::test]

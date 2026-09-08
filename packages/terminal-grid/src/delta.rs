@@ -164,6 +164,9 @@ impl GridDeltaBatch {
         if !matches!(self.mode.as_str(), "main" | "alternate") {
             return Err(GridDeltaApplyError::InvalidScreenMode);
         }
+        if self.cursor.row >= self.height || self.cursor.col >= self.width {
+            return Err(GridDeltaApplyError::InvalidCursor);
+        }
         if self
             .scroll_region
             .is_some_and(|region| region.top >= region.bottom || region.bottom >= self.height)
@@ -302,6 +305,8 @@ pub enum GridDeltaApplyError {
     NonIncreasingRowIndex(u32),
     #[error("grid delta dimensions must be nonzero")]
     ZeroDimensions,
+    #[error("grid delta cursor is outside the viewport")]
+    InvalidCursor,
     #[error("grid delta scroll region is empty, reversed, or outside the viewport")]
     InvalidScrollRegion,
     #[error("grid delta has an unknown screen mode")]

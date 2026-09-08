@@ -1293,6 +1293,40 @@ mod tests {
     }
 
     #[test]
+    fn invalid_active_cursor_rejects_without_losing_pending_wrap() {
+        let limits = GridLimits::default();
+        let mut producer = TerminalGridStream::new(10, 2, limits).unwrap();
+        producer.process(b"123456789");
+        let before = producer.snapshot(0, 2);
+        let mut consumer = TerminalGridStream::from_snapshot(&before, limits).unwrap();
+        let valid = producer.process_delta(b"0").unwrap();
+        assert!(valid.pending_wrap);
+        assert_eq!(valid.cursor.col, 9);
+        for (row, col) in [(2, 0), (0, 10), (u16::MAX, u16::MAX)] {
+            let mut malformed = valid.clone();
+            malformed.cursor.row = row;
+            malformed.cursor.col = col;
+            let mut snapshot = before.clone();
+            assert!(matches!(
+                malformed.apply_to_snapshot(&mut snapshot),
+                Err(crate::GridDeltaApplyError::InvalidCursor)
+            ));
+            assert_eq!(snapshot, before);
+            assert!(matches!(
+                consumer.apply_delta(&malformed, limits),
+                Err(super::TerminalGridStreamDeltaError::Delta(
+                    crate::GridDeltaApplyError::InvalidCursor
+                ))
+            ));
+            assert_eq!(consumer.snapshot(0, 2), before);
+        }
+        consumer.apply_delta(&valid, limits).unwrap();
+        producer.process(b"next");
+        consumer.process(b"next");
+        assert_eq!(consumer.snapshot(0, 2), producer.snapshot(0, 2));
+    }
+
+    #[test]
     fn malformed_scroll_regions_preserve_state_and_allow_retry() {
         let limits = GridLimits::default();
         let mut producer = TerminalGridStream::new(20, 4, limits).unwrap();
