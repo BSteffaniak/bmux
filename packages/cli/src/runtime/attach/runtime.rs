@@ -4017,7 +4017,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
             &attach_keymap,
             follow_target_id,
             global,
-            geometry.cols,
+            geometry,
             &runtime_appearance,
         );
         super::local_presentation::publish_notification(
@@ -7139,7 +7139,7 @@ fn build_attach_local_presentation_snapshot(
     keymap: &Keymap,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
-    viewport_cols: u16,
+    geometry: TerminalGeometry,
     runtime_appearance: &RuntimeAppearance,
 ) -> AttachLocalPresentationSnapshot {
     let zoomed = view_state
@@ -7209,7 +7209,8 @@ fn build_attach_local_presentation_snapshot(
         status_active: resolved_appearance.status.active_window,
         status_mode: resolved_appearance.status.mode_indicator,
         double_click_ms: view_state.mouse.config.double_click_ms,
-        viewport_cols,
+        viewport_cols: geometry.cols,
+        viewport_rows: geometry.rows,
     }
 }
 
@@ -7218,7 +7219,7 @@ fn publish_attach_local_presentation(
     keymap: &Keymap,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
-    viewport_cols: u16,
+    geometry: TerminalGeometry,
     runtime_appearance: &RuntimeAppearance,
 ) {
     let semantic_snapshot = build_attach_local_presentation_snapshot(
@@ -7226,7 +7227,7 @@ fn publish_attach_local_presentation(
         keymap,
         follow_target_id,
         follow_global,
-        viewport_cols,
+        geometry,
         runtime_appearance,
     );
     if view_state
@@ -11584,6 +11585,7 @@ async fn invoke_plugin_surface_pointer_event(
     }
     if result.release_capture {
         let _ = view_state.plugin_pointer_router.release_capture();
+        let _ = view_state.plugin_focus.clear();
     }
     if result.dirty {
         view_state
@@ -11616,9 +11618,6 @@ async fn try_handle_plugin_surface_mouse(
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
 ) -> std::result::Result<bool, ClientError> {
-    if matches!(mouse_event.kind, MouseEventKind::Down(_)) {
-        let _ = view_state.plugin_focus.clear();
-    }
     let events = view_state
         .plugin_pointer_router
         .route_terminal_mouse(&view_state.retained_compositor, mouse_event);
@@ -11633,6 +11632,11 @@ async fn try_handle_plugin_surface_mouse(
             event_consumed,
         );
         consumed |= event_consumed;
+    }
+    // Consumed pointer actions may intentionally retain an existing keyboard
+    // target (for example, a non-focusable control belonging to an editor).
+    if !consumed && matches!(mouse_event.kind, MouseEventKind::Down(_)) {
+        let _ = view_state.plugin_focus.clear();
     }
     Ok(consumed)
 }
@@ -15305,16 +15309,48 @@ mod tests {
         });
         let keymap = attach_keymap_from_config(&BmuxConfig::default());
         let appearance = RuntimeAppearance::default();
-        publish_attach_local_presentation(&mut view_state, &keymap, None, false, 80, &appearance);
+        publish_attach_local_presentation(
+            &mut view_state,
+            &keymap,
+            None,
+            false,
+            TerminalGeometry { cols: 80, rows: 24 },
+            &appearance,
+        );
         let first = view_state.local_presentation.clone().unwrap();
-        publish_attach_local_presentation(&mut view_state, &keymap, None, false, 80, &appearance);
+        publish_attach_local_presentation(
+            &mut view_state,
+            &keymap,
+            None,
+            false,
+            TerminalGeometry { cols: 80, rows: 24 },
+            &appearance,
+        );
         assert_eq!(view_state.local_presentation.as_ref(), Some(&first));
 
         view_state.active_mode_id = "insert".to_string();
-        publish_attach_local_presentation(&mut view_state, &keymap, None, false, 80, &appearance);
+        publish_attach_local_presentation(
+            &mut view_state,
+            &keymap,
+            None,
+            false,
+            TerminalGeometry { cols: 80, rows: 24 },
+            &appearance,
+        );
         let changed = view_state.local_presentation.as_ref().unwrap();
         assert_eq!(changed.revision, first.revision + 1);
         assert_eq!(changed.mode_label, "INSERT");
+        publish_attach_local_presentation(
+            &mut view_state,
+            &keymap,
+            None,
+            false,
+            TerminalGeometry { cols: 80, rows: 12 },
+            &appearance,
+        );
+        let resized = view_state.local_presentation.as_ref().unwrap();
+        assert_eq!(resized.viewport_rows, 12);
+        assert_eq!(resized.revision, first.revision + 2);
     }
 
     #[test]

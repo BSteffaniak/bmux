@@ -41,6 +41,9 @@ pub struct AttachLocalPresentationSnapshot {
     /// Current terminal width in cells. Layout-owning companions use this for
     /// width-aware retained projection; zero means no usable viewport yet.
     pub viewport_cols: u16,
+    /// Current terminal height in cells; zero means no usable viewport yet.
+    #[serde(default)]
+    pub viewport_rows: u16,
 }
 
 impl AttachLocalPresentationSnapshot {
@@ -65,6 +68,7 @@ impl AttachLocalPresentationSnapshot {
             status_mode: "#ffff00".to_string(),
             double_click_ms: 400,
             viewport_cols: 0,
+            viewport_rows: 0,
         }
     }
 }

@@ -3,6 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
+mod menu;
 mod projection;
 mod settings;
 
@@ -282,6 +283,19 @@ impl CompanionState {
         }
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
+            if self
+                .menu_window_id
+                .is_some_and(|id| !self.snapshot.windows.iter().any(|window| window.id == id))
+            {
+                self.menu_window_id = None;
+            }
+            if self
+                .editing_window_id
+                .is_some_and(|id| !self.snapshot.windows.iter().any(|window| window.id == id))
+            {
+                self.editing_window_id = None;
+                self.edit_buffer.clear();
+            }
             let visible_limit = self.visible_limit();
             let maximum_offset = self.snapshot.windows.len().saturating_sub(visible_limit);
             self.scroll_offset = self.scroll_offset.min(maximum_offset);
@@ -304,6 +318,9 @@ impl CompanionState {
     fn replace_local_presentation(&mut self, snapshot: AttachLocalPresentationSnapshot) {
         if self.local_presentation != snapshot {
             self.local_presentation = snapshot;
+            if self.menu_window_id.is_some() && menu::surfaces(self, self.revision).is_empty() {
+                self.menu_window_id = None;
+            }
             self.revision = self.revision.saturating_add(1).max(1);
         }
     }
@@ -482,9 +499,7 @@ fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
         return Ok(());
     };
     companion.replace_windows(snapshot);
-    let revision = companion.revision.max(1);
-    let surface = build_surface(companion, revision);
-    publish_surface(revision, &surface)
+    publish_companion(companion)
 }
 
 #[allow(clippy::significant_drop_tightening)] // The state lock must cover projection so snapshot fields remain coherent.
@@ -498,9 +513,9 @@ fn publish_local_presentation(snapshot: AttachLocalPresentationSnapshot) -> Resu
         };
         companion.replace_local_presentation(snapshot);
         let revision = companion.revision.max(1);
-        (revision, build_surface(companion, revision))
+        (revision, companion_surfaces(companion, revision))
     };
-    publish_surface(revision, &surface)
+    publish_surface(revision, surface)
 }
 
 #[allow(clippy::significant_drop_tightening)] // Serialize selection and surface publication with catalog updates.
@@ -525,23 +540,22 @@ fn publish_selection(context_id: Option<Uuid>) -> Result<(), String> {
     publish_companion(companion)
 }
 
-fn publish_surface(revision: u64, surface: &PluginSurface) -> Result<(), String> {
+fn publish_surface(revision: u64, surfaces: Vec<PluginSurface>) -> Result<(), String> {
     global_plugin_surface_registry()
-        .publish_advancing(
-            OWNER,
-            PluginSurfaceSnapshot {
-                revision,
-                surfaces: vec![surface.clone()],
-            },
-        )
+        .publish_advancing(OWNER, PluginSurfaceSnapshot { revision, surfaces })
         .map_err(|error| format!("publishing tab-strip surface: {error:?}"))?;
     Ok(())
 }
 
 fn publish_companion(companion: &CompanionState) -> Result<(), String> {
     let revision = companion.revision.max(1);
-    let surface = build_surface(companion, revision);
-    publish_surface(revision, &surface)
+    publish_surface(revision, companion_surfaces(companion, revision))
+}
+
+fn companion_surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface> {
+    let mut surfaces = vec![build_surface(companion, revision)];
+    surfaces.extend(menu::surfaces(companion, revision));
+    surfaces
 }
 
 #[cfg(test)]
@@ -793,12 +807,15 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
 #[allow(clippy::too_many_lines)] // One ordered retained projection keeps tab, overflow, editor, and menu geometry consistent.
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     let styles = BarStyles::resolve(&state.settings, &state.local_presentation);
+    let mut interaction = projection_interaction(state);
+    // The popup is a separate surface; retain the tabs and their focus identities.
+    interaction.menu_window_id = None;
     let projected = projection::project_bar(
         &state.settings,
         &state.snapshot.windows,
         &state.local_presentation,
         state.hovered_window_id,
-        &projection_interaction(state),
+        &interaction,
     );
     let rect = ExtensionRect::new(
         0,
@@ -1216,117 +1233,6 @@ fn begin_rename(event: &AttachInputEvent) -> bool {
     republish_companion(companion)
 }
 
-fn begin_menu(event: &AttachInputEvent) -> bool {
-    if event.event_kind != "pointer"
-        || event.phase != "down"
-        || event.button.as_deref() != Some("right")
-    {
-        return false;
-    }
-    let Some(target) = event
-        .hook_id
-        .strip_prefix("bmux.tab_strip:strip:window:")
-        .and_then(|target| Uuid::parse_str(target).ok())
-    else {
-        return false;
-    };
-    let Ok(mut guard) = state().lock() else {
-        return false;
-    };
-    let Some(companion) = guard.as_mut() else {
-        return false;
-    };
-    companion.menu_window_id = Some(target);
-    companion.menu_selected = 0;
-    republish_companion(companion)
-}
-
-fn update_menu(
-    context: &NativeServiceContext,
-    event: &AttachInputEvent,
-) -> Option<AttachInputResult> {
-    if event.event_kind != "key" || !matches!(event.phase.as_str(), "press" | "repeat") {
-        return None;
-    }
-    let mut guard = state().lock().ok()?;
-    let companion = guard.as_mut()?;
-    let target = companion.menu_window_id?;
-    match event.key.as_deref()? {
-        "left" => companion.menu_selected = companion.menu_selected.saturating_sub(1),
-        "right" | "tab" => companion.menu_selected = (companion.menu_selected + 1).min(2),
-        "esc" => {
-            companion.menu_window_id = None;
-        }
-        "enter" => {
-            let action = companion.menu_selected;
-            companion.menu_window_id = None;
-            if action == 1 {
-                let Some(window) = companion
-                    .snapshot
-                    .windows
-                    .iter()
-                    .find(|window| window.id == target)
-                else {
-                    return Some(AttachInputResult::default());
-                };
-                companion.editing_window_id = Some(target);
-                companion.edit_buffer =
-                    bmux_text_edit::TextEditBuffer::from_text(window.name.clone());
-                companion.edit_buffer.select_all();
-                let dirty = republish_companion(companion);
-                return Some(AttachInputResult {
-                    consumed: true,
-                    dirty,
-                    ..AttachInputResult::default()
-                });
-            }
-            drop(guard);
-            let mut client = ServiceCallerDispatchClient::new(context);
-            let result = if action == 0 {
-                block_on_typed_dispatch(windows_commands::client::switch_window(
-                    &mut client,
-                    target.to_string(),
-                ))
-            } else {
-                block_on_typed_dispatch(windows_commands::client::kill_window(
-                    &mut client,
-                    target.to_string(),
-                    false,
-                ))
-            };
-            return Some(match result {
-                Ok(Ok(_)) => AttachInputResult {
-                    consumed: true,
-                    dirty: true,
-                    ..AttachInputResult::default()
-                },
-                Ok(Err(error)) => AttachInputResult {
-                    consumed: true,
-                    status_message: Some(format!("window menu action failed: {error:?}")),
-                    ..AttachInputResult::default()
-                },
-                Err(error) => AttachInputResult {
-                    consumed: true,
-                    status_message: Some(format!("window menu action unavailable: {error}")),
-                    ..AttachInputResult::default()
-                },
-            });
-        }
-        _ => {
-            return Some(AttachInputResult {
-                consumed: true,
-                ..AttachInputResult::default()
-            });
-        }
-    }
-    let dirty = republish_companion(companion);
-    Some(AttachInputResult {
-        consumed: true,
-        dirty,
-        ..AttachInputResult::default()
-    })
-}
-
 fn rename_window_invocation(window_id: Uuid, name: String) -> Option<AttachInputServiceInvocation> {
     command_invocation(
         bmux_plugin::AttachInputEndpoint {
@@ -1412,6 +1318,9 @@ fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
 }
 
 fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
+    if let Some(result) = menu::handle_input(event) {
+        return Some(result);
+    }
     if let Some(result) = update_editor_local(event) {
         return Some(result);
     }
@@ -1449,25 +1358,8 @@ fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
 }
 
 fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
-    if let Some(result) = update_menu(context, event) {
-        return result;
-    }
     if let Some(result) = update_editor(context, event) {
         return result;
-    }
-    if begin_menu(event) {
-        return AttachInputResult {
-            consumed: true,
-            capture_keyboard: vec![
-                "left".to_string(),
-                "right".to_string(),
-                "tab".to_string(),
-                "enter".to_string(),
-                "esc".to_string(),
-            ],
-            dirty: true,
-            ..AttachInputResult::default()
-        };
     }
     if begin_rename(event) {
         return AttachInputResult {
@@ -1520,6 +1412,64 @@ mod tests {
                 .revision,
             10
         );
+        // Exercise the registered local route, not just projection helpers.
+        let id = Uuid::from_u128(7);
+        publish(windows_list::WindowListSnapshot {
+            revision: 2,
+            windows: vec![windows_list::WindowListEntry {
+                id,
+                name: "original".to_string(),
+                active: true,
+                workspace: "default".to_string(),
+                workspace_id: Uuid::nil(),
+            }],
+        })
+        .unwrap();
+        publish_local_presentation(AttachLocalPresentationSnapshot {
+            viewport_cols: 80,
+            viewport_rows: 24,
+            ..AttachLocalPresentationSnapshot::initial()
+        })
+        .unwrap();
+        let mut event = AttachInputEvent {
+            hook_id: format!("bmux.tab_strip:strip:window:{id}"),
+            event_kind: "pointer".to_string(),
+            phase: "down".to_string(),
+            button: Some("right".to_string()),
+            key: None,
+            col: Some(12),
+            row: Some(0),
+            wheel_delta: 0,
+            modifiers: bmux_plugin::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        let opened =
+            bmux_plugin::invoke_attach_presentation_input_handler(&input_endpoint(), &event)
+                .unwrap();
+        assert!(opened.consumed && opened.dirty && opened.service_invocation.is_none());
+        assert_eq!(
+            global_plugin_surface_registry()
+                .owner_snapshot(OWNER)
+                .unwrap()
+                .surfaces
+                .len(),
+            3
+        );
+        event.button = Some("left".to_string());
+        event.hook_id = "bmux.tab_strip:menu:item:1".to_string();
+        let rename = handle_local_input(&event).unwrap();
+        assert!(!rename.release_capture);
+        event.event_kind = "key".to_string();
+        event.phase = "press".to_string();
+        event.key = Some("enter".to_string());
+        let submitted = handle_local_input(&event).unwrap();
+        assert!(submitted.release_capture);
+        assert!(submitted.service_invocation.is_some());
+        event.key = Some("ctrl-a".to_string());
+        assert!(handle_local_input(&event).is_none());
+        event.key = Some("x".to_string());
+        assert!(handle_local_input(&event).is_none());
         uninstall();
     }
 
