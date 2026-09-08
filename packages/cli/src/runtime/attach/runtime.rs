@@ -10812,6 +10812,11 @@ pub async fn handle_attach_terminal_event(
         }
     }
 
+    if let Some(TerminalInputEvent::Paste(text)) = &normalized_event
+        && try_handle_plugin_surface_paste(view_state, text)
+    {
+        return Ok(AttachLoopControl::Continue);
+    }
     if let Some(TerminalInputEvent::Key(key)) = &normalized_event {
         match try_handle_plugin_surface_key(client, view_state, key).await {
             Ok(true) => return Ok(AttachLoopControl::Continue),
@@ -11698,12 +11703,46 @@ async fn try_handle_plugin_surface_mouse(
         );
         consumed |= event_consumed;
     }
+    if matches!(mouse_event.kind, MouseEventKind::Up(_)) {
+        let _ = view_state.plugin_pointer_router.release_capture();
+    }
     // Consumed pointer actions may intentionally retain an existing keyboard
     // target (for example, a non-focusable control belonging to an editor).
     if !consumed && matches!(mouse_event.kind, MouseEventKind::Down(_)) {
         clear_plugin_surface_focus(view_state);
     }
     Ok(consumed)
+}
+
+fn try_handle_plugin_surface_paste(view_state: &mut AttachViewState, text: &str) -> bool {
+    let Some(target) = view_state.plugin_focus.focused() else {
+        return false;
+    };
+    let Some(endpoint) = view_state.retained_compositor.endpoint_for_region(target) else {
+        return false;
+    };
+    let hook = format!(
+        "{}:{}:{}",
+        target.owner_plugin_id, target.surface_local_id, target.region_local_id
+    );
+    let Some(result) =
+        bmux_plugin::global_attach_presentation_input_registry().paste(endpoint, &hook, text)
+    else {
+        return false;
+    };
+    if result.dirty {
+        view_state
+            .dirty
+            .mark_extension_dirty(AttachDirtySource::PluginCommand);
+    }
+    if let Some(message) = result.status_message {
+        view_state.set_transient_status(
+            truncate_attach_status_message(&message),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+    }
+    result.consumed
 }
 
 async fn try_handle_plugin_surface_key(
@@ -11932,6 +11971,9 @@ fn attach_input_key_name(key: &TerminalKeyEvent) -> Option<String> {
         super::input::TerminalKeyCode::Enter => "enter".to_string(),
         super::input::TerminalKeyCode::Tab => "tab".to_string(),
         super::input::TerminalKeyCode::BackTab => "backtab".to_string(),
+        super::input::TerminalKeyCode::Delete => "delete".to_string(),
+        super::input::TerminalKeyCode::Home => "home".to_string(),
+        super::input::TerminalKeyCode::End => "end".to_string(),
         super::input::TerminalKeyCode::Backspace => "backspace".to_string(),
         super::input::TerminalKeyCode::Char(ch) => ch.to_string(),
         _ => return None,

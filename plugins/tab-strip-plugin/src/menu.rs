@@ -247,7 +247,7 @@ fn activate_selection(companion: &mut CompanionState, result: &mut AttachInputRe
             {
                 companion.editing_window_id = Some(target);
                 companion.edit_buffer =
-                    bmux_text_edit::TextEditBuffer::from_text(window.name.clone());
+                    bmux_text_edit::TextEditBuffer::from_text(window.name.clone()).into();
                 companion.edit_buffer.select_all();
                 result.release_capture = false;
                 result.capture_keyboard = vec!["*".to_string()];

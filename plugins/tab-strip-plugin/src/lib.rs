@@ -216,7 +216,7 @@ struct CompanionState {
     drag_target: Option<projection::ResolvedInsertion>,
     last_left_click: Option<(Uuid, u16, u16, Instant)>,
     editing_window_id: Option<Uuid>,
-    edit_buffer: bmux_text_edit::TextEditBuffer,
+    edit_buffer: rename_input::RenameInput,
     menu_window_id: Option<Uuid>,
     menu_selected: usize,
     local_presentation: AttachLocalPresentationSnapshot,
@@ -246,7 +246,7 @@ impl CompanionState {
             drag_target: None,
             last_left_click: None,
             editing_window_id: None,
-            edit_buffer: bmux_text_edit::TextEditBuffer::new(),
+            edit_buffer: rename_input::RenameInput::default(),
             menu_window_id: None,
             menu_selected: 0,
             local_presentation: AttachLocalPresentationSnapshot::initial(),
@@ -421,6 +421,8 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
         )
         .map_err(|error| format!("publishing tab-strip layout: {error:?}"))?;
     bmux_plugin::global_attach_presentation_input_registry()
+        .register_paste(input_endpoint(), std::sync::Arc::new(handle_editor_paste));
+    bmux_plugin::global_attach_presentation_input_registry()
         .register_focus_lost(input_endpoint(), std::sync::Arc::new(handle_focus_lost));
     bmux_plugin::register_attach_presentation_input_handler(
         input_endpoint(),
@@ -533,18 +535,14 @@ fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
 
 #[allow(clippy::significant_drop_tightening)] // The state lock must cover projection so snapshot fields remain coherent.
 fn publish_local_presentation(snapshot: AttachLocalPresentationSnapshot) -> Result<(), String> {
-    let (revision, surface) = {
-        let mut guard = state()
-            .lock()
-            .map_err(|_| "tab-strip state lock poisoned".to_string())?;
-        let Some(companion) = guard.as_mut() else {
-            return Ok(());
-        };
-        companion.replace_local_presentation(snapshot);
-        let revision = companion.revision.max(1);
-        (revision, companion_surfaces(companion, revision))
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "tab-strip state lock poisoned".to_string())?;
+    let Some(companion) = guard.as_mut() else {
+        return Ok(());
     };
-    publish_surface(revision, surface)
+    companion.replace_local_presentation(snapshot);
+    publish_companion(companion)
 }
 
 #[allow(clippy::significant_drop_tightening)] // Serialize selection and surface publication with catalog updates.
@@ -579,9 +577,14 @@ fn publish_surface(revision: u64, surfaces: Vec<PluginSurface>) -> Result<(), St
     Ok(())
 }
 
-fn publish_companion(companion: &CompanionState) -> Result<(), String> {
+fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
     let revision = companion.revision.max(1);
-    publish_surface(revision, companion_surfaces(companion, revision))
+    let (surface, viewport) = build_surface_with_editor(companion, revision);
+    let mut surfaces = vec![surface];
+    surfaces.extend(menu::surfaces(companion, revision));
+    publish_surface(revision, surfaces)?;
+    rename_input::commit(&mut companion.edit_buffer, viewport);
+    Ok(())
 }
 
 fn companion_surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface> {
@@ -825,6 +828,18 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
 
 #[allow(clippy::too_many_lines)] // One ordered retained projection keeps tab, overflow, editor, and menu geometry consistent.
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
+    build_surface_with_editor(state, revision).0
+}
+
+#[allow(clippy::too_many_lines)] // Keep surface paint, interaction regions, and editor geometry in one ordered projection.
+fn build_surface_with_editor(
+    state: &CompanionState,
+    revision: u64,
+) -> (
+    PluginSurface,
+    Option<bmux_plugin::component_viewport::ComponentViewport>,
+) {
+    let mut editor_viewport = None;
     let styles = BarStyles::resolve(&state.settings, &state.local_presentation);
     let mut interaction = projection_interaction(state);
     // The popup is a separate surface; retain the tabs and their focus identities.
@@ -857,13 +872,10 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
             ));
         }
         if segment.kind == projection::SegmentKind::EditingWorkspace {
-            ops.extend(rename_input::paint(
-                &state.edit_buffer,
-                "workspace-rename",
-                width,
-                x,
-                styles.editing,
-            ));
+            let (paint, viewport) =
+                rename_input::paint(&state.edit_buffer, width, x, styles.editing);
+            ops.extend(paint);
+            editor_viewport = viewport;
         } else if segment.kind == projection::SegmentKind::EditingTab
             && let Some((index, window)) = state
                 .snapshot
@@ -879,13 +891,16 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
                 let length = u16::try_from(length)
                     .unwrap_or(u16::MAX)
                     .min(width.saturating_sub(start));
-                ops.extend(rename_input::paint(
+                let (paint, viewport) = rename_input::paint(
                     &state.edit_buffer,
-                    &format!("rename:{}", window.id),
                     length,
                     x.saturating_add(start),
                     styles.editing,
-                ));
+                );
+                ops.extend(paint);
+                if editor_viewport.is_none() {
+                    editor_viewport = viewport;
+                }
             }
         }
         if width > 0
@@ -934,7 +949,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     for region in regions {
         surface = surface.interactive_region(region);
     }
-    surface
+    (surface, editor_viewport)
 }
 
 fn update_hover(event: &AttachInputEvent) -> bool {
@@ -1070,7 +1085,7 @@ fn update_drag_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
                 companion.drag_target = None;
                 companion.editing_window_id = Some(source);
                 companion.edit_buffer =
-                    bmux_text_edit::TextEditBuffer::from_text(window.name.clone());
+                    bmux_text_edit::TextEditBuffer::from_text(window.name.clone()).into();
                 companion.edit_buffer.select_all();
                 let dirty = republish_companion(companion);
                 return Some(AttachInputResult {
@@ -1234,7 +1249,7 @@ fn update_editor(
                 },
             );
         }
-        value => rename_input::key(&mut companion.edit_buffer, value),
+        value => rename_input::key(&mut companion.edit_buffer, value, event.modifiers),
     }
     let dirty = republish_companion(companion);
     Some(AttachInputResult {
@@ -1273,7 +1288,7 @@ fn begin_rename(event: &AttachInputEvent) -> bool {
         return false;
     };
     companion.editing_window_id = Some(target);
-    companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(window.name.clone());
+    companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(window.name.clone()).into();
     companion.edit_buffer.select_all();
     republish_companion(companion)
 }
@@ -1334,7 +1349,7 @@ fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
             companion.edit_buffer.clear();
             release_capture = true;
         }
-        value => rename_input::key(&mut companion.edit_buffer, value),
+        value => rename_input::key(&mut companion.edit_buffer, value, event.modifiers),
     }
     let dirty = republish_companion(companion);
     Some(AttachInputResult {
@@ -1373,7 +1388,83 @@ fn handle_focus_lost(_hook_id: &str) -> bool {
     cancel_rename(companion) && republish_companion(companion)
 }
 
+#[allow(clippy::significant_drop_tightening)] // Editor event and retained publication are serialized.
+fn handle_editor_pointer(event: &AttachInputEvent) -> Option<AttachInputResult> {
+    if event.event_kind != "pointer" {
+        return None;
+    }
+    let mut guard = state().lock().ok()?;
+    let companion = guard.as_mut()?;
+    let target = companion
+        .editing_window_id
+        .map(|id| format!("window:{id}"))
+        .or_else(|| {
+            companion
+                .editing_workspace_id
+                .map(|id| format!("workspace:{id}"))
+        })?;
+    if event.hook_id != format!("bmux.tab_strip:strip:{target}") {
+        return None;
+    }
+    if event.phase == "down"
+        && companion.edit_buffer.visible_rect().is_some_and(|rect| {
+            !rect.contains(bmux_tui::geometry::Point::new(
+                event.col.unwrap_or_default(),
+                event.row.unwrap_or_default(),
+            ))
+        })
+    {
+        cancel_rename(companion);
+        return Some(AttachInputResult {
+            consumed: true,
+            release_capture: true,
+            dirty: republish_companion(companion),
+            ..AttachInputResult::default()
+        });
+    }
+    let changed = companion.edit_buffer.pointer(event);
+    Some(AttachInputResult {
+        consumed: true,
+        capture_pointer: changed && event.phase == "down",
+        preserve_capture_across_revisions: true,
+        capture_keyboard: vec!["*".to_string()],
+        dirty: changed && republish_companion(companion),
+        ..AttachInputResult::default()
+    })
+}
+
+#[allow(clippy::significant_drop_tightening)] // Serialize edits with retained publication.
+fn handle_editor_paste(_hook: &str, text: &str) -> AttachInputResult {
+    let Ok(mut guard) = state().lock() else {
+        return AttachInputResult::default();
+    };
+    let Some(companion) = guard.as_mut() else {
+        return AttachInputResult::default();
+    };
+    if companion.editing_window_id.is_none() && companion.editing_workspace_id.is_none() {
+        return AttachInputResult::default();
+    }
+    if text.len() > 4096 || text.contains(['\n', '\r']) {
+        return AttachInputResult {
+            consumed: true,
+            status_message: Some("rename requires a single line of at most 4096 bytes".to_string()),
+            ..AttachInputResult::default()
+        };
+    }
+    companion
+        .edit_buffer
+        .dispatch(&bmux_tui::event::Event::Paste(text.to_string()));
+    AttachInputResult {
+        consumed: true,
+        dirty: republish_companion(companion),
+        ..AttachInputResult::default()
+    }
+}
+
 fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
+    if let Some(result) = handle_editor_pointer(event) {
+        return Some(result);
+    }
     if let Some(result) = menu::handle_input(event) {
         return Some(result);
     }
@@ -1450,7 +1541,8 @@ mod tests {
             } else {
                 companion.editing_window_id = Some(id);
             }
-            companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text("uncommitted draft");
+            companion.edit_buffer =
+                bmux_text_edit::TextEditBuffer::from_text("uncommitted draft").into();
             companion.edit_buffer.select_all();
             companion.last_left_click = Some((id, 0, 0, Instant::now()));
             companion.last_workspace_click = companion.last_left_click;

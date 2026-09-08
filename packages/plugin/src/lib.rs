@@ -16,6 +16,7 @@
 pub mod action_dispatch;
 mod attach_companion;
 mod attach_presentation_input;
+pub mod component_viewport;
 mod declaration;
 mod discovery;
 mod event_bus;
@@ -41,9 +42,9 @@ pub use attach_companion::{
 };
 pub use attach_presentation_input::{
     AttachPresentationFocusLostHandler, AttachPresentationInputHandler,
-    AttachPresentationInputRegistry, global_attach_presentation_input_registry,
-    invoke_attach_presentation_input_handler, register_attach_presentation_input_handler,
-    remove_attach_presentation_input_handler,
+    AttachPresentationInputRegistry, AttachPresentationPasteHandler,
+    global_attach_presentation_input_registry, invoke_attach_presentation_input_handler,
+    register_attach_presentation_input_handler, remove_attach_presentation_input_handler,
 };
 pub use bmux_plugin_runtime::{
     ConcurrencyGate, EffectiveConcurrencyPolicy, PluginConcurrencyConfig,

@@ -45,7 +45,8 @@ fn begin(companion: &mut CompanionState, id: Uuid, col: u16, row: u16) -> bool {
         companion.editing_workspace_id = Some(id);
         companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(
             companion.workspace_label.clone().unwrap_or_default(),
-        );
+        )
+        .into();
         companion.edit_buffer.select_all();
     }
     double

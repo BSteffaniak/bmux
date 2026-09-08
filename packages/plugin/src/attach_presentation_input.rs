@@ -13,8 +13,12 @@ pub type AttachPresentationInputHandler =
 /// value indicates that retained presentation changed. No input is synthesized.
 pub type AttachPresentationFocusLostHandler = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+pub type AttachPresentationPasteHandler =
+    Arc<dyn Fn(&str, &str) -> AttachInputResult + Send + Sync>;
+
 #[derive(Default)]
 pub struct AttachPresentationInputRegistry {
+    paste: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationPasteHandler>>,
     handlers: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationInputHandler>>,
     focus_lost: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationFocusLostHandler>>,
 }
@@ -71,7 +75,35 @@ impl AttachPresentationInputRegistry {
         handler.is_some_and(|handler| handler(hook_id))
     }
 
+    pub fn register_paste(
+        &self,
+        endpoint: AttachInputEndpoint,
+        handler: AttachPresentationPasteHandler,
+    ) {
+        if let Ok(mut handlers) = self.paste.write() {
+            handlers.insert(endpoint, handler);
+        }
+    }
+
+    #[must_use]
+    pub fn paste(
+        &self,
+        endpoint: &AttachInputEndpoint,
+        hook: &str,
+        text: &str,
+    ) -> Option<AttachInputResult> {
+        let handler = self
+            .paste
+            .read()
+            .ok()
+            .and_then(|handlers| handlers.get(endpoint).cloned());
+        handler.map(|handler| handler(hook, text))
+    }
+
     pub fn remove(&self, endpoint: &AttachInputEndpoint) {
+        if let Ok(mut handlers) = self.paste.write() {
+            handlers.remove(endpoint);
+        }
         if let Ok(mut handlers) = self.focus_lost.write() {
             handlers.remove(endpoint);
         }

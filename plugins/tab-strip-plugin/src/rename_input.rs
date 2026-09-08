@@ -1,18 +1,40 @@
-//! Inline adapter: the plugin owns rename policy; shared controls own text editing.
-use std::cell::RefCell;
-
+//! Caller-owned rename state mounted through the neutral component viewport.
+use bmux_plugin::component_viewport::ComponentViewport;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::{
-    buffer::Buffer,
-    component::{Component, LayoutNode, LogicalSize},
-    frame::Frame,
-    geometry::Rect,
-    paint::PaintCx,
+    component::{LayoutNode, LogicalSize},
+    event::{Event, MouseButton, MouseEvent, MouseEventKind},
+    geometry::{Point, Rect},
     style::Modifier,
 };
-use bmux_tui_components::text_input::{
-    TextInputComponent, TextInputControl, TextInputPolicy, TextInputState,
-};
+use bmux_tui_components::text_input::{TextInputComponent, TextInputPolicy, TextInputState};
+use std::cell::RefCell;
+use std::ops::{Deref, DerefMut};
+
+#[derive(Debug, Clone, Default)]
+pub struct RenameInput {
+    state: TextInputState,
+    viewport: Option<ComponentViewport>,
+}
+impl From<TextEditBuffer> for RenameInput {
+    fn from(buffer: TextEditBuffer) -> Self {
+        Self {
+            state: TextInputState::new(buffer),
+            viewport: None,
+        }
+    }
+}
+impl Deref for RenameInput {
+    type Target = TextEditBuffer;
+    fn deref(&self) -> &Self::Target {
+        self.state.buffer()
+    }
+}
+impl DerefMut for RenameInput {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.state.buffer_mut()
+    }
+}
 
 const fn policy() -> TextInputPolicy {
     let mut policy = TextInputPolicy::chat_composer();
@@ -21,7 +43,51 @@ const fn policy() -> TextInputPolicy {
     policy
 }
 
-pub fn key(buffer: &mut TextEditBuffer, key: &str) {
+impl RenameInput {
+    pub fn visible_rect(&self) -> Option<Rect> {
+        self.viewport.as_ref().map(ComponentViewport::visible_rect)
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn dispatch(&mut self, event: &Event) {
+        let Some(viewport) = &self.viewport else {
+            return;
+        };
+        let state = RefCell::new(self.state.clone());
+        let policy = policy();
+        let component = TextInputComponent::new("rename", &state, &policy).focused(true);
+        viewport.event(&component, event);
+        let next = state.into_inner();
+        if next.buffer().text().len() <= 4096 && !next.buffer().text().contains(['\n', '\r']) {
+            self.state = next;
+        }
+    }
+
+    pub fn pointer(&mut self, event: &bmux_plugin::AttachInputEvent) -> bool {
+        if self.viewport.is_none() {
+            return false;
+        }
+        let kind = match event.phase.as_str() {
+            "down" => MouseEventKind::Down(MouseButton::Left),
+            "drag" => MouseEventKind::Drag(MouseButton::Left),
+            "up" => MouseEventKind::Up(MouseButton::Left),
+            _ => return false,
+        };
+        if event.button.as_deref() != Some("left") {
+            return false;
+        }
+        self.dispatch(&Event::Mouse(MouseEvent::new(
+            kind,
+            Point::new(event.col.unwrap_or_default(), event.row.unwrap_or_default()),
+        )));
+        true
+    }
+}
+
+pub fn key(input: &mut RenameInput, key: &str, modifiers: bmux_plugin::AttachInputModifiers) {
     let stroke = if key.chars().count() == 1 {
         bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Char(
             key.chars().next().unwrap_or_default(),
@@ -32,38 +98,36 @@ pub fn key(buffer: &mut TextEditBuffer, key: &str) {
         };
         stroke
     };
-    let mut state = TextInputState::new(buffer.clone());
-    TextInputControl::new(&policy()).handle_key(&mut state, stroke);
-    // Rename fields are single-line and bounded regardless of keymap behavior.
-    if state.buffer().text().len() <= 4096 && !state.buffer().text().contains(['\n', '\r']) {
-        *buffer = state.buffer().clone();
-    }
+    let mut stroke = stroke;
+    stroke.modifiers = bmux_keyboard::Modifiers {
+        ctrl: modifiers.control,
+        alt: modifiers.alt,
+        shift: modifiers.shift,
+        super_key: modifiers.super_key,
+        hyper: modifiers.hyper,
+        meta: modifiers.meta,
+    };
+    input.dispatch(&Event::Key(stroke));
 }
 
 pub fn paint(
-    buffer: &TextEditBuffer,
-    id: &str,
+    input: &RenameInput,
     width: u16,
     x: u16,
     style: bmux_plugin::RenderStyle,
-) -> Vec<bmux_plugin::RenderOp> {
+) -> (Vec<bmux_plugin::RenderOp>, Option<ComponentViewport>) {
     if width == 0 {
-        return Vec::new();
+        return (Vec::new(), None);
     }
-    let state = RefCell::new(TextInputState::new(buffer.clone()));
-    let policy = policy();
-    let component = TextInputComponent::new(id.to_string(), &state, &policy).focused(true);
-    // Paint one logical line, then clip it into the retained name allocation.
-    // Selecting the full initial name keeps its leading text anchored on entry.
     let content_width =
-        u16::try_from(unicode_width::UnicodeWidthStr::width(buffer.text()).saturating_add(1))
+        u16::try_from(unicode_width::UnicodeWidthStr::width(input.text()).saturating_add(1))
             .unwrap_or(u16::MAX)
             .max(width);
-    let selected_all = buffer
+    let selected_all = input
         .selection()
-        .is_some_and(|range| range.start == 0 && range.end == buffer.text().len());
+        .is_some_and(|range| range.start == 0 && range.end == input.text().len());
     let cursor_col =
-        unicode_width::UnicodeWidthStr::width(&buffer.text()[..buffer.cursor_byte_index()]);
+        unicode_width::UnicodeWidthStr::width(&input.text()[..input.cursor_byte_index()]);
     let mut offset = if selected_all {
         0
     } else {
@@ -71,9 +135,8 @@ pub fn paint(
             .saturating_add(1)
             .saturating_sub(usize::from(width))
     };
-    // Never start the visible viewport in a wide grapheme's continuation cell.
     let mut boundary = 0;
-    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(buffer.text(), true) {
+    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(input.text(), true) {
         let next = boundary + unicode_width::UnicodeWidthStr::width(grapheme);
         if next > offset {
             offset = boundary;
@@ -81,18 +144,21 @@ pub fn paint(
         }
         boundary = next;
     }
-    let offset = u16::try_from(offset).unwrap_or(u16::MAX);
-    let mut cells = Buffer::empty(Rect::new(0, 0, content_width, 1));
-    let mut frame = Frame::new(&mut cells);
-    let layout = LayoutNode::leaf(id.to_string().into(), LogicalSize::new(content_width, 1));
-    component.paint(&layout, &mut PaintCx::new(&mut frame));
-    let cursor = frame.cursor();
+    let viewport = ComponentViewport::new(
+        LayoutNode::leaf("rename".into(), LogicalSize::new(content_width, 1)),
+        Rect::new(x, 0, width, 1),
+        Point::new(u16::try_from(offset).unwrap_or(u16::MAX), 0),
+    );
+    let Some(viewport) = viewport else {
+        return (Vec::new(), None);
+    };
+    let state = RefCell::new(input.state.clone());
+    let policy = policy();
+    let component = TextInputComponent::new("rename", &state, &policy).focused(true);
+    let painted = viewport.paint(&component);
     let mut ops = Vec::new();
     for col in 0..width {
-        let Some(cell) = frame.buffer().get(bmux_tui::geometry::Point::new(
-            col.saturating_add(offset),
-            0,
-        )) else {
+        let Some(cell) = painted.buffer.get(Point::new(col, 0)) else {
             continue;
         };
         if cell.is_wide_continuation()
@@ -101,47 +167,80 @@ pub fn paint(
         {
             continue;
         }
-        let selected = cell.style.modifiers.contains(Modifier::REVERSED);
-        let cursor_here = cursor.is_some_and(|cursor| {
-            cursor.visible && cursor.position.x == col.saturating_add(offset)
-        });
+        let reversed = cell.style.modifiers.contains(Modifier::REVERSED)
+            || painted
+                .cursor
+                .is_some_and(|cursor| cursor.visible && cursor.position.x == x.saturating_add(col));
         ops.push(bmux_plugin::RenderOp::text_run(
             x.saturating_add(col),
             0,
             cell.symbol.clone(),
-            if selected || cursor_here {
-                style.reverse()
-            } else {
-                style
-            },
+            if reversed { style.reverse() } else { style },
         ));
     }
-    ops
+    (ops, Some(viewport))
+}
+
+pub fn commit(input: &mut RenameInput, viewport: Option<ComponentViewport>) {
+    input.viewport = viewport;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn shared_control_handles_unicode_selection_and_navigation() {
-        let mut buffer = TextEditBuffer::from_text("old");
-        buffer.select_all();
-        key(&mut buffer, "界");
-        assert_eq!(buffer.text(), "界");
-        key(&mut buffer, "left");
-        key(&mut buffer, "A");
-        assert_eq!(buffer.text(), "A界");
+    fn mounted(text: &str) -> RenameInput {
+        let mut input: RenameInput = TextEditBuffer::from_text(text).into();
+        input.select_all();
+        refresh(&mut input);
+        input
+    }
+    fn refresh(input: &mut RenameInput) {
+        let (_, viewport) = paint(input, 20, 7, bmux_plugin::RenderStyle::default());
+        commit(input, viewport);
+    }
+    fn mouse(input: &mut RenameInput, kind: MouseEventKind, col: u16) {
+        input.dispatch(&Event::Mouse(MouseEvent::new(kind, Point::new(col, 0))));
+        refresh(input);
     }
 
     #[test]
-    fn selected_name_paints_at_original_origin_without_brackets() {
-        let mut buffer = TextEditBuffer::from_text("hello world");
-        buffer.select_all();
-        let ops = paint(&buffer, "test", 5, 7, bmux_plugin::RenderStyle::default());
-        assert!(
-            matches!(&ops[0], bmux_plugin::RenderOp::TextRun { x: 7, text, .. } if text == "h")
+    fn double_click_and_drag_use_persistent_component_state() {
+        let mut input = mounted("hello world");
+        mouse(&mut input, MouseEventKind::Down(MouseButton::Left), 9);
+        mouse(&mut input, MouseEventKind::Up(MouseButton::Left), 9);
+        assert_eq!(input.cursor_byte_index(), 2);
+        mouse(&mut input, MouseEventKind::Down(MouseButton::Left), 9);
+        assert_eq!(input.selected_text().as_deref(), Some("hello"));
+        mouse(&mut input, MouseEventKind::Drag(MouseButton::Left), 17);
+        assert_eq!(input.selected_text().as_deref(), Some("hello world"));
+        mouse(&mut input, MouseEventKind::Up(MouseButton::Left), 17);
+        assert!(!input.state.mouse_selection_active());
+    }
+
+    #[test]
+    fn word_keys_paste_and_cancel_preserve_single_line_policy() {
+        let mut input = mounted("hello world");
+        key(
+            &mut input,
+            "right",
+            bmux_plugin::AttachInputModifiers::default(),
         );
-        assert_eq!(ops.len(), 5);
+        key(
+            &mut input,
+            "backspace",
+            bmux_plugin::AttachInputModifiers {
+                alt: true,
+                ..bmux_plugin::AttachInputModifiers::default()
+            },
+        );
+        assert_eq!(input.text(), "hello ");
+        input.dispatch(&Event::Paste("界".to_string()));
+        assert_eq!(input.text(), "hello 界");
+        input.dispatch(&Event::Paste("bad\nline".to_string()));
+        assert_eq!(input.text(), "hello 界");
+        input.clear();
+        assert!(input.viewport.is_none());
+        assert!(!input.state.mouse_selection_active());
     }
 }
