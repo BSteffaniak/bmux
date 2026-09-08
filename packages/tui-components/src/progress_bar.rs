@@ -53,14 +53,14 @@ impl ProgressBarValue {
             Self::Determinate { value: _, total: 0 } => Some(0),
             Self::Determinate { value, total } => {
                 let clamped = if value > total { total } else { value };
-                Some(u16::try_from((clamped.saturating_mul(100)) / total).unwrap_or(100))
+                Some(u16::try_from(u128::from(clamped) * 100 / u128::from(total)).unwrap_or(100))
             }
             Self::Indeterminate { .. } => None,
         }
     }
 }
 
-/// Label placement for [`ProgressBar`].
+/// Label placement for [`ProgressBarComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProgressLabelPlacement {
     /// Do not render a label.
@@ -71,7 +71,7 @@ pub enum ProgressLabelPlacement {
     Right,
 }
 
-/// Render mode for [`ProgressBar`].
+/// Render mode for [`ProgressBarComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProgressBarMode {
     /// Filled bar gauge.
@@ -80,7 +80,7 @@ pub enum ProgressBarMode {
     LineGauge,
 }
 
-/// Behavior policy for [`ProgressBar`].
+/// Behavior policy for [`ProgressBarComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressBarPolicy {
     /// Filled cell symbol.
@@ -192,7 +192,7 @@ impl Default for ProgressBarPolicy {
     }
 }
 
-/// Visual styles for [`ProgressBar`].
+/// Visual styles for [`ProgressBarComponent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressBarStyles {
     /// Filled portion style.
@@ -289,6 +289,12 @@ impl Component for ProgressBarComponent<'_> {
         self.policy.empty.hash(&mut layout);
         self.policy.partial.hash(&mut layout);
         self.policy.pulse.hash(&mut layout);
+        if !matches!(self.policy.label, ProgressLabelPlacement::Hidden) {
+            self.label_text()
+                .as_deref()
+                .map_or(0, display_width)
+                .hash(&mut layout);
+        }
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         self.value.hash(&mut paint);
@@ -308,6 +314,11 @@ impl Component for ProgressBarComponent<'_> {
         let label_width = self.label_text().as_deref().map_or(0, display_width);
         let intrinsic_width = match self.policy.label {
             ProgressLabelPlacement::Right if label_width > 0 => label_width.saturating_add(2),
+            ProgressLabelPlacement::Inside
+                if label_width > 0 && matches!(self.policy.mode, ProgressBarMode::LineGauge) =>
+            {
+                label_width.saturating_add(2)
+            }
             ProgressLabelPlacement::Inside => label_width.max(1),
             ProgressLabelPlacement::Hidden | ProgressLabelPlacement::Right => 1,
         };
@@ -345,6 +356,19 @@ impl Component for ProgressBarComponent<'_> {
             }
         };
         cx.write_line(area, &line);
+        if matches!(self.value, ProgressBarValue::Determinate { .. })
+            && matches!(self.policy.mode, ProgressBarMode::Bar)
+            && matches!(self.policy.label, ProgressLabelPlacement::Inside)
+            && let Some(label) = self.label_text()
+        {
+            let label = truncate_to_display_width(&label, usize::from(layout.size.width));
+            let label_width = u16_saturating(display_width(&label));
+            let left = (layout.size.width - label_width) / 2;
+            cx.write_line(
+                LocalRect::new(i32::from(left), 0, label_width, 1),
+                &Line::from_spans([Span::styled(label, self.styles.label)]),
+            );
+        }
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
             Rect::new(0, 0, layout.size.width, 1),
@@ -371,7 +395,8 @@ impl ProgressBarComponent<'_> {
         match self.value {
             ProgressBarValue::Determinate { value, total } if total > 0 => {
                 let clamped = if value > total { total } else { value };
-                u16::try_from((clamped.saturating_mul(u64::from(width))) / total).unwrap_or(width)
+                u16::try_from(u128::from(clamped) * u128::from(width) / u128::from(total))
+                    .unwrap_or(width)
             }
             ProgressBarValue::Determinate { .. } | ProgressBarValue::Indeterminate { .. } => 0,
         }
@@ -383,8 +408,9 @@ impl ProgressBarComponent<'_> {
         match self.value {
             ProgressBarValue::Determinate { value, total } if total > 0 && width > 0 => {
                 let clamped = value.min(total);
-                let scaled = clamped.saturating_mul(u64::from(width));
-                u16::from(scaled % total > 0 && scaled / total < u64::from(width))
+                let scaled = u128::from(clamped) * u128::from(width);
+                let total = u128::from(total);
+                u16::from(scaled % total > 0 && scaled / total < u128::from(width))
             }
             ProgressBarValue::Determinate { .. } | ProgressBarValue::Indeterminate { .. } => 0,
         }
@@ -433,18 +459,7 @@ impl ProgressBarComponent<'_> {
                 spans.push(Span::styled(label.clone(), self.styles.label));
             }
         }
-        if matches!(self.policy.label, ProgressLabelPlacement::Inside)
-            && !matches!(self.policy.mode, ProgressBarMode::LineGauge)
-        {
-            overlay_label(
-                Line::from_spans(spans),
-                label.as_deref(),
-                self.styles.label,
-                usize::from(width),
-            )
-        } else {
-            Line::from_spans(spans)
-        }
+        Line::from_spans(spans)
     }
 
     fn line_gauge_line(&self, width: u16) -> Line {
@@ -501,11 +516,11 @@ impl ProgressBarComponent<'_> {
 
     fn indeterminate_line(&self, width: u16, offset: u16) -> Line {
         let pulse_width = self.policy.pulse_width.max(1).min(width.max(1));
-        let span = width.saturating_add(pulse_width);
-        let start = if span == 0 { 0 } else { offset % span };
+        let span = u32::from(width) + u32::from(pulse_width);
+        let start = u32::from(offset) % span;
         let mut cells = String::new();
         for x in 0..width {
-            let in_pulse = x.saturating_add(pulse_width) >= start && x < start;
+            let in_pulse = u32::from(x) + u32::from(pulse_width) >= start && u32::from(x) < start;
             cells.push_str(if in_pulse {
                 self.policy.pulse
             } else {
@@ -522,21 +537,6 @@ impl ProgressBarComponent<'_> {
             self.styles.filled
         }
     }
-}
-
-fn overlay_label(mut line: Line, label: Option<&str>, style: Style, width: usize) -> Line {
-    let Some(label) = label else {
-        return line;
-    };
-    if width == 0 {
-        return line;
-    }
-    let label = truncate_to_display_width(label, width);
-    let label_width = display_width(&label);
-    let left = width.saturating_sub(label_width) / 2;
-    let text = format!("{}{}", " ".repeat(left), label);
-    line.spans.push(Span::styled(text, style));
-    line
 }
 
 impl crate::theme::ComponentTheme {
@@ -585,6 +585,85 @@ mod tests {
     }
 
     #[test]
+    fn line_gauge_inside_label_reserves_adjacent_label_space() {
+        let component = ProgressBarComponent::new("gauge", ProgressBarValue::ratio(1, 1))
+            .policy(ProgressBarPolicy {
+                mode: super::ProgressBarMode::LineGauge,
+                label: ProgressLabelPlacement::Inside,
+                ..ProgressBarPolicy::bare()
+            })
+            .label("done");
+        let layout = component.layout(Constraints::loose(Size::new(20, 1)), &mut LayoutCx::new());
+        assert_eq!(layout.size.width, 6);
+        assert_eq!(render(&component, layout.size.width), "█ done");
+    }
+
+    #[test]
+    fn indeterminate_cycle_does_not_saturate_at_maximum_width() {
+        let component =
+            ProgressBarComponent::new("pulse", ProgressBarValue::indeterminate(u16::MAX)).policy(
+                ProgressBarPolicy {
+                    pulse: "#",
+                    empty: ".",
+                    pulse_width: 3,
+                    ..ProgressBarPolicy::bare()
+                },
+            );
+        let painted = render(&component, u16::MAX);
+        assert_eq!(painted.len(), usize::from(u16::MAX));
+        assert!(painted.ends_with("###"));
+        assert!(painted[..painted.len() - 3].chars().all(|cell| cell == '.'));
+        let wrapped = ProgressBarComponent::new("pulse", ProgressBarValue::indeterminate(13))
+            .policy(ProgressBarPolicy {
+                pulse: "#",
+                empty: ".",
+                pulse_width: 3,
+                ..ProgressBarPolicy::bare()
+            });
+        assert_eq!(render(&wrapped, 10), "..........");
+    }
+
+    #[test]
+    fn inside_label_overlays_bar_instead_of_appending() {
+        let component = ProgressBarComponent::new("progress", ProgressBarValue::ratio(1, 2))
+            .policy(ProgressBarPolicy {
+                label: ProgressLabelPlacement::Inside,
+                ..ProgressBarPolicy::bare()
+            })
+            .label("界");
+        assert_eq!(render(&component, 10), "████界░░░░");
+    }
+
+    #[test]
+    fn large_values_preserve_exact_progress_ratios() {
+        for (value, total, percent, filled, partial) in [
+            (u64::MAX, u64::MAX, 100, 10, 0),
+            (u64::MAX, u64::MAX - 1, 100, 10, 0),
+            (u64::MAX / 2, u64::MAX - 1, 50, 5, 0),
+            (u64::MAX - 1, u64::MAX, 99, 9, 1),
+            (0, u64::MAX, 0, 0, 0),
+            (u64::MAX, 0, 0, 0, 0),
+        ] {
+            let progress = ProgressBarValue::determinate(value, total);
+            let component =
+                ProgressBarComponent::new("large", progress).policy(ProgressBarPolicy::bare());
+            assert_eq!(progress.percent(), Some(percent));
+            assert_eq!(component.filled_width(10), filled);
+            assert_eq!(component.partial_width(10), partial);
+            assert_eq!(component.filled_width(0), 0);
+            assert_eq!(component.partial_width(0), 0);
+        }
+        let complete = ProgressBarComponent::new(
+            "complete",
+            ProgressBarValue::determinate(u64::MAX, u64::MAX),
+        )
+        .policy(ProgressBarPolicy::bare());
+        assert_eq!(complete.filled_width(u16::MAX), u16::MAX);
+        assert_eq!(complete.partial_width(u16::MAX), 0);
+        assert_eq!(render(&complete, 10), "██████████");
+    }
+
+    #[test]
     fn component_measures_paints_and_registers_progress() {
         let component = ProgressBarComponent::new("download", ProgressBarValue::determinate(1, 2))
             .policy(ProgressBarPolicy::bare());
@@ -603,13 +682,40 @@ mod tests {
     }
 
     #[test]
-    fn component_value_changes_are_paint_only() {
+    fn same_width_value_changes_are_paint_only() {
         let initial =
             ProgressBarComponent::new("download", ProgressBarValue::determinate(1, 2)).revision();
         let changed =
-            ProgressBarComponent::new("download", ProgressBarValue::determinate(2, 2)).revision();
+            ProgressBarComponent::new("download", ProgressBarValue::determinate(3, 4)).revision();
         assert_eq!(initial.layout, changed.layout);
         assert_ne!(initial.paint, changed.paint);
+    }
+
+    #[test]
+    fn percentage_width_changes_invalidate_cached_layout() {
+        let mut cache = bmux_tui::component::LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        let constraints = Constraints::loose(Size::new(20, 1));
+        for placement in [
+            ProgressLabelPlacement::Inside,
+            ProgressLabelPlacement::Right,
+        ] {
+            for value in [9, 10, 100, 0] {
+                let component =
+                    ProgressBarComponent::new("progress", ProgressBarValue::ratio(value, 100))
+                        .policy(ProgressBarPolicy {
+                            label: placement,
+                            percentage: true,
+                            ..ProgressBarPolicy::bare()
+                        });
+                let cached = cache.layout("progress".into(), &component, constraints, &mut cx);
+                let fresh = component.layout(constraints, &mut LayoutCx::new());
+                assert_eq!(cached.size, fresh.size);
+            }
+        }
+        // Returning to a two-column label reuses the earlier layout for each placement.
+        assert_eq!(cx.measured_nodes(), 6);
+        assert_eq!(cache.stats().hits, 2);
     }
 
     #[test]
