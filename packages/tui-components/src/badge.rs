@@ -382,6 +382,51 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_badge_emits_no_pixels_or_metadata() {
+        for size in [Size::new(0, 1), Size::new(6, 0), Size::new(0, 0)] {
+            let badge = BadgeComponent::new("collapsed", "ok");
+            let layout = badge.layout(Constraints::tight(size), &mut LayoutCx::new());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+            let mut frame = Frame::new(&mut buffer);
+            badge.paint(&layout, &mut PaintCx::new(&mut frame));
+            assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("        "));
+            assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("        "));
+            assert!(frame.semantics().regions().is_empty());
+            assert!(
+                frame
+                    .damage(bmux_tui::damage::DamagePolicy::default())
+                    .retained_regions()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn translated_parent_clip_bounds_badge_pixels_and_metadata() {
+        let badge = BadgeComponent::new("clipped", "abcdef").policy(BadgePolicy::bare());
+        let layout = badge.layout(Constraints::loose(Size::new(20, 1)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(
+            2,
+            1,
+            bmux_tui::paint::LocalRect::new(1, 0, 3, 1),
+            |cx| badge.paint(&layout, cx),
+        );
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("          "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("   bcd    "));
+        assert_eq!(frame.buffer().row_symbols(2).as_deref(), Some("          "));
+        assert_eq!(frame.semantics().regions().len(), 1);
+        assert_eq!(frame.semantics().regions()[0].area, Rect::new(3, 1, 3, 1));
+        assert_eq!(
+            frame
+                .damage(bmux_tui::damage::DamagePolicy::default())
+                .retained_regions(),
+            &[Rect::new(3, 1, 3, 1)]
+        );
+    }
+
+    #[test]
     fn uppercase_unicode_label_remeasures_cached_geometry() {
         let policy = BadgePolicy::bare().uppercase(true);
         let initial = BadgeComponent::new("label", "a").policy(policy);
