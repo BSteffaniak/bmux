@@ -2758,13 +2758,12 @@ impl OutputFanoutBuffer {
     }
 
     fn acknowledge_snapshot(&mut self, client_id: ClientId, offset: u64) {
-        let offset = self
-            .cursors
-            .get(&client_id)
-            .copied()
-            .unwrap_or(0)
-            .max(offset);
-        self.set_client_cursor(client_id, offset);
+        let Some(current) = self.cursors.get(&client_id).copied() else {
+            // Encoding runs outside the output lock. Detach may have retired
+            // this cursor since capture; an acknowledgement cannot register it.
+            return;
+        };
+        self.set_client_cursor(client_id, current.max(offset));
     }
 
     fn push_chunk(&mut self, chunk: &[u8]) {
@@ -12651,6 +12650,43 @@ mod tests {
 
         assert!(replay.stream_gap);
         assert!(replay.stream_start >= output.start_offset);
+    }
+
+    #[test]
+    fn snapshot_acknowledgement_preserves_other_clients_unread_output() {
+        let first = ClientId(Uuid::new_v4());
+        let second = ClientId(Uuid::new_v4());
+        let mut output = OutputFanoutBuffer::new(1024);
+        output.register_client_at_tail(first);
+        output.register_client_at_tail(second);
+        output.push_chunk(b"before");
+        let watermark = output.end_offset();
+        output.push_chunk(b"after");
+        output.acknowledge_snapshot(first, watermark);
+        assert_eq!(output.read_for_client(first, 1024).bytes, b"after");
+        assert_eq!(output.read_for_client(second, 1024).bytes, b"beforeafter");
+        output.unregister_client(first);
+        output.push_chunk(b"more");
+        output.acknowledge_snapshot(first, output.end_offset());
+        assert_eq!(output.read_for_client(second, 1024).bytes, b"more");
+        assert!(!output.cursors.contains_key(&first));
+    }
+
+    #[test]
+    fn snapshot_acknowledgement_does_not_recreate_detached_cursor() {
+        let client_id = ClientId(Uuid::new_v4());
+        let mut output = OutputFanoutBuffer::new(1024);
+        output.register_client_at_tail(client_id);
+        output.push_chunk(b"first");
+        let snapshot_end = output.end_offset();
+        output.unregister_client(client_id);
+        output.acknowledge_snapshot(client_id, snapshot_end);
+        assert!(!output.cursors.contains_key(&client_id));
+        output.push_chunk(b"second");
+        output.register_client_at_tail(client_id);
+        output.acknowledge_snapshot(client_id, snapshot_end);
+        assert_eq!(output.cursors.get(&client_id), Some(&output.end_offset()));
+        assert!(output.read_for_client(client_id, 1024).bytes.is_empty());
     }
 
     #[test]
