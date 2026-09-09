@@ -8,17 +8,31 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 pub type AttachCompanionCallback = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
+/// Registry selection supplied by the invoking presentation runtime.
+pub struct AttachPresentationResources {
+    pub layouts: Arc<crate::layout::PluginLayoutRegistry>,
+    pub allocations: Arc<crate::layout::AllocationRegistry>,
+    pub surfaces: Arc<crate::surface::PluginSurfaceRegistry>,
+    pub input: Arc<crate::AttachPresentationInputRegistry>,
+    pub events: Arc<crate::EventBus>,
+}
+
+pub type AttachCompanionFactory =
+    Arc<dyn Fn(&AttachPresentationResources) -> Result<Box<dyn Send + Sync>, String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AttachCompanion {
     id: String,
     start: AttachCompanionCallback,
     stop: AttachCompanionCallback,
+    factory: Option<AttachCompanionFactory>,
 }
 
 /// A successfully started companion owned by one runtime invocation.
 /// Dropping it stops the captured registration, even if the registry changed.
 pub struct StartedAttachCompanion {
     companion: AttachCompanion,
+    _installation: Option<Box<dyn Send + Sync>>,
 }
 
 impl Drop for StartedAttachCompanion {
@@ -30,12 +44,46 @@ impl Drop for StartedAttachCompanion {
 }
 
 impl AttachCompanion {
+    /// Register a factory whose returned installation is owned by the runtime.
+    #[must_use]
+    pub fn from_factory(id: impl Into<String>, factory: AttachCompanionFactory) -> Self {
+        Self {
+            id: id.into(),
+            start: Arc::new(|| Ok(())),
+            stop: Arc::new(|| Ok(())),
+            factory: Some(factory),
+        }
+    }
+
+    /// Install using the invoking runtime's selected resources.
+    ///
+    /// # Errors
+    /// Returns installation or startup failure.
+    pub fn start_with_resources(
+        self,
+        resources: &AttachPresentationResources,
+    ) -> Result<StartedAttachCompanion, String> {
+        if let Some(factory) = &self.factory {
+            let installation = factory(resources)?;
+            return Ok(StartedAttachCompanion {
+                companion: self,
+                _installation: Some(installation),
+            });
+        }
+        self.start_owned()
+    }
     /// Start and retain this exact registration until runtime teardown.
     ///
     /// # Errors
     /// Returns startup failure after attempting to clean up partial startup.
     pub fn start_owned(self) -> Result<StartedAttachCompanion, String> {
-        let started = StartedAttachCompanion { companion: self };
+        if self.factory.is_some() {
+            return Err("companion factory requires presentation resources".to_string());
+        }
+        let started = StartedAttachCompanion {
+            companion: self,
+            _installation: None,
+        };
         started.companion.start()?;
         Ok(started)
     }
@@ -49,6 +97,7 @@ impl AttachCompanion {
             id: id.into(),
             start,
             stop,
+            factory: None,
         }
     }
 

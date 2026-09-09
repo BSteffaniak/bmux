@@ -1758,13 +1758,14 @@ fn duration_millis_u64(duration: Duration) -> u64 {
 /// empty too.
 async fn notify_extensions_of_layout(
     client: &mut bmux_client::StreamingBmuxClient,
+    bus: &bmux_plugin::EventBus,
     _previous: Option<&bmux_client::AttachLayoutState>,
     current: Option<&bmux_client::AttachLayoutState>,
 ) -> std::collections::BTreeSet<Uuid> {
     use bmux_scene_protocol::scene_protocol::Rect as SceneRect;
 
     let Some(current) = current else {
-        publish_attach_layout_snapshot(client, &[]).await;
+        publish_attach_layout_snapshot(client, bus, &[]).await;
         return std::collections::BTreeSet::new();
     };
 
@@ -1790,7 +1791,7 @@ async fn notify_extensions_of_layout(
             visible: surface.visible,
         })
         .collect();
-    publish_attach_layout_snapshot(client, &layout_entries).await;
+    publish_attach_layout_snapshot(client, bus, &layout_entries).await;
 
     let mut current_pane_ids = std::collections::BTreeSet::new();
     for surface in &current.scene.surfaces {
@@ -1830,6 +1831,7 @@ fn mark_pane_surface_dirty(
 
 async fn publish_attach_layout_snapshot(
     client: &mut bmux_client::StreamingBmuxClient,
+    bus: &bmux_plugin::EventBus,
     surfaces: &[AttachSurfaceSummary],
 ) {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1841,8 +1843,7 @@ async fn publish_attach_layout_snapshot(
     };
     // Client-side publish: any render extension running in this
     // process picks up the snapshot.
-    let _ =
-        bmux_plugin::global_event_bus().publish_state(&ATTACH_LAYOUT_STATE_KIND, payload.clone());
+    let _ = bus.publish_state(&ATTACH_LAYOUT_STATE_KIND, payload.clone());
     // Server-side publish via IPC: any plugin that registered the
     // attach-layout channel with a decoder picks up the snapshot on
     // its process-local event bus. When the server hasn't registered
@@ -3397,14 +3398,15 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     let mut rendered_frame_count = 0_u64;
     let mut first_frame_emitted = false;
     let mut interactive_ready_emitted = false;
-    let (initial_appearance, appearance_rx_raw) = bmux_plugin::global_event_bus()
+    let presentation_events = bmux_plugin::global_event_bus();
+    let (initial_appearance, appearance_rx_raw) = presentation_events
         .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
         .unwrap_or_else(|_| {
-            let _ = bmux_plugin::global_event_bus().register_state_channel::<RuntimeAppearance>(
+            let _ = presentation_events.register_state_channel::<RuntimeAppearance>(
                 RUNTIME_APPEARANCE_STATE_KIND,
                 RuntimeAppearance::default(),
             );
-            bmux_plugin::global_event_bus()
+            presentation_events
                 .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
                 .expect("runtime appearance state channel was just registered")
         });
@@ -3514,12 +3516,11 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                 "attach seeded runtime appearance from theme plugin",
             );
             runtime_appearance = appearance.clone();
-            let _ = bmux_plugin::global_event_bus()
-                .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
+            let _ = presentation_events.publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
         }
         Err(error) => {
             tracing::debug!(%error, "theme plugin active-appearance query unavailable on attach startup");
-            let _ = bmux_plugin::global_event_bus()
+            let _ = presentation_events
                 .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, runtime_appearance.clone());
         }
     }
@@ -3529,8 +3530,8 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         match typed_active_runtime_appearance_for_cwd_attach(&mut client, cwd_text).await {
             Ok(appearance) => {
                 runtime_appearance = appearance.clone();
-                let _ = bmux_plugin::global_event_bus()
-                    .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
+                let _ =
+                    presentation_events.publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
             }
             Err(error) => {
                 tracing::debug!(%error, cwd = %cwd.display(), "cwd-scoped runtime appearance unavailable on attach startup");
@@ -3544,6 +3545,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     }
 
     let mut view_state = AttachViewState::new(attach_info);
+    view_state.presentation_events = presentation_events;
     terminal.set_attached_session_id(view_state.attached_id);
     view_state.self_client_id = Some(self_client_id);
     view_state.mouse.config = attach_config.attach_mouse_config();
@@ -3595,10 +3597,17 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
             context_id: view_state.attached_context_id,
         },
     );
+    let presentation_resources = bmux_plugin::AttachPresentationResources {
+        layouts: view_state.presentation_layouts.clone(),
+        allocations: view_state.presentation_allocations.clone(),
+        surfaces: view_state.presentation_surfaces.clone(),
+        input: view_state.presentation_input.clone(),
+        events: view_state.presentation_events.clone(),
+    };
     let mut started_companions = Vec::new();
     for companion in bmux_plugin::registered_attach_companions() {
         let id = companion.id().to_owned();
-        match companion.start_owned() {
+        match companion.start_with_resources(&presentation_resources) {
             Ok(started) => started_companions.push(started),
             Err(error) => {
                 tracing::warn!(companion_id = id, %error, "failed starting attach companion");
@@ -3638,8 +3647,13 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     // per-pane rects at attach entry. Subsequent layout changes flow
     // through the loop-body call to
     // `notify_extensions_of_layout` at the layout-refresh site.
-    let _ = notify_extensions_of_layout(&mut client, None, view_state.cached_layout_state.as_ref())
-        .await;
+    let _ = notify_extensions_of_layout(
+        &mut client,
+        &view_state.presentation_events,
+        None,
+        view_state.cached_layout_state.as_ref(),
+    )
+    .await;
     refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
     sync_attach_active_mode_from_processor(&mut view_state, &attach_keymap, None);
 
@@ -3704,7 +3718,8 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     // without scene updates — extensions that aren't loaded simply have
     // nothing to draw.
     let (mut last_scene_revision, mut scene_event_rx) =
-        match bmux_plugin::global_event_bus()
+        match view_state
+            .presentation_events
             .subscribe_state::<bmux_scene_protocol::scene_protocol::DecorationScene>(
                 &bmux_scene_protocol::scene_protocol::STATE_KIND,
             ) {
@@ -4224,6 +4239,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
             // to know which plugins care.
             let current_pane_ids = notify_extensions_of_layout(
                 &mut client,
+                &view_state.presentation_events,
                 previous_layout.as_ref(),
                 view_state.cached_layout_state.as_ref(),
             )

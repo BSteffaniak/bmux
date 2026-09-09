@@ -165,14 +165,21 @@ fn install_bundled_client_adapter(plugin_id: &str, settings: Option<&toml::Value
     }
     #[cfg(feature = "bundled-plugin-sidebar")]
     if plugin_id == "bmux.sidebar" {
-        if let Err(error) = bmux_sidebar_plugin::install(settings) {
-            tracing::warn!(%error, "failed installing sidebar attach companion");
-        } else {
-            match bmux_sidebar_plugin::installed_companion() {
-                Ok(companion) => bmux_plugin::register_attach_companion(companion),
-                Err(error) => tracing::warn!(%error, "failed capturing sidebar attach companion"),
-            }
-        }
+        let settings = settings.cloned();
+        bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::from_factory(
+            plugin_id,
+            std::sync::Arc::new(move |resources| {
+                let presentation = bmux_sidebar_plugin::SidebarPresentation::install(
+                    settings.as_ref(),
+                    resources.layouts.clone(),
+                    resources.allocations.clone(),
+                    resources.input.clone(),
+                    resources.surfaces.clone(),
+                )?;
+                presentation.start(&resources.events)?;
+                Ok(Box::new(presentation))
+            }),
+        ));
     }
 }
 

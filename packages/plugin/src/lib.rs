@@ -37,8 +37,9 @@ mod typed_dispatch_bridge;
 mod typed_service_caller;
 
 pub use attach_companion::{
-    AttachCompanion, AttachCompanionCallback, AttachCompanionRegistry,
-    global_attach_companion_registry, register_attach_companion, registered_attach_companions,
+    AttachCompanion, AttachCompanionCallback, AttachCompanionFactory, AttachCompanionRegistry,
+    AttachPresentationResources, global_attach_companion_registry, register_attach_companion,
+    registered_attach_companions,
 };
 pub use attach_presentation_input::{
     AttachPresentationCommittedHandler, AttachPresentationFocusLostHandler,
