@@ -9688,33 +9688,6 @@ async fn ensure_pane_scrollback_windows(
                     captured_windows.push((*pane_id, window));
                     continue;
                 }
-                Ok(crate::pane_runtime_client::CapturedWindowOutcome::LiveTail {
-                    capture_offset,
-                }) => {
-                    if let Ok(Some(window)) = crate::pane_runtime_client::captured_tail_window(
-                        client,
-                        view_state.attached_id,
-                        *pane_id,
-                        pin,
-                        capture_offset,
-                        rows,
-                        width,
-                    )
-                    .await
-                    {
-                        captured_windows.push((*pane_id, window));
-                        continue;
-                    }
-                    requested_panes.insert(*pane_id);
-                    requests.push(PaneGridWindowRequest {
-                        pane_id: *pane_id,
-                        scrollback_offset: capture_offset,
-                        rows,
-                        anchor_total_scrolled_rows: None,
-                        pin_id: Some(pin.pin_id),
-                    });
-                    continue;
-                }
                 Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) | Err(_) => {}
             }
             if let Some(window) = cached_window.filter(|window| !window.row_anchors.is_empty()) {

@@ -386,6 +386,40 @@ mod history_tests {
                 .collect::<String>(),
             "PX"
         );
+        let initial = super::captured_history_window_outcome(
+            &mut TailClient(0),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            3,
+            1,
+            (8, None, 0),
+        )
+        .await
+        .unwrap();
+        let super::CapturedWindowOutcome::Window(initial) = initial else {
+            panic!("pending entry should resolve");
+        };
+        assert_eq!(
+            bmux_terminal_grid::row_text(&initial.rows[0], 8),
+            "PX      "
+        );
+        let refreshed = super::captured_history_window_outcome(
+            &mut TailClient(0),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            3,
+            1,
+            (8, initial.row_anchors.last().copied(), 0),
+        )
+        .await
+        .unwrap();
+        let super::CapturedWindowOutcome::Window(refreshed) = refreshed else {
+            panic!("pending refresh should resolve");
+        };
+        assert_eq!(initial.rows, refreshed.rows);
+        assert_eq!(initial.row_anchors, refreshed.row_anchors);
         let mut client = TailClient(0);
         let window = super::captured_tail_window(
             &mut client,
@@ -408,6 +442,43 @@ mod history_tests {
                 .collect::<String>(),
             "AB  C"
         );
+    }
+
+    #[tokio::test]
+    async fn entry_resolves_physical_boundary_without_fetching_target_or_later_rows() {
+        let capture = super::AttachState::HistoryCaptureV1 {
+            width: 4,
+            height: 3,
+            capture_id: uuid::Uuid::new_v4(),
+            history_line_count: 1,
+            history_truncated: false,
+            pin: super::AttachState::PaneScrollbackPin {
+                pane_id: uuid::Uuid::new_v4(),
+                pin_id: 1,
+                total_scrolled_rows: 1,
+                max_scrollback_offset: 1,
+                stream_end: 0,
+            },
+        };
+        let mut client = TailClient(0);
+        // Pending P, hard-ended X, then paginated wrapped AB: the last physical
+        // row begins at column four regardless of whether it contains any cells.
+        let anchor = super::resolve_tail_entry(
+            &mut client,
+            uuid::Uuid::new_v4(),
+            &capture,
+            0,
+            &mut 65536,
+            &mut Vec::new(),
+            &mut 8,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(client.0, 3);
+        assert_eq!(anchor.line_index, 1);
+        assert_eq!(anchor.column, 4);
+        assert_eq!(anchor.capture_id, capture.capture_id);
     }
 
     struct HistoryClient;
@@ -567,20 +638,48 @@ mod history_tests {
         };
         assert_eq!(bmux_terminal_grid::row_text(&refreshed.rows[0], 1), "B");
         assert_eq!(refreshed.row_anchors[0].line_index, 1);
-        assert!(
-            super::captured_history_window(
-                &mut HistoryClient,
-                uuid::Uuid::new_v4(),
-                uuid::Uuid::new_v4(),
-                pin,
-                1,
-                1,
-                (2, None, 0),
-            )
-            .await
-            .unwrap()
-            .is_none()
-        );
+        let overshoot = super::captured_history_window(
+            &mut HistoryClient,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            0,
+            1,
+            (1, refreshed.row_anchors.last().copied(), -100),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(overshoot.row_anchors[0].line_index, 2);
+        assert_eq!(overshoot.row_anchors[0].column, 1);
+        assert_eq!(bmux_terminal_grid::row_text(&overshoot.rows[0], 1), "B");
+        let entered = super::captured_history_window(
+            &mut HistoryClient,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            1,
+            1,
+            (2, None, 0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(entered.row_anchors[0].line_index, 1);
+        let refreshed = super::captured_history_window(
+            &mut HistoryClient,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            1,
+            1,
+            (2, entered.row_anchors.last().copied(), 0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(entered.rows, refreshed.rows);
+        assert_eq!(entered.row_anchors, refreshed.row_anchors);
     }
 
     #[test]
@@ -605,7 +704,6 @@ mod history_tests {
 )]
 pub enum CapturedWindowOutcome {
     Window(bmux_attach_pipeline::PaneScrollbackWindow),
-    LiveTail { capture_offset: usize },
     Unavailable,
 }
 
@@ -630,7 +728,7 @@ pub async fn captured_history_window(
         .await?
         {
             CapturedWindowOutcome::Window(window) => Some(window),
-            CapturedWindowOutcome::LiveTail { .. } | CapturedWindowOutcome::Unavailable => None,
+            CapturedWindowOutcome::Unavailable => None,
         },
     )
 }
@@ -657,13 +755,7 @@ pub async fn captured_history_window_outcome(
     let Some(meta) = pin.capture else {
         return Ok(CapturedWindowOutcome::Unavailable);
     };
-    if (bottom_anchor.is_none() && offset < usize::from(meta.height))
-        || rows == 0
-        || rows > 256
-        || meta.width == 0
-        || width == 0
-        || width > 4096
-    {
+    if rows == 0 || rows > 256 || meta.width == 0 || width == 0 || width > 4096 {
         return Ok(CapturedWindowOutcome::Unavailable);
     }
     let capture = AttachState::HistoryCaptureV1 {
@@ -689,11 +781,27 @@ pub async fn captured_history_window_outcome(
     let mut remaining: usize = 2 * 1024 * 1024;
     let mut requests_left = 256;
     let mut styles = Vec::new();
+    if bottom_anchor.is_none() && offset < usize::from(meta.height) {
+        bottom_anchor = resolve_tail_entry(
+            client,
+            session_id,
+            &capture,
+            offset,
+            &mut remaining,
+            &mut styles,
+            &mut requests_left,
+        )
+        .await?;
+        if bottom_anchor.is_none() {
+            return Ok(CapturedWindowOutcome::Unavailable);
+        }
+    }
     if local_delta < 0 {
         let Some(mut anchor) = bottom_anchor else {
             return Ok(CapturedWindowOutcome::Unavailable);
         };
         let mut advance = local_delta.unsigned_abs();
+        let mut last_valid = None;
         loop {
             let Some(line) = fetch_captured_content_line(
                 client,
@@ -706,7 +814,11 @@ pub async fn captured_history_window_outcome(
             )
             .await?
             else {
-                return Ok(CapturedWindowOutcome::Unavailable);
+                let Some(last) = last_valid else {
+                    return Ok(CapturedWindowOutcome::Unavailable);
+                };
+                bottom_anchor = Some(last);
+                break;
             };
             let row = line
                 .row_for_column(width, anchor.column)
@@ -719,16 +831,18 @@ pub async fn captured_history_window_outcome(
                 bottom_anchor = Some(anchor);
                 break;
             }
+            anchor.column = line
+                .column_for_row(width, row + available)
+                .ok_or_else(|| history_decode_error(&"unavailable final capture row"))?;
+            last_valid = Some(anchor);
             advance -= available + 1;
             let Some(next) = anchor
                 .line_index
                 .checked_add(1)
                 .filter(|index| u64::from(*index) < meta.lines + u64::from(meta.height))
             else {
-                return Ok(CapturedWindowOutcome::LiveTail {
-                    capture_offset: usize::from(meta.height)
-                        .saturating_sub(advance.saturating_add(1)),
-                });
+                bottom_anchor = last_valid;
+                break;
             };
             anchor.line_index = next;
             anchor.column = 0;
@@ -756,7 +870,7 @@ pub async fn captured_history_window_outcome(
     // Bound scanning independently of bytes (empty lines still cost requests).
     for index in (0..scan_end).rev().take(256) {
         let index = u32::try_from(index).map_err(|error| history_decode_error(&error))?;
-        let line = if bottom_anchor.is_some() {
+        let mut line = if bottom_anchor.is_some() {
             let Some(line) = fetch_captured_content_line(
                 client,
                 session_id,
@@ -788,9 +902,38 @@ pub async fn captured_history_window_outcome(
             skip -= count;
             continue;
         }
+        // Resolve a pending prefix through the same complete line used on refresh.
+        // Its last captured row remains the boundary, not the appended main tail.
+        let pending_column = if bottom_anchor.is_none()
+            && matches!(
+                line.completed(),
+                Some((_, bmux_terminal_grid::HistorySliceEnd::Open))
+            ) {
+            let column = line
+                .column_for_row(usize::from(meta.width), count - skip - 1)
+                .ok_or_else(|| history_decode_error(&"unavailable pending boundary"))?;
+            line = fetch_captured_content_line(
+                client,
+                session_id,
+                &capture,
+                index,
+                &mut remaining,
+                &mut styles,
+                &mut requests_left,
+            )
+            .await?
+            .ok_or_else(|| history_decode_error(&"unavailable joined pending line"))?;
+            Some(column)
+        } else {
+            None
+        };
         // Offset remains in capture rows. Resolve the exclusive lower boundary
         // through content coordinates before selecting locally projected rows.
-        let end = if let Some(anchor) = bottom_anchor.filter(|anchor| anchor.line_index == index) {
+        let end = if let Some(column) = pending_column {
+            line.row_for_column(width, column)
+                .ok_or_else(|| history_decode_error(&"unavailable joined boundary"))?
+                + 1
+        } else if let Some(anchor) = bottom_anchor.filter(|anchor| anchor.line_index == index) {
             line.row_for_column(width, anchor.column)
                 .ok_or_else(|| history_decode_error(&"unavailable viewport anchor"))?
                 + 1
@@ -844,6 +987,7 @@ pub async fn captured_history_window_outcome(
 
 /// Project captured tail lines without resizing the replica.
 /// The first logical line includes any pending prefix from the same capture.
+#[cfg(test)]
 pub async fn captured_tail_window(
     client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     session: Uuid,
@@ -950,6 +1094,88 @@ pub async fn captured_tail_window(
         max_scrollback_offset: pin.max_scrollback_offset,
         total_scrolled_rows: pin.total_scrolled_rows,
     }))
+}
+
+/// Convert a main-screen capture row into a capture-wide logical anchor.
+async fn resolve_tail_entry(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    session: Uuid,
+    capture: &AttachState::HistoryCaptureV1,
+    offset: usize,
+    budget: &mut usize,
+    styles: &mut Vec<bmux_terminal_grid::Style>,
+    requests: &mut usize,
+) -> ClientResult<Option<bmux_attach_pipeline::CapturedHistoryAnchor>> {
+    use bmux_terminal_grid::HistorySliceEnd;
+    let mut index =
+        u32::try_from(capture.history_line_count).map_err(|error| history_decode_error(&error))?;
+    let mut prefix_columns = 0;
+    if index > 0 {
+        let last = fetch_captured_history_line(
+            client,
+            session,
+            capture,
+            index - 1,
+            budget,
+            styles,
+            requests,
+        )
+        .await?;
+        if matches!(last.completed(), Some((_, HistorySliceEnd::Open))) {
+            index -= 1;
+            prefix_columns = last.next_offset();
+        }
+    }
+    let target = usize::from(capture.height)
+        .checked_sub(offset + 1)
+        .ok_or_else(|| history_decode_error(&"invalid tail entry"))?;
+    for row in 0..=target {
+        if row == target {
+            return Ok(Some(bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id: capture.capture_id,
+                line_index: index,
+                column: prefix_columns,
+            }));
+        }
+        let mut cell_offset = 0;
+        let end = loop {
+            *requests = requests
+                .checked_sub(1)
+                .ok_or_else(|| history_decode_error(&"entry request limit"))?;
+            let reply = AttachState::client::attach_main_row_slice_v1(
+                client,
+                session,
+                capture.pin.pane_id,
+                capture.pin.pin_id,
+                capture.capture_id,
+                u32::try_from(row).map_err(|error| history_decode_error(&error))?,
+                cell_offset,
+                256,
+                4096,
+            )
+            .await
+            .map_err(|error| history_decode_error(&error))?
+            .map_err(|error| history_decode_error(&format!("{error:?}")))?;
+            // Validate every slice, even though entry only needs row boundaries.
+            decode_tail_slice(&reply, cell_offset, capture.width, styles, budget)?;
+            cell_offset = u32::try_from(reply.next_cell_offset)
+                .map_err(|error| history_decode_error(&error))?;
+            if !matches!(reply.end_kind, AttachState::HistoryEnd::Continue) {
+                break reply.end_kind;
+            }
+        };
+        if matches!(end, AttachState::HistoryEnd::HardBreak) {
+            index = index
+                .checked_add(1)
+                .ok_or_else(|| history_decode_error(&"tail index overflow"))?;
+            prefix_columns = 0;
+        } else {
+            prefix_columns = prefix_columns
+                .checked_add(usize::from(capture.width))
+                .ok_or_else(|| history_decode_error(&"entry column overflow"))?;
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve a capture-wide logical index, including the pending history/main join.
@@ -1074,6 +1300,7 @@ fn tail_next_column(offset: usize, cells: &[bmux_terminal_grid::Cell]) -> Client
         .ok_or_else(|| history_decode_error(&"tail column overflow"))
 }
 
+#[cfg(test)]
 async fn captured_tail_prefix(
     client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     session: Uuid,
@@ -1144,6 +1371,7 @@ async fn captured_tail_prefix(
     Ok(line)
 }
 
+#[cfg(test)]
 fn append_tail_projection(
     line: &bmux_terminal_grid::HistoryLineAssembly,
     width: usize,
