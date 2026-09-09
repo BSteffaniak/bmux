@@ -16,6 +16,24 @@ capability CLIENTS_READ = bmux.clients.read;
 capability CLIENTS_WRITE = bmux.clients.write;
 
 @capability(CLIENTS_READ)
+@interface-version(1)
+interface clients-identity {
+    // Local single-user identity association, not federated authentication.
+    record local-principal {
+        principal-id: uuid,
+    }
+
+    variant identity-error {
+        no-current-client,
+        principal-unavailable,
+        unsupported-context,
+    }
+
+    // Resolves only the host-supplied caller; never accepts a chosen owner.
+    query current-principal() -> result<local-principal, identity-error>;
+}
+
+@capability(CLIENTS_READ)
 interface clients-state {
     // Snapshot of a single client's public view state.
     record client-summary {

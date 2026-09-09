@@ -18,6 +18,8 @@ Use a two-level resume model:
 
 A client resumes by reconciling control state first, then each visible execution stream. Cursor gaps repair from a complete terminal snapshot rather than replaying through consensus.
 
+When persistent personal arrangements are negotiated, the [ADR-0012 personal-arrangement amendment](adr-0012-worker-output-and-attach-ownership.md#persistent-personal-arrangements-2026-09-09-amendment) governs their authority and resume semantics. The plugin-owned resume representation preserves selected view identity separately from attachment-local selection. Resume reauthenticates, resolves the authorized committed arrangement, and validates the selected reference and current execution authority before enabling input. It does not recreate resources from stale references or rewrite membership from incomplete catalog data. Deleted views and invalid selections require an explicit fallback or input-paused state. Existing v1 resume descriptors are not silently reinterpreted as supporting arrangements.
+
 ## Attach lifecycle
 
 ### Open

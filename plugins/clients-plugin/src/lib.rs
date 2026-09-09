@@ -9,6 +9,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod follow_state;
+mod identity;
 mod selection;
 pub use follow_state::FollowState;
 
@@ -457,6 +458,12 @@ impl RustPlugin for ClientsPlugin {
             },
             "clients-selection-commands-v1", "commit" => |req: clients_selection_commands_v1::client::CommitRequest, ctx| {
                 Ok::<Result<Selection, SelectionError>, ServiceResponse>(commit_client_selection(ctx, ctx.caller_client_id, &req))
+            },
+            "clients-identity/v1", "current-principal" => |_req: (), ctx| {
+                let identity = identity::CallerIdentity::new(ctx.caller_client_id);
+                Ok::<_, ServiceResponse>(bmux_plugin::block_on_typed_dispatch(
+                    bmux_clients_plugin_api::clients_identity::ClientsIdentityService::current_principal(&identity),
+                ))
             },
             "clients-state", "list-clients" => |_req: (), _ctx| {
                 list_clients_local()
