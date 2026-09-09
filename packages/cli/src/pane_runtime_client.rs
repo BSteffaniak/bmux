@@ -481,6 +481,193 @@ mod history_tests {
         assert_eq!(anchor.capture_id, capture.capture_id);
     }
 
+    struct EmptySuffixClient(usize);
+    impl bmux_plugin_sdk::TypedDispatchClient for EmptySuffixClient {
+        async fn invoke_service_raw(
+            &mut self,
+            _capability: &str,
+            _kind: bmux_ipc::InvokeServiceKind,
+            _interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            use super::AttachState::{HistoryEnd, HistoryFetchError, HistorySliceV1};
+            #[derive(serde::Deserialize)]
+            struct RowRequest {
+                session_id: uuid::Uuid,
+                pane_id: uuid::Uuid,
+                pin_id: u64,
+                capture_id: uuid::Uuid,
+                line_index: u32,
+                cell_offset: u32,
+                max_columns: u32,
+                max_text_bytes: u32,
+            }
+            assert_eq!(operation, "attach-main-row-slice-v1");
+            let request: RowRequest = bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+            let _ = (
+                request.session_id,
+                request.pane_id,
+                request.pin_id,
+                request.capture_id,
+                request.cell_offset,
+                request.max_columns,
+                request.max_text_bytes,
+            );
+            let empty = request.line_index == 1;
+            self.0 += 1;
+            let cells = if empty {
+                vec![]
+            } else {
+                vec![("A", 1_u8, bmux_terminal_grid::Style::default())]
+            };
+            Ok(
+                bmux_plugin_sdk::encode_service_message(&Ok::<_, HistoryFetchError>(
+                    HistorySliceV1 {
+                        encoded: serde_json::to_vec(&cells).unwrap(),
+                        next_cell_offset: u64::from(!empty),
+                        end_kind: if empty {
+                            HistoryEnd::HardBreak
+                        } else {
+                            HistoryEnd::Open
+                        },
+                    },
+                ))
+                .unwrap(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_suffix_entry_and_refresh_preserve_boundary() {
+        let pin = bmux_attach_pipeline::ScrollbackPin {
+            capture: Some(bmux_attach_pipeline::ScrollbackCapture {
+                identity: uuid::Uuid::new_v4(),
+                lines: 0,
+                truncated: false,
+                width: 4,
+                height: 2,
+            }),
+            pin_id: 1,
+            total_scrolled_rows: 0,
+            max_scrollback_offset: 0,
+            stream_end: 0,
+            created_epoch_secs: 0,
+        };
+        let window = super::captured_history_window(
+            &mut EmptySuffixClient(0),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            0,
+            1,
+            (4, None, 0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(window.row_anchors[0].column, 4);
+        assert_eq!(bmux_terminal_grid::row_text(&window.rows[0], 4), "    ");
+        let refreshed = super::captured_history_window(
+            &mut EmptySuffixClient(1),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            0,
+            1,
+            (4, window.row_anchors.last().copied(), 0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(window.rows, refreshed.rows);
+        assert_eq!(window.row_anchors, refreshed.row_anchors);
+        for width in [2, 8] {
+            let resized = super::captured_history_window(
+                &mut EmptySuffixClient(1),
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                pin,
+                0,
+                1,
+                (width, window.row_anchors.last().copied(), 0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                resized.row_anchors[0].capture_id,
+                window.row_anchors[0].capture_id
+            );
+            assert_eq!(
+                resized.row_anchors[0].column,
+                if width == 2 { 4 } else { 0 }
+            );
+        }
+        let backward = super::captured_history_window(
+            &mut EmptySuffixClient(1),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            1,
+            1,
+            (2, window.row_anchors.last().copied(), 1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(backward.row_anchors[0].column, 2);
+        assert_eq!(bmux_terminal_grid::row_text(&backward.rows[0], 2), "  ");
+    }
+
+    #[tokio::test]
+    async fn decoded_line_cache_reuses_admitted_assembly_without_budget_charge() {
+        let capture = super::AttachState::HistoryCaptureV1 {
+            width: 2,
+            height: 2,
+            capture_id: uuid::Uuid::new_v4(),
+            history_line_count: 1,
+            history_truncated: false,
+            pin: super::AttachState::PaneScrollbackPin {
+                pane_id: uuid::Uuid::new_v4(),
+                pin_id: 1,
+                total_scrolled_rows: 1,
+                max_scrollback_offset: 1,
+                stream_end: 0,
+            },
+        };
+        let mut cache = super::CapturedLineCache::default();
+        let mut remaining = 65536;
+        let mut styles = Vec::new();
+        let mut requests = 8;
+        let session = uuid::Uuid::new_v4();
+        let first = cache
+            .resolve(
+                &mut HistoryClient,
+                session,
+                &capture,
+                0,
+                (&mut remaining, &mut styles, &mut requests),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let admitted = (remaining, requests, styles.len());
+        let second = cache
+            .resolve(
+                &mut HistoryClient,
+                session,
+                &capture,
+                0,
+                (&mut remaining, &mut styles, &mut requests),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(admitted, (remaining, requests, styles.len()));
+    }
+
     struct HistoryClient;
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryClient {
         async fn invoke_service_raw(
@@ -707,6 +894,86 @@ pub enum CapturedWindowOutcome {
     Unavailable,
 }
 
+/// Request-local memoization for immutable capture reads only. It never survives
+/// a window refresh and never caches mutations or transport failures.
+struct CachedCaptureReply {
+    capability: String,
+    interface: String,
+    operation: String,
+    payload: Vec<u8>,
+    reply: Vec<u8>,
+}
+
+struct CaptureReadCache<'a, C> {
+    client: &'a mut C,
+    replies: Vec<CachedCaptureReply>,
+    remaining: usize,
+}
+
+impl<C: bmux_plugin_sdk::TypedDispatchClient> bmux_plugin_sdk::TypedDispatchClient
+    for CaptureReadCache<'_, C>
+{
+    async fn invoke_service_raw(
+        &mut self,
+        capability: &str,
+        kind: bmux_ipc::InvokeServiceKind,
+        interface: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+        let cacheable = kind == bmux_ipc::InvokeServiceKind::Query
+            && matches!(
+                operation,
+                "attach-history-slice-v1" | "attach-main-row-slice-v1"
+            );
+        if cacheable
+            && let Some(entry) = self.replies.iter().find(|entry| {
+                entry.capability == capability
+                    && entry.interface == interface
+                    && entry.operation == operation
+                    && entry.payload == payload
+            })
+        {
+            return Ok(entry.reply.clone());
+        }
+        let key = if cacheable && payload.len() <= self.remaining && self.replies.len() < 256 {
+            Some(payload.clone())
+        } else {
+            None
+        };
+        let reply = self
+            .client
+            .invoke_service_raw(capability, kind, interface, operation, payload)
+            .await?;
+        if let Some(key) = key {
+            let charge = key
+                .len()
+                .saturating_add(reply.len())
+                .saturating_add(capability.len())
+                .saturating_add(interface.len())
+                .saturating_add(operation.len())
+                .saturating_add(std::mem::size_of::<(
+                    String,
+                    String,
+                    String,
+                    Vec<u8>,
+                    Vec<u8>,
+                )>());
+            if charge <= self.remaining && self.replies.try_reserve_exact(1).is_ok() {
+                self.remaining -= charge;
+                self.replies.push(CachedCaptureReply {
+                    capability: capability.to_owned(),
+                    interface: interface.to_owned(),
+                    operation: operation.to_owned(),
+                    payload: key,
+                    reply: reply.clone(),
+                });
+            }
+        }
+        Ok(reply)
+    }
+}
+
 #[cfg(test)]
 pub async fn captured_history_window(
     client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
@@ -750,6 +1017,13 @@ pub async fn captured_history_window_outcome(
         isize,
     ),
 ) -> ClientResult<CapturedWindowOutcome> {
+    let mut cached_client = CaptureReadCache {
+        client,
+        replies: Vec::new(),
+        remaining: 256 * 1024,
+    };
+    let client = &mut cached_client;
+    let mut decoded = CapturedLineCache::default();
     let (width, mut bottom_anchor, local_delta) = projection;
     let mut local_skip = usize::try_from(local_delta).unwrap_or(0);
     let Some(meta) = pin.capture else {
@@ -803,16 +1077,15 @@ pub async fn captured_history_window_outcome(
         let mut advance = local_delta.unsigned_abs();
         let mut last_valid = None;
         loop {
-            let Some(line) = fetch_captured_content_line(
-                client,
-                session_id,
-                &capture,
-                anchor.line_index,
-                &mut remaining,
-                &mut styles,
-                &mut requests_left,
-            )
-            .await?
+            let Some(line) = decoded
+                .resolve(
+                    client,
+                    session_id,
+                    &capture,
+                    anchor.line_index,
+                    (&mut remaining, &mut styles, &mut requests_left),
+                )
+                .await?
             else {
                 let Some(last) = last_valid else {
                     return Ok(CapturedWindowOutcome::Unavailable);
@@ -871,31 +1144,32 @@ pub async fn captured_history_window_outcome(
     for index in (0..scan_end).rev().take(256) {
         let index = u32::try_from(index).map_err(|error| history_decode_error(&error))?;
         let mut line = if bottom_anchor.is_some() {
-            let Some(line) = fetch_captured_content_line(
-                client,
-                session_id,
-                &capture,
-                index,
-                &mut remaining,
-                &mut styles,
-                &mut requests_left,
-            )
-            .await?
+            let Some(line) = decoded
+                .resolve(
+                    client,
+                    session_id,
+                    &capture,
+                    index,
+                    (&mut remaining, &mut styles, &mut requests_left),
+                )
+                .await?
             else {
                 return Ok(CapturedWindowOutcome::Unavailable);
             };
             line
         } else {
-            fetch_captured_history_line(
-                client,
-                session_id,
-                &capture,
-                index,
-                &mut remaining,
-                &mut styles,
-                &mut requests_left,
+            std::sync::Arc::new(
+                fetch_captured_history_line(
+                    client,
+                    session_id,
+                    &capture,
+                    index,
+                    &mut remaining,
+                    &mut styles,
+                    &mut requests_left,
+                )
+                .await?,
             )
-            .await?
         };
         let count = line.projected_rows(usize::from(meta.width));
         if skip >= count {
@@ -912,17 +1186,16 @@ pub async fn captured_history_window_outcome(
             let column = line
                 .column_for_row(usize::from(meta.width), count - skip - 1)
                 .ok_or_else(|| history_decode_error(&"unavailable pending boundary"))?;
-            line = fetch_captured_content_line(
-                client,
-                session_id,
-                &capture,
-                index,
-                &mut remaining,
-                &mut styles,
-                &mut requests_left,
-            )
-            .await?
-            .ok_or_else(|| history_decode_error(&"unavailable joined pending line"))?;
+            line = decoded
+                .resolve(
+                    client,
+                    session_id,
+                    &capture,
+                    index,
+                    (&mut remaining, &mut styles, &mut requests_left),
+                )
+                .await?
+                .ok_or_else(|| history_decode_error(&"unavailable joined pending line"))?;
             Some(column)
         } else {
             None
@@ -1178,6 +1451,49 @@ async fn resolve_tail_entry(
     Ok(None)
 }
 
+#[derive(Default)]
+struct CapturedLineCache {
+    lines: Vec<(u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>)>,
+}
+
+impl CapturedLineCache {
+    async fn resolve(
+        &mut self,
+        client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+        session: Uuid,
+        capture: &AttachState::HistoryCaptureV1,
+        index: u32,
+        budgets: (&mut usize, &mut Vec<bmux_terminal_grid::Style>, &mut usize),
+    ) -> ClientResult<Option<std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>>> {
+        if let Some((_, line)) = self.lines.iter().find(|(key, _)| *key == index) {
+            return Ok(Some(std::sync::Arc::clone(line)));
+        }
+        let (remaining, styles, requests) = budgets;
+        if self.lines.len() >= 256 {
+            return Err(history_decode_error(&"decoded line cache limit"));
+        }
+        let charge = std::mem::size_of::<bmux_terminal_grid::HistoryLineAssembly>()
+            + 4 * std::mem::size_of::<usize>()
+            + std::mem::size_of::<u32>();
+        *remaining = remaining
+            .checked_sub(charge)
+            .ok_or_else(|| history_decode_error(&"decoded line metadata budget"))?;
+        let Some(line) = fetch_captured_content_line(
+            client, session, capture, index, remaining, styles, requests,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        self.lines
+            .try_reserve_exact(1)
+            .map_err(|error| history_decode_error(&error))?;
+        let line = std::sync::Arc::new(line);
+        self.lines.push((index, std::sync::Arc::clone(&line)));
+        Ok(Some(line))
+    }
+}
+
 /// Resolve a capture-wide logical index, including the pending history/main join.
 #[allow(
     clippy::too_many_lines,
@@ -1237,6 +1553,7 @@ async fn fetch_captured_content_line(
         )
         .map_err(|error| history_decode_error(&format!("{error:?}")))?;
     }
+    line.retain_trailing_cells();
     for row in 0..capture.height {
         let mut offset = 0;
         loop {
@@ -1257,7 +1574,15 @@ async fn fetch_captured_content_line(
             .await
             .map_err(|error| history_decode_error(&error))?
             .map_err(|error| history_decode_error(&format!("{error:?}")))?;
-            let cells = decode_tail_slice(&reply, offset, capture.width, styles, budget)?;
+            let mut cells = decode_tail_slice(&reply, offset, capture.width, styles, budget)?;
+            if offset == 0
+                && reply.next_cell_offset == 0
+                && cells.is_empty()
+                && matches!(reply.end_kind, AttachState::HistoryEnd::HardBreak)
+            {
+                pad_wrapped_tail(&mut cells, 1, budget, styles)?;
+            }
+            line.retain_trailing_cells();
             let end = match reply.end_kind {
                 AttachState::HistoryEnd::HardBreak => HistorySliceEnd::HardBreak,
                 AttachState::HistoryEnd::Open if row + 1 == capture.height => HistorySliceEnd::Open,

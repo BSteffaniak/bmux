@@ -33,8 +33,16 @@ pub(crate) fn project_logical_line(cells: &[Cell], width: usize) -> VecDeque<Phy
 }
 
 pub(crate) fn projected_logical_line_row_count(cells: &[Cell], width: usize) -> usize {
+    projected_logical_line_row_count_retained(cells, width, false)
+}
+
+pub(crate) fn projected_logical_line_row_count_retained(
+    cells: &[Cell],
+    width: usize,
+    retain: bool,
+) -> usize {
     let width = width.max(1);
-    let cells = trim_trailing_blank_cells(cells);
+    let cells = projection_cells(cells, retain);
     if cells.is_empty() {
         return 1;
     }
@@ -69,10 +77,20 @@ pub(crate) fn admit_logical_text(
     range: std::ops::Range<usize>,
     remaining: &mut usize,
 ) -> Option<()> {
+    admit_logical_text_retained(cells, width, range, remaining, false)
+}
+
+pub(crate) fn admit_logical_text_retained(
+    cells: &[Cell],
+    width: usize,
+    range: std::ops::Range<usize>,
+    remaining: &mut usize,
+    retain: bool,
+) -> Option<()> {
     let width = width.max(1);
     let mut row = 0_usize;
     let mut col = 0_usize;
-    for cell in trim_trailing_blank_cells(cells) {
+    for cell in projection_cells(cells, retain) {
         let cell_width = usize::from(cell.width()).max(1);
         if col > 0 && col.saturating_add(cell_width) > width {
             row = row.saturating_add(1);
@@ -101,13 +119,22 @@ pub(crate) fn projected_cell_storage(
     width: usize,
     range: std::ops::Range<usize>,
 ) -> Option<usize> {
+    projected_cell_storage_retained(cells, width, range, false)
+}
+
+pub(crate) fn projected_cell_storage_retained(
+    cells: &[Cell],
+    width: usize,
+    range: std::ops::Range<usize>,
+    retain: bool,
+) -> Option<usize> {
     let width = width.max(1);
     let mut row = 0_usize;
     let mut col = 0_usize;
     let mut extent = 0_usize;
     let mut total = 0_usize;
     let mut largest = 0_usize;
-    for cell in trim_trailing_blank_cells(cells) {
+    for cell in projection_cells(cells, retain) {
         let cell_width = usize::from(cell.width()).max(1);
         if col > 0 && col.saturating_add(cell_width) > width {
             total = total.checked_add(extent)?;
@@ -156,6 +183,15 @@ pub(crate) fn try_project_logical_line_window(
     width: usize,
     range: std::ops::Range<usize>,
 ) -> Option<VecDeque<PhysicalRow>> {
+    try_project_logical_line_window_retained(cells, width, range, false)
+}
+
+pub(crate) fn try_project_logical_line_window_retained(
+    cells: &[Cell],
+    width: usize,
+    range: std::ops::Range<usize>,
+    retain: bool,
+) -> Option<VecDeque<PhysicalRow>> {
     #[cfg(test)]
     PROJECTED_LOGICAL_LINES.set(PROJECTED_LOGICAL_LINES.get() + 1);
 
@@ -163,11 +199,13 @@ pub(crate) fn try_project_logical_line_window(
     rows.try_reserve_exact(
         range
             .end
-            .min(projected_logical_line_row_count(cells, width))
+            .min(projected_logical_line_row_count_retained(
+                cells, width, retain,
+            ))
             .saturating_sub(range.start),
     )
     .ok()?;
-    push_reflowed_logical_line(&mut rows, cells, width, range)?;
+    push_reflowed_logical_line(&mut rows, cells, width, range, retain)?;
 
     #[cfg(test)]
     PROJECTED_PHYSICAL_ROWS.set(PROJECTED_PHYSICAL_ROWS.get() + rows.len());
@@ -180,6 +218,7 @@ fn push_reflowed_logical_line(
     cells: &[Cell],
     width: usize,
     range: std::ops::Range<usize>,
+    retain: bool,
 ) -> Option<()> {
     let width = width.max(1);
     if range.is_empty() {
@@ -197,7 +236,7 @@ fn push_reflowed_logical_line(
     let mut col = 0_usize;
     let mut emitted_any = false;
 
-    for cell in trim_trailing_blank_cells(cells) {
+    for cell in projection_cells(cells, retain) {
         // Seeing another cell proves the last emitted row is a continuation.
         // If the line ended exactly there, the finalization below instead
         // clears its wrap flag.
@@ -250,8 +289,18 @@ fn push_reflowed_logical_line(
 /// Empty lines map row zero to column zero; their exclusive row bound is
 /// intentionally unavailable because a bare column cannot distinguish both.
 /// Nonempty lines map the exclusive row bound to the end of visible cells.
+#[cfg(test)]
 pub(crate) fn logical_column_for_row(cells: &[Cell], width: usize, target: usize) -> Option<usize> {
-    let cells = trim_trailing_blank_cells(cells);
+    logical_column_for_row_retained(cells, width, target, false)
+}
+
+pub(crate) fn logical_column_for_row_retained(
+    cells: &[Cell],
+    width: usize,
+    target: usize,
+    retain: bool,
+) -> Option<usize> {
+    let cells = projection_cells(cells, retain);
     if cells.is_empty() {
         return (target == 0).then_some(0);
     }
@@ -275,7 +324,7 @@ pub(crate) fn logical_column_for_row(cells: &[Cell], width: usize, target: usize
             col = 0;
         }
     }
-    let count = projected_logical_line_row_count(cells, width);
+    let count = projected_logical_line_row_count_retained(cells, width, retain);
     if target == count {
         Some(logical)
     } else if target == 0 {
@@ -289,8 +338,18 @@ pub(crate) fn logical_column_for_row(cells: &[Cell], width: usize, target: usize
 /// cells and trimmed trailing padding. End-of-line maps to the exclusive row
 /// bound rather than inventing a blank continuation row. For an empty or
 /// entirely trimmed line, column zero instead identifies the visible empty row.
+#[cfg(test)]
 pub(crate) fn row_for_logical_column(cells: &[Cell], width: usize, target: usize) -> Option<usize> {
-    let cells = trim_trailing_blank_cells(cells);
+    row_for_logical_column_retained(cells, width, target, false)
+}
+
+pub(crate) fn row_for_logical_column_retained(
+    cells: &[Cell],
+    width: usize,
+    target: usize,
+    retain: bool,
+) -> Option<usize> {
+    let cells = projection_cells(cells, retain);
     if cells.is_empty() {
         return (target == 0).then_some(0);
     }
@@ -317,10 +376,13 @@ pub(crate) fn row_for_logical_column(cells: &[Cell], width: usize, target: usize
             col = 0;
         }
     }
-    (logical == target).then(|| projected_logical_line_row_count(cells, width))
+    (logical == target).then(|| projected_logical_line_row_count_retained(cells, width, retain))
 }
 
-fn trim_trailing_blank_cells(cells: &[Cell]) -> &[Cell] {
+fn projection_cells(cells: &[Cell], retain: bool) -> &[Cell] {
+    if retain {
+        return cells;
+    }
     let mut end = cells.len();
     while end > 0 {
         let cell = &cells[end - 1];

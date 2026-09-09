@@ -59,6 +59,7 @@ pub struct HistoryLineAssembly {
     next_offset: usize,
     cells: Vec<Cell>,
     remaining_bytes: usize,
+    retain_trailing_cells: bool,
     prefix_unavailable: bool,
     end: HistorySliceEnd,
 }
@@ -77,9 +78,16 @@ impl HistoryLineAssembly {
             next_offset: 0,
             cells: Vec::new(),
             remaining_bytes: max_bytes,
+            retain_trailing_cells: false,
             prefix_unavailable,
             end: HistorySliceEnd::Continue,
         }
+    }
+
+    /// Preserve all admitted cells, including trailing blanks, in projection and
+    /// anchor mapping. This does not allocate or extend the admitted content.
+    pub const fn retain_trailing_cells(&mut self) {
+        self.retain_trailing_cells = true;
     }
 
     /// Admit and copy an ordered slice. Failure leaves the assembled content and
@@ -149,25 +157,41 @@ impl HistoryLineAssembly {
         if width == 0 || self.completed().is_none() {
             return Err(HistorySliceError::Unavailable);
         }
-        let count = crate::reflow::projected_logical_line_row_count(&self.cells, width);
+        let count = crate::reflow::projected_logical_line_row_count_retained(
+            &self.cells,
+            width,
+            self.retain_trailing_cells,
+        );
         let range = range.start.min(count)..range.end.min(count);
         let metadata = (range.end.saturating_sub(range.start))
             .checked_mul(std::mem::size_of::<PhysicalRow>())
             .and_then(|bytes| {
-                bytes.checked_add(crate::reflow::projected_cell_storage(
+                bytes.checked_add(crate::reflow::projected_cell_storage_retained(
                     &self.cells,
                     width,
                     range.clone(),
+                    self.retain_trailing_cells,
                 )?)
             })
             .ok_or(HistorySliceError::BudgetExhausted)?;
         let mut remaining = budget
             .checked_sub(metadata)
             .ok_or(HistorySliceError::BudgetExhausted)?;
-        crate::reflow::admit_logical_text(&self.cells, width, range.clone(), &mut remaining)
-            .ok_or(HistorySliceError::BudgetExhausted)?;
-        let rows = crate::reflow::try_project_logical_line_window(&self.cells, width, range)
-            .ok_or(HistorySliceError::BudgetExhausted)?;
+        crate::reflow::admit_logical_text_retained(
+            &self.cells,
+            width,
+            range.clone(),
+            &mut remaining,
+            self.retain_trailing_cells,
+        )
+        .ok_or(HistorySliceError::BudgetExhausted)?;
+        let rows = crate::reflow::try_project_logical_line_window_retained(
+            &self.cells,
+            width,
+            range,
+            self.retain_trailing_cells,
+        )
+        .ok_or(HistorySliceError::BudgetExhausted)?;
         let mut output = Vec::new();
         output
             .try_reserve_exact(rows.len())
@@ -185,19 +209,33 @@ impl HistoryLineAssembly {
     #[must_use]
     pub fn column_for_row(&self, width: usize, row: usize) -> Option<usize> {
         self.completed()?;
-        crate::reflow::logical_column_for_row(&self.cells, width, row)
+        crate::reflow::logical_column_for_row_retained(
+            &self.cells,
+            width,
+            row,
+            self.retain_trailing_cells,
+        )
     }
 
     /// Map a stable cell-boundary anchor to its row at another width.
     #[must_use]
     pub fn row_for_column(&self, width: usize, column: usize) -> Option<usize> {
         self.completed()?;
-        crate::reflow::row_for_logical_column(&self.cells, width, column)
+        crate::reflow::row_for_logical_column_retained(
+            &self.cells,
+            width,
+            column,
+            self.retain_trailing_cells,
+        )
     }
 
     #[must_use]
     pub fn projected_rows(&self, width: usize) -> usize {
-        crate::reflow::projected_logical_line_row_count(&self.cells, width.max(1))
+        crate::reflow::projected_logical_line_row_count_retained(
+            &self.cells,
+            width.max(1),
+            self.retain_trailing_cells,
+        )
     }
 
     #[must_use]
