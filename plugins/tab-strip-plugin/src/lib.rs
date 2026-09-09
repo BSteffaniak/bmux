@@ -202,13 +202,16 @@ impl Settings {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CompanionState {
+    surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
+    layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
     settings: Settings,
     revision: u64,
     snapshot: windows_list::WindowListSnapshot,
     hovered_window_id: Option<Uuid>,
     scroll_offset: usize,
+    manual_scroll: bool,
     pointer_source: Option<Uuid>,
     pointer_started_col: u16,
     pointer_started_row: u16,
@@ -231,6 +234,8 @@ struct CompanionState {
 impl CompanionState {
     fn new(settings: Settings) -> Self {
         Self {
+            surfaces: bmux_plugin::surface::global_plugin_surface_registry_handle(),
+            layouts: bmux_plugin::layout::global_plugin_layout_registry_handle(),
             settings,
             revision: 0,
             snapshot: windows_list::WindowListSnapshot {
@@ -239,6 +244,7 @@ impl CompanionState {
             },
             hovered_window_id: None,
             scroll_offset: 0,
+            manual_scroll: false,
             pointer_source: None,
             pointer_started_col: 0,
             pointer_started_row: 0,
@@ -301,6 +307,22 @@ impl CompanionState {
             }
         }
         if self.snapshot != snapshot {
+            let active_id = |windows: &[windows_list::WindowListEntry]| {
+                windows
+                    .iter()
+                    .find(|window| window.active)
+                    .map(|window| window.id)
+            };
+            let retained_anchor = (self.manual_scroll
+                && active_id(&self.snapshot.windows) == active_id(&snapshot.windows))
+            .then(|| {
+                self.snapshot
+                    .windows
+                    .get(self.scroll_offset)
+                    .map(|window| window.id)
+            })
+            .flatten()
+            .and_then(|id| snapshot.windows.iter().position(|window| window.id == id));
             self.snapshot = snapshot;
             if self
                 .menu_window_id
@@ -314,6 +336,12 @@ impl CompanionState {
             {
                 self.editing_window_id = None;
                 self.edit_buffer.clear();
+            }
+            self.manual_scroll = retained_anchor.is_some();
+            if let Some(anchor) = retained_anchor {
+                self.scroll_offset = anchor;
+                self.revision = self.revision.saturating_add(1).max(1);
+                return;
             }
             let visible_limit = self.visible_limit();
             let maximum_offset = self.snapshot.windows.len().saturating_sub(visible_limit);
@@ -345,9 +373,11 @@ impl CompanionState {
     }
 }
 
-fn state() -> &'static Mutex<Option<CompanionState>> {
-    static STATE: OnceLock<Mutex<Option<CompanionState>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(None))
+type CompanionHandle = std::sync::Arc<Mutex<Option<CompanionState>>>;
+
+fn state() -> &'static CompanionHandle {
+    static STATE: OnceLock<CompanionHandle> = OnceLock::new();
+    STATE.get_or_init(|| std::sync::Arc::new(Mutex::new(None)))
 }
 
 #[derive(Default)]
@@ -420,25 +450,187 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
             },
         )
         .map_err(|error| format!("publishing tab-strip layout: {error:?}"))?;
-    bmux_plugin::global_attach_presentation_input_registry().register_committed(
+    register_presentation_input(
+        bmux_plugin::global_attach_presentation_input_registry(),
+        state(),
+    );
+    Ok(())
+}
+
+fn register_presentation_input(
+    registry: &bmux_plugin::AttachPresentationInputRegistry,
+    owner: &CompanionHandle,
+) {
+    let input_owner = owner.clone();
+    registry.register(
         input_endpoint(),
-        std::sync::Arc::new(|revision| {
-            if let Ok(mut guard) = state().lock()
+        std::sync::Arc::new(move |event| handle_local_input(&input_owner, event)),
+    );
+    let committed_owner = owner.clone();
+    registry.register_committed(
+        input_endpoint(),
+        std::sync::Arc::new(move |revision| {
+            if let Ok(mut guard) = committed_owner.lock()
                 && let Some(companion) = guard.as_mut()
             {
                 rename_input::acknowledge(&mut companion.edit_buffer, revision);
             }
         }),
     );
-    bmux_plugin::global_attach_presentation_input_registry()
-        .register_paste(input_endpoint(), std::sync::Arc::new(handle_editor_paste));
-    bmux_plugin::global_attach_presentation_input_registry()
-        .register_focus_lost(input_endpoint(), std::sync::Arc::new(handle_focus_lost));
-    bmux_plugin::register_attach_presentation_input_handler(
+    let paste_owner = owner.clone();
+    registry.register_paste(
         input_endpoint(),
-        std::sync::Arc::new(handle_local_input),
+        std::sync::Arc::new(move |hook, text| handle_editor_paste(&paste_owner, hook, text)),
     );
-    Ok(())
+    let focus_owner = owner.clone();
+    registry.register_focus_lost(
+        input_endpoint(),
+        std::sync::Arc::new(move |hook| handle_focus_lost(&focus_owner, hook)),
+    );
+}
+
+/// One runtime-owned tab-strip installation and its subscriptions.
+pub struct TabStripPresentation {
+    owner: CompanionHandle,
+    layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
+    input: std::sync::Arc<bmux_plugin::AttachPresentationInputRegistry>,
+    surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TabStripPresentation {
+    /// Install and subscribe using the invoking runtime's resources.
+    ///
+    /// # Errors
+    /// Returns configuration, subscription, publication or runtime errors.
+    pub fn install(
+        settings: Option<&toml::Value>,
+        resources: &bmux_plugin::AttachPresentationResources,
+    ) -> Result<Self, String> {
+        let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
+        let request = layout_request(&settings);
+        let handle = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
+        let (windows, mut windows_rx) = resources
+            .events
+            .subscribe_state::<windows_list::WindowListSnapshot>(&windows_list::STATE_KIND)
+            .map_err(|error| error.to_string())?;
+        let (local, mut local_rx) = resources
+            .events
+            .subscribe_state::<AttachLocalPresentationSnapshot>(
+                &ATTACH_LOCAL_PRESENTATION_STATE_KIND,
+            )
+            .map_err(|error| error.to_string())?;
+        let (selection, mut selection_rx) = resources
+            .events
+            .subscribe_state::<bmux_windows_plugin_api::windows_local_view::WindowSelection>(
+                &bmux_windows_plugin_api::windows_local_view::STATE_KIND,
+            )
+            .map_err(|error| error.to_string())?;
+        let mut companion = CompanionState::new(settings);
+        companion.surfaces = resources.surfaces.clone();
+        companion.layouts = resources.layouts.clone();
+        companion.selected_context_id = selection.context_id;
+        companion.replace_windows(windows.as_ref().clone());
+        companion.replace_local_presentation(local.as_ref().clone());
+        resources
+            .layouts
+            .publish(
+                OWNER,
+                PluginLayoutSnapshot {
+                    revision: 1,
+                    requests: vec![request],
+                },
+            )
+            .map_err(|error| format!("publishing tab-strip layout: {error:?}"))?;
+        if let Err(error) = publish_companion(&mut companion) {
+            resources.layouts.remove_owner(OWNER);
+            return Err(error);
+        }
+        let owner = std::sync::Arc::new(Mutex::new(Some(companion)));
+        register_presentation_input(&resources.input, &owner);
+        let task_owner = std::sync::Arc::downgrade(&owner);
+        let task = handle.spawn(async move {
+            loop {
+                let update = tokio::select! {
+                    result = windows_rx.changed() => {
+                        if result.is_err() { break; }
+                        PresentationUpdate::Windows(windows_rx.borrow_and_update().as_ref().clone())
+                    }
+                    result = local_rx.changed() => {
+                        if result.is_err() { break; }
+                        PresentationUpdate::Local(Box::new(local_rx.borrow_and_update().as_ref().clone()))
+                    }
+                    result = selection_rx.changed() => {
+                        if result.is_err() { break; }
+                        PresentationUpdate::Selection(selection_rx.borrow_and_update().context_id)
+                    }
+                };
+                let Some(owner) = task_owner.upgrade() else {
+                    break;
+                };
+                if let Err(error) = apply_presentation_update(&owner, update) {
+                    tracing::warn!(%error, "tab-strip publication failed");
+                }
+            }
+        });
+        Ok(Self {
+            owner,
+            layouts: resources.layouts.clone(),
+            input: resources.input.clone(),
+            surfaces: resources.surfaces.clone(),
+            task,
+        })
+    }
+}
+
+impl Drop for TabStripPresentation {
+    fn drop(&mut self) {
+        self.task.abort();
+        self.input.remove(&input_endpoint());
+        if let Ok(mut owner) = self.owner.lock() {
+            *owner = None;
+        }
+        self.layouts.remove_owner(OWNER);
+        self.surfaces.remove_owner(OWNER);
+    }
+}
+
+enum PresentationUpdate {
+    Windows(windows_list::WindowListSnapshot),
+    Local(Box<AttachLocalPresentationSnapshot>),
+    Selection(Option<Uuid>),
+}
+
+fn apply_presentation_update(
+    owner: &CompanionHandle,
+    update: PresentationUpdate,
+) -> Result<(), String> {
+    let mut guard = owner
+        .lock()
+        .map_err(|_| "tab-strip state lock poisoned".to_string())?;
+    let Some(companion) = guard.as_mut() else {
+        return Ok(());
+    };
+    match update {
+        PresentationUpdate::Windows(snapshot) => companion.replace_windows(snapshot),
+        PresentationUpdate::Local(snapshot) => companion.replace_local_presentation(*snapshot),
+        PresentationUpdate::Selection(context_id) => {
+            if companion.selected_context_id == context_id {
+                return Ok(());
+            }
+            companion.selected_context_id = context_id;
+            companion.hovered_window_id = None;
+            companion.editing_window_id = None;
+            companion.menu_window_id = None;
+            companion.pointer_source = None;
+            companion.drag_target = None;
+            companion.scroll_offset = 0;
+            companion.replace_windows(companion.catalog.clone());
+        }
+    }
+    let result = publish_companion(companion);
+    drop(guard);
+    result
 }
 
 static ATTACH_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -580,11 +772,15 @@ fn publish_selection(context_id: Option<Uuid>) -> Result<(), String> {
     publish_companion(companion)
 }
 
-fn publish_surface(revision: u64, surfaces: Vec<PluginSurface>) -> Result<u64, String> {
-    global_plugin_surface_registry()
+fn publish_surface(
+    registry: &bmux_plugin::surface::PluginSurfaceRegistry,
+    revision: u64,
+    surfaces: Vec<PluginSurface>,
+) -> Result<u64, String> {
+    registry
         .publish_advancing(OWNER, PluginSurfaceSnapshot { revision, surfaces })
         .map_err(|error| format!("publishing tab-strip surface: {error:?}"))?;
-    global_plugin_surface_registry()
+    registry
         .owner_snapshot(OWNER)
         .map(|snapshot| snapshot.revision)
         .ok_or_else(|| "published surface is missing".to_string())
@@ -595,7 +791,7 @@ fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
     let (surface, viewport) = build_surface_with_editor(companion, revision);
     let mut surfaces = vec![surface];
     surfaces.extend(menu::surfaces(companion, revision));
-    let revision = publish_surface(revision, surfaces)?;
+    let revision = publish_surface(&companion.surfaces, revision, surfaces)?;
     rename_input::stage(&mut companion.edit_buffer, revision, viewport);
     Ok(())
 }
@@ -827,6 +1023,7 @@ fn adjust_rgb(value: (u8, u8, u8), delta: i16) -> (u8, u8, u8) {
 
 fn projection_interaction(state: &CompanionState) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
+        scroll_anchor: state.manual_scroll.then_some(state.scroll_offset),
         editing_window_id: state.editing_window_id,
         edit_selection: state
             .edit_buffer
@@ -982,7 +1179,7 @@ fn build_surface_with_editor(
     (surface, editor_viewport)
 }
 
-fn update_hover(event: &AttachInputEvent) -> bool {
+fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let target = event
         .hook_id
         .strip_prefix("bmux.tab_strip:strip:window:")
@@ -992,7 +1189,7 @@ fn update_hover(event: &AttachInputEvent) -> bool {
         "leave" => None,
         _ => return false,
     };
-    let Ok(mut guard) = state().lock() else {
+    let Ok(mut guard) = owner.lock() else {
         return false;
     };
     let Some(companion) = guard.as_mut() else {
@@ -1006,30 +1203,48 @@ fn update_hover(event: &AttachInputEvent) -> bool {
     publish_companion(companion).is_ok()
 }
 
-fn update_scroll(event: &AttachInputEvent) -> bool {
+fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     if event.phase != "wheel" || event.wheel_delta == 0 {
         return false;
     }
-    let Ok(mut guard) = state().lock() else {
+    let Ok(mut guard) = owner.lock() else {
         return false;
     };
     let Some(companion) = guard.as_mut() else {
         return false;
     };
-    let maximum = companion
-        .snapshot
-        .windows
-        .len()
-        .saturating_sub(companion.visible_limit());
-    let next = if event.wheel_delta > 0 {
-        companion.scroll_offset.saturating_sub(1)
-    } else {
-        companion.scroll_offset.saturating_add(1).min(maximum)
+    let ranges = projected_bar(companion).window_ranges();
+    let Some(first) = ranges.first().and_then(|range| {
+        companion
+            .snapshot
+            .windows
+            .iter()
+            .position(|window| window.id == range.window_id)
+    }) else {
+        return true;
     };
-    if next == companion.scroll_offset {
+    let last = ranges
+        .last()
+        .and_then(|range| {
+            companion
+                .snapshot
+                .windows
+                .iter()
+                .position(|window| window.id == range.window_id)
+        })
+        .unwrap_or(first);
+    let next = if event.wheel_delta > 0 {
+        first.saturating_sub(1)
+    } else if last + 1 < companion.snapshot.windows.len() {
+        first + 1
+    } else {
+        first
+    };
+    if next == first {
         return true;
     }
     companion.scroll_offset = next;
+    companion.manual_scroll = true;
     companion.revision = companion.revision.saturating_add(1).max(1);
     publish_companion(companion).is_ok()
 }
@@ -1048,6 +1263,7 @@ fn projection_interaction_without_marker(
     state: &CompanionState,
 ) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
+        scroll_anchor: state.manual_scroll.then_some(state.scroll_offset),
         editing_window_id: state.editing_window_id,
         edit_selection: state
             .edit_buffer
@@ -1075,14 +1291,17 @@ fn command_invocation<Request: serde::Serialize>(
 
 #[allow(clippy::significant_drop_tightening)] // The companion lock intentionally spans state mutation and retained publication.
 #[allow(clippy::too_many_lines)] // Gesture transition logic is clearer as one phase state machine.
-fn update_drag_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
+fn update_drag_local(
+    owner: &CompanionHandle,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
     let source = event
         .hook_id
         .strip_prefix("bmux.tab_strip:strip:window:")
         .and_then(|target| Uuid::parse_str(target).ok())?;
     let col = event.col.unwrap_or_default();
     let row = event.row.unwrap_or_default();
-    let mut guard = state().lock().ok()?;
+    let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     match event.phase.as_str() {
         "down" if event.button.as_deref() == Some("left") => {
@@ -1289,7 +1508,7 @@ fn update_editor(
     })
 }
 
-fn begin_rename(event: &AttachInputEvent) -> bool {
+fn begin_rename(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     if event.event_kind != "pointer"
         || event.phase != "down"
         || event.button.as_deref() != Some("middle")
@@ -1303,7 +1522,7 @@ fn begin_rename(event: &AttachInputEvent) -> bool {
     else {
         return false;
     };
-    let Ok(mut guard) = state().lock() else {
+    let Ok(mut guard) = owner.lock() else {
         return false;
     };
     let Some(companion) = guard.as_mut() else {
@@ -1339,11 +1558,14 @@ fn rename_window_invocation(window_id: Uuid, name: String) -> Option<AttachInput
 }
 
 #[allow(clippy::significant_drop_tightening)] // The companion lock intentionally spans editor mutation and retained publication.
-fn update_editor_local(event: &AttachInputEvent) -> Option<AttachInputResult> {
+fn update_editor_local(
+    owner: &CompanionHandle,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
     if event.event_kind != "key" || !matches!(event.phase.as_str(), "press" | "repeat") {
         return None;
     }
-    let mut guard = state().lock().ok()?;
+    let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     let editing = companion
         .editing_window_id
@@ -1408,8 +1630,8 @@ fn cancel_rename(companion: &mut CompanionState) -> bool {
 }
 
 #[allow(clippy::significant_drop_tightening)] // Cancellation and retained publication are serialized.
-fn handle_focus_lost(_hook_id: &str) -> bool {
-    let Ok(mut guard) = state().lock() else {
+fn handle_focus_lost(owner: &CompanionHandle, _hook_id: &str) -> bool {
+    let Ok(mut guard) = owner.lock() else {
         return false;
     };
     let Some(companion) = guard.as_mut() else {
@@ -1419,11 +1641,14 @@ fn handle_focus_lost(_hook_id: &str) -> bool {
 }
 
 #[allow(clippy::significant_drop_tightening)] // Editor event and retained publication are serialized.
-fn handle_editor_pointer(event: &AttachInputEvent) -> Option<AttachInputResult> {
+fn handle_editor_pointer(
+    owner: &CompanionHandle,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
     if event.event_kind != "pointer" {
         return None;
     }
-    let mut guard = state().lock().ok()?;
+    let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     let target = companion
         .editing_window_id
@@ -1464,8 +1689,8 @@ fn handle_editor_pointer(event: &AttachInputEvent) -> Option<AttachInputResult> 
 }
 
 #[allow(clippy::significant_drop_tightening)] // Serialize edits with retained publication.
-fn handle_editor_paste(_hook: &str, text: &str) -> AttachInputResult {
-    let Ok(mut guard) = state().lock() else {
+fn handle_editor_paste(owner: &CompanionHandle, _hook: &str, text: &str) -> AttachInputResult {
+    let Ok(mut guard) = owner.lock() else {
         return AttachInputResult::default();
     };
     let Some(companion) = guard.as_mut() else {
@@ -1491,20 +1716,23 @@ fn handle_editor_paste(_hook: &str, text: &str) -> AttachInputResult {
     }
 }
 
-fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
-    if let Some(result) = handle_editor_pointer(event) {
+fn handle_local_input(
+    owner: &CompanionHandle,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
+    if let Some(result) = handle_editor_pointer(owner, event) {
         return Some(result);
     }
-    if let Some(result) = menu::handle_input(event) {
+    if let Some(result) = menu::handle_input(owner, event) {
         return Some(result);
     }
-    if let Some(result) = update_editor_local(event) {
+    if let Some(result) = update_editor_local(owner, event) {
         return Some(result);
     }
     if event.event_kind != "pointer" {
         return None;
     }
-    if begin_rename(event) {
+    if begin_rename(owner, event) {
         return Some(AttachInputResult {
             consumed: true,
             capture_keyboard: vec!["*".to_string()],
@@ -1512,20 +1740,20 @@ fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
             ..AttachInputResult::default()
         });
     }
-    if let Some(result) = workspace_rename::handle_pointer(event) {
+    if let Some(result) = workspace_rename::handle_pointer(owner, event) {
         return Some(result);
     }
-    if let Some(result) = update_drag_local(event) {
+    if let Some(result) = update_drag_local(owner, event) {
         return Some(result);
     }
-    if update_scroll(event) {
+    if update_scroll(owner, event) {
         return Some(AttachInputResult {
             consumed: true,
             dirty: true,
             ..AttachInputResult::default()
         });
     }
-    if update_hover(event) {
+    if update_hover(owner, event) {
         return Some(AttachInputResult {
             // Legacy hover updated presentation but remained unconsumed so
             // pane hover/focus behavior could still run.
@@ -1541,7 +1769,7 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
     if let Some(result) = update_editor(context, event) {
         return result;
     }
-    if begin_rename(event) {
+    if begin_rename(state(), event) {
         return AttachInputResult {
             consumed: true,
             capture_keyboard: vec!["enter".to_string(), "esc".to_string()],
@@ -1559,6 +1787,263 @@ bmux_plugin_sdk::export_plugin!(TabStripPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
+    fn scoped_resources() -> bmux_plugin::AttachPresentationResources {
+        let events = std::sync::Arc::new(bmux_plugin::EventBus::new());
+        events.register_state_channel(
+            windows_list::STATE_KIND,
+            windows_list::WindowListSnapshot {
+                windows: Vec::new(),
+                revision: 0,
+            },
+        );
+        events.register_state_channel(
+            ATTACH_LOCAL_PRESENTATION_STATE_KIND,
+            AttachLocalPresentationSnapshot::initial(),
+        );
+        events.register_state_channel(
+            bmux_windows_plugin_api::windows_local_view::STATE_KIND,
+            bmux_windows_plugin_api::windows_local_view::WindowSelection { context_id: None },
+        );
+        bmux_plugin::AttachPresentationResources {
+            layouts: std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(64)),
+            allocations: std::sync::Arc::new(bmux_plugin::layout::AllocationRegistry::default()),
+            surfaces: std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
+            input: std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
+            events,
+        }
+    }
+
+    fn seed_input_owner(owner: &CompanionHandle, id: Uuid) {
+        let mut guard = owner.lock().unwrap();
+        let companion = guard.as_mut().unwrap();
+        companion.local_presentation.viewport_cols = 80;
+        companion.local_presentation.viewport_rows = 24;
+        companion.replace_windows(windows_list::WindowListSnapshot {
+            revision: 1,
+            windows: vec![windows_list::WindowListEntry {
+                id,
+                name: "original".to_string(),
+                active: true,
+                workspace: "default".to_string(),
+                workspace_id: Uuid::nil(),
+            }],
+        });
+        drop(guard);
+    }
+
+    fn seed_rename_owner(presentation: &TabStripPresentation, id: Uuid) {
+        let mut guard = presentation.owner.lock().unwrap();
+        let companion = guard.as_mut().unwrap();
+        companion.menu_window_id = None;
+        companion.editing_window_id = Some(id);
+        companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text("original").into();
+        companion.edit_buffer.select_all();
+        publish_companion(companion).unwrap();
+        let revision = companion.surfaces.owner_snapshot(OWNER).unwrap().revision;
+        drop(guard);
+        presentation.input.committed(&input_endpoint(), revision);
+    }
+
+    #[tokio::test]
+    async fn scoped_input_keeps_menu_paste_and_focus_on_the_owner() {
+        let first_resources = scoped_resources();
+        let second_resources = scoped_resources();
+        let first = TabStripPresentation::install(None, &first_resources).unwrap();
+        let second = TabStripPresentation::install(None, &second_resources).unwrap();
+        let id = Uuid::from_u128(7);
+        for owner in [&first.owner, &second.owner] {
+            seed_input_owner(owner, id);
+        }
+        let event = AttachInputEvent {
+            hook_id: format!("bmux.tab_strip:strip:window:{id}"),
+            event_kind: "pointer".to_string(),
+            phase: "down".to_string(),
+            button: Some("right".to_string()),
+            key: None,
+            col: Some(3),
+            row: Some(0),
+            wheel_delta: 0,
+            modifiers: bmux_plugin::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        assert!(
+            first_resources
+                .input
+                .invoke(&input_endpoint(), &event)
+                .unwrap()
+                .consumed
+        );
+        assert_eq!(
+            first.owner.lock().unwrap().as_ref().unwrap().menu_window_id,
+            Some(id)
+        );
+        assert!(
+            second
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .menu_window_id
+                .is_none()
+        );
+        for presentation in [&first, &second] {
+            seed_rename_owner(presentation, id);
+        }
+        assert!(
+            first_resources
+                .input
+                .paste(&input_endpoint(), &event.hook_id, "first")
+                .unwrap()
+                .consumed
+        );
+        assert_eq!(
+            first
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .edit_buffer
+                .text(),
+            "first"
+        );
+        assert_eq!(
+            second
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .edit_buffer
+                .text(),
+            "original"
+        );
+        assert!(
+            first_resources
+                .input
+                .notify_focus_lost(&input_endpoint(), &event.hook_id)
+        );
+        assert!(
+            first
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .editing_window_id
+                .is_none()
+        );
+        assert_eq!(
+            second
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .editing_window_id,
+            Some(id)
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_installations_deliver_updates_and_stop_independently() {
+        let first_resources = scoped_resources();
+        let second_resources = scoped_resources();
+        let first = TabStripPresentation::install(None, &first_resources).unwrap();
+        let second = TabStripPresentation::install(None, &second_resources).unwrap();
+        let update = |resources: &bmux_plugin::AttachPresentationResources, label: &str| {
+            resources
+                .events
+                .publish_state(
+                    &ATTACH_LOCAL_PRESENTATION_STATE_KIND,
+                    AttachLocalPresentationSnapshot {
+                        revision: 1,
+                        mode_label: label.to_string(),
+                        ..AttachLocalPresentationSnapshot::initial()
+                    },
+                )
+                .unwrap();
+        };
+        update(&first_resources, "FIRST");
+        update(&second_resources, "SECOND");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let first_ready = first
+                    .owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .local_presentation
+                    .mode_label
+                    == "FIRST";
+                let second_ready = second
+                    .owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .local_presentation
+                    .mode_label
+                    == "SECOND";
+                if first_ready && second_ready {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let stopped_owner = first.owner.clone();
+        drop(first);
+        update(&first_resources, "STOPPED");
+        update(&second_resources, "SURVIVOR");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if second
+                    .owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .local_presentation
+                    .mode_label
+                    == "SURVIVOR"
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(stopped_owner.lock().unwrap().is_none());
+        let restarted = TabStripPresentation::install(None, &first_resources).unwrap();
+        assert_eq!(
+            restarted
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .local_presentation
+                .mode_label,
+            "STOPPED"
+        );
+        assert_eq!(
+            second
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .local_presentation
+                .mode_label,
+            "SURVIVOR"
+        );
+    }
     use super::*;
 
     #[test]
@@ -1585,6 +2070,20 @@ mod tests {
             assert!(companion.last_workspace_click.is_none());
             assert!(!cancel_rename(&mut companion));
         }
+    }
+
+    #[test]
+    fn companion_publication_uses_its_selected_registry() {
+        let mut first = CompanionState::new(Settings::parse(None).unwrap());
+        let mut second = first.clone();
+        first.surfaces = std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
+        second.surfaces = std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
+        publish_companion(&mut first).unwrap();
+        assert!(first.surfaces.owner_snapshot(OWNER).is_some());
+        assert!(second.surfaces.owner_snapshot(OWNER).is_none());
+        publish_companion(&mut second).unwrap();
+        first.surfaces.remove_owner(OWNER);
+        assert!(second.surfaces.owner_snapshot(OWNER).is_some());
     }
 
     #[test]
@@ -1664,18 +2163,18 @@ mod tests {
         );
         event.button = Some("left".to_string());
         event.hook_id = "bmux.tab_strip:menu:item:1".to_string();
-        let rename = handle_local_input(&event).unwrap();
+        let rename = handle_local_input(state(), &event).unwrap();
         assert!(!rename.release_capture);
         event.event_kind = "key".to_string();
         event.phase = "press".to_string();
         event.key = Some("enter".to_string());
-        let submitted = handle_local_input(&event).unwrap();
+        let submitted = handle_local_input(state(), &event).unwrap();
         assert!(submitted.release_capture);
         assert!(submitted.service_invocation.is_some());
         event.key = Some("ctrl-a".to_string());
-        assert!(handle_local_input(&event).is_none());
+        assert!(handle_local_input(state(), &event).is_none());
         event.key = Some("x".to_string());
-        assert!(handle_local_input(&event).is_none());
+        assert!(handle_local_input(state(), &event).is_none());
         exercise_workspace_editor(event);
         uninstall();
     }
@@ -1693,13 +2192,15 @@ mod tests {
             .local_presentation
             .double_click_ms = 500;
         assert!(
-            handle_local_input(&event)
+            handle_local_input(state(), &event)
                 .unwrap()
                 .capture_keyboard
                 .is_empty()
         );
         assert_eq!(
-            handle_local_input(&event).unwrap().capture_keyboard,
+            handle_local_input(state(), &event)
+                .unwrap()
+                .capture_keyboard,
             vec!["*"]
         );
         let revision = global_plugin_surface_registry()
@@ -1711,18 +2212,18 @@ mod tests {
         event.event_kind = "key".to_string();
         event.phase = "press".to_string();
         event.key = Some("backspace".to_string());
-        assert!(handle_local_input(&event).unwrap().consumed);
+        assert!(handle_local_input(state(), &event).unwrap().consumed);
         event.key = Some("enter".to_string());
-        let empty = handle_local_input(&event).unwrap();
+        let empty = handle_local_input(state(), &event).unwrap();
         assert_eq!(
             empty.status_message.as_deref(),
             Some("workspace name must not be empty")
         );
         assert!(!empty.release_capture);
         event.key = Some("界".to_string());
-        assert!(handle_local_input(&event).unwrap().consumed);
+        assert!(handle_local_input(state(), &event).unwrap().consumed);
         event.key = Some("enter".to_string());
-        let submitted = handle_local_input(&event).unwrap();
+        let submitted = handle_local_input(state(), &event).unwrap();
         assert!(submitted.release_capture);
         let request: workspaces_commands::client::RenameWorkspaceRequest =
             bmux_plugin_sdk::decode_service_message(&submitted.service_invocation.unwrap().payload)
@@ -1742,12 +2243,12 @@ mod tests {
         );
         event.event_kind = "pointer".to_string();
         event.phase = "down".to_string();
-        handle_local_input(&event).unwrap();
-        handle_local_input(&event).unwrap();
+        handle_local_input(state(), &event).unwrap();
+        handle_local_input(state(), &event).unwrap();
         event.event_kind = "key".to_string();
         event.phase = "press".to_string();
         event.key = Some("esc".to_string());
-        let canceled = handle_local_input(&event).unwrap();
+        let canceled = handle_local_input(state(), &event).unwrap();
         assert!(canceled.release_capture && canceled.service_invocation.is_none());
     }
 
@@ -1992,6 +2493,88 @@ bar_bg = "#112233"
     }
 
     #[test]
+    fn wheel_scrolls_width_overflow_with_no_count_cap() {
+        let mut state = CompanionState::new(Settings::default());
+        state.surfaces = std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64));
+        state.local_presentation.viewport_cols = 80;
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: (0..20)
+                .map(|index| windows_list::WindowListEntry {
+                    id: Uuid::from_u128(index),
+                    name: format!("long-window-{index}"),
+                    active: index == 0,
+                    workspace: "default".to_string(),
+                    workspace_id: Uuid::nil(),
+                })
+                .collect(),
+            revision: 1,
+        });
+        let owner = std::sync::Arc::new(Mutex::new(Some(state)));
+        let mut event = AttachInputEvent {
+            hook_id: String::new(),
+            event_kind: "pointer".to_string(),
+            phase: "wheel".to_string(),
+            button: None,
+            key: None,
+            col: None,
+            row: None,
+            wheel_delta: -1,
+            modifiers: bmux_plugin::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        assert!(handle_local_input(&owner, &event).unwrap().consumed);
+        {
+            let guard = owner.lock().unwrap();
+            let state = guard.as_ref().unwrap();
+            assert_eq!(state.scroll_offset, 1);
+            assert_eq!(
+                projected_bar(state).window_ranges()[0].window_id,
+                Uuid::from_u128(1)
+            );
+            drop(guard);
+        }
+        event.wheel_delta = 1;
+        assert!(handle_local_input(&owner, &event).unwrap().consumed);
+        let guard = owner.lock().unwrap();
+        let state = guard.as_ref().unwrap();
+        assert_eq!(state.scroll_offset, 0);
+        assert_eq!(
+            projected_bar(state).window_ranges()[0].window_id,
+            Uuid::from_u128(0)
+        );
+        drop(guard);
+        event.wheel_delta = -1;
+        for _ in 0..40 {
+            assert!(handle_local_input(&owner, &event).unwrap().consumed);
+        }
+        let mut guard = owner.lock().unwrap();
+        let state = guard.as_mut().unwrap();
+        assert_eq!(
+            projected_bar(state)
+                .window_ranges()
+                .last()
+                .unwrap()
+                .window_id,
+            Uuid::from_u128(19)
+        );
+        let stopped_at = state.scroll_offset;
+        state.replace_local_presentation(AttachLocalPresentationSnapshot {
+            viewport_cols: 100,
+            revision: 2,
+            ..state.local_presentation.clone()
+        });
+        assert_eq!(state.scroll_offset, stopped_at);
+        assert!(state.manual_scroll);
+        drop(guard);
+        assert!(handle_local_input(&owner, &event).unwrap().consumed);
+        assert_eq!(
+            owner.lock().unwrap().as_ref().unwrap().scroll_offset,
+            stopped_at
+        );
+    }
+
+    #[test]
     fn overflow_window_keeps_active_tab_visible_and_bounded() {
         let settings = Settings {
             maximum_visible_tabs: Some(2),
@@ -2011,12 +2594,57 @@ bar_bg = "#112233"
             revision: 1,
         });
         assert_eq!(state.scroll_offset, 3);
-        let surface = build_surface(&state, 1);
-        assert_eq!(surface.interactive_regions.len(), 3);
-        assert_eq!(
-            surface.interactive_regions[2].local_id,
-            format!("window:{}", Uuid::from_u128(4))
+        state.manual_scroll = true;
+        state.scroll_offset = 1;
+        let mut updated = state.snapshot.clone();
+        updated.revision += 1;
+        state.replace_windows(updated.clone());
+        assert!(state.manual_scroll);
+        assert_eq!(state.scroll_offset, 1);
+        updated.windows.swap(0, 1);
+        updated.revision += 1;
+        state.replace_windows(updated.clone());
+        assert!(state.manual_scroll);
+        assert_eq!(state.scroll_offset, 0, "anchor follows stable tab identity");
+        updated.windows.swap(0, 1);
+        updated.windows[4].active = false;
+        updated.windows[0].active = true;
+        updated.revision += 1;
+        state.replace_windows(updated.clone());
+        assert!(
+            !state.manual_scroll,
+            "selection changes restore active reveal"
         );
+        updated.windows[0].active = false;
+        updated.windows[4].active = true;
+        updated.revision += 1;
+        state.replace_windows(updated);
+        state.manual_scroll = true;
+        state.scroll_offset = 0;
+        let scrolled = build_surface(&state, 1);
+        let scrolled_windows: Vec<_> = scrolled
+            .interactive_regions
+            .iter()
+            .filter(|region| region.local_id.starts_with("window:"))
+            .map(|region| region.local_id.as_str())
+            .collect();
+        assert_eq!(
+            scrolled_windows,
+            vec![
+                format!("window:{}", Uuid::from_u128(0)),
+                format!("window:{}", Uuid::from_u128(1)),
+            ]
+        );
+        state.manual_scroll = false;
+        let surface = build_surface(&state, 1);
+        let windows: Vec<_> = surface
+            .interactive_regions
+            .iter()
+            .filter(|region| region.local_id.starts_with("window:"))
+            .map(|region| region.local_id.as_str())
+            .collect();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[1], format!("window:{}", Uuid::from_u128(4)));
         assert!(
             surface
                 .ops

@@ -150,18 +150,18 @@ fn install_bundled_client_adapter(plugin_id: &str, settings: Option<&toml::Value
     }
     #[cfg(feature = "bundled-plugin-tab-strip")]
     if plugin_id == "bmux.tab_strip" {
-        if let Err(error) = bmux_tab_strip_plugin::install(settings) {
-            tracing::warn!(%error, "failed installing tab-strip attach companion");
-        } else {
-            bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::new(
-                plugin_id,
-                std::sync::Arc::new(bmux_tab_strip_plugin::start),
-                std::sync::Arc::new(|| {
-                    bmux_tab_strip_plugin::uninstall();
-                    Ok(())
-                }),
-            ));
-        }
+        let settings = settings.cloned();
+        bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::from_factory(
+            plugin_id,
+            std::sync::Arc::new(move |resources| {
+                Ok(Box::new(
+                    bmux_tab_strip_plugin::TabStripPresentation::install(
+                        settings.as_ref(),
+                        resources,
+                    )?,
+                ))
+            }),
+        ));
     }
     #[cfg(feature = "bundled-plugin-sidebar")]
     if plugin_id == "bmux.sidebar" {

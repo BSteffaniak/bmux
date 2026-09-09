@@ -255,6 +255,7 @@ impl RenderStyle {
 
 #[derive(Default)]
 pub struct ProjectionInteraction<'a> {
+    pub(super) scroll_anchor: Option<usize>,
     pub(super) editing_window_id: Option<Uuid>,
     pub(super) edit_selection: Option<(usize, usize)>,
     pub(super) menu_window_id: Option<Uuid>,
@@ -318,7 +319,13 @@ pub fn project_bar(
             }
         })
         .collect::<Vec<_>>();
-    let window = visible_tabs_for_layout(&tokens, settings, &style, tab_budget);
+    let window = visible_tabs_for_layout(
+        &tokens,
+        settings,
+        &style,
+        tab_budget,
+        interaction.scroll_anchor,
+    );
     let mut left = vec![ProjectedSegment {
         text: " ".repeat(settings.left_padding),
         kind: SegmentKind::Base,
@@ -569,14 +576,13 @@ fn visible_tabs_for_layout(
     settings: &Settings,
     style: &RenderStyle,
     budget: usize,
+    scroll_anchor: Option<usize>,
 ) -> TabWindow {
     if tokens.is_empty() {
         return TabWindow { start: 0, end: 0 };
     }
-    let anchor = tokens
-        .iter()
-        .position(|token| token.active)
-        .unwrap_or(0)
+    let anchor = scroll_anchor
+        .unwrap_or_else(|| tokens.iter().position(|token| token.active).unwrap_or(0))
         .min(tokens.len() - 1);
     let cap = settings.maximum_visible_tabs.unwrap_or(usize::MAX).max(1);
     let mut start = anchor;
@@ -587,7 +593,11 @@ fn visible_tabs_for_layout(
         if end.saturating_sub(start) >= cap {
             break;
         }
-        let left = start.checked_sub(1);
+        let left = if scroll_anchor.is_some() {
+            None
+        } else {
+            start.checked_sub(1)
+        };
         let right = (end < tokens.len()).then_some(end);
         let candidates = if extend_left {
             [left, right]

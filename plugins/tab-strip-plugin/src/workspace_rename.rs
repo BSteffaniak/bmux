@@ -1,6 +1,6 @@
 use super::{
-    AttachInputEvent, AttachInputResult, CompanionState, Instant, Uuid, command_invocation,
-    republish_companion, state, workspaces_commands, workspaces_state,
+    AttachInputEvent, AttachInputResult, CompanionHandle, CompanionState, Instant, Uuid,
+    command_invocation, republish_companion, workspaces_commands, workspaces_state,
 };
 
 pub fn invocation(id: Uuid, name: String) -> Option<super::AttachInputServiceInvocation> {
@@ -53,12 +53,15 @@ fn begin(companion: &mut CompanionState, id: Uuid, col: u16, row: u16) -> bool {
 }
 
 #[allow(clippy::significant_drop_tightening)] // Serialize the gesture and its retained publication.
-pub fn handle_pointer(event: &AttachInputEvent) -> Option<AttachInputResult> {
+pub fn handle_pointer(
+    owner: &CompanionHandle,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
     let id = event
         .hook_id
         .strip_prefix("bmux.tab_strip:strip:workspace:")
         .and_then(|id| Uuid::parse_str(id).ok())?;
-    let mut guard = state().lock().ok()?;
+    let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     if companion.workspace_id != Some(id) {
         return None;

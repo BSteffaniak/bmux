@@ -241,6 +241,7 @@ impl AttachDirtyFlags {
 #[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
     pub presentation_events: std::sync::Arc<bmux_plugin::EventBus>,
+    pub presentation_extensions: std::sync::Arc<bmux_plugin::RenderExtensionRegistry>,
     pub presentation_layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
     pub presentation_allocations: std::sync::Arc<bmux_plugin::layout::AllocationRegistry>,
     pub presentation_surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
@@ -571,9 +572,26 @@ pub struct AttachMouseResizeAxisDrag {
 }
 
 impl AttachViewState {
+    /// Start with independently owned retained presentation resources.
+    pub fn with_private_presentation(attach_info: bmux_client::AttachOpenInfo) -> Self {
+        let mut state = Self::new(attach_info);
+        state.presentation_events = std::sync::Arc::new(bmux_plugin::EventBus::new());
+        state.presentation_extensions =
+            std::sync::Arc::new(bmux_plugin::RenderExtensionRegistry::new());
+        state.presentation_layouts =
+            std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(64));
+        state.presentation_allocations =
+            std::sync::Arc::new(bmux_plugin::layout::AllocationRegistry::default());
+        state.presentation_surfaces =
+            std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64));
+        state.presentation_input =
+            std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new());
+        state
+    }
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
             presentation_events: bmux_plugin::global_event_bus(),
+            presentation_extensions: bmux_plugin::global_render_extension_registry(),
             presentation_layouts: bmux_plugin::layout::global_plugin_layout_registry_handle(),
             presentation_allocations: bmux_plugin::layout::global_allocation_registry_handle(),
             presentation_surfaces: bmux_plugin::surface::global_plugin_surface_registry_handle(),

@@ -1,10 +1,10 @@
 //! Client-local tab context menu. Only completed actions cross the service boundary.
 
 use super::{
-    BarStyles, CompanionState, LAYOUT_ID, OWNER, Placement, command_invocation, input_endpoint,
-    republish_companion, state, windows_commands,
+    BarStyles, CompanionHandle, CompanionState, LAYOUT_ID, OWNER, Placement, command_invocation,
+    input_endpoint, republish_companion, windows_commands,
 };
-use bmux_plugin::layout::{PluginLayoutId, global_plugin_layout_registry, resolve_plugin_layout};
+use bmux_plugin::layout::{PluginLayoutId, resolve_plugin_layout};
 use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceTarget,
 };
@@ -24,7 +24,7 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
     if viewport.w == 0 || viewport.h == 0 {
         return None;
     }
-    let mut requests = global_plugin_layout_registry().requests();
+    let mut requests = companion.layouts.requests();
     // Use this companion's layout intent even before its first publication.
     requests.retain(|request| request.id.owner_plugin_id != OWNER);
     requests.push(super::layout_request(&companion.settings));
@@ -128,8 +128,11 @@ pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface>
 }
 
 #[allow(clippy::significant_drop_tightening)] // Publish the surface under the same lock as its interaction state.
-pub fn handle_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
-    let mut guard = state().lock().ok()?;
+pub fn handle_input(
+    owner: &CompanionHandle,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
+    let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     let mut result = transition(companion, event)?;
     if result.dirty {
@@ -332,6 +335,33 @@ mod tests {
             companion,
             &event("key", "press", Some(key), None, String::new()),
         )
+    }
+
+    #[test]
+    fn popup_geometry_uses_the_companions_layout_registry() {
+        let mut first = companion();
+        first.layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4));
+        first.menu_window_id = Some(Uuid::from_u128(7));
+        let mut second = first.clone();
+        second.layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4));
+        let baseline = popup_rect(&second).unwrap();
+        first
+            .layouts
+            .publish(
+                "sidebar",
+                bmux_plugin::layout::PluginLayoutSnapshot {
+                    revision: 1,
+                    requests: vec![bmux_plugin::layout::PluginLayoutRequest::split(
+                        PluginLayoutId::new("sidebar", "left"),
+                        i32::MIN,
+                        bmux_plugin::layout::LayoutEdge::Left,
+                        bmux_plugin::layout::LayoutExtent::Cells(20),
+                    )],
+                },
+            )
+            .unwrap();
+        assert_eq!(popup_rect(&first).unwrap().x, baseline.x + 20);
+        assert_eq!(popup_rect(&second).unwrap(), baseline);
     }
 
     #[test]

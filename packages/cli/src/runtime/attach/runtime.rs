@@ -2584,25 +2584,16 @@ async fn maybe_emit_attach_frame_perf(
     Ok(())
 }
 
-/// Install every bundled plugin's client-side render extension.
-///
-/// Each `install` call is idempotent (uses its own `OnceLock` to
-/// guard extension construction). Extensions are feature-gated so
-/// builds that don't bundle a plugin simply skip its install call.
-///
-/// Called once per attach session from
-/// [`run_session_attach_with_client`]; subsequent attaches reuse the
-/// already-installed extensions.
-#[allow(clippy::missing_const_for_fn)]
-fn install_bundled_render_extensions() {
+/// Construct bundled render extensions for this attach's selected bus.
+fn install_bundled_render_extensions(view_state: &mut AttachViewState) {
+    let registry = std::sync::Arc::new(bmux_plugin::RenderExtensionRegistry::new());
     #[cfg(feature = "bundled-plugin-decoration")]
-    {
-        bmux_decoration_plugin_renderer::install();
-    }
+    registry.register(bmux_decoration_plugin_renderer::renderer_for_bus(
+        &view_state.presentation_events,
+    ));
+    view_state.presentation_extensions = registry;
     #[cfg(feature = "bundled-visual-adapters")]
-    {
-        bmux_visual_adapters_plugin_renderer::install();
-    }
+    bmux_visual_adapters_plugin_renderer::install();
 }
 
 pub async fn run_session_attach_with_client(
@@ -3363,12 +3354,6 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         "attach.runtime.start"
     );
 
-    // Install client-side render extensions for any bundled plugins
-    // that ship one. Each crate's `install` is idempotent; process-
-    // wide state is initialised on first call. Extensions populate
-    // themselves lazily as scene events arrive.
-    install_bundled_render_extensions();
-
     let follow_target_id = match follow {
         Some(follow_target) => Some(parse_uuid_value(follow_target, "follow target client id")?),
         None => None,
@@ -3398,7 +3383,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     let mut rendered_frame_count = 0_u64;
     let mut first_frame_emitted = false;
     let mut interactive_ready_emitted = false;
-    let presentation_events = bmux_plugin::global_event_bus();
+    let presentation_events = std::sync::Arc::new(bmux_plugin::EventBus::new());
     let (initial_appearance, appearance_rx_raw) = presentation_events
         .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
         .unwrap_or_else(|_| {
@@ -3544,8 +3529,9 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         display_capture.open_target(target, self_client_id);
     }
 
-    let mut view_state = AttachViewState::new(attach_info);
+    let mut view_state = AttachViewState::with_private_presentation(attach_info);
     view_state.presentation_events = presentation_events;
+    install_bundled_render_extensions(&mut view_state);
     terminal.set_attached_session_id(view_state.attached_id);
     view_state.self_client_id = Some(self_client_id);
     view_state.mouse.config = attach_config.attach_mouse_config();
@@ -4975,7 +4961,10 @@ async fn handle_attach_stream_server_event(
                 Ok(scene) => {
                     let scene_revision = scene.revision;
                     #[cfg(feature = "bundled-plugin-decoration")]
-                    bmux_decoration_plugin_renderer::publish_relayed_scene(scene);
+                    bmux_decoration_plugin_renderer::publish_relayed_scene_on(
+                        &view_state.presentation_events,
+                        scene,
+                    );
                     #[cfg(not(feature = "bundled-plugin-decoration"))]
                     let _ = scene;
                     if scene_revision != *last_scene_revision {
@@ -8432,7 +8421,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         retained_help_overlay_surface(surface, help_lines, help_scroll, runtime_appearance)
     });
     let prompt_overlay_render = if view_state.prompt.is_active() {
-        let extensions = bmux_plugin::registered_render_extensions();
+        let extensions = view_state.presentation_extensions.snapshot();
         let prompt_surface = view_state.prompt.overlay_surface(geometry);
         let extension_chrome = prompt_surface.as_ref().is_some_and(|surface| {
             retained_surface_extension_chrome_owned(
@@ -8518,7 +8507,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         // once per frame. The snapshot is cheap (Arc-clones) and
         // keeps the per-surface loop inside `render_attach_scene`
         // free of registry-lock churn.
-        let extensions = bmux_plugin::registered_render_extensions();
+        let extensions = view_state.presentation_extensions.snapshot();
         view_state
             .visual_projection_updates
             .extend(collect_visual_projection_updates(
@@ -8591,7 +8580,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
 
     let previous_cursor_state = view_state.last_cursor_state;
     let mut overlay_rendered = false;
-    let retained_extensions = bmux_plugin::registered_render_extensions();
+    let retained_extensions = view_state.presentation_extensions.snapshot();
     for extension in &retained_extensions {
         extension.refresh_state();
     }
@@ -12071,9 +12060,9 @@ async fn try_handle_plugin_surface_key(
     Ok(result.consumed)
 }
 
-fn attach_input_hooks() -> Vec<AttachInputHook> {
+fn attach_input_hooks(view_state: &AttachViewState) -> Vec<AttachInputHook> {
     let mut hooks = Vec::new();
-    for extension in bmux_plugin::registered_render_extensions() {
+    for extension in view_state.presentation_extensions.snapshot() {
         extension.refresh_state();
         hooks.extend(extension.input_hooks());
     }
@@ -12380,7 +12369,7 @@ async fn try_handle_uncaptured_attach_input_hook_mouse(
     let hovered =
         attach_input_hovered_pane_context(view_state, mouse_event.column, mouse_event.row);
 
-    for hook in attach_input_hooks() {
+    for hook in attach_input_hooks(view_state) {
         if !hook_matches_mouse(&hook, phase, focused.as_ref(), hovered.as_ref()) {
             continue;
         }
@@ -12434,10 +12423,10 @@ async fn try_handle_attach_input_hook_key(
         {
             vec![capture.hook]
         } else {
-            attach_input_hooks()
+            attach_input_hooks(view_state)
         }
     } else {
-        attach_input_hooks()
+        attach_input_hooks(view_state)
     };
     let focused = attach_input_focused_context(view_state);
     for hook in hooks {
@@ -13467,7 +13456,7 @@ fn attach_scene_pane_content_rect(
     // etc.) are the authoritative source of chrome insets; core
     // merely consults them. When no extension overrides, fall back
     // to the scene producer's content rect.
-    for ext in bmux_plugin::registered_render_extensions() {
+    for ext in view_state.presentation_extensions.snapshot() {
         if let Some(override_rect) = ext.content_rect_override(surface_id)
             && override_rect.w > 0
             && override_rect.h > 0
@@ -15909,6 +15898,122 @@ mod tests {
             )],
             cursor_state: None,
         }
+    }
+
+    #[test]
+    fn private_presentation_appearance_updates_and_teardown_are_isolated() {
+        let create = || {
+            AttachViewState::with_private_presentation(AttachOpenInfo {
+                context_id: None,
+                session_id: Uuid::new_v4(),
+                can_write: true,
+            })
+        };
+        let first = create();
+        let second = create();
+        for state in [&first, &second] {
+            state.presentation_events.register_state_channel(
+                RUNTIME_APPEARANCE_STATE_KIND,
+                RuntimeAppearance::default(),
+            );
+        }
+        let (_, first_rx) = first
+            .presentation_events
+            .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
+            .unwrap();
+        let (_, second_rx) = second
+            .presentation_events
+            .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
+            .unwrap();
+        first
+            .presentation_events
+            .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, RuntimeAppearance::default())
+            .unwrap();
+        assert!(first_rx.has_changed().unwrap());
+        assert!(!second_rx.has_changed().unwrap());
+        let released = std::sync::Arc::downgrade(&first.presentation_events);
+        drop(first);
+        assert!(released.upgrade().is_none());
+        second
+            .presentation_events
+            .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, RuntimeAppearance::default())
+            .unwrap();
+        assert!(second_rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn bundled_render_extensions_are_owned_by_each_attach() {
+        let create = || {
+            let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+                context_id: None,
+                session_id: Uuid::new_v4(),
+                can_write: true,
+            });
+            state.presentation_events = std::sync::Arc::new(bmux_plugin::EventBus::new());
+            install_bundled_render_extensions(&mut state);
+            state
+        };
+        let first = create();
+        let second = create();
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.presentation_extensions,
+            &second.presentation_extensions
+        ));
+        let first_extensions = first.presentation_extensions.snapshot();
+        let second_extensions = second.presentation_extensions.snapshot();
+        assert_eq!(first_extensions.len(), second_extensions.len());
+        for (first, second) in first_extensions.iter().zip(&second_extensions) {
+            assert!(!std::sync::Arc::ptr_eq(first, second));
+        }
+        let released = std::sync::Arc::downgrade(&first.presentation_extensions);
+        drop(first);
+        assert!(released.upgrade().is_none());
+        assert_eq!(
+            second.presentation_extensions.len(),
+            second_extensions.len()
+        );
+    }
+
+    #[test]
+    fn private_presentation_notifications_hydrate_and_teardown_independently() {
+        let create = || {
+            AttachViewState::with_private_presentation(AttachOpenInfo {
+                context_id: None,
+                session_id: Uuid::new_v4(),
+                can_write: true,
+            })
+        };
+        let first = create();
+        let second = create();
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        super::super::local_presentation::publish_notification(
+            &first.presentation_layouts,
+            &first.presentation_surfaces,
+            Some("first"),
+            80,
+            24,
+        );
+        assert_eq!(retained_plugin_surfaces(&first, viewport).len(), 1);
+        assert!(retained_plugin_surfaces(&second, viewport).is_empty());
+        super::super::local_presentation::publish_notification(
+            &second.presentation_layouts,
+            &second.presentation_surfaces,
+            Some("second"),
+            80,
+            24,
+        );
+        first.presentation_surfaces.clear();
+        first.presentation_layouts.clear();
+        assert!(retained_plugin_surfaces(&first, viewport).is_empty());
+        assert_eq!(retained_plugin_surfaces(&second, viewport).len(), 1);
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.presentation_input,
+            &second.presentation_input
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.presentation_allocations,
+            &second.presentation_allocations
+        ));
     }
 
     #[test]

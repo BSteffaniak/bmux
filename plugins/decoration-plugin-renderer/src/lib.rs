@@ -2377,6 +2377,47 @@ fn border_damage_rects(rect: &SceneRect) -> Vec<ExtensionRect> {
 /// Process-wide handle to the installed extension's cache. `install` stores it
 /// on first call; the retained scene-state relay (living in the CLI's streaming
 /// loop) updates the local state channel that feeds this cache.
+fn create_renderer(bus: &bmux_plugin::EventBus) -> DecorationRenderExtension {
+    let cache = Arc::new(Mutex::new(DecorationRendererCache::default()));
+    // Register only when absent: registration replaces an existing retained
+    // value, which would erase the latest scene on renderer restart.
+    if bus
+        .subscribe_state::<DecorationScene>(&SCENE_STATE_KIND)
+        .is_err()
+    {
+        let _ = bus.register_state_channel::<DecorationScene>(
+            SCENE_STATE_KIND,
+            DecorationScene {
+                revision: 0,
+                surfaces: BTreeMap::new(),
+                animation: None,
+                input_hooks: Vec::new(),
+                visual_adapters: Vec::new(),
+            },
+        );
+    }
+    match bus.subscribe_state::<DecorationScene>(&SCENE_STATE_KIND) {
+        Ok((initial, rx)) => {
+            let mut guard = cache.lock().expect("new decoration cache is not poisoned");
+            guard.replace_if_newer(initial.as_ref().clone());
+            guard.set_scene_receiver(rx);
+        }
+        Err(error) => tracing::warn!(%error, "decoration scene subscription failed"),
+    }
+    DecorationRenderExtension {
+        name: "bmux.decoration.renderer".to_string(),
+        cache,
+    }
+}
+
+/// Create an independent renderer subscribed to the supplied retained scene bus.
+/// Dropping the extension releases its cache and receiver; no background task or
+/// process-wide registration is installed.
+#[must_use]
+pub fn renderer_for_bus(bus: &bmux_plugin::EventBus) -> Arc<dyn AttachRenderExtension> {
+    Arc::new(create_renderer(bus))
+}
+
 static INSTALLED_CACHE: OnceLock<Arc<Mutex<DecorationRendererCache>>> = OnceLock::new();
 
 /// Install the decoration render extension.
@@ -2393,43 +2434,9 @@ pub fn install() {
     // SAFETY: `OnceLock` coordinates single-shot initialisation; repeat
     // calls are no-ops after the first.
     let _ = INSTALLED_CACHE.get_or_init(|| {
-        let cache: Arc<Mutex<DecorationRendererCache>> =
-            Arc::new(Mutex::new(DecorationRendererCache::default()));
-        let ext = Arc::new(DecorationRenderExtension {
-            name: "bmux.decoration.renderer".to_string(),
-            cache: cache.clone(),
-        }) as Arc<dyn AttachRenderExtension>;
-        bmux_plugin::register_render_extension(ext);
-        // Register a local retained state channel for scene updates. The CLI's
-        // streaming loop re-publishes IPC-delivered `PluginBusEvent`s onto this
-        // channel so the extension can drain the retained state at the frame
-        // boundary without a background subscriber race.
-        let _ = bmux_plugin::global_event_bus().register_state_channel::<DecorationScene>(
-            SCENE_STATE_KIND,
-            DecorationScene {
-                revision: 0,
-                surfaces: BTreeMap::new(),
-                animation: None,
-                input_hooks: Vec::new(),
-                visual_adapters: Vec::new(),
-            },
-        );
-        match bmux_plugin::global_event_bus().subscribe_state::<DecorationScene>(&SCENE_STATE_KIND)
-        {
-            Ok((initial, rx)) => {
-                if let Ok(mut guard) = cache.lock() {
-                    guard.replace_if_newer(initial.as_ref().clone());
-                    guard.set_scene_receiver(rx);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "decoration render extension: scene-protocol state channel not registered"
-                );
-            }
-        }
-        tracing::debug!("decoration render extension installed");
+        let extension = create_renderer(&bmux_plugin::global_event_bus());
+        let cache = extension.cache.clone();
+        bmux_plugin::register_render_extension(Arc::new(extension));
         cache
     });
 }
@@ -2440,13 +2447,15 @@ pub fn install() {
 /// The renderer owns channel creation and the empty compatibility snapshot so
 /// attach core only decodes and forwards the decoration plugin's typed payload.
 pub fn publish_relayed_scene(scene: DecorationScene) {
-    if bmux_plugin::global_event_bus()
-        .publish_state(&SCENE_STATE_KIND, scene.clone())
-        .is_ok()
-    {
+    publish_relayed_scene_on(&bmux_plugin::global_event_bus(), scene);
+}
+
+/// Relay a scene only to the selected renderer bus.
+pub fn publish_relayed_scene_on(bus: &bmux_plugin::EventBus, scene: DecorationScene) {
+    if bus.publish_state(&SCENE_STATE_KIND, scene.clone()).is_ok() {
         return;
     }
-    let _ = bmux_plugin::global_event_bus().register_state_channel::<DecorationScene>(
+    let _ = bus.register_state_channel::<DecorationScene>(
         SCENE_STATE_KIND,
         DecorationScene {
             revision: 0,
@@ -2456,7 +2465,7 @@ pub fn publish_relayed_scene(scene: DecorationScene) {
             visual_adapters: Vec::new(),
         },
     );
-    let _ = bmux_plugin::global_event_bus().publish_state(&SCENE_STATE_KIND, scene);
+    let _ = bus.publish_state(&SCENE_STATE_KIND, scene);
 }
 
 /// Manual push path. Callers that receive scene payloads from a
@@ -3181,6 +3190,41 @@ mod tests {
         assert_eq!(stats.sent_updates, 1);
         assert_eq!(stats.duplicate_suppressed, 1);
         assert_eq!(stats.errors, 0);
+    }
+
+    #[test]
+    fn scoped_renderers_retain_independent_scenes_and_release_receivers() {
+        let first_bus = bmux_plugin::EventBus::new();
+        let second_bus = bmux_plugin::EventBus::new();
+        let first = create_renderer(&first_bus);
+        let second = create_renderer(&second_bus);
+        let scene = |revision| DecorationScene {
+            revision,
+            surfaces: BTreeMap::new(),
+            animation: None,
+            input_hooks: Vec::new(),
+            visual_adapters: Vec::new(),
+        };
+        first_bus
+            .publish_state(&SCENE_STATE_KIND, scene(7))
+            .unwrap();
+        second_bus
+            .publish_state(&SCENE_STATE_KIND, scene(2))
+            .unwrap();
+        first.refresh_state();
+        second.refresh_state();
+        assert_eq!(first.cache.lock().unwrap().revision, 7);
+        assert_eq!(second.cache.lock().unwrap().revision, 2);
+        let released = Arc::downgrade(&first.cache);
+        drop(first);
+        assert!(released.upgrade().is_none());
+        second_bus
+            .publish_state(&SCENE_STATE_KIND, scene(3))
+            .unwrap();
+        second.refresh_state();
+        assert_eq!(second.cache.lock().unwrap().revision, 3);
+        let restarted = create_renderer(&first_bus);
+        assert_eq!(restarted.cache.lock().unwrap().revision, 7);
     }
 
     #[test]
