@@ -903,10 +903,46 @@ pub fn diff_viewer_rows_with_style(
 #[must_use]
 pub fn diff_viewer_document_rows_with_style(
     input: DiffViewerInput<'_>,
-    mut diff: DiffDocument,
+    diff: DiffDocument,
     width: u16,
     style: DiffViewerStyle,
 ) -> Vec<Line> {
+    diff_viewer_document_layout_with_style(input, diff, width, style).rows
+}
+
+/// Source side within a diff, independent of unified or split presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffSourceSide {
+    Old,
+    New,
+}
+
+/// First rendered row of a source line in the accepted preview.
+/// Wrapped continuation rows belong to this line until the next mapping on that side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffSourceLine {
+    pub side: DiffSourceSide,
+    pub line: u32,
+    pub row: usize,
+}
+
+/// Rows and source-line correspondence produced by the same layout pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffViewerProjection {
+    pub rows: Vec<Line>,
+    pub source_lines: Vec<DiffSourceLine>,
+}
+
+/// Render a diff and retain correspondence for every visible source line.
+/// Chrome, omitted lines, and padding do not acquire source identities.
+#[must_use]
+pub fn diff_viewer_document_layout_with_style(
+    input: DiffViewerInput<'_>,
+    mut diff: DiffDocument,
+    width: u16,
+    style: DiffViewerStyle,
+) -> DiffViewerProjection {
+    let source_lines = diff.lines.clone();
     if !input.line_numbers_known {
         for line in &mut diff.lines {
             line.old_line = None;
@@ -970,7 +1006,10 @@ pub fn diff_viewer_document_rows_with_style(
         .cloned()
         .collect::<Vec<_>>();
     if visible_lines.is_empty() {
-        return rows;
+        return DiffViewerProjection {
+            rows,
+            source_lines: Vec::new(),
+        };
     }
 
     let total_rows = visible_lines.len();
@@ -995,28 +1034,81 @@ pub fn diff_viewer_document_rows_with_style(
         card_width(&preview, width.saturating_sub(2))
     };
     rows.push(card_border('┌', '─', '┐', card_width, style.muted));
-    rows.extend(render_preview_rows(
+    finish_diff_projection(
+        rows,
+        source_lines,
         &preview,
         resolved_layout,
         card_width,
         style,
-    ));
-    rows.push(card_border('└', '─', '┘', card_width, style.muted));
-    rows
+    )
 }
 
-fn render_preview_rows(
+fn finish_diff_projection(
+    mut rows: Vec<Line>,
+    source_lines: Vec<DiffLine>,
     preview: &[PreviewRow<'_>],
+    resolved_layout: DiffViewerLayout,
+    card_width: u16,
+    style: DiffViewerStyle,
+) -> DiffViewerProjection {
+    let body_start = rows.len();
+    let source_preview_lines = source_lines
+        .into_iter()
+        .filter(|line| is_preview_content_line(line.kind))
+        .collect::<Vec<_>>();
+    let source_preview = inline_preview(&source_preview_lines, MAX_INLINE_DIFF_ROWS);
+    let mut mappings = Vec::new();
+    let body = render_preview_rows_mapped(
+        preview,
+        &source_preview,
+        resolved_layout,
+        card_width,
+        style,
+        &mut mappings,
+    );
+    rows.extend(body);
+    rows.push(card_border('└', '─', '┘', card_width, style.muted));
+    for mapping in &mut mappings {
+        mapping.row += body_start;
+    }
+    DiffViewerProjection {
+        rows,
+        source_lines: mappings,
+    }
+}
+
+fn push_source_lines(line: &DiffLine, row: usize, mappings: &mut Vec<DiffSourceLine>) {
+    if let Some(number) = line.old_line {
+        mappings.push(DiffSourceLine {
+            side: DiffSourceSide::Old,
+            line: number,
+            row,
+        });
+    }
+    if let Some(number) = line.new_line {
+        mappings.push(DiffSourceLine {
+            side: DiffSourceSide::New,
+            line: number,
+            row,
+        });
+    }
+}
+
+fn render_preview_rows_mapped(
+    preview: &[PreviewRow<'_>],
+    source: &[PreviewRow<'_>],
     layout: DiffViewerLayout,
     card_width: u16,
     style: DiffViewerStyle,
+    mappings: &mut Vec<DiffSourceLine>,
 ) -> Vec<Line> {
     if layout == DiffViewerLayout::SideBySide {
-        return render_side_by_side_preview_with_style(preview, card_width, style);
+        return render_side_by_side_preview_mapped(preview, source, card_width, style, mappings);
     }
     let mut rows = Vec::new();
     let mut rendered_rows = 0_usize;
-    for row in preview {
+    for (index, row) in preview.iter().enumerate() {
         let rendered = match row {
             PreviewRow::Line(line) => render_diff_line_with_style(line, card_width, style),
             PreviewRow::Hidden { count, .. } => {
@@ -1026,6 +1118,9 @@ fn render_preview_rows(
         let remaining = MAX_INLINE_DIFF_RENDER_ROWS.saturating_sub(rendered_rows);
         if remaining == 0 {
             break;
+        }
+        if let Some(PreviewRow::Line(line)) = source.get(index) {
+            push_source_lines(line, rows.len(), mappings);
         }
         let take = rendered.len().min(remaining);
         rows.extend(rendered.into_iter().take(take));
@@ -1214,10 +1309,21 @@ fn render_side_by_side_preview(preview: &[PreviewRow<'_>], width: u16) -> Vec<Li
     render_side_by_side_preview_with_style(preview, width, DiffViewerStyle::default())
 }
 
+#[cfg(test)]
 fn render_side_by_side_preview_with_style(
     preview: &[PreviewRow<'_>],
     width: u16,
     style: DiffViewerStyle,
+) -> Vec<Line> {
+    render_side_by_side_preview_mapped(preview, preview, width, style, &mut Vec::new())
+}
+
+fn render_side_by_side_preview_mapped(
+    preview: &[PreviewRow<'_>],
+    source: &[PreviewRow<'_>],
+    width: u16,
+    style: DiffViewerStyle,
+    mappings: &mut Vec<DiffSourceLine>,
 ) -> Vec<Line> {
     let mut rows = Vec::new();
     let (left_width, right_width) = side_by_side_column_widths(preview, width);
@@ -1260,6 +1366,17 @@ fn render_side_by_side_preview_with_style(
                     let new = (offset < added_count)
                         .then(|| preview.get(added_start + offset).and_then(preview_line))
                         .flatten();
+                    for source_index in [
+                        (offset < removed_count).then_some(removed_start + offset),
+                        (offset < added_count).then_some(added_start + offset),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if let Some(PreviewRow::Line(line)) = source.get(source_index) {
+                            push_source_lines(line, rows.len(), mappings);
+                        }
+                    }
                     rows.extend(render_split_row_with_style(
                         old,
                         new,
@@ -1270,6 +1387,9 @@ fn render_side_by_side_preview_with_style(
                 }
             }
             PreviewRow::Line(line) if line.kind == DiffLineKind::Added => {
+                if let Some(PreviewRow::Line(source_line)) = source.get(index) {
+                    push_source_lines(source_line, rows.len(), mappings);
+                }
                 rows.extend(render_split_row_with_style(
                     None,
                     Some(line),
@@ -1280,6 +1400,9 @@ fn render_side_by_side_preview_with_style(
                 index += 1;
             }
             PreviewRow::Line(line) => {
+                if let Some(PreviewRow::Line(source_line)) = source.get(index) {
+                    push_source_lines(source_line, rows.len(), mappings);
+                }
                 rows.extend(render_split_row_with_style(
                     Some(line),
                     Some(line),
@@ -1731,6 +1854,50 @@ const fn syntax_style(style: SyntaxStyle) -> Style {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_layout_maps_both_sides_and_preserves_rows() {
+        for layout in [DiffViewerLayout::Unified, DiffViewerLayout::SideBySide] {
+            let input = DiffViewerInput {
+                label: "test",
+                old_text: "old alpha\nold beta",
+                new_text: "new alpha\nnew beta",
+                old_start_line: 10,
+                new_start_line: 20,
+                line_numbers_known: false,
+                title: "Diff",
+                subtitle: None,
+                argument_bytes: None,
+                truncated: false,
+                layout,
+            };
+            let doc = diff_from_text_at_lines("test", input.old_text, input.new_text, 10, 20);
+            let projection = diff_viewer_document_layout_with_style(
+                input,
+                doc.clone(),
+                90,
+                DiffViewerStyle::default(),
+            );
+            assert_eq!(
+                projection.rows,
+                diff_viewer_document_rows_with_style(input, doc, 90, DiffViewerStyle::default())
+            );
+            assert_eq!(projection.source_lines.len(), 4);
+            for mapping in projection.source_lines {
+                let text = line_text(&projection.rows[mapping.row]);
+                let base = if mapping.side == DiffSourceSide::Old {
+                    10
+                } else {
+                    20
+                };
+                assert!(text.contains(if mapping.line == base {
+                    "alpha"
+                } else {
+                    "beta"
+                }));
+            }
+        }
+    }
+
     use super::*;
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;
