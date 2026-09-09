@@ -1815,7 +1815,9 @@ fn render_single_select(
         VirtualList::new("single-select-list"),
         |list, (index, option)| {
             let style = if index == *selected {
-                theme.focused
+                theme
+                    .focused
+                    .add_modifier(bmux_tui::style::Modifier::REVERSED)
             } else {
                 theme.text
             };
@@ -1827,7 +1829,14 @@ fn render_single_select(
                 index,
                 TextBlock::new(Text::from_lines([Line::from_spans(vec![
                     Span::styled(option.label.clone(), style),
-                    Span::styled(detail, theme.muted),
+                    Span::styled(
+                        detail,
+                        if index == *selected {
+                            theme.muted.patch(style)
+                        } else {
+                            theme.muted
+                        },
+                    ),
                 ])]))
                 .id(format!("single-select-list.label.{index}"))
                 .style(theme.background),
@@ -1967,13 +1976,21 @@ fn render_command_palette(
             .copied()
             .fold(VirtualList::new("command-list"), |list, source_index| {
                 let style = if filtered.get(*selected) == Some(&source_index) {
-                    theme.focused
+                    theme
+                        .focused
+                        .add_modifier(bmux_tui::style::Modifier::REVERSED)
                 } else {
                     theme.text
                 };
+                let mut line = items[source_index].clone();
+                if filtered.get(*selected) == Some(&source_index) {
+                    for span in &mut line.spans {
+                        span.style = span.style.patch(style);
+                    }
+                }
                 list.component(
                     source_index,
-                    TextBlock::new(Text::from_lines([items[source_index].clone()]))
+                    TextBlock::new(Text::from_lines([line]))
                         .id(format!("command-list.label.{source_index}"))
                         .style(style),
                 )
@@ -3097,6 +3114,70 @@ mod tests {
         assert_eq!(render.surface.rect.y, 0);
         assert_eq!(render.surface.rect.w, 20);
         assert_eq!(render.surface.rect.h, 6);
+    }
+
+    #[test]
+    fn prompt_highlight_tracks_arrow_navigation() {
+        for mode in 0..3 {
+            let options = vec![
+                PromptOption::new("one", "First label")
+                    .detail("First detail")
+                    .key_hint("F1"),
+                PromptOption::new("two", "Second label")
+                    .detail("Second detail")
+                    .key_hint("F2"),
+            ];
+            let request = match mode {
+                0 => PromptRequest::search_select("Search", options),
+                1 => PromptRequest::search_select("Search", options).modal_id("command-palette"),
+                _ => PromptRequest::single_select("Select", options),
+            };
+            let mut state = AttachPromptState::default();
+            state.enqueue_internal(request, AttachInternalPromptAction::QuitSession);
+            let geometry = TerminalGeometry { cols: 80, rows: 24 };
+            let appearance = RuntimeAppearance::default();
+            let before = state
+                .attach_prompt_overlay_render(geometry, &appearance, false)
+                .unwrap();
+            state.handle_key_event(&key_event(KeyCode::Down));
+            let after = state
+                .attach_prompt_overlay_render(geometry, &appearance, false)
+                .unwrap();
+            let style_for = |render: &super::AttachPromptOverlayRender, needle: &str| {
+                render
+                    .ops
+                    .iter()
+                    .find_map(|op| match op {
+                        bmux_plugin::RenderOp::TextRun { text, style, .. }
+                            if text.contains(needle) =>
+                        {
+                            Some(*style)
+                        }
+                        _ => None,
+                    })
+                    .expect("rendered text")
+            };
+            for (first, second) in [
+                ("First label", "Second label"),
+                ("First detail", "Second detail"),
+            ] {
+                assert_ne!(style_for(&before, first), style_for(&after, first));
+                assert_eq!(style_for(&before, first), style_for(&after, second));
+            }
+            if mode == 1 {
+                assert!(style_for(&before, "F1").reverse);
+                assert!(!style_for(&after, "F1").reverse);
+                assert!(style_for(&after, "F2").reverse);
+            }
+            state.handle_key_event(&key_event(KeyCode::Up));
+            let restored = state
+                .attach_prompt_overlay_render(geometry, &appearance, false)
+                .unwrap();
+            assert_eq!(
+                style_for(&before, "First label"),
+                style_for(&restored, "First label")
+            );
+        }
     }
 
     #[test]

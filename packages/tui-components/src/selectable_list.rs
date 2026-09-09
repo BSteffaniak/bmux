@@ -626,6 +626,12 @@ impl<'a> SelectableList<'a> {
         state: SelectableListState,
     ) -> Line {
         let style = self.style_for(index, item, state);
+        let interaction_styled = state.interaction.disabled
+            || item.disabled
+            || state.pressed == Some(index)
+            || state.focused == Some(index)
+            || state.hovered == Some(index)
+            || state.selected == Some(index);
         let mut spans = Vec::new();
         let prefix = if line_index == 0 && state.selected == Some(index) {
             self.policy.highlight.symbol.to_string()
@@ -642,7 +648,16 @@ impl<'a> SelectableList<'a> {
                 .get(line_index)
                 .into_iter()
                 .flat_map(|line| line.spans.iter())
-                .map(|span| Span::styled(span.content.clone(), style.patch(span.style))),
+                .map(|span| {
+                    // Interaction colors must remain visible over rich labels; inactive
+                    // rows retain their caller-supplied accents. Modifiers compose.
+                    let style = if interaction_styled {
+                        span.style.patch(style)
+                    } else {
+                        style.patch(span.style)
+                    };
+                    Span::styled(span.content.clone(), style)
+                }),
         );
         Line::from_spans(spans)
     }
@@ -1626,6 +1641,53 @@ mod tests {
         );
         assert_eq!(outcome, SelectableListOutcome::Redraw);
         assert_eq!(state.hovered, Some(1));
+    }
+
+    #[test]
+    fn interaction_colors_override_rich_labels_but_inactive_accents_survive() {
+        use bmux_tui::style::Color;
+
+        let accent = Style::new().fg(Color::Yellow).bg(Color::Blue);
+        let interaction = Style::new().fg(Color::White).bg(Color::Red);
+        let items = [SelectableListItem::multiline(
+            "one",
+            [Line::from_spans([Span::styled("Rich", accent)])],
+        )];
+        let list = SelectableList::new(&items).styles(SelectableListStyles {
+            focused: interaction,
+            selected: interaction,
+            hovered: interaction,
+            pressed: interaction,
+            disabled: interaction,
+            ..SelectableListStyles::default()
+        });
+        let inactive = SelectableListState::new(None);
+        assert_eq!(
+            list.line(0, &items[0], 0, inactive)
+                .spans
+                .last()
+                .unwrap()
+                .style,
+            accent
+        );
+        for kind in 0..5 {
+            let mut state = inactive;
+            match kind {
+                0 => state.focused = Some(0),
+                1 => state.selected = Some(0),
+                2 => state.hovered = Some(0),
+                3 => state.pressed = Some(0),
+                _ => state.interaction.disabled = true,
+            }
+            assert_eq!(
+                list.line(0, &items[0], 0, state)
+                    .spans
+                    .last()
+                    .unwrap()
+                    .style,
+                interaction
+            );
+        }
     }
 
     #[test]
