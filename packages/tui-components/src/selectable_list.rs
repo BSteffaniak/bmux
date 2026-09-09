@@ -75,8 +75,8 @@ impl SelectableListItem {
 
     /// Return rendered item height in rows.
     #[must_use]
-    pub fn height(&self) -> usize {
-        self.lines.len().max(1)
+    pub fn height(&self) -> u64 {
+        u64::try_from(self.lines.len().max(1)).unwrap_or(u64::MAX)
     }
 
     /// Return this item with disabled state set.
@@ -290,12 +290,12 @@ impl SelectableListState {
 
     /// Return vertical scroll offset in logical item rows.
     #[must_use]
-    pub const fn vertical_scroll(self) -> usize {
+    pub const fn vertical_scroll(self) -> u64 {
         self.scroll.vertical_offset()
     }
 
     /// Set vertical scroll offset in logical item rows before clamping.
-    pub const fn set_vertical_scroll(&mut self, vertical_scroll: usize) {
+    pub const fn set_vertical_scroll(&mut self, vertical_scroll: u64) {
         self.scroll.set_vertical_offset(vertical_scroll);
     }
 
@@ -413,7 +413,7 @@ impl<'a> SelectableList<'a> {
 
     /// Return maximum vertical scroll offset for this area.
     #[must_use]
-    pub fn max_vertical_scroll(&self, area: Rect) -> usize {
+    pub fn max_vertical_scroll(&self, area: Rect) -> u64 {
         resolved_viewport(&self.layout(&LayoutId::new("list"), area))
             .map_or(0, ScrollView::max_vertical_offset)
     }
@@ -485,8 +485,7 @@ impl<'a> SelectableList<'a> {
                                 state: *state,
                                 fallback,
                                 offset: state.scroll.vertical_offset(),
-                                viewport_height: usize::try_from(viewport.size.height)
-                                    .unwrap_or(usize::MAX),
+                                viewport_height: viewport.size.height,
                             },
                         )
                         .paint(viewport, cx);
@@ -653,13 +652,7 @@ impl<'a> SelectableList<'a> {
 
     /// Exact stacked item content at one content width.
     fn content_layout(&self, id: LayoutId, width: u16) -> LayoutNode {
-        LayoutNode::leaf(
-            id,
-            LogicalSize::new(
-                width.into(),
-                self.total_height().try_into().unwrap_or(u64::MAX),
-            ),
-        )
+        LayoutNode::leaf(id, LogicalSize::new(width.into(), self.total_height()))
     }
 
     fn line(
@@ -744,7 +737,7 @@ impl<'a> SelectableList<'a> {
         if !stroke.modifiers.is_empty() {
             return SelectableListOutcome::Ignored;
         }
-        let page = isize::try_from(viewport.size.height.max(1)).unwrap_or(isize::MAX);
+        let page = i64::try_from(viewport.size.height.max(1)).unwrap_or(i64::MAX);
         match stroke.key {
             KeyCode::Up if self.policy.keyboard.arrows_move_focus => {
                 self.move_focus(viewport, state, Direction::Previous)
@@ -891,7 +884,7 @@ impl<'a> SelectableList<'a> {
     fn scroll_by(
         viewport: &LayoutNode,
         state: &mut SelectableListState,
-        delta: isize,
+        delta: i64,
     ) -> SelectableListOutcome {
         scroll_outcome(ScrollView::scroll_vertical_by(
             viewport,
@@ -987,7 +980,7 @@ impl<'a> SelectableList<'a> {
             .ensure_visible(viewport, &mut state.scroll, start, height);
     }
 
-    fn item_start(&self, index: usize) -> usize {
+    fn item_start(&self, index: usize) -> u64 {
         self.items
             .iter()
             .take(index)
@@ -1047,8 +1040,8 @@ impl<'a> SelectableList<'a> {
         state: &SelectableListState,
     ) -> Vec<HitRegion<usize>> {
         let offset = state.scroll.vertical_offset();
-        let viewport_end = offset.saturating_add(usize::from(area.height));
-        let mut start = 0usize;
+        let viewport_end = offset.saturating_add(u64::from(area.height));
+        let mut start = 0u64;
         let mut regions = Vec::new();
         for (index, item) in self.items.iter().enumerate() {
             let end = start.saturating_add(item.height());
@@ -1079,7 +1072,7 @@ impl<'a> SelectableList<'a> {
         regions
     }
 
-    fn total_height(&self) -> usize {
+    fn total_height(&self) -> u64 {
         self.items.iter().map(SelectableListItem::height).sum()
     }
 
@@ -1126,8 +1119,8 @@ struct ItemRows<'a, 'list> {
     id: LayoutId,
     state: SelectableListState,
     fallback: Style,
-    offset: usize,
-    viewport_height: usize,
+    offset: u64,
+    viewport_height: u64,
 }
 
 impl Component for ItemRows<'_, '_> {
@@ -1142,7 +1135,7 @@ impl Component for ItemRows<'_, '_> {
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let width = layout.size.width;
         let end = self.offset.saturating_add(self.viewport_height);
-        let mut row = 0usize;
+        let mut row = 0u64;
         for (index, item) in self.list.items.iter().enumerate() {
             if row >= end {
                 break;
@@ -1156,7 +1149,12 @@ impl Component for ItemRows<'_, '_> {
                             width.try_into().unwrap_or(u16::MAX),
                             1,
                         ),
-                        &self.list.line(index, item, line_index, self.state),
+                        &self.list.line(
+                            index,
+                            item,
+                            usize::try_from(line_index).unwrap_or(usize::MAX),
+                            self.state,
+                        ),
                         self.fallback,
                     );
                 }

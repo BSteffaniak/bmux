@@ -29,7 +29,7 @@ pub struct VirtualListRenderStats {
 pub struct VirtualListState<K> {
     index: MeasuredListIndex<K>,
     layouts: LayoutCache,
-    anchor: Option<(K, usize, usize)>,
+    anchor: Option<(K, usize, u64)>,
     /// Shared logical scroll state.
     pub scroll: ScrollViewState,
 }
@@ -40,7 +40,7 @@ where
 {
     /// Create empty retained state with one logical inter-item gap.
     #[must_use]
-    pub fn new(gap: usize) -> Self {
+    pub fn new(gap: u64) -> Self {
         Self {
             index: MeasuredListIndex::new(gap),
             layouts: LayoutCache::new(),
@@ -61,7 +61,7 @@ where
     }
 
     /// Restore the captured stable-key anchor after synchronization.
-    pub fn restore_anchor(&mut self, viewport_height: usize) {
+    pub fn restore_anchor(&mut self, viewport_height: u64) {
         if self.scroll.follows_bottom() {
             let maximum = self.index.total_height().saturating_sub(viewport_height);
             self.scroll.set_vertical_offset(maximum);
@@ -90,7 +90,7 @@ where
     }
 
     /// Scroll so one stable item begins at the viewport top.
-    pub fn scroll_to_key(&mut self, key: &K, viewport_height: usize) -> bool {
+    pub fn scroll_to_key(&mut self, key: &K, viewport_height: u64) -> bool {
         let Some(index) = self.index.index_of(key) else {
             return false;
         };
@@ -101,7 +101,7 @@ where
     }
 
     /// Ensure one complete stable item is visible with minimum movement.
-    pub fn ensure_key_visible(&mut self, key: &K, viewport_height: usize) -> bool {
+    pub fn ensure_key_visible(&mut self, key: &K, viewport_height: u64) -> bool {
         let Some(index) = self.index.index_of(key) else {
             return false;
         };
@@ -122,13 +122,13 @@ where
 
     /// Exact logical content extent at the synchronized width.
     #[must_use]
-    pub fn total_height(&self) -> usize {
+    pub fn total_height(&self) -> u64 {
         self.index.total_height()
     }
 
     /// Convert exact virtual-list geometry into terminal scrollbar state.
     #[must_use]
-    pub fn scrollbar_state(&self, viewport_height: usize) -> crate::scrollbar::ScrollbarState {
+    pub fn scrollbar_state(&self, viewport_height: u64) -> crate::scrollbar::ScrollbarState {
         scrollbar_state(
             self.index.total_height(),
             viewport_height,
@@ -142,7 +142,7 @@ where
     }
 
     /// Move by a signed logical row delta and clamp to the collection extent.
-    pub fn scroll_by(&mut self, rows: isize, viewport_height: usize) -> bool {
+    pub fn scroll_by(&mut self, rows: i64, viewport_height: u64) -> bool {
         let old = self.scroll.vertical_offset();
         let next = old.saturating_add_signed(rows);
         let maximum = self.index.total_height().saturating_sub(viewport_height);
@@ -151,7 +151,7 @@ where
     }
 
     /// Scroll to the final logical collection row and follow subsequent appends.
-    pub fn scroll_to_bottom(&mut self, viewport_height: usize) {
+    pub fn scroll_to_bottom(&mut self, viewport_height: u64) {
         let maximum = self.index.total_height().saturating_sub(viewport_height);
         self.scroll.set_vertical_offset(maximum);
         self.scroll.set_follow_bottom(true);
@@ -159,7 +159,7 @@ where
 
     /// Clamp logical scrolling to the current collection extent without changing
     /// whether subsequent appends are followed.
-    pub fn clamp_scroll(&mut self, viewport_height: usize) {
+    pub fn clamp_scroll(&mut self, viewport_height: u64) {
         let maximum = self.index.total_height().saturating_sub(viewport_height);
         let follow_bottom = self.scroll.follows_bottom();
         self.scroll
@@ -169,7 +169,7 @@ where
 
     /// Logical start row for a stable key.
     #[must_use]
-    pub fn item_offset(&self, key: &K) -> Option<usize> {
+    pub fn item_offset(&self, key: &K) -> Option<u64> {
         self.index
             .index_of(key)
             .and_then(|index| self.index.item_offset(index))
@@ -177,7 +177,7 @@ where
 
     /// Measured logical height for a stable key at the synchronized width.
     #[must_use]
-    pub fn item_height(&self, key: &K) -> Option<usize> {
+    pub fn item_height(&self, key: &K) -> Option<u64> {
         self.index
             .index_of(key)
             .and_then(|index| self.index.item(index))
@@ -186,7 +186,7 @@ where
 
     /// Stable key containing one logical collection row.
     #[must_use]
-    pub fn key_at_offset(&self, offset: usize) -> Option<&K> {
+    pub fn key_at_offset(&self, offset: u64) -> Option<&K> {
         self.index
             .item_at_offset(offset)
             .and_then(|index| self.index.item(index))
@@ -264,7 +264,7 @@ where
     /// # Panics
     ///
     /// Panics if stable item keys or their string representations are duplicated.
-    pub fn sync(&self, width: u16, state: &mut VirtualListState<K>, cx: &mut LayoutCx) {
+    pub fn sync(&self, width: u64, state: &mut VirtualListState<K>, cx: &mut LayoutCx) {
         self.sync_with_environment(width, LayoutEnvironment::default(), state, cx);
     }
 
@@ -276,7 +276,7 @@ where
     /// Panics if stable item keys or their string representations are duplicated.
     pub fn sync_with_environment(
         &self,
-        width: u16,
+        width: u64,
         environment: LayoutEnvironment,
         state: &mut VirtualListState<K>,
         cx: &mut LayoutCx,
@@ -310,14 +310,12 @@ where
                         item_layout_id(&self.id, key),
                         item.component.as_component(),
                         item.layout_revision,
-                        Constraints::for_width(width.into()),
+                        Constraints::for_width(width),
                         environment,
                         cx,
                     )
                     .size
                     .height
-                    .try_into()
-                    .unwrap_or(usize::MAX)
             },
         );
         state.layouts.retain_ids(&active);
@@ -336,12 +334,12 @@ where
     ) -> VirtualListRenderStats {
         let offset = state.scroll.vertical_offset();
         let clip = cx.area();
-        let first = usize::try_from(clip.y.max(0))
-            .unwrap_or(usize::MAX)
-            .min(usize::from(area.height));
-        let end = usize::try_from(clip.y.saturating_add(i64::from(clip.height)).max(0))
-            .unwrap_or(usize::MAX)
-            .min(usize::from(area.height));
+        let first = u64::try_from(clip.y.max(0))
+            .unwrap_or(u64::MAX)
+            .min(u64::from(area.height));
+        let end = u64::try_from(clip.y.saturating_add(i64::from(clip.height)).max(0))
+            .unwrap_or(u64::MAX)
+            .min(u64::from(area.height));
         let mut report = VirtualListRenderStats::default();
         if end <= first
             || clip.width == 0
@@ -369,10 +367,7 @@ where
                 .layouts
                 .get(&layout_id, item.layout_revision, constraints)
                 .expect("visible synchronized item must have retained layout");
-            debug_assert_eq!(
-                layout.size.height,
-                measured.height.try_into().unwrap_or(u64::MAX)
-            );
+            debug_assert_eq!(layout.size.height, measured.height);
             let local_y = i64::try_from(start)
                 .unwrap_or(i64::MAX)
                 .saturating_sub(i64::try_from(offset).unwrap_or(i64::MAX));
@@ -422,12 +417,12 @@ where
         cx: &mut EventCx<'_>,
     ) -> EventOutcome {
         let offset = state.scroll.vertical_offset();
-        let range = state.index.visible_range(offset, usize::from(area.height));
+        let range = state.index.visible_range(offset, u64::from(area.height));
         let viewport = cx.visible_rect(LogicalRect::new(
             area.x.into(),
             u64::try_from(usize::from(area.y)).unwrap_or(u64::MAX),
             u64::try_from(usize::from(area.width)).unwrap_or(u64::MAX),
-            u64::try_from(usize::from(area.height)).unwrap_or(u64::MAX),
+            u64::from(area.height),
         ));
         if viewport.is_empty() {
             return EventOutcome::Ignored;
@@ -455,10 +450,7 @@ where
                 .layouts
                 .get(&layout_id, item.layout_revision, constraints)
                 .expect("visible synchronized item must have retained layout");
-            debug_assert_eq!(
-                layout.size.height,
-                measured.height.try_into().unwrap_or(u64::MAX)
-            );
+            debug_assert_eq!(layout.size.height, measured.height);
             let local_y = i64::try_from(start)
                 .unwrap_or(i64::MAX)
                 .saturating_sub(i64::try_from(offset).unwrap_or(i64::MAX));
@@ -474,7 +466,7 @@ where
             }
             let outcome = cx.with_transform(
                 0,
-                start.try_into().unwrap_or(u64::MAX),
+                start,
                 i32::from(area.x),
                 i64::from(area.y).saturating_add(local_y),
                 item_area,
@@ -497,7 +489,7 @@ where
         &self,
         state: &mut VirtualListState<K>,
         key: &K,
-        viewport_height: usize,
+        viewport_height: u64,
     ) -> bool {
         if state.index.index_of(key).is_none() {
             return false;
@@ -508,7 +500,7 @@ where
 
     /// Logical start row for a stable key.
     #[must_use]
-    pub fn item_offset(&self, state: &VirtualListState<K>, key: &K) -> Option<usize> {
+    pub fn item_offset(&self, state: &VirtualListState<K>, key: &K) -> Option<u64> {
         state.item_offset(key)
     }
 }
@@ -526,7 +518,7 @@ fn item_layout_id<K: ToString>(list_id: &str, key: &K) -> LayoutId {
     LayoutId::new(format!("{list_id}.item.{}", key.to_string()))
 }
 
-fn translated_item_area(area: Rect, local_y: i64, item_height: usize) -> Rect {
+fn translated_item_area(area: Rect, local_y: i64, item_height: u64) -> Rect {
     let top = i64::from(area.y).saturating_add(local_y);
     let bottom = top.saturating_add(i64::try_from(item_height).unwrap_or(i64::MAX));
     let visible_top = top.clamp(i64::from(area.y), i64::from(area.bottom()));
@@ -656,7 +648,7 @@ mod tests {
                     );
                 }
             }
-            if !state.scroll_by(1, usize::from(viewport.height)) {
+            if !state.scroll_by(1, u64::from(viewport.height)) {
                 break;
             }
         }
@@ -667,12 +659,12 @@ mod tests {
             .filter_map(|index| {
                 let start = state.item_offset(&index).unwrap();
                 let height = state.index.item(index).unwrap().height;
-                let visible_start = start.max(usize::from(offset) + 1);
-                let visible_end = (start + height).min(usize::from(offset) + 3);
+                let visible_start = start.max(u64::from(offset) + 1);
+                let visible_end = (start + height).min(u64::from(offset) + 3);
                 (visible_start < visible_end).then(|| {
                     Rect::new(
                         2,
-                        u16::try_from(visible_start - usize::from(offset) + 2).unwrap(),
+                        u16::try_from(visible_start - u64::from(offset) + 2).unwrap(),
                         12,
                         u16::try_from(visible_end - visible_start).unwrap(),
                     )
@@ -734,7 +726,7 @@ mod tests {
 
     struct RevisedHeightItem {
         revision: u64,
-        height: usize,
+        height: u64,
     }
 
     impl Component for RevisedHeightItem {
@@ -746,10 +738,7 @@ mod tests {
             cx.record_measurement();
             LayoutNode::leaf(
                 LayoutId::new("revised-height"),
-                constraints.constrain(LogicalSize::new(
-                    constraints.max_width(),
-                    self.height.try_into().unwrap_or(u64::MAX),
-                )),
+                constraints.constrain(LogicalSize::new(constraints.max_width(), self.height)),
             )
         }
 
@@ -758,7 +747,7 @@ mod tests {
 
     struct MetadataItem {
         id: &'static str,
-        height: usize,
+        height: u64,
         cursor_row: Option<u16>,
     }
 
@@ -767,10 +756,7 @@ mod tests {
             cx.record_measurement();
             LayoutNode::leaf(
                 LayoutId::new(self.id),
-                constraints.constrain(LogicalSize::new(
-                    constraints.max_width(),
-                    self.height.try_into().unwrap_or(u64::MAX),
-                )),
+                constraints.constrain(LogicalSize::new(constraints.max_width(), self.height)),
             )
         }
 
@@ -1027,7 +1013,7 @@ mod tests {
 
     struct EventItem {
         id: &'static str,
-        height: usize,
+        height: u64,
         outcome: EventOutcome,
     }
 
@@ -1036,10 +1022,7 @@ mod tests {
             cx.record_measurement();
             LayoutNode::leaf(
                 LayoutId::new(self.id),
-                constraints.constrain(LogicalSize::new(
-                    constraints.max_width(),
-                    self.height.try_into().unwrap_or(u64::MAX),
-                )),
+                constraints.constrain(LogicalSize::new(constraints.max_width(), self.height)),
             )
         }
 
@@ -1507,7 +1490,7 @@ mod tests {
         assert!(state.scroll_by(-2, 2));
         assert_eq!(state.scroll.vertical_offset(), 1);
         assert!(!state.scroll.follows_bottom());
-        assert!(state.scroll_by(isize::MAX, 2));
+        assert!(state.scroll_by(i64::MAX, 2));
         assert_eq!(state.scroll.vertical_offset(), 3);
         assert!(!state.scroll_by(1, 2));
         state.scroll_to_top();
@@ -1606,14 +1589,14 @@ mod tests {
             "a",
             TextBlock::new("message").style(Style::new().fg(bmux_tui::style::Color::Red)),
         );
-        initial.sync(area.width, &mut state, &mut cx);
+        initial.sync(u64::from(area.width), &mut state, &mut cx);
         let measured = cx.measured_nodes();
 
         let changed = VirtualList::new("messages").component(
             "a",
             TextBlock::new("message").style(Style::new().fg(bmux_tui::style::Color::Blue)),
         );
-        changed.sync(area.width, &mut state, &mut cx);
+        changed.sync(u64::from(area.width), &mut state, &mut cx);
         assert_eq!(cx.measured_nodes(), measured);
 
         let mut buffer = Buffer::empty(area);
@@ -2005,9 +1988,9 @@ mod tests {
         width: u16,
         state: &mut VirtualListState<&'a str>,
         key: &str,
-        row: usize,
+        row: u64,
     ) {
-        list.sync(width, state, &mut LayoutCx::new());
+        list.sync(u64::from(width), state, &mut LayoutCx::new());
         state.restore_anchor(3);
         assert_eq!(
             state.scroll.vertical_offset(),
@@ -2043,7 +2026,7 @@ mod tests {
             .item("b", 0, TextBlock::new("several wrapped words"))
             .item("c", 0, TextBlock::new("last"));
         for viewport in [0, 1, 3, 100] {
-            for offset in [0, 2, usize::MAX] {
+            for offset in [0, 2, u64::MAX] {
                 for key in ["a", "b", "c", "missing"] {
                     let mut through_list = VirtualListState::new(1);
                     let mut through_state = VirtualListState::new(1);

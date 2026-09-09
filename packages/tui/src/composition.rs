@@ -4,11 +4,12 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use crate::chrome::Border;
+use crate::component::LogicalInsets;
 use crate::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, LayoutCx, LayoutId,
     LayoutNode, LogicalSize, combine_child_revisions,
 };
-use crate::geometry::{Insets, Rect};
+use crate::geometry::Rect;
 use crate::paint::{LocalRect, PaintCx};
 use crate::selection::{SelectionContentId, SelectionScopeId, plain_text_fragments};
 use crate::style::Style;
@@ -52,7 +53,7 @@ fn event_children(
         .unwrap_or(crate::event::EventOutcome::Ignored)
 }
 
-fn hash_insets(insets: Insets, state: &mut impl Hasher) {
+fn hash_insets(insets: LogicalInsets, state: &mut impl Hasher) {
     insets.top.hash(state);
     insets.right.hash(state);
     insets.bottom.hash(state);
@@ -632,7 +633,7 @@ pub struct Surface<'a> {
     content_style: Style,
     border: Option<Border>,
     paint_border: bool,
-    padding: Insets,
+    padding: LogicalInsets,
 }
 
 impl<'a> Surface<'a> {
@@ -646,7 +647,7 @@ impl<'a> Surface<'a> {
             content_style: Style::new(),
             border: None,
             paint_border: true,
-            padding: Insets::all(0),
+            padding: LogicalInsets::all(0),
         }
     }
 
@@ -687,17 +688,17 @@ impl<'a> Surface<'a> {
 
     /// Set child padding.
     #[must_use]
-    pub const fn padding(mut self, padding: Insets) -> Self {
-        self.padding = padding;
+    pub fn padding(mut self, padding: impl Into<LogicalInsets>) -> Self {
+        self.padding = padding.into();
         self
     }
 
-    const fn insets(&self) -> Insets {
-        let border = match &self.border {
-            Some(border) => border.sides.insets(),
-            None => Insets::all(0),
-        };
-        Insets::new(
+    fn insets(&self) -> LogicalInsets {
+        let border = self.border.as_ref().map_or_else(
+            || LogicalInsets::all(0),
+            |border| LogicalInsets::from(border.sides.insets()),
+        );
+        LogicalInsets::new(
             border.top.saturating_add(self.padding.top),
             border.right.saturating_add(self.padding.right),
             border.bottom.saturating_add(self.padding.bottom),
@@ -729,27 +730,17 @@ impl Component for Surface<'_> {
         cx.record_measurement();
         let insets = self.insets();
         let child = self.child.layout(
-            constraints.inset(u64::from(insets.horizontal()), u64::from(insets.vertical())),
+            constraints.inset(insets.horizontal(), insets.vertical()),
             cx,
         );
         let size = constraints.constrain(LogicalSize::new(
-            child
-                .size
-                .width
-                .saturating_add(u64::from(insets.horizontal())),
-            child
-                .size
-                .height
-                .saturating_add(u64::from(insets.vertical())),
+            child.size.width.saturating_add(insets.horizontal()),
+            child.size.height.saturating_add(insets.vertical()),
         ));
         LayoutNode::with_children(
             self.id.clone(),
             size,
-            vec![ChildLayout::new(
-                u64::from(insets.left),
-                u64::from(insets.top),
-                child,
-            )],
+            vec![ChildLayout::new(insets.left, insets.top, child)],
         )
     }
 
@@ -910,7 +901,7 @@ pub struct Padding<'a> {
 impl<'a> Padding<'a> {
     /// Create a padding wrapper.
     #[must_use]
-    pub fn new(insets: Insets, child: impl Component + 'a) -> Self {
+    pub fn new(insets: impl Into<LogicalInsets>, child: impl Component + 'a) -> Self {
         Self {
             surface: Surface::new(child).id("padding").padding(insets),
         }
@@ -1583,7 +1574,7 @@ impl<'a> Flex<'a> {
 pub struct Row<'a> {
     id: LayoutId,
     children: Vec<RowChild<'a>>,
-    gap: u16,
+    gap: u64,
     alignment: VerticalAlignment,
 }
 
@@ -1608,7 +1599,7 @@ impl<'a> Row<'a> {
 
     /// Set cells between children.
     #[must_use]
-    pub const fn gap(mut self, gap: u16) -> Self {
+    pub const fn gap(mut self, gap: u64) -> Self {
         self.gap = gap;
         self
     }
@@ -1680,7 +1671,7 @@ impl Component for Row<'_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let gaps = u64::from(self.gap).saturating_mul(
+        let gaps = self.gap.saturating_mul(
             u64::try_from(self.children.len().saturating_sub(1)).expect("child count fits u64"),
         );
         let available = constraints.max_width().saturating_sub(gaps);
@@ -1727,10 +1718,10 @@ impl Component for Row<'_> {
             height = height.max(node.size.height);
             let width = node.size.width;
             children.push(ChildLayout::new(x, 0, node));
-            x = x.saturating_add(width).saturating_add(u64::from(self.gap));
+            x = x.saturating_add(width).saturating_add(self.gap);
         }
         if !children.is_empty() {
-            x = x.saturating_sub(u64::from(self.gap));
+            x = x.saturating_sub(self.gap);
         }
         let size = constraints.constrain(LogicalSize::new(x, height));
         for (index, child) in children.iter_mut().enumerate() {
@@ -1782,7 +1773,7 @@ pub struct Column<'a> {
     id: LayoutId,
     children: Vec<Element<'a>>,
     weights: Vec<u16>,
-    gap: usize,
+    gap: u64,
     alignment: HorizontalAlignment,
 }
 
@@ -1808,7 +1799,7 @@ impl<'a> Column<'a> {
 
     /// Set logical rows between children.
     #[must_use]
-    pub const fn gap(mut self, gap: usize) -> Self {
+    pub const fn gap(mut self, gap: u64) -> Self {
         self.gap = gap;
         self
     }
@@ -1891,12 +1882,10 @@ impl Component for Column<'_> {
                     })
                     .sum::<u64>();
                 height.saturating_sub(fixed).saturating_sub(
-                    u64::try_from(self.gap)
-                        .expect("gap fits logical coordinates")
-                        .saturating_mul(
-                            u64::try_from(self.children.len().saturating_sub(1))
-                                .expect("child count fits logical coordinates"),
-                        ),
+                    self.gap.saturating_mul(
+                        u64::try_from(self.children.len().saturating_sub(1))
+                            .expect("child count fits logical coordinates"),
+                    ),
                 )
             });
         let mut allocated = 0u64;
@@ -1926,10 +1915,10 @@ impl Component for Column<'_> {
             children.push(ChildLayout::new(x, y, node));
             y = y
                 .saturating_add(children.last().map_or(0, |child| child.node.size.height))
-                .saturating_add(u64::try_from(self.gap).expect("gap fits logical coordinates"));
+                .saturating_add(self.gap);
         }
         if !children.is_empty() {
-            y = y.saturating_sub(u64::try_from(self.gap).expect("gap fits logical coordinates"));
+            y = y.saturating_sub(self.gap);
         }
         let size = constraints.constrain(LogicalSize::new(width, y));
         LayoutNode::with_children(self.id.clone(), size, children)
@@ -2508,6 +2497,26 @@ mod tests {
             .width,
             u64::from(u16::MAX)
         );
+    }
+
+    #[test]
+    fn logical_spacing_exceeds_terminal_coordinates() {
+        let gap = u64::from(u32::MAX) + 1;
+        let row = Row::new()
+            .gap(gap)
+            .child(SizeBox::new(TextBlock::new("a")).width(1))
+            .child(SizeBox::new(TextBlock::new("b")).width(1));
+        let layout = row.layout(Constraints::for_width(gap + 2), &mut LayoutCx::new());
+        assert_eq!(layout.children[1].x, gap + 1);
+
+        let padded = Padding::new(
+            crate::component::LogicalInsets::new(gap, gap, gap, gap),
+            TextBlock::new("x"),
+        );
+        let layout = padded.layout(Constraints::for_width(gap * 2 + 1), &mut LayoutCx::new());
+        assert_eq!(layout.children[0].x, gap);
+        assert_eq!(layout.children[0].y, gap);
+        assert_eq!(layout.size, LogicalSize::new(gap * 2 + 1, gap * 2 + 1));
     }
 
     #[test]

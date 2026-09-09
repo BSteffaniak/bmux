@@ -16,6 +16,61 @@ use crate::event::{Event, EventOutcome};
 use crate::geometry::{Rect, Size};
 use crate::paint::PaintCx;
 
+/// Logical padding around component content, independent of terminal size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct LogicalInsets {
+    /// Top padding in rows.
+    pub top: u64,
+    /// Right padding in cells.
+    pub right: u64,
+    /// Bottom padding in rows.
+    pub bottom: u64,
+    /// Left padding in cells.
+    pub left: u64,
+}
+
+impl LogicalInsets {
+    /// Create logical edge padding.
+    #[must_use]
+    pub const fn new(top: u64, right: u64, bottom: u64, left: u64) -> Self {
+        Self {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+
+    /// Use the same padding on every edge.
+    #[must_use]
+    pub const fn all(value: u64) -> Self {
+        Self::new(value, value, value, value)
+    }
+
+    /// Combined horizontal padding.
+    #[must_use]
+    pub const fn horizontal(self) -> u64 {
+        self.left.saturating_add(self.right)
+    }
+
+    /// Combined vertical padding.
+    #[must_use]
+    pub const fn vertical(self) -> u64 {
+        self.top.saturating_add(self.bottom)
+    }
+}
+
+impl From<crate::geometry::Insets> for LogicalInsets {
+    fn from(value: crate::geometry::Insets) -> Self {
+        Self::new(
+            value.top.into(),
+            value.right.into(),
+            value.bottom.into(),
+            value.left.into(),
+        )
+    }
+}
+
 /// Root-relative rectangle in logical component coordinates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct LogicalRect {

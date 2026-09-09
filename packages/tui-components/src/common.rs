@@ -254,8 +254,8 @@ impl ResizeBounds {
 /// Logical geometry is unbounded; this is the single conversion used where a
 /// component projects a logical size onto a terminal rectangle.
 #[must_use]
-pub fn u16_saturating(value: usize) -> u16 {
-    u16::try_from(value).unwrap_or(u16::MAX)
+pub fn u16_saturating(value: impl TryInto<u16>) -> u16 {
+    value.try_into().unwrap_or(u16::MAX)
 }
 
 /// The local-coordinate rectangle covering a resolved logical size.

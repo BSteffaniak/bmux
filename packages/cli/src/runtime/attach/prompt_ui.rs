@@ -117,7 +117,7 @@ enum PromptWidgetState {
         list: VirtualListState<usize>,
         // Separate width-specific probe; released with the prompt.
         width_probe: Box<VirtualListState<usize>>,
-        viewport_height: usize,
+        viewport_height: u64,
         viewport_width: u16,
     },
     MultiToggle {
@@ -1083,7 +1083,7 @@ impl AttachPromptState {
             } else {
                 3
             };
-            list.scroll_by(delta, usize::from(active.list_viewport.height));
+            list.scroll_by(delta, u64::from(active.list_viewport.height));
             active.manual_list_scroll = true;
             return PromptKeyDisposition::Consumed;
         }
@@ -1933,7 +1933,7 @@ fn search_select_page_target(
     list: &VirtualListState<usize>,
     filtered: &[usize],
     selected: usize,
-    viewport_height: usize,
+    viewport_height: u64,
     forward: bool,
 ) -> usize {
     let final_index = filtered.len().saturating_sub(1);
@@ -1977,12 +1977,12 @@ fn sync_search_select_width(
     probe: &mut VirtualListState<usize>,
     painted: &mut VirtualListState<usize>,
     available_width: u16,
-    viewport_height: usize,
+    viewport_height: u64,
 ) -> u16 {
-    list.sync(available_width, probe, &mut LayoutCx::new());
+    list.sync(u64::from(available_width), probe, &mut LayoutCx::new());
     let gutter = available_width > 1 && probe.total_height() > viewport_height;
     let width = available_width.saturating_sub(u16::from(gutter));
-    list.sync(width, painted, &mut LayoutCx::new());
+    list.sync(u64::from(width), painted, &mut LayoutCx::new());
     width
 }
 
@@ -2054,12 +2054,12 @@ fn render_single_select(
     if active.manual_list_scroll {
         state.capture_anchor();
     }
-    items.sync(content.width, state, &mut LayoutCx::new());
+    items.sync(u64::from(content.width), state, &mut LayoutCx::new());
     active.list_viewport = content;
     if active.manual_list_scroll {
-        state.restore_anchor(usize::from(content.height));
+        state.restore_anchor(u64::from(content.height));
     } else if !options.is_empty() {
-        items.ensure_item_visible(state, selected, usize::from(content.height));
+        items.ensure_item_visible(state, selected, u64::from(content.height));
     }
     cx.with_child(
         i32::from(content.x),
@@ -2143,7 +2143,7 @@ fn render_command_palette(
     }
     let palette_area = Rect::new(content.x, palette_y, content.width, palette_height);
     let list_viewport = palette_height.saturating_sub(2);
-    *viewport_height = usize::from(list_viewport);
+    *viewport_height = u64::from(list_viewport);
     let list =
         filtered
             .iter()
@@ -2179,7 +2179,7 @@ fn render_command_palette(
         width_probe,
         list_state,
         palette_area.width,
-        usize::from(list_viewport),
+        u64::from(list_viewport),
     );
     let show_scrollbar = resolved_width < palette_area.width;
     let component_area = Rect::new(
@@ -2211,9 +2211,9 @@ fn render_command_palette(
     );
     active.list_viewport = list_area;
     if active.manual_list_scroll {
-        list_state.restore_anchor(usize::from(list_area.height));
+        list_state.restore_anchor(u64::from(list_area.height));
     } else if let Some(source_index) = filtered.get(*selected) {
-        list.ensure_item_visible(list_state, source_index, usize::from(list_area.height));
+        list.ensure_item_visible(list_state, source_index, u64::from(list_area.height));
     }
     if filtered.is_empty() {
         cx.write_line_with_fallback_style(
@@ -2243,7 +2243,7 @@ fn render_command_palette(
             list_viewport,
         );
         let scrollbar_state =
-            std::cell::Cell::new(list_state.scrollbar_state(usize::from(list_viewport)));
+            std::cell::Cell::new(list_state.scrollbar_state(u64::from(list_viewport)));
         let scrollbar = ScrollbarComponent::new("command-palette-scrollbar", &scrollbar_state)
             .policy(ScrollbarPolicy::bare())
             .styles(ScrollbarStyles {
@@ -3724,7 +3724,7 @@ mod tests {
         assert_eq!(*selected, 0);
         assert_eq!(
             list.scroll.vertical_offset(),
-            list.total_height() - usize::from(area.height)
+            list.total_height() - u64::from(area.height)
         );
         state.handle_key_event(&key_event(KeyCode::Down));
         state
@@ -4406,7 +4406,7 @@ mod tests {
         };
         assert_eq!(
             *selected,
-            (*viewport_height).min(29),
+            usize::try_from((*viewport_height).min(29)).unwrap(),
             "one-row results page by exactly the viewport height"
         );
         assert!(

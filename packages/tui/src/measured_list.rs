@@ -17,11 +17,11 @@ pub struct MeasuredListItem<K> {
     /// Caller-owned layout revision.
     pub layout_revision: u64,
     /// Width at which `height` was measured.
-    pub width: u16,
+    pub width: u64,
     /// Geometry-affecting terminal capability revision at measurement time.
     pub capability_revision: u64,
     /// Exact logical item height, excluding collection gap.
-    pub height: usize,
+    pub height: u64,
 }
 
 impl<K> MeasuredListItem<K> {
@@ -30,9 +30,9 @@ impl<K> MeasuredListItem<K> {
     pub const fn new(
         key: K,
         layout_revision: u64,
-        width: u16,
+        width: u64,
         capability_revision: u64,
-        height: usize,
+        height: u64,
     ) -> Self {
         Self {
             key,
@@ -52,7 +52,7 @@ pub struct VisibleItemRange {
     /// Last intersecting item index, exclusive.
     pub end: usize,
     /// Logical row clipped from the first item's top.
-    pub first_item_offset: usize,
+    pub first_item_offset: u64,
 }
 
 /// Retained keyed index for exact variable-height item geometry.
@@ -61,7 +61,7 @@ pub struct MeasuredListIndex<K> {
     items: Vec<MeasuredListItem<K>>,
     key_to_index: BTreeMap<K, usize>,
     tree: FenwickTree,
-    gap: usize,
+    gap: u64,
 }
 
 impl<K> MeasuredListIndex<K>
@@ -70,7 +70,7 @@ where
 {
     /// Create an empty measured collection with a logical inter-item gap.
     #[must_use]
-    pub fn new(gap: usize) -> Self {
+    pub fn new(gap: u64) -> Self {
         Self {
             items: Vec::new(),
             key_to_index: BTreeMap::new(),
@@ -90,9 +90,9 @@ where
     pub fn sync(
         &mut self,
         entries: impl IntoIterator<Item = (K, u64)>,
-        width: u16,
+        width: u64,
         capability_revision: u64,
-        mut measure: impl FnMut(&K) -> usize,
+        mut measure: impl FnMut(&K) -> u64,
     ) {
         let mut retained = std::mem::take(&mut self.items)
             .into_iter()
@@ -120,7 +120,7 @@ where
     }
 
     /// Update one item's exact height in logarithmic time.
-    pub fn update_height(&mut self, key: &K, height: usize) -> bool {
+    pub fn update_height(&mut self, key: &K, height: u64) -> bool {
         let Some(index) = self.key_to_index.get(key).copied() else {
             return false;
         };
@@ -145,7 +145,7 @@ where
 
     /// Logical gap after each indexed item except the final item.
     #[must_use]
-    pub const fn gap(&self) -> usize {
+    pub const fn gap(&self) -> u64 {
         self.gap
     }
 
@@ -163,13 +163,13 @@ where
 
     /// Logical start row for one item.
     #[must_use]
-    pub fn item_offset(&self, index: usize) -> Option<usize> {
+    pub fn item_offset(&self, index: usize) -> Option<u64> {
         (index < self.items.len()).then(|| self.tree.prefix_sum(index))
     }
 
     /// Total logical collection height, excluding a trailing gap.
     #[must_use]
-    pub fn total_height(&self) -> usize {
+    pub fn total_height(&self) -> u64 {
         self.tree
             .total()
             .saturating_sub(if self.items.is_empty() { 0 } else { self.gap })
@@ -178,7 +178,7 @@ where
     /// Find the item containing one logical row. Rows in an inter-item gap map
     /// to the preceding item so viewport projection remains monotonic.
     #[must_use]
-    pub fn item_at_offset(&self, offset: usize) -> Option<usize> {
+    pub fn item_at_offset(&self, offset: u64) -> Option<usize> {
         if self.items.is_empty() || offset >= self.total_height() {
             return None;
         }
@@ -187,7 +187,7 @@ where
 
     /// Find items intersecting a logical viewport.
     #[must_use]
-    pub fn visible_range(&self, offset: usize, viewport_height: usize) -> VisibleItemRange {
+    pub fn visible_range(&self, offset: u64, viewport_height: u64) -> VisibleItemRange {
         if self.items.is_empty() || viewport_height == 0 || offset >= self.total_height() {
             return VisibleItemRange {
                 start: 0,
@@ -208,7 +208,7 @@ where
         }
     }
 
-    fn item_extent(&self, index: usize) -> usize {
+    fn item_extent(&self, index: usize) -> u64 {
         self.items[index].height.saturating_add(self.gap)
     }
 
@@ -238,12 +238,12 @@ where
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FenwickTree {
-    values: Vec<usize>,
-    tree: Vec<usize>,
+    values: Vec<u64>,
+    tree: Vec<u64>,
 }
 
 impl FenwickTree {
-    fn from_values(values: impl IntoIterator<Item = usize>) -> Self {
+    fn from_values(values: impl IntoIterator<Item = u64>) -> Self {
         let values = values.into_iter().collect::<Vec<_>>();
         let mut result = Self {
             tree: vec![0; values.len().saturating_add(1)],
@@ -255,7 +255,7 @@ impl FenwickTree {
         result
     }
 
-    fn set(&mut self, index: usize, old: usize, new: usize) {
+    fn set(&mut self, index: usize, old: u64, new: u64) {
         if index >= self.values.len() {
             return;
         }
@@ -273,9 +273,9 @@ impl FenwickTree {
         }
     }
 
-    fn prefix_sum(&self, end: usize) -> usize {
+    fn prefix_sum(&self, end: usize) -> u64 {
         let mut cursor = end.min(self.values.len());
-        let mut total = 0usize;
+        let mut total = 0u64;
         while cursor > 0 {
             total = total.saturating_add(self.tree[cursor]);
             cursor &= cursor - 1;
@@ -283,14 +283,14 @@ impl FenwickTree {
         total
     }
 
-    fn total(&self) -> usize {
+    fn total(&self) -> u64 {
         self.prefix_sum(self.values.len())
     }
 
     /// Return the first value index whose inclusive prefix exceeds `target`.
-    fn upper_bound(&self, target: usize) -> usize {
+    fn upper_bound(&self, target: u64) -> usize {
         let mut index = 0usize;
-        let mut accumulated = 0usize;
+        let mut accumulated = 0u64;
         let mut step = if self.values.is_empty() {
             0
         } else {
@@ -362,7 +362,7 @@ mod tests {
         let mut keys = (0_u32..20).collect::<Vec<_>>();
         let mut heights = keys
             .iter()
-            .map(|key| (*key, usize::try_from(*key % 5 + 1).unwrap()))
+            .map(|key| (*key, u64::from(*key % 5 + 1)))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut index = MeasuredListIndex::new(2);
 
@@ -382,7 +382,7 @@ mod tests {
                             usize::try_from(seed).unwrap_or(0) % (keys.len() + 1)
                         };
                         keys.insert(position, key);
-                        usize::try_from(key % 7 + 1).unwrap()
+                        u64::from(key % 7 + 1)
                     });
                 }
                 2 if keys.len() > 1 => {
@@ -393,19 +393,16 @@ mod tests {
                 _ if !keys.is_empty() => {
                     let position = usize::try_from(seed >> 32).unwrap_or(0) % keys.len();
                     let key = keys[position];
-                    let height = usize::try_from(seed % 9 + 1).unwrap();
+                    let height = seed % 9 + 1;
                     heights.insert(key, height);
                 }
                 _ => {}
             }
 
-            index.sync(
-                keys.iter().map(|key| (*key, heights[key] as u64)),
-                20,
-                0,
-                |key| heights[key],
-            );
-            let mut expected_offset = 0usize;
+            index.sync(keys.iter().map(|key| (*key, heights[key])), 20, 0, |key| {
+                heights[key]
+            });
+            let mut expected_offset = 0u64;
             for (position, key) in keys.iter().enumerate() {
                 assert_eq!(index.index_of(key), Some(position));
                 assert_eq!(index.item_offset(position), Some(expected_offset));
@@ -442,35 +439,35 @@ mod tests {
         for _ in 0..500 {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             let len = usize::try_from(seed % 40).unwrap_or(0);
-            let gap = usize::try_from((seed >> 8) % 5).unwrap_or(0);
-            let viewport = usize::try_from((seed >> 16) % 20).unwrap_or(0);
+            let gap = (seed >> 8) % 5;
+            let viewport = (seed >> 16) % 20;
             let mut heights = std::collections::BTreeMap::new();
             let keys = (0..len)
                 .map(|key| {
                     let key = u32::try_from(key).unwrap();
                     seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                    heights.insert(key, usize::try_from(seed % 12 + 1).unwrap());
+                    heights.insert(key, seed % 12 + 1);
                     key
                 })
                 .collect::<Vec<_>>();
             let mut index = MeasuredListIndex::new(gap);
             index.sync(
-                keys.iter().map(|key| (*key, heights[key] as u64)),
-                u16::try_from((seed >> 24) % 80 + 1).unwrap(),
+                keys.iter().map(|key| (*key, heights[key])),
+                (seed >> 24) % 80 + 1,
                 0,
                 |key| heights[key],
             );
             let offset = if index.total_height() == 0 {
                 0
             } else {
-                usize::try_from(seed >> 32).unwrap_or(0) % (index.total_height() + 3)
+                (seed >> 32) % (index.total_height() + 3)
             };
 
             let actual = index.visible_range(offset, viewport);
             let expected_start = naive_item_at_offset(&keys, &heights, gap, offset);
             let expected = match expected_start {
                 Some(start) if viewport > 0 && offset < index.total_height() => {
-                    let start_offset = keys[..start].iter().fold(0usize, |sum, key| {
+                    let start_offset = keys[..start].iter().fold(0u64, |sum, key| {
                         sum.saturating_add(heights[key]).saturating_add(gap)
                     });
                     let end_offset = offset
@@ -497,11 +494,11 @@ mod tests {
 
     fn naive_item_at_offset(
         keys: &[u32],
-        heights: &std::collections::BTreeMap<u32, usize>,
-        gap: usize,
-        offset: usize,
+        heights: &std::collections::BTreeMap<u32, u64>,
+        gap: u64,
+        offset: u64,
     ) -> Option<usize> {
-        let mut start = 0usize;
+        let mut start = 0u64;
         for (index, key) in keys.iter().enumerate() {
             let end = start.saturating_add(heights[key]).saturating_add(gap);
             if offset < end {
@@ -510,6 +507,24 @@ mod tests {
             start = end;
         }
         None
+    }
+
+    #[test]
+    fn large_logical_heights_preserve_collection_indices() {
+        let height = u64::from(u32::MAX) + 1;
+        let mut index = MeasuredListIndex::new(3);
+        index.sync([("a", 0), ("b", 0)], height, 0, |_| height);
+        assert_eq!(index.item_offset(1), Some(height + 3));
+        assert_eq!(index.total_height(), height * 2 + 3);
+        assert_eq!(index.item_at_offset(height + 3), Some(1));
+        assert_eq!(
+            index.visible_range(height + 5, 1),
+            VisibleItemRange {
+                start: 1,
+                end: 2,
+                first_item_offset: 2,
+            }
+        );
     }
 
     #[test]

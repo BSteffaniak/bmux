@@ -191,8 +191,8 @@ impl TableRow {
 
     /// Return row height in rendered lines.
     #[must_use]
-    pub fn height(&self) -> usize {
-        self.cells.iter().map(Vec::len).max().unwrap_or(1).max(1)
+    pub fn height(&self) -> u64 {
+        u64::try_from(self.cells.iter().map(Vec::len).max().unwrap_or(1).max(1)).unwrap_or(u64::MAX)
     }
 
     /// Return plain text for one cell, joining multiline content with newlines.
@@ -276,23 +276,23 @@ impl TableState {
 
     /// Return horizontal scroll offset in content cells.
     #[must_use]
-    pub const fn horizontal_scroll(&self) -> usize {
+    pub const fn horizontal_scroll(&self) -> u64 {
         self.scroll.horizontal_offset()
     }
 
     /// Set horizontal scroll offset in content cells.
-    pub const fn set_horizontal_scroll(&mut self, horizontal_scroll: usize) {
+    pub const fn set_horizontal_scroll(&mut self, horizontal_scroll: u64) {
         self.scroll.set_horizontal_offset(horizontal_scroll);
     }
 
     /// Return the logical body-row scroll offset.
     #[must_use]
-    pub const fn scroll(&self) -> usize {
+    pub const fn scroll(&self) -> u64 {
         self.scroll.vertical_offset()
     }
 
     /// Set the logical body-row scroll offset.
-    pub const fn set_scroll(&mut self, scroll: usize) {
+    pub const fn set_scroll(&mut self, scroll: u64) {
         self.scroll.set_vertical_offset(scroll);
     }
 }
@@ -661,7 +661,7 @@ impl<'a> Table<'a> {
                 LogicalSize::new(
                     self.horizontal_content_width(&column_widths, body.width)
                         .into(),
-                    self.body_height().try_into().unwrap_or(u64::MAX),
+                    self.body_height(),
                 ),
             ),
         );
@@ -681,13 +681,13 @@ impl<'a> Table<'a> {
     /// every row at their exact heights, before viewport constraints apply.
     #[must_use]
     pub fn size(&self) -> (u16, u16) {
-        let header_rows = usize::from(self.policy.header);
-        let separator_rows = usize::from(self.policy.header && self.policy.header_separator);
+        let header_rows = u64::from(self.policy.header);
+        let separator_rows = u64::from(self.policy.header && self.policy.header_separator);
         let gutter = u16::from(matches!(
             self.policy.vertical_scrollbar,
             ScrollbarAxisLayoutMode::Gutter
         ));
-        let horizontal_gutter = usize::from(matches!(
+        let horizontal_gutter = u64::from(matches!(
             self.policy.horizontal_scrollbar,
             ScrollbarAxisLayoutMode::Gutter
         ));
@@ -967,19 +967,21 @@ impl<'a> Table<'a> {
             local_x
         } else if sticky > 0 {
             local_x
-                .saturating_add(horizontal)
+                .saturating_add(usize::try_from(horizontal).unwrap_or(usize::MAX))
                 .saturating_add(sticky_width)
                 .saturating_add(separator_width)
         } else {
-            local_x.saturating_add(horizontal)
+            local_x.saturating_add(usize::try_from(horizontal).unwrap_or(usize::MAX))
         };
-        let mut start = 0usize;
+        let mut start = 0u64;
         for (index, width) in layout.column_widths.iter().copied().enumerate() {
-            let end = start.saturating_add(usize::from(width));
-            if content_x >= start && content_x < end {
+            let end = start.saturating_add(u64::try_from(usize::from(width)).unwrap_or(u64::MAX));
+            if content_x >= usize::try_from(start).unwrap_or(usize::MAX)
+                && content_x < usize::try_from(end).unwrap_or(usize::MAX)
+            {
                 return Some(index);
             }
-            start = end.saturating_add(separator_width);
+            start = end.saturating_add(u64::try_from(separator_width).unwrap_or(u64::MAX));
         }
         None
     }
@@ -1003,8 +1005,8 @@ impl<'a> Table<'a> {
     ) -> Vec<HitRegion<usize>> {
         let body = layout.body;
         let offset = state.scroll.vertical_offset();
-        let viewport_end = offset.saturating_add(usize::from(body.height));
-        let mut start = 0usize;
+        let viewport_end = offset.saturating_add(u64::from(body.height));
+        let mut start = 0u64;
         let mut regions = Vec::new();
         for (index, row) in self.rows.iter().enumerate() {
             let end = start.saturating_add(row.height());
@@ -1054,12 +1056,12 @@ impl<'a> Table<'a> {
     }
 
     /// Exact stacked body height in logical rows.
-    fn body_height(&self) -> usize {
+    fn body_height(&self) -> u64 {
         self.rows.iter().map(TableRow::height).sum()
     }
 
     /// Logical start row of one source row.
-    fn row_start(&self, index: usize) -> Option<usize> {
+    fn row_start(&self, index: usize) -> Option<u64> {
         if index >= self.rows.len() {
             return None;
         }
@@ -1139,11 +1141,8 @@ impl<'a> Table<'a> {
         delta: i32,
     ) -> TableOutcome {
         let before_column = state.selected_column;
-        let scrolled = ScrollView::scroll_horizontal_by(
-            &layout.viewport,
-            &mut state.scroll,
-            isize::try_from(delta).unwrap_or(isize::MAX),
-        );
+        let scrolled =
+            ScrollView::scroll_horizontal_by(&layout.viewport, &mut state.scroll, i64::from(delta));
         let _ = self.move_column(state, delta);
         if scrolled == ScrollViewOutcome::Ignored && state.selected_column == before_column {
             TableOutcome::Ignored
@@ -1199,7 +1198,11 @@ impl<'a> Table<'a> {
         let horizontal = state.horizontal_scroll();
         let sticky = self.policy.sticky_left_columns.min(widths.len());
         if sticky == 0 {
-            return line_viewport(line, horizontal, usize::from(width));
+            return line_viewport(
+                line,
+                usize::try_from(horizontal).unwrap_or(usize::MAX),
+                usize::from(width),
+            );
         }
         let separator_width = display_width(self.policy.cell_separator);
         let sticky_width = widths
@@ -1216,7 +1219,7 @@ impl<'a> Table<'a> {
                 line,
                 sticky_width
                     .saturating_add(separator_width)
-                    .saturating_add(horizontal),
+                    .saturating_add(usize::try_from(horizontal).unwrap_or(usize::MAX)),
                 remaining,
             );
             left.spans.append(&mut right.spans);
@@ -1318,18 +1321,15 @@ impl Component for BodyRows<'_, '_> {
                 || LayoutId::new("table.content"),
                 |child| child.node.id.clone(),
             ),
-            LogicalSize::new(
-                constraints.max_width(),
-                self.table.body_height().try_into().unwrap_or(u64::MAX),
-            ),
+            LogicalSize::new(constraints.max_width(), self.table.body_height()),
         )
     }
 
     fn paint(&self, _layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let body = self.layout.body;
         let offset = self.state.scroll.vertical_offset();
-        let end = offset.saturating_add(usize::from(body.height));
-        let mut row = 0usize;
+        let end = offset.saturating_add(u64::from(body.height));
+        let mut row = 0u64;
         for (source, table_row) in self.table.rows.iter().enumerate() {
             if row >= end {
                 break;
@@ -1339,7 +1339,7 @@ impl Component for BodyRows<'_, '_> {
                     let line = self.table.row_line(
                         &self.layout.column_widths,
                         table_row.cells.iter().map(|cell| {
-                            cell.get(line_index)
+                            cell.get(usize::try_from(line_index).unwrap_or(usize::MAX))
                                 .cloned()
                                 .unwrap_or_else(|| Line::from(""))
                         }),

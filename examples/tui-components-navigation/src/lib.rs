@@ -586,7 +586,7 @@ pub fn demonstrate_pane_scroll_delegation() -> PaneOutcome {
     )
 }
 
-pub fn demonstrate_delegated_pane_scroll_offset() -> usize {
+pub fn demonstrate_delegated_pane_scroll_offset() -> u64 {
     let mut demo = NavigationDemo::new();
     let _ = demo.handle_event(&Event::Mouse(bmux_tui::event::MouseEvent::new(
         bmux_tui::event::MouseEventKind::ScrollDown,
@@ -614,7 +614,7 @@ pub fn demonstrate_breadcrumb_activation() -> String {
     demo.message
 }
 
-pub fn demonstrate_text_view_scroll() -> usize {
+pub fn demonstrate_text_view_scroll() -> u64 {
     let mut demo = NavigationDemo::new();
     let _ = demo.handle_event(&Event::Mouse(bmux_tui::event::MouseEvent::new(
         bmux_tui::event::MouseEventKind::ScrollDown,

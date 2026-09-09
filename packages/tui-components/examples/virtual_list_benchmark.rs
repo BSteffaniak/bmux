@@ -155,7 +155,7 @@ fn benchmark_composed_cards(count: usize) {
         "paint must remain viewport bounded"
     );
     let old_offset = state.scroll.vertical_offset();
-    assert!(state.scroll_by(1, usize::from(viewport.height)));
+    assert!(state.scroll_by(1, u64::from(viewport.height)));
     assert_eq!(state.scroll.vertical_offset(), old_offset + 1);
     // Pure scrolling consumes retained geometry; synchronization is a separate
     // diagnostic for callers that check unchanged models on every frame.
@@ -177,7 +177,7 @@ fn benchmark_composed_cards(count: usize) {
     let scroll_start = state.scroll.vertical_offset();
     for direction in [1, -1] {
         for _ in 0..64 {
-            assert!(state.scroll_by(direction, usize::from(viewport.height)));
+            assert!(state.scroll_by(direction, u64::from(viewport.height)));
             let report = paint_once(&list, &state, viewport);
             assert!(report.rendered.painted_items > 0);
             assert!(report.rendered.painted_items <= 6);
@@ -199,10 +199,10 @@ fn benchmark_composed_cards(count: usize) {
     );
     for (offset, direction) in [
         (0, -1),
-        (state.total_height() - usize::from(viewport.height), 1),
+        (state.total_height() - u64::from(viewport.height), 1),
     ] {
         state.scroll.set_vertical_offset(offset);
-        assert!(!state.scroll_by(direction, usize::from(viewport.height)));
+        assert!(!state.scroll_by(direction, u64::from(viewport.height)));
         assert_eq!(state.scroll.vertical_offset(), offset);
         let boundary = paint_once(&list, &state, viewport);
         assert!(boundary.rendered.painted_items > 0);
@@ -221,7 +221,7 @@ fn benchmark_composed_cards(count: usize) {
     let before_resize = cx.measured_nodes();
     let started = Instant::now();
     list.sync(24, &mut state, &mut cx);
-    state.restore_anchor(usize::from(viewport.height));
+    state.restore_anchor(u64::from(viewport.height));
     let resize = started.elapsed();
     let resize_measured = cx.measured_nodes() - before_resize;
     assert_eq!(
@@ -241,7 +241,7 @@ fn benchmark_composed_cards(count: usize) {
     assert!(resized_paint.rendered.painted_items <= 6);
     let before_widen = cx.measured_nodes();
     list.sync(40, &mut state, &mut cx);
-    state.restore_anchor(usize::from(viewport.height));
+    state.restore_anchor(u64::from(viewport.height));
     assert_eq!(
         cx.measured_nodes() - before_widen,
         0,
@@ -289,11 +289,13 @@ fn benchmark_composed_cards(count: usize) {
 
 fn benchmark_index_strategies() {
     for count in [100usize, 1_000, 10_000, 100_000] {
-        let heights = (0..count).map(|index| index % 3 + 1).collect::<Vec<_>>();
+        let heights = (0..count)
+            .map(|index| u64::try_from(index % 3 + 1).unwrap())
+            .collect::<Vec<_>>();
 
         let started = Instant::now();
         let mut prefixes = Vec::with_capacity(count.saturating_add(1));
-        prefixes.push(0usize);
+        prefixes.push(0u64);
         for height in &heights {
             prefixes.push(
                 prefixes
@@ -372,16 +374,16 @@ fn benchmark_count(count: usize) {
     let page_scroll = paint_once(&list, &state, viewport);
 
     state.scroll.set_follow_bottom(true);
-    state.restore_anchor(usize::from(viewport.height));
+    state.restore_anchor(u64::from(viewport.height));
     let started = Instant::now();
     let appended = build_list(count.saturating_add(1), 0);
     appended.sync(80, &mut state, &mut layout_cx);
-    state.restore_anchor(usize::from(viewport.height));
+    state.restore_anchor(u64::from(viewport.height));
     let append_follows_bottom = state.scroll.follows_bottom();
     let append_offset = state.scroll.vertical_offset();
     let append_maximum = state
         .total_height()
-        .saturating_sub(usize::from(viewport.height));
+        .saturating_sub(u64::from(viewport.height));
     let append = started.elapsed();
     let append_measured = layout_cx
         .measured_nodes()
@@ -402,7 +404,7 @@ fn benchmark_count(count: usize) {
     let started = Instant::now();
     let inserted = build_list_with_prefix(count, 0);
     inserted.sync(80, &mut state, &mut layout_cx);
-    state.restore_anchor(usize::from(viewport.height));
+    state.restore_anchor(u64::from(viewport.height));
     let insert_anchor_offset = state.item_offset(&insert_anchor_key).unwrap();
     let insert_restored_offset = state.scroll.vertical_offset();
     let insert = started.elapsed();
@@ -420,7 +422,7 @@ fn benchmark_count(count: usize) {
         .saturating_sub(state.item_offset(&remove_anchor_key).unwrap());
     let started = Instant::now();
     list.sync(80, &mut state, &mut layout_cx);
-    state.restore_anchor(usize::from(viewport.height));
+    state.restore_anchor(u64::from(viewport.height));
     let remove = started.elapsed();
     let remove_measured = layout_cx.measured_nodes().saturating_sub(before_remove);
     let remove_anchor_offset = state.item_offset(&remove_anchor_key).unwrap();
@@ -439,7 +441,7 @@ fn benchmark_count(count: usize) {
     let started = Instant::now();
     let reordered = build_reordered_list(count, 0);
     reordered.sync(80, &mut state, &mut layout_cx);
-    state.restore_anchor(usize::from(viewport.height));
+    state.restore_anchor(u64::from(viewport.height));
     let reorder_anchor_offset = state.item_offset(&reorder_anchor_key).unwrap();
     let reorder_restored_offset = state.scroll.vertical_offset();
     let reorder = started.elapsed();
@@ -466,7 +468,7 @@ fn benchmark_count(count: usize) {
     let before_resize = layout_cx.measured_nodes();
     let started = Instant::now();
     list.sync(64, &mut state, &mut layout_cx);
-    state.restore_anchor(usize::from(viewport.height));
+    state.restore_anchor(u64::from(viewport.height));
     let resize_anchor_offset = state.item_offset(&resize_anchor_key).unwrap();
     let resize_restored_offset = state.scroll.vertical_offset();
     let resize = started.elapsed();

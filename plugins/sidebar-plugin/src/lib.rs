@@ -403,8 +403,8 @@ impl CompanionState {
         bmux_tui_components::scroll_view::ScrollView::new().ensure_visible(
             &layout,
             &mut self.scroll,
-            usize::try_from(item.y).unwrap_or(usize::MAX),
-            usize::try_from(item.node.size.height).unwrap_or(usize::MAX),
+            item.y,
+            item.node.size.height,
         );
     }
 
@@ -934,7 +934,7 @@ fn push_wrapped_text(
 fn paint_sidebar_field(
     field: &bmux_tui::composition::TextBlock,
     child: &bmux_tui::component::ChildLayout,
-    placement: &(usize, std::ops::Range<usize>),
+    placement: &(u64, std::ops::Range<u64>),
     style: RenderStyle,
     ops: &mut Vec<RenderOp>,
 ) {
@@ -959,8 +959,8 @@ fn paint_sidebar_field(
             .collect::<String>();
         let logical_row = placement
             .0
-            .saturating_add(usize::try_from(child.y).unwrap_or(usize::MAX))
-            .saturating_add(offset);
+            .saturating_add(child.y)
+            .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
         let Some(projected) = bmux_tui_components::scroll_view::ScrollView::project_rows(
             &placement.1,
             logical_row..logical_row.saturating_add(1),
@@ -1031,16 +1031,14 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         ..state
             .scroll
             .vertical_offset()
-            .saturating_add(usize::try_from(layout.size.height).unwrap_or(usize::MAX));
+            .saturating_add(layout.size.height);
     let mut row = 1_u16;
     for (index, window) in state.snapshot.windows.iter().enumerate() {
         let item = &layout.children[0].node.children[index];
         let item_end = item.y.saturating_add(item.node.size.height);
-        let Some(projected) = bmux_tui_components::scroll_view::ScrollView::project_rows(
-            &visible,
-            usize::try_from(item.y).unwrap_or(usize::MAX)
-                ..usize::try_from(item_end).unwrap_or(usize::MAX),
-        ) else {
+        let Some(projected) =
+            bmux_tui_components::scroll_view::ScrollView::project_rows(&visible, item.y..item_end)
+        else {
             continue;
         };
         let fact = window_fact(window);
@@ -1063,16 +1061,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
                 "status" if window.active => active,
                 _ => inactive.dim(),
             };
-            paint_sidebar_field(
-                field,
-                child,
-                &(
-                    usize::try_from(item.y).unwrap_or(usize::MAX),
-                    visible.clone(),
-                ),
-                style,
-                &mut ops,
-            );
+            paint_sidebar_field(field, child, &(item.y, visible.clone()), style, &mut ops);
         }
         row = u16::try_from(projected.end + 1).unwrap_or(u16::MAX);
         regions.push(sidebar_region(

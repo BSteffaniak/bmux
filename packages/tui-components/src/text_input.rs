@@ -109,7 +109,7 @@ impl TextInputState {
 
     /// Return the vertical viewport scroll in wrapped rows.
     #[must_use]
-    pub const fn vertical_scroll(&self) -> usize {
+    pub const fn vertical_scroll(&self) -> u64 {
         self.scroll.vertical_offset()
     }
 
@@ -135,7 +135,7 @@ impl TextInputState {
 
     /// Return the scroll offset that keeps the cursor visible.
     #[must_use]
-    pub fn cursor_scroll_offset(&self, policy: &TextInputPolicy) -> Option<usize> {
+    pub fn cursor_scroll_offset(&self, policy: &TextInputPolicy) -> Option<u64> {
         if !policy.viewport.auto_scroll_to_cursor || self.content_area.height == 0 {
             return None;
         }
@@ -146,7 +146,12 @@ impl TextInputState {
         );
         // Preserve the editor's cursor-at-bottom policy while sharing reveal/clamping.
         let mut scroll = ScrollViewState::new();
-        ScrollView::new().ensure_visible(&viewport, &mut scroll, layout.cursor.row, 1);
+        ScrollView::new().ensure_visible(
+            &viewport,
+            &mut scroll,
+            u64::try_from(layout.cursor.row).unwrap_or(u64::MAX),
+            1,
+        );
         Some(scroll.vertical_offset())
     }
 
@@ -296,7 +301,7 @@ impl Component for TextInputComponent<'_, '_> {
             .selection_style(self.selection_style)
             .placeholder_style(self.placeholder_style)
             .cursor_visible(self.focused && !self.disabled)
-            .vertical_scroll(state.vertical_scroll());
+            .vertical_scroll(usize::try_from(state.vertical_scroll()).unwrap_or(usize::MAX));
         if let Some(placeholder) = self.placeholder {
             input = input.placeholder(placeholder);
         }
@@ -376,7 +381,7 @@ impl<'policy> TextInputControl<'policy> {
     pub fn handle_paste(&self, state: &mut TextInputState, text: &str) -> TextInputOutcome {
         state.buffer_mut().paste(text);
         if self.policy.viewport.auto_scroll_to_cursor {
-            state.scroll.set_vertical_offset(usize::MAX);
+            state.scroll.set_vertical_offset(u64::MAX);
         }
         TextInputOutcome::Edited
     }
@@ -960,7 +965,7 @@ fn mouse_wrapped_position(state: &TextInputState, mouse: MouseEvent) -> Option<(
     }
     Some((
         usize::from(mouse.position.y.saturating_sub(area.y))
-            .saturating_add(state.vertical_scroll()),
+            .saturating_add(usize::try_from(state.vertical_scroll()).unwrap_or(usize::MAX)),
         usize::from(mouse.position.x.saturating_sub(area.x)),
     ))
 }
@@ -990,7 +995,7 @@ fn drag_wrapped_position(
         let viewport = editor_viewport(area, state.wrapped_layout(area.width).lines.len());
         ScrollView::scroll_vertical_by(&viewport, &mut state.scroll, -1);
         return Some(DragPosition {
-            row: state.vertical_scroll(),
+            row: usize::try_from(state.vertical_scroll()).unwrap_or(usize::MAX),
             col,
             scrolled: state.vertical_scroll() != previous,
         });
@@ -1003,8 +1008,8 @@ fn drag_wrapped_position(
         let viewport = editor_viewport(area, state.wrapped_layout(area.width).lines.len());
         ScrollView::scroll_vertical_by(&viewport, &mut state.scroll, 1);
         return Some(DragPosition {
-            row: state
-                .vertical_scroll()
+            row: usize::try_from(state.vertical_scroll())
+                .unwrap_or(usize::MAX)
                 .saturating_add(usize::from(area.height).saturating_sub(1)),
             col,
             scrolled: state.vertical_scroll() != previous,
@@ -1012,7 +1017,7 @@ fn drag_wrapped_position(
     }
     Some(DragPosition {
         row: usize::from(mouse.position.y.saturating_sub(area.y))
-            .saturating_add(state.vertical_scroll()),
+            .saturating_add(usize::try_from(state.vertical_scroll()).unwrap_or(usize::MAX)),
         col,
         scrolled: false,
     })
@@ -1243,7 +1248,10 @@ mod tests {
                 state.buffer().selected_text().as_deref(),
                 Some(&state.buffer().text()[9..expected])
             );
-            assert!(state.wrapped_layout(width).cursor.row < state.vertical_scroll() + 3);
+            assert!(
+                u64::try_from(state.wrapped_layout(width).cursor.row).unwrap()
+                    < state.vertical_scroll() + 3
+            );
         }
     }
 
