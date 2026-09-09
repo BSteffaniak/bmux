@@ -11,6 +11,32 @@ capability CLUSTER_READ = bmux.server_clusters.read;
 capability CLUSTER_WRITE = bmux.server_clusters.write;
 capability CLUSTER_AUTH = bmux.server_clusters.auth;
 
+// Proof contract only: bootstrap mutation is not advertised until durable
+// application, capability negotiation, and snapshot preservation are connected.
+interface cluster-principal-bootstrap-types {
+    record bootstrap-statement {
+        schema-version: u16,
+        cluster-id: string,
+        membership-term: u64,
+        membership-leader-id: string,
+        membership-log-index: u64,
+        principal-id: uuid,
+        principal-public-key: string,
+        command-id: cluster-types.command-id,
+    }
+
+    record voter-approval {
+        node-id: string,
+        signature: bytes,
+    }
+
+    record bootstrap-proof {
+        statement: bootstrap-statement,
+        principal-signature: bytes,
+        voter-approvals: list<voter-approval>,
+    }
+}
+
 interface cluster-types {
     enum cluster-host-state {
         ready,

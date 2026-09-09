@@ -71,6 +71,32 @@ All peer and worker RPC uses mutual authentication and verifies:
 
 SSH, TLS, and Iroh may provide different transport mechanics, but they must produce the same authenticated peer identity semantics to the cluster plugin.
 
+## Principal bootstrap and authorization (2026-09-09 amendment)
+
+Principal UUIDs remain logical identity; a UUID supplied in a local handshake is not federated authentication. Federated enrollment binds that identity to a principal-controlled public key with proof of possession. Node keys and connection credentials remain distinct from principal keys.
+
+### Initial authority
+
+New clusters require principal-key proof of possession during explicit initialization and commit the first principal administrator with genesis. Private principal keys stay local; only public credentials and authority metadata are replicated.
+
+Existing clusters without principal authority use an explicit, one-time bootstrap transition. It requires signatures from a majority of the current committed voters over a canonical statement containing the cluster ID, committed membership revision, principal UUID, public key, and bootstrap command ID, plus proof of possession by that principal. The leader validates the signatures and membership using authoritative state before proposing the transition. Deterministic application verifies the bound membership revision and unused bootstrap state; quorum commit atomically records the administrator, command outcome, and permanently consumed bootstrap eligibility. Membership change during approval invalidates the old statement rather than substituting voters. Joint membership must satisfy both voter-majority requirements before this transition can commit.
+
+This is an explicitly approved migration authority, not an inference that connectivity or ordinary node membership grants resource permissions. Bootstrap cannot be reopened by deleting principals, restoring an older projection, or replaying an enrollment request. Snapshots retain consumed bootstrap state and recovery/deduplication metadata. Existing resources are preserved; this transition does not promote local resources into federation.
+
+After bootstrap, authenticated principal administrators authorize enrollment, grants, revocation, and credential rotation. Node membership alone grants no user permission. Loss of all administrator credentials does not enable node takeover or repeated bootstrap: administrator recovery requires a separately accepted procedure. Operations without a valid administrator fail explicitly rather than guessing authority.
+
+### Policy authority and enforcement
+
+Cluster consensus owns public principal credentials, credential epochs/revocations, and logical-workspace grants. The permissions plugin owns policy evaluation through a new versioned contract over authoritative records, not an ingress-local ACL copy or local session-ID reinterpretation. Missing permissions support denies federated operations while preserving the independent local single-user fallback.
+
+Authentication establishes proof of the enrolled principal key before ingress issues delegation. Signed delegation binds the original principal, credential epoch, cluster, issuer, exact audience/action/resource/command and canonical payload, expiry, and forwarding restrictions. Existing node mutual authentication and worker generation/lease fencing remain mandatory; neither replaces principal authentication or authorization.
+
+Authoritative services use consistent credential, membership, and policy reads. Authorization decisions bind their credential/policy/membership revisions to the proposed mutation. Deterministic apply checks these preconditions against committed state and rejects changes racing revocation or permission updates. Apply does not perform external permission calls, issue challenges, or consult local clocks. Reads and worker side effects likewise require current authorization at their authoritative boundary.
+
+Introduce explicit versioned authentication, delegated invocation, and policy contracts with committed capability/schema activation. New credentials cannot be accepted by silently reinterpreting old principal strings. Activation must close legacy unverified read/mutation bypasses; unsupported nodes or callers receive explicit incompatibility/authorization errors. Enrollment, bootstrap, rotation, revocation, and replay outcomes require atomic durable commits, bounded retention, snapshot preservation, and redacted audit records.
+
+Acceptance requires forged/duplicate/bootstrap replay rejection; membership-change and joint-quorum tests; principal proof and node/principal separation; revocation racing mutation; missing-policy denial; existing-cluster state preservation; snapshot restore of consumed bootstrap; explicit mixed-version rejection; and end-to-end ingress, leader, and worker authorization tests. This amendment ratifies the authority model, not implementation availability.
+
 ## Delegation
 
 When ingress forwards a user operation, it presents a signed short-lived delegation with:

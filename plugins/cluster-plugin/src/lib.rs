@@ -18,6 +18,7 @@ pub(crate) mod membership;
 mod native_consensus_service;
 pub(crate) mod pane;
 pub mod placement;
+pub mod principal_bootstrap;
 pub(crate) mod storage;
 pub mod worker_pane_runtime;
 pub mod worker_reconciler;
