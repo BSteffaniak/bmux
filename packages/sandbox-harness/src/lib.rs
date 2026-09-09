@@ -402,6 +402,30 @@ mod tests {
             .expect("sandbox shutdown should succeed");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_closes_an_idle_ipc_connection() {
+        let sandbox = SandboxHarness::start().await.expect("start");
+        let mut client = sandbox
+            .connect("idle-shutdown-test")
+            .await
+            .expect("connect");
+        client.ping().await.expect("initial round trip");
+        sandbox.server.request_shutdown();
+        // Keep the peer idle while the handler is blocked reading its socket.
+        // Its next round trip must observe termination, not another live handler.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if client.ping().await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle connection should close on shutdown");
+        sandbox.shutdown(false).await.expect("shutdown");
+    }
+
     #[test]
     fn ensure_sandbox_dirs_creates_sandbox_log_dir() {
         let (paths, root) = create_temp_paths();

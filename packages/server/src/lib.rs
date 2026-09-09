@@ -1318,6 +1318,9 @@ impl BmuxServer {
         // plugin's activate (see `plugins/snapshot-plugin/src/lib.rs`).
         // Server no longer spawns its own tokio flush task.
 
+        // Admit before spawning: overload must not create an unbounded set of
+        // waiting handler tasks, each with its own frame queue and encoder.
+        let transport_admission = Arc::new(tokio::sync::Semaphore::new(64));
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let shutdown_reason = loop {
             tokio::select! {
@@ -1333,10 +1336,15 @@ impl BmuxServer {
                 accepted = listener.accept() => {
                     match accepted {
                         Ok(stream) => {
+                            let Ok(permit) = Arc::clone(&transport_admission).try_acquire_owned() else {
+                                warn!("transport admission exhausted; rejecting connection");
+                                continue;
+                            };
+                            let permit = Arc::new(permit);
                             let state = Arc::clone(&self.state);
                             let shutdown_tx = self.shutdown_tx.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = handle_connection(state, shutdown_tx, stream).await {
+                                if let Err(error) = handle_connection(state, shutdown_tx, stream, permit).await {
                                     warn!("connection handler failed: {error:#}");
                                 }
                             });
@@ -1389,6 +1397,7 @@ async fn handle_connection(
     state: Arc<ServerState>,
     shutdown_tx: watch::Sender<bool>,
     mut stream: LocalIpcStream,
+    admission: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<()> {
     let client_id = ClientId::new();
     let client_principal_id: Uuid;
@@ -1462,7 +1471,7 @@ async fn handle_connection(
 
     // ── Split stream for concurrent read/write ───────────────────────────
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, writer) = stream.into_split();
 
     // Enable frame compression if negotiated.
     if negotiated_frame_codec.is_some() {
@@ -1475,21 +1484,41 @@ async fn handle_connection(
     // Channel-based writer: all outgoing frames (responses + pushed events)
     // are sent through this channel to a single writer task. This eliminates
     // mutex contention between the request loop and the event push task.
-    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Encoded frames have an IPC size ceiling. Bound queued frames as well:
+    // a stalled writer must not retain an unbounded stream of encoded output.
+    let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(16);
+    let writer_admission = Arc::clone(&admission);
+    let (writer_done_tx, mut writer_done_rx) = oneshot::channel();
+    let mut connection_shutdown = shutdown_tx.subscribe();
     let writer_task = tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            if writer.write_raw_frame(&frame).await.is_err() {
-                return;
-            }
-        }
+        // A cancelled handler must not release admission while its writer lives.
+        write_queued_frames(writer, frame_rx, Duration::from_secs(5)).await;
+        drop(writer_admission);
+        let _ = writer_done_tx.send(());
     });
 
+    let _writer_abort = AbortOnDrop(writer_task.abort_handle());
+    let mut push_abort = None;
     let mut event_push_task: Option<tokio::task::JoinHandle<()>> = None;
 
     // ── Request loop ─────────────────────────────────────────────────────
 
+    let request_result: Result<()> = async {
     loop {
-        let (envelope, request_read_timing) = match reader.recv_envelope_with_timing().await {
+        if *connection_shutdown.borrow() {
+            break;
+        }
+        let received = tokio::select! {
+            result = reader.recv_envelope_with_timing() => result,
+            _ = &mut writer_done_rx => break,
+            changed = connection_shutdown.changed() => {
+                if changed.is_err() || *connection_shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
+        let (envelope, request_read_timing) = match received {
             Ok(result) => result,
             Err(IpcTransportError::Io(error))
                 if error.kind() == std::io::ErrorKind::UnexpectedEof =>
@@ -1626,11 +1655,14 @@ async fn handle_connection(
         if is_enable_push && event_push_task.is_none() {
             state.event_push_clients.lock().await.insert(client_id);
             debug!(%client_id, "event_push.client_registered");
-            replay_retained_plugin_state_to_client(
-                &state,
-                &frame_tx,
-                negotiated_frame_codec.as_deref(),
-            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                replay_retained_plugin_state_to_client(
+                    &state,
+                    &frame_tx,
+                    negotiated_frame_codec.as_deref(),
+                ),
+            ).await.context("writer stalled during retained-state replay")?;
             let mut event_rx = state.event_broadcast.subscribe();
             let push_frame_tx = frame_tx.clone();
             let push_frame_codec = negotiated_frame_codec.clone();
@@ -1669,7 +1701,7 @@ async fn handle_connection(
                                 continue;
                             };
                             let frame_len = frame.len();
-                            if push_frame_tx.send(frame).is_err() {
+                            if push_frame_tx.send(frame).await.is_err() {
                                 return; // writer dropped (client disconnected)
                             }
                             if push_perf_settings.enabled() {
@@ -1752,7 +1784,7 @@ async fn handle_connection(
                                     continue;
                                 };
                                 let frame_len = frame.len();
-                                if push_frame_tx.send(frame).is_err() {
+                                if push_frame_tx.send(frame).await.is_err() {
                                     return;
                                 }
                                 if push_perf_settings.enabled() {
@@ -1770,18 +1802,23 @@ async fn handle_connection(
                     }
                 }
             }));
+            push_abort = event_push_task.as_ref().map(|task| AbortOnDrop(task.abort_handle()));
         }
     }
+    Ok(())
+    }.await;
 
     state.event_push_clients.lock().await.remove(&client_id);
 
     // Abort the event push task if running.
+    drop(push_abort);
     if let Some(task) = event_push_task {
         task.abort();
+        let _ = task.await;
     }
     // Drop the frame sender so the writer task exits.
     drop(frame_tx);
-    let _ = writer_task.await;
+    finish_writer(writer_task, std::time::Duration::from_secs(5)).await;
 
     detach_client_state_on_disconnect(
         &state,
@@ -1801,7 +1838,42 @@ async fn handle_connection(
     maybe_flush_snapshot(&state, false)?;
     unsubscribe_events(&state, client_id)?;
 
-    Ok(())
+    request_result
+}
+
+async fn write_queued_frames(
+    mut writer: bmux_ipc::transport::IpcStreamWriter,
+    mut frames: mpsc::Receiver<Vec<u8>>,
+    deadline: Duration,
+) {
+    while let Some(frame) = frames.recv().await {
+        // A timeout may leave a partial frame on the wire. Close the transport
+        // and discard the queue; never resume or retry this frame.
+        if !matches!(
+            tokio::time::timeout(deadline, writer.write_raw_frame(&frame)).await,
+            Ok(Ok(()))
+        ) {
+            break;
+        }
+    }
+}
+
+// JoinHandle alone detaches on drop. Keep cancellation ownership even while a
+// task is being joined, so dropping the parent future cannot strand its IO.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn finish_writer(mut task: tokio::task::JoinHandle<()>, timeout: std::time::Duration) {
+    let _abort = AbortOnDrop(task.abort_handle());
+    if tokio::time::timeout(timeout, &mut task).await.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 async fn select_device_seal_broker_client(state: &Arc<ServerState>) -> Option<ClientId> {
@@ -1835,9 +1907,9 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
     Ok(())
 }
 
-fn replay_retained_plugin_state_to_client(
+async fn replay_retained_plugin_state_to_client(
     state: &Arc<ServerState>,
-    frame_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    frame_tx: &mpsc::Sender<Vec<u8>>,
     frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
 ) {
     let replayers = state
@@ -1851,7 +1923,7 @@ fn replay_retained_plugin_state_to_client(
         let Some(frame) = encode_event_frame(&event, frame_codec) else {
             continue;
         };
-        if frame_tx.send(frame).is_err() {
+        if frame_tx.send(frame).await.is_err() {
             return;
         }
     }
@@ -2780,7 +2852,7 @@ async fn send_response(
 }
 
 fn send_error_via_channel(
-    frame_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    frame_tx: &mpsc::Sender<Vec<u8>>,
     request_id: u64,
     code: ErrorCode,
     message: String,
@@ -2798,7 +2870,7 @@ struct IpcResponseSendTiming {
 }
 
 fn send_response_via_channel(
-    frame_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    frame_tx: &mpsc::Sender<Vec<u8>>,
     request_id: u64,
     response: &Response,
     frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
@@ -2817,8 +2889,8 @@ fn send_response_via_channel(
     let frame_encode_us = frame_encode_started.elapsed().as_micros();
     let queue_started = Instant::now();
     frame_tx
-        .send(frame)
-        .map_err(|_| anyhow::anyhow!("writer channel closed"))?;
+        .try_send(frame)
+        .map_err(|_| anyhow::anyhow!("writer channel full or closed"))?;
     Ok(IpcResponseSendTiming {
         response_encode: response_encode_us,
         frame_encode: frame_encode_us,
@@ -2877,6 +2949,107 @@ mod tests {
         context_id: String,
         can_write: bool,
         cols: u16,
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonreading_socket_terminates_writer_and_releases_admission() {
+        let path = std::env::temp_dir().join(format!("bmux-stall-{}.sock", Uuid::new_v4()));
+        let endpoint = IpcEndpoint::UnixSocket(path.clone());
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        let peer = LocalIpcStream::connect(&endpoint).await.unwrap();
+        let stream = listener.accept().await.unwrap();
+        let (reader, writer) = stream.into_split();
+        let (tx, rx) = mpsc::channel(16);
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&pool).try_acquire_owned().unwrap();
+        // Large valid-sized frames exceed the socket buffer while the peer
+        // deliberately performs no reads. Keep tx alive to exclude queue EOF.
+        for _ in 0..16 {
+            tx.try_send(vec![0; bmux_ipc::frame::MAX_FRAME_PAYLOAD_SIZE])
+                .unwrap();
+        }
+        let task = tokio::spawn(async move {
+            write_queued_frames(writer, rx, Duration::from_millis(50)).await;
+            drop(permit);
+        });
+        let _abort = AbortOnDrop(task.abort_handle());
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tx.is_closed());
+        assert_eq!(pool.available_permits(), 1);
+        drop((reader, peer, listener));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_parent_aborts_owned_task_and_restores_admission() {
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&pool).try_acquire_owned().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let parent = tokio::spawn(async move {
+            let child = tokio::spawn(async move {
+                std::future::pending::<()>().await;
+                drop(permit);
+            });
+            let _abort = AbortOnDrop(child.abort_handle());
+            ready_tx.send(child).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let child = ready_rx.await.unwrap();
+        assert_eq!(pool.available_permits(), 0);
+        parent.abort();
+        assert!(parent.await.unwrap_err().is_cancelled());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), child)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert_eq!(pool.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn transport_admission_remains_charged_until_writer_finishes() {
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let handler = Arc::new(Arc::clone(&pool).try_acquire_owned().unwrap());
+        let writer = Arc::clone(&handler);
+        let task = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(writer);
+        });
+        drop(handler);
+        assert!(Arc::clone(&pool).try_acquire_owned().is_err());
+        finish_writer(task, std::time::Duration::from_millis(1)).await;
+        assert!(Arc::clone(&pool).try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn stalled_writer_is_aborted_and_releases_owned_frames() {
+        let owned = Arc::new(vec![0_u8; 1024]);
+        let weak = Arc::downgrade(&owned);
+        let task = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+            drop(owned);
+        });
+        finish_writer(task, std::time::Duration::from_millis(1)).await;
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn response_queue_rejects_overflow_and_recovers_after_drain() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let response = Response::Err(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "test".to_string(),
+        });
+        assert!(send_response_via_channel(&tx, 1, &response, None).is_ok());
+        assert!(send_response_via_channel(&tx, 2, &response, None).is_err());
+        assert!(rx.try_recv().is_ok());
+        assert!(send_response_via_channel(&tx, 3, &response, None).is_ok());
     }
 
     #[test]

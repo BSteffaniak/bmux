@@ -39,10 +39,10 @@ pub use manager_handle::{
     AttachGridDeltaState, AttachGridSnapshotState, AttachGridWindowState, AttachLayoutState,
     AttachPaneGridDelta, AttachPaneGridSnapshot, AttachPaneGridWindow, AttachPaneGridWindowRequest,
     AttachPaneScrollbackPin, AttachPaneScrollbackUnpinAck, AttachPaneSnapshotState,
-    AttachSnapshotState, FloatingPaneRuntimeSummary, NoopSessionRuntimeManager,
-    PaneProcessIdentity, PaneProcessSignal, PaneScrollbackMetadata, RemovedRuntimeInfo,
-    RestoreRuntimeRequest, SessionRuntimeManagerApi, SessionRuntimeManagerHandle,
-    SessionRuntimeSnapshot,
+    AttachSnapshotState, FloatingPaneRuntimeSummary, HistoryEnd, HistoryFetchError,
+    NoopSessionRuntimeManager, PaneProcessIdentity, PaneProcessSignal, PaneScrollbackMetadata,
+    RemovedRuntimeInfo, RestoreRuntimeRequest, SessionRuntimeManagerApi,
+    SessionRuntimeManagerHandle, SessionRuntimeSnapshot,
 };
 pub use meta::{PaneCommandSource, PaneLaunchSpec, PaneResurrectionSnapshot, PaneRuntimeMeta};
 pub use output::{OutputRead, PaneOutputReader, PaneOutputReaderHandle};

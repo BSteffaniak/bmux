@@ -113,6 +113,29 @@ impl TerminalGridStream {
         snapshot
     }
 
+    /// Fallible snapshot capture including admission of parser-prefix storage.
+    #[must_use]
+    pub fn try_snapshot(
+        &self,
+        offset: usize,
+        rows: usize,
+        budget: usize,
+    ) -> Option<crate::GridSnapshot> {
+        let mut remaining = budget;
+        let mut pending_bytes = Vec::new();
+        crate::snapshot::reserve_snapshot_vec(
+            &mut pending_bytes,
+            self.pending_bytes.len(),
+            &mut remaining,
+        )?;
+        pending_bytes.extend_from_slice(&self.pending_bytes);
+        // Prefix storage coexists with every projection and wire allocation.
+        // Charge returned capacity, not just its requested length.
+        let mut snapshot = crate::GridSnapshot::try_from_grid(&self.grid, offset, rows, remaining)?;
+        snapshot.pending_bytes = pending_bytes;
+        Some(snapshot)
+    }
+
     /// Apply a structured delta by rebuilding the stream from the resulting
     /// snapshot. This keeps parser-prefix state in sync with the producer.
     ///
@@ -828,6 +851,41 @@ fn has_string_terminator(bytes: &[u8]) -> bool {
 mod tests {
     use crate::model::{GridLimits, TerminalGrid};
     use crate::parser::TerminalGridStream;
+
+    #[test]
+    fn budgeted_prefix_capture_preserves_pending_sequence_on_rejection() {
+        let mut stream = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        stream.process(b"hello\x1b[31");
+        let expected = stream.snapshot(0, 2);
+        assert!(!expected.pending_bytes.is_empty());
+        assert!(
+            stream
+                .try_snapshot(0, 2, expected.pending_bytes.len() - 1)
+                .is_none()
+        );
+        assert_eq!(stream.snapshot(0, 2), expected);
+        let accepted = stream.try_snapshot(0, 2, 10_000).unwrap();
+        assert_eq!(accepted, expected);
+        let prefix_capacity = accepted.pending_bytes.capacity();
+        let grid_minimum = (0..10_000)
+            .find(|&budget| {
+                crate::GridSnapshot::try_from_grid(stream.grid(), 0, 2, budget).is_some()
+            })
+            .unwrap();
+        assert!(
+            stream
+                .try_snapshot(0, 2, grid_minimum + prefix_capacity - 1)
+                .is_none()
+        );
+        assert_eq!(
+            stream
+                .try_snapshot(0, 2, grid_minimum + prefix_capacity)
+                .unwrap(),
+            expected
+        );
+        stream.process(b"mred");
+        assert!(stream.snapshot(0, 2).pending_bytes.is_empty());
+    }
 
     #[test]
     fn protocol_tracker_tracks_hints_without_rows() {

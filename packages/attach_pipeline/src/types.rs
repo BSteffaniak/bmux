@@ -94,7 +94,17 @@ impl ScrollbackViewportBase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollbackCapture {
+    pub identity: Uuid,
+    pub lines: u64,
+    pub truncated: bool,
+    pub width: u16,
+    pub height: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScrollbackPin {
+    pub capture: Option<ScrollbackCapture>,
     pub pin_id: u64,
     pub total_scrolled_rows: u64,
     pub max_scrollback_offset: usize,
@@ -117,6 +127,10 @@ pub struct PaneScrollbackView {
     pub cursor: AttachScrollbackCursor,
     /// Selection anchor as an absolute history line, when selecting.
     pub selection_anchor: Option<AttachScrollbackPosition>,
+    /// Logical endpoint and its last physical projection. The physical value
+    /// detects selection replacement by input handlers; identity survives eviction
+    /// from the bounded display window.
+    pub captured_selection: Option<(CapturedHistoryAnchor, AttachScrollbackPosition)>,
     /// Immutable server-side history pin when this pane uses frozen scrollback.
     pub pin: Option<ScrollbackPin>,
 }
@@ -333,14 +347,212 @@ impl PaneVisualRowFingerprintState {
     }
 }
 
+/// A content position within one immutable history capture, independent of width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapturedHistoryAnchor {
+    pub capture_id: Uuid,
+    pub line_index: u32,
+    pub column: usize,
+}
+
 pub struct PaneScrollbackWindow {
+    /// Local projection width, or zero for legacy snapshot windows.
+    pub projection_width: usize,
+    /// Per-row content origins; empty for legacy physical snapshot windows.
+    pub row_anchors: Vec<CapturedHistoryAnchor>,
+    /// Palette captured with these rows, independent of live-grid style IDs.
+    pub palette: bmux_terminal_grid::StylePalette,
     pub scrollback_offset: usize,
     pub max_scrollback_offset: usize,
     pub total_scrolled_rows: u64,
     pub rows: Vec<PhysicalRow>,
 }
 
+impl PaneScrollbackWindow {
+    /// Resolve selection against this projection, clipping an off-window logical
+    /// endpoint by content order rather than its obsolete physical row number.
+    #[must_use]
+    pub fn selection_bounds(
+        &self,
+        view: &PaneScrollbackView,
+    ) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
+        let base = ScrollbackViewportBase::from_scrolled_rows(
+            self.total_scrolled_rows,
+            self.scrollback_offset,
+        );
+        let Some((anchor, last_position)) = view
+            .captured_selection
+            .filter(|(_, position)| Some(*position) == view.selection_anchor)
+        else {
+            return view.selection_bounds(base);
+        };
+        let first = *self.row_anchors.first()?;
+        if anchor.capture_id != first.capture_id {
+            return None;
+        }
+        let position = self.position_for_anchor(anchor).or_else(|| {
+            let key = (anchor.line_index, anchor.column);
+            if key < (first.line_index, first.column) {
+                Some(AttachScrollbackPosition {
+                    line: base.top_line(),
+                    col: 0,
+                })
+            } else {
+                let last = *self.row_anchors.last()?;
+                let row = self.rows.len().checked_sub(1)?;
+                let col = self.rows.get(row)?.cells().len().saturating_sub(1);
+                (key > (last.line_index, last.column.saturating_add(col))).then_some(
+                    AttachScrollbackPosition {
+                        line: base.line_for_viewport_row(row),
+                        col,
+                    },
+                )
+            }
+        })?;
+        let mut projected = *view;
+        // The saved projection is only a change detector, never a row identity.
+        debug_assert_eq!(view.selection_anchor, Some(last_position));
+        projected.selection_anchor = Some(position);
+        projected.selection_bounds(base)
+    }
+    /// Locate an anchor in this bounded projection; never clamp missing content.
+    #[must_use]
+    pub fn position_for_anchor(
+        &self,
+        anchor: CapturedHistoryAnchor,
+    ) -> Option<AttachScrollbackPosition> {
+        let base = ScrollbackViewportBase::from_scrolled_rows(
+            self.total_scrolled_rows,
+            self.scrollback_offset,
+        );
+        self.row_anchors
+            .iter()
+            .enumerate()
+            .find_map(|(row, origin)| {
+                if origin.capture_id != anchor.capture_id || origin.line_index != anchor.line_index
+                {
+                    return None;
+                }
+                let col = anchor.column.checked_sub(origin.column)?;
+                (self.content_anchor(row, col)? == anchor).then_some(AttachScrollbackPosition {
+                    line: base.line_for_viewport_row(row),
+                    col,
+                })
+            })
+    }
+
+    /// Preserve visible content endpoints when replacing a frozen projection.
+    /// Off-window endpoints retain their existing physical numbering until a
+    /// complete capture-wide index is available. Scrolling intentionally keeps
+    /// the navigation cursor viewport-relative.
+    pub fn remap_view_from(&self, previous: &Self, view: &mut PaneScrollbackView) {
+        // Snapshot and logical projections do not share row identity. Until
+        // the captured live tail carries logical origins, fail closed rather
+        // than highlighting/copying unrelated text with stale physical bounds.
+        if self.row_anchors.is_empty() != previous.row_anchors.is_empty() {
+            view.captured_selection = None;
+            view.selection_anchor = None;
+            return;
+        }
+        let old_base = ScrollbackViewportBase::from_scrolled_rows(
+            previous.total_scrolled_rows,
+            previous.scrollback_offset,
+        );
+        if view
+            .captured_selection
+            .is_some_and(|(_, position)| Some(position) != view.selection_anchor)
+        {
+            view.captured_selection = None;
+        }
+        if view.captured_selection.is_none()
+            && let Some(position) = view.selection_anchor
+            && let Some(row) = position
+                .line
+                .checked_sub(old_base.top_line())
+                .and_then(|row| usize::try_from(row).ok())
+            && let Some(anchor) = previous.content_anchor(row, position.col)
+        {
+            view.captured_selection = Some((anchor, position));
+        }
+        if let Some((anchor, _)) = view.captured_selection {
+            if self
+                .row_anchors
+                .first()
+                .is_some_and(|origin| origin.capture_id != anchor.capture_id)
+            {
+                view.captured_selection = None;
+                view.selection_anchor = None;
+            } else if let Some(position) = self.position_for_anchor(anchor) {
+                view.selection_anchor = Some(position);
+                view.captured_selection = Some((anchor, position));
+            }
+        }
+        if previous.scrollback_offset == self.scrollback_offset
+            && let Some(anchor) = previous.content_anchor(view.cursor.row, view.cursor.col)
+            && let Some(position) = self.position_for_anchor(anchor)
+        {
+            let base = ScrollbackViewportBase::from_scrolled_rows(
+                self.total_scrolled_rows,
+                self.scrollback_offset,
+            );
+            if let Some(row) = position
+                .line
+                .checked_sub(base.top_line())
+                .and_then(|row| usize::try_from(row).ok())
+            {
+                view.cursor.row = row;
+                view.cursor.col = position.col;
+            }
+        }
+    }
+
+    /// Translate a displayed cell into capture coordinates. Padding and wide
+    /// continuation cells are not independent selectable content anchors.
+    #[must_use]
+    pub fn content_anchor(&self, row: usize, column: usize) -> Option<CapturedHistoryAnchor> {
+        let mut anchor = *self.row_anchors.get(row)?;
+        let cell = self.rows.get(row)?.cells().get(column)?;
+        if cell.is_wide_continuation() {
+            return None;
+        }
+        anchor.column = anchor.column.checked_add(column)?;
+        Some(anchor)
+    }
+}
+
 impl PaneRenderBuffer {
+    /// Selection bounds in the same numbering as the currently displayed rows.
+    #[must_use]
+    pub fn scrollback_selection_bounds(
+        &self,
+        view: &PaneScrollbackView,
+    ) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
+        self.scrollback_window
+            .as_ref()
+            .filter(|window| {
+                window.scrollback_offset == view.offset && !window.row_anchors.is_empty()
+            })
+            .map_or_else(
+                || view.selection_bounds(self.scrollback_viewport_base(Some(view))),
+                |window| window.selection_bounds(view),
+            )
+    }
+
+    /// Use a captured palette only when its window is also the displayed one.
+    #[must_use]
+    pub fn scrollback_palette(
+        &self,
+        view: Option<&PaneScrollbackView>,
+    ) -> &bmux_terminal_grid::StylePalette {
+        self.scrollback_window
+            .as_ref()
+            .filter(|window| view.is_some_and(|view| view.offset == window.scrollback_offset))
+            .map_or_else(
+                || self.terminal_grid.grid().palette(),
+                |window| &window.palette,
+            )
+    }
+
     /// Rows to draw for this pane, plus the line numbering they are drawn in.
     ///
     /// This is the single source of truth for "what is currently on screen for
@@ -440,9 +652,93 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn captured_window_remaps_selection_and_cursor_across_widths() {
+        use bmux_terminal_grid::{GridLimits, TerminalGridStream};
+        let capture_id = Uuid::new_v4();
+        let window = |width: usize| PaneScrollbackWindow {
+            projection_width: width,
+            row_anchors: (0..6 / width)
+                .map(|row| CapturedHistoryAnchor {
+                    capture_id,
+                    line_index: 0,
+                    column: row * width,
+                })
+                .collect(),
+            rows: (0..6 / width)
+                .map(|_| {
+                    let mut stream = TerminalGridStream::new(
+                        u16::try_from(width).unwrap(),
+                        1,
+                        GridLimits::default(),
+                    )
+                    .unwrap();
+                    stream.process("x".repeat(width).as_bytes());
+                    stream.grid().viewport_rows()[0].clone()
+                })
+                .collect(),
+            palette: bmux_terminal_grid::StylePalette::default(),
+            scrollback_offset: 1,
+            max_scrollback_offset: 10,
+            total_scrolled_rows: 10,
+        };
+        let wide = window(3);
+        let narrow = window(2);
+        let mut view = PaneScrollbackView {
+            captured_selection: None,
+            offset: 1,
+            cursor: AttachScrollbackCursor { row: 1, col: 2 },
+            selection_anchor: Some(AttachScrollbackPosition { line: 10, col: 1 }),
+            pin: None,
+        };
+        narrow.remap_view_from(&wide, &mut view);
+        assert_eq!(
+            view.selection_anchor,
+            Some(AttachScrollbackPosition { line: 11, col: 0 })
+        );
+        assert_eq!(view.cursor, AttachScrollbackCursor { row: 2, col: 1 });
+        wide.remap_view_from(&narrow, &mut view);
+        assert_eq!(
+            view.selection_anchor,
+            Some(AttachScrollbackPosition { line: 10, col: 1 })
+        );
+        assert_eq!(view.cursor, AttachScrollbackCursor { row: 1, col: 2 });
+        let mut absent = window(3);
+        for origin in &mut absent.row_anchors {
+            origin.line_index = 1;
+        }
+        absent.remap_view_from(&wide, &mut view);
+        assert_eq!(view.captured_selection.unwrap().0.line_index, 0);
+        assert_eq!(
+            absent.selection_bounds(&view).unwrap().0,
+            AttachScrollbackPosition { line: 9, col: 0 }
+        );
+        narrow.remap_view_from(&absent, &mut view);
+        assert_eq!(
+            view.selection_anchor,
+            Some(AttachScrollbackPosition { line: 11, col: 0 })
+        );
+        // A snapshot transition cannot reuse logical projection row numbers.
+        let mut snapshot = window(2);
+        snapshot.row_anchors.clear();
+        view.selection_anchor = Some(AttachScrollbackPosition { line: 11, col: 0 });
+        snapshot.remap_view_from(&narrow, &mut view);
+        assert!(view.selection_anchor.is_none());
+        assert!(view.captured_selection.is_none());
+        view.selection_anchor = Some(AttachScrollbackPosition { line: 10, col: 0 });
+        narrow.remap_view_from(&snapshot, &mut view);
+        assert!(view.selection_anchor.is_none());
+        // Explicitly clearing selection must not resurrect its saved endpoint.
+        view.selection_anchor = None;
+        wide.remap_view_from(&narrow, &mut view);
+        assert!(view.captured_selection.is_none());
+        assert!(view.selection_anchor.is_none());
+    }
+
+    #[test]
     fn selection_rebase_preserves_offsets_on_both_sides_of_viewport() {
         for (line, expected) in [(7, 97), (10, 100), (14, 104)] {
             let mut view = PaneScrollbackView {
+                captured_selection: None,
                 selection_anchor: Some(AttachScrollbackPosition { line, col: 5 }),
                 offset: 0,
                 cursor: AttachScrollbackCursor { row: 0, col: 0 },
@@ -466,6 +762,7 @@ mod tests {
     fn selection_rebase_saturates_at_history_numbering_bounds() {
         for (line, new_top, expected) in [(0, 2, 0), (20, u64::MAX, u64::MAX)] {
             let mut view = PaneScrollbackView {
+                captured_selection: None,
                 selection_anchor: Some(AttachScrollbackPosition { line, col: 3 }),
                 offset: 0,
                 cursor: AttachScrollbackCursor { row: 0, col: 0 },

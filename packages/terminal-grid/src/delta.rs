@@ -19,6 +19,8 @@ pub struct RowUpdateSnapshot {
 )]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GridDeltaBatch {
+    #[serde(default)]
+    pub history_truncated: Option<bool>,
     /// Revision the receiver must already have before applying this delta.
     pub base_revision: u64,
     /// Revision after applying this delta.
@@ -116,6 +118,7 @@ impl GridDeltaBatch {
             height: after.height,
             mode: after.mode.clone(),
             scrollback_rows: after.scrollback_rows,
+            history_truncated: after.history_truncated,
             total_scrolled_rows: after.total_scrolled_rows,
             cursor: after.cursor,
             saved_cursor: after.saved_cursor,
@@ -301,6 +304,7 @@ impl GridDeltaBatch {
         snapshot.height = self.height;
         snapshot.mode.clone_from(&self.mode);
         snapshot.scrollback_rows = self.scrollback_rows;
+        snapshot.history_truncated = self.history_truncated;
         snapshot.total_scrolled_rows = self.total_scrolled_rows;
         snapshot.cursor = self.cursor;
         snapshot.saved_cursor = self.saved_cursor;

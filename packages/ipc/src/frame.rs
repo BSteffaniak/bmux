@@ -55,6 +55,18 @@ pub enum FrameDecodeError {
     Deserialize(bmux_codec::Error),
 }
 
+const fn check_envelope_payload(envelope: &Envelope) -> Result<(), FrameEncodeError> {
+    // Serialized envelope overhead can only increase this lower bound. Avoid
+    // allocating a second copy when the source payload already exceeds the cap.
+    if envelope.payload.len() > MAX_FRAME_PAYLOAD_SIZE {
+        return Err(FrameEncodeError::PayloadTooLarge {
+            actual: envelope.payload.len(),
+            max: MAX_FRAME_PAYLOAD_SIZE,
+        });
+    }
+    Ok(())
+}
+
 /// Encode an envelope into a length-prefixed frame.
 ///
 /// Framing format:
@@ -65,6 +77,7 @@ pub enum FrameDecodeError {
 ///
 /// Returns an error if payload serialization fails or exceeds max size.
 pub fn encode_frame(envelope: &Envelope) -> Result<Vec<u8>, FrameEncodeError> {
+    check_envelope_payload(envelope)?;
     let payload = encode(envelope)?;
     if payload.len() > MAX_FRAME_PAYLOAD_SIZE {
         return Err(FrameEncodeError::PayloadTooLarge {
@@ -183,6 +196,7 @@ pub fn encode_frame_compressed(
     envelope: &Envelope,
     codec: Option<&dyn CompressionCodec>,
 ) -> Result<Vec<u8>, FrameEncodeError> {
+    check_envelope_payload(envelope)?;
     let serialized = encode(envelope)?;
     if serialized.len() > MAX_FRAME_PAYLOAD_SIZE {
         return Err(FrameEncodeError::PayloadTooLarge {
@@ -327,6 +341,30 @@ mod tests {
         try_decode_frame,
     };
     use crate::{Envelope, EnvelopeKind, ProtocolVersion, Request, encode};
+
+    #[test]
+    fn oversized_source_payload_is_rejected_before_envelope_encoding() {
+        let envelope = Envelope::new(
+            1,
+            EnvelopeKind::Response,
+            vec![0; MAX_FRAME_PAYLOAD_SIZE + 1],
+        );
+        for result in [
+            encode_frame(&envelope),
+            super::encode_frame_compressed(&envelope, None),
+        ] {
+            assert!(
+                matches!(result, Err(super::FrameEncodeError::PayloadTooLarge { actual, max })
+                if actual == envelope.payload.len() && max == MAX_FRAME_PAYLOAD_SIZE)
+            );
+        }
+        // A source that fits still needs the exact serialized overhead check.
+        let envelope = Envelope::new(1, EnvelopeKind::Response, vec![0; MAX_FRAME_PAYLOAD_SIZE]);
+        assert!(
+            matches!(encode_frame(&envelope), Err(super::FrameEncodeError::PayloadTooLarge { actual, .. })
+            if actual > MAX_FRAME_PAYLOAD_SIZE)
+        );
+    }
 
     #[test]
     fn frame_roundtrip_exact() {

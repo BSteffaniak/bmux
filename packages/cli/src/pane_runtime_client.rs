@@ -63,6 +63,7 @@ pub struct PaneGridWindowResult {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneScrollbackPinResult {
+    pub capture: bmux_attach_pipeline::ScrollbackCapture,
     pub pane_id: Uuid,
     pub pin_id: u64,
     pub total_scrolled_rows: u64,
@@ -194,19 +195,559 @@ pub async fn pane_scrollback_rule_metadata_streaming(
     }
 }
 
+/// Assemble a requested logical line from an existing immutable capture.
+/// The caller owns the pin lifetime; failures never substitute a new capture.
+pub async fn fetch_captured_history_line(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    session_id: Uuid,
+    capture: &AttachState::HistoryCaptureV1,
+    line_index: u32,
+    remaining: &mut usize,
+    styles: &mut Vec<bmux_terminal_grid::Style>,
+    requests_left: &mut usize,
+) -> ClientResult<bmux_terminal_grid::HistoryLineAssembly> {
+    use bmux_terminal_grid::{HistoryLineAssembly, HistorySlice, HistorySliceEnd};
+    if u64::from(line_index) >= capture.history_line_count {
+        return typed_server_error("history-line", "line outside capture");
+    }
+    let mut line = HistoryLineAssembly::new(
+        capture.capture_id.as_u128(),
+        line_index as usize,
+        *remaining,
+        capture.history_truncated && line_index == 0,
+    );
+    while line.completed().is_none() {
+        *requests_left = requests_left
+            .checked_sub(1)
+            .ok_or_else(|| history_decode_error(&"history window request limit"))?;
+        let offset =
+            u32::try_from(line.next_offset()).map_err(|error| history_decode_error(&error))?;
+        let reply = AttachState::client::attach_history_slice_v1(
+            client,
+            session_id,
+            capture.pin.pane_id,
+            capture.pin.pin_id,
+            capture.capture_id,
+            line_index,
+            offset,
+            256,
+            4096,
+        )
+        .await
+        .map_err(|error| history_decode_error(&error))?
+        .map_err(|error| history_decode_error(&format!("{error:?}")))?;
+        // Bound the complete JSON input before deserializing. Each cell is then
+        // admitted individually; do not deserialize an unbounded Vec first.
+        if reply.encoded.len() > 128 * 1024 {
+            return Err(history_decode_error(&"oversized history reply"));
+        }
+        let cells = decode_history_cells(&reply.encoded, styles, remaining)?;
+        let end = match reply.end_kind {
+            AttachState::HistoryEnd::Continue => HistorySliceEnd::Continue,
+            AttachState::HistoryEnd::HardBreak => HistorySliceEnd::HardBreak,
+            AttachState::HistoryEnd::Open => HistorySliceEnd::Open,
+        };
+        let next = usize::try_from(reply.next_cell_offset)
+            .map_err(|error| history_decode_error(&error))?;
+        line.append(
+            capture.capture_id.as_u128(),
+            line_index as usize,
+            offset as usize,
+            &HistorySlice {
+                cells: &cells,
+                next_cell_offset: next,
+                end,
+            },
+        )
+        .map_err(|error| history_decode_error(&format!("{error:?}")))?;
+    }
+    Ok(line)
+}
+
+#[cfg(test)]
+mod history_tests {
+    struct HistoryClient;
+    impl bmux_plugin_sdk::TypedDispatchClient for HistoryClient {
+        async fn invoke_service_raw(
+            &mut self,
+            _capability: &str,
+            _kind: bmux_ipc::InvokeServiceKind,
+            _interface: &str,
+            operation: &str,
+            _payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            assert_eq!(operation, "attach-history-slice-v1");
+            let reply = super::AttachState::HistorySliceV1 {
+                encoded: serde_json::to_vec(&vec![
+                    ("A", 1_u8, bmux_terminal_grid::Style::default()),
+                    ("B", 1_u8, bmux_terminal_grid::Style::default()),
+                ])
+                .unwrap(),
+                next_cell_offset: 2,
+                end_kind: super::AttachState::HistoryEnd::HardBreak,
+            };
+            Ok(bmux_plugin_sdk::encode_service_message(&Ok::<
+                _,
+                super::AttachState::HistoryFetchError,
+            >(reply))
+            .unwrap())
+        }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "sequential fetch, resize and navigation assertions share one immutable capture"
+    )]
+    async fn captured_window_fetches_and_projects_history_without_live_tail() {
+        let pin = bmux_attach_pipeline::ScrollbackPin {
+            capture: Some(bmux_attach_pipeline::ScrollbackCapture {
+                identity: uuid::Uuid::new_v4(),
+                lines: 1,
+                truncated: false,
+                width: 2,
+                height: 2,
+            }),
+            pin_id: 1,
+            total_scrolled_rows: 1,
+            max_scrollback_offset: 1,
+            stream_end: 9,
+            created_epoch_secs: 0,
+        };
+        let window = super::captured_history_window(
+            &mut HistoryClient,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            2,
+            1,
+            (2, None, 0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(bmux_terminal_grid::row_text(&window.rows[0], 2), "AB");
+        assert_eq!(window.scrollback_offset, 2);
+        let anchor = window.content_anchor(0, 1).unwrap();
+        assert_eq!(anchor.capture_id, pin.capture.unwrap().identity);
+        assert_eq!(anchor.line_index, 0);
+        assert_eq!(anchor.column, 1);
+        let narrow = super::captured_history_window(
+            &mut HistoryClient,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            2,
+            2,
+            (1, None, 0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(narrow.projection_width, 1);
+        assert_eq!(bmux_terminal_grid::row_text(&narrow.rows[0], 1), "A");
+        assert_eq!(bmux_terminal_grid::row_text(&narrow.rows[1], 1), "B");
+        assert_eq!(narrow.content_anchor(1, 0), Some(anchor));
+        let anchored = super::captured_history_window(
+            &mut HistoryClient,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            2,
+            1,
+            (1, window.row_anchors.last().copied(), 0),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(bmux_terminal_grid::row_text(&anchored.rows[0], 1), "A");
+        let scrolled = super::captured_history_window(
+            &mut HistoryClient,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            3,
+            1,
+            (1, narrow.row_anchors.last().copied(), 1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(bmux_terminal_grid::row_text(&scrolled.rows[0], 1), "A");
+        let returned = super::captured_history_window(
+            &mut HistoryClient,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            2,
+            1,
+            (1, scrolled.row_anchors.last().copied(), -1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(bmux_terminal_grid::row_text(&returned.rows[0], 1), "B");
+        assert_eq!(returned.row_anchors.last(), narrow.row_anchors.last());
+        let boundary = super::captured_history_window_outcome(
+            &mut HistoryClient,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            pin,
+            1,
+            1,
+            (1, returned.row_anchors.last().copied(), -1),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            boundary,
+            super::CapturedWindowOutcome::LiveTail { capture_offset: 1 }
+        ));
+        assert!(
+            super::captured_history_window(
+                &mut HistoryClient,
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                pin,
+                1,
+                1,
+                (2, None, 0),
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn decoding_charges_cells_and_rejects_exhausted_budget() {
+        let style = bmux_terminal_grid::Style::default();
+        let encoded = serde_json::to_vec(&vec![("界", 2_u8, style)]).unwrap();
+        let mut styles = Vec::new();
+        let mut budget = 1024;
+        let cells = super::decode_history_cells(&encoded, &mut styles, &mut budget).unwrap();
+        assert_eq!(cells[0].text(), "界");
+        assert_eq!(styles, vec![style]);
+        assert!(budget < 1024);
+        assert!(super::decode_history_cells(&encoded, &mut styles, &mut 0).is_err());
+    }
+}
+
+/// History-only windows use local width with capture-relative scroll offsets.
+/// Live-tail overlap stays on the pinned snapshot path until joins are modeled.
+#[allow(
+    clippy::too_many_lines,
+    reason = "bounded fetch, projection and budget accounting form one ordered window assembly workflow"
+)]
+pub enum CapturedWindowOutcome {
+    Window(bmux_attach_pipeline::PaneScrollbackWindow),
+    LiveTail { capture_offset: usize },
+    Unavailable,
+}
+
+#[cfg(test)]
+pub async fn captured_history_window(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    session_id: Uuid,
+    pane_id: Uuid,
+    pin: bmux_attach_pipeline::ScrollbackPin,
+    offset: usize,
+    rows: usize,
+    projection: (
+        usize,
+        Option<bmux_attach_pipeline::CapturedHistoryAnchor>,
+        isize,
+    ),
+) -> ClientResult<Option<bmux_attach_pipeline::PaneScrollbackWindow>> {
+    Ok(
+        match captured_history_window_outcome(
+            client, session_id, pane_id, pin, offset, rows, projection,
+        )
+        .await?
+        {
+            CapturedWindowOutcome::Window(window) => Some(window),
+            CapturedWindowOutcome::LiveTail { .. } | CapturedWindowOutcome::Unavailable => None,
+        },
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "bounded navigation and assembly share one request and byte budget"
+)]
+pub async fn captured_history_window_outcome(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    session_id: Uuid,
+    pane_id: Uuid,
+    pin: bmux_attach_pipeline::ScrollbackPin,
+    offset: usize,
+    rows: usize,
+    projection: (
+        usize,
+        Option<bmux_attach_pipeline::CapturedHistoryAnchor>,
+        isize,
+    ),
+) -> ClientResult<CapturedWindowOutcome> {
+    let (width, mut bottom_anchor, local_delta) = projection;
+    let mut local_skip = usize::try_from(local_delta).unwrap_or(0);
+    let Some(meta) = pin.capture else {
+        return Ok(CapturedWindowOutcome::Unavailable);
+    };
+    if (bottom_anchor.is_none() && offset < usize::from(meta.height))
+        || rows == 0
+        || rows > 256
+        || meta.width == 0
+        || width == 0
+        || width > 4096
+    {
+        return Ok(CapturedWindowOutcome::Unavailable);
+    }
+    let capture = AttachState::HistoryCaptureV1 {
+        width: meta.width,
+        height: meta.height,
+        capture_id: meta.identity,
+        history_line_count: meta.lines,
+        history_truncated: meta.truncated,
+        pin: AttachState::PaneScrollbackPin {
+            pane_id,
+            pin_id: pin.pin_id,
+            total_scrolled_rows: pin.total_scrolled_rows,
+            max_scrollback_offset: u32::try_from(pin.max_scrollback_offset).unwrap_or(u32::MAX),
+            stream_end: pin.stream_end,
+        },
+    };
+    if bottom_anchor.is_some_and(|anchor| {
+        anchor.capture_id != meta.identity || u64::from(anchor.line_index) >= meta.lines
+    }) {
+        return Ok(CapturedWindowOutcome::Unavailable);
+    }
+    let mut remaining: usize = 2 * 1024 * 1024;
+    let mut requests_left = 256;
+    let mut styles = Vec::new();
+    if local_delta < 0 {
+        let Some(mut anchor) = bottom_anchor else {
+            return Ok(CapturedWindowOutcome::Unavailable);
+        };
+        let mut advance = local_delta.unsigned_abs();
+        loop {
+            let line = fetch_captured_history_line(
+                client,
+                session_id,
+                &capture,
+                anchor.line_index,
+                &mut remaining,
+                &mut styles,
+                &mut requests_left,
+            )
+            .await?;
+            let row = line
+                .row_for_column(width, anchor.column)
+                .ok_or_else(|| history_decode_error(&"unavailable navigation anchor"))?;
+            let available = line.projected_rows(width).saturating_sub(row + 1);
+            if advance <= available {
+                anchor.column = line
+                    .column_for_row(width, row + advance)
+                    .ok_or_else(|| history_decode_error(&"unavailable navigation destination"))?;
+                bottom_anchor = Some(anchor);
+                break;
+            }
+            advance -= available + 1;
+            let Some(next) = anchor
+                .line_index
+                .checked_add(1)
+                .filter(|index| u64::from(*index) < meta.lines)
+            else {
+                return Ok(CapturedWindowOutcome::LiveTail {
+                    capture_offset: usize::from(meta.height)
+                        .saturating_sub(advance.saturating_add(1)),
+                });
+            };
+            anchor.line_index = next;
+            anchor.column = 0;
+        }
+    }
+    let scan_end = bottom_anchor.map_or(meta.lines, |anchor| u64::from(anchor.line_index) + 1);
+    let mut skip = if bottom_anchor.is_some() {
+        0
+    } else {
+        offset - usize::from(meta.height)
+    };
+    let mut selected = Vec::new();
+    let mut anchors = Vec::new();
+    anchors
+        .try_reserve_exact(rows)
+        .map_err(|error| history_decode_error(&error))?;
+    remaining = remaining
+        .checked_sub(rows.saturating_mul(std::mem::size_of::<
+            bmux_attach_pipeline::CapturedHistoryAnchor,
+        >()))
+        .ok_or_else(|| history_decode_error(&"anchor budget exhausted"))?;
+    selected
+        .try_reserve_exact(rows)
+        .map_err(|error| history_decode_error(&error))?;
+    // Bound scanning independently of bytes (empty lines still cost requests).
+    for index in (0..scan_end).rev().take(256) {
+        let index = u32::try_from(index).map_err(|error| history_decode_error(&error))?;
+        let line = fetch_captured_history_line(
+            client,
+            session_id,
+            &capture,
+            index,
+            &mut remaining,
+            &mut styles,
+            &mut requests_left,
+        )
+        .await?;
+        let count = line.projected_rows(usize::from(meta.width));
+        if skip >= count {
+            skip -= count;
+            continue;
+        }
+        // Offset remains in capture rows. Resolve the exclusive lower boundary
+        // through content coordinates before selecting locally projected rows.
+        let end = if let Some(anchor) = bottom_anchor.filter(|anchor| anchor.line_index == index) {
+            line.row_for_column(width, anchor.column)
+                .ok_or_else(|| history_decode_error(&"unavailable viewport anchor"))?
+                + 1
+        } else if skip == 0 {
+            line.projected_rows(width)
+        } else {
+            let column = line
+                .column_for_row(usize::from(meta.width), count - skip)
+                .ok_or_else(|| history_decode_error(&"unavailable capture boundary"))?;
+            line.row_for_column(width, column)
+                .ok_or_else(|| history_decode_error(&"unavailable projection boundary"))?
+        };
+        let skipped = local_skip.min(end);
+        local_skip -= skipped;
+        let end = end - skipped;
+        let start = end.saturating_sub(rows - selected.len());
+        let projected = line
+            .project(width, start..end, remaining)
+            .map_err(|error| history_decode_error(&format!("{error:?}")))?;
+        // The line decoder charged two copies; selected projection is limited
+        // to one viewport and cannot contain more source cells than its line.
+        for row in (start..end).rev() {
+            let column = line
+                .column_for_row(width, row)
+                .ok_or_else(|| history_decode_error(&"unavailable logical row origin"))?;
+            anchors.push(bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id: meta.identity,
+                line_index: index,
+                column,
+            });
+        }
+        selected.extend(projected.into_iter().rev());
+        skip = 0;
+        if selected.len() == rows {
+            break;
+        }
+    }
+    if selected.len() != rows {
+        return Ok(CapturedWindowOutcome::Unavailable);
+    }
+    selected.reverse();
+    anchors.reverse();
+    Ok(CapturedWindowOutcome::Window(
+        bmux_attach_pipeline::PaneScrollbackWindow {
+            projection_width: width,
+            row_anchors: anchors,
+            palette: bmux_terminal_grid::StylePalette::from_styles(styles),
+            rows: selected,
+            scrollback_offset: offset,
+            max_scrollback_offset: pin.max_scrollback_offset,
+            total_scrolled_rows: pin.total_scrolled_rows,
+        },
+    ))
+}
+
+fn history_decode_error(error: &impl std::fmt::Display) -> ClientError {
+    ClientError::ServerError {
+        code: ErrorCode::Internal,
+        message: format!("captured history: {error}"),
+    }
+}
+
+fn decode_history_cells(
+    encoded: &[u8],
+    styles: &mut Vec<bmux_terminal_grid::Style>,
+    remaining: &mut usize,
+) -> ClientResult<Vec<bmux_terminal_grid::Cell>> {
+    use serde::de::{Error, SeqAccess, Visitor};
+    struct Cells<'a> {
+        styles: &'a mut Vec<bmux_terminal_grid::Style>,
+        remaining: &'a mut usize,
+    }
+    impl<'de> Visitor<'de> for Cells<'_> {
+        type Value = Vec<bmux_terminal_grid::Cell>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("bounded history cells")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            use bmux_terminal_grid::{Cell, Style, StyleId};
+            let mut cells = Vec::new();
+            while let Some((text, width, style)) = seq.next_element::<(String, u8, Style)>()? {
+                if cells.len() >= 256 || !(1..=2).contains(&width) || text.len() > 4096 {
+                    return Err(A::Error::custom("invalid history cell limits"));
+                }
+                // Charge both temporary decoded and retained copies, plus a
+                // conservative palette slot even when the style already exists.
+                let charge =
+                    2 * (std::mem::size_of::<Cell>() + text.len()) + std::mem::size_of::<Style>();
+                *self.remaining = self
+                    .remaining
+                    .checked_sub(charge)
+                    .ok_or_else(|| A::Error::custom("history budget exhausted"))?;
+                let index =
+                    if let Some(index) = self.styles.iter().position(|entry| *entry == style) {
+                        index
+                    } else {
+                        self.styles.try_reserve_exact(1).map_err(A::Error::custom)?;
+                        self.styles.push(style);
+                        self.styles.len() - 1
+                    };
+                cells.try_reserve_exact(1).map_err(A::Error::custom)?;
+                cells.push(Cell::new(
+                    text,
+                    StyleId(u32::try_from(index).map_err(A::Error::custom)?),
+                    width,
+                ));
+            }
+            Ok(cells)
+        }
+    }
+    let mut decoder = serde_json::Deserializer::from_slice(encoded);
+    let cells = serde::Deserializer::deserialize_seq(&mut decoder, Cells { styles, remaining })
+        .map_err(|error| history_decode_error(&error))?;
+    decoder
+        .end()
+        .map_err(|error| history_decode_error(&error))?;
+    Ok(cells)
+}
+
 pub async fn attach_pane_scrollback_pin_streaming(
     client: &mut bmux_client::StreamingBmuxClient,
     session_id: Uuid,
     pane_id: Uuid,
 ) -> ClientResult<PaneScrollbackPinResult> {
-    match AttachState::client::attach_pane_scrollback_pin(client, session_id, pane_id).await {
-        Ok(Ok(pin)) => Ok(PaneScrollbackPinResult {
-            pane_id: pin.pane_id,
-            pin_id: pin.pin_id,
-            total_scrolled_rows: pin.total_scrolled_rows,
-            max_scrollback_offset: pin.max_scrollback_offset as usize,
-            stream_end: pin.stream_end,
-        }),
+    match AttachState::client::attach_history_capture_v1(client, session_id, pane_id).await {
+        Ok(Ok(captured)) => {
+            let pin = captured.pin;
+            Ok(PaneScrollbackPinResult {
+                capture: bmux_attach_pipeline::ScrollbackCapture {
+                    identity: captured.capture_id,
+                    lines: captured.history_line_count,
+                    truncated: captured.history_truncated,
+                    width: captured.width,
+                    height: captured.height,
+                },
+                pane_id: pin.pane_id,
+                pin_id: pin.pin_id,
+                total_scrolled_rows: pin.total_scrolled_rows,
+                max_scrollback_offset: pin.max_scrollback_offset as usize,
+                stream_end: pin.stream_end,
+            })
+        }
         Ok(Err(err)) => typed_server_error("attach-pane-scrollback-pin", err),
         Err(err) => typed_dispatch_error("attach-pane-scrollback-pin", err),
     }

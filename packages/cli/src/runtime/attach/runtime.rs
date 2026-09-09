@@ -109,6 +109,9 @@ pub trait AttachTerminal: Write {
 
     fn set_attached_session_id(&self, _session_id: Uuid) {}
 
+    #[cfg(test)]
+    fn observe_scrollback(&self, _active: bool) {}
+
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
@@ -152,6 +155,10 @@ impl Write for RealAttachTerminal {
 
 #[derive(Clone)]
 pub struct HeadlessAttachTerminalHandle {
+    #[cfg(test)]
+    scrollback: Arc<Mutex<bool>>,
+    #[cfg(test)]
+    screen: Arc<Mutex<bmux_terminal_grid::TerminalGridStream>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
     geometry: Arc<Mutex<TerminalGeometry>>,
     output: Arc<Mutex<Vec<u8>>>,
@@ -160,6 +167,14 @@ pub struct HeadlessAttachTerminalHandle {
 }
 
 impl HeadlessAttachTerminalHandle {
+    #[cfg(test)]
+    pub fn scrollback_active(&self) -> bool {
+        *self
+            .scrollback
+            .lock()
+            .expect("headless scrollback lock poisoned")
+    }
+
     pub fn send_event(&self, event: Event) -> Result<()> {
         self.event_tx
             .send(event)
@@ -172,6 +187,11 @@ impl HeadlessAttachTerminalHandle {
             .lock()
             .map_err(|_| anyhow::anyhow!("headless attach terminal geometry lock poisoned"))? =
             TerminalGeometry { cols, rows };
+        #[cfg(test)]
+        self.screen
+            .lock()
+            .map_err(|_| anyhow::anyhow!("headless screen lock poisoned"))?
+            .resize(cols, rows)?;
         self.send_event(Event::Resize(cols, rows))
     }
 
@@ -185,14 +205,9 @@ impl HeadlessAttachTerminalHandle {
     #[cfg(test)]
     #[must_use]
     pub fn output_screen_text(&self, cols: u16, rows: u16) -> String {
-        let Ok(mut stream) = bmux_terminal_grid::TerminalGridStream::new(
-            cols,
-            rows,
-            bmux_terminal_grid::GridLimits::default(),
-        ) else {
-            return String::new();
-        };
-        stream.process(&self.output_bytes());
+        let stream = self.screen.lock().expect("headless screen lock poisoned");
+        assert_eq!(stream.grid().width(), usize::from(cols));
+        assert_eq!(stream.grid().height(), usize::from(rows));
         bmux_terminal_grid::visible_text(stream.grid(), 0, usize::from(rows))
     }
 
@@ -210,6 +225,10 @@ impl HeadlessAttachTerminalHandle {
 }
 
 pub struct HeadlessAttachTerminal {
+    #[cfg(test)]
+    scrollback: Arc<Mutex<bool>>,
+    #[cfg(test)]
+    screen: Arc<Mutex<bmux_terminal_grid::TerminalGridStream>>,
     geometry: Arc<Mutex<TerminalGeometry>>,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
     output: Arc<Mutex<Vec<u8>>>,
@@ -221,12 +240,27 @@ impl HeadlessAttachTerminal {
     #[must_use]
     pub fn new(cols: u16, rows: u16) -> (Self, HeadlessAttachTerminalHandle) {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        #[cfg(test)]
+        let scrollback = Arc::new(Mutex::new(false));
+        #[cfg(test)]
+        let screen = Arc::new(Mutex::new(
+            bmux_terminal_grid::TerminalGridStream::new(
+                cols,
+                rows,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .expect("headless terminal dimensions must be nonzero"),
+        ));
         let geometry = Arc::new(Mutex::new(TerminalGeometry { cols, rows }));
         let output = Arc::new(Mutex::new(Vec::new()));
         let pending_output_chunks = Arc::new(Mutex::new(Vec::new()));
         let attached_session_id = Arc::new(Mutex::new(None));
         (
             Self {
+                #[cfg(test)]
+                scrollback: Arc::clone(&scrollback),
+                #[cfg(test)]
+                screen: Arc::clone(&screen),
                 geometry: Arc::clone(&geometry),
                 event_rx,
                 output: Arc::clone(&output),
@@ -234,6 +268,10 @@ impl HeadlessAttachTerminal {
                 attached_session_id: Arc::clone(&attached_session_id),
             },
             HeadlessAttachTerminalHandle {
+                #[cfg(test)]
+                scrollback,
+                #[cfg(test)]
+                screen,
                 event_tx,
                 geometry,
                 output,
@@ -246,6 +284,11 @@ impl HeadlessAttachTerminal {
 
 impl Write for HeadlessAttachTerminal {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        self.screen
+            .lock()
+            .map_err(|_| io::Error::other("headless screen lock poisoned"))?
+            .process(buf);
         self.output
             .lock()
             .map_err(|_| io::Error::other("headless attach terminal output lock poisoned"))?
@@ -263,6 +306,14 @@ impl Write for HeadlessAttachTerminal {
 }
 
 impl AttachTerminal for HeadlessAttachTerminal {
+    #[cfg(test)]
+    fn observe_scrollback(&self, active: bool) {
+        *self
+            .scrollback
+            .lock()
+            .expect("headless scrollback lock poisoned") = active;
+    }
+
     fn geometry(&self) -> TerminalGeometry {
         self.geometry
             .lock()
@@ -3699,6 +3750,8 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
 
     loop {
         terminal.set_attached_session_id(view_state.attached_id);
+        #[cfg(test)]
+        terminal.observe_scrollback(view_state.scrollback_active());
         tokio::select! {
             // Server-pushed events (layout changes, session events, pane output)
             event = client.event_receiver().recv() => {
@@ -6558,6 +6611,7 @@ pub fn enter_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uu
     view_state.pane_scrollback.insert(
         pane_id,
         PaneScrollbackView {
+            captured_selection: None,
             offset: 0,
             cursor: AttachScrollbackCursor {
                 row: cursor.row.min(inner_h.saturating_sub(1)),
@@ -6582,6 +6636,7 @@ pub fn begin_attach_selection_for(view_state: &mut AttachViewState, pane_id: Uui
         return false;
     };
     if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+        view.captured_selection = None;
         view.selection_anchor = Some(anchor);
         return true;
     }
@@ -6624,6 +6679,7 @@ pub fn clear_attach_selection_at(
     now: Instant,
 ) {
     if let Some(view) = view_state.focused_scrollback_mut() {
+        view.captured_selection = None;
         view.selection_anchor = None;
     }
     if show_status {
@@ -6639,17 +6695,29 @@ pub fn attach_selection_bounds(
     view_state: &AttachViewState,
 ) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
     let pane_id = view_state.focused_pane_id()?;
-    let base = attach_scrollback_viewport_base(view_state, pane_id)?;
-    view_state.scrollback_for(pane_id)?.selection_bounds(base)
+    let view = view_state.scrollback_for(pane_id)?;
+    view_state
+        .pane_buffers
+        .get(&pane_id)?
+        .scrollback_selection_bounds(&view)
 }
 
-/// Drop every pane's selection anchor.
-///
-/// Used when history line numbering stops being comparable (terminal resize
-/// reflows the grid), where keeping an anchor would select unrelated text.
-pub fn clear_all_attach_selection_anchors(view_state: &mut AttachViewState) {
-    for view in view_state.pane_scrollback.values_mut() {
-        view.selection_anchor = None;
+/// Preserve immutable pinned selections across presentation resize. Unpinned
+/// history can reflow underneath physical endpoints and must still invalidate.
+fn prepare_attach_selections_for_resize(view_state: &mut AttachViewState) {
+    for (pane_id, view) in &mut view_state.pane_scrollback {
+        if view.pin.is_some() {
+            if let Some(window) = view_state
+                .pane_buffers
+                .get(pane_id)
+                .and_then(|buffer| buffer.scrollback_window.as_ref())
+            {
+                window.remap_view_from(window, view);
+            }
+        } else {
+            view.captured_selection = None;
+            view.selection_anchor = None;
+        }
     }
 }
 
@@ -9556,6 +9624,10 @@ async fn hydrate_attach_structured_grid_snapshots(
 /// scrollback is refreshed in a single round trip. Keeping unfocused panes
 /// refreshed is what lets them stay frozen at their own offset while they keep
 /// producing output (the server's `anchor_total_scrolled_rows` handling).
+#[allow(
+    clippy::too_many_lines,
+    reason = "window selection, fallback and selection-anchor reconciliation form one ordered refresh workflow"
+)]
 async fn ensure_pane_scrollback_windows(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -9565,10 +9637,12 @@ async fn ensure_pane_scrollback_windows(
         return Ok(());
     }
 
+    let mut captured_windows = Vec::new();
+    let mut retained_offsets = Vec::new();
     let mut requests = Vec::new();
     let mut requested_panes = BTreeSet::new();
     for (pane_id, view) in &view_state.pane_scrollback {
-        let Some((_, rows)) = attach_pane_inner_size(view_state, *pane_id) else {
+        let Some((width, rows)) = attach_pane_inner_size(view_state, *pane_id) else {
             continue;
         };
         let cached_window = view_state
@@ -9576,9 +9650,66 @@ async fn ensure_pane_scrollback_windows(
             .get(pane_id)
             .and_then(|buffer| buffer.scrollback_window.as_ref());
         if !force_refresh
-            && cached_window.is_some_and(|window| window.scrollback_offset == view.offset)
+            && cached_window.is_some_and(|window| {
+                window.scrollback_offset == view.offset
+                    && window.rows.len() == rows
+                    && (window.projection_width == 0 || window.projection_width == width)
+            })
         {
             continue;
+        }
+        if let Some(pin) = view.pin {
+            let fetch = crate::pane_runtime_client::captured_history_window_outcome(
+                client,
+                view_state.attached_id,
+                *pane_id,
+                pin,
+                view.offset,
+                rows,
+                (
+                    width,
+                    cached_window.and_then(|window| window.row_anchors.last().copied()),
+                    cached_window
+                        .filter(|window| !window.row_anchors.is_empty())
+                        .map_or(0, |window| {
+                            let distance =
+                                isize::try_from(view.offset.abs_diff(window.scrollback_offset))
+                                    .unwrap_or(isize::MAX);
+                            if view.offset >= window.scrollback_offset {
+                                distance
+                            } else {
+                                -distance
+                            }
+                        }),
+                ),
+            );
+            match fetch.await {
+                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(window)) => {
+                    captured_windows.push((*pane_id, window));
+                    continue;
+                }
+                Ok(crate::pane_runtime_client::CapturedWindowOutcome::LiveTail {
+                    capture_offset,
+                }) => {
+                    requested_panes.insert(*pane_id);
+                    requests.push(PaneGridWindowRequest {
+                        pane_id: *pane_id,
+                        scrollback_offset: capture_offset,
+                        rows,
+                        anchor_total_scrolled_rows: None,
+                        pin_id: Some(pin.pin_id),
+                    });
+                    continue;
+                }
+                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) | Err(_) => {}
+            }
+            if let Some(window) = cached_window.filter(|window| !window.row_anchors.is_empty()) {
+                // This offset now counts local navigation steps. Sending it to
+                // snapshot transport would silently reinterpret it as capture
+                // rows. Keep the last coherent window on exhaustion/failure.
+                retained_offsets.push((*pane_id, window.scrollback_offset));
+                continue;
+            }
         }
         requested_panes.insert(*pane_id);
         requests.push(PaneGridWindowRequest {
@@ -9594,6 +9725,14 @@ async fn ensure_pane_scrollback_windows(
         });
     }
 
+    for (pane_id, offset) in retained_offsets {
+        if let Some(view) = view_state.scrollback_for_mut(pane_id) {
+            view.offset = offset;
+        }
+    }
+    for (pane_id, window) in captured_windows {
+        publish_scrollback_window(view_state, pane_id, window);
+    }
     if requests.is_empty() {
         return Ok(());
     }
@@ -9620,41 +9759,63 @@ async fn ensure_pane_scrollback_windows(
             message: format!("hydrating structured scrollback window: {error}"),
         })?;
 
-        // The server clamps/advances the offset to keep a scrolled view anchored
-        // as new output scrolls history. Selection anchors are absolute history
-        // lines in the server's `total_scrolled_rows` numbering, so that
-        // re-anchoring needs no anchor adjustment at all. The one case that does
-        // need care is the *first* window for a pane: before it arrives the base
-        // is derived from the client's local grid counter, which can differ from
-        // the server's, so rebase the anchor onto the authoritative numbering.
-        let adjusted_offset = window.scrollback_offset;
-        let previous_base = view_state
-            .pane_buffers
-            .get(&pane_id)
-            .filter(|buffer| buffer.scrollback_window.is_none())
-            .map(|buffer| {
-                buffer.scrollback_viewport_base(view_state.scrollback_for(pane_id).as_ref())
-            });
-        let next_base = bmux_attach_pipeline::ScrollbackViewportBase::from_scrolled_rows(
-            window.total_scrolled_rows,
-            adjusted_offset,
-        );
-        if let Some(view) = view_state.scrollback_for_mut(pane_id) {
-            view.offset = adjusted_offset;
-            if let Some(previous_base) = previous_base {
-                view.rebase_selection_anchor(previous_base, next_base);
-            }
-        }
-        if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
-            buffer.scrollback_window = Some(PaneScrollbackWindow {
-                scrollback_offset: adjusted_offset,
+        publish_scrollback_window(
+            view_state,
+            pane_id,
+            PaneScrollbackWindow {
+                projection_width: 0,
+                row_anchors: Vec::new(),
+                palette: grid.palette().clone(),
+                scrollback_offset: window.scrollback_offset,
                 max_scrollback_offset: window.max_scrollback_offset,
                 total_scrolled_rows: window.total_scrolled_rows,
                 rows: grid.viewport_rows(),
-            });
-        }
+            },
+        );
     }
     Ok(())
+}
+
+/// Both fetch paths publish in authoritative physical-row coordinates. Rebase
+/// the first window from the local counter; later windows already share the
+/// authoritative numbering and must not shift selection a second time.
+fn publish_scrollback_window(
+    view_state: &mut AttachViewState,
+    pane_id: Uuid,
+    window: PaneScrollbackWindow,
+) {
+    let previous_base = view_state
+        .pane_buffers
+        .get(&pane_id)
+        .filter(|buffer| buffer.scrollback_window.is_none())
+        .map(|buffer| buffer.scrollback_viewport_base(view_state.scrollback_for(pane_id).as_ref()));
+    let next_base = bmux_attach_pipeline::ScrollbackViewportBase::from_scrolled_rows(
+        window.total_scrolled_rows,
+        window.scrollback_offset,
+    );
+    let remapped_view = view_state.scrollback_for(pane_id).map(|mut view| {
+        if let Some(previous) = view_state
+            .pane_buffers
+            .get(&pane_id)
+            .and_then(|buffer| buffer.scrollback_window.as_ref())
+        {
+            window.remap_view_from(previous, &mut view);
+        }
+        view
+    });
+    let Some(view) = view_state.scrollback_for_mut(pane_id) else {
+        return;
+    };
+    if let Some(remapped) = remapped_view {
+        *view = remapped;
+    }
+    view.offset = window.scrollback_offset;
+    if let Some(previous_base) = previous_base {
+        view.rebase_selection_anchor(previous_base, next_base);
+    }
+    if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
+        buffer.scrollback_window = Some(window);
+    }
 }
 
 async fn handle_attach_mouse_scrollback_with_window(
@@ -9701,6 +9862,7 @@ async fn handle_attach_mouse_scrollback_with_window(
                 Ok(pin) => {
                     if let Some(view) = view_state.scrollback_for_mut(pane_id) {
                         view.pin = Some(ScrollbackPin {
+                            capture: Some(pin.capture),
                             pin_id: pin.pin_id,
                             total_scrolled_rows: pin.total_scrolled_rows,
                             max_scrollback_offset: pin.max_scrollback_offset,
@@ -9851,6 +10013,7 @@ async fn pin_focused_scrollback_if_configured(
         Ok(pin) => {
             if let Some(view) = view_state.scrollback_for_mut(pane_id) {
                 view.pin = Some(ScrollbackPin {
+                    capture: Some(pin.capture),
                     pin_id: pin.pin_id,
                     total_scrolled_rows: pin.total_scrolled_rows,
                     max_scrollback_offset: pin.max_scrollback_offset,
@@ -10783,10 +10946,9 @@ pub async fn handle_attach_terminal_event(
         _ => {}
     }
     if matches!(&raw_event, Event::Resize(_, _)) {
-        // Reflow renumbers history lines, so any in-flight selection no longer
-        // refers to the text it was anchored on. Drop it rather than copy the
-        // wrong region.
-        clear_all_attach_selection_anchors(view_state);
+        // Immutable pins keep their coordinate identity while live history may
+        // reflow. Capture logical endpoints before changing presentation size.
+        prepare_attach_selections_for_resize(view_state);
         update_attach_viewport_with_geometry(client, view_state.attached_id, geometry).await?;
     }
 
@@ -13627,6 +13789,7 @@ fn update_attach_mouse_selection_drag_at(
     };
 
     if let Some(view) = view_state.scrollback_for_mut(drag.pane_id) {
+        view.captured_selection = None;
         view.selection_anchor = Some(drag.anchor);
     }
     let _ = set_attach_scrollback_cursor_to_position(view_state, head);
@@ -19261,6 +19424,7 @@ mod tests {
         let now = 100_u64;
         if let Some(view) = view_state.scrollback_for_mut(left_pane) {
             view.pin = Some(ScrollbackPin {
+                capture: None,
                 pin_id: 1,
                 total_scrolled_rows: 10,
                 max_scrollback_offset: 8,
@@ -19270,6 +19434,7 @@ mod tests {
         }
         if let Some(view) = view_state.scrollback_for_mut(right_pane) {
             view.pin = Some(ScrollbackPin {
+                capture: None,
                 pin_id: 2,
                 total_scrolled_rows: 10,
                 max_scrollback_offset: 8,
@@ -19293,6 +19458,7 @@ mod tests {
         assert!(enter_attach_scrollback_for(&mut view_state, left_pane));
         if let Some(view) = view_state.scrollback_for_mut(left_pane) {
             view.pin = Some(ScrollbackPin {
+                capture: None,
                 pin_id: 1,
                 total_scrolled_rows: 10,
                 max_scrollback_offset: 8,
@@ -19440,6 +19606,48 @@ mod tests {
     /// A selection served from the server scrollback window must read that
     /// window's rows, in the window's line numbering.
     #[test]
+    fn publishing_first_scrollback_window_rebases_selection_only_once() {
+        let mut state = attach_view_state_with_scrollback_fixture();
+        let pane = focused_attach_pane_id(&state).unwrap();
+        assert!(enter_attach_scrollback(&mut state));
+        let base =
+            state.pane_buffers[&pane].scrollback_viewport_base(state.scrollback_for(pane).as_ref());
+        let view = state.scrollback_for_mut(pane).unwrap();
+        view.selection_anchor = Some(AttachScrollbackPosition {
+            line: base.line_for_viewport_row(1),
+            col: 2,
+        });
+        view.cursor = AttachScrollbackCursor { row: 2, col: 4 };
+        let window = || PaneScrollbackWindow {
+            projection_width: 0,
+            row_anchors: Vec::new(),
+            palette: bmux_terminal_grid::StylePalette::default(),
+            scrollback_offset: 3,
+            max_scrollback_offset: 100,
+            total_scrolled_rows: 100,
+            rows: Vec::new(),
+        };
+        publish_scrollback_window(&mut state, pane, window());
+        let expected = bmux_attach_pipeline::ScrollbackViewportBase::from_scrolled_rows(100, 3)
+            .line_for_viewport_row(1);
+        assert_eq!(
+            state.scrollback_for(pane).unwrap().selection_anchor,
+            Some(AttachScrollbackPosition {
+                line: expected,
+                col: 2
+            })
+        );
+        publish_scrollback_window(&mut state, pane, window());
+        assert_eq!(
+            state.scrollback_for(pane).unwrap().selection_anchor,
+            Some(AttachScrollbackPosition {
+                line: expected,
+                col: 2
+            })
+        );
+    }
+
+    #[test]
     fn selected_attach_text_reads_server_scrollback_window_rows() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         let pane_id = focused_attach_pane_id(&view_state).expect("focused pane");
@@ -19464,6 +19672,9 @@ mod tests {
         }
         if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
             buffer.scrollback_window = Some(PaneScrollbackWindow {
+                projection_width: 0,
+                row_anchors: Vec::new(),
+                palette: bmux_terminal_grid::StylePalette::default(),
                 scrollback_offset: 3,
                 max_scrollback_offset: 9,
                 total_scrolled_rows: 12,
@@ -19656,6 +19867,38 @@ mod tests {
     }
 
     #[test]
+    fn resize_preserves_pinned_selection_but_invalidates_live_selection() {
+        let mut state = attach_view_state_with_scrollback_fixture();
+        let pane = focused_attach_pane_id(&state).unwrap();
+        assert!(enter_attach_scrollback(&mut state));
+        let endpoint = AttachScrollbackPosition { line: 2, col: 1 };
+        let view = state.scrollback_for_mut(pane).unwrap();
+        view.selection_anchor = Some(endpoint);
+        view.pin = Some(bmux_attach_pipeline::ScrollbackPin {
+            capture: None,
+            pin_id: 1,
+            total_scrolled_rows: 10,
+            max_scrollback_offset: 10,
+            stream_end: 0,
+            created_epoch_secs: 0,
+        });
+        prepare_attach_selections_for_resize(&mut state);
+        assert_eq!(
+            state.scrollback_for(pane).unwrap().selection_anchor,
+            Some(endpoint)
+        );
+        state.scrollback_for_mut(pane).unwrap().pin = None;
+        prepare_attach_selections_for_resize(&mut state);
+        assert!(
+            state
+                .scrollback_for(pane)
+                .unwrap()
+                .selection_anchor
+                .is_none()
+        );
+    }
+
+    #[test]
     fn clear_all_attach_selection_anchors_drops_every_pane_anchor() {
         let (mut view_state, left_pane, right_pane) = attach_view_state_with_two_panes_fixture();
         assert!(enter_attach_scrollback_for(&mut view_state, left_pane));
@@ -19663,7 +19906,7 @@ mod tests {
         assert!(begin_attach_selection_for(&mut view_state, left_pane));
         assert!(begin_attach_selection_for(&mut view_state, right_pane));
 
-        clear_all_attach_selection_anchors(&mut view_state);
+        prepare_attach_selections_for_resize(&mut view_state);
 
         assert!(view_state.scrollback_active_for(left_pane));
         assert!(view_state.scrollback_active_for(right_pane));

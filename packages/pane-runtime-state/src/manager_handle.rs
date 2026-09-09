@@ -98,11 +98,42 @@ pub struct AttachPaneGridWindowRequest {
 /// Immutable per-client pane-history capture used by frozen scrollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttachPaneScrollbackPin {
+    pub width: u16,
+    pub height: u16,
+    pub history_truncated: bool,
+    pub history_line_count: usize,
+    pub capture_id: Uuid,
     pub pane_id: Uuid,
     pub pin_id: u64,
     pub total_scrolled_rows: u64,
     pub max_scrollback_offset: usize,
     pub stream_end: u64,
+}
+
+/// Logical slice termination within an immutable capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryEnd {
+    Continue,
+    HardBreak,
+    Open,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryFetchError {
+    StaleCapture,
+    Unavailable,
+    InvalidOffset,
+    BudgetExhausted,
+    Runtime(SessionRuntimeError),
+}
+
+impl From<SessionRuntimeError> for HistoryFetchError {
+    fn from(error: SessionRuntimeError) -> Self {
+        match error {
+            SessionRuntimeError::ResponseBudgetExceeded => Self::BudgetExhausted,
+            other => Self::Runtime(other),
+        }
+    }
 }
 
 /// Result of releasing one frozen-scrollback pin.
@@ -512,6 +543,32 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         client_id: ClientId,
         windows: &[AttachPaneGridWindowRequest],
     ) -> Result<AttachGridWindowState, SessionRuntimeError>;
+
+    /// Fetch JSON styled cells from one immutable pin; never falls back to live state.
+    fn attach_history_slice(
+        &self,
+        _session_id: SessionId,
+        _client_id: ClientId,
+        _pane_id: Uuid,
+        _pin_id: (u64, Uuid),
+        _position: (usize, usize),
+        _limits: (usize, usize),
+    ) -> Result<(Vec<u8>, usize, HistoryEnd), HistoryFetchError> {
+        Err(HistoryFetchError::Unavailable)
+    }
+
+    /// Fetch JSON styled cells from one immutable pin; never falls back to live state.
+    fn attach_main_row_slice(
+        &self,
+        _session_id: SessionId,
+        _client_id: ClientId,
+        _pane_id: Uuid,
+        _pin_id: (u64, Uuid),
+        _position: (usize, usize),
+        _limits: (usize, usize),
+    ) -> Result<(Vec<u8>, usize, HistoryEnd), HistoryFetchError> {
+        Err(HistoryFetchError::Unavailable)
+    }
 
     fn attach_scrollback_pin(
         &self,

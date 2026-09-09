@@ -203,6 +203,15 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "attach-runtime-state", "attach-pane-grid-window-state" => |req: attach_state::AttachPaneGridWindowArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_window_state(&req, ctx))
         },
+        "attach-runtime-state", "attach-history-capture-v1" => |req: attach_state::AttachPaneScrollbackPinArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::history_capture(&req, ctx))
+        },
+        "attach-runtime-state", "attach-main-row-slice-v1" => |req: attach_state::HistorySliceArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::main_row_slice(&req, ctx))
+        },
+        "attach-runtime-state", "attach-history-slice-v1" => |req: attach_state::HistorySliceArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::history_slice(&req, ctx))
+        },
         "attach-runtime-state", "attach-pane-scrollback-pin" => |req: attach_state::AttachPaneScrollbackPinArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_scrollback_pin(&req, ctx))
         },

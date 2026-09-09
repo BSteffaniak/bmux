@@ -41,6 +41,48 @@ const fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{pane_runtime_commands, pane_runtime_state};
+    #[test]
+    fn versioned_capture_preserves_legacy_pin_wire_shape() {
+        use super::attach_runtime_state::{HistoryCaptureV1, PaneScrollbackPin};
+        #[derive(serde::Serialize)]
+        struct LegacyPin {
+            pane_id: uuid::Uuid,
+            pin_id: u64,
+            total_scrolled_rows: u64,
+            max_scrollback_offset: u32,
+            stream_end: u64,
+        }
+        let pin = PaneScrollbackPin {
+            pane_id: uuid::Uuid::new_v4(),
+            pin_id: 7,
+            total_scrolled_rows: 12,
+            max_scrollback_offset: 3,
+            stream_end: 99,
+        };
+        let legacy = LegacyPin {
+            pane_id: pin.pane_id,
+            pin_id: pin.pin_id,
+            total_scrolled_rows: pin.total_scrolled_rows,
+            max_scrollback_offset: pin.max_scrollback_offset,
+            stream_end: pin.stream_end,
+        };
+        assert_eq!(
+            bmux_codec::to_vec(&pin).unwrap(),
+            bmux_codec::to_vec(&legacy).unwrap()
+        );
+        let capture = HistoryCaptureV1 {
+            width: 80,
+            height: 24,
+            history_truncated: true,
+            history_line_count: 3,
+            capture_id: uuid::Uuid::new_v4(),
+            pin,
+        };
+        let bytes = bmux_codec::to_vec(&capture).unwrap();
+        let decoded: HistoryCaptureV1 = bmux_codec::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, capture);
+    }
+
     use pane_runtime_commands::client::SetPanePaddingRequest;
 
     #[test]

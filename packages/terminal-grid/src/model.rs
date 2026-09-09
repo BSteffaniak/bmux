@@ -22,6 +22,202 @@ impl Default for GridLimits {
     }
 }
 
+/// Why a bounded logical-history slice stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorySliceEnd {
+    /// More cells remain in this captured logical line.
+    Continue,
+    /// The captured logical line ends with a hard break.
+    HardBreak,
+    /// The pending logical line continues into the live screen.
+    Open,
+}
+
+/// Borrowed history content; offsets count terminal columns, not UTF-8 bytes.
+/// Line indices are valid only within the same grid capture and revision.
+#[derive(Debug)]
+pub struct HistorySlice<'a> {
+    pub cells: &'a [Cell],
+    pub next_cell_offset: usize,
+    pub end: HistorySliceEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistorySliceError {
+    StaleRevision,
+    Unavailable,
+    InvalidOffset,
+    BudgetExhausted,
+}
+
+/// Consumer-owned assembly of one captured logical line. The opaque identity
+/// belongs to the caller; terminal algorithms do not interpret it.
+#[derive(Debug)]
+pub struct HistoryLineAssembly {
+    identity: u128,
+    line_index: usize,
+    next_offset: usize,
+    cells: Vec<Cell>,
+    remaining_bytes: usize,
+    prefix_unavailable: bool,
+    end: HistorySliceEnd,
+}
+
+impl HistoryLineAssembly {
+    #[must_use]
+    pub const fn new(
+        identity: u128,
+        line_index: usize,
+        max_bytes: usize,
+        prefix_unavailable: bool,
+    ) -> Self {
+        Self {
+            identity,
+            line_index,
+            next_offset: 0,
+            cells: Vec::new(),
+            remaining_bytes: max_bytes,
+            prefix_unavailable,
+            end: HistorySliceEnd::Continue,
+        }
+    }
+
+    /// Admit and copy an ordered slice. Failure leaves the assembled content and
+    /// continuation unchanged; allocation is fallible and text plus cell metadata
+    /// is charged before copying. Styles must already use the consumer's palette.
+    ///
+    /// # Errors
+    /// Rejects another capture/line, gaps, overlaps, malformed column counts,
+    /// appends after termination, and exhausted allocation/content budgets.
+    pub fn append(
+        &mut self,
+        identity: u128,
+        line_index: usize,
+        offset: usize,
+        slice: &HistorySlice<'_>,
+    ) -> Result<(), HistorySliceError> {
+        if identity != self.identity {
+            return Err(HistorySliceError::StaleRevision);
+        }
+        if line_index != self.line_index
+            || offset != self.next_offset
+            || self.end != HistorySliceEnd::Continue
+        {
+            return Err(HistorySliceError::InvalidOffset);
+        }
+        let mut next = offset;
+        for cell in slice.cells {
+            if !(1..=2).contains(&cell.width()) {
+                return Err(HistorySliceError::InvalidOffset);
+            }
+            next = next
+                .checked_add(usize::from(cell.width()))
+                .ok_or(HistorySliceError::InvalidOffset)?;
+        }
+        if next != slice.next_cell_offset
+            || (next == offset && slice.end == HistorySliceEnd::Continue)
+        {
+            return Err(HistorySliceError::InvalidOffset);
+        }
+        let charged = history_cells_bytes(slice.cells);
+        let remaining = self
+            .remaining_bytes
+            .checked_sub(charged)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let copied = try_clone_cells(slice.cells).ok_or(HistorySliceError::BudgetExhausted)?;
+        self.cells
+            .try_reserve_exact(copied.len())
+            .map_err(|_| HistorySliceError::BudgetExhausted)?;
+        self.cells.extend(copied);
+        self.next_offset = next;
+        self.remaining_bytes = remaining;
+        self.end = slice.end;
+        Ok(())
+    }
+
+    /// Project a bounded physical-row range after complete assembly.
+    ///
+    /// # Errors
+    /// Returns unavailable for unfinished content and budget exhaustion when
+    /// selected row allocation exceeds the caller's projection allowance.
+    pub fn project(
+        &self,
+        width: usize,
+        range: std::ops::Range<usize>,
+        budget: usize,
+    ) -> Result<Vec<PhysicalRow>, HistorySliceError> {
+        if width == 0 || self.completed().is_none() {
+            return Err(HistorySliceError::Unavailable);
+        }
+        let count = crate::reflow::projected_logical_line_row_count(&self.cells, width);
+        let range = range.start.min(count)..range.end.min(count);
+        let metadata = (range.end.saturating_sub(range.start))
+            .checked_mul(std::mem::size_of::<PhysicalRow>())
+            .and_then(|bytes| {
+                bytes.checked_add(crate::reflow::projected_cell_storage(
+                    &self.cells,
+                    width,
+                    range.clone(),
+                )?)
+            })
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let mut remaining = budget
+            .checked_sub(metadata)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        crate::reflow::admit_logical_text(&self.cells, width, range.clone(), &mut remaining)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let rows = crate::reflow::try_project_logical_line_window(&self.cells, width, range)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(rows.len())
+            .map_err(|_| HistorySliceError::BudgetExhausted)?;
+        for mut row in rows {
+            if self.end == HistorySliceEnd::Open {
+                row.set_wrapped(true);
+            }
+            output.push(row);
+        }
+        Ok(output)
+    }
+
+    /// Map a presentation row boundary to a stable logical-column anchor.
+    #[must_use]
+    pub fn column_for_row(&self, width: usize, row: usize) -> Option<usize> {
+        self.completed()?;
+        crate::reflow::logical_column_for_row(&self.cells, width, row)
+    }
+
+    /// Map a stable cell-boundary anchor to its row at another width.
+    #[must_use]
+    pub fn row_for_column(&self, width: usize, column: usize) -> Option<usize> {
+        self.completed()?;
+        crate::reflow::row_for_logical_column(&self.cells, width, column)
+    }
+
+    #[must_use]
+    pub fn projected_rows(&self, width: usize) -> usize {
+        crate::reflow::projected_logical_line_row_count(&self.cells, width.max(1))
+    }
+
+    #[must_use]
+    pub const fn next_offset(&self) -> usize {
+        self.next_offset
+    }
+
+    #[must_use]
+    pub const fn prefix_unavailable(&self) -> bool {
+        self.prefix_unavailable
+    }
+
+    /// Only a terminated line is available for presentation. An Open ending
+    /// still continues into the live screen and must not become a hard break.
+    #[must_use]
+    pub fn completed(&self) -> Option<(&[Cell], HistorySliceEnd)> {
+        (self.end != HistorySliceEnd::Continue).then_some((&self.cells, self.end))
+    }
+}
+
 /// Terminal grid mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridMode {
@@ -205,6 +401,53 @@ pub struct PhysicalRow {
 }
 
 impl PhysicalRow {
+    pub(crate) fn allocated_bytes(&self) -> Option<usize> {
+        self.cells.iter().try_fold(
+            self.cells
+                .capacity()
+                .checked_mul(std::mem::size_of::<Cell>())?,
+            |bytes, cell| bytes.checked_add(cell.text.capacity()),
+        )
+    }
+
+    pub(crate) fn try_set_projected_cell(
+        &mut self,
+        col: usize,
+        cell: &Cell,
+        width: usize,
+    ) -> Option<()> {
+        let end = col.checked_add(if cell.width == 2 && col + 1 < width {
+            2
+        } else {
+            1
+        })?;
+        self.cells
+            .try_reserve_exact(end.saturating_sub(self.cells.len()))
+            .ok()?;
+        while self.cells.len() < end {
+            // Reserve blank text explicitly; projection can expose gaps after
+            // discardable cells have been trimmed.
+            let mut text = String::new();
+            text.try_reserve_exact(1).ok()?;
+            text.push(' ');
+            self.cells.push(Cell::new(text, StyleId::DEFAULT, 1));
+        }
+        let mut text = String::new();
+        text.try_reserve_exact(cell.text.len()).ok()?;
+        text.push_str(&cell.text);
+        self.cells[col] = Cell {
+            text,
+            style: cell.style,
+            width: cell.width,
+            wide_continuation: cell.wide_continuation,
+        };
+        if end > col + 1 {
+            self.cells[col + 1] = Cell::spacer(cell.style);
+        }
+        self.trim_trailing_blanks();
+        Some(())
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -307,11 +550,17 @@ pub enum TerminalGridError {
 /// Structured terminal state with bounded main-screen scrollback and isolated
 /// alternate-screen viewport.
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "history provenance is independent of terminal protocol flags, not a mutually exclusive mode"
+)]
 pub struct TerminalGrid {
     width: usize,
     height: usize,
     limits: GridLimits,
     main_history: VecDeque<LogicalLine>,
+    history_bytes: usize,
+    history_truncated: bool,
     main_history_projected_rows: OnceLock<usize>,
     pending_history_cells: Vec<Cell>,
     main_rows: VecDeque<PhysicalRow>,
@@ -409,6 +658,8 @@ impl TerminalGrid {
             height,
             limits,
             main_history: VecDeque::new(),
+            history_bytes: 0,
+            history_truncated: false,
             main_history_projected_rows: OnceLock::from(0),
             pending_history_cells: Vec::new(),
             main_rows,
@@ -496,6 +747,12 @@ impl TerminalGrid {
             width,
             height,
             limits,
+            history_bytes: main_history
+                .iter()
+                .map(|line| history_cells_bytes(&line.cells))
+                .sum::<usize>()
+                .saturating_add(history_cells_bytes(&pending_history_cells)),
+            history_truncated: snapshot.history_truncated.unwrap_or(true),
             main_history,
             main_history_projected_rows: OnceLock::from(main_history_projected_rows),
             pending_history_cells,
@@ -880,6 +1137,8 @@ impl TerminalGrid {
                     self.fill_viewport_row(row, fill);
                 }
                 if mode == 3 && self.mode == GridMode::Main {
+                    self.history_truncated |= self.history_line_count() > 0;
+                    self.history_bytes = 0;
                     self.main_history.clear();
                     self.main_history_projected_rows = OnceLock::from(0);
                     self.pending_history_cells.clear();
@@ -1301,16 +1560,172 @@ impl TerminalGrid {
         self.active_row_mut(row).set_wrapped(true);
     }
 
+    /// Whether content before the retained history is unavailable. Legacy
+    /// snapshots conservatively report truncation when provenance is unknown.
+    #[must_use]
+    pub const fn history_truncated(&self) -> bool {
+        self.history_truncated
+    }
+
+    /// Number of logical lines addressable by `history_slice` in this capture.
+    /// Includes the pending open line when present; unrelated to projected rows.
+    #[must_use]
+    pub fn history_line_count(&self) -> usize {
+        self.main_history.len() + usize::from(!self.pending_history_cells.is_empty())
+    }
+
+    /// Read a bounded slice without allocating or projecting physical rows.
+    ///
+    /// The caller must bind `revision` and `line_index` to one capture identity;
+    /// revisions alone do not identify different grids. Completed retained lines
+    /// precede the optional pending line. Evicted lines cannot be reconstructed.
+    ///
+    /// # Errors
+    /// Rejects stale revisions, unavailable lines, offsets inside wide cells,
+    /// and budgets that cannot make progress. `max_text_bytes` counts source
+    /// UTF-8 only, not serialized metadata or envelope overhead.
+    pub fn history_slice(
+        &self,
+        revision: u64,
+        line_index: usize,
+        cell_offset: usize,
+        max_columns: usize,
+        max_text_bytes: usize,
+    ) -> Result<HistorySlice<'_>, HistorySliceError> {
+        if revision != self.revision {
+            return Err(HistorySliceError::StaleRevision);
+        }
+        let (cells, terminal_end) = if let Some(line) = self.main_history.get(line_index) {
+            (line.cells.as_slice(), HistorySliceEnd::HardBreak)
+        } else if line_index == self.main_history.len() && !self.pending_history_cells.is_empty() {
+            (self.pending_history_cells.as_slice(), HistorySliceEnd::Open)
+        } else {
+            return Err(HistorySliceError::Unavailable);
+        };
+        let mut offset = 0_usize;
+        let mut start = 0;
+        while start < cells.len() && offset < cell_offset {
+            offset = offset
+                .checked_add(usize::from(cells[start].width()))
+                .ok_or(HistorySliceError::InvalidOffset)?;
+            start += 1;
+        }
+        if offset != cell_offset {
+            return Err(HistorySliceError::InvalidOffset);
+        }
+        let mut end = start;
+        let mut columns = 0_usize;
+        let mut bytes = 0_usize;
+        for cell in &cells[start..] {
+            let Some(next_columns) = columns.checked_add(usize::from(cell.width())) else {
+                break;
+            };
+            let Some(next_bytes) = bytes.checked_add(cell.text().len()) else {
+                break;
+            };
+            if next_columns > max_columns || next_bytes > max_text_bytes {
+                break;
+            }
+            columns = next_columns;
+            bytes = next_bytes;
+            end += 1;
+        }
+        if end == start && start < cells.len() {
+            return Err(HistorySliceError::BudgetExhausted);
+        }
+        Ok(HistorySlice {
+            cells: &cells[start..end],
+            next_cell_offset: offset + columns,
+            end: if end == cells.len() {
+                terminal_end
+            } else {
+                HistorySliceEnd::Continue
+            },
+        })
+    }
+
+    /// Read a bounded fragment of an immutable main-screen row, even while
+    /// the alternate screen is active. `Open` means the row soft-wraps into
+    /// the next row; `Continue` means another slice of this row is required.
+    /// Physical row boundaries and implicit trailing blanks remain significant:
+    /// callers join wrapped rows using the capture width, not slice length.
+    ///
+    /// # Errors
+    /// Rejects stale revisions, missing rows, wide-continuation offsets and
+    /// budgets too small to return the next complete cell.
+    pub fn main_row_slice(
+        &self,
+        revision: u64,
+        row_index: usize,
+        cell_offset: usize,
+        max_columns: usize,
+        max_text_bytes: usize,
+    ) -> Result<HistorySlice<'_>, HistorySliceError> {
+        if revision != self.revision {
+            return Err(HistorySliceError::StaleRevision);
+        }
+        let row = self
+            .main_rows
+            .get(row_index)
+            .ok_or(HistorySliceError::Unavailable)?;
+        let cells = row.cells();
+        if cell_offset > cells.len()
+            || cells
+                .get(cell_offset)
+                .is_some_and(Cell::is_wide_continuation)
+        {
+            return Err(HistorySliceError::InvalidOffset);
+        }
+        let mut end = cell_offset;
+        let mut bytes = 0_usize;
+        while let Some(cell) = cells.get(end) {
+            let span = usize::from(cell.width()).max(1).min(cells.len() - end);
+            let next = end + span;
+            let next_bytes = bytes
+                .checked_add(cell.text().len())
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            if next - cell_offset > max_columns || next_bytes > max_text_bytes {
+                break;
+            }
+            end = next;
+            bytes = next_bytes;
+        }
+        if end == cell_offset && end < cells.len() {
+            return Err(HistorySliceError::BudgetExhausted);
+        }
+        Ok(HistorySlice {
+            cells: &cells[cell_offset..end],
+            next_cell_offset: end,
+            end: if end < cells.len() {
+                HistorySliceEnd::Continue
+            } else if row.wrapped() {
+                HistorySliceEnd::Open
+            } else {
+                HistorySliceEnd::HardBreak
+            },
+        })
+    }
+
     fn push_history_row(&mut self, row: &PhysicalRow) {
-        self.pending_history_cells
-            .extend(row_logical_cells(row, self.width));
+        let cells = row_logical_cells(row, self.width);
+        self.history_bytes = self
+            .history_bytes
+            .saturating_add(history_cells_bytes(&cells));
+        self.pending_history_cells.extend(cells);
         if !row.wrapped() {
-            let cells = trim_trailing_blank_cells(std::mem::take(&mut self.pending_history_cells));
+            let pending = std::mem::take(&mut self.pending_history_cells);
+            self.history_bytes = self
+                .history_bytes
+                .saturating_sub(history_cells_bytes(&pending));
+            let cells = trim_trailing_blank_cells(pending);
             self.push_history_line(LogicalLine::new(cells));
         }
     }
 
     fn push_history_line(&mut self, line: LogicalLine) {
+        self.history_bytes = self
+            .history_bytes
+            .saturating_add(history_cells_bytes(&line.cells));
         if let Some(count) = self.main_history_projected_rows.get_mut() {
             *count = count.saturating_add(line.projected_row_count(self.width));
         }
@@ -1324,6 +1739,102 @@ impl TerminalGrid {
                 .map(|line| line.projected_row_count(self.width))
                 .sum()
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_display_rows(
+        &self,
+        offset: usize,
+        rows: usize,
+        main: bool,
+    ) -> Option<Vec<PhysicalRow>> {
+        let mut remaining = usize::MAX;
+        self.try_display_rows_charged(offset, rows, main, &mut remaining)
+    }
+
+    pub(crate) fn try_display_rows_charged(
+        &self,
+        offset: usize,
+        rows: usize,
+        main: bool,
+        remaining: &mut usize,
+    ) -> Option<Vec<PhysicalRow>> {
+        let mut selected = Vec::new();
+        if !main && self.mode == GridMode::Alternate {
+            let end = self.alt_rows.len().saturating_sub(offset);
+            let start = end.saturating_sub(rows);
+            crate::snapshot::reserve_snapshot_vec(&mut selected, end - start, remaining)?;
+            for row in &self.alt_rows[start..end] {
+                selected.push(try_clone_row_charged(row, remaining)?);
+            }
+            return Some(selected);
+        }
+        let mut skip = offset;
+        crate::snapshot::reserve_snapshot_vec(
+            &mut selected,
+            rows.min(self.main_row_count().saturating_sub(offset)),
+            remaining,
+        )?;
+        for row in self.main_rows.iter().rev() {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            if selected.len() == rows {
+                break;
+            }
+            selected.push(try_clone_row_charged(row, remaining)?);
+        }
+        let lines = std::iter::once((self.pending_history_cells.as_slice(), true))
+            .filter(|(cells, _)| !cells.is_empty())
+            .chain(
+                self.main_history
+                    .iter()
+                    .rev()
+                    .map(|line| (line.cells.as_slice(), false)),
+            );
+        for (cells, pending) in lines {
+            if selected.len() == rows {
+                break;
+            }
+            let count = projected_row_count(cells, self.width);
+            if skip >= count {
+                skip -= count;
+                continue;
+            }
+            let end = count - skip;
+            let start = end.saturating_sub(rows - selected.len());
+            // Admit selected cells plus both the destination vector (already
+            // charged) and the temporary projection deque before projection.
+            let metadata = (end - start)
+                .checked_mul(std::mem::size_of::<PhysicalRow>())?
+                .checked_add(crate::reflow::projected_cell_storage(
+                    cells,
+                    self.width,
+                    start..end,
+                )?)?;
+            let mut text_budget = remaining.checked_sub(metadata)?;
+            crate::reflow::admit_logical_text(cells, self.width, start..end, &mut text_budget)?;
+            let projected =
+                crate::reflow::try_project_logical_line_window(cells, self.width, start..end)?;
+            let deque_bytes = projected
+                .capacity()
+                .checked_mul(std::mem::size_of::<PhysicalRow>())?;
+            let allocated = projected.iter().try_fold(deque_bytes, |bytes, row| {
+                bytes.checked_add(row.allocated_bytes()?)
+            })?;
+            *remaining = remaining.checked_sub(allocated)?;
+            for mut row in projected.into_iter().rev() {
+                if pending {
+                    row.set_wrapped(true);
+                }
+                selected.push(row);
+            }
+            *remaining = remaining.checked_add(deque_bytes)?;
+            skip = 0;
+        }
+        selected.reverse();
+        Some(selected)
     }
 
     pub(crate) fn main_display_rows(
@@ -1464,6 +1975,12 @@ impl TerminalGrid {
             row_index = line_end;
         }
         self.pending_history_cells = trim_trailing_blank_cells(next_pending);
+        self.history_bytes = self
+            .main_history
+            .iter()
+            .map(|line| history_cells_bytes(&line.cells))
+            .sum::<usize>()
+            .saturating_add(history_cells_bytes(&self.pending_history_cells));
         while next_rows.len() < new_height {
             next_rows.push_back(PhysicalRow::new());
         }
@@ -1575,22 +2092,292 @@ impl TerminalGrid {
         self.cursor.col = self.cursor.col.min(self.width.saturating_sub(1));
     }
 
+    /// Whether either screen contains a cell whose text exceeds a byte limit.
+    ///
+    /// This borrows existing storage and performs no projection or text cloning.
+    /// History is deliberately excluded: a viewport snapshot need not carry it.
+    #[must_use]
+    pub fn screen_cell_text_exceeds(&self, max_bytes: usize) -> bool {
+        self.main_rows
+            .iter()
+            .chain(self.alt_rows.iter())
+            .any(|row| row.cells().iter().any(|cell| cell.text().len() > max_bytes))
+    }
+
+    /// Admit aggregate source text for exactly the snapshot's selected rows.
+    /// No rows or cell text are cloned. This is a text bound, not a bound on
+    /// metadata, parser state, or allocator overhead.
+    #[must_use]
+    pub fn snapshot_text_fits(&self, offset: usize, rows: usize, max_bytes: usize) -> bool {
+        let rows = if rows == usize::MAX {
+            self.height
+        } else {
+            rows.max(self.height)
+        };
+        let mut remaining = max_bytes;
+        let mut admit_main = |offset: usize| -> Option<()> {
+            let mut skip = offset;
+            let mut needed = rows;
+            for row in self.main_rows.iter().rev() {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                if needed == 0 {
+                    break;
+                }
+                for cell in row.cells() {
+                    remaining = remaining.checked_sub(cell.text().len())?;
+                }
+                needed -= 1;
+            }
+            let lines = std::iter::once(self.pending_history_cells.as_slice())
+                .filter(|cells| !cells.is_empty())
+                .chain(
+                    self.main_history
+                        .iter()
+                        .rev()
+                        .map(|line| line.cells.as_slice()),
+                );
+            for cells in lines {
+                if needed == 0 {
+                    break;
+                }
+                let count = projected_row_count(cells, self.width);
+                if skip >= count {
+                    skip -= count;
+                    continue;
+                }
+                let end = count - skip;
+                let start = end.saturating_sub(needed);
+                crate::reflow::admit_logical_text(cells, self.width, start..end, &mut remaining)?;
+                needed -= end - start;
+                skip = 0;
+            }
+            Some(())
+        };
+        if admit_main(if self.mode == GridMode::Main {
+            offset
+        } else {
+            0
+        })
+        .is_none()
+        {
+            return false;
+        }
+        if self.mode == GridMode::Alternate {
+            let end = self.alt_rows.len().saturating_sub(offset);
+            for row in &self.alt_rows[end.saturating_sub(rows)..end] {
+                for cell in row.cells() {
+                    let Some(next) = remaining.checked_sub(cell.text().len()) else {
+                        return false;
+                    };
+                    remaining = next;
+                }
+            }
+        }
+        true
+    }
+
+    /// Clone retained state only after admitting its owned payload. Container
+    /// and text reservations are fallible; allocator bookkeeping is excluded.
+    pub fn try_clone_with_budget(&self, mut max_bytes: usize) -> Option<Self> {
+        self.try_clone_charged(&mut max_bytes)
+    }
+
+    /// Clone and debit a shared payload budget only on successful allocation.
+    /// The remaining budget can admit temporary storage coexisting with this clone.
+    pub fn try_clone_charged(&self, budget: &mut usize) -> Option<Self> {
+        let mut remaining = budget.checked_sub(std::mem::size_of::<Self>())?;
+        let mut charge = |count: usize, size: usize| -> Option<()> {
+            remaining = remaining.checked_sub(count.checked_mul(size)?)?;
+            Some(())
+        };
+        charge(self.main_history.len(), std::mem::size_of::<LogicalLine>())?;
+        charge(self.main_rows.len(), std::mem::size_of::<PhysicalRow>())?;
+        charge(self.alt_rows.len(), std::mem::size_of::<PhysicalRow>())?;
+        charge(self.palette.styles().len(), std::mem::size_of::<Style>())?;
+        let cells = self
+            .main_history
+            .iter()
+            .map(|line| line.cells.as_slice())
+            .chain(std::iter::once(self.pending_history_cells.as_slice()))
+            .chain(
+                self.main_rows
+                    .iter()
+                    .chain(self.alt_rows.iter())
+                    .map(PhysicalRow::cells),
+            );
+        for row in cells {
+            charge(row.len(), std::mem::size_of::<Cell>())?;
+            for cell in row {
+                charge(cell.text.len(), 1)?;
+            }
+        }
+        let mut main_history = VecDeque::new();
+        main_history
+            .try_reserve_exact(self.main_history.len())
+            .ok()?;
+        for line in &self.main_history {
+            main_history.push_back(LogicalLine::new(try_clone_cells(&line.cells)?));
+        }
+        let mut main_rows = VecDeque::new();
+        main_rows.try_reserve_exact(self.main_rows.len()).ok()?;
+        for row in &self.main_rows {
+            main_rows.push_back(try_clone_row(row)?);
+        }
+        let mut alt_rows = Vec::new();
+        alt_rows.try_reserve_exact(self.alt_rows.len()).ok()?;
+        for row in &self.alt_rows {
+            alt_rows.push(try_clone_row(row)?);
+        }
+        let mut styles = Vec::new();
+        styles.try_reserve_exact(self.palette.styles().len()).ok()?;
+        styles.extend_from_slice(self.palette.styles());
+        let cloned = Self {
+            width: self.width,
+            height: self.height,
+            limits: self.limits,
+            history_bytes: self.history_bytes,
+            history_truncated: self.history_truncated,
+            main_history,
+            main_history_projected_rows: OnceLock::new(),
+            pending_history_cells: try_clone_cells(&self.pending_history_cells)?,
+            main_rows,
+            alt_rows,
+            mode: self.mode,
+            cursor: self.cursor,
+            saved_cursor: self.saved_cursor,
+            saved_pending_wrap: self.saved_pending_wrap,
+            characters: self.characters,
+            saved_characters: self.saved_characters,
+            current_style: self.current_style,
+            palette: StylePalette::from_styles(styles),
+            revision: self.revision,
+            content_revision: self.content_revision,
+            total_scrolled_rows: self.total_scrolled_rows,
+            autowrap: self.autowrap,
+            pending_wrap: self.pending_wrap,
+            scroll_region: self.scroll_region,
+            protocol: self.protocol,
+        };
+        // Exact reservations may still receive excess capacity from an allocator.
+        // Do not publish that capacity without charging the shared budget.
+        *budget = budget.checked_sub(cloned.retained_capacity_bytes()?)?;
+        Some(cloned)
+    }
+
+    /// Owned allocation capacity plus the grid value, excluding allocator
+    /// bookkeeping and allocations owned by callers (for example Arc headers).
+    #[must_use]
+    pub fn retained_capacity_bytes(&self) -> Option<usize> {
+        let mut bytes = std::mem::size_of::<Self>();
+        let mut charge = |count: usize, size: usize| -> Option<()> {
+            bytes = bytes.checked_add(count.checked_mul(size)?)?;
+            Some(())
+        };
+        charge(
+            self.main_history.capacity(),
+            std::mem::size_of::<LogicalLine>(),
+        )?;
+        charge(
+            self.main_rows.capacity(),
+            std::mem::size_of::<PhysicalRow>(),
+        )?;
+        charge(self.alt_rows.capacity(), std::mem::size_of::<PhysicalRow>())?;
+        charge(self.palette.capacity(), std::mem::size_of::<Style>())?;
+        let vectors = self
+            .main_history
+            .iter()
+            .map(|line| &line.cells)
+            .chain(std::iter::once(&self.pending_history_cells))
+            .chain(
+                self.main_rows
+                    .iter()
+                    .chain(self.alt_rows.iter())
+                    .map(|row| &row.cells),
+            );
+        for cells in vectors {
+            charge(cells.capacity(), std::mem::size_of::<Cell>())?;
+            for cell in cells {
+                charge(cell.text.capacity(), 1)?;
+            }
+        }
+        Some(bytes)
+    }
+
     pub(crate) fn retained_history_line_count(&self) -> usize {
         self.main_history.len()
     }
 
     fn evict_excess_history(&mut self) {
-        while self.main_history.len() > self.limits.scrollback_rows {
+        self.evict_history_to_budget(8 * 1024 * 1024);
+    }
+
+    // Charge stored cell metadata and UTF-8 bytes, not physical projected rows.
+    // Evict completed lines first. An oversized open line loses its prefix as
+    // a whole; the truncation flag prevents presenting the suffix as complete.
+    fn evict_history_to_budget(&mut self, max_bytes: usize) {
+        while self.main_history.len() > self.limits.scrollback_rows
+            || self.history_bytes > max_bytes
+        {
+            self.history_truncated = true;
             if let Some(line) = self.main_history.pop_front() {
+                self.history_bytes = self
+                    .history_bytes
+                    .saturating_sub(history_cells_bytes(&line.cells));
                 if let Some(count) = self.main_history_projected_rows.get_mut() {
                     *count = count.saturating_sub(line.projected_row_count(self.width));
                 }
             } else {
-                self.pending_history_cells.clear();
+                self.pending_history_cells = Vec::new();
+                self.history_bytes = 0;
                 break;
             }
         }
     }
+}
+
+fn history_cells_bytes(cells: &[Cell]) -> usize {
+    cells.iter().fold(
+        cells.len().saturating_mul(std::mem::size_of::<Cell>()),
+        |bytes, cell| bytes.saturating_add(cell.text.len()),
+    )
+}
+
+fn try_clone_cells(cells: &[Cell]) -> Option<Vec<Cell>> {
+    let mut cloned = Vec::new();
+    cloned.try_reserve_exact(cells.len()).ok()?;
+    for cell in cells {
+        let mut text = String::new();
+        text.try_reserve_exact(cell.text.len()).ok()?;
+        text.push_str(&cell.text);
+        cloned.push(Cell {
+            text,
+            style: cell.style,
+            width: cell.width,
+            wide_continuation: cell.wide_continuation,
+        });
+    }
+    Some(cloned)
+}
+
+fn try_clone_row_charged(row: &PhysicalRow, remaining: &mut usize) -> Option<PhysicalRow> {
+    let bytes = row.cells.iter().try_fold(
+        row.cells.len().checked_mul(std::mem::size_of::<Cell>())?,
+        |bytes, cell| bytes.checked_add(cell.text.len()),
+    )?;
+    remaining.checked_sub(bytes)?;
+    let cloned = try_clone_row(row)?;
+    *remaining = remaining.checked_sub(cloned.allocated_bytes()?)?;
+    Some(cloned)
+}
+
+fn try_clone_row(row: &PhysicalRow) -> Option<PhysicalRow> {
+    Some(PhysicalRow {
+        cells: try_clone_cells(&row.cells)?,
+        wrapped: row.wrapped,
+    })
 }
 
 fn clamp_cursor_to_dimensions(mut cursor: Cursor, width: usize, height: usize) -> Cursor {
@@ -1777,6 +2564,221 @@ fn parse_extended_color(params: &[i64]) -> Option<(Color, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assembly_rejects_gaps_identity_changes_and_budget_without_partial_commit() {
+        let cells = vec![Cell::new("界", StyleId(0), 2)];
+        let mut assembly = HistoryLineAssembly::new(7, 0, history_cells_bytes(&cells), true);
+        let slice = HistorySlice {
+            cells: &cells,
+            next_cell_offset: 2,
+            end: HistorySliceEnd::Continue,
+        };
+        assert_eq!(
+            assembly.append(8, 0, 0, &slice),
+            Err(HistorySliceError::StaleRevision)
+        );
+        assert_eq!(
+            assembly.append(7, 0, 1, &slice),
+            Err(HistorySliceError::InvalidOffset)
+        );
+        assembly.append(7, 0, 0, &slice).unwrap();
+        assert!(assembly.completed().is_none());
+        let end = HistorySlice {
+            cells: &cells,
+            next_cell_offset: 4,
+            end: HistorySliceEnd::HardBreak,
+        };
+        assert_eq!(
+            assembly.append(7, 0, 2, &end),
+            Err(HistorySliceError::BudgetExhausted)
+        );
+        assert_eq!(assembly.next_offset(), 2);
+        let end = HistorySlice {
+            cells: &[],
+            next_cell_offset: 2,
+            end: HistorySliceEnd::Open,
+        };
+        assembly.append(7, 0, 2, &end).unwrap();
+        assert_eq!(
+            assembly.completed(),
+            Some((cells.as_slice(), HistorySliceEnd::Open))
+        );
+        assert!(assembly.prefix_unavailable());
+        assert_eq!(
+            assembly.append(7, 0, 2, &end),
+            Err(HistorySliceError::InvalidOffset)
+        );
+    }
+
+    #[test]
+    fn history_byte_budget_discards_prefix_and_preserves_truncation() {
+        let mut grid = TerminalGrid::new(4, 2, GridLimits::default()).unwrap();
+        let style = StyleId(0);
+        grid.push_history_line(LogicalLine::new(vec![Cell::new("old", style, 1)]));
+        grid.push_history_line(LogicalLine::new(vec![Cell::new("new", style, 1)]));
+        let budget = history_cells_bytes(&grid.main_history.back().unwrap().cells);
+        grid.evict_history_to_budget(budget);
+        assert_eq!(grid.history_line_count(), 1);
+        assert_eq!(grid.main_history.front().unwrap().cells[0].text(), "new");
+        assert!(grid.history_truncated());
+        assert!(grid.history_bytes <= budget);
+        let snapshot = GridSnapshot::from_grid(&grid, 0, usize::MAX);
+        let restored = TerminalGrid::from_snapshot(&snapshot, GridLimits::default()).unwrap();
+        assert!(restored.history_truncated());
+        assert!(
+            grid.try_clone_charged(&mut (1024 * 1024))
+                .unwrap()
+                .history_truncated()
+        );
+        let mut legacy = snapshot;
+        legacy.history_truncated = None;
+        assert!(
+            TerminalGrid::from_snapshot(&legacy, GridLimits::default())
+                .unwrap()
+                .history_truncated()
+        );
+
+        grid.pending_history_cells = vec![Cell::new("oversized", style, 1)];
+        grid.history_bytes += history_cells_bytes(&grid.pending_history_cells);
+        grid.evict_history_to_budget(1);
+        assert_eq!(grid.history_line_count(), 0);
+        assert_eq!(grid.pending_history_cells.capacity(), 0);
+        assert_eq!(grid.history_bytes, 0);
+    }
+
+    #[test]
+    fn main_row_slices_preserve_wide_cells_and_wrap_boundaries() {
+        let mut grid = TerminalGrid::new(4, 2, GridLimits::default()).unwrap();
+        grid.main_rows[0].set_cell(0, Cell::new("界", StyleId::DEFAULT, 2));
+        grid.main_rows[0].set_cell(1, Cell::spacer(StyleId::DEFAULT));
+        grid.main_rows[0].set_cell(2, Cell::new("x", StyleId::DEFAULT, 1));
+        grid.main_rows[0].set_wrapped(true);
+        let revision = grid.revision();
+        assert_eq!(
+            grid.main_row_slice(revision, 0, 0, 1, 10).unwrap_err(),
+            HistorySliceError::BudgetExhausted
+        );
+        assert_eq!(
+            grid.main_row_slice(revision, 0, 1, 4, 10).unwrap_err(),
+            HistorySliceError::InvalidOffset
+        );
+        let first = grid.main_row_slice(revision, 0, 0, 2, 3).unwrap();
+        assert_eq!(first.cells.len(), 2);
+        assert_eq!(first.next_cell_offset, 2);
+        assert_eq!(first.end, HistorySliceEnd::Continue);
+        let last = grid.main_row_slice(revision, 0, 2, 2, 1).unwrap();
+        assert_eq!(last.end, HistorySliceEnd::Open);
+        assert_eq!(last.cells[0].text(), "x");
+        assert_eq!(
+            grid.main_row_slice(revision, 1, 0, 0, 0).unwrap().end,
+            HistorySliceEnd::HardBreak
+        );
+        assert_eq!(
+            grid.main_row_slice(revision.wrapping_add(1), 0, 0, 4, 10)
+                .unwrap_err(),
+            HistorySliceError::StaleRevision
+        );
+    }
+
+    #[test]
+    fn history_slices_preserve_column_boundaries_and_capture_revision() {
+        let mut grid = TerminalGrid::new(4, 2, GridLimits::default()).unwrap();
+        grid.push_history_line(LogicalLine::new(vec![
+            Cell::new("界", StyleId::DEFAULT, 2),
+            Cell::new("x", StyleId::DEFAULT, 1),
+        ]));
+        let revision = grid.revision();
+        assert!(matches!(
+            grid.history_slice(revision, 0, 1, 4, 20),
+            Err(HistorySliceError::InvalidOffset)
+        ));
+        assert!(matches!(
+            grid.history_slice(revision, 0, 0, 1, 20),
+            Err(HistorySliceError::BudgetExhausted)
+        ));
+        assert!(matches!(
+            grid.history_slice(revision, 0, 0, 2, 2),
+            Err(HistorySliceError::BudgetExhausted)
+        ));
+        let first = grid.history_slice(revision, 0, 0, 2, 3).unwrap();
+        assert_eq!(first.cells[0].text(), "界");
+        assert_eq!(first.next_cell_offset, 2);
+        assert_eq!(first.end, HistorySliceEnd::Continue);
+        let last = grid
+            .history_slice(revision, 0, first.next_cell_offset, 1, 1)
+            .unwrap();
+        assert_eq!(last.cells[0].text(), "x");
+        assert_eq!(last.end, HistorySliceEnd::HardBreak);
+        grid.pending_history_cells
+            .push(Cell::new("z", StyleId::DEFAULT, 1));
+        assert_eq!(
+            grid.history_slice(revision, 1, 0, 1, 1).unwrap().end,
+            HistorySliceEnd::Open
+        );
+        grid.process(b"a");
+        assert!(matches!(
+            grid.history_slice(revision, 0, 0, 4, 20),
+            Err(HistorySliceError::StaleRevision)
+        ));
+    }
+
+    #[test]
+    fn sparse_wide_history_admission_ignores_unused_columns() {
+        let mut grid = TerminalGrid::new(1000, 2, GridLimits::default()).unwrap();
+        grid.process(b"a\r\nb\r\nc\r\nd");
+        let mut budget = 1000;
+        let rows = grid
+            .try_display_rows_charged(2, 2, true, &mut budget)
+            .unwrap();
+        assert_eq!(rows, grid.main_display_rows(2, 2));
+        assert!(budget > 0);
+    }
+
+    #[test]
+    fn charged_projection_rejects_before_history_materialization() {
+        let mut grid = TerminalGrid::new(4, 2, GridLimits::default()).unwrap();
+        grid.process(b"abcdefghijklmnop");
+        crate::reflow::reset_projection_stats();
+        let mut budget = 2 * std::mem::size_of::<PhysicalRow>();
+        assert!(
+            grid.try_display_rows_charged(2, 2, true, &mut budget)
+                .is_none()
+        );
+        assert_eq!(crate::reflow::projection_stats().physical_rows_projected, 0);
+        let mut budget = 100_000;
+        let rows = grid
+            .try_display_rows_charged(2, 2, true, &mut budget)
+            .unwrap();
+        let actual = rows.capacity() * std::mem::size_of::<PhysicalRow>()
+            + rows
+                .iter()
+                .map(|row| row.allocated_bytes().unwrap())
+                .sum::<usize>();
+        assert_eq!(100_000 - budget, actual);
+        assert_eq!(rows, grid.main_display_rows(2, 2));
+    }
+
+    #[test]
+    fn retained_capacity_accounts_for_unused_storage_and_clone_debit() {
+        let mut grid = TerminalGrid::new(10, 2, GridLimits::default()).unwrap();
+        grid.process(b"x");
+        let initial = grid.retained_capacity_bytes().unwrap();
+        let row = grid.main_rows.front_mut().unwrap();
+        let old_cells = row.cells.capacity();
+        let old_text = row.cells[0].text.capacity();
+        row.cells.reserve_exact(100);
+        row.cells[0].text.reserve_exact(1000);
+        let extra = (row.cells.capacity() - old_cells) * std::mem::size_of::<Cell>()
+            + row.cells[0].text.capacity()
+            - old_text;
+        assert_eq!(grid.retained_capacity_bytes(), Some(initial + extra));
+        let mut budget = 100_000;
+        let cloned = grid.try_clone_charged(&mut budget).unwrap();
+        assert_eq!(100_000 - budget, cloned.retained_capacity_bytes().unwrap());
+        assert_eq!(cloned.snapshot(0, 2), grid.snapshot(0, 2));
+        assert!(cloned.retained_capacity_bytes().unwrap() < initial + extra);
+    }
 
     #[test]
     fn logical_line_projection_cache_keeps_width_and_count_coherent() {

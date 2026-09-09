@@ -24,6 +24,126 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistorySliceArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub pin_id: u64,
+    pub capture_id: Uuid,
+    pub line_index: u32,
+    pub cell_offset: u32,
+    pub max_columns: u32,
+    pub max_text_bytes: u32,
+}
+
+pub fn history_slice(
+    req: &HistorySliceArgs,
+    ctx: &NativeServiceContext,
+) -> Result<
+    bmux_pane_runtime_plugin_api::attach_runtime_state::HistorySliceV1,
+    bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryFetchError,
+> {
+    use bmux_pane_runtime_plugin_api::attach_runtime_state::{HistoryEnd, HistoryFetchError};
+    let handle = super::session_runtime_handle().ok_or_else(|| HistoryFetchError::Runtime {
+        error: failed("runtime unavailable"),
+    })?;
+    let (encoded, next_cell_offset, end_kind) = handle
+        .0
+        .attach_history_slice(
+            SessionId(req.session_id),
+            caller_client_id(ctx),
+            req.pane_id,
+            (req.pin_id, req.capture_id),
+            (req.line_index as usize, req.cell_offset as usize),
+            (req.max_columns as usize, req.max_text_bytes as usize),
+        )
+        .map_err(|error| match error {
+            bmux_pane_runtime_state::HistoryFetchError::StaleCapture => {
+                HistoryFetchError::StaleCapture
+            }
+            bmux_pane_runtime_state::HistoryFetchError::Unavailable => {
+                HistoryFetchError::Unavailable
+            }
+            bmux_pane_runtime_state::HistoryFetchError::InvalidOffset => {
+                HistoryFetchError::InvalidOffset
+            }
+            bmux_pane_runtime_state::HistoryFetchError::BudgetExhausted => {
+                HistoryFetchError::BudgetExhausted
+            }
+            bmux_pane_runtime_state::HistoryFetchError::Runtime(error) => {
+                HistoryFetchError::Runtime {
+                    error: attach_runtime_error(error),
+                }
+            }
+        })?;
+    let end_kind = match end_kind {
+        bmux_pane_runtime_state::HistoryEnd::Continue => HistoryEnd::Continue,
+        bmux_pane_runtime_state::HistoryEnd::HardBreak => HistoryEnd::HardBreak,
+        bmux_pane_runtime_state::HistoryEnd::Open => HistoryEnd::Open,
+    };
+    Ok(
+        bmux_pane_runtime_plugin_api::attach_runtime_state::HistorySliceV1 {
+            encoded,
+            next_cell_offset: next_cell_offset as u64,
+            end_kind,
+        },
+    )
+}
+
+pub fn main_row_slice(
+    req: &HistorySliceArgs,
+    ctx: &NativeServiceContext,
+) -> Result<
+    bmux_pane_runtime_plugin_api::attach_runtime_state::HistorySliceV1,
+    bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryFetchError,
+> {
+    use bmux_pane_runtime_plugin_api::attach_runtime_state::{HistoryEnd, HistoryFetchError};
+    let handle = super::session_runtime_handle().ok_or_else(|| HistoryFetchError::Runtime {
+        error: failed("runtime unavailable"),
+    })?;
+    let (encoded, next_cell_offset, end_kind) = handle
+        .0
+        .attach_main_row_slice(
+            SessionId(req.session_id),
+            caller_client_id(ctx),
+            req.pane_id,
+            (req.pin_id, req.capture_id),
+            (req.line_index as usize, req.cell_offset as usize),
+            (req.max_columns as usize, req.max_text_bytes as usize),
+        )
+        .map_err(|error| match error {
+            bmux_pane_runtime_state::HistoryFetchError::StaleCapture => {
+                HistoryFetchError::StaleCapture
+            }
+            bmux_pane_runtime_state::HistoryFetchError::Unavailable => {
+                HistoryFetchError::Unavailable
+            }
+            bmux_pane_runtime_state::HistoryFetchError::InvalidOffset => {
+                HistoryFetchError::InvalidOffset
+            }
+            bmux_pane_runtime_state::HistoryFetchError::BudgetExhausted => {
+                HistoryFetchError::BudgetExhausted
+            }
+            bmux_pane_runtime_state::HistoryFetchError::Runtime(error) => {
+                HistoryFetchError::Runtime {
+                    error: attach_runtime_error(error),
+                }
+            }
+        })?;
+    let end_kind = match end_kind {
+        bmux_pane_runtime_state::HistoryEnd::Continue => HistoryEnd::Continue,
+        bmux_pane_runtime_state::HistoryEnd::HardBreak => HistoryEnd::HardBreak,
+        bmux_pane_runtime_state::HistoryEnd::Open => HistoryEnd::Open,
+    };
+    Ok(
+        bmux_pane_runtime_plugin_api::attach_runtime_state::HistorySliceV1 {
+            encoded,
+            next_cell_offset: next_cell_offset as u64,
+            end_kind,
+        },
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachLayoutArgs {
     pub session_id: Uuid,
 }
@@ -425,6 +545,39 @@ pub fn attach_pane_scrollback_pin(
         max_scrollback_offset: u32::try_from(pin.max_scrollback_offset).unwrap_or(u32::MAX),
         stream_end: pin.stream_end,
     })
+}
+
+pub fn history_capture(
+    req: &AttachPaneScrollbackPinArgs,
+    ctx: &NativeServiceContext,
+) -> Result<bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryCaptureV1, AttachStateError>
+{
+    let handle = super::session_runtime_handle().ok_or_else(|| failed("runtime unavailable"))?;
+    let captured = handle
+        .0
+        .attach_scrollback_pin(
+            SessionId(req.session_id),
+            caller_client_id(ctx),
+            req.pane_id,
+        )
+        .map_err(attach_runtime_error)?;
+    Ok(
+        bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryCaptureV1 {
+            width: captured.width,
+            height: captured.height,
+            history_truncated: captured.history_truncated,
+            history_line_count: captured.history_line_count as u64,
+            capture_id: captured.capture_id,
+            pin: PaneScrollbackPin {
+                pane_id: captured.pane_id,
+                pin_id: captured.pin_id,
+                total_scrolled_rows: captured.total_scrolled_rows,
+                max_scrollback_offset: u32::try_from(captured.max_scrollback_offset)
+                    .unwrap_or(u32::MAX),
+                stream_end: captured.stream_end,
+            },
+        },
+    )
 }
 
 pub fn attach_pane_scrollback_unpin(

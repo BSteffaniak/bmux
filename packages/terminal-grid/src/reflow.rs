@@ -62,21 +62,117 @@ pub(crate) fn projected_logical_line_row_count(cells: &[Cell], width: usize) -> 
     rows.max(1)
 }
 
+/// Charge selected logical cells before projection can clone their text.
+pub(crate) fn admit_logical_text(
+    cells: &[Cell],
+    width: usize,
+    range: std::ops::Range<usize>,
+    remaining: &mut usize,
+) -> Option<()> {
+    let width = width.max(1);
+    let mut row = 0_usize;
+    let mut col = 0_usize;
+    for cell in trim_trailing_blank_cells(cells) {
+        let cell_width = usize::from(cell.width()).max(1);
+        if col > 0 && col.saturating_add(cell_width) > width {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+        if row >= range.end {
+            break;
+        }
+        if range.contains(&row) {
+            *remaining = remaining.checked_sub(cell.text().len())?;
+        }
+        col = col.saturating_add(cell_width).min(width);
+        if col >= width {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+    }
+    Some(())
+}
+
+/// Requested cell storage for a selected projection, without allocating rows.
+/// Includes implicit gaps/spacers and one replacement buffer for the widest
+/// selected row. Allocator excess is accounted separately after projection.
+pub(crate) fn projected_cell_storage(
+    cells: &[Cell],
+    width: usize,
+    range: std::ops::Range<usize>,
+) -> Option<usize> {
+    let width = width.max(1);
+    let mut row = 0_usize;
+    let mut col = 0_usize;
+    let mut extent = 0_usize;
+    let mut total = 0_usize;
+    let mut largest = 0_usize;
+    for cell in trim_trailing_blank_cells(cells) {
+        let cell_width = usize::from(cell.width()).max(1);
+        if col > 0 && col.saturating_add(cell_width) > width {
+            total = total.checked_add(extent)?;
+            largest = largest.max(extent);
+            extent = 0;
+            row = row.saturating_add(1);
+            col = 0;
+        }
+        if row >= range.end {
+            break;
+        }
+        if range.contains(&row) {
+            extent = col.checked_add(if cell_width == 2 && col + 1 < width {
+                2
+            } else {
+                1
+            })?;
+        }
+        col = col.saturating_add(cell_width).min(width);
+        if col >= width {
+            total = total.checked_add(extent)?;
+            largest = largest.max(extent);
+            extent = 0;
+            row = row.saturating_add(1);
+            col = 0;
+        }
+    }
+    total = total.checked_add(extent)?;
+    largest = largest.max(extent);
+    // Each slot can temporarily contain a one-byte implicit blank.
+    total
+        .checked_mul(std::mem::size_of::<Cell>() + 1)?
+        .checked_add(largest.checked_mul(std::mem::size_of::<Cell>())?)
+}
+
 pub(crate) fn project_logical_line_window(
     cells: &[Cell],
     width: usize,
     range: std::ops::Range<usize>,
 ) -> VecDeque<PhysicalRow> {
+    try_project_logical_line_window(cells, width, range).expect("projection allocation failed")
+}
+
+pub(crate) fn try_project_logical_line_window(
+    cells: &[Cell],
+    width: usize,
+    range: std::ops::Range<usize>,
+) -> Option<VecDeque<PhysicalRow>> {
     #[cfg(test)]
     PROJECTED_LOGICAL_LINES.set(PROJECTED_LOGICAL_LINES.get() + 1);
 
     let mut rows = VecDeque::new();
-    push_reflowed_logical_line(&mut rows, cells, width, range);
+    rows.try_reserve_exact(
+        range
+            .end
+            .min(projected_logical_line_row_count(cells, width))
+            .saturating_sub(range.start),
+    )
+    .ok()?;
+    push_reflowed_logical_line(&mut rows, cells, width, range)?;
 
     #[cfg(test)]
     PROJECTED_PHYSICAL_ROWS.set(PROJECTED_PHYSICAL_ROWS.get() + rows.len());
 
-    rows
+    Some(rows)
 }
 
 fn push_reflowed_logical_line(
@@ -84,16 +180,16 @@ fn push_reflowed_logical_line(
     cells: &[Cell],
     width: usize,
     range: std::ops::Range<usize>,
-) {
+) -> Option<()> {
     let width = width.max(1);
     if range.is_empty() {
-        return;
+        return Some(());
     }
     if cells.is_empty() {
         if range.contains(&0) {
             rows.push_back(PhysicalRow::new());
         }
-        return;
+        return Some(());
     }
 
     let mut index = 0;
@@ -106,7 +202,7 @@ fn push_reflowed_logical_line(
         // If the line ended exactly there, the finalization below instead
         // clears its wrap flag.
         if index >= range.end {
-            return;
+            return Some(());
         }
         let cell_width = usize::from(cell.width()).max(1);
         if col > 0 && col + cell_width > width {
@@ -120,10 +216,7 @@ fn push_reflowed_logical_line(
         }
 
         if range.contains(&index) {
-            current.set_cell(col, cell.clone());
-            if cell_width == 2 && col + 1 < width {
-                current.set_cell(col + 1, Cell::spacer(cell.style()));
-            }
+            current.try_set_projected_cell(col, cell, width)?;
         }
         col = col.saturating_add(cell_width).min(width);
         emitted_any = true;
@@ -149,6 +242,82 @@ fn push_reflowed_logical_line(
     {
         last.set_wrapped(false);
     }
+    Some(())
+}
+
+/// Logical column at the start of a projected row. Uses the same trimming,
+/// wide-cell overflow and one-column clipping rules as physical projection.
+/// Empty lines map row zero to column zero; their exclusive row bound is
+/// intentionally unavailable because a bare column cannot distinguish both.
+/// Nonempty lines map the exclusive row bound to the end of visible cells.
+pub(crate) fn logical_column_for_row(cells: &[Cell], width: usize, target: usize) -> Option<usize> {
+    let cells = trim_trailing_blank_cells(cells);
+    if cells.is_empty() {
+        return (target == 0).then_some(0);
+    }
+    let width = width.max(1);
+    let mut row = 0;
+    let mut col = 0;
+    let mut logical = 0_usize;
+    for cell in cells {
+        let extent = usize::from(cell.width()).max(1);
+        if col > 0 && col + extent > width {
+            row += 1;
+            col = 0;
+        }
+        if row == target && col == 0 {
+            return Some(logical);
+        }
+        logical = logical.checked_add(extent)?;
+        col = (col + extent).min(width);
+        if col == width {
+            row += 1;
+            col = 0;
+        }
+    }
+    let count = projected_logical_line_row_count(cells, width);
+    if target == count {
+        Some(logical)
+    } else if target == 0 {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// Project a cell-boundary anchor into a row, rejecting offsets inside wide
+/// cells and trimmed trailing padding. End-of-line maps to the exclusive row
+/// bound rather than inventing a blank continuation row. For an empty or
+/// entirely trimmed line, column zero instead identifies the visible empty row.
+pub(crate) fn row_for_logical_column(cells: &[Cell], width: usize, target: usize) -> Option<usize> {
+    let cells = trim_trailing_blank_cells(cells);
+    if cells.is_empty() {
+        return (target == 0).then_some(0);
+    }
+    let width = width.max(1);
+    let mut row = 0;
+    let mut col = 0;
+    let mut logical = 0_usize;
+    for cell in cells {
+        let extent = usize::from(cell.width()).max(1);
+        if col > 0 && col + extent > width {
+            row += 1;
+            col = 0;
+        }
+        if logical == target {
+            return Some(row);
+        }
+        logical = logical.checked_add(extent)?;
+        if logical > target {
+            return None;
+        }
+        col = (col + extent).min(width);
+        if col == width {
+            row += 1;
+            col = 0;
+        }
+    }
+    (logical == target).then(|| projected_logical_line_row_count(cells, width))
 }
 
 fn trim_trailing_blank_cells(cells: &[Cell]) -> &[Cell] {
@@ -168,6 +337,59 @@ fn trim_trailing_blank_cells(cells: &[Cell]) -> &[Cell] {
 mod tests {
     use super::*;
     use crate::style::StyleId;
+
+    #[test]
+    fn empty_line_anchor_is_the_visible_row_not_exclusive_end() {
+        for cells in [Vec::new(), vec![Cell::new(" ", StyleId::DEFAULT, 1)]] {
+            for width in 1..=5 {
+                assert_eq!(logical_column_for_row(&cells, width, 0), Some(0));
+                assert_eq!(row_for_logical_column(&cells, width, 0), Some(0));
+                assert_eq!(logical_column_for_row(&cells, width, 1), None);
+                assert_eq!(row_for_logical_column(&cells, width, 1), None);
+            }
+        }
+    }
+
+    #[test]
+    fn row_anchors_follow_wide_cell_overflow_and_round_trip() {
+        let cells = vec![
+            Cell::new("a", StyleId::DEFAULT, 1),
+            Cell::new("界", StyleId::DEFAULT, 2),
+            Cell::new("b", StyleId::DEFAULT, 1),
+        ];
+        assert_eq!(logical_column_for_row(&cells, 2, 1), Some(1));
+        assert_eq!(row_for_logical_column(&cells, 3, 1), Some(0));
+        assert_eq!(row_for_logical_column(&cells, 2, 2), None);
+        for width in 1..=5 {
+            let count = projected_logical_line_row_count(&cells, width);
+            for row in 0..=count {
+                let column = logical_column_for_row(&cells, width, row).unwrap();
+                assert_eq!(row_for_logical_column(&cells, width, column), Some(row));
+            }
+        }
+    }
+
+    #[test]
+    fn selected_storage_uses_cell_extents_not_terminal_width() {
+        let cells = vec![
+            Cell::new("界", StyleId::DEFAULT, 2),
+            Cell::new("a\u{0301}", StyleId::DEFAULT, 1),
+        ];
+        let slot = std::mem::size_of::<Cell>();
+        assert_eq!(
+            projected_cell_storage(&cells, 1000, 0..1),
+            Some(3 * (slot + 1) + 3 * slot)
+        );
+        assert_eq!(
+            projected_cell_storage(&cells, 2, 1..2),
+            Some(slot + 1 + slot)
+        );
+        assert_eq!(projected_cell_storage(&cells, 2, 2..3), Some(0));
+        assert_eq!(
+            projected_cell_storage(&cells, 1, 0..1),
+            Some(slot + 1 + slot)
+        );
+    }
 
     #[test]
     fn projection_stats_are_isolated_between_threads() {

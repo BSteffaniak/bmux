@@ -79,6 +79,41 @@ const PANE_PADDING_PREVIEW_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const RESPONSE_OUTPUT_BUDGET: usize =
     bmux_ipc::frame::MAX_FRAME_PAYLOAD_SIZE - RESPONSE_METADATA_HEADROOM;
 
+// Published pin payload across this manager, independent of client/session count.
+const RETAINED_PIN_BUDGET: usize = 64 * 1024 * 1024;
+
+fn admit_retained_pin(
+    manager: &SessionRuntimeManager,
+    session_id: SessionId,
+    client_id: ClientId,
+    pane_id: Uuid,
+    candidate: &bmux_terminal_grid::TerminalGrid,
+) -> Result<(), SessionRuntimeError> {
+    let mut remaining = RETAINED_PIN_BUDGET;
+    for (id, runtime) in &manager.runtimes {
+        for (key, pin) in &runtime.scrollback_pins {
+            if *id == session_id && *key == (client_id, pane_id) {
+                continue;
+            }
+            let bytes = pin
+                .grid
+                .grid
+                .retained_capacity_bytes()
+                .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+            remaining = remaining
+                .checked_sub(bytes)
+                .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+        }
+    }
+    let bytes = candidate
+        .retained_capacity_bytes()
+        .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+    remaining
+        .checked_sub(bytes)
+        .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+    Ok(())
+}
+
 fn context_handle() -> ContextStateHandle {
     bmux_plugin::global_plugin_state_registry()
         .get::<ContextStateHandle>()
@@ -487,6 +522,7 @@ struct SessionRuntimeManager {
     pane_input_index: Arc<RwLock<BTreeMap<Uuid, PaneInputHandle>>>,
     client_write_permissions: Arc<RwLock<BTreeMap<SessionId, BTreeSet<ClientId>>>>,
     retained_output_bytes: Arc<AtomicUsize>,
+    retained_pin_bytes: Arc<AtomicUsize>,
     shell: String,
     pane_term: String,
     protocol_profile: ProtocolProfile,
@@ -518,11 +554,67 @@ struct SessionRuntimeHandle {
     attach_view_revision: u64,
 }
 
+struct PinReservation {
+    used: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl PinReservation {
+    fn shrink(&mut self, bytes: usize) -> Result<(), SessionRuntimeError> {
+        let released = self
+            .bytes
+            .checked_sub(bytes)
+            .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+        self.used.fetch_sub(released, Ordering::AcqRel);
+        self.bytes = bytes;
+        Ok(())
+    }
+
+    fn acquire(used: &Arc<AtomicUsize>, bytes: usize) -> Result<Self, SessionRuntimeError> {
+        used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current
+                .checked_add(bytes)
+                .filter(|&next| next <= RETAINED_PIN_BUDGET)
+        })
+        .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
+        Ok(Self {
+            used: Arc::clone(used),
+            bytes,
+        })
+    }
+}
+
+impl Drop for PinReservation {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+struct CapturedPinGrid {
+    grid: TerminalGrid,
+    // Drop the grid before releasing its charge, including for retired readers.
+    reservation: PinReservation,
+}
+
+impl CapturedPinGrid {
+    fn new(grid: TerminalGrid, reservation: PinReservation) -> Result<Self, SessionRuntimeError> {
+        let mut captured = Self { grid, reservation };
+        captured.reservation.shrink(
+            captured
+                .grid
+                .retained_capacity_bytes()
+                .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?,
+        )?;
+        Ok(captured)
+    }
+}
+
 #[derive(Clone)]
 struct ScrollbackPin {
+    capture_id: Uuid,
     id: u64,
-    // Window requests clone the pin handle, not its immutable captured history.
-    grid: Arc<TerminalGrid>,
+    // Backing content and its charge share one lifetime; neither can escape alone.
+    grid: Arc<CapturedPinGrid>,
     total_scrolled_rows: u64,
     stream_end: u64,
     encoded_bytes: usize,
@@ -3760,6 +3852,7 @@ impl SessionRuntimeManager {
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell,
             pane_term,
             protocol_profile,
@@ -6193,30 +6286,39 @@ struct ServerSessionRuntimeAdapter {
     pane_input_index: Arc<RwLock<BTreeMap<Uuid, PaneInputHandle>>>,
     client_write_permissions: Arc<RwLock<BTreeMap<SessionId, BTreeSet<ClientId>>>>,
     current_holder: Arc<Mutex<Option<ManagerLockHolder>>>,
+    retained_pin_bytes: Arc<AtomicUsize>,
 }
 
 impl ServerSessionRuntimeAdapter {
     fn new(inner: Arc<Mutex<SessionRuntimeManager>>) -> Self {
-        let (pane_input_index, client_write_permissions) = inner.lock().map_or_else(
-            |_| {
-                (
-                    Arc::new(RwLock::new(BTreeMap::new())),
-                    Arc::new(RwLock::new(BTreeMap::new())),
-                )
-            },
-            |manager| {
-                (
-                    Arc::clone(&manager.pane_input_index),
-                    Arc::clone(&manager.client_write_permissions),
-                )
-            },
-        );
+        let (pane_input_index, client_write_permissions, retained_pin_bytes) =
+            inner.lock().map_or_else(
+                |_| {
+                    (
+                        Arc::new(RwLock::new(BTreeMap::new())),
+                        Arc::new(RwLock::new(BTreeMap::new())),
+                        Arc::new(AtomicUsize::new(0)),
+                    )
+                },
+                |manager| {
+                    (
+                        Arc::clone(&manager.pane_input_index),
+                        Arc::clone(&manager.client_write_permissions),
+                        Arc::clone(&manager.retained_pin_bytes),
+                    )
+                },
+            );
         Self {
             inner,
             pane_input_index,
             client_write_permissions,
             current_holder: Arc::new(Mutex::new(None)),
+            retained_pin_bytes,
         }
+    }
+
+    fn reserve_grid_working_set(&self) -> Result<PinReservation, SessionRuntimeError> {
+        PinReservation::acquire(&self.retained_pin_bytes, 2 * RESPONSE_OUTPUT_BUDGET)
     }
 
     fn current_holder_snapshot(&self) -> Option<(&'static str, u128)> {
@@ -7154,6 +7256,10 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         pane_ids: &[Uuid],
         max_rows_per_pane: usize,
     ) -> Result<bmux_pane_runtime_state::AttachGridSnapshotState, SessionRuntimeError> {
+        // Reserve both the projected snapshot and its coexisting encoded output.
+        // The guard is declared first so construction temporaries drop before it.
+        // Returned response storage belongs to the caller, not this working set.
+        let _working_set = self.reserve_grid_working_set()?;
         let panes = self
             .with_lock_read_named("attach_grid_snapshot_state.resolve", |m| {
                 m.attach_pane_data_refs_for_session_panes(session_id, client_id, pane_ids)
@@ -7171,7 +7277,16 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 .terminal_grid
                 .lock()
                 .map_err(|_| SessionRuntimeError::Closed)?;
-            let snapshot = grid.snapshot(0, max_rows_per_pane);
+            // Admit selected aggregate source text before projection clones it.
+            if !grid
+                .grid()
+                .snapshot_text_fits(0, max_rows_per_pane, remaining)
+            {
+                return Err(SessionRuntimeError::ResponseBudgetExceeded);
+            }
+            let snapshot = grid
+                .try_snapshot(0, max_rows_per_pane, remaining)
+                .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
             let stream_end = pane
                 .output_buffer
                 .lock()
@@ -7196,6 +7311,8 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         client_id: ClientId,
         windows: &[bmux_pane_runtime_state::AttachPaneGridWindowRequest],
     ) -> Result<bmux_pane_runtime_state::AttachGridWindowState, SessionRuntimeError> {
+        // Share construction admission with snapshots and retained captures.
+        let _working_set = self.reserve_grid_working_set()?;
         let pane_ids = windows
             .iter()
             .map(|window| window.pane_id)
@@ -7242,10 +7359,16 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 // A frozen pin is immutable: use the requested offset directly
                 // (bounded only by the captured history), never apply live
                 // anchor growth or live-history clamping.
-                let max_offset = pin.grid.max_scrollback_offset();
+                let max_offset = pin.grid.grid.max_scrollback_offset();
                 let offset = window.scrollback_offset.min(max_offset);
                 (
-                    pin.grid.snapshot(offset, window.rows),
+                    bmux_terminal_grid::GridSnapshot::try_from_grid(
+                        &pin.grid.grid,
+                        offset,
+                        window.rows,
+                        remaining,
+                    )
+                    .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?,
                     max_offset,
                     pin.total_scrolled_rows,
                     offset,
@@ -7267,7 +7390,8 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                     .saturating_add(usize::try_from(anchor_growth).unwrap_or(usize::MAX));
                 let adjusted_offset = desired_offset.min(max_scrollback_offset);
                 (
-                    grid.snapshot(adjusted_offset, window.rows),
+                    grid.try_snapshot(adjusted_offset, window.rows, remaining)
+                        .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?,
                     max_scrollback_offset,
                     total_scrolled_rows,
                     adjusted_offset,
@@ -7293,6 +7417,172 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         Ok(bmux_pane_runtime_state::AttachGridWindowState { windows: snapshots })
     }
 
+    fn attach_history_slice(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_id: Uuid,
+        pin_id: (u64, Uuid),
+        position: (usize, usize),
+        limits: (usize, usize),
+    ) -> Result<
+        (Vec<u8>, usize, bmux_pane_runtime_state::HistoryEnd),
+        bmux_pane_runtime_state::HistoryFetchError,
+    > {
+        use bmux_pane_runtime_state::{HistoryEnd, HistoryFetchError};
+        let _working = self.reserve_grid_working_set()?;
+        let pin = self
+            .with_lock_read_named("attach_history_slice", |manager| {
+                let runtime = manager
+                    .runtimes
+                    .get(&session_id)
+                    .ok_or(SessionRuntimeError::NotFound)?;
+                if !runtime.attached_clients.contains(&client_id) {
+                    return Err(HistoryFetchError::Runtime(SessionRuntimeError::NotAttached));
+                }
+                let pin = runtime
+                    .scrollback_pins
+                    .get(&(client_id, pane_id))
+                    .ok_or(HistoryFetchError::Unavailable)?;
+                if pin.id != pin_id.0 || pin.capture_id != pin_id.1 {
+                    return Err(HistoryFetchError::StaleCapture);
+                }
+                Ok(pin.clone())
+            })
+            .unwrap_or(Err(HistoryFetchError::Runtime(SessionRuntimeError::Closed)))?;
+        let grid = &pin.grid.grid;
+        let slice = grid
+            .history_slice(
+                grid.revision(),
+                position.0,
+                position.1,
+                limits.0.min(4096),
+                limits.1.min(64 * 1024),
+            )
+            .map_err(|error| match error {
+                bmux_terminal_grid::HistorySliceError::BudgetExhausted => {
+                    HistoryFetchError::BudgetExhausted
+                }
+                bmux_terminal_grid::HistorySliceError::InvalidOffset => {
+                    HistoryFetchError::InvalidOffset
+                }
+                bmux_terminal_grid::HistorySliceError::Unavailable => {
+                    HistoryFetchError::Unavailable
+                }
+                bmux_terminal_grid::HistorySliceError::StaleRevision => {
+                    HistoryFetchError::StaleCapture
+                }
+            })?;
+        let cells = slice
+            .cells
+            .iter()
+            .map(|cell| (cell.text(), cell.width(), grid.palette().get(cell.style())))
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_vec(&cells).map_err(|_| SessionRuntimeError::Closed)?;
+        if encoded.len() > 128 * 1024 {
+            return Err(HistoryFetchError::BudgetExhausted);
+        }
+        let end = match slice.end {
+            bmux_terminal_grid::HistorySliceEnd::Continue => HistoryEnd::Continue,
+            bmux_terminal_grid::HistorySliceEnd::HardBreak => HistoryEnd::HardBreak,
+            bmux_terminal_grid::HistorySliceEnd::Open => HistoryEnd::Open,
+        };
+        Ok((encoded, slice.next_cell_offset, end))
+    }
+
+    fn attach_main_row_slice(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_id: Uuid,
+        pin_id: (u64, Uuid),
+        position: (usize, usize),
+        limits: (usize, usize),
+    ) -> Result<
+        (Vec<u8>, usize, bmux_pane_runtime_state::HistoryEnd),
+        bmux_pane_runtime_state::HistoryFetchError,
+    > {
+        use bmux_pane_runtime_state::{HistoryEnd, HistoryFetchError};
+        let _working = self.reserve_grid_working_set()?;
+        let pin = self
+            .with_lock_read_named("attach_main_row_slice", |manager| {
+                let runtime = manager
+                    .runtimes
+                    .get(&session_id)
+                    .ok_or(SessionRuntimeError::NotFound)?;
+                if !runtime.attached_clients.contains(&client_id) {
+                    return Err(HistoryFetchError::Runtime(SessionRuntimeError::NotAttached));
+                }
+                let pin = runtime
+                    .scrollback_pins
+                    .get(&(client_id, pane_id))
+                    .ok_or(HistoryFetchError::Unavailable)?;
+                if pin.id != pin_id.0 || pin.capture_id != pin_id.1 {
+                    return Err(HistoryFetchError::StaleCapture);
+                }
+                Ok(pin.clone())
+            })
+            .unwrap_or(Err(HistoryFetchError::Runtime(SessionRuntimeError::Closed)))?;
+        let grid = &pin.grid.grid;
+        let slice = grid
+            .main_row_slice(
+                grid.revision(),
+                position.0,
+                position.1,
+                limits.0.min(4096),
+                limits.1.min(64 * 1024),
+            )
+            .map_err(|error| match error {
+                bmux_terminal_grid::HistorySliceError::BudgetExhausted => {
+                    HistoryFetchError::BudgetExhausted
+                }
+                bmux_terminal_grid::HistorySliceError::InvalidOffset => {
+                    HistoryFetchError::InvalidOffset
+                }
+                bmux_terminal_grid::HistorySliceError::Unavailable => {
+                    HistoryFetchError::Unavailable
+                }
+                bmux_terminal_grid::HistorySliceError::StaleRevision => {
+                    HistoryFetchError::StaleCapture
+                }
+            })?;
+        let cells = slice
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| !cell.is_wide_continuation())
+            .map(|(index, cell)| {
+                // A width-two glyph clipped at the physical row edge occupies
+                // one column. Match the slice's physical continuation offset.
+                let width = if cell.width() == 2
+                    && !slice
+                        .cells
+                        .get(index + 1)
+                        .is_some_and(bmux_terminal_grid::Cell::is_wide_continuation)
+                {
+                    1
+                } else {
+                    cell.width()
+                };
+                (cell.text(), width, grid.palette().get(cell.style()))
+            })
+            .collect::<Vec<_>>();
+        let encoded = serde_json::to_vec(&cells).map_err(|_| SessionRuntimeError::Closed)?;
+        if encoded.len() > 128 * 1024 {
+            return Err(HistoryFetchError::BudgetExhausted);
+        }
+        let end = match slice.end {
+            bmux_terminal_grid::HistorySliceEnd::Continue => HistoryEnd::Continue,
+            bmux_terminal_grid::HistorySliceEnd::HardBreak => HistoryEnd::HardBreak,
+            bmux_terminal_grid::HistorySliceEnd::Open => HistoryEnd::Open,
+        };
+        Ok((encoded, slice.next_cell_offset, end))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "capture admission and publication stay together to make lock and reservation lifetimes reviewable"
+    )]
     fn attach_scrollback_pin(
         &self,
         session_id: SessionId,
@@ -7306,12 +7596,18 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                     .and_then(|mut panes| panes.pop().ok_or(SessionRuntimeError::NotFound))
             })
             .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        let reservation =
+            PinReservation::acquire(&self.retained_pin_bytes, RESPONSE_OUTPUT_BUDGET)?;
+        let mut capture_budget = RESPONSE_OUTPUT_BUDGET;
         let (captured_grid, stream_end) = {
             let grid = pane
                 .terminal_grid
                 .lock()
                 .map_err(|_| SessionRuntimeError::Closed)?;
-            let captured_grid = grid.grid().clone();
+            let captured_grid = grid
+                .grid()
+                .try_clone_charged(&mut capture_budget)
+                .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
             let stream_end = pane
                 .output_buffer
                 .lock()
@@ -7319,14 +7615,31 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 .end_offset();
             (captured_grid, stream_end)
         };
+        let width =
+            u16::try_from(captured_grid.width()).map_err(|_| SessionRuntimeError::Closed)?;
+        let height =
+            u16::try_from(captured_grid.height()).map_err(|_| SessionRuntimeError::Closed)?;
+        let history_truncated = captured_grid.history_truncated();
+        let history_line_count = captured_grid.history_line_count();
         let total_scrolled_rows = captured_grid.total_scrolled_rows();
         let max_scrollback_offset = captured_grid.max_scrollback_offset();
-        let full_snapshot = captured_grid.snapshot(0, captured_grid.main_row_count());
-        let mut encoded_count = EncodedByteCount::default();
+        let full_snapshot = bmux_terminal_grid::GridSnapshot::try_from_grid(
+            &captured_grid,
+            0,
+            captured_grid.main_row_count(),
+            capture_budget,
+        )
+        .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+        let mut encoded_count = EncodedByteCount(0, RESPONSE_OUTPUT_BUDGET);
         serde_json::to_writer(&mut encoded_count, &full_snapshot)
-            .map_err(|_| SessionRuntimeError::Closed)?;
+            .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
         let encoded_bytes = encoded_count.0;
+        drop(full_snapshot);
+        // Couple storage and charge before entering the publication closure: its
+        // early returns and lock failures must free storage before admission.
+        let captured = Arc::new(CapturedPinGrid::new(captured_grid, reservation)?);
         self.with_lock_named("attach_scrollback_pin.store", |manager| {
+            admit_retained_pin(manager, session_id, client_id, pane_id, &captured.grid)?;
             let runtime = manager
                 .runtimes
                 .get_mut(&session_id)
@@ -7343,6 +7656,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             if !Arc::ptr_eq(&current_pane.terminal_grid, &pane.terminal_grid) {
                 return Err(SessionRuntimeError::NotFound);
             }
+            let capture_id = Uuid::new_v4();
             let pin_id = runtime.next_scrollback_pin_id;
             // Never reuse a token: a delayed unpin must not release a newer capture.
             runtime.next_scrollback_pin_id =
@@ -7350,8 +7664,9 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             runtime.scrollback_pins.insert(
                 (client_id, pane_id),
                 ScrollbackPin {
+                    capture_id,
                     id: pin_id,
-                    grid: Arc::new(captured_grid),
+                    grid: captured,
                     total_scrolled_rows,
                     stream_end,
                     encoded_bytes,
@@ -7372,6 +7687,11 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 "captured frozen scrollback pin"
             );
             Ok(bmux_pane_runtime_state::AttachPaneScrollbackPin {
+                width,
+                height,
+                history_truncated,
+                history_line_count,
+                capture_id,
                 pane_id,
                 pin_id,
                 total_scrolled_rows,
@@ -10171,6 +10491,7 @@ mod tests {
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -10228,6 +10549,7 @@ mod tests {
 
     fn test_delta(base_revision: u64, revision: u64, text_len: usize) -> GridDeltaBatch {
         GridDeltaBatch {
+            history_truncated: None,
             base_revision,
             revision,
             content_revision: revision,
@@ -10301,6 +10623,7 @@ mod tests {
             pane_input_index,
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -10625,6 +10948,255 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_screen_cell_snapshot_rejection_preserves_state() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        set_pane_grid(pane, 10, 2);
+        let grid = Arc::clone(&pane.terminal_grid);
+        let output = Arc::clone(&pane.output_buffer);
+        output.lock().unwrap().register_client_at_tail(client_id);
+        let mut bytes = b"a".to_vec();
+        for _ in 0..=RESPONSE_OUTPUT_BUDGET / 2 {
+            bytes.extend_from_slice("\u{0301}".as_bytes());
+        }
+        process_pane_output(&grid, &output, &bytes).unwrap();
+        let revision = grid.lock().unwrap().grid().revision();
+        let cursor = output.lock().unwrap().cursors[&client_id];
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let result = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[pane_id],
+            2,
+        );
+        assert!(matches!(
+            result,
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        ));
+        assert_eq!(grid.lock().unwrap().grid().revision(), revision);
+        assert!(
+            grid.lock()
+                .unwrap()
+                .grid()
+                .screen_cell_text_exceeds(RESPONSE_OUTPUT_BUDGET)
+        );
+        assert_eq!(output.lock().unwrap().cursors[&client_id], cursor);
+        grid.lock().unwrap().process(b"\r\x1b[2Kok");
+        assert!(
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+                &adapter,
+                session_id,
+                client_id,
+                &[pane_id],
+                2,
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_pin_capture_preserves_previous_pin() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        set_pane_grid(pane, 10, 2);
+        let grid = Arc::clone(&pane.terminal_grid);
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let pin = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_pin(
+            &adapter, session_id, client_id, pane_id,
+        )
+        .unwrap();
+        let mut bytes = b"a".to_vec();
+        for _ in 0..=RESPONSE_OUTPUT_BUDGET / 2 {
+            bytes.extend_from_slice("\u{0301}".as_bytes());
+        }
+        grid.lock().unwrap().process(&bytes);
+        let revision = grid.lock().unwrap().grid().revision();
+        assert!(matches!(
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_pin(
+                &adapter, session_id, client_id, pane_id,
+            ),
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        ));
+        assert_eq!(grid.lock().unwrap().grid().revision(), revision);
+        let windows = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_window_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[bmux_pane_runtime_state::AttachPaneGridWindowRequest {
+                pane_id,
+                scrollback_offset: 0,
+                rows: 2,
+                anchor_total_scrolled_rows: None,
+                pin_id: Some(pin.pin_id),
+            }],
+        )
+        .unwrap();
+        assert_eq!(windows.windows.len(), 1);
+        // A retained clone can fit while projection plus wire text cannot.
+        // Exercise the post-clone admission stage, not just clone rejection.
+        grid.lock().unwrap().process(b"\r\x1b[2K");
+        let mut text = b"a".to_vec();
+        for _ in 0..RESPONSE_OUTPUT_BUDGET / 3 {
+            text.extend_from_slice("\u{0301}".as_bytes());
+        }
+        grid.lock().unwrap().process(&text);
+        assert!(
+            grid.lock()
+                .unwrap()
+                .grid()
+                .try_clone_with_budget(RESPONSE_OUTPUT_BUDGET)
+                .is_some()
+        );
+        assert!(matches!(
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_pin(
+                &adapter, session_id, client_id, pane_id,
+            ),
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        ));
+        let request = bmux_pane_runtime_state::AttachPaneGridWindowRequest {
+            pane_id,
+            scrollback_offset: 0,
+            rows: 2,
+            anchor_total_scrolled_rows: None,
+            pin_id: Some(pin.pin_id),
+        };
+        assert!(
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_window_state(
+                &adapter,
+                session_id,
+                client_id,
+                &[request],
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_wide_attach_snapshot_does_not_charge_unused_columns() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        set_pane_grid(pane, 1000, 1000);
+        pane.terminal_grid.lock().unwrap().process(b"sparse");
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let result = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[pane_id],
+            1000,
+        )
+        .unwrap();
+        let snapshot: bmux_terminal_grid::GridSnapshot =
+            serde_json::from_slice(&result.snapshots[0].encoded).unwrap();
+        assert_eq!(snapshot.width, 1000);
+        assert_eq!(snapshot.rows[0].runs[0].text, "sparse");
+    }
+
+    #[tokio::test]
+    async fn adapters_share_pin_reservations_and_shrink_releases_only_unused_capacity() {
+        let runtime = runtime_with_panes(&[Uuid::new_v4()]);
+        let manager = Arc::new(Mutex::new(manager_with_runtime(
+            SessionId(Uuid::new_v4()),
+            runtime,
+        )));
+        let first = ServerSessionRuntimeAdapter::new(Arc::clone(&manager));
+        let second = ServerSessionRuntimeAdapter::new(manager);
+        assert!(Arc::ptr_eq(
+            &first.retained_pin_bytes,
+            &second.retained_pin_bytes
+        ));
+        let mut reservation =
+            PinReservation::acquire(&first.retained_pin_bytes, RETAINED_PIN_BUDGET).unwrap();
+        assert!(PinReservation::acquire(&second.retained_pin_bytes, 1).is_err());
+        reservation.shrink(100).unwrap();
+        assert_eq!(second.retained_pin_bytes.load(Ordering::Acquire), 100);
+        let reader = Arc::new(reservation);
+        let retired = Arc::clone(&reader);
+        drop(reader);
+        let rest =
+            PinReservation::acquire(&second.retained_pin_bytes, RETAINED_PIN_BUDGET - 100).unwrap();
+        assert!(PinReservation::acquire(&first.retained_pin_bytes, 1).is_err());
+        drop(retired);
+        drop(rest);
+        assert_eq!(first.retained_pin_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn pin_reservation_survives_retirement_until_final_reader_drops() {
+        let used = Arc::new(AtomicUsize::new(0));
+        let capture = Arc::new(PinReservation::acquire(&used, RETAINED_PIN_BUDGET).unwrap());
+        assert!(PinReservation::acquire(&used, 1).is_err());
+        let reader = Arc::clone(&capture);
+        drop(capture);
+        assert!(PinReservation::acquire(&used, 1).is_err());
+        drop(reader);
+        assert_eq!(used.load(Ordering::Acquire), 0);
+        let retry = PinReservation::acquire(&used, RETAINED_PIN_BUDGET).unwrap();
+        drop(retry);
+        assert_eq!(used.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_pin_admission_counts_other_sessions_and_releases_removed_pins() {
+        let session = SessionId(Uuid::new_v4());
+        let other_session = SessionId(Uuid::new_v4());
+        let client = ClientId(Uuid::new_v4());
+        let pane = Uuid::new_v4();
+        let grid = Arc::new(CapturedPinGrid {
+            grid: bmux_terminal_grid::TerminalGrid::new(1, 1, GridLimits::default()).unwrap(),
+            reservation: PinReservation::acquire(&Arc::new(AtomicUsize::new(0)), 0).unwrap(),
+        });
+        let bytes = grid.grid.retained_capacity_bytes().unwrap();
+        let mut other = runtime_with_panes(&[pane]);
+        // Shared test backing keeps the fixture cheap; admission deliberately
+        // charges each registered pin conservatively even when backing aliases.
+        for id in 0..RETAINED_PIN_BUDGET / bytes {
+            other.scrollback_pins.insert(
+                (client, Uuid::from_u128(id as u128)),
+                ScrollbackPin {
+                    capture_id: Uuid::new_v4(),
+                    id: 1,
+                    grid: Arc::clone(&grid),
+                    total_scrolled_rows: 0,
+                    stream_end: 0,
+                    encoded_bytes: 0,
+                },
+            );
+        }
+        let mut manager = manager_with_runtime(other_session, other);
+        assert!(matches!(
+            admit_retained_pin(&manager, session, client, pane, &grid.grid),
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        ));
+        let key = *manager.runtimes[&other_session]
+            .scrollback_pins
+            .keys()
+            .next()
+            .unwrap();
+        assert!(admit_retained_pin(&manager, other_session, key.0, key.1, &grid.grid).is_ok());
+        manager
+            .runtimes
+            .get_mut(&other_session)
+            .unwrap()
+            .scrollback_pins
+            .remove(&key);
+        assert!(admit_retained_pin(&manager, session, client, pane, &grid.grid).is_ok());
     }
 
     #[tokio::test]
@@ -11087,6 +11659,450 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grid_builders_share_capture_admission_and_release_working_capacity() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let other = ServerSessionRuntimeAdapter::new(Arc::clone(&adapter.inner));
+        let occupied = PinReservation::acquire(
+            &adapter.retained_pin_bytes,
+            RETAINED_PIN_BUDGET - 2 * RESPONSE_OUTPUT_BUDGET + 1,
+        )
+        .unwrap();
+        assert!(matches!(
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+                &other,
+                session_id,
+                client_id,
+                &[pane_id],
+                1,
+            ),
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        ));
+        assert!(matches!(
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_window_state(
+                &other,
+                session_id,
+                client_id,
+                &[],
+            ),
+            Err(SessionRuntimeError::ResponseBudgetExceeded)
+        ));
+        drop(occupied);
+        let response =
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+                &other,
+                session_id,
+                client_id,
+                &[pane_id],
+                1,
+            )
+            .unwrap();
+        assert_eq!(response.snapshots.len(), 1);
+        // Only construction is charged; the returned response is caller-owned.
+        assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), 0);
+        bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_window_state(
+            &other,
+            session_id,
+            client_id,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), 0);
+        assert!(
+            bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+                &other,
+                SessionId(Uuid::new_v4()),
+                client_id,
+                &[pane_id],
+                1,
+            )
+            .is_err()
+        );
+        assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), 0);
+    }
+
+    struct HistoryRegistryRestore(
+        Option<Arc<std::sync::RwLock<bmux_pane_runtime_state::SessionRuntimeManagerHandle>>>,
+    );
+
+    impl Drop for HistoryRegistryRestore {
+        fn drop(&mut self) {
+            let registry = bmux_plugin::global_plugin_state_registry();
+            if let Some(previous) = self.0.take() {
+                registry.register(&previous);
+            } else {
+                // The process registry has no removal API. Release captured state
+                // by replacing our fixture with an empty manager.
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let empty = SessionRuntimeManager::new(
+                    "sh".into(),
+                    "xterm-256color".into(),
+                    protocol_profile_for_term("xterm-256color"),
+                    false,
+                    None,
+                    PanePaddingConfig::default(),
+                    tx,
+                );
+                registry.register(&Arc::new(std::sync::RwLock::new(
+                    bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter_for_manager(
+                        empty,
+                    )),
+                )));
+            }
+        }
+    }
+
+    struct HistoryDispatch(Uuid);
+    impl bmux_plugin_sdk::TypedDispatchClient for HistoryDispatch {
+        async fn invoke_service_raw(
+            &mut self,
+            capability: &str,
+            kind: bmux_ipc::InvokeServiceKind,
+            interface_id: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            use bmux_plugin_sdk::{
+                ApiVersion, HostConnectionInfo, HostMetadata, HostScope, NativeServiceContext,
+                ProviderId, RegisteredService, ServiceKind, ServiceRequest,
+            };
+            assert_eq!(kind, bmux_ipc::InvokeServiceKind::Query);
+            let response = crate::handlers::route(NativeServiceContext {
+                plugin_id: "bmux.pane-runtime".into(),
+                request: ServiceRequest {
+                    caller_plugin_id: String::new(),
+                    service: RegisteredService {
+                        capability: HostScope::new(capability).unwrap(),
+                        kind: ServiceKind::Query,
+                        interface_id: interface_id.into(),
+                        provider: ProviderId::Plugin("bmux.pane-runtime".into()),
+                    },
+                    operation: operation.into(),
+                    payload,
+                },
+                required_capabilities: vec![],
+                provided_capabilities: vec![],
+                services: vec![],
+                available_capabilities: vec![],
+                enabled_plugins: vec![],
+                plugin_search_roots: vec![],
+                host: HostMetadata {
+                    product_name: "bmux".into(),
+                    product_version: env!("CARGO_PKG_VERSION").into(),
+                    plugin_api_version: ApiVersion::new(1, 0),
+                    plugin_abi_version: ApiVersion::new(1, 0),
+                },
+                connection: HostConnectionInfo {
+                    config_dir: String::new(),
+                    config_dir_candidates: vec![],
+                    runtime_dir: String::new(),
+                    data_dir: String::new(),
+                    state_dir: String::new(),
+                },
+                settings: None,
+                plugin_settings_map: std::collections::BTreeMap::new(),
+                caller_client_id: Some(self.0),
+                cancellation: bmux_plugin_sdk::CancellationToken::default(),
+                host_kernel_bridge: None,
+            });
+            assert_eq!(response.error, None);
+            Ok(response.payload)
+        }
+    }
+
+    async fn assert_history_fetch_errors(
+        dispatch: &mut HistoryDispatch,
+        session: SessionId,
+        pane: Uuid,
+        capture: &bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryCaptureV1,
+    ) {
+        use bmux_pane_runtime_plugin_api::attach_runtime_state::{HistoryFetchError, client};
+        for (identity, line, offset, columns, expected) in [
+            (Uuid::new_v4(), 0, 0, 2, HistoryFetchError::StaleCapture),
+            (
+                capture.capture_id,
+                u32::try_from(capture.history_line_count).unwrap(),
+                0,
+                2,
+                HistoryFetchError::Unavailable,
+            ),
+            (
+                capture.capture_id,
+                0,
+                u32::MAX,
+                2,
+                HistoryFetchError::InvalidOffset,
+            ),
+            (
+                capture.capture_id,
+                0,
+                0,
+                0,
+                HistoryFetchError::BudgetExhausted,
+            ),
+        ] {
+            assert_eq!(
+                client::attach_history_slice_v1(
+                    dispatch,
+                    session.0,
+                    pane,
+                    capture.pin.pin_id,
+                    identity,
+                    line,
+                    offset,
+                    columns,
+                    100,
+                )
+                .await
+                .unwrap(),
+                Err(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "capture, fetch, replacement and stale-identity assertions share one registered runtime lifecycle"
+    )]
+    async fn generated_history_capture_and_fetch_share_logical_bounds() {
+        use bmux_pane_runtime_plugin_api::attach_runtime_state::{
+            HistoryEnd, HistoryFetchError, client,
+        };
+
+        let session = SessionId(Uuid::new_v4());
+        let caller = ClientId(Uuid::new_v4());
+        let pane = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane]);
+        runtime.attached_clients.insert(caller);
+        for _ in 0..100 {
+            runtime.panes[&pane]
+                .terminal_grid
+                .lock()
+                .unwrap()
+                .process(b"first\r\n");
+        }
+        let adapter = adapter_for_manager(manager_with_runtime(session, runtime));
+        let handle = Arc::new(std::sync::RwLock::new(
+            bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter),
+        ));
+        let registry = bmux_plugin::global_plugin_state_registry();
+        let _restore = HistoryRegistryRestore(registry.register(&handle));
+        let mut dispatch = HistoryDispatch(caller.0);
+        let capture = client::attach_history_capture_v1(&mut dispatch, session.0, pane)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(capture.history_line_count > 0);
+        let row = client::attach_main_row_slice_v1(
+            &mut dispatch,
+            session.0,
+            pane,
+            capture.pin.pin_id,
+            capture.capture_id,
+            0,
+            0,
+            4096,
+            65536,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(row.next_cell_offset <= u64::from(capture.width));
+        let stale = client::attach_main_row_slice_v1(
+            &mut dispatch,
+            session.0,
+            pane,
+            capture.pin.pin_id,
+            Uuid::new_v4(),
+            0,
+            0,
+            4096,
+            65536,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            stale,
+            Err(
+                bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryFetchError::StaleCapture
+            )
+        ));
+        let slice = client::attach_history_slice_v1(
+            &mut dispatch,
+            session.0,
+            pane,
+            capture.pin.pin_id,
+            capture.capture_id,
+            0,
+            0,
+            2,
+            100,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(slice.next_cell_offset, 2);
+        assert_eq!(slice.end_kind, HistoryEnd::Continue);
+        let slice = client::attach_history_slice_v1(
+            &mut dispatch,
+            session.0,
+            pane,
+            capture.pin.pin_id,
+            capture.capture_id,
+            0,
+            2,
+            100,
+            100,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(slice.end_kind, HistoryEnd::HardBreak);
+        let cells: Vec<(String, u8, bmux_terminal_grid::Style)> =
+            serde_json::from_slice(&slice.encoded).unwrap();
+        assert_eq!(
+            cells.iter().map(|cell| cell.0.as_str()).collect::<String>(),
+            "rst"
+        );
+        assert_history_fetch_errors(&mut dispatch, session, pane, &capture).await;
+        // Replacement makes the previous capture identity unusable even though
+        // the same session and pane remain attached.
+        let replacement = client::attach_history_capture_v1(&mut dispatch, session.0, pane)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement.capture_id, capture.capture_id);
+        assert_eq!(
+            client::attach_history_slice_v1(
+                &mut dispatch,
+                session.0,
+                pane,
+                capture.pin.pin_id,
+                capture.capture_id,
+                0,
+                0,
+                2,
+                100,
+            )
+            .await
+            .unwrap(),
+            Err(HistoryFetchError::StaleCapture)
+        );
+    }
+
+    #[tokio::test]
+    async fn history_fetch_uses_frozen_pin_and_rejects_released_token() {
+        use bmux_pane_runtime_state::SessionRuntimeManagerApi;
+        let session = SessionId(Uuid::new_v4());
+        let client = ClientId(Uuid::new_v4());
+        let pane = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane]);
+        runtime.attached_clients.insert(client);
+        for _ in 0..100 {
+            runtime.panes[&pane]
+                .terminal_grid
+                .lock()
+                .unwrap()
+                .process(b"first\r\n");
+        }
+        let adapter = adapter_for_manager(manager_with_runtime(session, runtime));
+        let pin = adapter
+            .attach_scrollback_pin(session, client, pane)
+            .unwrap();
+        let (encoded, next, end) = adapter
+            .attach_history_slice(
+                session,
+                client,
+                pane,
+                (pin.pin_id, pin.capture_id),
+                (0, 0),
+                (2, 100),
+            )
+            .unwrap();
+        assert!(!encoded.is_empty());
+        assert_eq!(next, 2);
+        assert_eq!(end, bmux_pane_runtime_state::HistoryEnd::Continue);
+        assert!(
+            adapter
+                .attach_history_slice(
+                    session,
+                    client,
+                    pane,
+                    (pin.pin_id, Uuid::new_v4()),
+                    (0, 0),
+                    (10, 100)
+                )
+                .is_err()
+        );
+        // An unavailable line must not manufacture content from the live grid.
+        assert!(
+            adapter
+                .attach_history_slice(
+                    session,
+                    client,
+                    pane,
+                    (pin.pin_id, pin.capture_id),
+                    (usize::MAX, 0),
+                    (10, 100)
+                )
+                .is_err()
+        );
+        adapter
+            .attach_scrollback_unpin(session, client, pane, pin.pin_id)
+            .unwrap();
+        assert!(
+            adapter
+                .attach_history_slice(
+                    session,
+                    client,
+                    pane,
+                    (pin.pin_id, pin.capture_id),
+                    (0, 0),
+                    (10, 100)
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pin_publication_releases_capture_and_allows_retry() {
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        // Exhaust tokens to fail after capture and admission, before insertion.
+        runtime.next_scrollback_pin_id = u64::MAX;
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let result = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_pin(
+            &adapter, session_id, client_id, pane_id,
+        );
+        assert!(matches!(result, Err(SessionRuntimeError::Closed)));
+        assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), 0);
+        {
+            let mut manager = adapter.inner.lock().unwrap();
+            let runtime = manager.runtimes.get_mut(&session_id).unwrap();
+            assert!(runtime.scrollback_pins.is_empty());
+            runtime.next_scrollback_pin_id = 1;
+        }
+        let pin = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_pin(
+            &adapter, session_id, client_id, pane_id,
+        )
+        .unwrap();
+        assert!(adapter.retained_pin_bytes.load(Ordering::Acquire) > 0);
+        bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_unpin(
+            &adapter, session_id, client_id, pane_id, pin.pin_id,
+        )
+        .unwrap();
+        assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
     async fn unpinned_capture_lives_only_until_last_window_reader_drops() {
         let session_id = SessionId(Uuid::new_v4());
         let client_id = ClientId(Uuid::new_v4());
@@ -11103,7 +12119,10 @@ mod tests {
             manager.runtimes[&session_id].scrollback_pins[&(client_id, pane_id)].clone()
         };
         let weak_grid = Arc::downgrade(&reader.grid);
-        let before = reader.grid.snapshot(0, 1);
+        let backing_reader = Arc::clone(&reader.grid);
+        let bytes = backing_reader.grid.retained_capacity_bytes().unwrap();
+        assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), bytes);
+        let before = reader.grid.grid.snapshot(0, 1);
         let ack = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_unpin(
             &adapter,
             session_id,
@@ -11113,10 +12132,13 @@ mod tests {
         )
         .expect("unpin");
         assert!(ack.released);
-        assert_eq!(reader.grid.snapshot(0, 1), before);
+        assert_eq!(reader.grid.grid.snapshot(0, 1), before);
         assert!(weak_grid.upgrade().is_some());
         drop(reader);
+        assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), bytes);
+        drop(backing_reader);
         assert!(weak_grid.upgrade().is_none());
+        assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]
@@ -11705,6 +12727,7 @@ mod tests {
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -11765,6 +12788,7 @@ mod tests {
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -11817,6 +12841,7 @@ mod tests {
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -11858,6 +12883,7 @@ mod tests {
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -11906,6 +12932,7 @@ mod tests {
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,
@@ -11946,6 +12973,7 @@ mod tests {
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
             retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
             protocol_profile: ProtocolProfile::Bmux,

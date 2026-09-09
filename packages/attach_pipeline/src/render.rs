@@ -4642,6 +4642,7 @@ fn build_render_frame_output_plan<'a>(
             build_surface_output_plan(
                 surface_index,
                 surface,
+                viewport,
                 pane_buffers,
                 frame_damage,
                 &retained_repaint_ids,
@@ -4711,6 +4712,7 @@ fn pane_surface_geometry(
 fn build_surface_output_plan<'a>(
     surface_index: usize,
     surface: &bmux_attach_layout_protocol::AttachSurface,
+    viewport: DamageRect,
     pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
     frame_damage: &FrameDamage,
     retained_repaint_ids: &BTreeSet<Uuid>,
@@ -4722,7 +4724,17 @@ fn build_surface_output_plan<'a>(
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
     render_context: &RenderExtensionContext,
 ) -> Option<SurfaceOutputPlan<'a>> {
-    let (pane_id, _rect, content, ext_rect) = pane_surface_geometry(surface)?;
+    let (pane_id, _rect, mut content, mut ext_rect) = pane_surface_geometry(surface)?;
+    // The scene is shared, but terminal output belongs to the local viewport.
+    // Keep authoritative positions while bounding the surface used to lower
+    // extension operations and the independently projected pane content.
+    ext_rect.w = ext_rect.w.min(viewport.w.saturating_sub(ext_rect.x));
+    ext_rect.h = ext_rect.h.min(viewport.h.saturating_sub(ext_rect.y));
+    if ext_rect.w == 0 || ext_rect.h == 0 {
+        return None;
+    }
+    content.w = content.w.min(viewport.w.saturating_sub(content.x));
+    content.h = content.h.min(viewport.h.saturating_sub(content.y));
     let before_content_snapshots = extension_layer_snapshots_for_surface(
         render_extensions,
         surface.id,
@@ -5242,7 +5254,12 @@ fn queue_pane_content_for_surface<W: io::Write>(
         );
         if next_grid_size != previous_grid_size {
             entry.prev_rows.clear();
-            entry.scrollback_window = None;
+            // A pinned window is immutable, independent of the resized live
+            // grid. Retain it until its replacement is published so selection
+            // remapping can still inspect the previous content origins.
+            if stage.scrollback.is_none_or(|view| view.pin.is_none()) {
+                entry.scrollback_window = None;
+            }
         }
         // Per-pane scrollback: a pane renders frozen history if and only if it
         // has its own scrollback view. This is deliberately NOT gated on focus
@@ -5252,7 +5269,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
         let use_scrollback = scrollback.is_some();
         let (grid_rows, viewport_base) =
             entry.scrollback_render_window(scrollback.as_ref(), inner_h);
-        let selection = scrollback.and_then(|view| view.selection_bounds(viewport_base));
+        let selection = scrollback.and_then(|view| entry.scrollback_selection_bounds(&view));
         if stage.focus {
             let (cursor_row, cursor_col) = if let Some(view) = scrollback {
                 let cursor = view.cursor;
@@ -5327,7 +5344,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
                                 selection,
                                 selection_line: viewport_base.line_for_viewport_row(row),
                                 runtime_appearance: stage.runtime_appearance,
-                                palette: entry.terminal_grid.grid().palette(),
+                                palette: entry.scrollback_palette(scrollback.as_ref()),
                                 before_content_cells: &before_cells,
                             },
                             0,
@@ -5341,7 +5358,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
                                 selection,
                                 selection_line: viewport_base.line_for_viewport_row(row),
                                 runtime_appearance: stage.runtime_appearance,
-                                palette: entry.terminal_grid.grid().palette(),
+                                palette: entry.scrollback_palette(scrollback.as_ref()),
                                 before_content_cells: &before_cells,
                             },
                             0,
@@ -5369,7 +5386,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
                                             selection_line: viewport_base
                                                 .line_for_viewport_row(row),
                                             runtime_appearance: stage.runtime_appearance,
-                                            palette: entry.terminal_grid.grid().palette(),
+                                            palette: entry.scrollback_palette(scrollback.as_ref()),
                                             before_content_cells: &before_cells,
                                         },
                                         start_col,
@@ -5384,7 +5401,7 @@ fn queue_pane_content_for_surface<W: io::Write>(
                                             selection_line: viewport_base
                                                 .line_for_viewport_row(row),
                                             runtime_appearance: stage.runtime_appearance,
-                                            palette: entry.terminal_grid.grid().palette(),
+                                            palette: entry.scrollback_palette(scrollback.as_ref()),
                                             before_content_cells: &before_cells,
                                         },
                                         start_col,
@@ -9254,6 +9271,27 @@ mod tests {
     /// pane without one must render live grid output even when it is focused.
     /// The previous implementation gated scrollback on `focus`, so focusing an
     /// unrelated pane made it render from another pane's view position.
+    fn assert_captured_palette(buffer: &PaneRenderBuffer) {
+        let view = PaneScrollbackView {
+            captured_selection: None,
+            offset: 1,
+            cursor: AttachScrollbackCursor { row: 0, col: 0 },
+            selection_anchor: None,
+            pin: None,
+        };
+        assert_eq!(
+            buffer
+                .scrollback_palette(Some(&view))
+                .get(bmux_terminal_grid::StyleId::DEFAULT)
+                .fg,
+            Some(bmux_terminal_grid::Color::Indexed(1))
+        );
+        assert_eq!(
+            buffer.scrollback_palette(None),
+            buffer.terminal_grid.grid().palette()
+        );
+    }
+
     #[test]
     fn render_attach_scene_renders_scrollback_per_pane_not_by_focus() {
         let scrolled_pane = Uuid::from_u128(0x5c01);
@@ -9307,17 +9345,27 @@ mod tests {
             // Give each pane a frozen window so the only difference between the
             // two panes is whether it has a scrollback *view*.
             buffer.scrollback_window = Some(crate::types::PaneScrollbackWindow {
+                projection_width: 0,
+                row_anchors: Vec::new(),
+                palette: bmux_terminal_grid::StylePalette::from_styles(vec![
+                    bmux_terminal_grid::Style {
+                        fg: Some(bmux_terminal_grid::Color::Indexed(1)),
+                        ..bmux_terminal_grid::Style::default()
+                    },
+                ]),
                 scrollback_offset: 1,
                 max_scrollback_offset: 5,
                 total_scrolled_rows: 5,
                 rows: frozen_rows.clone(),
             });
+            assert_captured_palette(&buffer);
             pane_buffers.insert(pane_id, buffer);
         }
 
         let scrollback_views = scrollback_views_for(
             scrolled_pane,
             PaneScrollbackView {
+                captured_selection: None,
                 offset: 1,
                 cursor: AttachScrollbackCursor { row: 0, col: 0 },
                 selection_anchor: None,
@@ -9657,6 +9705,7 @@ mod tests {
             &scrollback_views_for(
                 pane_id,
                 PaneScrollbackView {
+                    captured_selection: None,
                     offset: 1,
                     cursor: AttachScrollbackCursor { row: 0, col: 0 },
                     selection_anchor: None,
@@ -9724,6 +9773,7 @@ mod tests {
             &scrollback_views_for(
                 pane_id,
                 PaneScrollbackView {
+                    captured_selection: None,
                     offset: 0,
                     cursor: AttachScrollbackCursor { row: 0, col: 4 },
                     selection_anchor: Some(AttachScrollbackPosition { line: 0, col: 1 }),

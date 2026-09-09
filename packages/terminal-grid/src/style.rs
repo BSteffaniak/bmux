@@ -121,6 +121,10 @@ impl StylePalette {
             .unwrap_or_default()
     }
 
+    pub(crate) fn capacity(&self) -> usize {
+        self.styles.capacity()
+    }
+
     /// All interned styles in id order.
     #[must_use]
     pub fn styles(&self) -> &[Style] {

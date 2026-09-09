@@ -4948,6 +4948,226 @@ fn session_plugin_bus_event_matches(kind: &str, payload: &[u8], name: &str) -> b
 mod tests {
     use super::*;
 
+    #[test]
+    fn headless_screen_preserves_output_resize_order() {
+        let (mut first, first_handle) = HeadlessAttachTerminal::new(10, 3);
+        let (mut second, second_handle) = HeadlessAttachTerminal::new(20, 4);
+        first.write_all(b"ABCDEFGHIJK").unwrap();
+        second.write_all(b"independent").unwrap();
+        first_handle.resize(20, 3).unwrap();
+        first.write_all(b"\x1b[?1049hALT\x1b[?1049l!").unwrap();
+        let mut expected = bmux_terminal_grid::TerminalGridStream::new(
+            10,
+            3,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .unwrap();
+        expected.process(b"ABCDEFGHIJK");
+        expected.resize(20, 3).unwrap();
+        expected.process(b"\x1b[?1049hALT\x1b[?1049l!");
+        assert_eq!(
+            first_handle.output_screen_text(20, 3),
+            bmux_terminal_grid::visible_text(expected.grid(), 0, 3)
+        );
+        assert!(
+            second_handle
+                .output_screen_text(20, 4)
+                .contains("independent")
+        );
+        assert!(
+            first_handle
+                .output_screen_text(20, 3)
+                .contains("ABCDEFGHIJK!")
+        );
+    }
+
+    #[tokio::test]
+    async fn simultaneous_attach_preserves_independent_screens() {
+        let executable = std::env::current_exe().unwrap();
+        let binary = executable.parent().unwrap().parent().unwrap().join("bmux");
+        let sandbox = SandboxServer::start(super::super::sandbox::SandboxStartOptions {
+            shell: Some("sh"),
+            plugin_config: &super::super::types::PluginConfig::default(),
+            startup_timeout: Duration::from_secs(15),
+            env: &BTreeMap::new(),
+            env_mode: super::super::types::SandboxEnvMode::Clean,
+            binary: Some(&binary),
+            sandbox_config_file: None,
+            bundled_plugin_ids: &[],
+        })
+        .await
+        .unwrap();
+        // Exercise normal-mode UI commands explicitly; the product default is
+        // passthrough insert mode, where prefixed bytes correctly reach the PTY.
+        let config_path = sandbox.paths().config_file();
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str("\n[keybindings]\ninitial_mode = 'normal'\n");
+        std::fs::write(&config_path, config).unwrap();
+        let mut control = sandbox.connect("replication-control").await.unwrap();
+        let session = typed_new_session_playbook(&mut control, None)
+            .await
+            .unwrap();
+        let first = start_real_attach_playbook_runtime(Some(&sandbox), session, None, (80, 24))
+            .await
+            .unwrap();
+        let second = start_real_attach_playbook_runtime(Some(&sandbox), session, None, (120, 30))
+            .await
+            .unwrap();
+        let result = async {
+            let grant = control.attach_grant(SessionSelector::ById(session)).await?;
+            control.open_attach_stream_info(&grant).await?;
+            control.attach_input(session, b"printf '\\033[2J\\033[HMAIN_RETAINED\\n\\033[?1049h\\033[2J\\033[HALT_ACTIVE'; read answer; printf '\\033[?1049l'; read answer\r".to_vec()).await?;
+            wait_for_replication_screens(&first, &second, "ALT_ACTIVE", (80, 24)).await?;
+            first.resize(90, 26)?;
+            wait_for_replication_screens(&first, &second, "ALT_ACTIVE", (90, 26)).await?;
+            control.attach_input(session, b"\r".to_vec()).await?;
+            wait_for_replication_screens(&first, &second, "MAIN_RETAINED", (90, 26)).await?;
+            for runtime in [&first, &second] {
+                runtime.send_chord("ctrl+a [").await?;
+            }
+            wait_for_scrollback_mode(&first, &second, true).await?;
+            wait_for_replication_screens(&first, &second, "MAIN_RETAINED", (90, 26)).await?;
+            for runtime in [&first, &second] {
+                runtime.send_chord("Escape").await?;
+            }
+            wait_for_scrollback_mode(&first, &second, false).await?;
+            wait_for_replication_screens(&first, &second, "MAIN_RETAINED", (90, 26)).await?;
+            let mut inspector = ScreenInspector::new(90, 26);
+            inspector.refresh(&mut control, session).await?;
+            ensure!(inspector.pane_scrollback_text(1).is_some_and(|text| text.contains("MAIN_RETAINED")), "authoritative scrollback lost restored content");
+            ensure!(!first.task.is_finished() && !second.task.is_finished(), "attach loop exited");
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        first.task.abort();
+        second.task.abort();
+        let _ = tokio::join!(first.task, second.task);
+        sandbox.shutdown(false).await.unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn captured_history_window_reads_real_server_pin() {
+        use bmux_pane_runtime_plugin_api::attach_runtime_state as api;
+        let executable = std::env::current_exe().unwrap();
+        let binary = executable.parent().unwrap().parent().unwrap().join("bmux");
+        let sandbox = SandboxServer::start(super::super::sandbox::SandboxStartOptions {
+            shell: Some("sh"),
+            plugin_config: &super::super::types::PluginConfig::default(),
+            startup_timeout: Duration::from_secs(15),
+            env: &BTreeMap::new(),
+            env_mode: super::super::types::SandboxEnvMode::Clean,
+            binary: Some(&binary),
+            sandbox_config_file: None,
+            bundled_plugin_ids: &[],
+        })
+        .await
+        .unwrap();
+        let result = async {
+            let mut client = sandbox.connect("history-window-test").await?;
+            let session = typed_new_session_playbook(&mut client, None).await?;
+            let grant = client.attach_grant(SessionSelector::ById(session)).await?;
+            client.open_attach_stream_info(&grant).await?;
+            let pane = client.attach_layout(session).await?.panes[0].id;
+            client
+                .attach_input(
+                    session,
+                    b"i=0; while [ $i -lt 100 ]; do printf 'HISTORY_MARKER\\n'; i=$((i+1)); done\r"
+                        .to_vec(),
+                )
+                .await?;
+            let capture = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let capture =
+                        api::client::attach_history_capture_v1(&mut client, session, pane)
+                            .await?
+                            .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+                    if capture.history_line_count > 40 {
+                        break Ok::<_, anyhow::Error>(capture);
+                    }
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                }
+            })
+            .await??;
+            let pin = bmux_attach_pipeline::ScrollbackPin {
+                capture: Some(bmux_attach_pipeline::ScrollbackCapture {
+                    identity: capture.capture_id,
+                    lines: capture.history_line_count,
+                    truncated: capture.history_truncated,
+                    width: capture.width,
+                    height: capture.height,
+                }),
+                pin_id: capture.pin.pin_id,
+                total_scrolled_rows: capture.pin.total_scrolled_rows,
+                max_scrollback_offset: capture.pin.max_scrollback_offset as usize,
+                stream_end: capture.pin.stream_end,
+                created_epoch_secs: 0,
+            };
+            let window = crate::pane_runtime_client::captured_history_window(
+                &mut client,
+                session,
+                pane,
+                pin,
+                usize::from(capture.height),
+                2,
+                (usize::from(capture.width), None, 0),
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("history window fell back"))?;
+            ensure!(
+                window.rows.iter().all(|row| bmux_terminal_grid::row_text(
+                    row,
+                    usize::from(capture.width)
+                )
+                .contains("HISTORY_MARKER")),
+                "unexpected frozen rows"
+            );
+            api::client::attach_pane_scrollback_unpin(&mut client, session, pane, pin.pin_id)
+                .await?
+                .map_err(|err| anyhow::anyhow!("{err:?}"))?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        sandbox.shutdown(false).await.unwrap();
+        result.unwrap();
+    }
+
+    async fn wait_for_scrollback_mode(
+        first: &RealAttachPlaybookRuntime,
+        second: &RealAttachPlaybookRuntime,
+        active: bool,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while first.terminal.scrollback_active() != active
+                || second.terminal.scrollback_active() != active
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .context("scrollback mode transition timed out")
+    }
+
+    async fn wait_for_replication_screens(
+        first: &RealAttachPlaybookRuntime,
+        second: &RealAttachPlaybookRuntime,
+        marker: &str,
+        size: (u16, u16),
+    ) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let a = first.terminal.output_screen_text(size.0, size.1);
+            let b = second.terminal.output_screen_text(120, 30);
+            if a.contains(marker) && b.contains(marker) {
+                return Ok(());
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "missing {marker}: first={a:?}, second={b:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn test_attach_info() -> bmux_client::AttachOpenInfo {
         bmux_client::AttachOpenInfo {
             context_id: Some(Uuid::nil()),
