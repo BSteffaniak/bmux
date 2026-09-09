@@ -212,6 +212,7 @@ struct CompanionState {
     hovered_tab_id: Option<Uuid>,
     scroll_offset: usize,
     manual_scroll: bool,
+    measurements: projection::ProjectionMeasurements,
     pointer_source: Option<Uuid>,
     pointer_started_col: u16,
     pointer_started_row: u16,
@@ -245,6 +246,7 @@ impl CompanionState {
             hovered_tab_id: None,
             scroll_offset: 0,
             manual_scroll: false,
+            measurements: projection::ProjectionMeasurements::default(),
             pointer_source: None,
             pointer_started_col: 0,
             pointer_started_row: 0,
@@ -1002,6 +1004,7 @@ fn adjust_rgb(value: (u8, u8, u8), delta: i16) -> (u8, u8, u8) {
 
 fn projection_interaction(state: &CompanionState) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
+        measurements: Some(&state.measurements),
         scroll_anchor: state.manual_scroll.then_some(state.scroll_offset),
         editing_tab_id: state.editing_tab_id,
         edit_text: Some(state.edit_buffer.text()),
@@ -1244,6 +1247,7 @@ fn projection_interaction_without_marker(
     state: &CompanionState,
 ) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
+        measurements: Some(&state.measurements),
         scroll_anchor: state.manual_scroll.then_some(state.scroll_offset),
         editing_tab_id: state.editing_tab_id,
         edit_text: Some(state.edit_buffer.text()),

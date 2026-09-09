@@ -1,4 +1,7 @@
 use bmux_attach_view_protocol::AttachLocalPresentationSnapshot;
+use bmux_tui::measured_list::MeasuredListIndex;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
@@ -252,8 +255,18 @@ impl RenderStyle {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ProjectionMeasurements(RefCell<MeasuredListIndex<Uuid>>);
+
+impl Default for ProjectionMeasurements {
+    fn default() -> Self {
+        Self(RefCell::new(MeasuredListIndex::new(0)))
+    }
+}
+
 #[derive(Default)]
 pub struct ProjectionInteraction<'a> {
+    pub(super) measurements: Option<&'a ProjectionMeasurements>,
     pub(super) scroll_anchor: Option<usize>,
     pub(super) editing_tab_id: Option<Uuid>,
     pub(super) edit_text: Option<&'a str>,
@@ -346,12 +359,15 @@ pub fn project_bar(
             }
         })
         .collect::<Vec<_>>();
+    let fallback_measurements = ProjectionMeasurements::default();
+    let measurements = interaction.measurements.unwrap_or(&fallback_measurements);
     let tab = visible_tabs_for_layout(
         &tokens,
         settings,
         &style,
         tab_budget,
         interaction.scroll_anchor,
+        &mut measurements.0.borrow_mut(),
     );
     let mut left = vec![ProjectedSegment {
         text: " ".repeat(settings.left_padding),
@@ -614,9 +630,39 @@ fn visible_tabs_for_layout(
     style: &RenderStyle,
     budget: usize,
     scroll_anchor: Option<usize>,
+    measurements: &mut MeasuredListIndex<Uuid>,
 ) -> TabTab {
     if tokens.is_empty() {
+        measurements.sync([], 0, 0, |_| 0);
         return TabTab { start: 0, end: 0 };
+    }
+    // Index the horizontal main axis with the shared measured extent index.
+    // Whole-tab admission and overflow chrome remain presentation policy here.
+    let gap = UnicodeWidthStr::width(style.tab_separator.as_str()) as u64;
+    if measurements.gap() != gap {
+        *measurements = MeasuredListIndex::new(gap);
+    }
+    // Painting, hit testing, and wheel dispatch can project the same snapshot.
+    // Reuse the index unchanged on those paths, including paint-only updates.
+    if measurements.len() != tokens.len()
+        || tokens.iter().enumerate().any(|(index, token)| {
+            measurements
+                .item(index)
+                .is_none_or(|item| item.key != token.tab_id || item.height != token.width as u64)
+        })
+    {
+        let widths: BTreeMap<_, _> = tokens
+            .iter()
+            .map(|token| (token.tab_id, token.width as u64))
+            .collect();
+        measurements.sync(
+            tokens
+                .iter()
+                .map(|token| (token.tab_id, token.width as u64)),
+            0,
+            0,
+            |key| widths[key],
+        );
     }
     let anchor = scroll_anchor
         .unwrap_or_else(|| tokens.iter().position(|token| token.active).unwrap_or(0))
@@ -654,7 +700,9 @@ fn visible_tabs_for_layout(
                     end: candidate + 1,
                 }
             };
-            if tab_window_width(tokens, &proposed, style, settings.overflow_style) <= budget {
+            if tab_window_width(measurements, &proposed, style, settings.overflow_style)
+                <= budget as u64
+            {
                 start = proposed.start;
                 end = proposed.end;
                 expanded = true;
@@ -670,34 +718,33 @@ fn visible_tabs_for_layout(
 }
 
 fn tab_window_width(
-    tokens: &[TabToken],
+    measurements: &MeasuredListIndex<Uuid>,
     tab: &TabTab,
     style: &RenderStyle,
     overflow_style: OverflowStyle,
-) -> usize {
-    let visible = tab.end.saturating_sub(tab.start);
-    let mut width = tokens[tab.start..tab.end]
-        .iter()
-        .map(|token| token.width)
-        .sum::<usize>()
-        .saturating_add(
-            UnicodeWidthStr::width(style.tab_separator.as_str())
-                .saturating_mul(visible.saturating_sub(1)),
-        );
+) -> u64 {
+    let start = measurements.item_offset(tab.start).unwrap_or(0);
+    let last = tab.end.saturating_sub(1);
+    let end = measurements
+        .item_offset(last)
+        .unwrap_or(0)
+        .saturating_add(measurements.item(last).map_or(0, |item| item.height));
+    let mut width = end.saturating_sub(start);
+    let separator = UnicodeWidthStr::width(style.tab_separator.as_str()) as u64;
     if tab.start > 0 {
         width = width
             .saturating_add(UnicodeWidthStr::width(
                 style.overflow(tab.start, overflow_style).as_str(),
-            ))
-            .saturating_add(UnicodeWidthStr::width(style.tab_separator.as_str()));
+            ) as u64)
+            .saturating_add(separator);
     }
-    let hidden_right = tokens.len().saturating_sub(tab.end);
+    let hidden_right = measurements.len().saturating_sub(tab.end);
     if hidden_right > 0 {
         width = width
             .saturating_add(UnicodeWidthStr::width(
                 style.overflow(hidden_right, overflow_style).as_str(),
-            ))
-            .saturating_add(UnicodeWidthStr::width(style.tab_separator.as_str()));
+            ) as u64)
+            .saturating_add(separator);
     }
     width
 }
@@ -853,6 +900,69 @@ fn segments_width(segments: &[ProjectedSegment]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_projection_reconciles_width_order_and_empty_content() {
+        let settings = Settings::default();
+        let measurements = ProjectionMeasurements::default();
+        let interaction = ProjectionInteraction {
+            measurements: Some(&measurements),
+            ..ProjectionInteraction::default()
+        };
+        let mut tabs = vec![tab(1, "one", true), tab(2, "two", false)];
+        let initial = project_bar(&settings, &tabs, &local(80), None, &interaction);
+        let index = measurements.0.borrow().clone();
+        assert_eq!(index.len(), 2);
+        assert_eq!(
+            project_bar(&settings, &tabs, &local(80), None, &interaction),
+            initial,
+        );
+        assert_eq!(*measurements.0.borrow(), index);
+        tabs[1].name = "a substantially longer name".into();
+        project_bar(&settings, &tabs, &local(80), None, &interaction);
+        assert!(measurements.0.borrow().total_height() > index.total_height());
+        tabs.reverse();
+        project_bar(&settings, &tabs, &local(80), None, &interaction);
+        assert_eq!(measurements.0.borrow().item(0).unwrap().key, tabs[0].id);
+        let independent = measurements.clone();
+        project_bar(&settings, &[], &local(80), None, &interaction);
+        assert!(measurements.0.borrow().is_empty());
+        assert_eq!(independent.0.borrow().len(), 2);
+    }
+
+    #[test]
+    fn measured_tab_windows_preserve_gaps_and_overflow_at_wide_offsets() {
+        let settings = Settings::default();
+        let style = RenderStyle::from_settings(&settings);
+        let gap = UnicodeWidthStr::width(style.tab_separator.as_str()) as u64;
+        let mut measurements = MeasuredListIndex::new(gap);
+        measurements.sync((1..=3).map(|key| (Uuid::from_u128(key), 0)), 0, 0, |_| {
+            70_000
+        });
+        for start in 0..3 {
+            for end in start + 1..=3 {
+                let count = (end - start) as u64;
+                let mut expected = count * 70_000 + (count - 1) * gap;
+                for hidden in [start, 3 - end] {
+                    if hidden > 0 {
+                        expected += UnicodeWidthStr::width(
+                            style.overflow(hidden, settings.overflow_style).as_str(),
+                        ) as u64
+                            + gap;
+                    }
+                }
+                assert_eq!(
+                    tab_window_width(
+                        &measurements,
+                        &TabTab { start, end },
+                        &style,
+                        settings.overflow_style,
+                    ),
+                    expected,
+                );
+            }
+        }
+    }
 
     fn tab(index: u128, name: &str, active: bool) -> tabs_list::TabListEntry {
         tabs_list::TabListEntry {
