@@ -9691,6 +9691,20 @@ async fn ensure_pane_scrollback_windows(
                 Ok(crate::pane_runtime_client::CapturedWindowOutcome::LiveTail {
                     capture_offset,
                 }) => {
+                    if let Ok(Some(window)) = crate::pane_runtime_client::captured_tail_window(
+                        client,
+                        view_state.attached_id,
+                        *pane_id,
+                        pin,
+                        capture_offset,
+                        rows,
+                        width,
+                    )
+                    .await
+                    {
+                        captured_windows.push((*pane_id, window));
+                        continue;
+                    }
                     requested_panes.insert(*pane_id);
                     requests.push(PaneGridWindowRequest {
                         pane_id: *pane_id,
