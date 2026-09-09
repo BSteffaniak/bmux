@@ -618,7 +618,11 @@ impl<'a> SelectableList<'a> {
             id.clone(),
             size,
             vec![
-                ChildLayout::new(content_area.x, usize::from(content_area.y), viewport),
+                ChildLayout::new(
+                    usize::from(content_area.x),
+                    usize::from(content_area.y),
+                    viewport,
+                ),
                 ChildLayout::new(
                     0,
                     0,

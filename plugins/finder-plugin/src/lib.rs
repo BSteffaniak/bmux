@@ -7,7 +7,7 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     PromptOption, PromptRequest, PromptResponse, PromptSearchMatchMode, PromptValue,
 };
-use bmux_windows_plugin_api::windows_list::{self, WindowListEntry};
+use bmux_windows_plugin_api::windows_list::WindowListEntry;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -26,21 +26,44 @@ impl RustPlugin for FinderPlugin {
     }
 }
 
+// Commands may run outside the process owning the reactive catalog. Query
+// the provider so discovery also reflects the invoking client's selection.
+fn load_windows(
+    context: &NativeCommandContext,
+) -> Result<Vec<WindowListEntry>, PluginCommandError> {
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let windows = bmux_plugin::block_on_typed_dispatch(
+        bmux_windows_plugin_api::windows_state::client::list_windows(&mut client, None),
+    )
+    .map_err(|error| {
+        PluginCommandError::unavailable(format!("window list unavailable: {error}"))
+    })?;
+    windows
+        .into_iter()
+        .map(|window| {
+            Ok(WindowListEntry {
+                id: Uuid::parse_str(&window.id).map_err(|error| {
+                    PluginCommandError::failed(format!("invalid window ID: {error}"))
+                })?,
+                name: window.name,
+                active: window.active,
+                workspace: window.workspace,
+                workspace_id: window.workspace_id,
+            })
+        })
+        .collect()
+}
+
 fn show_finder(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
     let _workspace_contract = bmux_workspaces_plugin_api::workspaces_state::INTERFACE_ID.as_str();
     let settings =
         FinderSettings::parse(context.settings.as_ref()).map_err(PluginCommandError::failed)?;
-    let (snapshot, _) = bmux_plugin::global_event_bus()
-        .subscribe_state::<windows_list::WindowListSnapshot>(&windows_list::STATE_KIND)
-        .map_err(|error| {
-            PluginCommandError::unavailable(format!("window list unavailable: {error}"))
-        })?;
-    let active_workspace_id = snapshot
-        .windows
+    let windows = load_windows(context)?;
+    let active_workspace_id = windows
         .iter()
         .find(|window| window.active)
         .map(|window| window.workspace_id);
-    let entries = build_entries(&snapshot.windows, &settings, active_workspace_id);
+    let entries = build_entries(&windows, &settings, active_workspace_id);
     if entries.is_empty() {
         warn!("finder: no tabs available");
         return Ok(EXIT_OK);

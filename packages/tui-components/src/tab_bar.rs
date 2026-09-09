@@ -393,7 +393,7 @@ impl Component for TabBarComponent<'_, '_> {
             .visible_rect(bmux_tui::component::LogicalRect::new(
                 0,
                 0,
-                layout.size.width,
+                usize::from(layout.size.width),
                 usize::from(!self.bar.items.is_empty()).min(layout.size.height),
             ))
             .intersection(area);
@@ -412,9 +412,9 @@ impl Component for TabBarComponent<'_, '_> {
                 .iter()
                 .position(|rect| {
                     cx.visible_rect(bmux_tui::component::LogicalRect::new(
-                        rect.x,
+                        rect.x.into(),
                         usize::from(rect.y),
-                        rect.width,
+                        usize::from(rect.width),
                         usize::from(rect.height),
                     ))
                     .contains(mouse.position)

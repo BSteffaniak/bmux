@@ -30,6 +30,11 @@ toml                         = { workspace = true }
 uuid                         = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
+bmux_attach_view_protocol = { workspace = true }
+bmux_client               = { workspace = true }
+bmux_contexts_plugin      = { workspace = true, features = ["static-bundled"] }
+bmux_session_models       = { workspace = true }
+bmux_tab_strip_plugin     = { workspace = true, features = ["static-bundled"] }
 
 [features]
 fail-on-warnings = [

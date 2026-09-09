@@ -137,7 +137,7 @@ impl Component for DialogContent<'_, '_> {
                 continue;
             };
             cx.with_child_size(
-                i32::from(child.x),
+                i32::try_from(child.x).unwrap_or(i32::MAX),
                 i64::try_from(child.y).unwrap_or(i64::MAX),
                 child.node.size,
                 |cx| component.paint(&child.node, cx),

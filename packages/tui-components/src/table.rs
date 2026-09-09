@@ -1642,7 +1642,7 @@ impl Component for TableComponent<'_, '_> {
             self.id.clone(),
             size,
             vec![ChildLayout::new(
-                table_layout.body.x,
+                usize::from(table_layout.body.x),
                 usize::from(table_layout.body.y),
                 table_layout.viewport,
             )],

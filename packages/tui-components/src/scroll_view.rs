@@ -26,10 +26,11 @@ use crate::scrollbar::{
 };
 use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
 
-/// Stable layout identity and viewport-relative row used across relayout.
+/// Stable layout identity and viewport-relative position used across relayout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrollAnchor {
     id: LayoutId,
+    viewport_column: i64,
     viewport_row: i64,
 }
 
@@ -38,6 +39,12 @@ impl ScrollAnchor {
     #[must_use]
     pub const fn id(&self) -> &LayoutId {
         &self.id
+    }
+
+    /// Signed target column relative to the viewport left edge.
+    #[must_use]
+    pub const fn viewport_column(&self) -> i64 {
+        self.viewport_column
     }
 
     /// Signed target row relative to the viewport top.
@@ -294,8 +301,8 @@ impl<'a> ScrollViewComponent<'a> {
             state.horizontal_offset = self.reveal_axis_offset(
                 state.horizontal_offset,
                 usize::from(layout.size.width),
-                usize::from(rect.x),
-                usize::from(rect.width),
+                rect.x,
+                rect.width,
                 maximum_x,
             );
             state.vertical_offset = self.reveal_axis_offset(
@@ -415,7 +422,7 @@ impl Component for ScrollViewComponent<'_> {
         let clip = cx.visible_rect(LogicalRect::new(
             0,
             0,
-            layout.size.width,
+            usize::from(layout.size.width),
             layout.size.height,
         ));
         let resolved = self.effective_state(layout);
@@ -431,7 +438,7 @@ impl Component for ScrollViewComponent<'_> {
                 let clip = cx.visible_rect(LogicalRect::new(
                     0,
                     0,
-                    child.node.size.width,
+                    usize::from(child.node.size.width),
                     child.node.size.height,
                 ));
                 if clip.is_empty()
@@ -901,12 +908,7 @@ impl ScrollView {
         let Some(rect) = layout.find_logical_rect(id) else {
             return ScrollViewOutcome::Ignored;
         };
-        let horizontal = Self::ensure_horizontal_visible(
-            layout,
-            state,
-            usize::from(rect.x),
-            usize::from(rect.width),
-        );
+        let horizontal = Self::ensure_horizontal_visible(layout, state, rect.x, rect.width);
         let vertical = self.ensure_visible(layout, state, rect.y, rect.height);
         if vertical == ScrollViewOutcome::Ignored {
             horizontal
@@ -915,7 +917,7 @@ impl ScrollView {
         }
     }
 
-    /// Capture one stable descendant's signed viewport-relative row.
+    /// Capture one stable descendant's signed viewport-relative position.
     #[must_use]
     pub fn capture_anchor(
         layout: &LayoutNode,
@@ -925,6 +927,7 @@ impl ScrollView {
         let rect = layout.find_logical_rect(id)?;
         Some(ScrollAnchor {
             id: id.clone(),
+            viewport_column: signed_difference(rect.x, state.horizontal_offset),
             viewport_row: signed_difference(rect.y, state.vertical_offset),
         })
     }
@@ -941,9 +944,19 @@ impl ScrollView {
             return ScrollViewOutcome::Ignored;
         };
         let old = state.vertical_offset;
+        let old_horizontal = state.horizontal_offset;
+        state.horizontal_offset = offset_for_viewport_row(rect.x, anchor.viewport_column)
+            .min(Self::max_horizontal_offset(layout));
         state.vertical_offset = offset_for_viewport_row(rect.y, anchor.viewport_row)
             .min(Self::max_vertical_offset(layout));
-        outcome(old, state.vertical_offset)
+        let vertical = outcome(old, state.vertical_offset);
+        if vertical == ScrollViewOutcome::Ignored && old_horizontal != state.horizontal_offset {
+            ScrollViewOutcome::HorizontalScrolled {
+                horizontal_offset: state.horizontal_offset,
+            }
+        } else {
+            vertical
+        }
     }
 
     /// Route one event to the innermost viewport first, handing an unconsumed
@@ -2282,6 +2295,52 @@ mod tests {
             assert!(!state.follows_bottom());
             view.reconcile(&appended, &mut state);
             assert_eq!(state.vertical_offset(), 15);
+        }
+    }
+
+    #[test]
+    fn stable_anchor_restores_horizontal_position_and_clamps() {
+        let anchored = |column| {
+            let content = LayoutNode::with_children(
+                LayoutId::new("content"),
+                LogicalSize::new(100, 1),
+                vec![ChildLayout::new(
+                    column,
+                    0,
+                    LayoutNode::leaf(LayoutId::new("target"), LogicalSize::new(5, 1)),
+                )],
+            );
+            LayoutNode::with_children(
+                LayoutId::new("viewport"),
+                LogicalSize::new(10, 1),
+                vec![ChildLayout::new(0, 0, content)],
+            )
+        };
+        let view = ScrollView::new();
+        for (offset, relative, expected) in [(17, 3, 47), (23, -3, 53)] {
+            let mut state = ScrollViewState::new();
+            state.set_horizontal_offset(offset);
+            state.set_follow_bottom(true);
+            let anchor =
+                ScrollView::capture_anchor(&anchored(20), &state, &LayoutId::new("target"))
+                    .unwrap();
+            assert_eq!(anchor.viewport_column(), relative);
+            assert_eq!(
+                view.restore_anchor(&anchored(50), &mut state, &anchor),
+                ScrollViewOutcome::HorizontalScrolled {
+                    horizontal_offset: expected
+                }
+            );
+            assert_eq!(state.horizontal_offset(), expected);
+            assert!(state.follows_bottom());
+            view.restore_anchor(&anchored(99), &mut state, &anchor);
+            assert_eq!(state.horizontal_offset(), 90);
+            let unchanged = state;
+            assert_eq!(
+                view.restore_anchor(&layout(1, 1), &mut state, &anchor),
+                ScrollViewOutcome::Ignored
+            );
+            assert_eq!(state, unchanged);
         }
     }
 

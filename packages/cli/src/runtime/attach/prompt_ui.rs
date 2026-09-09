@@ -30,9 +30,7 @@ use bmux_tui_components::checkbox::{CheckboxComponent, CheckboxState, CheckboxSt
 use bmux_tui_components::dialog::{Dialog, DialogComponent};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
 use bmux_tui_components::scroll_view::{ScrollViewComponent, ScrollViewState};
-use bmux_tui_components::scrollbar::{
-    ScrollbarComponent, ScrollbarPolicy, ScrollbarState, ScrollbarStyles,
-};
+use bmux_tui_components::scrollbar::{ScrollbarComponent, ScrollbarPolicy, ScrollbarStyles};
 use bmux_tui_components::text_input::{TextInputComponent, TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{
     TextInputBoxComponent, TextInputBoxPolicy, TextInputBoxStyles,
@@ -117,7 +115,10 @@ enum PromptWidgetState {
         query: TextEditBuffer,
         selected: usize,
         list: VirtualListState<usize>,
+        // Separate width-specific probe; released with the prompt.
+        width_probe: Box<VirtualListState<usize>>,
         viewport_height: usize,
+        viewport_width: u16,
     },
     MultiToggle {
         cursor: usize,
@@ -139,6 +140,8 @@ struct ActivePrompt {
     envelope: AttachPromptEnvelope,
     state: PromptWidgetState,
     hits: HitMap,
+    manual_list_scroll: bool,
+    list_viewport: Rect,
     // One active scrolling layout; dropped with the prompt, replaced on geometry changes.
     scroll_layout: LayoutCache,
 }
@@ -182,7 +185,9 @@ impl ActivePrompt {
                     query: TextEditBuffer::new(),
                     selected,
                     list: VirtualListState::new(0),
+                    width_probe: Box::new(VirtualListState::new(0)),
                     viewport_height: 0,
+                    viewport_width: 0,
                 }
             }
             PromptField::MultiToggle {
@@ -214,6 +219,8 @@ impl ActivePrompt {
             envelope,
             state,
             hits: HitMap::new(),
+            manual_list_scroll: false,
+            list_viewport: Rect::new(0, 0, 0, 0),
             scroll_layout: LayoutCache::new(),
         }
     }
@@ -271,18 +278,14 @@ impl AttachPromptState {
                 *error = None;
             }
             (
-                PromptField::SearchSelect {
-                    options,
-                    match_mode,
-                    ..
-                },
+                PromptField::SearchSelect { .. },
                 PromptWidgetState::SearchSelect {
                     query, selected, ..
                 },
             ) => {
+                active.manual_list_scroll = false;
                 query.paste(text);
-                let len = filtered_option_indices(options, query.text(), *match_mode).len();
-                *selected = (*selected).min(len.saturating_sub(1));
+                *selected = 0;
             }
             (
                 PromptField::Form {
@@ -340,6 +343,7 @@ impl AttachPromptState {
 
         let mut completion: Option<PromptResponse> = None;
         if let Some(active) = self.active.as_mut() {
+            active.manual_list_scroll = false;
             match (&active.envelope.request.field, &mut active.state) {
                 (PromptField::Confirm { .. }, PromptWidgetState::Confirm { selected_yes }) => {
                     match key.code {
@@ -500,8 +504,10 @@ impl AttachPromptState {
                     PromptWidgetState::SearchSelect {
                         query,
                         selected,
-                        list: _,
+                        list,
                         viewport_height,
+                        viewport_width,
+                        width_probe,
                     },
                 ) => {
                     let previous_selected_value =
@@ -573,15 +579,34 @@ impl AttachPromptState {
                         KeyCode::Home => {
                             *selected = 0;
                         }
-                        KeyCode::PageUp => {
-                            *selected = selected.saturating_sub((*viewport_height).max(1));
-                        }
-                        KeyCode::PageDown => {
-                            let len =
-                                filtered_option_indices(options, query.text(), *match_mode).len();
-                            *selected = selected
-                                .saturating_add((*viewport_height).max(1))
-                                .min(len.saturating_sub(1));
+                        KeyCode::PageUp | KeyCode::PageDown => {
+                            let filtered =
+                                filtered_option_indices(options, query.text(), *match_mode);
+                            if *viewport_width > 0 {
+                                let measured = filtered.iter().copied().fold(
+                                    VirtualList::new("command-list"),
+                                    |measured, source| measured.component(source,
+                                        TextBlock::new(Text::from_lines([search_select_label(
+                                            &options[source],
+                                            active.envelope.request.modal_id.as_deref() == Some("command-palette"),
+                                            bmux_tui_components::modal_frame::ModalTheme::dark(bmux_tui::style::Color::White),
+                                        )])).id(format!("command-list.label.{source}"))),
+                                );
+                                sync_search_select_width(
+                                    &measured,
+                                    width_probe,
+                                    list,
+                                    *viewport_width,
+                                    *viewport_height,
+                                );
+                            }
+                            *selected = search_select_page_target(
+                                list,
+                                &filtered,
+                                *selected,
+                                *viewport_height,
+                                key.code == KeyCode::PageDown,
+                            );
                         }
                         KeyCode::End => {
                             let len =
@@ -1044,7 +1069,35 @@ impl AttachPromptState {
             return PromptKeyDisposition::Consumed;
         }
 
-        if active.envelope.request.modal_id.as_deref() == Some("command-palette") {
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && active
+            .list_viewport
+            .contains(Point::new(mouse.column, mouse.row))
+            && let PromptWidgetState::SearchSelect { list, .. }
+            | PromptWidgetState::SingleSelect { list, .. } = &mut active.state
+        {
+            let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                -3
+            } else {
+                3
+            };
+            list.scroll_by(delta, usize::from(active.list_viewport.height));
+            active.manual_list_scroll = true;
+            return PromptKeyDisposition::Consumed;
+        }
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left)
+        ) {
+            return PromptKeyDisposition::Consumed;
+        }
+
+        if matches!(
+            active.envelope.request.field,
+            PromptField::SearchSelect { .. }
+        ) {
             let Some(hit) = active.hits.hit_test(Point::new(mouse.column, mouse.row)) else {
                 return PromptKeyDisposition::Consumed;
             };
@@ -1869,6 +1922,82 @@ fn render_text_input(
     true
 }
 
+// Page through measured rows, not option counts. Before the first render (or
+// after filtering invalidates the selected key), fall back to one-item movement.
+fn search_select_page_target(
+    list: &VirtualListState<usize>,
+    filtered: &[usize],
+    selected: usize,
+    viewport_height: usize,
+    forward: bool,
+) -> usize {
+    let final_index = filtered.len().saturating_sub(1);
+    let selected = selected.min(final_index);
+    let adjacent = if forward {
+        selected.saturating_add(1).min(final_index)
+    } else {
+        selected.saturating_sub(1)
+    };
+    // Filtering may change between input events without a render. Reuse keyed
+    // heights, but never reuse offsets that include now-hidden options.
+    let mut target = selected;
+    let mut remaining = viewport_height.max(1);
+    while if forward {
+        target < final_index
+    } else {
+        target > 0
+    } {
+        let measured = if forward { target } else { target - 1 };
+        let Some(height) = filtered.get(measured).and_then(|key| list.item_height(key)) else {
+            return adjacent;
+        };
+        if forward && height > remaining {
+            break;
+        }
+        target = if forward { target + 1 } else { target - 1 };
+        remaining = remaining.saturating_sub(height);
+        if remaining == 0 {
+            break;
+        }
+    }
+    if forward {
+        target.max(adjacent)
+    } else {
+        target.min(adjacent)
+    }
+}
+
+fn sync_search_select_width(
+    list: &VirtualList<'_, usize>,
+    probe: &mut VirtualListState<usize>,
+    painted: &mut VirtualListState<usize>,
+    available_width: u16,
+    viewport_height: usize,
+) -> u16 {
+    list.sync(available_width, probe, &mut LayoutCx::new());
+    let gutter = available_width > 1 && probe.total_height() > viewport_height;
+    let width = available_width.saturating_sub(u16::from(gutter));
+    list.sync(width, painted, &mut LayoutCx::new());
+    width
+}
+
+fn search_select_label(
+    option: &crate::runtime::prompt::PromptOption,
+    is_command_palette: bool,
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+) -> Line {
+    let mut spans = vec![Span::styled(option.label.clone(), theme.text)];
+    if let Some(key_hint) = &option.key_hint
+        && is_command_palette
+    {
+        spans.push(Span::styled(format!("  {key_hint}"), theme.focused));
+    }
+    if let Some(detail) = &option.detail {
+        spans.push(Span::styled(format!("  —  {detail}"), theme.muted));
+    }
+    Line::from_spans(spans)
+}
+
 fn render_single_select(
     active: &mut ActivePrompt,
     content: Rect,
@@ -1917,8 +2046,14 @@ fn render_single_select(
             )
         },
     );
+    if active.manual_list_scroll {
+        state.capture_anchor();
+    }
     items.sync(content.width, state, &mut LayoutCx::new());
-    if !options.is_empty() {
+    active.list_viewport = content;
+    if active.manual_list_scroll {
+        state.restore_anchor(usize::from(content.height));
+    } else if !options.is_empty() {
         items.ensure_item_visible(state, selected, usize::from(content.height));
     }
     cx.with_child(
@@ -1952,7 +2087,9 @@ fn render_command_palette(
         query,
         selected,
         list: list_state,
+        width_probe,
         viewport_height,
+        viewport_width,
     } = &mut active.state
     else {
         return false;
@@ -1960,18 +2097,7 @@ fn render_command_palette(
     let is_command_palette = active.envelope.request.modal_id.as_deref() == Some("command-palette");
     let items = options
         .iter()
-        .map(|option| {
-            let mut spans = vec![Span::styled(option.label.clone(), theme.text)];
-            if let Some(key_hint) = &option.key_hint
-                && is_command_palette
-            {
-                spans.push(Span::styled(format!("  {key_hint}"), theme.focused));
-            }
-            if let Some(detail) = &option.detail {
-                spans.push(Span::styled(format!("  —  {detail}"), theme.muted));
-            }
-            Line::from_spans(spans)
-        })
+        .map(|option| search_select_label(option, is_command_palette, theme))
         .collect::<Vec<_>>();
     let filtered = filtered_option_indices(options, query.text(), *match_mode);
     let message_rows = active
@@ -2013,7 +2139,44 @@ fn render_command_palette(
     let palette_area = Rect::new(content.x, palette_y, content.width, palette_height);
     let list_viewport = palette_height.saturating_sub(2);
     *viewport_height = usize::from(list_viewport);
-    let show_scrollbar = filtered.len() > usize::from(list_viewport) && content.width > 1;
+    let list =
+        filtered
+            .iter()
+            .copied()
+            .fold(VirtualList::new("command-list"), |list, source_index| {
+                let style = if filtered.get(*selected) == Some(&source_index) {
+                    theme
+                        .focused
+                        .add_modifier(bmux_tui::style::Modifier::REVERSED)
+                } else {
+                    theme.text
+                };
+                let mut line = items[source_index].clone();
+                if filtered.get(*selected) == Some(&source_index) {
+                    for span in &mut line.spans {
+                        span.style = span.style.patch(style);
+                    }
+                }
+                list.component(
+                    source_index,
+                    TextBlock::new(Text::from_lines([line]))
+                        .id(format!("command-list.label.{source_index}"))
+                        .style(style),
+                )
+            });
+    // Decide overflow from the same measured rows used for painting and hits.
+    *viewport_width = palette_area.width;
+    if active.manual_list_scroll {
+        list_state.capture_anchor();
+    }
+    let resolved_width = sync_search_select_width(
+        &list,
+        width_probe,
+        list_state,
+        palette_area.width,
+        usize::from(list_viewport),
+    );
+    let show_scrollbar = resolved_width < palette_area.width;
     let component_area = Rect::new(
         palette_area.x,
         palette_area.y,
@@ -2041,33 +2204,10 @@ fn render_command_palette(
         component_area.width,
         list_viewport,
     );
-    let list =
-        filtered
-            .iter()
-            .copied()
-            .fold(VirtualList::new("command-list"), |list, source_index| {
-                let style = if filtered.get(*selected) == Some(&source_index) {
-                    theme
-                        .focused
-                        .add_modifier(bmux_tui::style::Modifier::REVERSED)
-                } else {
-                    theme.text
-                };
-                let mut line = items[source_index].clone();
-                if filtered.get(*selected) == Some(&source_index) {
-                    for span in &mut line.spans {
-                        span.style = span.style.patch(style);
-                    }
-                }
-                list.component(
-                    source_index,
-                    TextBlock::new(Text::from_lines([line]))
-                        .id(format!("command-list.label.{source_index}"))
-                        .style(style),
-                )
-            });
-    list.sync(list_area.width, list_state, &mut LayoutCx::new());
-    if let Some(source_index) = filtered.get(*selected) {
+    active.list_viewport = list_area;
+    if active.manual_list_scroll {
+        list_state.restore_anchor(usize::from(list_area.height));
+    } else if let Some(source_index) = filtered.get(*selected) {
         list.ensure_item_visible(list_state, source_index, usize::from(list_area.height));
     }
     if filtered.is_empty() {
@@ -2097,13 +2237,8 @@ fn render_command_palette(
             1,
             list_viewport,
         );
-        let scrollbar_state = std::cell::Cell::new(
-            ScrollbarState::new(
-                u16::try_from(filtered.len()).unwrap_or(u16::MAX),
-                list_viewport,
-            )
-            .offset(u16::try_from(list_state.scroll.vertical_offset()).unwrap_or(u16::MAX)),
-        );
+        let scrollbar_state =
+            std::cell::Cell::new(list_state.scrollbar_state(usize::from(list_viewport)));
         let scrollbar = ScrollbarComponent::new("command-palette-scrollbar", &scrollbar_state)
             .policy(ScrollbarPolicy::bare())
             .styles(ScrollbarStyles {
@@ -3324,6 +3459,380 @@ mod tests {
     }
 
     #[test]
+    fn search_select_pages_by_measured_rows() {
+        use super::{
+            LayoutCx, Line, Text, TextBlock, VirtualList, VirtualListState,
+            search_select_page_target,
+        };
+        let list = VirtualList::new("paging")
+            .component(
+                10,
+                TextBlock::new(Text::from_lines([Line::raw("abcdefgh")])).id("first"),
+            )
+            .component(
+                20,
+                TextBlock::new(Text::from_lines([Line::raw("ijklmnop")])).id("second"),
+            )
+            .component(
+                30,
+                TextBlock::new(Text::from_lines([Line::raw("qrstuvwx")])).id("third"),
+            );
+        let mut state = VirtualListState::new(0);
+        list.sync(2, &mut state, &mut LayoutCx::new());
+        assert_eq!(state.total_height(), 12);
+        assert_eq!(state.item_height(&20), Some(4));
+        assert_eq!(state.item_height(&99), None);
+        let filtered = [10, 20, 30];
+        // No sync between filtering/reordering and paging: offsets are stale,
+        // but each retained keyed height remains usable.
+        assert_eq!(
+            search_select_page_target(&state, &[30, 10, 20], 0, 8, true),
+            2
+        );
+        assert_eq!(
+            search_select_page_target(&state, &[30, 10, 20], 2, 8, false),
+            0
+        );
+        assert_eq!(search_select_page_target(&state, &filtered, 0, 4, true), 1);
+        assert_eq!(search_select_page_target(&state, &filtered, 2, 4, false), 1);
+        assert_eq!(search_select_page_target(&state, &filtered, 0, 1, true), 1);
+        assert_eq!(search_select_page_target(&state, &filtered, 2, 4, true), 2);
+        assert_eq!(search_select_page_target(&state, &filtered, 0, 4, false), 0);
+        assert_eq!(search_select_page_target(&state, &[], 0, 4, true), 0);
+        assert_eq!(search_select_page_target(&state, &[40, 50], 0, 4, true), 1);
+    }
+
+    #[test]
+    fn search_select_reuses_gutter_and_full_width_measurements() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Search",
+                vec![PromptOption::new("long", "wrapped label ".repeat(100))],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 40, rows: 16 };
+        let misses = |state: &AttachPromptState| {
+            let PromptWidgetState::SearchSelect {
+                list, width_probe, ..
+            } = &state.active.as_ref().unwrap().state
+            else {
+                panic!("search select");
+            };
+            (
+                list.layout_cache().stats().misses,
+                width_probe.layout_cache().stats().misses,
+            )
+        };
+        state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .unwrap();
+        let initial = misses(&state);
+        assert!(initial.0 > 0 && initial.1 > 0);
+        for _ in 0..3 {
+            state
+                .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+                .unwrap();
+            assert_eq!(misses(&state), initial);
+        }
+    }
+
+    #[test]
+    fn command_palette_scrollbar_uses_wrapped_row_extent() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Command Palette",
+                vec![PromptOption::new("long", "wrapped label ".repeat(100))],
+            )
+            .modal_id("command-palette"),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let render = state
+            .attach_prompt_overlay_render(
+                TerminalGeometry { cols: 40, rows: 16 },
+                &RuntimeAppearance::default(),
+                false,
+            )
+            .expect("palette should render");
+        let active = state.active.as_ref().unwrap();
+        let PromptWidgetState::SearchSelect {
+            list,
+            viewport_height,
+            ..
+        } = &active.state
+        else {
+            panic!("expected search select");
+        };
+        assert!(*viewport_height > 1);
+        assert!(list.total_height() > *viewport_height);
+        assert!(render.ops.iter().any(|op| {
+            matches!(op, bmux_plugin::RenderOp::TextRun { text, .. } if text.contains('█'))
+        }));
+    }
+
+    #[test]
+    fn pasted_search_reveals_first_match_after_manual_scroll() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Search",
+                (0..40)
+                    .map(|i| PromptOption::new(i.to_string(), format!("Item {i:02}")))
+                    .collect(),
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 40, rows: 16 };
+        state.handle_key_event(&KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .unwrap();
+        let area = state.active.as_ref().unwrap().list_viewport;
+        state.handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            geometry,
+        );
+        assert!(state.active.as_ref().unwrap().manual_list_scroll);
+        state.handle_paste("Item 1");
+        assert!(!state.active.as_ref().unwrap().manual_list_scroll);
+        for _ in 0..2 {
+            state
+                .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+                .unwrap();
+            let PromptWidgetState::SearchSelect { selected, list, .. } =
+                &state.active.as_ref().unwrap().state
+            else {
+                panic!("search select");
+            };
+            assert_eq!(*selected, 0);
+            assert_eq!(list.scroll.vertical_offset(), 0);
+            assert_eq!(list.key_at_offset(0), Some(&10));
+        }
+    }
+
+    #[test]
+    fn manual_select_scroll_preserves_key_and_row_on_resize() {
+        for searchable in [false, true] {
+            let options = (0..40)
+                .map(|i| {
+                    PromptOption::new(
+                        i.to_string(),
+                        format!("Item {i:02} {}", "wrapped ".repeat(10)),
+                    )
+                })
+                .collect();
+            let request = if searchable {
+                PromptRequest::search_select("Search", options)
+            } else {
+                PromptRequest::single_select("Select", options)
+            };
+            let mut state = AttachPromptState::default();
+            state.enqueue_internal(request, AttachInternalPromptAction::QuitSession);
+            let narrow = TerminalGeometry { cols: 40, rows: 16 };
+            state
+                .attach_prompt_overlay_render(narrow, &RuntimeAppearance::default(), false)
+                .unwrap();
+            let area = state.active.as_ref().unwrap().list_viewport;
+            for _ in 0..5 {
+                state.handle_mouse_event(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    narrow,
+                );
+            }
+            let anchor = |state: &AttachPromptState| {
+                let (PromptWidgetState::SingleSelect { list, .. }
+                | PromptWidgetState::SearchSelect { list, .. }) =
+                    &state.active.as_ref().unwrap().state
+                else {
+                    panic!("select");
+                };
+                let offset = list.scroll.vertical_offset();
+                let key = *list.key_at_offset(offset).unwrap();
+                (
+                    key,
+                    offset - list.item_offset(&key).unwrap(),
+                    list.item_height(&key).unwrap(),
+                )
+            };
+            let before = anchor(&state);
+            state
+                .attach_prompt_overlay_render(
+                    TerminalGeometry { cols: 80, rows: 24 },
+                    &RuntimeAppearance::default(),
+                    false,
+                )
+                .unwrap();
+            let after = anchor(&state);
+            assert_eq!(after.0, before.0);
+            assert_eq!(after.1, before.1.min(after.2 - 1));
+        }
+    }
+
+    #[test]
+    fn single_select_wheel_clamps_and_survives_repaint() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::single_select(
+                "Select",
+                (0..40)
+                    .map(|i| PromptOption::new(i.to_string(), format!("Item {i}")))
+                    .collect(),
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 80, rows: 16 };
+        state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .unwrap();
+        let area = state.active.as_ref().unwrap().list_viewport;
+        for _ in 0..50 {
+            state.handle_mouse_event(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                geometry,
+            );
+        }
+        state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .unwrap();
+        let PromptWidgetState::SingleSelect { list, selected } =
+            &state.active.as_ref().unwrap().state
+        else {
+            panic!("select");
+        };
+        assert_eq!(*selected, 0);
+        assert_eq!(
+            list.scroll.vertical_offset(),
+            list.total_height() - usize::from(area.height)
+        );
+        state.handle_key_event(&key_event(KeyCode::Down));
+        state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .unwrap();
+        let PromptWidgetState::SingleSelect { list, selected } =
+            &state.active.as_ref().unwrap().state
+        else {
+            panic!("select");
+        };
+        assert_eq!(*selected, 1);
+        assert_eq!(list.scroll.vertical_offset(), 1);
+    }
+
+    #[test]
+    fn search_select_wheel_survives_render_and_keys_restore_reveal() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Search",
+                (0..40)
+                    .map(|i| PromptOption::new(i.to_string(), format!("Result {i:02}")))
+                    .collect(),
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+        state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .unwrap();
+        let area = state.active.as_ref().unwrap().list_viewport;
+        state.handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            geometry,
+        );
+        state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .unwrap();
+        let PromptWidgetState::SearchSelect { list, selected, .. } =
+            &state.active.as_ref().unwrap().state
+        else {
+            panic!("search");
+        };
+        assert_eq!(*selected, 0);
+        assert_eq!(list.scroll.vertical_offset(), 3);
+        state.handle_key_event(&key_event(KeyCode::Home));
+        state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .unwrap();
+        let PromptWidgetState::SearchSelect { list, .. } = &state.active.as_ref().unwrap().state
+        else {
+            panic!("search");
+        };
+        assert_eq!(list.scroll.vertical_offset(), 0);
+    }
+
+    #[test]
+    fn search_select_non_selection_mouse_events_preserve_selection() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Search",
+                vec![
+                    PromptOption::new("one", "One"),
+                    PromptOption::new("two", "Two"),
+                ],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 80, rows: 24 };
+        state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .unwrap();
+        let hit = state
+            .active
+            .as_ref()
+            .unwrap()
+            .hits
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == "command-list.item.1")
+            .unwrap()
+            .area;
+        for kind in [
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            state.handle_mouse_event(
+                MouseEvent {
+                    kind,
+                    column: hit.x,
+                    row: hit.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                geometry,
+            );
+            let PromptWidgetState::SearchSelect { selected, .. } =
+                &state.active.as_ref().unwrap().state
+            else {
+                panic!("search select");
+            };
+            assert_eq!(*selected, 0, "{kind:?} must not select the hovered item");
+        }
+    }
+
+    #[test]
     fn command_palette_mouse_uses_component_hit_map() {
         let mut state = AttachPromptState::default();
         state.enqueue_internal(
@@ -3728,6 +4237,176 @@ mod tests {
         assert_eq!(
             completion.response,
             PromptResponse::Submitted(PromptValue::Single(format!("command-{expected_index}")))
+        );
+    }
+
+    #[test]
+    fn search_select_overflow_resize_preserves_pointer_activation() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Search",
+                (0..30)
+                    .map(|index| {
+                        PromptOption::new(
+                            index.to_string(),
+                            format!("Result {index:02} {}", "wrapped ".repeat(8)),
+                        )
+                    })
+                    .collect(),
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let narrow = TerminalGeometry { cols: 40, rows: 16 };
+        state
+            .attach_prompt_overlay_render(narrow, &RuntimeAppearance::default(), false)
+            .unwrap();
+        for _ in 0..40 {
+            state.handle_key_event(&key_event(KeyCode::PageDown));
+        }
+        state
+            .attach_prompt_overlay_render(narrow, &RuntimeAppearance::default(), false)
+            .unwrap();
+        let selected_key = |state: &AttachPromptState| {
+            let active = state.active.as_ref().unwrap();
+            let PromptWidgetState::SearchSelect {
+                selected,
+                list,
+                viewport_height,
+                ..
+            } = &active.state
+            else {
+                panic!("search select");
+            };
+            assert_eq!(*selected, 29);
+            assert!(list.total_height() > *viewport_height);
+            assert!(list.scroll.vertical_offset() > 0);
+            let PromptField::SearchSelect {
+                options,
+                match_mode,
+                ..
+            } = &active.envelope.request.field
+            else {
+                panic!("search select");
+            };
+            filtered_option_indices(options, "", *match_mode)[*selected]
+        };
+        let source = selected_key(&state);
+        state.handle_key_event(&key_event(KeyCode::PageDown));
+        assert_eq!(selected_key(&state), source);
+        let wide = TerminalGeometry { cols: 80, rows: 24 };
+        state
+            .attach_prompt_overlay_render(wide, &RuntimeAppearance::default(), false)
+            .unwrap();
+        assert_eq!(selected_key(&state), source);
+        let hit = state
+            .active
+            .as_ref()
+            .unwrap()
+            .hits
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == format!("command-list.item.{source}"))
+            .expect("selected item remains visible after resize");
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.area.x,
+            row: hit.area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let PromptKeyDisposition::Completed(completion) = state.handle_mouse_event(mouse, wide)
+        else {
+            panic!("click completes");
+        };
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Single(source.to_string()))
+        );
+    }
+
+    #[test]
+    fn search_select_width_tracks_filter_overflow_transitions() {
+        use super::{
+            LayoutCx, Line, Text, TextBlock, VirtualList, VirtualListState,
+            sync_search_select_width,
+        };
+        let mut probe = VirtualListState::new(0);
+        let mut painted = VirtualListState::new(0);
+        let short = VirtualList::new("command-list").component(
+            0,
+            TextBlock::new(Text::from_lines([Line::raw("abcde")])).id("label"),
+        );
+        assert_eq!(
+            sync_search_select_width(&short, &mut probe, &mut painted, 5, 2),
+            5
+        );
+        let long = short.component(
+            1,
+            TextBlock::new(Text::from_lines([Line::raw("abcdefghij")])).id("other"),
+        );
+        assert_eq!(
+            sync_search_select_width(&long, &mut probe, &mut painted, 5, 2),
+            4
+        );
+        assert_eq!(painted.item_height(&0), Some(2));
+        assert_eq!(painted.item_height(&1), Some(3));
+        let short = VirtualList::new("command-list").component(
+            0,
+            TextBlock::new(Text::from_lines([Line::raw("abcde")])).id("label"),
+        );
+        assert_eq!(
+            sync_search_select_width(&short, &mut probe, &mut painted, 5, 2),
+            5
+        );
+        assert_eq!(painted.item_height(&0), Some(1));
+        assert_eq!(painted.item_height(&1), None);
+        // Same resolved width remains a cache hit.
+        let misses = painted.layout_cache().stats().misses;
+        short.sync(5, &mut painted, &mut LayoutCx::new());
+        assert_eq!(painted.layout_cache().stats().misses, misses);
+    }
+
+    #[test]
+    fn search_select_reintroduced_results_are_measured_before_paging() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Search",
+                (0..30)
+                    .map(|index| PromptOption::new(index.to_string(), format!("Result {index:02}")))
+                    .collect(),
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        state.handle_key_event(&key_event(KeyCode::Char('9')));
+        state
+            .attach_prompt_overlay_render(
+                TerminalGeometry { cols: 80, rows: 24 },
+                &RuntimeAppearance::default(),
+                false,
+            )
+            .unwrap();
+        state.handle_key_event(&key_event(KeyCode::Backspace));
+        state.handle_key_event(&key_event(KeyCode::PageDown));
+        let PromptWidgetState::SearchSelect { selected, list, .. } =
+            &state.active.as_ref().unwrap().state
+        else {
+            panic!("search select");
+        };
+        let PromptWidgetState::SearchSelect {
+            viewport_height, ..
+        } = &state.active.as_ref().unwrap().state
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            *selected,
+            (*viewport_height).min(29),
+            "one-row results page by exactly the viewport height"
+        );
+        assert!(
+            list.item_height(&0).is_some(),
+            "reintroduced option measured before repaint"
         );
     }
 

@@ -448,7 +448,7 @@ impl<'a> PanelGroupComponent<'a> {
             .iter()
             .map(|child| {
                 Rect::new(
-                    child.x,
+                    u16::try_from(child.x).unwrap_or(u16::MAX),
                     u16::try_from(child.y).unwrap_or(u16::MAX),
                     child.node.size.width,
                     u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
@@ -463,7 +463,12 @@ impl<'a> PanelGroupComponent<'a> {
             .windows(2)
             .map(|pair| match self.group.axis {
                 PanelGroupAxis::Horizontal => Rect::new(
-                    pair[0].x.saturating_add(pair[0].node.size.width),
+                    u16::try_from(
+                        pair[0]
+                            .x
+                            .saturating_add(usize::from(pair[0].node.size.width)),
+                    )
+                    .unwrap_or(u16::MAX),
                     0,
                     1,
                     u16::try_from(layout.size.height).unwrap_or(u16::MAX),
@@ -603,11 +608,7 @@ impl Component for PanelGroupComponent<'_> {
             match self.group.axis {
                 PanelGroupAxis::Horizontal => {
                     cross = cross.max(node.size.height);
-                    children.push(ChildLayout::new(
-                        u16::try_from(cursor).unwrap_or(u16::MAX),
-                        0,
-                        node,
-                    ));
+                    children.push(ChildLayout::new(cursor, 0, node));
                 }
                 PanelGroupAxis::Vertical => {
                     cross = cross.max(usize::from(node.size.width));
@@ -632,7 +633,7 @@ impl Component for PanelGroupComponent<'_> {
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         for (child, component) in layout.children.iter().zip(&self.children) {
             cx.with_child(
-                i32::from(child.x),
+                i32::try_from(child.x).unwrap_or(i32::MAX),
                 i64::try_from(child.y).unwrap_or(i64::MAX),
                 LocalRect::new(
                     0,
@@ -658,7 +659,8 @@ impl Component for PanelGroupComponent<'_> {
         }
         for (child, component) in layout.children.iter().zip(&self.children).rev() {
             let clip = Rect::new(
-                area.x.saturating_add(child.x),
+                area.x
+                    .saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
                 area.y
                     .saturating_add(u16::try_from(child.y).unwrap_or(u16::MAX)),
                 child.node.size.width,

@@ -4498,6 +4498,7 @@ mod tests {
         deny_close: bool,
     ) -> bmux_plugin::test_support::TestServiceRouterGuard {
         use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
+        let selected = Mutex::new(Uuid::from_u128(1));
         let router: TestServiceRouter = std::sync::Arc::new(
             move |_caller_plugin,
                   _caller_client,
@@ -4510,19 +4511,33 @@ mod tests {
                     ("contexts-state", "list-contexts") => {
                         let contexts: Vec<
                             bmux_contexts_plugin_api::contexts_state::ContextSummary,
-                        > = vec![bmux_contexts_plugin_api::contexts_state::ContextSummary {
-                            id: Uuid::new_v4(),
-                            name: Some("alpha".to_string()),
-                            attributes: BTreeMap::new(),
-                        }];
+                        > = ["alpha", "beta"]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, name)| {
+                                bmux_contexts_plugin_api::contexts_state::ContextSummary {
+                                    id: Uuid::from_u128(index as u128 + 1),
+                                    name: Some(name.to_string()),
+                                    attributes: BTreeMap::new(),
+                                }
+                            })
+                            .collect();
                         encode_service_message(&contexts)
                     }
                     ("contexts-state", "current-context") => {
+                        let selected_id = *selected.lock().unwrap();
                         let context: Option<
                             bmux_contexts_plugin_api::contexts_state::ContextSummary,
                         > = Some(bmux_contexts_plugin_api::contexts_state::ContextSummary {
-                            id: Uuid::new_v4(),
-                            name: Some("current".to_string()),
+                            id: selected_id,
+                            name: Some(
+                                if selected_id == Uuid::from_u128(1) {
+                                    "alpha"
+                                } else {
+                                    "beta"
+                                }
+                                .to_string(),
+                            ),
                             attributes: BTreeMap::new(),
                         });
                         encode_service_message(&context)
@@ -4590,11 +4605,15 @@ mod tests {
                         encode_service_message(&ok)
                     }
                     ("contexts-commands", "select-context") => {
+                        let request: contexts_commands::client::SelectContextRequest =
+                            decode_service_message(&payload)?;
+                        let id = request.selector.id.expect("switch resolves a context ID");
+                        *selected.lock().unwrap() = id;
                         let ok: Result<
                             bmux_contexts_plugin_api::contexts_commands::ContextAck,
                             bmux_contexts_plugin_api::contexts_commands::SelectContextError,
                         > = Ok(bmux_contexts_plugin_api::contexts_commands::ContextAck {
-                            id: Uuid::new_v4(),
+                            id,
                             session_id: None,
                         });
                         encode_service_message(&ok)
@@ -5982,6 +6001,267 @@ mod tests {
         let ack = result.expect("switch-window should succeed");
         assert!(ack.ok);
         assert!(ack.id.is_some_and(|id| !id.is_empty()));
+    }
+
+    fn installed_switch_request(
+        resources: &bmux_plugin::AttachPresentationResources,
+        target: Uuid,
+    ) -> Vec<u8> {
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "bmux.tab_strip.input".into(),
+            interface_id: "presentation-input".into(),
+            operation: "handle-input".into(),
+        };
+        let mut event = bmux_plugin::AttachInputEvent {
+            hook_id: format!("bmux.tab_strip:strip:window:{target}"),
+            event_kind: "pointer".into(),
+            phase: "down".into(),
+            button: Some("right".into()),
+            key: None,
+            col: None,
+            row: None,
+            wheel_delta: 0,
+            modifiers: bmux_plugin::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        assert!(resources.input.invoke(&endpoint, &event).unwrap().consumed);
+        event.event_kind = "key".into();
+        event.phase = "press".into();
+        event.key = Some("enter".into());
+        let result = resources.input.invoke(&endpoint, &event).unwrap();
+        assert!(result.consumed && result.release_capture);
+        let invocation = result.service_invocation.unwrap();
+        assert_eq!(invocation.endpoint.operation, "switch-window");
+        invocation.payload
+    }
+
+    fn installed_strip_ops(
+        resources: &bmux_plugin::AttachPresentationResources,
+    ) -> Vec<bmux_plugin::RenderOp> {
+        resources
+            .surfaces
+            .surfaces()
+            .into_iter()
+            .flat_map(|surface| surface.ops)
+            .collect()
+    }
+
+    #[allow(clippy::result_large_err)] // TestServiceRouter requires the SDK's unboxed PluginError.
+    fn real_context_router() -> (
+        bmux_plugin::test_support::TestServiceRouterGuard,
+        Arc<std::sync::RwLock<bmux_contexts_plugin::ContextState>>,
+        [Uuid; 2],
+    ) {
+        let client = bmux_session_models::ClientId(Uuid::from_u128(99));
+        let mut state = bmux_contexts_plugin::ContextState::default();
+        let alpha = state
+            .create(client, Some("alpha".into()), BTreeMap::new())
+            .id;
+        let beta = state
+            .create(client, Some("beta".into()), BTreeMap::new())
+            .id;
+        let state = Arc::new(std::sync::RwLock::new(state));
+        bmux_plugin::global_plugin_state_registry().register(&state);
+        let router = bmux_plugin::test_support::install_test_service_router(Arc::new(
+            move |_, _, capability, kind, interface, operation, payload| {
+                if interface.starts_with("contexts-") {
+                    let mut context =
+                        service_test_context(interface, operation, payload, capability, kind);
+                    context.plugin_id = "bmux.contexts".into();
+                    context.caller_client_id = Some(client.0);
+                    let response = bmux_contexts_plugin::ContextsPlugin.invoke_service(context);
+                    assert!(response.error.is_none(), "{:?}", response.error);
+                    Ok(response.payload)
+                } else if interface == "storage-query/v1" {
+                    encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value: None })
+                } else if interface == "volatile-state-query/v1" {
+                    encode_service_message(&bmux_plugin_sdk::VolatileStateGetResponse {
+                        value: None,
+                    })
+                } else if matches!(
+                    interface,
+                    "storage-command/v1" | "volatile-state-command/v1"
+                ) {
+                    encode_service_message(&())
+                } else {
+                    Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                        operation: "real_context_router",
+                    })
+                }
+            },
+        ));
+        (router, state, [alpha, beta])
+    }
+
+    fn assert_selected_context(
+        state: &std::sync::RwLock<bmux_contexts_plugin::ContextState>,
+        expected: Uuid,
+    ) {
+        assert_eq!(
+            state
+                .read()
+                .unwrap()
+                .selected_by_client
+                .get(&bmux_session_models::ClientId(Uuid::from_u128(99))),
+            Some(&expected)
+        );
+    }
+
+    async fn dispatch_window_over_transport(payload: Vec<u8>) -> Vec<u8> {
+        use bmux_ipc::transport::ErasedIpcStream;
+        use bmux_ipc::{Envelope, EnvelopeKind, Request, Response, ResponsePayload};
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let server = async move {
+            let mut stream = ErasedIpcStream::new(Box::new(server_stream));
+            for step in 0..2 {
+                let envelope = stream.recv_envelope().await.unwrap();
+                let request: Request = bmux_ipc::decode(&envelope.payload).unwrap();
+                let response = if step == 0 {
+                    let Request::Hello { contract, .. } = request else {
+                        panic!("expected hello")
+                    };
+                    ResponsePayload::HelloNegotiated {
+                        negotiated: bmux_ipc::NegotiatedProtocol {
+                            wire_epoch: contract.wire_epoch,
+                            revision: contract.revisions.max,
+                            capabilities: Vec::new(),
+                        },
+                    }
+                } else {
+                    let Request::InvokeService {
+                        capability,
+                        interface_id,
+                        operation,
+                        payload,
+                        ..
+                    } = request
+                    else {
+                        panic!("expected invocation")
+                    };
+                    let response = WindowsPlugin::default().invoke_service(service_test_context(
+                        &interface_id,
+                        &operation,
+                        payload,
+                        &capability,
+                        ServiceKind::Command,
+                    ));
+                    assert!(response.error.is_none(), "{:?}", response.error);
+                    ResponsePayload::ServiceInvoked {
+                        payload: response.payload,
+                    }
+                };
+                stream
+                    .send_envelope(&Envelope::new(
+                        envelope.request_id,
+                        EnvelopeKind::Response,
+                        bmux_ipc::encode(&Response::Ok(response)).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        };
+        let client = async move {
+            let client = bmux_client::BmuxClient::connect_with_bridge_stream(
+                ErasedIpcStream::new(Box::new(client_stream)),
+                std::time::Duration::from_secs(2),
+                "window-integration",
+                Uuid::from_u128(99),
+            )
+            .await
+            .unwrap();
+            let mut client = bmux_client::StreamingBmuxClient::from_client(client).unwrap();
+            client
+                .invoke_service_raw(
+                    "bmux.windows.write",
+                    bmux_ipc::InvokeServiceKind::Command,
+                    "windows-commands",
+                    "switch-window",
+                    payload,
+                )
+                .await
+                .unwrap()
+        };
+        let ((), response) = tokio::join!(server, client);
+        response
+    }
+
+    #[test]
+    fn service_switch_publication_reaches_installed_strip() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_router, context_state, [alpha, beta]) = real_context_router();
+            let events = bmux_plugin::global_event_bus();
+            events.register_state_channel(
+                bmux_windows_plugin_api::windows_list::STATE_KIND,
+                bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+                    windows: Vec::new(),
+                    revision: 0,
+                },
+            );
+            events.register_state_channel(
+                bmux_plugin_sdk::PluginEventKind::from_static("bmux.attach/local-presentation"),
+                bmux_attach_view_protocol::AttachLocalPresentationSnapshot {
+                    viewport_cols: 80,
+                    viewport_rows: 24,
+                    ..bmux_attach_view_protocol::AttachLocalPresentationSnapshot::initial()
+                },
+            );
+            events.register_state_channel(
+                bmux_windows_plugin_api::windows_local_view::STATE_KIND,
+                bmux_windows_plugin_api::windows_local_view::WindowSelection { context_id: None },
+            );
+            let resources = bmux_plugin::AttachPresentationResources {
+                events: events.clone(),
+                layouts: Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(64)),
+                allocations: Arc::new(bmux_plugin::layout::AllocationRegistry::default()),
+                surfaces: Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
+                input: Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
+            };
+            let settings: toml::Value = toml::from_str("preset = 'classic'\ntab_template = '{name}'").unwrap();
+            let _installation =
+                bmux_tab_strip_plugin::TabStripPresentation::install(Some(&settings), &resources).unwrap();
+            for (target, expected_id) in [("alpha", alpha), ("beta", beta)] {
+                let response = dispatch_window_over_transport(
+                    if expected_id == alpha {
+                        encode_service_message(&SwitchWindowArgs { target: target.into() }).unwrap()
+                    } else {
+                        installed_switch_request(&resources, expected_id)
+                    },
+                ).await;
+                let result: Result<WindowAck, WindowError> = decode_service_message(&response).unwrap();
+                assert_eq!(result.unwrap().id, Some(expected_id.to_string()));
+                let (catalog, _) = events
+                    .subscribe_state::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
+                        &bmux_windows_plugin_api::windows_list::STATE_KIND,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    catalog
+                        .windows
+                        .iter()
+                        .find(|entry| entry.active)
+                        .unwrap()
+                        .id,
+                    expected_id
+                );
+                assert_selected_context(&context_state, expected_id);
+                let expected = format!("({target})");
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                    if installed_strip_ops(&resources).iter().any(|op| matches!(op, bmux_plugin::RenderOp::TextRun { text, .. } if text == &expected)) {
+                        break;
+                    }
+                }
+                let ops = installed_strip_ops(&resources);
+                assert!(ops.iter().any(|op| matches!(op, bmux_plugin::RenderOp::TextRun { text, .. } if text == &expected)), "missing selected tab {expected}: {ops:?}");
+                let inactive = if target == "alpha" { "(beta)" } else { "(alpha)" };
+                assert!(!ops.iter().any(|op| matches!(op, bmux_plugin::RenderOp::TextRun { text, .. } if text == inactive)));
+            }
+        });
     }
 
     #[test]

@@ -115,6 +115,9 @@ impl TextInputState {
 
     /// Store the latest content area.
     pub fn set_content_area(&mut self, area: Rect, policy: &TextInputPolicy) {
+        if self.content_area.width.max(1) != area.width.max(1) {
+            self.buffer.reset_preferred_visual_column();
+        }
         self.content_area = area;
         self.sync_scroll_to_cursor(policy);
         let rows = self.wrapped_layout(area.width).lines.len();
@@ -385,10 +388,19 @@ impl<'policy> TextInputControl<'policy> {
         let Some(command) = self.policy.keyboard.keymap.command_for_key(stroke) else {
             return TextInputOutcome::Ignored;
         };
-        if matches!(command, bmux_text_edit::TextEditCommand::Move(_)) {
-            state.buffer.apply_command(command);
-        } else {
-            state.buffer_mut().apply_command(command);
+        match command {
+            bmux_text_edit::TextEditCommand::Move(TextMotion::VisualUp) => {
+                move_visual_cursor(state, -1, SelectionMode::Move);
+            }
+            bmux_text_edit::TextEditCommand::Move(TextMotion::VisualDown) => {
+                move_visual_cursor(state, 1, SelectionMode::Move);
+            }
+            bmux_text_edit::TextEditCommand::Move(_) => {
+                state.buffer.apply_command(command);
+            }
+            _ => {
+                state.buffer_mut().apply_command(command);
+            }
         }
         state.sync_scroll_to_cursor(self.policy);
         TextInputOutcome::Edited
@@ -914,22 +926,14 @@ fn extend_selection(state: &mut TextInputState, motion: TextMotion) {
 }
 
 fn extend_visual_selection(state: &mut TextInputState, delta: isize) {
-    let width = state.content_area.width;
-    let layout = state.wrapped_layout(width);
-    let target_row = if delta.is_negative() {
-        layout.cursor.row.saturating_sub(delta.unsigned_abs())
-    } else {
-        layout
-            .cursor
-            .row
-            .saturating_add(delta.unsigned_abs())
-            .min(layout.lines.len().saturating_sub(1))
-    };
-    let byte_index = layout.byte_index_for_position(target_row, layout.cursor.col);
-    drop(layout);
-    state
-        .buffer
-        .move_cursor_with_selection(TextMotion::Absolute(byte_index), SelectionMode::Extend);
+    move_visual_cursor(state, delta, SelectionMode::Extend);
+}
+
+fn move_visual_cursor(state: &mut TextInputState, delta: isize, selection: SelectionMode) {
+    drop(state.wrapped_layout(state.content_area.width));
+    let cached = state.wrapped.borrow();
+    let layout = &cached.as_ref().expect("measured projection").2;
+    state.buffer.move_cursor_in_layout(layout, delta, selection);
 }
 
 fn mouse_wrapped_position(state: &TextInputState, mouse: MouseEvent) -> Option<(usize, usize)> {
@@ -1201,6 +1205,64 @@ mod tests {
         *state.buffer_mut() = TextEditBuffer::from_text("short");
         state.set_content_area(Rect::new(0, 0, 8, 4), &policy);
         assert_eq!(state.vertical_scroll(), 0);
+    }
+
+    #[test]
+    fn width_reflow_resets_preferred_column_but_translation_does_not() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        for (width, expected) in [(8, 16), (4, 11)] {
+            let mut state = TextInputState::new(TextEditBuffer::from_text("ab界de\nx\nab界de"));
+            state.set_content_area(Rect::new(0, 0, 8, 2), &policy);
+            state.buffer_mut().move_cursor(TextMotion::Absolute(6));
+            control.handle_key(&mut state, key(KeyCode::Down));
+            assert_eq!(state.buffer().cursor_byte_index(), 9);
+            // A moved/resized viewport must not move the source cursor or selection.
+            state.set_content_area(Rect::new(3, 5, width, 3), &policy);
+            assert_eq!(state.buffer().cursor_byte_index(), 9);
+            control.handle_key(&mut state, shift_key(KeyCode::Down));
+            assert_eq!(state.buffer().cursor_byte_index(), expected);
+            assert_eq!(
+                state.buffer().selected_text().as_deref(),
+                Some(&state.buffer().text()[9..expected])
+            );
+            assert!(state.wrapped_layout(width).cursor.row < state.vertical_scroll() + 3);
+        }
+    }
+
+    #[test]
+    fn keyboard_vertical_motion_preserves_column_across_short_rows() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("abcde\nx\nabcde"));
+        state.set_content_area(Rect::new(0, 0, 5, 2), &policy);
+        state.buffer_mut().move_cursor(TextMotion::Absolute(4));
+        control.handle_key(&mut state, key(KeyCode::Down));
+        assert_eq!(state.buffer().cursor_byte_index(), 7);
+        control.handle_key(&mut state, shift_key(KeyCode::Down));
+        assert_eq!(state.buffer().cursor_byte_index(), 12);
+        assert_eq!(state.vertical_scroll(), 1);
+        assert_eq!(state.buffer().selected_text().as_deref(), Some("\nabcd"));
+        control.handle_key(&mut state, key(KeyCode::Up));
+        assert!(state.buffer().selection().is_none());
+        control.handle_key(&mut state, key(KeyCode::Up));
+        assert_eq!(state.buffer().cursor_byte_index(), 4);
+        assert_eq!(state.vertical_scroll(), 0);
+    }
+
+    #[test]
+    fn visual_movement_and_selection_share_wrapped_geometry() {
+        let mut state = TextInputState::new(TextEditBuffer::from_text("abcdefghi"));
+        state.content_area = Rect::new(0, 0, 3, 3);
+        state.buffer_mut().move_cursor(TextMotion::Absolute(1));
+        move_visual_cursor(&mut state, 1, SelectionMode::Move);
+        assert_eq!(state.buffer().cursor_byte_index(), 4);
+        extend_visual_selection(&mut state, 1);
+        assert_eq!(state.buffer().cursor_byte_index(), 7);
+        assert!(state.buffer().selection().is_some());
+        move_visual_cursor(&mut state, -1, SelectionMode::Move);
+        assert_eq!(state.buffer().cursor_byte_index(), 4);
+        assert!(state.buffer().selection().is_none());
     }
 
     #[test]

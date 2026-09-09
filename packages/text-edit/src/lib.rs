@@ -541,6 +541,33 @@ impl TextEditBuffer {
         }
     }
 
+    /// Release the preferred vertical column after the display geometry changes.
+    /// The next vertical movement starts from the newly projected cursor column.
+    pub const fn reset_preferred_visual_column(&mut self) {
+        self.desired_visual_col = None;
+    }
+
+    /// Move by displayed rows using the caller's current measured projection.
+    ///
+    /// `layout` must describe this buffer at the current viewport width. Retain the
+    /// preferred column across short rows, just like ordinary vertical movement.
+    pub fn move_cursor_in_layout(
+        &mut self,
+        layout: &WrapLayout,
+        delta: isize,
+        mode: SelectionMode,
+    ) {
+        let column = self.desired_visual_col.unwrap_or(layout.cursor.col);
+        let row = layout
+            .cursor
+            .row
+            .saturating_add_signed(delta)
+            .min(layout.lines.len().saturating_sub(1));
+        let target = layout.byte_index_for_position(row, column);
+        self.move_cursor_with_selection(TextMotion::Absolute(target), mode);
+        self.desired_visual_col = Some(column);
+    }
+
     fn motion_position(&self, motion: TextMotion) -> usize {
         match motion {
             TextMotion::Left => previous_grapheme_boundary(&self.text, self.cursor).unwrap_or(0),

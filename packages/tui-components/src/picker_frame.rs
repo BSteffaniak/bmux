@@ -405,7 +405,7 @@ impl<'a> PickerFrameComponent<'a> {
         };
         let panel_height = u16::try_from(panel.node.size.height).unwrap_or(u16::MAX);
         cx.with_child(
-            i32::from(panel.x),
+            i32::try_from(panel.x).unwrap_or(i32::MAX),
             i64::try_from(panel.y).unwrap_or(i64::MAX),
             LocalRect::new(0, 0, panel.node.size.width, panel_height),
             |cx| {
@@ -419,7 +419,7 @@ impl<'a> PickerFrameComponent<'a> {
                     if let Some(name) = child.node.id.as_str().strip_prefix(&prefix) {
                         let component = self.chrome_component(name);
                         cx.with_child(
-                            i32::from(child.x),
+                            i32::try_from(child.x).unwrap_or(i32::MAX),
                             i64::try_from(child.y).unwrap_or(i64::MAX),
                             LocalRect::new(
                                 0,
@@ -497,7 +497,11 @@ impl Component for PickerFrameComponent<'_> {
         let mut children = Vec::with_capacity(2);
         if let (Some(input), Some(area)) = (&self.input, local.input) {
             let node = input.layout(Constraints::new(area.width, area.width, 1, Some(1)), cx);
-            children.push(ChildLayout::new(area.x, usize::from(area.y), node));
+            children.push(ChildLayout::new(
+                usize::from(area.x),
+                usize::from(area.y),
+                node,
+            ));
         }
         let list = self.list.layout(
             Constraints::new(
@@ -509,7 +513,7 @@ impl Component for PickerFrameComponent<'_> {
             cx,
         );
         children.push(ChildLayout::new(
-            local.list.x,
+            usize::from(local.list.x),
             usize::from(local.list.y),
             list,
         ));
@@ -533,7 +537,11 @@ impl Component for PickerFrameComponent<'_> {
                     .chrome_component(name)
                     .layout(Constraints::tight(area.size()), cx);
                 node.id = LayoutId::new(format!("{}.chrome.{name}", self.id.as_str()));
-                children.push(ChildLayout::new(area.x, usize::from(area.y), node));
+                children.push(ChildLayout::new(
+                    usize::from(area.x),
+                    usize::from(area.y),
+                    node,
+                ));
             }
         }
         let surface = self
@@ -546,7 +554,11 @@ impl Component for PickerFrameComponent<'_> {
             children,
         );
         let (x, y) = self.panel_origin(outer, panel_size);
-        LayoutNode::with_children(self.id.clone(), outer, vec![ChildLayout::new(x, y, panel)])
+        LayoutNode::with_children(
+            self.id.clone(),
+            outer,
+            vec![ChildLayout::new(usize::from(x), y, panel)],
+        )
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -560,7 +572,7 @@ impl Component for PickerFrameComponent<'_> {
                 break;
             };
             cx.with_child(
-                i32::from(panel.x.saturating_add(child.x)),
+                i32::try_from(panel.x.saturating_add(child.x)).unwrap_or(i32::MAX),
                 i64::try_from(panel.y.saturating_add(child.y)).unwrap_or(i64::MAX),
                 LocalRect::new(
                     0,
@@ -593,10 +605,10 @@ impl Component for PickerFrameComponent<'_> {
             let outcome = cx.with_transform(
                 x,
                 y,
-                i32::from(x),
+                i32::try_from(x).unwrap_or(i32::MAX),
                 i64::try_from(y).unwrap_or(i64::MAX),
                 Rect::new(
-                    x,
+                    u16::try_from(x).unwrap_or(u16::MAX),
                     u16::try_from(y).unwrap_or(u16::MAX),
                     child.node.size.width,
                     u16::try_from(child.node.size.height).unwrap_or(u16::MAX),

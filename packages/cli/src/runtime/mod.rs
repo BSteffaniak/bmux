@@ -88,8 +88,9 @@ use playbook_cli::{
     run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run, run_playbook_interactive,
     run_playbook_run, run_playbook_validate,
 };
+pub use plugin_kernel::KernelClientFactory;
 use plugin_kernel::{
-    EFFECTIVE_LOG_LEVEL, KernelClientFactory, LOG_CONTROL, available_capability_providers,
+    EFFECTIVE_LOG_LEVEL, LOG_CONTROL, available_capability_providers,
     available_service_descriptors, core_provided_capabilities, enter_host_kernel_client_factory,
     enter_host_kernel_connection, host_kernel_bridge, register_plugin_service_handlers,
     service_descriptors_from_declarations,

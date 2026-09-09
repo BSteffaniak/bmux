@@ -228,11 +228,13 @@ impl ModalFrame {
             return Rect::default();
         };
         Rect::new(
-            parent.x.saturating_add(area.x),
+            parent
+                .x
+                .saturating_add(u16::try_from(area.x).unwrap_or(u16::MAX)),
             parent
                 .y
                 .saturating_add(u16::try_from(area.y).unwrap_or(u16::MAX)),
-            area.width,
+            u16::try_from(area.width).unwrap_or(u16::MAX),
             u16::try_from(area.height).unwrap_or(u16::MAX),
         )
     }
@@ -357,7 +359,11 @@ impl Component for ModalPlacementComponent<'_> {
                 usize::from(point.y).min(remaining_y),
             ),
         };
-        LayoutNode::with_children(self.id.clone(), size, vec![ChildLayout::new(x, y, child)])
+        LayoutNode::with_children(
+            self.id.clone(),
+            size,
+            vec![ChildLayout::new(usize::from(x), y, child)],
+        )
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -365,7 +371,7 @@ impl Component for ModalPlacementComponent<'_> {
             return;
         };
         cx.with_child(
-            i32::from(child.x),
+            i32::try_from(child.x).unwrap_or(i32::MAX),
             i64::try_from(child.y).unwrap_or(i64::MAX),
             bmux_tui::paint::LocalRect::new(
                 0,
@@ -382,7 +388,7 @@ impl Component for ModalPlacementComponent<'_> {
             return EventOutcome::Ignored;
         };
         let clip = Rect::new(
-            child.x,
+            u16::try_from(child.x).unwrap_or(u16::MAX),
             u16::try_from(child.y).unwrap_or(u16::MAX),
             child.node.size.width,
             u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
@@ -390,7 +396,7 @@ impl Component for ModalPlacementComponent<'_> {
         cx.with_transform(
             child.x,
             child.y,
-            i32::from(child.x),
+            i32::try_from(child.x).unwrap_or(i32::MAX),
             i64::try_from(child.y).unwrap_or(i64::MAX),
             clip,
             |cx| self.child.event(event, &child.node, cx),
@@ -507,9 +513,14 @@ impl Component for ModalChrome<'_> {
             self.panel.paint(&panel.node, cx);
         }
         if let (Some(title), Some(node)) = (&self.title, layout.children.get(1)) {
-            cx.with_child_size(i32::from(node.x), 0, node.node.size, |cx| {
-                title.paint(&node.node, cx);
-            });
+            cx.with_child_size(
+                i32::try_from(node.x).unwrap_or(i32::MAX),
+                0,
+                node.node.size,
+                |cx| {
+                    title.paint(&node.node, cx);
+                },
+            );
         }
     }
 

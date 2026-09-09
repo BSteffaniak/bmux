@@ -3532,6 +3532,18 @@ async fn start_real_attach_playbook_runtime(
                 .context("failed loading sandbox config for real-attach driver")
         })
         .transpose()?;
+    let kernel_client_factory = sandbox.map(|sandbox| {
+        let paths = sandbox.paths().clone();
+        let factory: crate::runtime::KernelClientFactory = std::sync::Arc::new(move || {
+            let paths = paths.clone();
+            Box::pin(async move {
+                BmuxClient::connect_with_paths(&paths, "bmux-playbook-plugin")
+                    .await
+                    .map_err(Into::into)
+            })
+        });
+        factory
+    });
     let (mut terminal, handle) = HeadlessAttachTerminal::new(viewport.0, viewport.1);
     let target = session_id.to_string();
     let task = tokio::spawn(async move {
@@ -3540,7 +3552,7 @@ async fn start_real_attach_playbook_runtime(
             Some(target.as_str()),
             None,
             false,
-            None,
+            kernel_client_factory,
             &mut terminal,
             attach_config,
         ))
@@ -4313,6 +4325,28 @@ pub(super) async fn execute_step(
             Ok(Some(detail))
         }
 
+        Action::AssertRendered { contains, matches } => {
+            let runtime =
+                real_attach_runtime.context("assert-rendered requires an attach driver")?;
+            let grid = runtime.terminal.output_grid()?;
+            let text =
+                super::screen::terminal_grid_to_text(grid.grid(), usize::from(*viewport_rows));
+            if let Some(expected) = contains {
+                let expected = runtime_vars.resolve_opt(expected);
+                ensure!(
+                    text.contains(&expected),
+                    "rendered output did not contain '{expected}':\n{text}"
+                );
+            }
+            if let Some(pattern) = matches {
+                let pattern = runtime_vars.resolve_opt(pattern);
+                ensure!(
+                    regex::Regex::new(&pattern)?.is_match(&text),
+                    "rendered output did not match '{pattern}':\n{text}"
+                );
+            }
+            Ok(None)
+        }
         Action::RenderMark { .. } | Action::AssertRender { .. } => {
             bail!("render trace actions are handled by the playbook runner")
         }
@@ -4325,7 +4359,6 @@ pub(super) async fn execute_step(
         | Action::AssertEffect { .. }
         | Action::AssertNoEffect { .. }
         | Action::AssertState { .. }
-        | Action::AssertRendered { .. }
         | Action::SetConfig { .. } => {
             bail!("attach simulation actions require @driver attach-sim")
         }

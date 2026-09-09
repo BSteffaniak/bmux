@@ -19,12 +19,12 @@ use crate::paint::PaintCx;
 /// Root-relative rectangle in logical component coordinates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct LogicalRect {
-    /// Horizontal origin in terminal cells.
-    pub x: u16,
+    /// Horizontal origin in logical cells.
+    pub x: usize,
     /// Vertical origin in logical rows.
     pub y: usize,
-    /// Width in terminal cells.
-    pub width: u16,
+    /// Width in logical cells.
+    pub width: usize,
     /// Height in logical rows.
     pub height: usize,
 }
@@ -32,7 +32,7 @@ pub struct LogicalRect {
 impl LogicalRect {
     /// Create a logical rectangle.
     #[must_use]
-    pub const fn new(x: u16, y: usize, width: u16, height: usize) -> Self {
+    pub const fn new(x: usize, y: usize, width: usize, height: usize) -> Self {
         Self {
             x,
             y,
@@ -245,8 +245,8 @@ const fn combine_revision(parent: u64, child: u64) -> u64 {
 /// Placement and resolved layout for one child node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildLayout {
-    /// Child origin relative to its parent.
-    pub x: u16,
+    /// Logical child column relative to its parent.
+    pub x: usize,
     /// Logical child row relative to its parent.
     pub y: usize,
     /// Child layout.
@@ -256,7 +256,7 @@ pub struct ChildLayout {
 impl ChildLayout {
     /// Create a child placement.
     #[must_use]
-    pub const fn new(x: u16, y: usize, node: LayoutNode) -> Self {
+    pub const fn new(x: usize, y: usize, node: LayoutNode) -> Self {
         Self { x, y, node }
     }
 }
@@ -359,9 +359,14 @@ impl LayoutNode {
         self.find_logical_rect_at(id, 0, 0)
     }
 
-    fn find_logical_rect_at(&self, id: &LayoutId, x: u16, y: usize) -> Option<LogicalRect> {
+    fn find_logical_rect_at(&self, id: &LayoutId, x: usize, y: usize) -> Option<LogicalRect> {
         if &self.id == id {
-            return Some(LogicalRect::new(x, y, self.size.width, self.size.height));
+            return Some(LogicalRect::new(
+                x,
+                y,
+                usize::from(self.size.width),
+                self.size.height,
+            ));
         }
         self.children.iter().find_map(|child| {
             child.node.find_logical_rect_at(
@@ -387,9 +392,11 @@ impl LayoutNode {
             return Some(self.terminal_rect(x, u16::try_from(y).unwrap_or(u16::MAX)));
         }
         self.children.iter().find_map(|child| {
-            child
-                .node
-                .find_rect_at(id, x.saturating_add(child.x), y.saturating_add(child.y))
+            child.node.find_rect_at(
+                id,
+                x.saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
+                y.saturating_add(child.y),
+            )
         })
     }
 
@@ -437,7 +444,7 @@ pub struct EventCx<'a> {
     root: &'a LayoutNode,
     translation_x: i32,
     translation_y: i64,
-    logical_x: u16,
+    logical_x: usize,
     logical_y: usize,
     clip: Option<Rect>,
 }
@@ -495,10 +502,15 @@ impl<'a> EventCx<'a> {
 
     /// Route a resolved child using its logical bounds projected into terminal space.
     pub fn with_child<R>(&mut self, child: &ChildLayout, f: impl FnOnce(&mut Self) -> R) -> R {
-        let dx = i32::from(child.x);
+        let dx = i32::try_from(child.x).unwrap_or(i32::MAX);
         let dy = i64::try_from(child.y).unwrap_or(i64::MAX);
         let clip = translate_logical_rect(
-            LogicalRect::new(0, 0, child.node.size.width, child.node.size.height),
+            LogicalRect::new(
+                0,
+                0,
+                usize::from(child.node.size.width),
+                child.node.size.height,
+            ),
             self.translation_x.saturating_add(dx),
             self.translation_y.saturating_add(dy),
         );
@@ -508,7 +520,7 @@ impl<'a> EventCx<'a> {
     /// Route a transformed child event with a terminal-space clip.
     pub fn with_transform<R>(
         &mut self,
-        logical_x: u16,
+        logical_x: usize,
         logical_y: usize,
         dx: i32,
         dy: i64,
@@ -577,12 +589,14 @@ impl<'a> EventCx<'a> {
 }
 
 fn translate_logical_rect(rect: LogicalRect, dx: i32, dy: i64) -> Rect {
-    let x = i64::from(rect.x).saturating_add(i64::from(dx));
+    let x = i64::try_from(rect.x)
+        .unwrap_or(i64::MAX)
+        .saturating_add(i64::from(dx));
     let y = i64::try_from(rect.y).unwrap_or(i64::MAX).saturating_add(dy);
     let left = x.clamp(0, i64::from(u16::MAX));
     let top = y.clamp(0, i64::from(u16::MAX));
     let right = x
-        .saturating_add(i64::from(rect.width))
+        .saturating_add(i64::try_from(rect.width).unwrap_or(i64::MAX))
         .clamp(0, i64::from(u16::MAX));
     let bottom = y
         .saturating_add(i64::try_from(rect.height).unwrap_or(i64::MAX))
@@ -999,6 +1013,56 @@ mod tests {
             Some(crate::geometry::Rect::new(0, 0, 2, 1))
         );
         assert!(root.find(&LayoutId::new("missing")).is_none());
+    }
+
+    #[test]
+    fn individual_child_preserves_large_horizontal_offset() {
+        let root = LayoutNode::with_children(
+            LayoutId::new("root"),
+            LogicalSize::new(2, 1),
+            vec![super::ChildLayout::new(
+                80_000,
+                0,
+                LayoutNode::leaf(LayoutId::new("target"), LogicalSize::new(2, 1)),
+            )],
+        );
+        let rect = root.find_logical_rect(&LayoutId::new("target")).unwrap();
+        assert_eq!(rect.x, 80_000);
+        assert_eq!(
+            super::translate_logical_rect(rect, -80_000, 0),
+            crate::geometry::Rect::new(0, 0, 2, 1)
+        );
+    }
+
+    #[test]
+    fn wide_logical_rectangle_is_clipped_after_translation() {
+        let rect = super::LogicalRect::new(0, 0, 80_002, 1);
+        assert_eq!(
+            super::translate_logical_rect(rect, -80_000, 0),
+            crate::geometry::Rect::new(0, 0, 2, 1)
+        );
+        assert_eq!(super::translate_logical_rect(rect, -80_003, 0).width, 0);
+    }
+
+    #[test]
+    fn logical_lookup_preserves_nested_horizontal_positions() {
+        let target = LayoutNode::leaf(LayoutId::new("target"), LogicalSize::new(2, 1));
+        let parent = LayoutNode::with_children(
+            LayoutId::new("parent"),
+            LogicalSize::new(2, 1),
+            vec![super::ChildLayout::new(40_000, 0, target)],
+        );
+        let root = LayoutNode::with_children(
+            LayoutId::new("root"),
+            LogicalSize::new(2, 1),
+            vec![super::ChildLayout::new(40_000, 0, parent)],
+        );
+        let rect = root.find_logical_rect(&LayoutId::new("target")).unwrap();
+        assert_eq!(rect.x, 80_000);
+        assert_eq!(
+            super::translate_logical_rect(rect, -79_999, 0),
+            crate::geometry::Rect::new(1, 0, 2, 1)
+        );
     }
 
     #[test]

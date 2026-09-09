@@ -175,6 +175,15 @@ where
             .and_then(|index| self.index.item_offset(index))
     }
 
+    /// Measured logical height for a stable key at the synchronized width.
+    #[must_use]
+    pub fn item_height(&self, key: &K) -> Option<usize> {
+        self.index
+            .index_of(key)
+            .and_then(|index| self.index.item(index))
+            .map(|item| item.height)
+    }
+
     /// Stable key containing one logical collection row.
     #[must_use]
     pub fn key_at_offset(&self, offset: usize) -> Option<&K> {
@@ -410,9 +419,9 @@ where
         let offset = state.scroll.vertical_offset();
         let range = state.index.visible_range(offset, usize::from(area.height));
         let viewport = cx.visible_rect(LogicalRect::new(
-            area.x,
+            area.x.into(),
             usize::from(area.y),
-            area.width,
+            usize::from(area.width),
             usize::from(area.height),
         ));
         if viewport.is_empty() {
@@ -447,9 +456,9 @@ where
                 .saturating_sub(i64::try_from(offset).unwrap_or(i64::MAX));
             let local_area = translated_item_area(area, local_y, measured.height);
             let item_area = cx.visible_rect(LogicalRect::new(
-                local_area.x,
+                local_area.x.into(),
                 usize::from(local_area.y),
-                local_area.width,
+                usize::from(local_area.width),
                 usize::from(local_area.height),
             ));
             if item_area.is_empty() || pointer.is_some_and(|point| !item_area.contains(point)) {

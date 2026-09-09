@@ -26,7 +26,7 @@ use tracing::Level;
 /// path is not viable (e.g. iroh remote connections where the server lives on a
 /// different host).  Each invocation should return a fresh, independently-usable
 /// client -- callers will run one request and drop it.
-pub(super) type KernelClientFactory =
+pub type KernelClientFactory =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<BmuxClient>> + Send>> + Send + Sync>;
 
 use super::{

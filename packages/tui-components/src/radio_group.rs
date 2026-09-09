@@ -286,7 +286,7 @@ impl RadioGroupComponent<'_, '_> {
             cx.visible_rect(bmux_tui::component::LogicalRect::new(
                 0,
                 index,
-                layout.size.width,
+                usize::from(layout.size.width),
                 1,
             ))
         };
@@ -408,7 +408,7 @@ impl Component for RadioGroupComponent<'_, '_> {
             .visible_rect(bmux_tui::component::LogicalRect::new(
                 0,
                 0,
-                layout.size.width,
+                usize::from(layout.size.width),
                 self.group.options.len().min(layout.size.height),
             ))
             .intersection(area);

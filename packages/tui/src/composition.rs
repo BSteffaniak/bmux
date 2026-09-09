@@ -715,7 +715,7 @@ impl Component for Surface<'_> {
             self.id.clone(),
             size,
             vec![ChildLayout::new(
-                insets.left,
+                usize::from(insets.left),
                 usize::from(insets.top),
                 child,
             )],
@@ -741,7 +741,7 @@ impl Component for Surface<'_> {
             };
             cx.with_style(self.content_style, |cx| {
                 cx.with_child_size(
-                    i32::from(child_layout.x),
+                    i32::try_from(child_layout.x).unwrap_or(i32::MAX),
                     i64::try_from(child_layout.y).unwrap_or(i64::MAX),
                     child_layout.node.size,
                     |cx| self.child.paint(&child_layout.node, cx),
@@ -1225,7 +1225,11 @@ impl Component for Align<'_> {
             VerticalAlignment::Center => size.height.saturating_sub(child.size.height) / 2,
             VerticalAlignment::End => size.height.saturating_sub(child.size.height),
         };
-        LayoutNode::with_children(self.id.clone(), size, vec![ChildLayout::new(x, y, child)])
+        LayoutNode::with_children(
+            self.id.clone(),
+            size,
+            vec![ChildLayout::new(usize::from(x), y, child)],
+        )
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -1519,7 +1523,7 @@ fn paint_single_child(child: &Element<'_>, layout: &LayoutNode, cx: &mut PaintCx
 
 fn paint_child(child: &Element<'_>, resolved: &ChildLayout, cx: &mut PaintCx<'_, '_>) {
     cx.with_child_size(
-        i32::from(resolved.x),
+        i32::try_from(resolved.x).unwrap_or(i32::MAX),
         i64::try_from(resolved.y).unwrap_or(i64::MAX),
         resolved.node.size,
         |cx| child.paint(&resolved.node, cx),
@@ -1665,7 +1669,7 @@ impl Component for Row<'_> {
         let available = constraints.max_width().saturating_sub(gaps);
         let mut resolved: Vec<Option<LayoutNode>> = vec![None; self.children.len()];
         let mut intrinsic_width = 0u16;
-        let mut flex_weight = 0u32;
+        let mut flex_weight = 0u128;
         for (index, child) in self.children.iter().enumerate() {
             if child.flex == 0 {
                 let node = child.component.layout(
@@ -1675,18 +1679,18 @@ impl Component for Row<'_> {
                 intrinsic_width = intrinsic_width.saturating_add(node.size.width);
                 resolved[index] = Some(node);
             } else {
-                flex_weight = flex_weight.saturating_add(u32::from(child.flex));
+                flex_weight = flex_weight.saturating_add(u128::from(child.flex));
             }
         }
         let remaining = available.saturating_sub(intrinsic_width);
         let mut assigned_flex = 0u16;
-        let mut seen_weight = 0u32;
+        let mut seen_weight = 0u128;
         for (index, child) in self.children.iter().enumerate() {
             if child.flex == 0 {
                 continue;
             }
-            seen_weight = seen_weight.saturating_add(u32::from(child.flex));
-            let cumulative = u32::from(remaining)
+            seen_weight = seen_weight.saturating_add(u128::from(child.flex));
+            let cumulative = u128::from(remaining)
                 .saturating_mul(seen_weight)
                 .checked_div(flex_weight.max(1))
                 .unwrap_or(0);
@@ -1698,19 +1702,24 @@ impl Component for Row<'_> {
                 cx,
             ));
         }
-        let mut x = 0u16;
+        let mut x = 0usize;
         let mut height = 0usize;
         let mut children = Vec::with_capacity(self.children.len());
         for node in resolved.into_iter().flatten() {
             height = height.max(node.size.height);
             let width = node.size.width;
             children.push(ChildLayout::new(x, 0, node));
-            x = x.saturating_add(width).saturating_add(self.gap);
+            x = x
+                .saturating_add(usize::from(width))
+                .saturating_add(usize::from(self.gap));
         }
         if !children.is_empty() {
-            x = x.saturating_sub(self.gap);
+            x = x.saturating_sub(usize::from(self.gap));
         }
-        let size = constraints.constrain(LogicalSize::new(x, height));
+        let size = constraints.constrain(LogicalSize::new(
+            u16::try_from(x).unwrap_or(u16::MAX),
+            height,
+        ));
         for (index, child) in children.iter_mut().enumerate() {
             child.y = match self.alignment {
                 VerticalAlignment::Start => 0,
@@ -1897,7 +1906,7 @@ impl Component for Column<'_> {
                 HorizontalAlignment::Center => width.saturating_sub(node.size.width) / 2,
                 HorizontalAlignment::End => width.saturating_sub(node.size.width),
             };
-            children.push(ChildLayout::new(x, y, node));
+            children.push(ChildLayout::new(usize::from(x), y, node));
             y = y
                 .saturating_add(children.last().map_or(0, |child| child.node.size.height))
                 .saturating_add(self.gap);
@@ -2851,6 +2860,43 @@ mod tests {
             Some(Some(Color::Blue))
         );
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some(" hello    "));
+    }
+
+    #[test]
+    fn row_large_flex_weights_distribute_all_available_width() {
+        let component = Row::new()
+            .flex_child(u16::MAX, TextBlock::new("a"))
+            .flex_child(u16::MAX, TextBlock::new("b"))
+            .flex_child(u16::MAX, TextBlock::new("c"));
+        let layout = component.layout(Constraints::for_width(u16::MAX), &mut LayoutCx::new());
+        assert_eq!(
+            layout
+                .children
+                .iter()
+                .map(|child| child.node.size.width)
+                .collect::<Vec<_>>(),
+            [21_845, 21_845, 21_845]
+        );
+        assert_eq!(layout.children[2].x, 43_690);
+    }
+
+    #[test]
+    fn row_preserves_overflowing_child_positions() {
+        let component = Row::new()
+            .gap(1)
+            .child(SizeBox::new(TextBlock::new("a")).width(40_000))
+            .child(SizeBox::new(TextBlock::new("b")).width(40_000))
+            .child(SizeBox::new(TextBlock::new("c")).width(40_000))
+            .child(TextBlock::new("d"));
+        let layout = component.layout(Constraints::for_width(u16::MAX), &mut LayoutCx::new());
+        assert_eq!(
+            layout
+                .children
+                .iter()
+                .map(|child| child.x)
+                .collect::<Vec<_>>(),
+            [0, 40_001, 80_002, 120_003]
+        );
     }
 
     #[test]

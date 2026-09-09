@@ -268,10 +268,6 @@ impl CompanionState {
         }
     }
 
-    fn visible_limit(&self) -> usize {
-        self.settings.maximum_visible_tabs.unwrap_or(usize::MAX)
-    }
-
     fn replace_windows(&mut self, mut snapshot: windows_list::WindowListSnapshot) {
         self.catalog = snapshot.clone();
         let selected = self.selected_context_id;
@@ -343,21 +339,9 @@ impl CompanionState {
                 self.revision = self.revision.saturating_add(1).max(1);
                 return;
             }
-            let visible_limit = self.visible_limit();
-            let maximum_offset = self.snapshot.windows.len().saturating_sub(visible_limit);
-            self.scroll_offset = self.scroll_offset.min(maximum_offset);
-            if let Some(active) = self
-                .snapshot
-                .windows
-                .iter()
-                .position(|window| window.active)
-            {
-                if active < self.scroll_offset {
-                    self.scroll_offset = active;
-                } else if active >= self.scroll_offset.saturating_add(visible_limit) {
-                    self.scroll_offset = active.saturating_add(1).saturating_sub(visible_limit);
-                }
-            }
+            // Automatic reveal is resolved by the width-budgeted projection.
+            // This offset is only meaningful while manual scrolling is active.
+            self.scroll_offset = 0;
             self.revision = self.revision.saturating_add(1).max(1);
         }
     }
@@ -1947,6 +1931,290 @@ mod tests {
         );
     }
 
+    async fn remove_open_menu_target(
+        first_resources: &bmux_plugin::AttachPresentationResources,
+        first: &TabStripPresentation,
+        event: &mut AttachInputEvent,
+    ) {
+        event.event_kind = "pointer".into();
+        event.phase = "down".into();
+        assert!(
+            first_resources
+                .input
+                .invoke(&input_endpoint(), event)
+                .unwrap()
+                .consumed
+        );
+        first_resources
+            .events
+            .publish_state(
+                &windows_list::STATE_KIND,
+                windows_list::WindowListSnapshot {
+                    windows: Vec::new(),
+                    revision: 2,
+                },
+            )
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if first
+                    .owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .windows
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        event.event_kind = "key".into();
+        event.phase = "press".into();
+        event.key = Some("enter".into());
+        assert!(
+            first
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .menu_window_id
+                .is_none()
+        );
+        assert!(
+            !first_resources
+                .surfaces
+                .owner_snapshot(OWNER)
+                .unwrap()
+                .surfaces
+                .iter()
+                .any(|surface| surface.id.local_id == "menu")
+        );
+        let cancelled = first_resources.input.invoke(&input_endpoint(), event);
+        assert!(cancelled.is_none_or(|result| result.service_invocation.is_none()));
+    }
+
+    fn populated_resources(base: u128) -> bmux_plugin::AttachPresentationResources {
+        let resources = scoped_resources();
+        resources
+            .events
+            .publish_state(
+                &windows_list::STATE_KIND,
+                windows_list::WindowListSnapshot {
+                    windows: (0..20)
+                        .map(|index| windows_list::WindowListEntry {
+                            id: Uuid::from_u128(base + index),
+                            name: format!("long-tab-{index}"),
+                            active: index == 0,
+                            workspace: "default".into(),
+                            workspace_id: Uuid::nil(),
+                        })
+                        .collect(),
+                    revision: 1,
+                },
+            )
+            .unwrap();
+        resources
+            .events
+            .publish_state(
+                &ATTACH_LOCAL_PRESENTATION_STATE_KIND,
+                AttachLocalPresentationSnapshot {
+                    viewport_cols: 80,
+                    viewport_rows: 24,
+                    ..AttachLocalPresentationSnapshot::initial()
+                },
+            )
+            .unwrap();
+        resources
+    }
+
+    #[tokio::test]
+    async fn populated_registries_isolate_scrolling_and_switch_requests() {
+        let first_resources = populated_resources(100);
+        let second_resources = populated_resources(200);
+        let first = TabStripPresentation::install(None, &first_resources).unwrap();
+        let second = TabStripPresentation::install(None, &second_resources).unwrap();
+        let mut event = AttachInputEvent {
+            hook_id: String::new(),
+            event_kind: "pointer".into(),
+            phase: "wheel".into(),
+            button: None,
+            key: None,
+            col: None,
+            row: None,
+            wheel_delta: -1,
+            modifiers: bmux_plugin::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        for resources in [&first_resources, &second_resources, &first_resources] {
+            assert!(
+                resources
+                    .input
+                    .invoke(&input_endpoint(), &event)
+                    .unwrap()
+                    .consumed
+            );
+        }
+        assert_eq!(
+            first.owner.lock().unwrap().as_ref().unwrap().scroll_offset,
+            2
+        );
+        assert_eq!(
+            second.owner.lock().unwrap().as_ref().unwrap().scroll_offset,
+            1
+        );
+        for (resources, target) in [(&first_resources, 102), (&second_resources, 201)] {
+            event.event_kind = "pointer".into();
+            event.phase = "down".into();
+            event.button = Some("right".into());
+            event.wheel_delta = 0;
+            event.hook_id = format!("bmux.tab_strip:strip:window:{}", Uuid::from_u128(target));
+            assert!(
+                resources
+                    .input
+                    .invoke(&input_endpoint(), &event)
+                    .unwrap()
+                    .consumed
+            );
+            event.event_kind = "key".into();
+            event.phase = "press".into();
+            event.key = Some("enter".into());
+            let result = resources.input.invoke(&input_endpoint(), &event).unwrap();
+            assert!(result.release_capture);
+            let invocation = result.service_invocation.unwrap();
+            assert_eq!(
+                invocation.endpoint.operation,
+                windows_commands::client::SwitchWindowEndpoint::OPERATION.to_string()
+            );
+            let request: windows_commands::client::SwitchWindowRequest =
+                bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
+            assert_eq!(request.target, Uuid::from_u128(target).to_string());
+        }
+        assert!(
+            first
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .menu_window_id
+                .is_none()
+        );
+        assert!(
+            second
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .menu_window_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_registry_menu_routing_rejects_stale_targets() {
+        let first_resources = scoped_resources();
+        let second_resources = scoped_resources();
+        for resources in [&first_resources, &second_resources] {
+            resources
+                .events
+                .publish_state(
+                    &ATTACH_LOCAL_PRESENTATION_STATE_KIND,
+                    AttachLocalPresentationSnapshot {
+                        viewport_cols: 80,
+                        viewport_rows: 24,
+                        ..AttachLocalPresentationSnapshot::initial()
+                    },
+                )
+                .unwrap();
+        }
+        let target = Uuid::from_u128(42);
+        first_resources
+            .events
+            .publish_state(
+                &windows_list::STATE_KIND,
+                windows_list::WindowListSnapshot {
+                    windows: vec![windows_list::WindowListEntry {
+                        id: target,
+                        name: "tab".into(),
+                        active: true,
+                        workspace: "default".into(),
+                        workspace_id: Uuid::nil(),
+                    }],
+                    revision: 1,
+                },
+            )
+            .unwrap();
+        let first = TabStripPresentation::install(None, &first_resources).unwrap();
+        let second = TabStripPresentation::install(None, &second_resources).unwrap();
+        let mut event = AttachInputEvent {
+            hook_id: format!("bmux.tab_strip:strip:window:{target}"),
+            event_kind: "pointer".into(),
+            phase: "down".into(),
+            button: Some("right".into()),
+            key: None,
+            col: None,
+            row: None,
+            wheel_delta: 0,
+            modifiers: bmux_plugin::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        let opened = first_resources
+            .input
+            .invoke(&input_endpoint(), &event)
+            .unwrap();
+        assert!(opened.consumed);
+        assert_eq!(opened.capture_keyboard, vec!["*"]);
+        let rejected = second_resources.input.invoke(&input_endpoint(), &event);
+        assert!(!rejected.is_some_and(|result| result.consumed));
+        assert!(
+            second
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .menu_window_id
+                .is_none()
+        );
+        event.event_kind = "key".into();
+        event.phase = "press".into();
+        event.key = Some("esc".into());
+        let closed = first_resources
+            .input
+            .invoke(&input_endpoint(), &event)
+            .unwrap();
+        assert!(closed.release_capture);
+        assert!(
+            first
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .menu_window_id
+                .is_none()
+        );
+        remove_open_menu_target(&first_resources, &first, &mut event).await;
+        drop(first);
+        assert!(
+            first_resources
+                .input
+                .invoke(&input_endpoint(), &event)
+                .is_none()
+        );
+        assert!(second.owner.lock().unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn scoped_installations_deliver_updates_and_stop_independently() {
         let first_resources = scoped_resources();
@@ -2593,7 +2861,15 @@ bar_bg = "#112233"
                 .collect(),
             revision: 1,
         });
-        assert_eq!(state.scroll_offset, 3);
+        assert!(!state.manual_scroll);
+        assert_eq!(
+            projected_bar(&state)
+                .window_ranges()
+                .last()
+                .unwrap()
+                .window_id,
+            Uuid::from_u128(4)
+        );
         state.manual_scroll = true;
         state.scroll_offset = 1;
         let mut updated = state.snapshot.clone();

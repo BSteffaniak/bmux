@@ -708,7 +708,10 @@ impl Component for PaneComponent<'_, '_> {
             return EventOutcome::Ignored;
         };
         let clip = Rect::new(
-            state.area.x.saturating_add(child.x),
+            state
+                .area
+                .x
+                .saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
             state
                 .area
                 .y
@@ -719,7 +722,12 @@ impl Component for PaneComponent<'_, '_> {
         cx.with_transform(
             child.x,
             child.y,
-            i32::from(state.area.x.saturating_add(child.x)),
+            i32::from(
+                state
+                    .area
+                    .x
+                    .saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
+            ),
             i64::from(state.area.y).saturating_add(i64::try_from(child.y).unwrap_or(i64::MAX)),
             clip,
             |cx| self.child.event(event, &child.node, cx),

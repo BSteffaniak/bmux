@@ -856,7 +856,10 @@ fn build_pane_content_dimensions_from_scene(
         .collect()
 }
 
-fn terminal_grid_to_text(grid: &bmux_terminal_grid::TerminalGrid, rows: usize) -> String {
+pub(super) fn terminal_grid_to_text(
+    grid: &bmux_terminal_grid::TerminalGrid,
+    rows: usize,
+) -> String {
     terminal_grid_rows_to_text(grid.display_rows(0, rows))
 }
 

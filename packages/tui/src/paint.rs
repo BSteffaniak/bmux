@@ -164,6 +164,13 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         paint: impl FnOnce(&mut PaintCx<'_, 'buffer>),
     ) {
         let area = self.area();
+        let left = area.x.saturating_sub(offset_x).max(0);
+        let right = area
+            .x
+            .saturating_sub(offset_x)
+            .saturating_add(i32::from(area.width))
+            .min(i32::from(size.width));
+        let width = u16::try_from(right.saturating_sub(left)).unwrap_or(0);
         let top = area.y.saturating_sub(offset_y).max(0);
         let bottom = area
             .y
@@ -174,7 +181,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         self.with_child(
             offset_x,
             offset_y,
-            LocalRect::new(0, top, size.width, height),
+            LocalRect::new(left, top, width, height),
             paint,
         );
     }
@@ -723,6 +730,29 @@ mod tests {
         assert_eq!(visited, [(0, 0), (1, 0), (2, 0)]);
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("      "));
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some(" 0 2  "));
+    }
+
+    #[test]
+    fn child_size_clips_both_axes_before_painting() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 2));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child_size(
+            -40_000,
+            -70_000,
+            crate::component::LogicalSize::new(40_002, 70_001),
+            |paint| {
+                assert_eq!(paint.area(), LocalRect::new(40_000, 70_000, 2, 1));
+                paint.rasterize(paint.area(), |_, _| Some(("x".into(), Style::new())));
+            },
+        );
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("xx "));
+        assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("   "));
+        PaintCx::new(&mut frame).with_child_size(
+            -40_003,
+            0,
+            crate::component::LogicalSize::new(40_002, 1),
+            |_| panic!("offscreen child painted"),
+        );
     }
 
     #[test]

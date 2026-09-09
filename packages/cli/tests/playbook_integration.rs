@@ -159,6 +159,7 @@ fn run_playbook_fixture(name: &str) -> (serde_json::Value, bool) {
     let output = sandbox
         .command()
         .args(["playbook", "run", "--json", fixture.to_str().unwrap()])
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
         .env("BMUX_PLAYBOOK_ENV_MODE", "clean")
         .output()
         .expect("failed to run bmux playbook");
@@ -248,6 +249,25 @@ fn playbook_run_interactive_step_controls() {
 // ---------------------------------------------------------------------------
 // Subprocess integration tests
 // ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn playbook_real_attach_finder_switches_sandbox_tabs() {
+    let (json, pass) = run_playbook_fixture("tab_navigation_finder_real_attach.dsl");
+    assert!(
+        pass,
+        "real attach finder should stay in its sandbox: {json:#}"
+    );
+    let steps = json["steps"].as_array().expect("steps should be array");
+    assert!(steps.iter().all(|step| step["status"] == "pass"));
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| step["action"] == "assert-rendered")
+            .count(),
+        4
+    );
+}
 
 #[test]
 #[serial]

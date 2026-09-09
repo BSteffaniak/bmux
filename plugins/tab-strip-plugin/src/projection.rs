@@ -274,24 +274,44 @@ pub fn project_bar(
     interaction: &ProjectionInteraction<'_>,
 ) -> ProjectedBar {
     let style = RenderStyle::from_settings(settings);
-    let right = right_segments(settings, local, &style);
-    let right_width = segments_width(&right);
-    let tail = left_tail(settings, local, &style);
-    let tail_width = segments_width(&tail);
+    let mut right = right_segments(settings, local, &style);
+    let mut tail = left_tail(settings, local, &style);
     let width = if local.viewport_cols == 0 {
         usize::from(u16::MAX)
     } else {
         usize::from(local.viewport_cols)
     };
+    // Tabs are the interactive content. Optional status modules may use the
+    // remaining space, but must not remove every tab on a narrow viewport.
+    let inner_width = width
+        .saturating_sub(settings.left_padding)
+        .saturating_sub(settings.right_padding);
+    let tab_reserve = if windows.is_empty() {
+        0
+    } else {
+        inner_width.min(2)
+    };
+    truncate_segments(
+        &mut right,
+        inner_width.saturating_sub(tab_reserve).saturating_sub(1),
+    );
+    let right_width = segments_width(&right);
+    let module_budget = inner_width
+        .saturating_sub(tab_reserve)
+        .saturating_sub(right_width)
+        .saturating_sub(usize::from(!right.is_empty()));
+    truncate_segments(&mut tail, module_budget);
+    let tail_width = segments_width(&tail);
     let workspace_name = interaction
         .workspace_label
         .or_else(|| windows.first().map(|window| window.workspace.as_str()));
     let workspace_budget = width.saturating_sub(right_width + tail_width + 20).min(24);
     let workspace_label =
         workspace_name.map_or_else(String::new, |name| truncate_cells(name, workspace_budget));
+    let show_workspace = workspace_name.is_some() && workspace_budget > 0;
     let tab_budget = width
         .saturating_sub(UnicodeWidthStr::width(workspace_label.as_str()))
-        .saturating_sub(if workspace_name.is_some() { 3 } else { 0 })
+        .saturating_sub(if show_workspace { 3 } else { 0 })
         .saturating_sub(right_width)
         .saturating_sub(usize::from(!right.is_empty()))
         .saturating_sub(settings.left_padding)
@@ -342,7 +362,7 @@ pub fn project_bar(
         window_id: None,
         edit_cursor_offset: interaction.editing_workspace.then_some(0),
     });
-    if workspace_name.is_some() {
+    if show_workspace {
         left.push(ProjectedSegment {
             text: " │ ".to_string(),
             kind: SegmentKind::Base,
@@ -358,7 +378,7 @@ pub fn project_bar(
             edit_cursor_offset: None,
         });
     } else {
-        append_tabs(&mut left, &tokens, &window, settings, &style);
+        append_tabs(&mut left, &tokens, &window, settings, &style, tab_budget);
     }
     left.extend(tail);
 
@@ -437,10 +457,20 @@ fn append_tabs(
     window: &TabWindow,
     settings: &Settings,
     style: &RenderStyle,
+    budget: usize,
 ) {
     let hidden_left = window.start;
     let hidden_right = tokens.len().saturating_sub(window.end);
-    if hidden_left > 0 {
+    // Chrome must not consume the anchor's entire budget on narrow resizes.
+    // Keep the marker only when it leaves room for the first tab's label.
+    let leading_width = UnicodeWidthStr::width(
+        style
+            .overflow(hidden_left, settings.overflow_style)
+            .as_str(),
+    )
+    .saturating_add(UnicodeWidthStr::width(style.tab_separator.as_str()));
+    let anchor_width = tokens.get(window.start).map_or(0, |token| token.width);
+    if hidden_left > 0 && leading_width.saturating_add(anchor_width) <= budget {
         output.push(ProjectedSegment {
             text: style.overflow(hidden_left, settings.overflow_style),
             kind: SegmentKind::Overflow,
@@ -819,6 +849,73 @@ mod tests {
     }
 
     #[test]
+    fn default_modules_leave_narrow_manual_anchor_interactive() {
+        let windows = [window(1, "first", true), window(2, "second", false)];
+        for width in 3..40 {
+            let projected = project_bar(
+                &Settings::default(),
+                &windows,
+                &local(width),
+                None,
+                &ProjectionInteraction {
+                    scroll_anchor: Some(1),
+                    ..ProjectionInteraction::default()
+                },
+            );
+            assert_eq!(
+                projected
+                    .window_ranges()
+                    .first()
+                    .map(|range| range.window_id),
+                Some(windows[1].id),
+                "width {width}: {}",
+                projected.plain_text()
+            );
+            assert_eq!(
+                UnicodeWidthStr::width(projected.plain_text().as_str()),
+                usize::from(width)
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_manual_anchor_takes_priority_over_overflow_marker() {
+        let settings = Settings {
+            show_mode: false,
+            show_role: false,
+            show_follow: false,
+            show_hint: false,
+            ..Settings::default()
+        };
+        let windows = [window(1, "first", true), window(2, "second", false)];
+        for width in 6..20 {
+            let projected = project_bar(
+                &settings,
+                &windows,
+                &local(width),
+                None,
+                &ProjectionInteraction {
+                    scroll_anchor: Some(1),
+                    ..ProjectionInteraction::default()
+                },
+            );
+            assert_eq!(
+                projected
+                    .window_ranges()
+                    .first()
+                    .map(|range| range.window_id),
+                Some(windows[1].id),
+                "width {width}: {}",
+                projected.plain_text()
+            );
+            assert_eq!(
+                UnicodeWidthStr::width(projected.plain_text().as_str()),
+                usize::from(width)
+            );
+        }
+    }
+
+    #[test]
     fn default_projection_omits_session_and_context_modules() {
         let settings = Settings::default();
         let windows = [window(1, "main", true)];
@@ -915,7 +1012,13 @@ mod tests {
             let text = projected.plain_text();
             assert_eq!(UnicodeWidthStr::width(text.as_str()), usize::from(width));
             assert!(text.contains("NORMAL"), "width {width}: {text:?}");
-            assert!(text.contains("write"), "width {width}: {text:?}");
+            if width >= 40 {
+                assert!(text.contains("write"), "width {width}: {text:?}");
+            }
+            assert!(
+                !projected.window_ranges().is_empty(),
+                "width {width}: {text:?}"
+            );
         }
     }
 

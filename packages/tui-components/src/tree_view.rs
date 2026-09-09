@@ -642,7 +642,7 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
                         cx.visible_rect(bmux_tui::component::LogicalRect::new(
                             0,
                             row,
-                            layout.size.width,
+                            usize::from(layout.size.width),
                             1,
                         ))
                         .contains(mouse.position)

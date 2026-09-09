@@ -510,7 +510,7 @@ impl Component for TextViewComponent<'_, '_> {
             content,
         );
         let mut children = vec![ChildLayout::new(
-            content_area.x,
+            usize::from(content_area.x),
             usize::from(content_area.y),
             viewport,
         )];

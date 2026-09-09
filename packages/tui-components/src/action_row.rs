@@ -387,9 +387,9 @@ impl Component for ActionRowComponent<'_, '_> {
                 .iter()
                 .position(|area| {
                     cx.visible_rect(bmux_tui::component::LogicalRect::new(
-                        area.x,
+                        area.x.into(),
                         usize::from(area.y),
-                        area.width,
+                        usize::from(area.width),
                         usize::from(area.height),
                     ))
                     .contains(mouse.position)

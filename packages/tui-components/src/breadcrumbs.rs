@@ -250,9 +250,9 @@ impl<'a, 'state> BreadcrumbsComponent<'a, 'state> {
                         .find_map(|(index, item)| {
                             let width = u16_saturating(display_width(item.label));
                             let visible = cx.visible_rect(bmux_tui::component::LogicalRect::new(
-                                x,
+                                x.into(),
                                 0,
-                                width.min(interactive_width.saturating_sub(x)),
+                                usize::from(width.min(interactive_width.saturating_sub(x))),
                                 usize::from(layout.size.height > 0),
                             ));
                             x = x.saturating_add(width).saturating_add(u16_saturating(

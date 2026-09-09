@@ -151,6 +151,12 @@ impl Write for RealAttachTerminal {
     }
 }
 
+struct HeadlessTerminalOutput {
+    bytes: Vec<u8>,
+    // Byte offsets serialize resize boundaries with writes without duplicating output.
+    resizes: Vec<(usize, TerminalGeometry)>,
+}
+
 #[derive(Clone)]
 pub struct HeadlessAttachTerminalHandle {
     #[cfg(test)]
@@ -159,7 +165,7 @@ pub struct HeadlessAttachTerminalHandle {
     screen: Arc<Mutex<bmux_terminal_grid::TerminalGridStream>>,
     event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
     geometry: Arc<Mutex<TerminalGeometry>>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: Arc<Mutex<HeadlessTerminalOutput>>,
     pending_output_chunks: Arc<Mutex<Vec<Vec<u8>>>>,
     attached_session_id: Arc<Mutex<Option<Uuid>>>,
 }
@@ -180,6 +186,10 @@ impl HeadlessAttachTerminalHandle {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        let mut output = self
+            .output
+            .lock()
+            .map_err(|_| anyhow::anyhow!("headless attach terminal output lock poisoned"))?;
         *self
             .geometry
             .lock()
@@ -190,6 +200,11 @@ impl HeadlessAttachTerminalHandle {
             .lock()
             .map_err(|_| anyhow::anyhow!("headless screen lock poisoned"))?
             .resize(cols, rows)?;
+        let offset = output.bytes.len();
+        output
+            .resizes
+            .push((offset, TerminalGeometry { cols, rows }));
+        drop(output);
         self.send_event(Event::Resize(cols, rows))
     }
 
@@ -197,7 +212,30 @@ impl HeadlessAttachTerminalHandle {
     pub fn output_bytes(&self) -> Vec<u8> {
         self.output
             .lock()
-            .map_or_else(|_| Vec::new(), |out| out.clone())
+            .map_or_else(|_| Vec::new(), |out| out.bytes.clone())
+    }
+
+    /// Replay output at its original geometry, applying resizes between writes.
+    pub fn output_grid(&self) -> Result<bmux_terminal_grid::TerminalGridStream> {
+        let output = self
+            .output
+            .lock()
+            .map_err(|_| anyhow::anyhow!("headless attach terminal output lock poisoned"))?;
+        let (_, initial) = output.resizes[0];
+        let mut stream = bmux_terminal_grid::TerminalGridStream::new(
+            initial.cols,
+            initial.rows,
+            bmux_terminal_grid::GridLimits::default(),
+        )?;
+        let mut start = 0;
+        for &(offset, geometry) in &output.resizes[1..] {
+            stream.process(&output.bytes[start..offset]);
+            stream.resize(geometry.cols, geometry.rows)?;
+            start = offset;
+        }
+        stream.process(&output.bytes[start..]);
+        drop(output);
+        Ok(stream)
     }
 
     #[cfg(test)]
@@ -229,7 +267,7 @@ pub struct HeadlessAttachTerminal {
     screen: Arc<Mutex<bmux_terminal_grid::TerminalGridStream>>,
     geometry: Arc<Mutex<TerminalGeometry>>,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output: Arc<Mutex<HeadlessTerminalOutput>>,
     pending_output_chunks: Arc<Mutex<Vec<Vec<u8>>>>,
     attached_session_id: Arc<Mutex<Option<Uuid>>>,
 }
@@ -250,7 +288,10 @@ impl HeadlessAttachTerminal {
             .expect("headless terminal dimensions must be nonzero"),
         ));
         let geometry = Arc::new(Mutex::new(TerminalGeometry { cols, rows }));
-        let output = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::new(Mutex::new(HeadlessTerminalOutput {
+            bytes: Vec::new(),
+            resizes: vec![(0, TerminalGeometry { cols, rows })],
+        }));
         let pending_output_chunks = Arc::new(Mutex::new(Vec::new()));
         let attached_session_id = Arc::new(Mutex::new(None));
         (
@@ -290,6 +331,7 @@ impl Write for HeadlessAttachTerminal {
         self.output
             .lock()
             .map_err(|_| io::Error::other("headless attach terminal output lock poisoned"))?
+            .bytes
             .extend_from_slice(buf);
         self.pending_output_chunks
             .lock()
@@ -8453,6 +8495,9 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     let retained_repaint_by_id = frame_plan.retained.repaint_by_id();
 
     let mut frame_bytes = Vec::new();
+    // Reconciliation describes encoded output, not yet-presented resources.
+    // Keep the committed cache intact until the terminal accepts the frame.
+    let mut pending_graphics_cache = view_state.terminal_graphics_cache.clone();
     // Wrap multi-region scene/overlay frames in a synchronized update so the
     // terminal buffers output and displays it atomically (Mode 2026). Status-only
     // frames are tiny and safe to write directly, avoiding two extra control
@@ -8468,7 +8513,8 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     // Reflect the forced-hide in tracked state so apply_attach_cursor_state
     // will re-emit Show if the cursor should be visible after the frame.
     let cursor_state_before_forced_hide = view_state.last_cursor_state;
-    if let Some(ref mut cs) = view_state.last_cursor_state {
+    let mut pending_cursor_state = view_state.last_cursor_state;
+    if let Some(ref mut cs) = pending_cursor_state {
         cs.visible = false;
     }
     queue_retained_background_clear(&mut frame_bytes, &frame_plan.retained.damage.graph)?;
@@ -8522,7 +8568,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
                 &layout_state.scene,
                 &layout_state.panes,
                 &mut view_state.pane_buffers,
-                &mut view_state.terminal_graphics_cache,
+                &mut pending_graphics_cache,
                 &frame_damage,
                 top_inset,
                 bottom_inset,
@@ -8578,7 +8624,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         }
     }
 
-    let previous_cursor_state = view_state.last_cursor_state;
+    let previous_cursor_state = cursor_state_before_forced_hide;
     let mut overlay_rendered = false;
     let retained_extensions = view_state.presentation_extensions.snapshot();
     for extension in &retained_extensions {
@@ -8644,7 +8690,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
             repaint,
             &retained_extensions,
             retained_capabilities,
-            &mut view_state.terminal_graphics_cache,
+            &mut pending_graphics_cache,
         )?;
     }
     if let Some(prompt_surface) = frame_plan.retained.prompt_surface.as_ref()
@@ -8675,7 +8721,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
             repaint,
             &retained_extensions,
             retained_capabilities,
-            &mut view_state.terminal_graphics_cache,
+            &mut pending_graphics_cache,
         )?;
     } else if view_state.prompt.is_active() {
         overlay_cursor_state = cursor_state_before_forced_hide.map(|mut cursor| {
@@ -8721,7 +8767,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         apply_attach_cursor_state(
             &mut frame_bytes,
             overlay_cursor_state,
-            &mut view_state.last_cursor_state,
+            &mut pending_cursor_state,
             false,
         )?;
     } else {
@@ -8729,7 +8775,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         apply_attach_cursor_state(
             &mut frame_bytes,
             cursor_state,
-            &mut view_state.last_cursor_state,
+            &mut pending_cursor_state,
             force_cursor_move,
         )?;
     }
@@ -8739,6 +8785,30 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
             .context("failed queuing end synchronized update")?;
     }
 
+    let terminal_write_started_at = Instant::now();
+    let write_result = terminal_writer
+        .write_all(&frame_bytes)
+        .context("failed writing attach frame")
+        .and_then(|()| {
+            terminal_writer
+                .flush()
+                .context("failed flushing attach frame")
+        });
+    if let Err(error) = write_result {
+        // Encoding has advanced row baselines, but partial output is not a
+        // presented frame. Repaint every row before using incremental diffs.
+        for buffer in view_state.pane_buffers.values_mut() {
+            buffer.prev_rows.clear();
+        }
+        view_state
+            .dirty
+            .mark_full_frame(AttachDirtySource::ManualRedraw);
+        return Err(error);
+    }
+    let terminal_write_ms = duration_millis_u64(terminal_write_started_at.elapsed());
+    view_state.last_cursor_state = pending_cursor_state;
+    view_state.terminal_graphics_cache = pending_graphics_cache;
+    // Capture only frames that were successfully written and flushed.
     display_capture.record_frame(
         &frame_bytes,
         view_state.last_cursor_state,
@@ -8775,14 +8845,6 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         display_capture.record_images(&all_images);
     }
 
-    let terminal_write_started_at = Instant::now();
-    terminal_writer
-        .write_all(&frame_bytes)
-        .context("failed writing attach frame")?;
-    terminal_writer
-        .flush()
-        .context("failed flushing attach frame")?;
-    let terminal_write_ms = duration_millis_u64(terminal_write_started_at.elapsed());
     if terminal_write_ms >= slow_terminal_write_ms {
         tracing::warn!(
             terminal_write_ms,
@@ -11809,17 +11871,6 @@ async fn invoke_plugin_surface_pointer_event(
             },
         )?
     };
-    if let Some(invocation) = result.service_invocation.as_ref() {
-        client
-            .invoke_service_raw(
-                invocation.endpoint.capability.clone(),
-                InvokeServiceKind::Command,
-                invocation.endpoint.interface_id.clone(),
-                invocation.endpoint.operation.clone(),
-                invocation.payload.clone(),
-            )
-            .await?;
-    }
     if result.capture_pointer {
         view_state.plugin_pointer_router.capture(event.hit.clone());
         view_state
@@ -11841,6 +11892,10 @@ async fn invoke_plugin_surface_pointer_event(
             Instant::now(),
             ATTACH_TRANSIENT_STATUS_TTL,
         );
+    }
+    // Commit local input state even when the requested service action fails.
+    if let Some(invocation) = result.service_invocation.as_ref() {
+        return Ok(execute_surface_action(client, view_state, result.consumed, invocation).await);
     }
     Ok(result.consumed)
 }
@@ -12031,17 +12086,6 @@ async fn try_handle_plugin_surface_key(
             },
         )?
     };
-    if let Some(invocation) = result.service_invocation.as_ref() {
-        client
-            .invoke_service_raw(
-                invocation.endpoint.capability.clone(),
-                InvokeServiceKind::Command,
-                invocation.endpoint.interface_id.clone(),
-                invocation.endpoint.operation.clone(),
-                invocation.payload.clone(),
-            )
-            .await?;
-    }
     if result.release_capture {
         let _ = view_state.plugin_focus.clear();
     }
@@ -12057,7 +12101,49 @@ async fn try_handle_plugin_surface_key(
             ATTACH_TRANSIENT_STATUS_TTL,
         );
     }
+    // Commit local input state even when the requested service action fails.
+    if let Some(invocation) = result.service_invocation.as_ref() {
+        return Ok(execute_surface_action(client, view_state, result.consumed, invocation).await);
+    }
     Ok(result.consumed)
+}
+
+async fn execute_surface_action(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    consumed: bool,
+    invocation: &bmux_plugin::AttachInputServiceInvocation,
+) -> bool {
+    let outcome = client
+        .invoke_service_raw(
+            invocation.endpoint.capability.clone(),
+            InvokeServiceKind::Command,
+            invocation.endpoint.interface_id.clone(),
+            invocation.endpoint.operation.clone(),
+            invocation.payload.clone(),
+        )
+        .await;
+    finish_surface_action(view_state, consumed, outcome)
+}
+
+// Service failure does not undo the consumer's input decision: forwarding a
+// consumed key after failure would send a menu action to the application below.
+fn finish_surface_action<T>(
+    view_state: &mut AttachViewState,
+    consumed: bool,
+    outcome: std::result::Result<T, ClientError>,
+) -> bool {
+    if let Err(error) = outcome {
+        view_state.set_transient_status(
+            truncate_attach_status_message(&format!("plugin surface action failed: {error}")),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        view_state
+            .dirty
+            .mark_extension_dirty(AttachDirtySource::PluginCommand);
+    }
+    consumed
 }
 
 fn attach_input_hooks(view_state: &AttachViewState) -> Vec<AttachInputHook> {
@@ -14563,6 +14649,455 @@ pub fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool {
 }
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "bundled-plugin-tab-strip")]
+    fn installed_menu_action(
+        state: &mut super::AttachViewState,
+    ) -> (
+        bmux_tab_strip_plugin::TabStripPresentation,
+        bmux_plugin::AttachPresentationResources,
+    ) {
+        use bmux_windows_plugin_api::windows_list;
+        let events = std::sync::Arc::new(bmux_plugin::EventBus::new());
+        let target = uuid::Uuid::from_u128(42);
+        events.register_state_channel(
+            windows_list::STATE_KIND,
+            windows_list::WindowListSnapshot {
+                windows: vec![windows_list::WindowListEntry {
+                    id: target,
+                    name: "tab".into(),
+                    active: true,
+                    workspace: "default".into(),
+                    workspace_id: uuid::Uuid::nil(),
+                }],
+                revision: 1,
+            },
+        );
+        events.register_state_channel(
+            super::ATTACH_LOCAL_PRESENTATION_STATE_KIND,
+            super::AttachLocalPresentationSnapshot {
+                viewport_cols: 80,
+                viewport_rows: 24,
+                ..super::AttachLocalPresentationSnapshot::initial()
+            },
+        );
+        events.register_state_channel(
+            bmux_windows_plugin_api::windows_local_view::STATE_KIND,
+            bmux_windows_plugin_api::windows_local_view::WindowSelection { context_id: None },
+        );
+        let resources = bmux_plugin::AttachPresentationResources {
+            events,
+            layouts: std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(64)),
+            allocations: std::sync::Arc::new(bmux_plugin::layout::AllocationRegistry::default()),
+            surfaces: std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
+            input: std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
+        };
+        let installation =
+            bmux_tab_strip_plugin::TabStripPresentation::install(None, &resources).unwrap();
+        state.presentation_input = resources.input.clone();
+        state.presentation_layouts = resources.layouts.clone();
+        state.presentation_allocations = resources.allocations.clone();
+        state.presentation_surfaces = resources.surfaces.clone();
+        (installation, resources)
+    }
+
+    #[cfg(feature = "bundled-plugin-tab-strip")]
+    async fn dispatch_installed_menu(
+        client: &mut bmux_client::StreamingBmuxClient,
+        state: &mut super::AttachViewState,
+        resources: &bmux_plugin::AttachPresentationResources,
+    ) {
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let lowered = super::retained_plugin_surfaces(state, viewport);
+        super::replace_retained_surfaces(
+            state,
+            lowered,
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        let (column, row) = (0..24)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                state
+                    .retained_compositor
+                    .hit_test(x, y)
+                    .and_then(|hit| hit.region_id)
+                    .is_some_and(|id| {
+                        id.owner_plugin_id == "bmux.tab_strip"
+                            && id.region_local_id.starts_with("window:")
+                    })
+            })
+            .expect("tab hit");
+        assert!(
+            super::try_handle_plugin_surface_mouse(
+                client,
+                state,
+                MouseEvent {
+                    kind: MouseEventKind::Down(crossterm::event::MouseButton::Right),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                }
+            )
+            .await
+            .unwrap()
+        );
+        assert!(state.plugin_focus.focused().is_some());
+        let focused = state.plugin_focus.focused().cloned();
+        let lowered = super::retained_plugin_surfaces(state, viewport);
+        super::replace_retained_surfaces(
+            state,
+            lowered,
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        assert_eq!(state.plugin_focus.focused(), focused.as_ref());
+        let mut output = Vec::new();
+        for surface in state.retained_compositor.surfaces().values() {
+            queue_retained_render_ops(
+                &mut output,
+                surface,
+                &retained_full_surface_repaint(surface),
+                bmux_plugin::TerminalRenderCapabilities::default(),
+            )
+            .unwrap();
+        }
+        let rendered = String::from_utf8_lossy(&output);
+        for label in ["Switch", "Rename", "Close"] {
+            assert!(rendered.contains(label), "missing menu label: {label}");
+        }
+        assert!(!resources.surfaces.surfaces().is_empty());
+        let key = super::super::input::TerminalKeyEvent::from(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert!(
+            super::try_handle_plugin_surface_key(client, state, &key)
+                .await
+                .unwrap()
+        );
+        assert!(state.plugin_focus.focused().is_none());
+    }
+
+    #[cfg(feature = "bundled-plugin-tab-strip")]
+    #[tokio::test]
+    async fn surface_action_uses_framed_service_transport() {
+        use bmux_ipc::transport::ErasedIpcStream;
+        use bmux_ipc::{Envelope, EnvelopeKind, Response, ResponsePayload};
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let mut stream = ErasedIpcStream::new(Box::new(server_stream));
+            for step in 0..3 {
+                let envelope = stream.recv_envelope().await.unwrap();
+                let request: bmux_ipc::Request = bmux_ipc::decode(&envelope.payload).unwrap();
+                let response = if step == 0 {
+                    let bmux_ipc::Request::Hello { contract, .. } = request else {
+                        panic!("expected hello")
+                    };
+                    Response::Ok(ResponsePayload::HelloNegotiated {
+                        negotiated: bmux_ipc::NegotiatedProtocol {
+                            wire_epoch: contract.wire_epoch,
+                            revision: contract.revisions.max,
+                            capabilities: Vec::new(),
+                        },
+                    })
+                } else {
+                    use bmux_windows_plugin_api::windows_commands::client::{
+                        SwitchWindowEndpoint, SwitchWindowRequest,
+                    };
+                    let bmux_ipc::Request::InvokeService {
+                        capability,
+                        interface_id,
+                        operation,
+                        payload,
+                        ..
+                    } = request
+                    else {
+                        panic!("expected service")
+                    };
+                    assert_eq!(capability, SwitchWindowEndpoint::CAPABILITY.as_str());
+                    assert_eq!(interface_id, SwitchWindowEndpoint::INTERFACE_ID.as_str());
+                    assert_eq!(operation, SwitchWindowEndpoint::OPERATION.as_str());
+                    let request: SwitchWindowRequest =
+                        bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+                    assert_eq!(request.target, uuid::Uuid::from_u128(42).to_string());
+                    if step == 1 {
+                        Response::Err(bmux_ipc::ErrorResponse {
+                            code: bmux_ipc::ErrorCode::Internal,
+                            message: "transport action rejected".into(),
+                        })
+                    } else {
+                        Response::Ok(ResponsePayload::ServiceInvoked {
+                            payload: Vec::new(),
+                        })
+                    }
+                };
+                stream
+                    .send_envelope(&Envelope::new(
+                        envelope.request_id,
+                        EnvelopeKind::Response,
+                        bmux_ipc::encode(&response).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = bmux_client::BmuxClient::connect_with_bridge_stream(
+            ErasedIpcStream::new(Box::new(client_stream)),
+            std::time::Duration::from_secs(2),
+            "surface-test",
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let mut client = bmux_client::StreamingBmuxClient::from_client(client).unwrap();
+        let mut state = super::AttachViewState::new(bmux_client::AttachOpenInfo {
+            context_id: None,
+            session_id: uuid::Uuid::new_v4(),
+            can_write: true,
+        });
+        let (installation, resources) = installed_menu_action(&mut state);
+        let mut survivor = super::AttachViewState::new(bmux_client::AttachOpenInfo {
+            context_id: None,
+            session_id: uuid::Uuid::new_v4(),
+            can_write: true,
+        });
+        let (_survivor_installation, survivor_resources) = installed_menu_action(&mut survivor);
+        let before = survivor_resources.surfaces.surfaces();
+        dispatch_installed_menu(&mut client, &mut state, &resources).await;
+        assert!(
+            state
+                .transient_status
+                .as_deref()
+                .unwrap()
+                .contains("transport action rejected")
+        );
+        drop(installation);
+        assert!(resources.surfaces.surfaces().is_empty());
+        assert_eq!(survivor_resources.surfaces.surfaces(), before);
+        dispatch_installed_menu(&mut client, &mut survivor, &survivor_resources).await;
+        assert!(survivor.transient_status.is_none());
+        server.await.unwrap();
+    }
+    struct FailingWriter {
+        fail_flush: bool,
+    }
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_flush {
+                Ok(bytes.len())
+            } else {
+                Err(std::io::Error::other("write rejected"))
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush rejected"))
+        }
+    }
+
+    #[test]
+    fn failed_terminal_frames_do_not_commit_display_capture() {
+        for fail_flush in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let client_id = Uuid::new_v4();
+            let recording_id = Uuid::new_v4();
+            let mut capture = DisplayCaptureFanout::default();
+            capture.writers.insert(
+                recording_id,
+                display_capture::DisplayCaptureWriter::open(
+                    recording_id,
+                    dir.path(),
+                    client_id,
+                    None,
+                )
+                .unwrap(),
+            );
+            capture.writers[&recording_id].flush().unwrap();
+            let track_path = dir.path().join(format!("display-{client_id}.bin"));
+            let initial = std::fs::read(&track_path).unwrap();
+            let initial = bmux_recording_protocol::read_frames::<
+                bmux_recording_protocol::DisplayTrackEnvelope,
+            >(&initial)
+            .unwrap();
+            let baseline_frames = initial
+                .frames
+                .iter()
+                .filter(|frame| {
+                    matches!(
+                        frame.event,
+                        bmux_recording_protocol::DisplayTrackEvent::FrameBytes { .. }
+                    )
+                })
+                .count();
+            let pane_id = Uuid::new_v4();
+            let session_id = Uuid::new_v4();
+            let mut state = AttachViewState::new(AttachOpenInfo {
+                context_id: None,
+                session_id,
+                can_write: true,
+            });
+            let layout = retry_test_layout(&mut state, pane_id, session_id);
+            let prior_cursor = Some(super::super::state::AttachCursorState {
+                x: 7,
+                y: 3,
+                visible: true,
+            });
+            state.last_cursor_state = prior_cursor;
+            let result = render_attach_frame_to_writer(
+                &mut FailingWriter { fail_flush },
+                &mut state,
+                &layout,
+                &RuntimeAppearance::default(),
+                &[],
+                0,
+                &bmux_config::DamageBehaviorConfig::default(),
+                u64::MAX,
+                &mut capture,
+                TerminalGeometry { cols: 80, rows: 24 },
+                None,
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                state.last_cursor_state, prior_cursor,
+                "failed output committed cursor state"
+            );
+            capture.close_all();
+            let bytes = std::fs::read(dir.path().join(format!("display-{client_id}.bin"))).unwrap();
+            let track = bmux_recording_protocol::read_frames::<
+                bmux_recording_protocol::DisplayTrackEnvelope,
+            >(&bytes)
+            .unwrap();
+            assert_eq!(
+                track
+                    .frames
+                    .iter()
+                    .filter(|frame| matches!(
+                        frame.event,
+                        bmux_recording_protocol::DisplayTrackEvent::FrameBytes { .. }
+                    ))
+                    .count(),
+                baseline_frames
+            );
+            verify_frame_retry(&mut state, &layout);
+        }
+    }
+
+    fn retry_test_layout(
+        state: &mut AttachViewState,
+        pane_id: Uuid,
+        session_id: Uuid,
+    ) -> AttachLayoutState {
+        seed_retry_graphics_cache(state, pane_id);
+        state
+            .pane_buffers
+            .insert(pane_id, PaneRenderBuffer::default());
+        append_pane_output(
+            state.pane_buffers.get_mut(&pane_id).unwrap(),
+            b"retry-visible-content",
+        );
+        AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: pane_id,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![test_pane_surface(
+                    pane_id,
+                    AttachRect {
+                        x: 0,
+                        y: 0,
+                        w: 80,
+                        h: 24,
+                    },
+                )],
+            },
+            zoomed: false,
+        }
+    }
+
+    fn seed_retry_graphics_cache(state: &mut AttachViewState, pane_id: Uuid) {
+        state.terminal_graphics_cache.insert(
+            1,
+            bmux_attach_pipeline::types::TerminalGraphicCacheEntry {
+                pane_id,
+                surface_id: pane_id,
+                source: bmux_attach_pipeline::types::TerminalGraphicSourceSignature {
+                    pixel_width: 1,
+                    pixel_height: 1,
+                    color: bmux_plugin::TerminalRgba {
+                        r: 1,
+                        g: 2,
+                        b: 3,
+                        a: 255,
+                    },
+                    fill: bmux_plugin::TerminalGraphicFill::Full,
+                },
+                placement: None,
+                host_image_id: 1,
+            },
+        );
+    }
+
+    fn verify_frame_retry(state: &mut AttachViewState, layout: &AttachLayoutState) {
+        assert_eq!(
+            state.terminal_graphics_cache.len(),
+            1,
+            "failed output committed graphics cleanup"
+        );
+        let mut output = Vec::new();
+        render_attach_frame_to_writer(
+            &mut output,
+            state,
+            layout,
+            &RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            TerminalGeometry { cols: 80, rows: 24 },
+            None,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("retry-visible-content"));
+        assert!(
+            state.terminal_graphics_cache.is_empty(),
+            "successful retry did not commit graphics cleanup"
+        );
+        assert!(state.last_cursor_state.is_some());
+    }
+
+    #[test]
+    fn surface_action_failure_preserves_consumption_and_reports_status() {
+        let mut state = super::AttachViewState::new(bmux_client::AttachOpenInfo {
+            context_id: None,
+            session_id: uuid::Uuid::new_v4(),
+            can_write: true,
+        });
+        for consumed in [false, true] {
+            assert_eq!(
+                super::finish_surface_action(&mut state, consumed, Ok(())),
+                consumed
+            );
+            let failure = bmux_client::ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: "action rejected".to_owned(),
+            };
+            assert_eq!(
+                super::finish_surface_action::<()>(&mut state, consumed, Err(failure)),
+                consumed
+            );
+            assert!(
+                state
+                    .transient_status
+                    .as_deref()
+                    .unwrap()
+                    .contains("action rejected")
+            );
+        }
+    }
     #[allow(clippy::wildcard_imports)]
     use super::*;
     use crate::input::InputProcessor;
@@ -15741,6 +16276,26 @@ mod tests {
         let resized = view_state.local_presentation.as_ref().unwrap();
         assert_eq!(resized.viewport_rows, 12);
         assert_eq!(resized.revision, first.revision + 2);
+    }
+
+    #[test]
+    fn headless_terminal_replays_resize_boundaries() {
+        let (mut terminal, handle) = HeadlessAttachTerminal::new(4, 3);
+        terminal.write_all(b"\x1b[1;8HX\r\nefgh").unwrap();
+        handle.resize(8, 3).unwrap();
+        terminal.write_all(b"\x1b[3;1Htail").unwrap();
+        let grid = handle.output_grid().unwrap();
+        let text = bmux_terminal_grid::visible_text(grid.grid(), 0, 3);
+        assert!(text.lines().next().unwrap().starts_with("   X"), "{text:?}");
+        assert!(text.lines().nth(1).unwrap().starts_with("efgh"), "{text:?}");
+        assert!(text.lines().nth(2).unwrap().starts_with("tail"), "{text:?}");
+        // Resizes without intervening bytes must also be preserved.
+        handle.resize(6, 3).unwrap();
+        handle.resize(8, 3).unwrap();
+        assert_eq!(
+            bmux_terminal_grid::visible_text(handle.output_grid().unwrap().grid(), 0, 3),
+            text
+        );
     }
 
     #[test]

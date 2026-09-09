@@ -965,7 +965,7 @@ fn paint_sidebar_field(
             continue;
         };
         ops.push(RenderOp::text_run(
-            2_u16.saturating_add(child.x),
+            2_u16.saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
             u16::try_from(projected.start + 1).unwrap_or(u16::MAX),
             text.trim_end(),
             style,
