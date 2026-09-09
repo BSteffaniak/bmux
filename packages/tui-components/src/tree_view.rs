@@ -331,7 +331,10 @@ impl<'a> TreeView<'a> {
             })
             .max()
             .unwrap_or(0);
-        LogicalSize::new(u16_saturating(width), visible.len())
+        LogicalSize::new(
+            u16_saturating(width).into(),
+            visible.len().try_into().unwrap_or(u64::MAX),
+        )
     }
 
     fn handle_key_event(&self, state: &mut TreeViewState, event: &Event) -> TreeViewOutcome {
@@ -641,8 +644,8 @@ impl<'a, 'state> TreeViewComponent<'a, 'state> {
                     (0..self.tree.visible_indices(&state).len()).find(|&row| {
                         cx.visible_rect(bmux_tui::component::LogicalRect::new(
                             0,
-                            row,
-                            usize::from(layout.size.width),
+                            row.try_into().unwrap_or(u64::MAX),
+                            layout.size.width,
                             1,
                         ))
                         .contains(mouse.position)
@@ -724,14 +727,19 @@ impl Component for TreeViewComponent<'_, '_> {
         let clip = cx.area();
         let start = usize::try_from(clip.y.max(0))
             .unwrap_or(usize::MAX)
-            .min(layout.size.height);
+            .min(layout.size.height.try_into().unwrap_or(usize::MAX));
         let end = usize::try_from(clip.y.saturating_add(i64::from(clip.height)).max(0))
             .unwrap_or(usize::MAX)
-            .min(layout.size.height);
+            .min(layout.size.height.try_into().unwrap_or(usize::MAX));
         if start >= end || layout.size.width == 0 || clip.width == 0 {
             return;
         }
-        let area = Rect::new(0, 0, layout.size.width, u16_saturating(end - start));
+        let area = Rect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            u16_saturating(end - start),
+        );
         let state = self.state.borrow();
         cx.with_child(
             0,
@@ -1000,13 +1008,14 @@ mod tests {
                 let state = RefCell::new(TreeViewState::new(None));
                 let component = TreeViewComponent::new("tree", &items, &state);
                 for constraints in [
-                    Constraints::new(0, u16::MAX, 0, None),
+                    Constraints::new(0, u16::MAX.into(), 0, None),
                     Constraints::for_width(3),
                 ] {
                     let layout = component.layout(constraints, &mut LayoutCx::new());
                     assert_eq!(
                         layout.size,
-                        constraints.constrain(bmux_tui::component::LogicalSize::new(expected, 1))
+                        constraints
+                            .constrain(bmux_tui::component::LogicalSize::new(expected.into(), 1))
                     );
                 }
             }
@@ -1222,7 +1231,10 @@ mod tests {
                 state.borrow_mut().set_expanded(id, expanded);
             }
             let layout = component.layout(Constraints::for_width(20), &mut LayoutCx::new());
-            assert_eq!(layout.size.height, expected.len());
+            assert_eq!(
+                layout.size.height,
+                expected.len().try_into().unwrap_or(u64::MAX)
+            );
             let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 5));
             let mut frame = Frame::new(&mut buffer);
             component.paint(&layout, &mut PaintCx::new(&mut frame));

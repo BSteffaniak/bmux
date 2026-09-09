@@ -261,7 +261,12 @@ pub fn u16_saturating(value: usize) -> u16 {
 /// The local-coordinate rectangle covering a resolved logical size.
 #[must_use]
 pub fn local_area_of(size: LogicalSize) -> Rect {
-    Rect::new(0, 0, size.width, u16_saturating(size.height))
+    Rect::new(
+        0,
+        0,
+        u16::try_from(size.width).unwrap_or(u16::MAX),
+        u16::try_from(size.height).unwrap_or(u16::MAX),
+    )
 }
 
 /// Translate a terminal-space rectangle nested inside `area` into

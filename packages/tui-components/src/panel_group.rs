@@ -437,7 +437,7 @@ impl<'a> PanelGroupComponent<'a> {
         Rect::new(
             0,
             0,
-            layout.size.width,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
             u16::try_from(layout.size.height).unwrap_or(u16::MAX),
         )
     }
@@ -450,7 +450,7 @@ impl<'a> PanelGroupComponent<'a> {
                 Rect::new(
                     u16::try_from(child.x).unwrap_or(u16::MAX),
                     u16::try_from(child.y).unwrap_or(u16::MAX),
-                    child.node.size.width,
+                    child.node.size.width.try_into().unwrap_or(u16::MAX),
                     u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
                 )
             })
@@ -464,9 +464,12 @@ impl<'a> PanelGroupComponent<'a> {
             .map(|pair| match self.group.axis {
                 PanelGroupAxis::Horizontal => Rect::new(
                     u16::try_from(
-                        pair[0]
-                            .x
-                            .saturating_add(usize::from(pair[0].node.size.width)),
+                        pair[0].x.saturating_add(
+                            u64::try_from(
+                                usize::try_from(pair[0].node.size.width).unwrap_or(usize::MAX),
+                            )
+                            .unwrap_or(u64::MAX),
+                        ),
                     )
                     .unwrap_or(u16::MAX),
                     0,
@@ -477,7 +480,7 @@ impl<'a> PanelGroupComponent<'a> {
                     0,
                     u16::try_from(pair[0].y.saturating_add(pair[0].node.size.height))
                         .unwrap_or(u16::MAX),
-                    layout.size.width,
+                    layout.size.width.try_into().unwrap_or(u16::MAX),
                     1,
                 ),
             })
@@ -579,12 +582,17 @@ impl Component for PanelGroupComponent<'_> {
             PanelGroupAxis::Vertical => u16::try_from(
                 constraints
                     .max_height()
-                    .unwrap_or_else(|| usize::from(u16::MAX)),
+                    .unwrap_or_else(|| u64::try_from(usize::from(u16::MAX)).unwrap_or(u64::MAX)),
             )
-            .unwrap_or(u16::MAX),
+            .unwrap_or(u16::MAX)
+            .into(),
         };
-        let available = primary_max.saturating_sub(u16_saturating(divider_count));
-        let lengths = allocated_lengths_for_count(available, &state, count);
+        let available = primary_max.saturating_sub(u64::from(u16_saturating(divider_count)));
+        let lengths = allocated_lengths_for_count(
+            u16::try_from(available).unwrap_or(u16::MAX),
+            &state,
+            count,
+        );
         let mut children = Vec::with_capacity(count);
         let mut cursor = 0usize;
         let mut cross = 0usize;
@@ -592,27 +600,35 @@ impl Component for PanelGroupComponent<'_> {
             let primary = lengths[index];
             let child_constraints = match self.group.axis {
                 PanelGroupAxis::Horizontal => Constraints::new(
-                    primary,
-                    primary,
+                    primary.into(),
+                    primary.into(),
                     constraints.min_height(),
                     constraints.max_height(),
                 ),
                 PanelGroupAxis::Vertical => Constraints::new(
                     constraints.min_width(),
                     constraints.max_width(),
-                    usize::from(primary),
-                    Some(usize::from(primary)),
+                    u64::try_from(usize::from(primary)).unwrap_or(u64::MAX),
+                    Some(u64::try_from(usize::from(primary)).unwrap_or(u64::MAX)),
                 ),
             };
             let node = child.layout(child_constraints, cx);
             match self.group.axis {
                 PanelGroupAxis::Horizontal => {
-                    cross = cross.max(node.size.height);
-                    children.push(ChildLayout::new(cursor, 0, node));
+                    cross = cross.max(node.size.height.try_into().unwrap_or(usize::MAX));
+                    children.push(ChildLayout::new(
+                        cursor.try_into().unwrap_or(u64::MAX),
+                        0,
+                        node,
+                    ));
                 }
                 PanelGroupAxis::Vertical => {
-                    cross = cross.max(usize::from(node.size.width));
-                    children.push(ChildLayout::new(0, cursor, node));
+                    cross = cross.max(usize::try_from(node.size.width).unwrap_or(usize::MAX));
+                    children.push(ChildLayout::new(
+                        0,
+                        cursor.try_into().unwrap_or(u64::MAX),
+                        node,
+                    ));
                 }
             }
             cursor = cursor
@@ -620,12 +636,14 @@ impl Component for PanelGroupComponent<'_> {
                 .saturating_add(usize::from(index + 1 < count));
         }
         let proposed = match self.group.axis {
-            PanelGroupAxis::Horizontal => {
-                LogicalSize::new(u16::try_from(cursor).unwrap_or(u16::MAX), cross)
-            }
-            PanelGroupAxis::Vertical => {
-                LogicalSize::new(u16::try_from(cross).unwrap_or(u16::MAX), cursor)
-            }
+            PanelGroupAxis::Horizontal => LogicalSize::new(
+                u16::try_from(cursor).unwrap_or(u16::MAX).into(),
+                cross.try_into().unwrap_or(u64::MAX),
+            ),
+            PanelGroupAxis::Vertical => LogicalSize::new(
+                u16::try_from(cross).unwrap_or(u16::MAX).into(),
+                cursor.try_into().unwrap_or(u64::MAX),
+            ),
         };
         LayoutNode::with_children(self.id.clone(), constraints.constrain(proposed), children)
     }
@@ -638,7 +656,7 @@ impl Component for PanelGroupComponent<'_> {
                 LocalRect::new(
                     0,
                     0,
-                    child.node.size.width,
+                    child.node.size.width.try_into().unwrap_or(u16::MAX),
                     u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
                 ),
                 |cx| component.paint(&child.node, cx),
@@ -663,7 +681,7 @@ impl Component for PanelGroupComponent<'_> {
                     .saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX)),
                 area.y
                     .saturating_add(u16::try_from(child.y).unwrap_or(u16::MAX)),
-                child.node.size.width,
+                child.node.size.width.try_into().unwrap_or(u16::MAX),
                 u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
             );
             let outcome = cx.with_transform(

@@ -441,14 +441,22 @@ impl Component for MenuComponent<'_, '_> {
             .sum::<usize>();
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, height)),
+            constraints.constrain(LogicalSize::new(
+                width.into(),
+                height.try_into().unwrap_or(u64::MAX),
+            )),
         )
         .with_metadata(LayoutMetadata::new().semantic("menu"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let area = Rect::new(0, 0, layout.size.width, height);
+        let area = Rect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            height,
+        );
         if area.is_empty() {
             return;
         }

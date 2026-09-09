@@ -253,7 +253,11 @@ impl Component for StepperComponent<'_> {
         } else {
             u16::try_from(intrinsic_width)
                 .unwrap_or(u16::MAX)
-                .clamp(constraints.min_width(), constraints.max_width())
+                .clamp(
+                    constraints.min_width().try_into().unwrap_or(u16::MAX),
+                    constraints.max_width().try_into().unwrap_or(u16::MAX),
+                )
+                .into()
         };
         let intrinsic_height = match self.policy.orientation {
             StepperOrientation::Horizontal => usize::from(!self.steps.is_empty()),
@@ -261,7 +265,10 @@ impl Component for StepperComponent<'_> {
         };
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, intrinsic_height)),
+            constraints.constrain(LogicalSize::new(
+                width,
+                intrinsic_height.try_into().unwrap_or(u64::MAX),
+            )),
         )
         .with_metadata(LayoutMetadata::new().semantic("progress"))
     }
@@ -271,6 +278,8 @@ impl Component for StepperComponent<'_> {
             return;
         }
         let viewport = cx.area();
+        let width = u16::try_from(layout.size.width).unwrap_or(u16::MAX);
+        let logical_width = usize::try_from(layout.size.width).unwrap_or(usize::MAX);
         let content_height = match self.policy.orientation {
             StepperOrientation::Horizontal => 1,
             StepperOrientation::Vertical => self.steps.len(),
@@ -279,7 +288,7 @@ impl Component for StepperComponent<'_> {
             || viewport.height == 0
             || viewport.y.saturating_add(i64::from(viewport.height)) <= 0
             || usize::try_from(viewport.y.max(0)).unwrap_or(usize::MAX)
-                >= content_height.min(layout.size.height)
+                >= content_height.min(layout.size.height.try_into().unwrap_or(usize::MAX))
         {
             return;
         }
@@ -299,18 +308,20 @@ impl Component for StepperComponent<'_> {
                     ));
                 }
                 let mut line = Line::from_spans(spans);
-                if self.policy.truncate && line.width() > usize::from(layout.size.width) {
-                    line = line.truncate(usize::from(layout.size.width));
+                if self.policy.truncate && line.width() > logical_width {
+                    line = line.truncate(logical_width);
                 }
-                cx.write_line(LocalRect::new(0, 0, layout.size.width, 1), &line);
+                cx.write_line(LocalRect::new(0, 0, width, 1), &line);
             }
             StepperOrientation::Vertical => {
                 let viewport = cx.area();
+                let width = u16::try_from(layout.size.width).unwrap_or(u16::MAX);
+                let logical_width = usize::try_from(layout.size.width).unwrap_or(usize::MAX);
                 let start = usize::try_from(viewport.y.max(0)).unwrap_or(usize::MAX);
                 let end =
                     usize::try_from(viewport.y.saturating_add(i64::from(viewport.height)).max(0))
                         .unwrap_or(usize::MAX)
-                        .min(layout.size.height)
+                        .min(layout.size.height.try_into().unwrap_or(usize::MAX))
                         .min(self.steps.len());
                 for index in start..end {
                     let step = &self.steps[index];
@@ -324,38 +335,32 @@ impl Component for StepperComponent<'_> {
                         Span::styled(self.step_text(step), self.style_for(step.status)),
                     ]);
                     if self.policy.truncate {
-                        line = line.truncate(usize::from(layout.size.width));
+                        line = line.truncate(logical_width);
                     }
                     cx.write_line(
-                        LocalRect::new(
-                            0,
-                            i64::try_from(index).unwrap_or(i64::MAX),
-                            layout.size.width,
-                            1,
-                        ),
+                        LocalRect::new(0, i64::try_from(index).unwrap_or(i64::MAX), width, 1),
                         &line,
                     );
                 }
             }
         }
-        let viewport = cx.area();
         let start = usize::try_from(viewport.y.max(0)).unwrap_or(usize::MAX);
         let end = usize::try_from(viewport.y.saturating_add(i64::from(viewport.height)).max(0))
             .unwrap_or(usize::MAX)
-            .min(layout.size.height)
+            .min(layout.size.height.try_into().unwrap_or(usize::MAX))
             .min(content_height);
         let height = u16::try_from(end.saturating_sub(start)).unwrap_or(u16::MAX);
         cx.with_child(
             0,
             i64::try_from(start).unwrap_or(i64::MAX),
-            LocalRect::new(0, 0, layout.size.width, height),
+            LocalRect::new(0, 0, width, height),
             |cx| {
                 cx.push_semantic(SemanticRegion::new(
                     self.id.as_str(),
-                    Rect::new(0, 0, layout.size.width, height),
+                    Rect::new(0, 0, width, height),
                     "progress",
                 ));
-                cx.push_damage(LocalRect::new(0, 0, layout.size.width, height));
+                cx.push_damage(LocalRect::new(0, 0, width, height));
             },
         );
     }
@@ -543,10 +548,15 @@ mod tests {
                 &mut LayoutCx::new(),
             );
             assert_eq!(
-                usize::from(layout.size.width),
+                usize::try_from(layout.size.width).unwrap_or(usize::MAX),
                 bmux_tui::text_width::display_width(&expected)
             );
-            let mut buffer = Buffer::empty(Rect::new(0, 0, layout.size.width, 1));
+            let mut buffer = Buffer::empty(Rect::new(
+                0,
+                0,
+                layout.size.width.try_into().unwrap_or(u16::MAX),
+                1,
+            ));
             let mut frame = Frame::new(&mut buffer);
             component.paint(&layout, &mut PaintCx::new(&mut frame));
             assert_eq!(

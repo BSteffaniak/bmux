@@ -652,12 +652,16 @@ impl<'a> Table<'a> {
             resolve_column_widths(self.columns, body.width, self.policy.cell_separator);
         let viewport = ScrollViewComponent::viewport_layout(
             viewport_id(id),
-            LogicalSize::new(body.width, usize::from(body.height)),
+            LogicalSize::new(
+                body.width.into(),
+                u64::try_from(usize::from(body.height)).unwrap_or(u64::MAX),
+            ),
             LayoutNode::leaf(
                 content_id(id),
                 LogicalSize::new(
-                    self.horizontal_content_width(&column_widths, body.width),
-                    self.body_height(),
+                    self.horizontal_content_width(&column_widths, body.width)
+                        .into(),
+                    self.body_height().try_into().unwrap_or(u64::MAX),
                 ),
             ),
         );
@@ -1314,7 +1318,10 @@ impl Component for BodyRows<'_, '_> {
                 || LayoutId::new("table.content"),
                 |child| child.node.id.clone(),
             ),
-            LogicalSize::new(constraints.max_width(), self.table.body_height()),
+            LogicalSize::new(
+                constraints.max_width(),
+                self.table.body_height().try_into().unwrap_or(u64::MAX),
+            ),
         )
     }
 
@@ -1635,15 +1642,23 @@ impl Component for TableComponent<'_, '_> {
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
         let (width, height) = self.table.size();
-        let size = constraints.constrain(LogicalSize::new(width, usize::from(height)));
-        let area = Rect::new(0, 0, size.width, u16_saturating(size.height));
+        let size = constraints.constrain(LogicalSize::new(
+            width.into(),
+            u64::try_from(usize::from(height)).unwrap_or(u64::MAX),
+        ));
+        let area = Rect::new(
+            0,
+            0,
+            size.width.try_into().unwrap_or(u16::MAX),
+            u16_saturating(size.height.try_into().unwrap_or(usize::MAX)),
+        );
         let table_layout = self.table.layout_with_id(&self.id, area);
         LayoutNode::with_children(
             self.id.clone(),
             size,
             vec![ChildLayout::new(
-                usize::from(table_layout.body.x),
-                usize::from(table_layout.body.y),
+                u64::try_from(usize::from(table_layout.body.x)).unwrap_or(u64::MAX),
+                u64::try_from(usize::from(table_layout.body.y)).unwrap_or(u64::MAX),
                 table_layout.viewport,
             )],
         )
@@ -1651,7 +1666,12 @@ impl Component for TableComponent<'_, '_> {
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let area = Rect::new(0, 0, layout.size.width, u16_saturating(layout.size.height));
+        let area = Rect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            u16_saturating(layout.size.height.try_into().unwrap_or(usize::MAX)),
+        );
         if area.is_empty() {
             return;
         }

@@ -112,9 +112,9 @@ impl Component for FormFieldComponent<'_> {
                 constraints.min_width(),
                 constraints.max_width(),
                 0,
-                constraints
-                    .max_height()
-                    .map(|height| height.saturating_sub(chrome_height)),
+                constraints.max_height().map(|height| {
+                    height.saturating_sub(chrome_height.try_into().unwrap_or(u64::MAX))
+                }),
             ),
             cx,
         );
@@ -128,13 +128,17 @@ impl Component for FormFieldComponent<'_> {
             .map(bmux_tui::text_width::display_width)
             .max()
             .unwrap_or_default();
-        let width = control
-            .size
-            .width
-            .max(u16::try_from(label_width.max(footer_width)).unwrap_or(u16::MAX));
+        let width = control.size.width.max(
+            u16::try_from(label_width.max(footer_width))
+                .unwrap_or(u16::MAX)
+                .into(),
+        );
         let size = constraints.constrain(LogicalSize::new(
             width,
-            control.size.height.saturating_add(chrome_height),
+            control
+                .size
+                .height
+                .saturating_add(chrome_height.try_into().unwrap_or(u64::MAX)),
         ));
         LayoutNode::with_children(
             self.id.clone(),
@@ -149,7 +153,7 @@ impl Component for FormFieldComponent<'_> {
             return;
         }
         cx.write_line(
-            LocalRect::new(0, 0, layout.size.width, 1),
+            LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             &self.field.label_line(),
         );
         let Some(child) = layout.children.first() else {
@@ -169,7 +173,7 @@ impl Component for FormFieldComponent<'_> {
                 LocalRect::new(
                     0,
                     i64::try_from(row).unwrap_or(i64::MAX),
-                    layout.size.width,
+                    layout.size.width.try_into().unwrap_or(u16::MAX),
                     1,
                 ),
                 &Line::from_spans([Span::styled(help, self.field.styles.help)]),
@@ -183,7 +187,7 @@ impl Component for FormFieldComponent<'_> {
                 LocalRect::new(
                     0,
                     i64::try_from(row).unwrap_or(i64::MAX),
-                    layout.size.width,
+                    layout.size.width.try_into().unwrap_or(u16::MAX),
                     1,
                 ),
                 &Line::from_spans([Span::styled(error, self.field.styles.error)]),

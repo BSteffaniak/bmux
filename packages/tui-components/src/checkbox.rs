@@ -211,7 +211,7 @@ impl Component for CheckboxComponent<'_, '_> {
         let width = self.checkbox.width();
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, 1)),
+            constraints.constrain(LogicalSize::new(width.into(), 1)),
         )
         .with_metadata(LayoutMetadata::new().semantic("checkbox"))
     }
@@ -221,19 +221,22 @@ impl Component for CheckboxComponent<'_, '_> {
             return;
         }
         let state = self.state.get();
-        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        let area = LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         cx.write_line_with_fallback_style(area, &self.checkbox.line(state), self.fallback);
         cx.push_hit(
-            SceneRegion::new(self.id.as_str(), Rect::new(0, 0, layout.size.width, 1))
-                .role(HitRole::Action)
-                .pointer_events(self.checkbox.policy.mouse.enabled)
-                .hoverable(self.checkbox.policy.mouse.enabled && self.checkbox.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled),
+            SceneRegion::new(
+                self.id.as_str(),
+                Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
+            )
+            .role(HitRole::Action)
+            .pointer_events(self.checkbox.policy.mouse.enabled)
+            .hoverable(self.checkbox.policy.mouse.enabled && self.checkbox.policy.mouse.hover)
+            .focusable(true)
+            .enabled(!state.interaction.disabled),
         );
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
+            Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             "checkbox",
         ));
         cx.push_damage(area);
@@ -247,7 +250,7 @@ impl Component for CheckboxComponent<'_, '_> {
             .visible_rect(bmux_tui::component::LogicalRect::new(
                 0,
                 0,
-                usize::from(layout.size.width),
+                layout.size.width,
                 1,
             ))
             .intersection(area);
@@ -527,11 +530,12 @@ mod tests {
                 &mut cx,
             );
             assert_eq!(layout.size.width, width);
-            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+            let mut buffer =
+                Buffer::empty(Rect::new(0, 0, width.try_into().unwrap_or(u16::MAX), 1));
             let mut frame = Frame::new(&mut buffer);
             component.paint(&layout, &mut PaintCx::new(&mut frame));
             assert_eq!(frame.buffer().row_symbols(0), Some(format!("[ ] {label}")));
-            assert_eq!(frame.hits().regions()[0].area.width, width);
+            assert_eq!(u64::from(frame.hits().regions()[0].area.width), width);
         }
         assert_eq!(cx.measured_nodes(), 2);
         assert_eq!(cache.stats().hits, 1);
@@ -548,10 +552,12 @@ mod tests {
         ] {
             let state = Cell::new(CheckboxState::new(false));
             let component = CheckboxComponent::new("check", label, &state);
-            let layout =
-                component.layout(Constraints::new(0, u16::MAX, 0, None), &mut LayoutCx::new());
-            assert_eq!(layout.size.width, width);
-            assert_eq!(layout.size.width, Checkbox::new(label).width());
+            let layout = component.layout(
+                Constraints::new(0, u16::MAX.into(), 0, None),
+                &mut LayoutCx::new(),
+            );
+            assert_eq!(layout.size.width, width.into());
+            assert_eq!(layout.size.width, Checkbox::new(label).width().into());
             assert_eq!(layout.size.height, 1);
             if width < u16::MAX {
                 let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));

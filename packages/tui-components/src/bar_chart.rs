@@ -260,8 +260,8 @@ impl Component for BarChartComponent<'_> {
         let width = if constraints.min_width() == constraints.max_width() {
             constraints.max_width()
         } else if self.items.is_empty() {
-            u16::try_from(display_width(self.empty))
-                .unwrap_or(u16::MAX)
+            u64::try_from(display_width(self.empty))
+                .unwrap_or(u64::MAX)
                 .clamp(constraints.min_width(), constraints.max_width())
         } else {
             let label_width = self
@@ -278,13 +278,13 @@ impl Component for BarChartComponent<'_> {
                     .map(|item| item.value.to_string().len().saturating_add(1))
                     .max()
                     .unwrap_or_default();
-            u16::try_from(
+            u64::try_from(
                 label_width
                     .saturating_add(display_width(self.policy.separator))
                     .saturating_add(value_width)
                     .saturating_add(1),
             )
-            .unwrap_or(u16::MAX)
+            .unwrap_or(u64::MAX)
             .clamp(constraints.min_width(), constraints.max_width())
         };
         let visible = self.items.len();
@@ -297,7 +297,10 @@ impl Component for BarChartComponent<'_> {
         };
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, height)),
+            constraints.constrain(LogicalSize::new(
+                width,
+                height.try_into().unwrap_or(u64::MAX),
+            )),
         )
         .with_metadata(LayoutMetadata::new().semantic("chart"))
     }
@@ -308,7 +311,7 @@ impl Component for BarChartComponent<'_> {
         }
         if self.items.is_empty() {
             cx.write_line_with_fallback_style(
-                LocalRect::new(0, 0, layout.size.width, 1),
+                LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
                 &Line::from(self.empty),
                 self.styles.empty_message,
             );
@@ -323,25 +326,35 @@ impl Component for BarChartComponent<'_> {
             let row_step = usize::from(self.policy.bar_gap).saturating_add(1);
             for (index, item) in self.items.iter().enumerate() {
                 let row = index.saturating_mul(row_step);
-                if row >= layout.size.height {
+                if row >= layout.size.height.try_into().unwrap_or(usize::MAX) {
                     break;
                 }
                 cx.write_line(
                     LocalRect::new(
                         0,
                         i64::try_from(row).unwrap_or(i64::MAX),
-                        layout.size.width,
+                        layout.size.width.try_into().unwrap_or(u16::MAX),
                         1,
                     ),
-                    &self.item_line(item, max, layout.size.width),
+                    &self.item_line(item, max, layout.size.width.try_into().unwrap_or(u16::MAX)),
                 );
             }
         }
         let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let area = LocalRect::new(0, 0, layout.size.width, height);
+        let area = LocalRect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            height,
+        );
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, height),
+            Rect::new(
+                0,
+                0,
+                layout.size.width.try_into().unwrap_or(u16::MAX),
+                height,
+            ),
             "chart",
         ));
         cx.push_damage(area);

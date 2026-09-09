@@ -127,12 +127,19 @@ impl Component for LabeledDetailsComponent<'_> {
                 .unwrap_or_default();
             u16::try_from(intrinsic)
                 .unwrap_or(u16::MAX)
-                .clamp(constraints.min_width(), constraints.max_width())
+                .clamp(
+                    constraints.min_width().try_into().unwrap_or(u16::MAX),
+                    constraints.max_width().try_into().unwrap_or(u16::MAX),
+                )
+                .into()
         };
-        let height = self.lines(width).len();
+        let height = self.lines(u16::try_from(width).unwrap_or(u16::MAX)).len();
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, height)),
+            constraints.constrain(LogicalSize::new(
+                width,
+                height.try_into().unwrap_or(u64::MAX),
+            )),
         )
         .with_metadata(LayoutMetadata::new().semantic("details"))
     }
@@ -142,26 +149,36 @@ impl Component for LabeledDetailsComponent<'_> {
             return;
         }
         for (row, line) in self
-            .lines(layout.size.width)
+            .lines(layout.size.width.try_into().unwrap_or(u16::MAX))
             .iter()
-            .take(layout.size.height)
+            .take(layout.size.height.try_into().unwrap_or(usize::MAX))
             .enumerate()
         {
             cx.write_line(
                 LocalRect::new(
                     0,
                     i64::try_from(row).unwrap_or(i64::MAX),
-                    layout.size.width,
+                    layout.size.width.try_into().unwrap_or(u16::MAX),
                     1,
                 ),
                 line,
             );
         }
         let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let area = LocalRect::new(0, 0, layout.size.width, height);
+        let area = LocalRect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            height,
+        );
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, height),
+            Rect::new(
+                0,
+                0,
+                layout.size.width.try_into().unwrap_or(u16::MAX),
+                height,
+            ),
             "details",
         ));
         cx.push_damage(area);

@@ -324,7 +324,7 @@ impl CompanionState {
                     column.child(field.clone())
                 });
             let layout = content.layout(
-                Constraints::for_width(u16::try_from(width).unwrap_or(u16::MAX)),
+                Constraints::for_width(u64::from(u16::try_from(width).unwrap_or(u16::MAX))),
                 &mut LayoutCx::new(),
             );
             self.measured_items.borrow_mut().insert(
@@ -367,7 +367,7 @@ impl CompanionState {
         use bmux_tui::component::{ChildLayout, LayoutId, LayoutNode, LogicalSize};
         let mut content = LayoutNode::leaf(
             LayoutId::new("sidebar.items"),
-            LogicalSize::new(self.settings.width, 0),
+            LogicalSize::new(u64::from(self.settings.width), 0),
         );
         for index in 0..self.snapshot.windows.len() {
             let item = self.measured_window(index);
@@ -386,9 +386,9 @@ impl CompanionState {
         bmux_tui_components::scroll_view::ScrollViewComponent::viewport_layout(
             LayoutId::new("sidebar.viewport"),
             LogicalSize::new(
-                self.allocated_width(),
+                u64::from(self.allocated_width()),
                 self.allocation.map_or(viewport_height, |rect| {
-                    usize::from(rect.h.saturating_sub(2))
+                    u64::try_from(usize::from(rect.h.saturating_sub(2))).unwrap_or(u64::MAX)
                 }),
             ),
             content,
@@ -403,8 +403,8 @@ impl CompanionState {
         bmux_tui_components::scroll_view::ScrollView::new().ensure_visible(
             &layout,
             &mut self.scroll,
-            item.y,
-            item.node.size.height,
+            usize::try_from(item.y).unwrap_or(usize::MAX),
+            usize::try_from(item.node.size.height).unwrap_or(usize::MAX),
         );
     }
 
@@ -944,7 +944,7 @@ fn paint_sidebar_field(
     use bmux_tui::geometry::Rect;
     use bmux_tui::paint::PaintCx;
 
-    let width = child.node.size.width;
+    let width = u16::try_from(child.node.size.width).unwrap_or(u16::MAX);
     if width == 0 {
         return;
     }
@@ -957,7 +957,10 @@ fn paint_sidebar_field(
             .filter(|cell| !cell.is_wide_continuation())
             .map(|cell| cell.symbol.as_str())
             .collect::<String>();
-        let logical_row = placement.0.saturating_add(child.y).saturating_add(offset);
+        let logical_row = placement
+            .0
+            .saturating_add(usize::try_from(child.y).unwrap_or(usize::MAX))
+            .saturating_add(offset);
         let Some(projected) = bmux_tui_components::scroll_view::ScrollView::project_rows(
             &placement.1,
             logical_row..logical_row.saturating_add(1),
@@ -1028,14 +1031,16 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         ..state
             .scroll
             .vertical_offset()
-            .saturating_add(layout.size.height);
+            .saturating_add(usize::try_from(layout.size.height).unwrap_or(usize::MAX));
     let mut row = 1_u16;
     for (index, window) in state.snapshot.windows.iter().enumerate() {
         let item = &layout.children[0].node.children[index];
         let item_end = item.y.saturating_add(item.node.size.height);
-        let Some(projected) =
-            bmux_tui_components::scroll_view::ScrollView::project_rows(&visible, item.y..item_end)
-        else {
+        let Some(projected) = bmux_tui_components::scroll_view::ScrollView::project_rows(
+            &visible,
+            usize::try_from(item.y).unwrap_or(usize::MAX)
+                ..usize::try_from(item_end).unwrap_or(usize::MAX),
+        ) else {
             continue;
         };
         let fact = window_fact(window);
@@ -1058,7 +1063,16 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
                 "status" if window.active => active,
                 _ => inactive.dim(),
             };
-            paint_sidebar_field(field, child, &(item.y, visible.clone()), style, &mut ops);
+            paint_sidebar_field(
+                field,
+                child,
+                &(
+                    usize::try_from(item.y).unwrap_or(usize::MAX),
+                    visible.clone(),
+                ),
+                style,
+                &mut ops,
+            );
         }
         row = u16::try_from(projected.end + 1).unwrap_or(u16::MAX);
         regions.push(sidebar_region(

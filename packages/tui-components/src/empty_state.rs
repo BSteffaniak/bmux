@@ -233,12 +233,24 @@ impl Component for EmptyStateComponent<'_> {
         } else {
             u16::try_from(intrinsic_width)
                 .unwrap_or(u16::MAX)
-                .clamp(constraints.min_width(), constraints.max_width())
+                .clamp(
+                    constraints.min_width().try_into().unwrap_or(u16::MAX),
+                    constraints.max_width().try_into().unwrap_or(u16::MAX),
+                )
+                .into()
         };
-        let content_width = width.saturating_sub(self.policy.padding.horizontal());
-        let content_height = wrapped_lines(&lines, content_width, self.policy.wrap).len();
+        let content_width = width.saturating_sub(u64::from(self.policy.padding.horizontal()));
+        let content_height = wrapped_lines(
+            &lines,
+            u16::try_from(content_width).unwrap_or(u16::MAX),
+            self.policy.wrap,
+        )
+        .len();
         let height = content_height.saturating_add(usize::from(self.policy.padding.vertical()));
-        let size = constraints.constrain(LogicalSize::new(width, height));
+        let size = constraints.constrain(LogicalSize::new(
+            width,
+            height.try_into().unwrap_or(u64::MAX),
+        ));
         let surface = bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
             .background(self.styles.background);
         let children = if self.policy.background {
@@ -264,7 +276,7 @@ impl Component for EmptyStateComponent<'_> {
         let full = LocalRect::new(
             0,
             0,
-            layout.size.width,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
             u16::try_from(layout.size.height).unwrap_or(u16::MAX),
         );
         if let Some(surface) = layout.children.first() {
@@ -274,30 +286,42 @@ impl Component for EmptyStateComponent<'_> {
         }
 
         let horizontal_padding = self.policy.padding.horizontal();
-        let content_width = layout.size.width.saturating_sub(horizontal_padding);
-        let rows = wrapped_lines(&self.lines(), content_width, self.policy.wrap);
-        let available_height = layout
-            .size
-            .height
-            .saturating_sub(usize::from(self.policy.padding.vertical()));
-        let visible_rows = rows.len().min(available_height);
+        let content_width = layout.size.width.saturating_sub(horizontal_padding.into());
+        let rows = wrapped_lines(
+            &self.lines(),
+            content_width.try_into().unwrap_or(u16::MAX),
+            self.policy.wrap,
+        );
+        let available_height = layout.size.height.saturating_sub(
+            u64::try_from(usize::from(self.policy.padding.vertical())).unwrap_or(u64::MAX),
+        );
+        let visible_rows = rows
+            .len()
+            .min(available_height.try_into().unwrap_or(usize::MAX));
         let content_y = usize::from(self.policy.padding.top)
-            + match self.policy.placement {
+            + usize::try_from(match self.policy.placement {
                 EmptyStatePlacement::Top => 0,
-                EmptyStatePlacement::Center => available_height.saturating_sub(visible_rows) / 2,
-            };
+                EmptyStatePlacement::Center => {
+                    available_height.saturating_sub(visible_rows.try_into().unwrap_or(u64::MAX)) / 2
+                }
+            })
+            .unwrap_or(usize::MAX);
         for (index, line) in rows.iter().take(visible_rows).enumerate() {
             let line_width = u16::try_from(line.width()).unwrap_or(u16::MAX);
             let alignment_offset = match self.policy.alignment {
                 Alignment::Left => 0,
-                Alignment::Center => content_width.saturating_sub(line_width) / 2,
-                Alignment::Right => content_width.saturating_sub(line_width),
+                Alignment::Center => content_width.saturating_sub(line_width.into()) / 2,
+                Alignment::Right => content_width.saturating_sub(line_width.into()),
             };
             cx.write_line(
                 LocalRect::new(
-                    i32::from(self.policy.padding.left) + i32::from(alignment_offset),
+                    i32::from(self.policy.padding.left)
+                        + i32::try_from(alignment_offset).unwrap_or(i32::MAX),
                     i64::try_from(content_y.saturating_add(index)).unwrap_or(i64::MAX),
-                    content_width.saturating_sub(alignment_offset),
+                    content_width
+                        .saturating_sub(alignment_offset)
+                        .try_into()
+                        .unwrap_or(u16::MAX),
                     1,
                 ),
                 line,
@@ -308,7 +332,7 @@ impl Component for EmptyStateComponent<'_> {
             Rect::new(
                 0,
                 0,
-                layout.size.width,
+                layout.size.width.try_into().unwrap_or(u16::MAX),
                 u16::try_from(layout.size.height).unwrap_or(u16::MAX),
             ),
             "status",
@@ -489,8 +513,13 @@ mod tests {
                 Constraints::for_width(width),
                 &mut cx,
             );
-            assert_eq!(layout.size.height, usize::from(height));
-            let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+            assert_eq!(layout.size.height, u64::from(height));
+            let mut buffer = Buffer::empty(Rect::new(
+                0,
+                0,
+                width.try_into().unwrap_or(u16::MAX),
+                height,
+            ));
             let mut frame = Frame::new(&mut buffer);
             component.paint(&layout, &mut PaintCx::new(&mut frame));
             assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(first_row));

@@ -1616,7 +1616,12 @@ impl Component for FormFieldComponent<'_> {
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let area = Rect::new(0, 0, layout.size.width, 1);
+        let area = Rect::new(
+            0,
+            0,
+            u16::try_from(layout.size.width).unwrap_or(u16::MAX),
+            1,
+        );
         cx.push_hit(HitRegion::new(self.id.clone(), area));
         if !self.errors.contains_key(&self.field.id)
             && render_form_control(
@@ -1716,7 +1721,7 @@ fn render_form(
     let retained_scroll = Cell::new(*scroll);
     let viewport = ScrollViewComponent::new(
         "prompt.form.viewport",
-        LogicalSize::new(fields_area.width, usize::from(fields_area.height)),
+        LogicalSize::terminal(fields_area.size()),
         *scroll,
         column,
     )
@@ -1815,7 +1820,7 @@ fn render_multi_toggle(
     let retained = Cell::new(*scroll);
     let viewport = ScrollViewComponent::new(
         "prompt.multi-toggle.viewport",
-        LogicalSize::new(content.width, usize::from(content.height)),
+        LogicalSize::terminal(content.size()),
         *scroll,
         column,
     )

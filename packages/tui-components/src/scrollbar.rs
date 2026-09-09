@@ -265,7 +265,12 @@ impl Component for ScrollbarComponent<'_> {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let area = Rect::new(0, 0, layout.size.width, height);
+        let area = Rect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            height,
+        );
         let state = self.state.get();
         self.scrollbar.paint(area, &state, cx);
         let geometry = self.scrollbar.layout(area, &state);
@@ -277,7 +282,12 @@ impl Component for ScrollbarComponent<'_> {
                     .focusable(false),
             );
         }
-        cx.push_damage(LocalRect::new(0, 0, layout.size.width, height));
+        cx.push_damage(LocalRect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            height,
+        ));
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {

@@ -332,8 +332,8 @@ fn scroll_layout(
     ScrollViewComponent::new(
         id.to_owned(),
         bmux_tui::component::LogicalSize::new(
-            area.width.saturating_sub(1),
-            usize::from(area.height),
+            u64::from(area.width.saturating_sub(1)),
+            u64::try_from(usize::from(area.height)).unwrap_or(u64::MAX),
         ),
         state,
         TextBlock::new(Text::from_lines(lines.to_vec())).id(format!("{id}.content")),
@@ -426,8 +426,8 @@ fn render_navigation_with_state(cx: &mut PaintCx<'_, '_>, demo: &NavigationDemo)
     let component = ScrollViewComponent::new(
         "navigation.scroll",
         bmux_tui::component::LogicalSize::new(
-            area.width.saturating_sub(1),
-            usize::from(area.height),
+            u64::from(area.width.saturating_sub(1)),
+            u64::try_from(usize::from(area.height)).unwrap_or(u64::MAX),
         ),
         demo.scroll,
         TextBlock::new(Text::from_lines(lines)).id("navigation.scroll.content"),
@@ -475,8 +475,8 @@ fn render_navigation_with_state(cx: &mut PaintCx<'_, '_>, demo: &NavigationDemo)
             ScrollViewComponent::new(
                 "navigation.scroll-pane.viewport",
                 bmux_tui::component::LogicalSize::new(
-                    content_area.width,
-                    usize::from(content_area.height),
+                    u64::from(content_area.width),
+                    u64::try_from(usize::from(content_area.height)).unwrap_or(u64::MAX),
                 ),
                 demo.pane_scroll,
                 TextBlock::new(Text::from_lines(pane_lines)).id("navigation.scroll-pane.content"),

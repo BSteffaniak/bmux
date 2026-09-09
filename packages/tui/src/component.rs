@@ -20,19 +20,19 @@ use crate::paint::PaintCx;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct LogicalRect {
     /// Horizontal origin in logical cells.
-    pub x: usize,
+    pub x: u64,
     /// Vertical origin in logical rows.
-    pub y: usize,
+    pub y: u64,
     /// Width in logical cells.
-    pub width: usize,
+    pub width: u64,
     /// Height in logical rows.
-    pub height: usize,
+    pub height: u64,
 }
 
 impl LogicalRect {
     /// Create a logical rectangle.
     #[must_use]
-    pub const fn new(x: usize, y: usize, width: usize, height: usize) -> Self {
+    pub const fn new(x: u64, y: u64, width: u64, height: u64) -> Self {
         Self {
             x,
             y,
@@ -44,37 +44,36 @@ impl LogicalRect {
 
 /// Logical component size.
 ///
-/// Width is bounded by terminal cell coordinates. Height remains logical so a
-/// scrollable document can exceed the visible terminal coordinate range.
+/// Both axes remain logical so scrollable content can exceed terminal coordinates.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct LogicalSize {
-    /// Width in terminal cells.
-    pub width: u16,
+    /// Width in logical cells.
+    pub width: u64,
     /// Height in logical terminal rows.
-    pub height: usize,
+    pub height: u64,
 }
 
 impl LogicalSize {
     /// Create a logical size.
     #[must_use]
-    pub const fn new(width: u16, height: usize) -> Self {
+    pub const fn new(width: u64, height: u64) -> Self {
         Self { width, height }
     }
 
     /// Create a terminal-sized logical size.
     #[must_use]
     pub const fn terminal(size: Size) -> Self {
-        Self::new(size.width, size.height as usize)
+        Self::new(size.width as u64, size.height as u64)
     }
 }
 
 /// Normalized minimum and maximum dimensions supplied to component layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Constraints {
-    min_width: u16,
-    max_width: u16,
-    min_height: usize,
-    max_height: Option<usize>,
+    min_width: u64,
+    max_width: u64,
+    min_height: u64,
+    max_height: Option<u64>,
 }
 
 impl Constraints {
@@ -82,10 +81,10 @@ impl Constraints {
     /// maxima when a caller supplies an inverted range.
     #[must_use]
     pub const fn new(
-        min_width: u16,
-        max_width: u16,
-        min_height: usize,
-        max_height: Option<usize>,
+        min_width: u64,
+        max_width: u64,
+        min_height: u64,
+        max_height: Option<u64>,
     ) -> Self {
         let min_width = if min_width > max_width {
             max_width
@@ -108,46 +107,46 @@ impl Constraints {
     #[must_use]
     pub const fn tight(size: Size) -> Self {
         Self::new(
-            size.width,
-            size.width,
-            size.height as usize,
-            Some(size.height as usize),
+            size.width as u64,
+            size.width as u64,
+            size.height as u64,
+            Some(size.height as u64),
         )
     }
 
     /// Permit any height at one exact width.
     #[must_use]
-    pub const fn for_width(width: u16) -> Self {
+    pub const fn for_width(width: u64) -> Self {
         Self::new(width, width, 0, None)
     }
 
     /// Permit any size up to a terminal size.
     #[must_use]
     pub const fn loose(size: Size) -> Self {
-        Self::new(0, size.width, 0, Some(size.height as usize))
+        Self::new(0, size.width as u64, 0, Some(size.height as u64))
     }
 
     /// Minimum width.
     #[must_use]
-    pub const fn min_width(self) -> u16 {
+    pub const fn min_width(self) -> u64 {
         self.min_width
     }
 
     /// Maximum width.
     #[must_use]
-    pub const fn max_width(self) -> u16 {
+    pub const fn max_width(self) -> u64 {
         self.max_width
     }
 
     /// Minimum logical height.
     #[must_use]
-    pub const fn min_height(self) -> usize {
+    pub const fn min_height(self) -> u64 {
         self.min_height
     }
 
     /// Maximum logical height, or `None` when height is unbounded.
     #[must_use]
-    pub const fn max_height(self) -> Option<usize> {
+    pub const fn max_height(self) -> Option<u64> {
         self.max_height
     }
 
@@ -164,7 +163,7 @@ impl Constraints {
 
     /// Return constraints for content inside fixed terminal-cell insets.
     #[must_use]
-    pub const fn inset(self, horizontal: u16, vertical: usize) -> Self {
+    pub const fn inset(self, horizontal: u64, vertical: u64) -> Self {
         Self::new(
             self.min_width.saturating_sub(horizontal),
             self.max_width.saturating_sub(horizontal),
@@ -246,9 +245,9 @@ const fn combine_revision(parent: u64, child: u64) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildLayout {
     /// Logical child column relative to its parent.
-    pub x: usize,
+    pub x: u64,
     /// Logical child row relative to its parent.
-    pub y: usize,
+    pub y: u64,
     /// Child layout.
     pub node: LayoutNode,
 }
@@ -256,7 +255,7 @@ pub struct ChildLayout {
 impl ChildLayout {
     /// Create a child placement.
     #[must_use]
-    pub const fn new(x: usize, y: usize, node: LayoutNode) -> Self {
+    pub const fn new(x: u64, y: u64, node: LayoutNode) -> Self {
         Self { x, y, node }
     }
 }
@@ -359,14 +358,9 @@ impl LayoutNode {
         self.find_logical_rect_at(id, 0, 0)
     }
 
-    fn find_logical_rect_at(&self, id: &LayoutId, x: usize, y: usize) -> Option<LogicalRect> {
+    fn find_logical_rect_at(&self, id: &LayoutId, x: u64, y: u64) -> Option<LogicalRect> {
         if &self.id == id {
-            return Some(LogicalRect::new(
-                x,
-                y,
-                usize::from(self.size.width),
-                self.size.height,
-            ));
+            return Some(LogicalRect::new(x, y, self.size.width, self.size.height));
         }
         self.children.iter().find_map(|child| {
             child.node.find_logical_rect_at(
@@ -387,7 +381,7 @@ impl LayoutNode {
         self.find_rect_at(id, 0, 0)
     }
 
-    fn find_rect_at(&self, id: &LayoutId, x: u16, y: usize) -> Option<Rect> {
+    fn find_rect_at(&self, id: &LayoutId, x: u16, y: u64) -> Option<Rect> {
         if &self.id == id {
             return Some(self.terminal_rect(x, u16::try_from(y).unwrap_or(u16::MAX)));
         }
@@ -407,7 +401,7 @@ impl LayoutNode {
         Rect::new(
             x,
             y,
-            self.size.width,
+            u16::try_from(self.size.width).unwrap_or(u16::MAX),
             u16::try_from(self.size.height).unwrap_or(u16::MAX),
         )
     }
@@ -444,8 +438,8 @@ pub struct EventCx<'a> {
     root: &'a LayoutNode,
     translation_x: i32,
     translation_y: i64,
-    logical_x: usize,
-    logical_y: usize,
+    logical_x: u64,
+    logical_y: u64,
     clip: Option<Rect>,
 }
 
@@ -505,12 +499,7 @@ impl<'a> EventCx<'a> {
         let dx = i32::try_from(child.x).unwrap_or(i32::MAX);
         let dy = i64::try_from(child.y).unwrap_or(i64::MAX);
         let clip = translate_logical_rect(
-            LogicalRect::new(
-                0,
-                0,
-                usize::from(child.node.size.width),
-                child.node.size.height,
-            ),
+            LogicalRect::new(0, 0, child.node.size.width, child.node.size.height),
             self.translation_x.saturating_add(dx),
             self.translation_y.saturating_add(dy),
         );
@@ -520,8 +509,8 @@ impl<'a> EventCx<'a> {
     /// Route a transformed child event with a terminal-space clip.
     pub fn with_transform<R>(
         &mut self,
-        logical_x: usize,
-        logical_y: usize,
+        logical_x: u64,
+        logical_y: u64,
         dx: i32,
         dy: i64,
         clip: Rect,

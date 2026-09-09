@@ -188,7 +188,10 @@ impl Component for KeyHintBarComponent<'_> {
         cx.record_measurement();
         let width = u16::try_from(display_width(&self.bar.text())).unwrap_or(u16::MAX);
         let height = usize::from(!self.bar.hints.is_empty());
-        let size = constraints.constrain(LogicalSize::new(width, height));
+        let size = constraints.constrain(LogicalSize::new(
+            width.into(),
+            height.try_into().unwrap_or(u64::MAX),
+        ));
         let children = if self.bar.policy.background {
             vec![bmux_tui::component::ChildLayout::new(
                 0,
@@ -218,27 +221,28 @@ impl Component for KeyHintBarComponent<'_> {
         }
         let text = self.bar.text();
         if matches!(self.bar.policy.overflow, KeyHintOverflow::Hide)
-            && display_width(&text) > usize::from(layout.size.width)
+            && display_width(&text) > usize::try_from(layout.size.width).unwrap_or(usize::MAX)
         {
             return;
         }
-        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        let area = LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         if let Some(surface) = layout.children.first() {
             bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
                 .background(self.bar.styles.background)
                 .paint(&surface.node, cx);
         }
-        let line = if display_width(&text) > usize::from(layout.size.width) {
-            self.bar
-                .styled_line()
-                .truncate(usize::from(layout.size.width))
-        } else {
-            self.bar.styled_line()
-        };
+        let line =
+            if display_width(&text) > usize::try_from(layout.size.width).unwrap_or(usize::MAX) {
+                self.bar
+                    .styled_line()
+                    .truncate(usize::try_from(layout.size.width).unwrap_or(usize::MAX))
+            } else {
+                self.bar.styled_line()
+            };
         cx.write_line_with_fallback_style(area, &line, self.bar.styles.background);
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
+            Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             "hint",
         ));
         cx.push_damage(area);

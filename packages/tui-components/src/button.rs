@@ -218,7 +218,7 @@ impl Component for ButtonComponent<'_, '_> {
         cx.record_measurement();
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(self.button.width(), 1)),
+            constraints.constrain(LogicalSize::new(self.button.width().into(), 1)),
         )
         .with_metadata(LayoutMetadata::new().semantic("button"))
     }
@@ -232,21 +232,32 @@ impl Component for ButtonComponent<'_, '_> {
             format!("[ {} ]", self.button.label),
             self.button.style_for(state),
         )]);
-        cx.write_line(LocalRect::new(0, 0, layout.size.width, 1), &line);
+        cx.write_line(
+            LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
+            &line,
+        );
         cx.push_hit(
-            SceneRegion::new(self.id.as_str(), Rect::new(0, 0, layout.size.width, 1))
-                .role(HitRole::Action)
-                .pointer_events(self.button.policy.mouse.enabled)
-                .hoverable(self.button.policy.mouse.enabled && self.button.policy.mouse.hover)
-                .focusable(true)
-                .enabled(!state.interaction.disabled),
+            SceneRegion::new(
+                self.id.as_str(),
+                Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
+            )
+            .role(HitRole::Action)
+            .pointer_events(self.button.policy.mouse.enabled)
+            .hoverable(self.button.policy.mouse.enabled && self.button.policy.mouse.hover)
+            .focusable(true)
+            .enabled(!state.interaction.disabled),
         );
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
+            Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             "button",
         ));
-        cx.push_damage(LocalRect::new(0, 0, layout.size.width, 1));
+        cx.push_damage(LocalRect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            1,
+        ));
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
@@ -257,7 +268,7 @@ impl Component for ButtonComponent<'_, '_> {
             .visible_rect(bmux_tui::component::LogicalRect::new(
                 0,
                 0,
-                usize::from(layout.size.width),
+                layout.size.width,
                 1,
             ))
             .intersection(area);

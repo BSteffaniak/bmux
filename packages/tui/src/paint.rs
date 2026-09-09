@@ -169,7 +169,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
             .x
             .saturating_sub(offset_x)
             .saturating_add(i32::from(area.width))
-            .min(i32::from(size.width));
+            .min(i32::try_from(size.width).unwrap_or(i32::MAX));
         let width = u16::try_from(right.saturating_sub(left)).unwrap_or(0);
         let top = area.y.saturating_sub(offset_y).max(0);
         let bottom = area

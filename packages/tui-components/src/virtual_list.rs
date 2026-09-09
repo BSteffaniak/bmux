@@ -310,12 +310,14 @@ where
                         item_layout_id(&self.id, key),
                         item.component.as_component(),
                         item.layout_revision,
-                        Constraints::for_width(width),
+                        Constraints::for_width(width.into()),
                         environment,
                         cx,
                     )
                     .size
                     .height
+                    .try_into()
+                    .unwrap_or(usize::MAX)
             },
         );
         state.layouts.retain_ids(&active);
@@ -362,12 +364,15 @@ where
                 continue;
             };
             let layout_id = item_layout_id(&self.id, &item.key);
-            let constraints = Constraints::for_width(area.width);
+            let constraints = Constraints::for_width(area.width.into());
             let layout = state
                 .layouts
                 .get(&layout_id, item.layout_revision, constraints)
                 .expect("visible synchronized item must have retained layout");
-            debug_assert_eq!(layout.size.height, measured.height);
+            debug_assert_eq!(
+                layout.size.height,
+                measured.height.try_into().unwrap_or(u64::MAX)
+            );
             let local_y = i64::try_from(start)
                 .unwrap_or(i64::MAX)
                 .saturating_sub(i64::try_from(offset).unwrap_or(i64::MAX));
@@ -420,9 +425,9 @@ where
         let range = state.index.visible_range(offset, usize::from(area.height));
         let viewport = cx.visible_rect(LogicalRect::new(
             area.x.into(),
-            usize::from(area.y),
-            usize::from(area.width),
-            usize::from(area.height),
+            u64::try_from(usize::from(area.y)).unwrap_or(u64::MAX),
+            u64::try_from(usize::from(area.width)).unwrap_or(u64::MAX),
+            u64::try_from(usize::from(area.height)).unwrap_or(u64::MAX),
         ));
         if viewport.is_empty() {
             return EventOutcome::Ignored;
@@ -445,28 +450,31 @@ where
                 continue;
             };
             let layout_id = item_layout_id(&self.id, &item.key);
-            let constraints = Constraints::for_width(area.width);
+            let constraints = Constraints::for_width(area.width.into());
             let layout = state
                 .layouts
                 .get(&layout_id, item.layout_revision, constraints)
                 .expect("visible synchronized item must have retained layout");
-            debug_assert_eq!(layout.size.height, measured.height);
+            debug_assert_eq!(
+                layout.size.height,
+                measured.height.try_into().unwrap_or(u64::MAX)
+            );
             let local_y = i64::try_from(start)
                 .unwrap_or(i64::MAX)
                 .saturating_sub(i64::try_from(offset).unwrap_or(i64::MAX));
             let local_area = translated_item_area(area, local_y, measured.height);
             let item_area = cx.visible_rect(LogicalRect::new(
                 local_area.x.into(),
-                usize::from(local_area.y),
-                usize::from(local_area.width),
-                usize::from(local_area.height),
+                u64::try_from(usize::from(local_area.y)).unwrap_or(u64::MAX),
+                u64::try_from(usize::from(local_area.width)).unwrap_or(u64::MAX),
+                u64::try_from(usize::from(local_area.height)).unwrap_or(u64::MAX),
             ));
             if item_area.is_empty() || pointer.is_some_and(|point| !item_area.contains(point)) {
                 continue;
             }
             let outcome = cx.with_transform(
                 0,
-                start,
+                start.try_into().unwrap_or(u64::MAX),
                 i32::from(area.x),
                 i64::from(area.y).saturating_add(local_y),
                 item_area,
@@ -738,7 +746,10 @@ mod tests {
             cx.record_measurement();
             LayoutNode::leaf(
                 LayoutId::new("revised-height"),
-                constraints.constrain(LogicalSize::new(constraints.max_width(), self.height)),
+                constraints.constrain(LogicalSize::new(
+                    constraints.max_width(),
+                    self.height.try_into().unwrap_or(u64::MAX),
+                )),
             )
         }
 
@@ -756,20 +767,33 @@ mod tests {
             cx.record_measurement();
             LayoutNode::leaf(
                 LayoutId::new(self.id),
-                constraints.constrain(LogicalSize::new(constraints.max_width(), self.height)),
+                constraints.constrain(LogicalSize::new(
+                    constraints.max_width(),
+                    self.height.try_into().unwrap_or(u64::MAX),
+                )),
             )
         }
 
         fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
             let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
             cx.fill(
-                LocalRect::new(0, 0, layout.size.width, height),
+                LocalRect::new(
+                    0,
+                    0,
+                    layout.size.width.try_into().unwrap_or(u16::MAX),
+                    height,
+                ),
                 self.id,
                 Style::new(),
             );
             cx.push_selection_scope(SelectionScope::new(
                 format!("scope:{}", self.id),
-                Rect::new(0, 0, layout.size.width, height),
+                Rect::new(
+                    0,
+                    0,
+                    layout.size.width.try_into().unwrap_or(u16::MAX),
+                    height,
+                ),
             ));
             cx.push_selection_fragment(SelectionFragment::new(
                 format!("scope:{}", self.id),
@@ -786,13 +810,23 @@ mod tests {
                     height: 1,
                 },
                 destination: Rect::new(1, 0, 2, height),
-                clip: Rect::new(0, 0, layout.size.width, height),
+                clip: Rect::new(
+                    0,
+                    0,
+                    layout.size.width.try_into().unwrap_or(u16::MAX),
+                    height,
+                ),
                 lifecycle: ImageLifecycle::Frame,
             }));
             if let Some(row) = self.cursor_row {
                 cx.set_cursor(Point::new(2, row), true);
             }
-            cx.push_damage(LocalRect::new(0, 0, layout.size.width, height));
+            cx.push_damage(LocalRect::new(
+                0,
+                0,
+                layout.size.width.try_into().unwrap_or(u16::MAX),
+                height,
+            ));
         }
 
         fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
@@ -1002,7 +1036,10 @@ mod tests {
             cx.record_measurement();
             LayoutNode::leaf(
                 LayoutId::new(self.id),
-                constraints.constrain(LogicalSize::new(constraints.max_width(), self.height)),
+                constraints.constrain(LogicalSize::new(
+                    constraints.max_width(),
+                    self.height.try_into().unwrap_or(u64::MAX),
+                )),
             )
         }
 

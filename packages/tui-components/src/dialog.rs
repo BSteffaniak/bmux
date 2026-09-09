@@ -77,16 +77,23 @@ impl Component for DialogContent<'_, '_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let action_height =
-            usize::from(self.actions.is_some()).min(constraints.max_height().unwrap_or(usize::MAX));
+        let action_height = usize::from(self.actions.is_some()).min(
+            constraints
+                .max_height()
+                .unwrap_or(u64::MAX)
+                .try_into()
+                .unwrap_or(usize::MAX),
+        );
         let body = self.body.layout(
             Constraints::new(
                 constraints.min_width(),
                 constraints.max_width(),
-                constraints.min_height().saturating_sub(action_height),
                 constraints
-                    .max_height()
-                    .map(|height| height.saturating_sub(action_height)),
+                    .min_height()
+                    .saturating_sub(action_height.try_into().unwrap_or(u64::MAX)),
+                constraints.max_height().map(|height| {
+                    height.saturating_sub(action_height.try_into().unwrap_or(u64::MAX))
+                }),
             ),
             cx,
         );
@@ -95,8 +102,8 @@ impl Component for DialogContent<'_, '_> {
                 Constraints::new(
                     0,
                     constraints.max_width(),
-                    action_height,
-                    Some(action_height),
+                    action_height.try_into().unwrap_or(u64::MAX),
+                    Some(action_height.try_into().unwrap_or(u64::MAX)),
                 ),
                 cx,
             )
@@ -109,7 +116,12 @@ impl Component for DialogContent<'_, '_> {
         let mut children = vec![ChildLayout::new(0, 0, body)];
         if let Some(actions) = &self.actions {
             let actions = actions.layout(
-                Constraints::new(width, width, action_height, Some(action_height)),
+                Constraints::new(
+                    width,
+                    width,
+                    action_height.try_into().unwrap_or(u64::MAX),
+                    Some(action_height.try_into().unwrap_or(u64::MAX)),
+                ),
                 cx,
             );
             let y = children[0].node.size.height;

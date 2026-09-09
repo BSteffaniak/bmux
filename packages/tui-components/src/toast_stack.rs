@@ -279,7 +279,10 @@ impl Component for ToastStackComponent<'_, '_> {
             .policy
             .width
             .min(u16::try_from(content_width).unwrap_or(u16::MAX))
-            .clamp(constraints.min_width(), constraints.max_width());
+            .clamp(
+                constraints.min_width().try_into().unwrap_or(u16::MAX),
+                constraints.max_width().try_into().unwrap_or(u16::MAX),
+            );
         let content_height = self
             .stack
             .toasts
@@ -292,7 +295,10 @@ impl Component for ToastStackComponent<'_, '_> {
             );
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, content_height)),
+            constraints.constrain(LogicalSize::new(
+                width.into(),
+                content_height.try_into().unwrap_or(u64::MAX),
+            )),
         )
         .with_metadata(LayoutMetadata::new().semantic("notifications"))
     }
@@ -304,7 +310,7 @@ impl Component for ToastStackComponent<'_, '_> {
         let area = Rect::new(
             0,
             0,
-            layout.size.width,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
             u16::try_from(layout.size.height).unwrap_or(u16::MAX),
         );
         for (index, toast) in self

@@ -386,7 +386,7 @@ impl<'a, 'state> TextViewComponent<'a, 'state> {
                     LocalRect::new(
                         i32::try_from(x).unwrap_or(i32::MAX),
                         i64::try_from(y).unwrap_or(i64::MAX),
-                        viewport.size.width,
+                        viewport.size.width.try_into().unwrap_or(u16::MAX),
                         u16::try_from(viewport.size.height).unwrap_or(u16::MAX),
                     ),
                     |cx| {
@@ -491,27 +491,39 @@ impl Component for TextViewComponent<'_, '_> {
         let width = constraints.max_width();
         // Gutter reservation depends only on policy and outer width, so resolve
         // it against a tall probe rectangle before the height is known.
-        let probe = scroll_view.content_area(Rect::new(0, 0, width, u16::MAX));
+        let probe = scroll_view.content_area(Rect::new(
+            0,
+            0,
+            width.try_into().unwrap_or(u16::MAX),
+            u16::MAX,
+        ));
         let content_width = self.natural_content_width(probe.width);
         // Measure the content exactly once at its content width. Loose parents
         // size this view intrinsically from that height; tight parents clamp it.
         let content = self
             .text_block()
-            .layout(Constraints::for_width(content_width), cx);
+            .layout(Constraints::for_width(content_width.into()), cx);
         let gutter_rows = usize::from(u16::MAX.saturating_sub(probe.height));
         let size = constraints.constrain(LogicalSize::new(
             width,
-            content.size.height.max(1).saturating_add(gutter_rows),
+            content
+                .size
+                .height
+                .max(1)
+                .saturating_add(gutter_rows.try_into().unwrap_or(u64::MAX)),
         ));
         let content_area = scroll_view.content_area(local_area_of(size));
         let viewport = ScrollViewComponent::viewport_layout(
             self.viewport_id(),
-            LogicalSize::new(content_area.width, usize::from(content_area.height)),
+            LogicalSize::new(
+                content_area.width.into(),
+                u64::try_from(usize::from(content_area.height)).unwrap_or(u64::MAX),
+            ),
             content,
         );
         let mut children = vec![ChildLayout::new(
-            usize::from(content_area.x),
-            usize::from(content_area.y),
+            u64::try_from(usize::from(content_area.x)).unwrap_or(u64::MAX),
+            u64::try_from(usize::from(content_area.y)).unwrap_or(u64::MAX),
             viewport,
         )];
         if self.policy.background {

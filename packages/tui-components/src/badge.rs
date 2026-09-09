@@ -246,7 +246,7 @@ impl Component for BadgeComponent<'_> {
             u16::try_from(bmux_tui::text_width::display_width(&self.text())).unwrap_or(u16::MAX);
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, 1)),
+            constraints.constrain(LogicalSize::new(width.into(), 1)),
         )
         .with_metadata(LayoutMetadata::new().semantic("status"))
     }
@@ -256,14 +256,16 @@ impl Component for BadgeComponent<'_> {
             return;
         }
         let mut line = Line::from_spans([Span::styled(self.text(), self.style())]);
-        if self.policy.truncate && line.width() > usize::from(layout.size.width) {
-            line = line.truncate(usize::from(layout.size.width));
+        if self.policy.truncate
+            && line.width() > usize::try_from(layout.size.width).unwrap_or(usize::MAX)
+        {
+            line = line.truncate(usize::try_from(layout.size.width).unwrap_or(usize::MAX));
         }
-        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        let area = LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         cx.write_line(area, &line);
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
+            Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             "status",
         ));
         cx.push_damage(area);

@@ -260,18 +260,32 @@ impl Component for TextInputComponent<'_, '_> {
         cx.record_measurement();
         let width = constraints.max_width();
         let state = self.state.borrow();
-        let rows = TextInputControl::new(self.policy).visible_rows_for_width(&state, width);
+        let rows = TextInputControl::new(self.policy)
+            .visible_rows_for_width(&state, width.try_into().unwrap_or(u16::MAX));
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, usize::from(rows))),
+            constraints.constrain(LogicalSize::new(
+                width,
+                u64::try_from(usize::from(rows)).unwrap_or(u64::MAX),
+            )),
         )
         .with_metadata(LayoutMetadata::new().semantic("text-input"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let local = LocalRect::new(0, 0, layout.size.width, height);
-        let area = Rect::new(0, 0, layout.size.width, height);
+        let local = LocalRect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            height,
+        );
+        let area = Rect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            height,
+        );
         let mut state = self.state.borrow_mut();
         state.set_content_area(area, self.policy);
         let wrapped = state.wrapped_layout(area.width);
@@ -1017,10 +1031,13 @@ fn clamped_mouse_col(area: Rect, x: u16) -> usize {
 fn editor_viewport(area: Rect, rows: usize) -> LayoutNode {
     ScrollViewComponent::viewport_layout(
         LayoutId::new("text-input.viewport"),
-        LogicalSize::new(area.width, usize::from(area.height)),
+        LogicalSize::new(
+            area.width.into(),
+            u64::try_from(usize::from(area.height)).unwrap_or(u64::MAX),
+        ),
         LayoutNode::leaf(
             LayoutId::new("text-input.content"),
-            LogicalSize::new(area.width, rows),
+            LogicalSize::new(area.width.into(), rows.try_into().unwrap_or(u64::MAX)),
         ),
     )
 }

@@ -502,7 +502,7 @@ impl Component for Chart<'_> {
             Rect::new(
                 0,
                 0,
-                layout.size.width,
+                layout.size.width.try_into().unwrap_or(u16::MAX),
                 u16::try_from(layout.size.height).unwrap_or(u16::MAX),
             ),
             cx,

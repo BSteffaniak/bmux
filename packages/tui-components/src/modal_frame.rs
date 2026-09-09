@@ -220,8 +220,8 @@ impl ModalFrame {
         }
         let child = SizeBox::new(Stack::new())
             .id("modal.area.content")
-            .min_width(u16::MAX)
-            .min_height(usize::from(u16::MAX));
+            .min_width(u16::MAX.into())
+            .min_height(u64::try_from(usize::from(u16::MAX)).unwrap_or(u64::MAX));
         let component = ModalFrameComponent::new("modal.area", frame, child);
         let layout = component.layout(Constraints::tight(parent.size()), &mut LayoutCx::new());
         let Some(area) = layout.find_logical_rect(&LayoutId::new(id)) else {
@@ -343,8 +343,8 @@ impl Component for ModalPlacementComponent<'_> {
         ));
         let child = self.child.layout(
             constraints.inset(
-                self.margin.horizontal(),
-                usize::from(self.margin.vertical()),
+                self.margin.horizontal().into(),
+                u64::try_from(usize::from(self.margin.vertical())).unwrap_or(u64::MAX),
             ),
             cx,
         );
@@ -355,15 +355,11 @@ impl Component for ModalPlacementComponent<'_> {
             ModalPlacement::UpperThird => (remaining_x / 2, remaining_y / 3),
             ModalPlacement::LowerThird => (remaining_x / 2, remaining_y.saturating_mul(2) / 3),
             ModalPlacement::Anchored(point) => (
-                point.x.min(remaining_x),
-                usize::from(point.y).min(remaining_y),
+                u64::from(point.x).min(remaining_x),
+                u64::from(point.y).min(remaining_y),
             ),
         };
-        LayoutNode::with_children(
-            self.id.clone(),
-            size,
-            vec![ChildLayout::new(usize::from(x), y, child)],
-        )
+        LayoutNode::with_children(self.id.clone(), size, vec![ChildLayout::new(x, y, child)])
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -376,7 +372,7 @@ impl Component for ModalPlacementComponent<'_> {
             bmux_tui::paint::LocalRect::new(
                 0,
                 0,
-                child.node.size.width,
+                child.node.size.width.try_into().unwrap_or(u16::MAX),
                 u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
             ),
             |cx| self.child.paint(&child.node, cx),
@@ -390,7 +386,7 @@ impl Component for ModalPlacementComponent<'_> {
         let clip = Rect::new(
             u16::try_from(child.x).unwrap_or(u16::MAX),
             u16::try_from(child.y).unwrap_or(u16::MAX),
-            child.node.size.width,
+            child.node.size.width.try_into().unwrap_or(u16::MAX),
             u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
         );
         cx.with_transform(
@@ -458,10 +454,10 @@ impl<'a> ModalFrameComponent<'a> {
         };
         let panel = SizeBox::new(panel)
             .id(format!("{}.size", self.id.as_str()))
-            .min_width(sizing.min.width)
-            .max_width(sizing.max.width)
-            .min_height(usize::from(sizing.min.height))
-            .max_height(usize::from(sizing.max.height));
+            .min_width(sizing.min.width.into())
+            .max_width(sizing.max.width.into())
+            .min_height(u64::try_from(usize::from(sizing.min.height)).unwrap_or(u64::MAX))
+            .max_height(u64::try_from(usize::from(sizing.max.height)).unwrap_or(u64::MAX));
         let placed = ModalPlacementComponent::new(
             format!("{}.placement", self.id.as_str()),
             self.frame.placement,

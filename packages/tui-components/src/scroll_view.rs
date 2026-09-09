@@ -238,7 +238,7 @@ impl<'a> ScrollViewComponent<'a> {
         Self {
             id: id.into(),
             viewport,
-            content_width: viewport.width,
+            content_width: u16::try_from(viewport.width).unwrap_or(u16::MAX),
             offset_x: state.horizontal_offset(),
             offset_y: state.vertical_offset(),
             child: Element::new(child),
@@ -300,16 +300,16 @@ impl<'a> ScrollViewComponent<'a> {
         if let Some(rect) = revealed {
             state.horizontal_offset = self.reveal_axis_offset(
                 state.horizontal_offset,
-                usize::from(layout.size.width),
-                rect.x,
-                rect.width,
+                usize::try_from(layout.size.width).unwrap_or(usize::MAX),
+                rect.x.try_into().unwrap_or(usize::MAX),
+                rect.width.try_into().unwrap_or(usize::MAX),
                 maximum_x,
             );
             state.vertical_offset = self.reveal_axis_offset(
                 state.vertical_offset,
-                layout.size.height,
-                rect.y,
-                rect.height,
+                layout.size.height.try_into().unwrap_or(usize::MAX),
+                rect.y.try_into().unwrap_or(usize::MAX),
+                rect.height.try_into().unwrap_or(usize::MAX),
                 maximum_y,
             );
         }
@@ -379,7 +379,7 @@ impl Component for ScrollViewComponent<'_> {
     ) -> LayoutNode {
         let child = self
             .child
-            .layout(Constraints::for_width(self.content_width), cx);
+            .layout(Constraints::for_width(self.content_width.into()), cx);
         Self::viewport_layout(self.id.clone(), constraints.constrain(self.viewport), child)
     }
 
@@ -422,7 +422,7 @@ impl Component for ScrollViewComponent<'_> {
         let clip = cx.visible_rect(LogicalRect::new(
             0,
             0,
-            usize::from(layout.size.width),
+            layout.size.width,
             layout.size.height,
         ));
         let resolved = self.effective_state(layout);
@@ -438,7 +438,7 @@ impl Component for ScrollViewComponent<'_> {
                 let clip = cx.visible_rect(LogicalRect::new(
                     0,
                     0,
-                    usize::from(child.node.size.width),
+                    child.node.size.width,
                     child.node.size.height,
                 ));
                 if clip.is_empty()
@@ -581,7 +581,7 @@ impl ScrollView {
         if let Some(scrollbar_area) = resolved.vertical_scrollbar {
             let scrollbar = scrollbar_state(
                 content_height(layout),
-                layout.size.height,
+                layout.size.height.try_into().unwrap_or(usize::MAX),
                 state.vertical_offset,
             );
             Scrollbar::new()
@@ -592,7 +592,7 @@ impl ScrollView {
         if let Some(scrollbar_area) = resolved.horizontal_scrollbar {
             let scrollbar = scrollbar_state(
                 content_width(layout),
-                usize::from(layout.size.width),
+                usize::try_from(layout.size.width).unwrap_or(usize::MAX),
                 state.horizontal_offset,
             );
             Scrollbar::new()
@@ -654,7 +654,7 @@ impl ScrollView {
         {
             let mut scrollbar = scrollbar_state(
                 content_height(layout),
-                layout.size.height,
+                layout.size.height.try_into().unwrap_or(usize::MAX),
                 state.vertical_offset,
             );
             scrollbar.dragging = state.dragging == Some(ScrollbarOrientation::Vertical);
@@ -683,7 +683,7 @@ impl ScrollView {
         {
             let mut scrollbar = scrollbar_state(
                 content_width(layout),
-                usize::from(layout.size.width),
+                usize::try_from(layout.size.width).unwrap_or(usize::MAX),
                 state.horizontal_offset,
             );
             scrollbar.dragging = state.dragging == Some(ScrollbarOrientation::Horizontal);
@@ -726,14 +726,21 @@ impl ScrollView {
     #[must_use]
     pub fn max_vertical_offset(layout: &LayoutNode) -> usize {
         layout.children.first().map_or(0, |child| {
-            child.node.size.height.saturating_sub(layout.size.height)
+            child
+                .node
+                .size
+                .height
+                .saturating_sub(layout.size.height)
+                .try_into()
+                .unwrap_or(usize::MAX)
         })
     }
 
     /// Return the maximum logical horizontal offset from an authoritative viewport layout.
     #[must_use]
     pub fn max_horizontal_offset(layout: &LayoutNode) -> usize {
-        content_width(layout).saturating_sub(usize::from(layout.size.width))
+        content_width(layout)
+            .saturating_sub(usize::try_from(layout.size.width).unwrap_or(usize::MAX))
     }
 
     /// Move vertically by a signed logical-row delta and clamp to layout.
@@ -782,7 +789,7 @@ impl ScrollView {
         width: usize,
     ) -> ScrollViewOutcome {
         let old = state.horizontal_offset;
-        let viewport = usize::from(layout.size.width);
+        let viewport = usize::try_from(layout.size.width).unwrap_or(usize::MAX);
         state.horizontal_offset = reveal_offset(old, viewport, start, width);
         state.horizontal_offset = state
             .horizontal_offset
@@ -849,8 +856,13 @@ impl ScrollView {
     ) -> ScrollViewOutcome {
         let old = state.vertical_offset;
         let viewport = layout.size.height;
-        state.vertical_offset =
-            reveal_offset(old, viewport, start, height).min(Self::max_vertical_offset(layout));
+        state.vertical_offset = reveal_offset(
+            old,
+            viewport.try_into().unwrap_or(usize::MAX),
+            start,
+            height,
+        )
+        .min(Self::max_vertical_offset(layout));
         if state.vertical_offset != old {
             state.follow_bottom = false;
         }
@@ -890,7 +902,14 @@ impl ScrollView {
             return ScrollViewOutcome::Ignored;
         };
         let old = state.vertical_offset;
-        state.vertical_offset = rect.y.min(Self::max_vertical_offset(layout));
+        state.vertical_offset = usize::try_from(
+            rect.y.min(
+                Self::max_vertical_offset(layout)
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            ),
+        )
+        .unwrap_or(usize::MAX);
         state.follow_bottom = false;
         outcome(old, state.vertical_offset)
     }
@@ -906,8 +925,18 @@ impl ScrollView {
         let Some(rect) = layout.find_logical_rect(id) else {
             return ScrollViewOutcome::Ignored;
         };
-        let horizontal = Self::ensure_horizontal_visible(layout, state, rect.x, rect.width);
-        let vertical = self.ensure_visible(layout, state, rect.y, rect.height);
+        let horizontal = Self::ensure_horizontal_visible(
+            layout,
+            state,
+            rect.x.try_into().unwrap_or(usize::MAX),
+            rect.width.try_into().unwrap_or(usize::MAX),
+        );
+        let vertical = self.ensure_visible(
+            layout,
+            state,
+            rect.y.try_into().unwrap_or(usize::MAX),
+            rect.height.try_into().unwrap_or(usize::MAX),
+        );
         if vertical == ScrollViewOutcome::Ignored {
             horizontal
         } else {
@@ -925,8 +954,14 @@ impl ScrollView {
         let rect = layout.find_logical_rect(id)?;
         Some(ScrollAnchor {
             id: id.clone(),
-            viewport_column: signed_difference(rect.x, state.horizontal_offset),
-            viewport_row: signed_difference(rect.y, state.vertical_offset),
+            viewport_column: signed_difference(
+                rect.x.try_into().unwrap_or(usize::MAX),
+                state.horizontal_offset,
+            ),
+            viewport_row: signed_difference(
+                rect.y.try_into().unwrap_or(usize::MAX),
+                state.vertical_offset,
+            ),
         })
     }
 
@@ -943,10 +978,14 @@ impl ScrollView {
         };
         let old = state.vertical_offset;
         let old_horizontal = state.horizontal_offset;
-        state.horizontal_offset = offset_for_viewport_row(rect.x, anchor.viewport_column)
-            .min(Self::max_horizontal_offset(layout));
-        state.vertical_offset = offset_for_viewport_row(rect.y, anchor.viewport_row)
-            .min(Self::max_vertical_offset(layout));
+        state.horizontal_offset = offset_for_viewport_row(
+            rect.x.try_into().unwrap_or(usize::MAX),
+            anchor.viewport_column,
+        )
+        .min(Self::max_horizontal_offset(layout));
+        state.vertical_offset =
+            offset_for_viewport_row(rect.y.try_into().unwrap_or(usize::MAX), anchor.viewport_row)
+                .min(Self::max_vertical_offset(layout));
         let vertical = outcome(old, state.vertical_offset);
         if vertical == ScrollViewOutcome::Ignored && old_horizontal != state.horizontal_offset {
             ScrollViewOutcome::HorizontalScrolled {
@@ -1002,7 +1041,12 @@ impl ScrollView {
         let old_horizontal = state.horizontal_offset;
         match event {
             Event::Key(stroke) if self.policy.keyboard && state.interaction.focused => {
-                if !Self::handle_key(*stroke, layout.size.height, maximum, state) {
+                if !Self::handle_key(
+                    *stroke,
+                    layout.size.height.try_into().unwrap_or(usize::MAX),
+                    maximum,
+                    state,
+                ) {
                     return ScrollViewOutcome::Ignored;
                 }
             }
@@ -1121,17 +1165,15 @@ pub(crate) fn scrollbar_state(total: usize, viewport: usize, offset: usize) -> S
 }
 
 fn content_height(layout: &LayoutNode) -> usize {
-    layout
-        .children
-        .first()
-        .map_or(0, |child| child.node.size.height)
+    layout.children.first().map_or(0, |child| {
+        child.node.size.height.try_into().unwrap_or(usize::MAX)
+    })
 }
 
 fn content_width(layout: &LayoutNode) -> usize {
-    layout
-        .children
-        .first()
-        .map_or(0, |child| usize::from(child.node.size.width))
+    layout.children.first().map_or(0, |child| {
+        usize::try_from(child.node.size.width).unwrap_or(usize::MAX)
+    })
 }
 
 fn logical_offset_from_scrollbar(
@@ -1581,7 +1623,7 @@ mod tests {
         ] {
             let component = ScrollViewComponent::new(
                 "scroll",
-                LogicalSize::new(1, usize::from(height)),
+                LogicalSize::new(1, u64::from(height)),
                 retained.get(),
                 TextBlock::new(text),
             )
@@ -2029,7 +2071,7 @@ mod tests {
     fn reconcile_clamps_both_logical_axes_without_terminal_saturation() {
         let content = LayoutNode::leaf(
             LayoutId::new("content"),
-            LogicalSize::new(u16::MAX, 100_000),
+            LogicalSize::new(u16::MAX.into(), 100_000),
         );
         let layout = LayoutNode::with_children(
             LayoutId::new("scroll"),
@@ -2069,13 +2111,13 @@ mod tests {
     fn layout(content_height: usize, viewport_height: usize) -> LayoutNode {
         LayoutNode::with_children(
             LayoutId::new("viewport"),
-            LogicalSize::new(10, viewport_height),
+            LogicalSize::new(10, viewport_height.try_into().unwrap_or(u64::MAX)),
             vec![ChildLayout::new(
                 0,
                 0,
                 LayoutNode::leaf(
                     LayoutId::new("content"),
-                    LogicalSize::new(10, content_height),
+                    LogicalSize::new(10, content_height.try_into().unwrap_or(u64::MAX)),
                 ),
             )],
         )
@@ -2266,7 +2308,7 @@ mod tests {
                 LogicalSize::new(10, 5),
                 LayoutNode::with_children(
                     "content".into(),
-                    LogicalSize::new(10, height),
+                    LogicalSize::new(10, height.try_into().unwrap_or(u64::MAX)),
                     vec![ChildLayout::new(
                         0,
                         15,
@@ -2349,7 +2391,11 @@ mod tests {
             let content = LayoutNode::with_children(
                 LayoutId::new("content"),
                 LogicalSize::new(10, 100_000),
-                vec![ChildLayout::new(0, target_row, target)],
+                vec![ChildLayout::new(
+                    0,
+                    target_row.try_into().unwrap_or(u64::MAX),
+                    target,
+                )],
             );
             LayoutNode::with_children(
                 LayoutId::new("viewport"),

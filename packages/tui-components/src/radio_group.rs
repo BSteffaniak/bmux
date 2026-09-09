@@ -286,25 +286,31 @@ impl RadioGroupComponent<'_, '_> {
             cx.visible_rect(bmux_tui::component::LogicalRect::new(
                 0,
                 index,
-                usize::from(layout.size.width),
+                layout.size.width,
                 1,
             ))
         };
-        let count = self.group.options.len().min(layout.size.height);
+        let count = self
+            .group
+            .options
+            .len()
+            .min(layout.size.height.try_into().unwrap_or(usize::MAX));
         let mut low = 0;
         let mut high = count;
         // Projected row bottoms are monotonic, including rows clipped above
         // the viewport. Find the first row extending below the pointer.
         while low < high {
             let middle = low + (high - low) / 2;
-            if row_rect(middle).bottom() <= position.y {
+            if row_rect(middle.try_into().unwrap_or(u64::MAX)).bottom() <= position.y {
                 low = middle + 1;
             } else {
                 high = middle;
             }
         }
-        (low < count && self.group.is_enabled_option(low) && row_rect(low).contains(position))
-            .then_some(low)
+        (low < count
+            && self.group.is_enabled_option(low)
+            && row_rect(low.try_into().unwrap_or(u64::MAX)).contains(position))
+        .then_some(low)
     }
 }
 
@@ -343,7 +349,10 @@ impl Component for RadioGroupComponent<'_, '_> {
             .unwrap_or_default();
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, self.group.options.len())),
+            constraints.constrain(LogicalSize::new(
+                width.into(),
+                self.group.options.len().try_into().unwrap_or(u64::MAX),
+            )),
         )
         .with_metadata(LayoutMetadata::new().semantic("radio-group"))
     }
@@ -357,29 +366,34 @@ impl Component for RadioGroupComponent<'_, '_> {
         let start = usize::try_from(viewport.y.max(0)).unwrap_or(usize::MAX);
         let end = usize::try_from(viewport.y.saturating_add(i64::from(viewport.height)).max(0))
             .unwrap_or(usize::MAX)
-            .min(layout.size.height)
+            .min(layout.size.height.try_into().unwrap_or(usize::MAX))
             .min(self.group.options.len());
         for index in start..end {
             let option = &self.group.options[index];
             let row = i64::try_from(index).unwrap_or(i64::MAX);
-            cx.with_child(0, row, LocalRect::new(0, 0, layout.size.width, 1), |cx| {
-                cx.write_line_with_fallback_style(
-                    LocalRect::new(0, 0, layout.size.width, 1),
-                    &self.group.line(index, option, state),
-                    self.fallback,
-                );
-                cx.push_hit(
-                    SceneRegion::new(
-                        format!("{}:{}", self.id.as_str(), option.id),
-                        Rect::new(0, 0, layout.size.width, 1),
-                    )
-                    .role(HitRole::Action)
-                    .pointer_events(self.group.policy.mouse.enabled)
-                    .hoverable(self.group.policy.mouse.enabled && self.group.policy.mouse.hover)
-                    .focusable(true)
-                    .enabled(!state.interaction.disabled && !option.disabled),
-                );
-            });
+            cx.with_child(
+                0,
+                row,
+                LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
+                |cx| {
+                    cx.write_line_with_fallback_style(
+                        LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
+                        &self.group.line(index, option, state),
+                        self.fallback,
+                    );
+                    cx.push_hit(
+                        SceneRegion::new(
+                            format!("{}:{}", self.id.as_str(), option.id),
+                            Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
+                        )
+                        .role(HitRole::Action)
+                        .pointer_events(self.group.policy.mouse.enabled)
+                        .hoverable(self.group.policy.mouse.enabled && self.group.policy.mouse.hover)
+                        .focusable(true)
+                        .enabled(!state.interaction.disabled && !option.disabled),
+                    );
+                },
+            );
         }
         if start >= end {
             return;
@@ -388,14 +402,29 @@ impl Component for RadioGroupComponent<'_, '_> {
         cx.with_child(
             0,
             i64::try_from(start).unwrap_or(i64::MAX),
-            LocalRect::new(0, 0, layout.size.width, height),
+            LocalRect::new(
+                0,
+                0,
+                layout.size.width.try_into().unwrap_or(u16::MAX),
+                height,
+            ),
             |cx| {
                 cx.push_semantic(SemanticRegion::new(
                     self.id.as_str(),
-                    Rect::new(0, 0, layout.size.width, height),
+                    Rect::new(
+                        0,
+                        0,
+                        layout.size.width.try_into().unwrap_or(u16::MAX),
+                        height,
+                    ),
                     "radio-group",
                 ));
-                cx.push_damage(LocalRect::new(0, 0, layout.size.width, height));
+                cx.push_damage(LocalRect::new(
+                    0,
+                    0,
+                    layout.size.width.try_into().unwrap_or(u16::MAX),
+                    height,
+                ));
             },
         );
     }
@@ -408,8 +437,13 @@ impl Component for RadioGroupComponent<'_, '_> {
             .visible_rect(bmux_tui::component::LogicalRect::new(
                 0,
                 0,
-                usize::from(layout.size.width),
-                self.group.options.len().min(layout.size.height),
+                layout.size.width,
+                self.group
+                    .options
+                    .len()
+                    .min(layout.size.height.try_into().unwrap_or(usize::MAX))
+                    .try_into()
+                    .unwrap_or(u64::MAX),
             ))
             .intersection(area);
         // Reconcile caller-owned state even while hidden, without activating.

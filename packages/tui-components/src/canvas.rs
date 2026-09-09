@@ -400,14 +400,22 @@ impl Component for Canvas<'_> {
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let width = layout.size.width;
         let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let Some(raster) = self.raster(Rect::new(0, 0, width, height)) else {
+        let Some(raster) = self.raster(Rect::new(
+            0,
+            0,
+            width.try_into().unwrap_or(u16::MAX),
+            height,
+        )) else {
             return;
         };
-        cx.rasterize(LocalRect::new(0, 0, width, height), |x, y| {
-            let x = u16::try_from(x).ok()?;
-            let y = u16::try_from(y).ok()?;
-            raster.output_cell(x, y)
-        });
+        cx.rasterize(
+            LocalRect::new(0, 0, width.try_into().unwrap_or(u16::MAX), height),
+            |x, y| {
+                let x = u16::try_from(x).ok()?;
+                let y = u16::try_from(y).ok()?;
+                raster.output_cell(x, y)
+            },
+        );
     }
 }
 

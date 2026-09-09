@@ -340,8 +340,8 @@ impl Component for TabBarComponent<'_, '_> {
         LayoutNode::leaf(
             self.id.clone(),
             constraints.constrain(LogicalSize::new(
-                width,
-                usize::from(!self.bar.items.is_empty()),
+                width.into(),
+                u64::try_from(usize::from(!self.bar.items.is_empty())).unwrap_or(u64::MAX),
             )),
         )
         .with_metadata(LayoutMetadata::new().semantic("tabs"))
@@ -352,7 +352,7 @@ impl Component for TabBarComponent<'_, '_> {
             return;
         }
         let state = self.state.borrow();
-        let area = Rect::new(0, 0, layout.size.width, 1);
+        let area = Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         cx.push_hit(
             SceneRegion::new(self.id.as_str(), area)
                 .role(HitRole::Action)
@@ -375,11 +375,11 @@ impl Component for TabBarComponent<'_, '_> {
         }
         let line = self.bar.line(&state);
         let line = if matches!(self.bar.policy.overflow, TabBarOverflow::Truncate) {
-            line.truncate(usize::from(layout.size.width))
+            line.truncate(usize::try_from(layout.size.width).unwrap_or(usize::MAX))
         } else {
             line
         };
-        let local = LocalRect::new(0, 0, layout.size.width, 1);
+        let local = LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         cx.write_line(local, &line);
         cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "tabs"));
         cx.push_damage(local);
@@ -393,8 +393,11 @@ impl Component for TabBarComponent<'_, '_> {
             .visible_rect(bmux_tui::component::LogicalRect::new(
                 0,
                 0,
-                usize::from(layout.size.width),
-                usize::from(!self.bar.items.is_empty()).min(layout.size.height),
+                layout.size.width,
+                usize::from(!self.bar.items.is_empty())
+                    .min(layout.size.height.try_into().unwrap_or(usize::MAX))
+                    .try_into()
+                    .unwrap_or(u64::MAX),
             ))
             .intersection(area);
         // Hidden tabs reconcile policy and lifecycle without handling activation.
@@ -408,14 +411,19 @@ impl Component for TabBarComponent<'_, '_> {
             let fallback = self.bar.handle_event(area, &mut state, &Event::Tick);
             let hit = self
                 .bar
-                .hit_rects(Rect::new(0, 0, layout.size.width, 1))
+                .hit_rects(Rect::new(
+                    0,
+                    0,
+                    layout.size.width.try_into().unwrap_or(u16::MAX),
+                    1,
+                ))
                 .iter()
                 .position(|rect| {
                     cx.visible_rect(bmux_tui::component::LogicalRect::new(
                         rect.x.into(),
-                        usize::from(rect.y),
-                        usize::from(rect.width),
-                        usize::from(rect.height),
+                        u64::try_from(usize::from(rect.y)).unwrap_or(u64::MAX),
+                        u64::try_from(usize::from(rect.width)).unwrap_or(u64::MAX),
+                        u64::try_from(usize::from(rect.height)).unwrap_or(u64::MAX),
                     ))
                     .contains(mouse.position)
                 });

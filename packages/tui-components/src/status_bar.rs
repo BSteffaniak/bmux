@@ -277,7 +277,7 @@ impl Component for StatusBarComponent<'_> {
         } else {
             center.saturating_add(left.max(right).saturating_mul(2))
         };
-        let size = constraints.constrain(LogicalSize::new(width, 1));
+        let size = constraints.constrain(LogicalSize::new(width.into(), 1));
         bar_layout(
             self.id.clone(),
             size,
@@ -291,16 +291,31 @@ impl Component for StatusBarComponent<'_> {
         if layout.size.width == 0 || layout.size.height == 0 {
             return;
         }
-        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        let area = LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         if let Some(surface) = layout.children.first() {
             bar_surface(self.bar.styles.background).paint(&surface.node, cx);
         }
-        self.paint_group(cx, layout.size.width, self.bar.left, BarAlign::Left);
-        self.paint_group(cx, layout.size.width, self.bar.center, BarAlign::Center);
-        self.paint_group(cx, layout.size.width, self.bar.right, BarAlign::Right);
+        self.paint_group(
+            cx,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            self.bar.left,
+            BarAlign::Left,
+        );
+        self.paint_group(
+            cx,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            self.bar.center,
+            BarAlign::Center,
+        );
+        self.paint_group(
+            cx,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            self.bar.right,
+            BarAlign::Right,
+        );
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
+            Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             "status",
         ));
         cx.push_damage(area);
@@ -498,7 +513,7 @@ impl Component for MessageBarComponent<'_> {
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
         let size = constraints.constrain(LogicalSize::new(
-            u16_saturating(display_width(self.bar.message.text)),
+            u16_saturating(display_width(self.bar.message.text)).into(),
             1,
         ));
         bar_layout(
@@ -514,17 +529,22 @@ impl Component for MessageBarComponent<'_> {
         if layout.size.width == 0 || layout.size.height == 0 {
             return;
         }
-        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        let area = LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         if let Some(surface) = layout.children.first() {
             bar_surface(self.bar.styles.background).paint(&surface.node, cx);
         }
         StatusBarComponent::new(self.id.clone())
             .policy(self.bar.policy)
             .styles(self.bar.styles)
-            .paint_group(cx, layout.size.width, &[self.bar.message], self.bar.align);
+            .paint_group(
+                cx,
+                layout.size.width.try_into().unwrap_or(u16::MAX),
+                &[self.bar.message],
+                self.bar.align,
+            );
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
+            Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             "status",
         ));
         cx.push_damage(area);
@@ -680,10 +700,15 @@ mod tests {
                 .right(&right);
             let layout = bar.layout(Constraints::new(0, 80, 0, Some(1)), &mut LayoutCx::new());
             assert_eq!(
-                usize::from(layout.size.width),
+                usize::try_from(layout.size.width).unwrap_or(usize::MAX),
                 bmux_tui::text_width::display_width(expected)
             );
-            let mut buffer = Buffer::empty(Rect::new(0, 0, layout.size.width, 1));
+            let mut buffer = Buffer::empty(Rect::new(
+                0,
+                0,
+                layout.size.width.try_into().unwrap_or(u16::MAX),
+                1,
+            ));
             let mut frame = Frame::new(&mut buffer);
             bar.paint(&layout, &mut PaintCx::new(&mut frame));
             assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(expected));
@@ -726,7 +751,7 @@ mod tests {
                 .policy(StatusBarPolicy::compact().separator(separator));
             let layout = bar.layout(Constraints::loose(Size::new(80, 1)), &mut LayoutCx::new());
             assert_eq!(
-                usize::from(layout.size.width),
+                usize::try_from(layout.size.width).unwrap_or(usize::MAX),
                 bmux_tui::text_width::display_width(expected)
             );
         }

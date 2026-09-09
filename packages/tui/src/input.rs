@@ -231,14 +231,17 @@ impl Component for TextInput<'_> {
             usize::from(self.placeholder.is_some())
         } else {
             self.buffer
-                .wrapped_layout(usize::from(width.max(1)))
+                .wrapped_layout(usize::try_from(width.max(1)).unwrap_or(usize::MAX))
                 .lines
                 .len()
                 .max(1)
         };
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, rows)),
+            constraints.constrain(LogicalSize::new(
+                width,
+                u64::try_from(rows).expect("row count fits u64"),
+            )),
         )
     }
 
@@ -247,7 +250,7 @@ impl Component for TextInput<'_> {
             LocalRect::new(
                 0,
                 0,
-                layout.size.width,
+                u16::try_from(layout.size.width).unwrap_or(u16::MAX),
                 u16::try_from(layout.size.height).unwrap_or(u16::MAX),
             ),
             cx,

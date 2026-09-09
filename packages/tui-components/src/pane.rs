@@ -643,7 +643,7 @@ impl Component for PaneComponent<'_, '_> {
         let size = Rect::new(
             0,
             0,
-            layout.size.width,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
             u16::try_from(layout.size.height).unwrap_or(u16::MAX),
         );
         if self.pane.policy.mouse.enabled && !size.is_empty() {
@@ -678,9 +678,14 @@ impl Component for PaneComponent<'_, '_> {
                 LocalRect::new(
                     1,
                     0,
-                    u16::try_from(title.width())
-                        .unwrap_or(u16::MAX)
-                        .min(layout.size.width.saturating_sub(2)),
+                    u16::try_from(title.width()).unwrap_or(u16::MAX).min(
+                        layout
+                            .size
+                            .width
+                            .saturating_sub(2)
+                            .try_into()
+                            .unwrap_or(u16::MAX),
+                    ),
                     1,
                 ),
                 title,
@@ -695,7 +700,7 @@ impl Component for PaneComponent<'_, '_> {
             Rect::new(
                 0,
                 0,
-                layout.size.width,
+                layout.size.width.try_into().unwrap_or(u16::MAX),
                 u16::try_from(layout.size.height).unwrap_or(u16::MAX),
             )
         });
@@ -716,7 +721,7 @@ impl Component for PaneComponent<'_, '_> {
                 .area
                 .y
                 .saturating_add(u16::try_from(child.y).unwrap_or(u16::MAX)),
-            child.node.size.width,
+            child.node.size.width.try_into().unwrap_or(u16::MAX),
             u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
         );
         cx.with_transform(

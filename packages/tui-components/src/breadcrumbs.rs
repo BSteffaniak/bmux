@@ -229,17 +229,18 @@ impl<'a, 'state> BreadcrumbsComponent<'a, 'state> {
         let outcome = if let Event::Mouse(mouse) = event {
             if self.breadcrumbs.policy.mouse.enabled {
                 let interactive_width = if self.breadcrumbs.policy.truncate
-                    && self.breadcrumbs.intrinsic_width() > usize::from(layout.size.width)
+                    && self.breadcrumbs.intrinsic_width()
+                        > usize::try_from(layout.size.width).unwrap_or(usize::MAX)
                 {
                     u16_saturating(
                         self.breadcrumbs
                             .line(&state)
-                            .truncate(usize::from(layout.size.width))
+                            .truncate(usize::try_from(layout.size.width).unwrap_or(usize::MAX))
                             .width()
                             .saturating_sub(1),
                     )
                 } else {
-                    layout.size.width
+                    layout.size.width.try_into().unwrap_or(u16::MAX)
                 };
                 let mut x = 0_u16;
                 let hit =
@@ -252,8 +253,12 @@ impl<'a, 'state> BreadcrumbsComponent<'a, 'state> {
                             let visible = cx.visible_rect(bmux_tui::component::LogicalRect::new(
                                 x.into(),
                                 0,
-                                usize::from(width.min(interactive_width.saturating_sub(x))),
-                                usize::from(layout.size.height > 0),
+                                u64::try_from(usize::from(
+                                    width.min(interactive_width.saturating_sub(x)),
+                                ))
+                                .unwrap_or(u64::MAX),
+                                u64::try_from(usize::from(layout.size.height > 0))
+                                    .unwrap_or(u64::MAX),
                             ));
                             x = x.saturating_add(width).saturating_add(u16_saturating(
                                 display_width(self.breadcrumbs.policy.separator),
@@ -325,7 +330,7 @@ impl Component for BreadcrumbsComponent<'_, '_> {
         let width = u16_saturating(self.breadcrumbs.intrinsic_width());
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, 1)),
+            constraints.constrain(LogicalSize::new(width.into(), 1)),
         )
         .with_metadata(LayoutMetadata::new().semantic("breadcrumbs"))
     }
@@ -336,27 +341,31 @@ impl Component for BreadcrumbsComponent<'_, '_> {
         }
         let state = self.state.get();
         let mut line = self.breadcrumbs.line(&state);
-        if self.breadcrumbs.policy.truncate && line.width() > usize::from(layout.size.width) {
-            line = line.truncate(usize::from(layout.size.width));
+        if self.breadcrumbs.policy.truncate
+            && line.width() > usize::try_from(layout.size.width).unwrap_or(usize::MAX)
+        {
+            line = line.truncate(usize::try_from(layout.size.width).unwrap_or(usize::MAX));
         }
-        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        let area = LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         cx.write_line(area, &line);
         let interactive = self.breadcrumbs.policy.keyboard || self.breadcrumbs.policy.mouse.enabled;
         if interactive && self.breadcrumbs.items.iter().any(|item| !item.disabled) {
             cx.push_hit(
-                SceneRegion::new(self.id.as_str(), Rect::new(0, 0, layout.size.width, 1))
-                    .role(HitRole::ListItem)
-                    .pointer_events(self.breadcrumbs.policy.mouse.enabled)
-                    .hoverable(
-                        self.breadcrumbs.policy.mouse.enabled
-                            && self.breadcrumbs.policy.mouse.hover,
-                    )
-                    .focusable(self.breadcrumbs.policy.keyboard),
+                SceneRegion::new(
+                    self.id.as_str(),
+                    Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
+                )
+                .role(HitRole::ListItem)
+                .pointer_events(self.breadcrumbs.policy.mouse.enabled)
+                .hoverable(
+                    self.breadcrumbs.policy.mouse.enabled && self.breadcrumbs.policy.mouse.hover,
+                )
+                .focusable(self.breadcrumbs.policy.keyboard),
             );
         }
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
+            Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             "breadcrumbs",
         ));
         cx.push_damage(area);
@@ -1014,8 +1023,11 @@ mod tests {
         let state = Cell::new(BreadcrumbsState::new(None));
         let component = BreadcrumbsComponent::new("trail", &items, &state);
         assert_eq!(component.breadcrumbs.intrinsic_width(), label.len());
-        let layout = component.layout(Constraints::for_width(u16::MAX), &mut LayoutCx::new());
-        assert_eq!(layout.size.width, u16::MAX);
+        let layout = component.layout(
+            Constraints::for_width(u16::MAX.into()),
+            &mut LayoutCx::new(),
+        );
+        assert_eq!(layout.size.width, u16::MAX.into());
         let mut buffer = Buffer::empty(Rect::new(0, 0, u16::MAX, 1));
         let mut frame = Frame::new(&mut buffer);
         component.paint(&layout, &mut PaintCx::new(&mut frame));
@@ -1104,7 +1116,8 @@ mod tests {
             let state = Cell::new(BreadcrumbsState::new(None));
             let component = BreadcrumbsComponent::new("trail", &items, &state);
             let layout = component.layout(Constraints::for_width(width), &mut LayoutCx::new());
-            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+            let mut buffer =
+                Buffer::empty(Rect::new(0, 0, width.try_into().unwrap_or(u16::MAX), 1));
             let mut frame = Frame::new(&mut buffer);
             component.paint(&layout, &mut PaintCx::new(&mut frame));
             assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some(expected));
@@ -1114,12 +1127,17 @@ mod tests {
                     0,
                     2,
                     1,
-                    Rect::new(3, 1, width.saturating_sub(1), 1),
+                    Rect::new(
+                        3,
+                        1,
+                        width.saturating_sub(1).try_into().unwrap_or(u16::MAX),
+                        1,
+                    ),
                     |cx| {
                         component.handle_event(
                             &Event::Mouse(MouseEvent::new(
                                 MouseEventKind::Down(MouseButton::Left),
-                                Point::new(x + 2, 1),
+                                Point::new((x + 2).try_into().unwrap_or(u16::MAX), 1),
                             )),
                             &layout,
                             cx,
@@ -1127,7 +1145,7 @@ mod tests {
                         let outcome = component.handle_event(
                             &Event::Mouse(MouseEvent::new(
                                 MouseEventKind::Up(MouseButton::Left),
-                                Point::new(x + 2, 1),
+                                Point::new((x + 2).try_into().unwrap_or(u16::MAX), 1),
                             )),
                             &layout,
                             cx,

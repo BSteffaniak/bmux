@@ -270,8 +270,9 @@ impl TextBlock {
         self.measured_rows(layout, 0).collect()
     }
 
-    fn raw_line_rows<'a>(&'a self, line: &'a Line, width: u16) -> impl Iterator<Item = Line> + 'a {
-        let geometry = TextWrapGeometry::uniform(usize::from(width.max(1)));
+    fn raw_line_rows<'a>(&'a self, line: &'a Line, width: u64) -> impl Iterator<Item = Line> + 'a {
+        let geometry =
+            TextWrapGeometry::uniform(usize::try_from(width.max(1)).unwrap_or(usize::MAX));
         let mut character = crate::text::character_rows(line, geometry);
         let mut word =
             (self.wrap == TextWrap::Word).then(|| crate::text::word_rows(line, geometry));
@@ -283,13 +284,13 @@ impl TextBlock {
         })
     }
 
-    fn projection_rows(&self, width: u16) -> impl Iterator<Item = TextProjectionRow> + '_ {
+    fn projection_rows(&self, width: u64) -> impl Iterator<Item = TextProjectionRow> + '_ {
         self.projection_rows_from(width, 0)
     }
 
     fn projection_rows_from(
         &self,
-        width: u16,
+        width: u64,
         first_line: usize,
     ) -> impl Iterator<Item = TextProjectionRow> + '_ {
         self.text
@@ -365,19 +366,34 @@ impl TextBlock {
             let text = row.line.plain_text();
             let x = self.row_alignment_offset(&row.line, layout.size.width);
             let y = i64::try_from(row_index).unwrap_or(i64::MAX);
-            cx.with_child(0, y, LocalRect::new(0, 0, layout.size.width, 1), |cx| {
-                for fragment in plain_text_fragments(
-                    scope_id.clone(),
-                    content_id.clone(),
-                    Rect::new(x, 0, layout.size.width.saturating_sub(x), 1),
-                    order.saturating_add(u64::try_from(row_index).unwrap_or(u64::MAX)),
-                    &text,
-                    row.source_range.start,
-                    revision,
-                ) {
-                    cx.push_selection_fragment(fragment);
-                }
-            });
+            cx.with_child(
+                0,
+                y,
+                LocalRect::new(
+                    0,
+                    0,
+                    u16::try_from(layout.size.width).unwrap_or(u16::MAX),
+                    1,
+                ),
+                |cx| {
+                    for fragment in plain_text_fragments(
+                        scope_id.clone(),
+                        content_id.clone(),
+                        Rect::new(
+                            u16::try_from(x).unwrap_or(u16::MAX),
+                            0,
+                            u16::try_from(layout.size.width.saturating_sub(x)).unwrap_or(u16::MAX),
+                            1,
+                        ),
+                        order.saturating_add(u64::try_from(row_index).unwrap_or(u64::MAX)),
+                        &text,
+                        row.source_range.start,
+                        revision,
+                    ) {
+                        cx.push_selection_fragment(fragment);
+                    }
+                },
+            );
         }
     }
 
@@ -417,8 +433,8 @@ impl TextBlock {
             })
     }
 
-    fn row_alignment_offset(&self, line: &Line, width: u16) -> u16 {
-        let line_width = u16::try_from(line.width()).unwrap_or(u16::MAX);
+    fn row_alignment_offset(&self, line: &Line, width: u64) -> u64 {
+        let line_width = u64::try_from(line.width()).expect("line width fits u64");
         let remaining = width.saturating_sub(line_width);
         match self.alignment {
             Alignment::Left => 0,
@@ -430,23 +446,24 @@ impl TextBlock {
     fn visible_rows(layout: &LayoutNode, visible: LocalRect) -> std::ops::Range<usize> {
         if visible.width == 0
             || visible.height == 0
-            || visible.x >= i32::from(layout.size.width)
+            || visible.x >= i32::try_from(layout.size.width).unwrap_or(i32::MAX)
             || visible.x.saturating_add(i32::from(visible.width)) <= 0
         {
             return 0..0;
         }
         let first = usize::try_from(visible.y.max(0))
             .unwrap_or(usize::MAX)
-            .min(layout.size.height);
+            .min(usize::try_from(layout.size.height).unwrap_or(usize::MAX));
         let end = usize::try_from(visible.y.saturating_add(i64::from(visible.height)).max(0))
             .unwrap_or(usize::MAX)
-            .min(layout.size.height);
+            .min(usize::try_from(layout.size.height).unwrap_or(usize::MAX));
         first..end
     }
 
     #[cfg(test)]
-    fn line_row_count(&self, line: &Line, width: u16) -> usize {
-        let geometry = TextWrapGeometry::uniform(usize::from(width.max(1)));
+    fn line_row_count(&self, line: &Line, width: u64) -> usize {
+        let geometry =
+            TextWrapGeometry::uniform(usize::try_from(width.max(1)).unwrap_or(usize::MAX));
         match self.wrap {
             TextWrap::Character => crate::text::character_row_count(line, geometry),
             TextWrap::Word => crate::text::word_row_count(line, geometry),
@@ -457,7 +474,7 @@ impl TextBlock {
     /// Locate a display row without constructing preceding rendered lines.
     /// The returned offset is relative to the first retained source line.
     #[cfg(test)]
-    fn source_start(&self, width: u16, mut row: usize) -> (usize, usize) {
+    fn source_start(&self, width: u64, mut row: usize) -> (usize, usize) {
         if self.wrap == TextWrap::None {
             return (row.min(self.text.lines.len()), 0);
         }
@@ -467,7 +484,8 @@ impl TextBlock {
             if row == 0 {
                 return (index, 0);
             }
-            let geometry = TextWrapGeometry::uniform(usize::from(width.max(1)));
+            let geometry =
+                TextWrapGeometry::uniform(usize::try_from(width.max(1)).unwrap_or(usize::MAX));
             let limit = row.saturating_add(1);
             let count = match self.wrap {
                 TextWrap::Character => {
@@ -485,7 +503,7 @@ impl TextBlock {
     }
 
     #[cfg(test)]
-    fn row_count(&self, width: u16) -> usize {
+    fn row_count(&self, width: u64) -> usize {
         if self.wrap == TextWrap::None {
             return self.text.lines.len();
         }
@@ -552,8 +570,8 @@ impl Component for TextBlock {
         let width = if constraints.min_width() == constraints.max_width() {
             constraints.max_width()
         } else {
-            u16::try_from(self.intrinsic_width)
-                .unwrap_or(u16::MAX)
+            u64::try_from(self.intrinsic_width)
+                .expect("intrinsic width fits u64")
                 .clamp(constraints.min_width(), constraints.max_width())
         };
         let rows = self
@@ -563,7 +581,10 @@ impl Component for TextBlock {
                 source_range: row.source_range,
             })
             .collect::<Vec<_>>();
-        let size = constraints.constrain(LogicalSize::new(width, rows.len()));
+        let size = constraints.constrain(LogicalSize::new(
+            width,
+            u64::try_from(rows.len()).expect("row count fits u64"),
+        ));
         let mut node = LayoutNode::leaf(self.id.clone(), size);
         node.metadata.text_rows = Some(rows.into());
         node
@@ -583,12 +604,19 @@ impl Component for TextBlock {
         {
             let x = self.row_alignment_offset(&line, layout.size.width);
             if x > 0 {
-                line.spans
-                    .insert(0, crate::text::Span::raw(" ".repeat(usize::from(x))));
+                line.spans.insert(
+                    0,
+                    crate::text::Span::raw(" ".repeat(usize::try_from(x).unwrap_or(usize::MAX))),
+                );
             }
             let row = i64::try_from(visible.start.saturating_add(index)).unwrap_or(i64::MAX);
             cx.write_line_with_fallback_style(
-                LocalRect::new(0, row, layout.size.width, 1),
+                LocalRect::new(
+                    0,
+                    row,
+                    u16::try_from(layout.size.width).unwrap_or(u16::MAX),
+                    1,
+                ),
                 &line,
                 self.style,
             );
@@ -701,22 +729,25 @@ impl Component for Surface<'_> {
         cx.record_measurement();
         let insets = self.insets();
         let child = self.child.layout(
-            constraints.inset(insets.horizontal(), usize::from(insets.vertical())),
+            constraints.inset(u64::from(insets.horizontal()), u64::from(insets.vertical())),
             cx,
         );
         let size = constraints.constrain(LogicalSize::new(
-            child.size.width.saturating_add(insets.horizontal()),
+            child
+                .size
+                .width
+                .saturating_add(u64::from(insets.horizontal())),
             child
                 .size
                 .height
-                .saturating_add(usize::from(insets.vertical())),
+                .saturating_add(u64::from(insets.vertical())),
         ));
         LayoutNode::with_children(
             self.id.clone(),
             size,
             vec![ChildLayout::new(
-                usize::from(insets.left),
-                usize::from(insets.top),
+                u64::from(insets.left),
+                u64::from(insets.top),
                 child,
             )],
         )
@@ -761,8 +792,8 @@ impl Component for Surface<'_> {
 }
 
 fn paint_border(
-    width: u16,
-    height: usize,
+    width: u64,
+    height: u64,
     border: &Border,
     background: Style,
     cx: &mut PaintCx<'_, '_>,
@@ -771,7 +802,7 @@ fn paint_border(
         return;
     }
     let style = background.patch(border.style);
-    let right = width.saturating_sub(1);
+    let right = i32::try_from(width.saturating_sub(1)).unwrap_or(i32::MAX);
     let bottom = i64::try_from(height.saturating_sub(1)).unwrap_or(i64::MAX);
     let visible = cx.area();
     let first_row = visible.y.max(0);
@@ -780,19 +811,19 @@ fn paint_border(
         .saturating_add(i64::from(visible.height))
         .min(bottom.saturating_add(1));
     let sides = border.sides;
+    let first_column = visible.x.max(0);
+    let end_column = visible
+        .x
+        .saturating_add(i32::from(visible.width))
+        .min(i32::try_from(width).unwrap_or(i32::MAX));
     if sides.top {
-        for x in 0..width {
-            cx.set_cell(i32::from(x), 0, &border.set.horizontal.to_string(), style);
+        for x in first_column..end_column {
+            cx.set_cell(x, 0, &border.set.horizontal.to_string(), style);
         }
     }
     if sides.bottom && bottom != 0 {
-        for x in 0..width {
-            cx.set_cell(
-                i32::from(x),
-                bottom,
-                &border.set.horizontal.to_string(),
-                style,
-            );
+        for x in first_column..end_column {
+            cx.set_cell(x, bottom, &border.set.horizontal.to_string(), style);
         }
     }
     if sides.left {
@@ -802,7 +833,7 @@ fn paint_border(
     }
     if sides.right && right != 0 {
         for y in first_row..end_row {
-            cx.set_cell(i32::from(right), y, &border.set.vertical.to_string(), style);
+            cx.set_cell(right, y, &border.set.vertical.to_string(), style);
         }
     }
     if width > 1 && height > 1 {
@@ -810,23 +841,13 @@ fn paint_border(
             cx.set_cell(0, 0, &border.set.top_left.to_string(), style);
         }
         if sides.top && sides.right {
-            cx.set_cell(
-                i32::from(right),
-                0,
-                &border.set.top_right.to_string(),
-                style,
-            );
+            cx.set_cell(right, 0, &border.set.top_right.to_string(), style);
         }
         if sides.bottom && sides.left {
             cx.set_cell(0, bottom, &border.set.bottom_left.to_string(), style);
         }
         if sides.bottom && sides.right {
-            cx.set_cell(
-                i32::from(right),
-                bottom,
-                &border.set.bottom_right.to_string(),
-                style,
-            );
+            cx.set_cell(right, bottom, &border.set.bottom_right.to_string(), style);
         }
     }
 }
@@ -975,12 +996,12 @@ impl Component for Fill<'_> {
 pub struct SizeBox<'a> {
     id: LayoutId,
     child: Element<'a>,
-    width: Option<u16>,
-    height: Option<usize>,
-    min_width: u16,
-    max_width: Option<u16>,
-    min_height: usize,
-    max_height: Option<usize>,
+    width: Option<u64>,
+    height: Option<u64>,
+    min_width: u64,
+    max_width: Option<u64>,
+    min_height: u64,
+    max_height: Option<u64>,
 }
 
 impl<'a> SizeBox<'a> {
@@ -1008,42 +1029,42 @@ impl<'a> SizeBox<'a> {
 
     /// Require an exact width, clamped by parent constraints.
     #[must_use]
-    pub const fn width(mut self, width: u16) -> Self {
+    pub const fn width(mut self, width: u64) -> Self {
         self.width = Some(width);
         self
     }
 
     /// Require an exact logical height, clamped by parent constraints.
     #[must_use]
-    pub const fn height(mut self, height: usize) -> Self {
+    pub const fn height(mut self, height: u64) -> Self {
         self.height = Some(height);
         self
     }
 
     /// Set a minimum width.
     #[must_use]
-    pub const fn min_width(mut self, width: u16) -> Self {
+    pub const fn min_width(mut self, width: u64) -> Self {
         self.min_width = width;
         self
     }
 
     /// Set a maximum width.
     #[must_use]
-    pub const fn max_width(mut self, width: u16) -> Self {
+    pub const fn max_width(mut self, width: u64) -> Self {
         self.max_width = Some(width);
         self
     }
 
     /// Set a minimum logical height.
     #[must_use]
-    pub const fn min_height(mut self, height: usize) -> Self {
+    pub const fn min_height(mut self, height: u64) -> Self {
         self.min_height = height;
         self
     }
 
     /// Set a maximum logical height.
     #[must_use]
-    pub const fn max_height(mut self, height: usize) -> Self {
+    pub const fn max_height(mut self, height: u64) -> Self {
         self.max_height = Some(height);
         self
     }
@@ -1225,11 +1246,7 @@ impl Component for Align<'_> {
             VerticalAlignment::Center => size.height.saturating_sub(child.size.height) / 2,
             VerticalAlignment::End => size.height.saturating_sub(child.size.height),
         };
-        LayoutNode::with_children(
-            self.id.clone(),
-            size,
-            vec![ChildLayout::new(usize::from(x), y, child)],
-        )
+        LayoutNode::with_children(self.id.clone(), size, vec![ChildLayout::new(x, y, child)])
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -1663,12 +1680,12 @@ impl Component for Row<'_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let gaps = self.gap.saturating_mul(
-            u16::try_from(self.children.len().saturating_sub(1)).unwrap_or(u16::MAX),
+        let gaps = u64::from(self.gap).saturating_mul(
+            u64::try_from(self.children.len().saturating_sub(1)).expect("child count fits u64"),
         );
         let available = constraints.max_width().saturating_sub(gaps);
         let mut resolved: Vec<Option<LayoutNode>> = vec![None; self.children.len()];
-        let mut intrinsic_width = 0u16;
+        let mut intrinsic_width = 0u64;
         let mut flex_weight = 0u128;
         for (index, child) in self.children.iter().enumerate() {
             if child.flex == 0 {
@@ -1683,7 +1700,7 @@ impl Component for Row<'_> {
             }
         }
         let remaining = available.saturating_sub(intrinsic_width);
-        let mut assigned_flex = 0u16;
+        let mut assigned_flex = 0u64;
         let mut seen_weight = 0u128;
         for (index, child) in self.children.iter().enumerate() {
             if child.flex == 0 {
@@ -1694,7 +1711,8 @@ impl Component for Row<'_> {
                 .saturating_mul(seen_weight)
                 .checked_div(flex_weight.max(1))
                 .unwrap_or(0);
-            let cumulative = u16::try_from(cumulative).unwrap_or(u16::MAX);
+            let cumulative =
+                u64::try_from(cumulative).expect("allocated share is bounded by remaining width");
             let width = cumulative.saturating_sub(assigned_flex);
             assigned_flex = cumulative;
             resolved[index] = Some(child.component.layout(
@@ -1702,24 +1720,19 @@ impl Component for Row<'_> {
                 cx,
             ));
         }
-        let mut x = 0usize;
-        let mut height = 0usize;
+        let mut x = 0u64;
+        let mut height = 0u64;
         let mut children = Vec::with_capacity(self.children.len());
         for node in resolved.into_iter().flatten() {
             height = height.max(node.size.height);
             let width = node.size.width;
             children.push(ChildLayout::new(x, 0, node));
-            x = x
-                .saturating_add(usize::from(width))
-                .saturating_add(usize::from(self.gap));
+            x = x.saturating_add(width).saturating_add(u64::from(self.gap));
         }
         if !children.is_empty() {
-            x = x.saturating_sub(usize::from(self.gap));
+            x = x.saturating_sub(u64::from(self.gap));
         }
-        let size = constraints.constrain(LogicalSize::new(
-            u16::try_from(x).unwrap_or(u16::MAX),
-            height,
-        ));
+        let size = constraints.constrain(LogicalSize::new(x, height));
         for (index, child) in children.iter_mut().enumerate() {
             child.y = match self.alignment {
                 VerticalAlignment::Start => 0,
@@ -1853,14 +1866,14 @@ impl Component for Column<'_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let mut y = 0usize;
+        let mut y = 0u64;
         let width = constraints.max_width();
         let mut children = Vec::with_capacity(self.children.len());
         let total_weight = self
             .weights
             .iter()
-            .map(|weight| usize::from(*weight))
-            .sum::<usize>();
+            .map(|weight| u64::from(*weight))
+            .sum::<u64>();
         let flex_height = constraints
             .max_height()
             .filter(|_| total_weight > 0)
@@ -1876,14 +1889,18 @@ impl Component for Column<'_> {
                             .size
                             .height
                     })
-                    .sum::<usize>();
+                    .sum::<u64>();
                 height.saturating_sub(fixed).saturating_sub(
-                    self.gap
-                        .saturating_mul(self.children.len().saturating_sub(1)),
+                    u64::try_from(self.gap)
+                        .expect("gap fits logical coordinates")
+                        .saturating_mul(
+                            u64::try_from(self.children.len().saturating_sub(1))
+                                .expect("child count fits logical coordinates"),
+                        ),
                 )
             });
-        let mut allocated = 0usize;
-        let mut consumed_weight = 0usize;
+        let mut allocated = 0u64;
+        let mut consumed_weight = 0u64;
         for (child, weight) in self.children.iter().zip(&self.weights) {
             let child_min_width = if self.alignment == HorizontalAlignment::Stretch {
                 width
@@ -1893,7 +1910,7 @@ impl Component for Column<'_> {
             let child_constraints = flex_height.filter(|_| *weight > 0).map_or_else(
                 || Constraints::new(child_min_width, width, 0, constraints.max_height()),
                 |height| {
-                    consumed_weight += usize::from(*weight);
+                    consumed_weight += u64::from(*weight);
                     let end = height.saturating_mul(consumed_weight) / total_weight;
                     let share = end.saturating_sub(allocated);
                     allocated = end;
@@ -1906,13 +1923,13 @@ impl Component for Column<'_> {
                 HorizontalAlignment::Center => width.saturating_sub(node.size.width) / 2,
                 HorizontalAlignment::End => width.saturating_sub(node.size.width),
             };
-            children.push(ChildLayout::new(usize::from(x), y, node));
+            children.push(ChildLayout::new(x, y, node));
             y = y
                 .saturating_add(children.last().map_or(0, |child| child.node.size.height))
-                .saturating_add(self.gap);
+                .saturating_add(u64::try_from(self.gap).expect("gap fits logical coordinates"));
         }
         if !children.is_empty() {
-            y = y.saturating_sub(self.gap);
+            y = y.saturating_sub(u64::try_from(self.gap).expect("gap fits logical coordinates"));
         }
         let size = constraints.constrain(LogicalSize::new(width, y));
         LayoutNode::with_children(self.id.clone(), size, children)
@@ -2003,7 +2020,7 @@ mod tests {
         let area = Rect::new(
             0,
             0,
-            layout.size.width,
+            u16::try_from(layout.size.width).unwrap(),
             u16::try_from(layout.size.height).unwrap(),
         );
         let mut buffer = Buffer::empty(area);
@@ -2208,7 +2225,7 @@ mod tests {
                         let layout =
                             component.layout(Constraints::for_width(width), &mut LayoutCx::new());
                         assert_eq!(
-                            layout.size.height,
+                            usize::try_from(layout.size.height).unwrap(),
                             component
                                 .projection(
                                     &component.layout(
@@ -2483,10 +2500,13 @@ mod tests {
         }
         let wide = TextBlock::new("x".repeat(70_000)).wrap(crate::text::TextWrap::None);
         assert_eq!(
-            wide.layout(Constraints::new(0, u16::MAX, 0, None), &mut LayoutCx::new())
-                .size
-                .width,
-            u16::MAX
+            wide.layout(
+                Constraints::new(0, u64::from(u16::MAX), 0, None),
+                &mut LayoutCx::new()
+            )
+            .size
+            .width,
+            u64::from(u16::MAX)
         );
     }
 
@@ -2868,7 +2888,10 @@ mod tests {
             .flex_child(u16::MAX, TextBlock::new("a"))
             .flex_child(u16::MAX, TextBlock::new("b"))
             .flex_child(u16::MAX, TextBlock::new("c"));
-        let layout = component.layout(Constraints::for_width(u16::MAX), &mut LayoutCx::new());
+        let layout = component.layout(
+            Constraints::for_width(u64::from(u16::MAX)),
+            &mut LayoutCx::new(),
+        );
         assert_eq!(
             layout
                 .children
@@ -2888,7 +2911,10 @@ mod tests {
             .child(SizeBox::new(TextBlock::new("b")).width(40_000))
             .child(SizeBox::new(TextBlock::new("c")).width(40_000))
             .child(TextBlock::new("d"));
-        let layout = component.layout(Constraints::for_width(u16::MAX), &mut LayoutCx::new());
+        let layout = component.layout(
+            Constraints::for_width(u64::from(u16::MAX)),
+            &mut LayoutCx::new(),
+        );
         assert_eq!(
             layout
                 .children

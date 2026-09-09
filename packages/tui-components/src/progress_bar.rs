@@ -320,8 +320,12 @@ impl Component for ProgressBarComponent<'_> {
             ProgressLabelPlacement::Inside => label_width.max(1),
             ProgressLabelPlacement::Hidden | ProgressLabelPlacement::Right => 1,
         };
-        let size = constraints.constrain(LogicalSize::new(u16_saturating(intrinsic_width), 0));
-        let size = constraints.constrain(LogicalSize::new(size.width, usize::from(size.width > 0)));
+        let size =
+            constraints.constrain(LogicalSize::new(u16_saturating(intrinsic_width).into(), 0));
+        let size = constraints.constrain(LogicalSize::new(
+            size.width,
+            u64::try_from(usize::from(size.width > 0)).unwrap_or(u64::MAX),
+        ));
         let children = if self.policy.background {
             vec![bmux_tui::component::ChildLayout::new(
                 0,
@@ -349,7 +353,7 @@ impl Component for ProgressBarComponent<'_> {
         if layout.size.width == 0 || layout.size.height == 0 {
             return;
         }
-        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        let area = LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         if let Some(surface) = layout.children.first() {
             bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
                 .background(self.styles.background)
@@ -359,11 +363,13 @@ impl Component for ProgressBarComponent<'_> {
             ProgressBarValue::Determinate { .. }
                 if matches!(self.policy.mode, ProgressBarMode::LineGauge) =>
             {
-                self.line_gauge_line(layout.size.width)
+                self.line_gauge_line(layout.size.width.try_into().unwrap_or(u16::MAX))
             }
-            ProgressBarValue::Determinate { .. } => self.determinate_line(layout.size.width),
+            ProgressBarValue::Determinate { .. } => {
+                self.determinate_line(layout.size.width.try_into().unwrap_or(u16::MAX))
+            }
             ProgressBarValue::Indeterminate { offset } => {
-                self.indeterminate_line(layout.size.width, offset)
+                self.indeterminate_line(layout.size.width.try_into().unwrap_or(u16::MAX), offset)
             }
         };
         cx.write_line(area, &line);
@@ -372,17 +378,20 @@ impl Component for ProgressBarComponent<'_> {
             && matches!(self.policy.label, ProgressLabelPlacement::Inside)
             && let Some(label) = self.label_text()
         {
-            let label = truncate_to_display_width(&label, usize::from(layout.size.width));
+            let label = truncate_to_display_width(
+                &label,
+                usize::try_from(layout.size.width).unwrap_or(usize::MAX),
+            );
             let label_width = u16_saturating(display_width(&label));
-            let left = (layout.size.width - label_width) / 2;
+            let left = (layout.size.width - u64::from(label_width)) / 2;
             cx.write_line(
-                LocalRect::new(i32::from(left), 0, label_width, 1),
+                LocalRect::new(i32::try_from(left).unwrap_or(i32::MAX), 0, label_width, 1),
                 &Line::from_spans([Span::styled(label, self.styles.label)]),
             );
         }
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
+            Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             "progress",
         ));
         cx.push_damage(area);
@@ -674,13 +683,14 @@ mod tests {
                 &mut cx,
             );
             assert_eq!(layout.size.width, width);
-            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 1));
+            let mut buffer =
+                Buffer::empty(Rect::new(0, 0, width.try_into().unwrap_or(u16::MAX), 1));
             let mut frame = Frame::new(&mut buffer);
             component.paint(&layout, &mut PaintCx::new(&mut frame));
             assert_eq!(frame.buffer().row_symbols(0), Some(format!("█ {label}")));
             assert_eq!(
                 frame.semantics().regions()[0].area,
-                Rect::new(0, 0, width, 1)
+                Rect::new(0, 0, width.try_into().unwrap_or(u16::MAX), 1)
             );
         }
         assert_eq!(cx.measured_nodes(), 2);
@@ -747,7 +757,10 @@ mod tests {
                 );
             let label = component.label_text().unwrap();
             let layout = component.layout(Constraints::new(0, 20, 0, None), &mut LayoutCx::new());
-            assert_eq!(usize::from(layout.size.width), label.len() + 2);
+            assert_eq!(
+                usize::try_from(layout.size.width).unwrap_or(usize::MAX),
+                label.len() + 2
+            );
         }
     }
 
@@ -769,7 +782,10 @@ mod tests {
         let layout = cache.layout("progress".into(), &changed, constraints, &mut cx);
         assert_eq!(cx.measured_nodes(), 1);
         assert_eq!(cache.stats().hits, 1);
-        assert_eq!(render(&changed, layout.size.width), "##..");
+        assert_eq!(
+            render(&changed, layout.size.width.try_into().unwrap_or(u16::MAX)),
+            "##.."
+        );
     }
 
     #[test]
@@ -837,7 +853,10 @@ mod tests {
             .label("done");
         let layout = component.layout(Constraints::loose(Size::new(20, 1)), &mut LayoutCx::new());
         assert_eq!(layout.size.width, 6);
-        assert_eq!(render(&component, layout.size.width), "█ done");
+        assert_eq!(
+            render(&component, layout.size.width.try_into().unwrap_or(u16::MAX)),
+            "█ done"
+        );
     }
 
     #[test]

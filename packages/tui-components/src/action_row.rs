@@ -341,7 +341,7 @@ impl Component for ActionRowComponent<'_, '_> {
             ));
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, 1)),
+            constraints.constrain(LogicalSize::new(width.into(), 1)),
         )
         .with_metadata(LayoutMetadata::new().semantic("actions"))
     }
@@ -351,7 +351,7 @@ impl Component for ActionRowComponent<'_, '_> {
             return;
         }
         let state = self.state.get();
-        let area = Rect::new(0, 0, layout.size.width, 1);
+        let area = Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         for (index, action_area) in self.row.action_areas(area).into_iter().enumerate() {
             let Some(action) = self.row.actions.get(index) else {
                 break;
@@ -372,7 +372,12 @@ impl Component for ActionRowComponent<'_, '_> {
             );
         }
         cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "actions"));
-        cx.push_damage(LocalRect::new(0, 0, layout.size.width, 1));
+        cx.push_damage(LocalRect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            1,
+        ));
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
@@ -383,14 +388,19 @@ impl Component for ActionRowComponent<'_, '_> {
         let outcome = if let Event::Mouse(mouse) = event {
             let hit = self
                 .row
-                .action_areas(Rect::new(0, 0, layout.size.width, 1))
+                .action_areas(Rect::new(
+                    0,
+                    0,
+                    layout.size.width.try_into().unwrap_or(u16::MAX),
+                    1,
+                ))
                 .iter()
                 .position(|area| {
                     cx.visible_rect(bmux_tui::component::LogicalRect::new(
                         area.x.into(),
-                        usize::from(area.y),
-                        usize::from(area.width),
-                        usize::from(area.height),
+                        u64::try_from(usize::from(area.y)).unwrap_or(u64::MAX),
+                        u64::try_from(usize::from(area.width)).unwrap_or(u64::MAX),
+                        u64::try_from(usize::from(area.height)).unwrap_or(u64::MAX),
                     ))
                     .contains(mouse.position)
                 });

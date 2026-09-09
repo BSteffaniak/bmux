@@ -255,10 +255,15 @@ impl<'a, 'state> TextInputBoxComponent<'a, 'state> {
         };
         let bounded = SizeBox::new(input)
             .id(format!("{}.rows", self.id.as_str()))
-            .min_height(usize::from(self.box_control.policy.min_rows))
-            .max_height(usize::from(
-                self.box_control.policy.max_rows.unwrap_or(u16::MAX),
-            ));
+            .min_height(
+                u64::try_from(usize::from(self.box_control.policy.min_rows)).unwrap_or(u64::MAX),
+            )
+            .max_height(
+                u64::try_from(usize::from(
+                    self.box_control.policy.max_rows.unwrap_or(u16::MAX),
+                ))
+                .unwrap_or(u64::MAX),
+            );
         let control = if self.box_control.policy.panel_chrome {
             let mut surface = Surface::new(bounded)
                 .id(format!("{}.surface", self.id.as_str()))

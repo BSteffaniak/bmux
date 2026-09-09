@@ -276,10 +276,17 @@ impl Component for SparklineComponent<'_> {
         } else {
             u16::try_from(intrinsic_width)
                 .unwrap_or(u16::MAX)
-                .clamp(constraints.min_width(), constraints.max_width())
+                .clamp(
+                    constraints.min_width().try_into().unwrap_or(u16::MAX),
+                    constraints.max_width().try_into().unwrap_or(u16::MAX),
+                )
+                .into()
         };
         let height = usize::from(width > 0);
-        let size = constraints.constrain(LogicalSize::new(width, height));
+        let size = constraints.constrain(LogicalSize::new(
+            width,
+            height.try_into().unwrap_or(u64::MAX),
+        ));
         let children = if self.policy.background {
             vec![bmux_tui::component::ChildLayout::new(
                 0,
@@ -307,13 +314,13 @@ impl Component for SparklineComponent<'_> {
         if layout.size.width == 0 || layout.size.height == 0 {
             return;
         }
-        let area = LocalRect::new(0, 0, layout.size.width, 1);
+        let area = LocalRect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1);
         if let Some(surface) = layout.children.first() {
             bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
                 .background(self.styles.background)
                 .paint(&surface.node, cx);
         }
-        let samples = self.visible_samples(layout.size.width);
+        let samples = self.visible_samples(layout.size.width.try_into().unwrap_or(u16::MAX));
         if samples.is_empty() || self.policy.symbols.is_empty() {
             cx.write_line_with_fallback_style(area, &Line::from(self.empty), self.styles.empty);
         } else {
@@ -348,7 +355,7 @@ impl Component for SparklineComponent<'_> {
         }
         cx.push_semantic(SemanticRegion::new(
             self.id.as_str(),
-            Rect::new(0, 0, layout.size.width, 1),
+            Rect::new(0, 0, layout.size.width.try_into().unwrap_or(u16::MAX), 1),
             "chart",
         ));
         cx.push_damage(area);

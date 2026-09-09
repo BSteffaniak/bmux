@@ -485,7 +485,8 @@ impl<'a> SelectableList<'a> {
                                 state: *state,
                                 fallback,
                                 offset: state.scroll.vertical_offset(),
-                                viewport_height: viewport.size.height,
+                                viewport_height: usize::try_from(viewport.size.height)
+                                    .unwrap_or(usize::MAX),
                             },
                         )
                         .paint(viewport, cx);
@@ -601,17 +602,25 @@ impl<'a> SelectableList<'a> {
         let scroll_view = self.scroll_view();
         let (natural_width, _) = self.size();
         let width = constraints
-            .constrain(LogicalSize::new(natural_width, 0))
+            .constrain(LogicalSize::new(natural_width.into(), 0))
             .width;
         // Gutter reservation depends only on policy and outer width, so resolve
         // it against a tall probe rectangle before the height is known.
-        let probe = scroll_view.content_area(Rect::new(0, 0, width, u16::MAX));
+        let probe = scroll_view.content_area(Rect::new(
+            0,
+            0,
+            width.try_into().unwrap_or(u16::MAX),
+            u16::MAX,
+        ));
         let content = self.content_layout(content_id(id), probe.width);
         let size = constraints.constrain(LogicalSize::new(width, content.size.height));
         let content_area = scroll_view.content_area(local_area_of(size));
         let viewport = ScrollViewComponent::viewport_layout(
             viewport_id(id),
-            LogicalSize::new(content_area.width, usize::from(content_area.height)),
+            LogicalSize::new(
+                content_area.width.into(),
+                u64::try_from(usize::from(content_area.height)).unwrap_or(u64::MAX),
+            ),
             content,
         );
         LayoutNode::with_children(
@@ -619,8 +628,8 @@ impl<'a> SelectableList<'a> {
             size,
             vec![
                 ChildLayout::new(
-                    usize::from(content_area.x),
-                    usize::from(content_area.y),
+                    u64::try_from(usize::from(content_area.x)).unwrap_or(u64::MAX),
+                    u64::try_from(usize::from(content_area.y)).unwrap_or(u64::MAX),
                     viewport,
                 ),
                 ChildLayout::new(
@@ -644,7 +653,13 @@ impl<'a> SelectableList<'a> {
 
     /// Exact stacked item content at one content width.
     fn content_layout(&self, id: LayoutId, width: u16) -> LayoutNode {
-        LayoutNode::leaf(id, LogicalSize::new(width, self.total_height()))
+        LayoutNode::leaf(
+            id,
+            LogicalSize::new(
+                width.into(),
+                self.total_height().try_into().unwrap_or(u64::MAX),
+            ),
+        )
     }
 
     fn line(
@@ -1118,8 +1133,10 @@ struct ItemRows<'a, 'list> {
 impl Component for ItemRows<'_, '_> {
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        self.list
-            .content_layout(self.id.clone(), constraints.max_width())
+        self.list.content_layout(
+            self.id.clone(),
+            constraints.max_width().try_into().unwrap_or(u16::MAX),
+        )
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -1133,7 +1150,12 @@ impl Component for ItemRows<'_, '_> {
             for line_index in 0..item.height() {
                 if row >= self.offset && row < end {
                     cx.write_line_with_fallback_style(
-                        LocalRect::new(0, i64::try_from(row).unwrap_or(i64::MAX), width, 1),
+                        LocalRect::new(
+                            0,
+                            i64::try_from(row).unwrap_or(i64::MAX),
+                            width.try_into().unwrap_or(u16::MAX),
+                            1,
+                        ),
                         &self.list.line(index, item, line_index, self.state),
                         self.fallback,
                     );

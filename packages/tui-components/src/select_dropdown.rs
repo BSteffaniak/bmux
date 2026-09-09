@@ -692,14 +692,22 @@ impl Component for SelectDropdownComponent<'_, '_> {
         let (width, height) = self.select.size(self.state.get());
         LayoutNode::leaf(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, usize::from(height))),
+            constraints.constrain(LogicalSize::new(
+                width.into(),
+                u64::try_from(usize::from(height)).unwrap_or(u64::MAX),
+            )),
         )
         .with_metadata(LayoutMetadata::new().semantic("select"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
-        let area = Rect::new(0, 0, layout.size.width, height);
+        let area = Rect::new(
+            0,
+            0,
+            layout.size.width.try_into().unwrap_or(u16::MAX),
+            height,
+        );
         if area.is_empty() {
             return;
         }

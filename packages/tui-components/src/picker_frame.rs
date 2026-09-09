@@ -301,44 +301,57 @@ impl<'a> PickerFrameComponent<'a> {
             .policy
             .max_size
             .width
-            .min(constraints.max_width())
+            .min(constraints.max_width().try_into().unwrap_or(u16::MAX))
             .max(
                 self.frame
                     .policy
                     .min_size
                     .width
-                    .min(constraints.max_width()),
+                    .min(constraints.max_width().try_into().unwrap_or(u16::MAX)),
             );
         let available_height = constraints
             .max_height()
             .unwrap_or_else(|| constraints.min_height());
         let height = usize::from(self.frame.policy.max_size.height)
-            .min(available_height)
-            .max(usize::from(self.frame.policy.min_size.height).min(available_height));
-        LogicalSize::new(width, height)
+            .min(available_height.try_into().unwrap_or(usize::MAX))
+            .max(
+                usize::from(self.frame.policy.min_size.height)
+                    .min(available_height.try_into().unwrap_or(usize::MAX)),
+            );
+        LogicalSize::new(width.into(), height.try_into().unwrap_or(u64::MAX))
     }
 
     fn panel_origin(&self, outer: LogicalSize, panel: LogicalSize) -> (u16, usize) {
         let margin = self.frame.policy.margin;
-        let available_width = outer.width.saturating_sub(margin.horizontal());
-        let available_height = outer.height.saturating_sub(usize::from(margin.vertical()));
+        let available_width = outer.width.saturating_sub(margin.horizontal().into());
+        let available_height = outer
+            .height
+            .saturating_sub(u64::try_from(usize::from(margin.vertical())).unwrap_or(u64::MAX));
         let remaining_x = available_width.saturating_sub(panel.width);
         let remaining_y = available_height.saturating_sub(panel.height);
         let x = match self.frame.policy.placement {
             PickerFramePlacement::Center
             | PickerFramePlacement::UpperThird
             | PickerFramePlacement::LowerThird => remaining_x / 2,
-            PickerFramePlacement::Anchored(point) => point.x.min(remaining_x),
+            PickerFramePlacement::Anchored(point) => point
+                .x
+                .min(remaining_x.try_into().unwrap_or(u16::MAX))
+                .into(),
         };
         let y = match self.frame.policy.placement {
             PickerFramePlacement::Center => remaining_y / 2,
             PickerFramePlacement::UpperThird => remaining_y / 3,
             PickerFramePlacement::LowerThird => remaining_y.saturating_mul(2) / 3,
-            PickerFramePlacement::Anchored(point) => usize::from(point.y).min(remaining_y),
+            PickerFramePlacement::Anchored(point) => usize::from(point.y)
+                .min(remaining_y.try_into().unwrap_or(usize::MAX))
+                .try_into()
+                .unwrap_or(u64::MAX),
         };
         (
-            margin.left.saturating_add(x),
-            usize::from(margin.top).saturating_add(y),
+            margin
+                .left
+                .saturating_add(u16::try_from(x).unwrap_or(u16::MAX)),
+            usize::from(margin.top).saturating_add(usize::try_from(y).unwrap_or(usize::MAX)),
         )
     }
 
@@ -348,7 +361,7 @@ impl<'a> PickerFrameComponent<'a> {
         frame.resolved_layout(Rect::new(
             0,
             0,
-            size.width,
+            size.width.try_into().unwrap_or(u16::MAX),
             u16::try_from(size.height).unwrap_or(u16::MAX),
         ))
     }
@@ -407,7 +420,12 @@ impl<'a> PickerFrameComponent<'a> {
         cx.with_child(
             i32::try_from(panel.x).unwrap_or(i32::MAX),
             i64::try_from(panel.y).unwrap_or(i64::MAX),
-            LocalRect::new(0, 0, panel.node.size.width, panel_height),
+            LocalRect::new(
+                0,
+                0,
+                panel.node.size.width.try_into().unwrap_or(u16::MAX),
+                panel_height,
+            ),
             |cx| {
                 let surface = self.panel_surface();
                 let Some(surface_layout) = panel.node.children.last() else {
@@ -424,7 +442,7 @@ impl<'a> PickerFrameComponent<'a> {
                             LocalRect::new(
                                 0,
                                 0,
-                                child.node.size.width,
+                                child.node.size.width.try_into().unwrap_or(u16::MAX),
                                 u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
                             ),
                             |cx| component.paint(&child.node, cx),
@@ -490,31 +508,34 @@ impl Component for PickerFrameComponent<'_> {
                 .unwrap_or_else(|| constraints.min_height()),
         ));
         let panel_size = self.panel_size(constraints.inset(
-            self.frame.policy.margin.horizontal(),
-            usize::from(self.frame.policy.margin.vertical()),
+            self.frame.policy.margin.horizontal().into(),
+            u64::try_from(usize::from(self.frame.policy.margin.vertical())).unwrap_or(u64::MAX),
         ));
         let local = self.local_layout(panel_size);
         let mut children = Vec::with_capacity(2);
         if let (Some(input), Some(area)) = (&self.input, local.input) {
-            let node = input.layout(Constraints::new(area.width, area.width, 1, Some(1)), cx);
+            let node = input.layout(
+                Constraints::new(area.width.into(), area.width.into(), 1, Some(1)),
+                cx,
+            );
             children.push(ChildLayout::new(
-                usize::from(area.x),
-                usize::from(area.y),
+                u64::try_from(usize::from(area.x)).unwrap_or(u64::MAX),
+                u64::try_from(usize::from(area.y)).unwrap_or(u64::MAX),
                 node,
             ));
         }
         let list = self.list.layout(
             Constraints::new(
-                local.list.width,
-                local.list.width,
-                usize::from(local.list.height),
-                Some(usize::from(local.list.height)),
+                local.list.width.into(),
+                local.list.width.into(),
+                u64::try_from(usize::from(local.list.height)).unwrap_or(u64::MAX),
+                Some(u64::try_from(usize::from(local.list.height)).unwrap_or(u64::MAX)),
             ),
             cx,
         );
         children.push(ChildLayout::new(
-            usize::from(local.list.x),
-            usize::from(local.list.y),
+            u64::try_from(usize::from(local.list.x)).unwrap_or(u64::MAX),
+            u64::try_from(usize::from(local.list.y)).unwrap_or(u64::MAX),
             list,
         ));
         for (name, area) in [
@@ -538,8 +559,8 @@ impl Component for PickerFrameComponent<'_> {
                     .layout(Constraints::tight(area.size()), cx);
                 node.id = LayoutId::new(format!("{}.chrome.{name}", self.id.as_str()));
                 children.push(ChildLayout::new(
-                    usize::from(area.x),
-                    usize::from(area.y),
+                    u64::try_from(usize::from(area.x)).unwrap_or(u64::MAX),
+                    u64::try_from(usize::from(area.y)).unwrap_or(u64::MAX),
                     node,
                 ));
             }
@@ -557,7 +578,11 @@ impl Component for PickerFrameComponent<'_> {
         LayoutNode::with_children(
             self.id.clone(),
             outer,
-            vec![ChildLayout::new(usize::from(x), y, panel)],
+            vec![ChildLayout::new(
+                u64::try_from(usize::from(x)).unwrap_or(u64::MAX),
+                y.try_into().unwrap_or(u64::MAX),
+                panel,
+            )],
         )
     }
 
@@ -577,7 +602,7 @@ impl Component for PickerFrameComponent<'_> {
                 LocalRect::new(
                     0,
                     0,
-                    child.node.size.width,
+                    child.node.size.width.try_into().unwrap_or(u16::MAX),
                     u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
                 ),
                 |cx| component.paint(&child.node, cx),
@@ -610,7 +635,7 @@ impl Component for PickerFrameComponent<'_> {
                 Rect::new(
                     u16::try_from(x).unwrap_or(u16::MAX),
                     u16::try_from(y).unwrap_or(u16::MAX),
-                    child.node.size.width,
+                    child.node.size.width.try_into().unwrap_or(u16::MAX),
                     u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
                 ),
                 |cx| component.event(event, &child.node, cx),
