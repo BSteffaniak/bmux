@@ -15,11 +15,13 @@ use bmux_attach_layout_protocol::{
 };
 use bmux_plugin::RenderOp;
 use bmux_text_edit::{TextDelete, TextEditBuffer, TextMotion};
-use bmux_tui::component::{Component, Constraints, LayoutCx};
-use bmux_tui::composition::TextBlock;
+use bmux_tui::component::{
+    Component, ComponentRevision, Constraints, LayoutCache, LayoutCx, LayoutNode, LogicalSize,
+};
+use bmux_tui::composition::{Column, SizeBox, TextBlock};
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
-use bmux_tui::hit::HitMap;
+use bmux_tui::hit::{HitMap, HitRegion};
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Text};
 use bmux_tui_components::action_row::{ActionButton, ActionRowComponent, ActionRowState};
@@ -27,6 +29,7 @@ use bmux_tui_components::button::ButtonStyles;
 use bmux_tui_components::checkbox::{CheckboxComponent, CheckboxState, CheckboxStyles};
 use bmux_tui_components::dialog::{Dialog, DialogComponent};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing};
+use bmux_tui_components::scroll_view::{ScrollViewComponent, ScrollViewState};
 use bmux_tui_components::scrollbar::{
     ScrollbarComponent, ScrollbarPolicy, ScrollbarState, ScrollbarStyles,
 };
@@ -108,7 +111,7 @@ enum PromptWidgetState {
     },
     SingleSelect {
         selected: usize,
-        scroll: usize,
+        list: VirtualListState<usize>,
     },
     SearchSelect {
         query: TextEditBuffer,
@@ -119,11 +122,11 @@ enum PromptWidgetState {
     MultiToggle {
         cursor: usize,
         selected: BTreeSet<usize>,
-        scroll: usize,
+        scroll: ScrollViewState,
     },
     Form {
         cursor: usize,
-        scroll: usize,
+        scroll: ScrollViewState,
         values: BTreeMap<String, PromptFormValue>,
         editors: BTreeMap<String, TextEditBuffer>,
         errors: BTreeMap<String, String>,
@@ -136,6 +139,8 @@ struct ActivePrompt {
     envelope: AttachPromptEnvelope,
     state: PromptWidgetState,
     hits: HitMap,
+    // One active scrolling layout; dropped with the prompt, replaced on geometry changes.
+    scroll_layout: LayoutCache,
 }
 
 impl ActivePrompt {
@@ -160,7 +165,7 @@ impl ActivePrompt {
                 };
                 PromptWidgetState::SingleSelect {
                     selected,
-                    scroll: 0,
+                    list: VirtualListState::new(0),
                 }
             }
             PromptField::SearchSelect {
@@ -193,12 +198,12 @@ impl ActivePrompt {
                 PromptWidgetState::MultiToggle {
                     cursor: 0,
                     selected,
-                    scroll: 0,
+                    scroll: ScrollViewState::new(),
                 }
             }
             PromptField::Form { sections, .. } => PromptWidgetState::Form {
                 cursor: 0,
-                scroll: 0,
+                scroll: ScrollViewState::new(),
                 values: initial_form_values(sections),
                 editors: initial_form_editors(sections),
                 errors: BTreeMap::new(),
@@ -209,6 +214,7 @@ impl ActivePrompt {
             envelope,
             state,
             hits: HitMap::new(),
+            scroll_layout: LayoutCache::new(),
         }
     }
 }
@@ -271,25 +277,12 @@ impl AttachPromptState {
                     ..
                 },
                 PromptWidgetState::SearchSelect {
-                    query,
-                    selected,
-                    list,
-                    viewport_height,
+                    query, selected, ..
                 },
             ) => {
                 query.paste(text);
                 let len = filtered_option_indices(options, query.text(), *match_mode).len();
                 *selected = (*selected).min(len.saturating_sub(1));
-                let offset = list.scroll.vertical_offset();
-                list.scroll.set_vertical_offset(if *selected < offset {
-                    *selected
-                } else if *viewport_height > 0
-                    && *selected >= offset.saturating_add(*viewport_height)
-                {
-                    selected.saturating_add(1).saturating_sub(*viewport_height)
-                } else {
-                    offset
-                });
             }
             (
                 PromptField::Form {
@@ -458,7 +451,7 @@ impl AttachPromptState {
                         live_preview,
                         ..
                     },
-                    PromptWidgetState::SingleSelect { selected, scroll },
+                    PromptWidgetState::SingleSelect { selected, .. },
                 ) => {
                     let previous_selected = *selected;
                     if options.is_empty() {
@@ -492,7 +485,6 @@ impl AttachPromptState {
                             }
                             _ => {}
                         }
-                        *scroll = (*scroll).min(*selected);
                         if *live_preview && *selected != previous_selected {
                             emit_selection_changed(&active.envelope, *selected);
                         }
@@ -508,7 +500,7 @@ impl AttachPromptState {
                     PromptWidgetState::SearchSelect {
                         query,
                         selected,
-                        list,
+                        list: _,
                         viewport_height,
                     },
                 ) => {
@@ -612,17 +604,6 @@ impl AttachPromptState {
                     }
                     let filtered = filtered_option_indices(options, query.text(), *match_mode);
                     *selected = (*selected).min(filtered.len().saturating_sub(1));
-                    let offset = list.scroll.vertical_offset();
-                    let next = if *selected < offset {
-                        *selected
-                    } else if *viewport_height > 0
-                        && *selected >= offset.saturating_add(*viewport_height)
-                    {
-                        selected.saturating_add(1).saturating_sub(*viewport_height)
-                    } else {
-                        offset
-                    };
-                    list.scroll.set_vertical_offset(next);
                     if *live_preview {
                         let selected_value = filtered
                             .get(*selected)
@@ -644,7 +625,7 @@ impl AttachPromptState {
                     PromptWidgetState::MultiToggle {
                         cursor,
                         selected,
-                        scroll,
+                        scroll: _,
                     },
                 ) => {
                     let len = options.len();
@@ -690,7 +671,6 @@ impl AttachPromptState {
                             }
                             _ => {}
                         }
-                        *scroll = (*scroll).min(*cursor);
                     }
                 }
                 (
@@ -702,7 +682,7 @@ impl AttachPromptState {
                     },
                     PromptWidgetState::Form {
                         cursor,
-                        scroll,
+                        scroll: _,
                         values,
                         editors,
                         errors,
@@ -943,7 +923,6 @@ impl AttachPromptState {
                             }
                             _ => {}
                         }
-                        *scroll = (*scroll).min(*cursor);
                     }
                 }
                 _ => {}
@@ -1003,7 +982,7 @@ impl AttachPromptState {
             },
             PromptWidgetState::Form {
                 cursor,
-                scroll,
+                scroll: _,
                 values,
                 errors,
                 ..
@@ -1033,8 +1012,21 @@ impl AttachPromptState {
                 return PromptKeyDisposition::Consumed;
             }
             let fields = flatten_form_fields(sections);
-            let row = usize::from(mouse.row.saturating_sub(content_y));
-            let index = scroll.saturating_add(row);
+            let Some(index) = active.hits.regions().iter().rev().find_map(|hit| {
+                hit.area
+                    .contains(Point::new(mouse.column, mouse.row))
+                    .then(|| {
+                        hit.id
+                            .as_str()
+                            .strip_prefix("prompt.form.field.")?
+                            .parse::<usize>()
+                            .ok()
+                    })
+                    .flatten()
+            }) else {
+                // No painted target: do not infer interaction geometry from raw rows.
+                return PromptKeyDisposition::Consumed;
+            };
             let Some(field) = fields.get(index) else {
                 return PromptKeyDisposition::Consumed;
             };
@@ -1106,38 +1098,25 @@ impl AttachPromptState {
         else {
             return PromptKeyDisposition::Consumed;
         };
-        let PromptWidgetState::SingleSelect { selected, scroll } = &mut active.state else {
+        let PromptWidgetState::SingleSelect { selected, .. } = &mut active.state else {
             return PromptKeyDisposition::Consumed;
         };
         if options.is_empty() {
             return PromptKeyDisposition::Consumed;
         }
 
-        let width = usize::from(layout.surface.rect.w);
-        let height = usize::from(layout.surface.rect.h);
-        let x = usize::from(layout.surface.rect.x);
-        let text_width = width.saturating_sub(4);
-        let body_rows = height.saturating_sub(4).max(1);
-        let message_rows = active
-            .envelope
-            .request
-            .message
-            .as_ref()
-            .map_or(0, |message| wrap_lines(message, text_width).len());
-        let field_rows = body_rows.saturating_sub(message_rows).max(1);
-        *scroll = adjust_scroll(*scroll, *selected, options.len(), field_rows);
-
-        let body_y = usize::from(layout.surface.rect.y).saturating_add(1);
-        let field_y = body_y.saturating_add(message_rows);
-        let column = usize::from(mouse.column);
-        if column <= x || column >= x.saturating_add(width).saturating_sub(1) {
+        let Some(option_index) = active
+            .hits
+            .hit_test(Point::new(mouse.column, mouse.row))
+            .and_then(|hit| {
+                hit.id()
+                    .as_str()
+                    .strip_prefix("single-select-list.item.")
+                    .and_then(|index| index.parse::<usize>().ok())
+            })
+        else {
             return PromptKeyDisposition::Consumed;
-        }
-        let row = usize::from(mouse.row);
-        if row < field_y || row >= field_y.saturating_add(field_rows) {
-            return PromptKeyDisposition::Consumed;
-        }
-        let option_index = scroll.saturating_add(row.saturating_sub(field_y));
+        };
         if option_index >= options.len() {
             return PromptKeyDisposition::Consumed;
         }
@@ -1265,7 +1244,14 @@ impl AttachPromptState {
                 });
             (rendered_palette, cursor_state)
         };
-        if rendered_palette {
+        if rendered_palette
+            || matches!(
+                active.state,
+                PromptWidgetState::SingleSelect { .. }
+                    | PromptWidgetState::Form { .. }
+                    | PromptWidgetState::MultiToggle { .. }
+            )
+        {
             active.hits = frame.hits().clone();
         }
         let ops = buffer_render_ops(&buffer);
@@ -1320,6 +1306,29 @@ impl AttachPromptState {
             response,
         })
     }
+}
+
+fn paint_retained_scroll(
+    component: &impl Component,
+    area: Rect,
+    cache: &mut LayoutCache,
+    cx: &mut PaintCx<'_, '_>,
+) {
+    let id = bmux_tui::component::LayoutId::new("prompt.scroll");
+    let constraints = Constraints::tight(area.size());
+    if cache
+        .get(&id, component.revision().layout, constraints)
+        .is_none()
+    {
+        cache.clear();
+    }
+    let layout = cache.layout(id, component, constraints, &mut LayoutCx::new());
+    cx.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| component.paint(&layout, cx),
+    );
 }
 
 fn paint_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
@@ -1526,9 +1535,68 @@ const fn form_text_input_styles(
     }
 }
 
+struct FormFieldComponent<'a> {
+    id: String,
+    field: &'a PromptFormField,
+    values: &'a BTreeMap<String, PromptFormValue>,
+    editors: &'a BTreeMap<String, TextEditBuffer>,
+    errors: &'a BTreeMap<String, String>,
+    focused: bool,
+    text: String,
+    theme: bmux_tui_components::modal_frame::ModalTheme,
+}
+
+impl Component for FormFieldComponent<'_> {
+    fn revision(&self) -> ComponentRevision {
+        SizeBox::new(TextBlock::new(self.text.clone()))
+            .id(self.id.clone())
+            .height(1)
+            .revision()
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        // Existing form controls occupy one terminal row, including error text.
+        SizeBox::new(TextBlock::new(self.text.clone()))
+            .id(self.id.clone())
+            .height(1)
+            .layout(constraints, cx)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let area = Rect::new(0, 0, layout.size.width, 1);
+        cx.push_hit(HitRegion::new(self.id.clone(), area));
+        if !self.errors.contains_key(&self.field.id)
+            && render_form_control(
+                self.field,
+                self.values,
+                self.editors,
+                self.errors,
+                self.focused,
+                area,
+                cx,
+                self.theme,
+            )
+        {
+            return;
+        }
+        let style = if self.field.disabled {
+            self.theme.muted
+        } else if self.focused || self.errors.contains_key(&self.field.id) {
+            self.theme.focused
+        } else {
+            self.theme.text
+        };
+        cx.write_line_with_fallback_style(
+            LocalRect::terminal(area),
+            &Line::raw(self.text.clone()),
+            self.theme.background.patch(style),
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)] // Form rendering keeps pagination, canonical values, controls, errors, and action rows synchronized.
 fn render_form(
-    active: &ActivePrompt,
+    active: &mut ActivePrompt,
     content: Rect,
     cx: &mut PaintCx<'_, '_>,
     theme: bmux_tui_components::modal_frame::ModalTheme,
@@ -1548,7 +1616,7 @@ fn render_form(
         editors,
         errors,
         page,
-    } = &active.state
+    } = &mut active.state
     else {
         return false;
     };
@@ -1579,48 +1647,30 @@ fn render_form(
         content.width,
         content.height.saturating_sub(actions_height),
     );
-    let visible_rows = usize::from(fields_area.height).max(1);
-    let start = (*scroll).min(rows.len().saturating_sub(visible_rows));
-    let end = start.saturating_add(visible_rows).min(rows.len());
-    for (visible_row, row) in rows.iter().take(end).skip(start).enumerate() {
-        let index = start.saturating_add(visible_row);
-        let Ok(visible_row) = u16::try_from(visible_row) else {
-            break;
-        };
-        let control_area = Rect::new(
-            fields_area.x,
-            fields_area.y.saturating_add(visible_row),
-            fields_area.width,
-            1,
-        );
-        let field = fields[index];
-        if !errors.contains_key(&field.id)
-            && render_form_control(
-                field,
-                values,
-                editors,
-                errors,
-                index.saturating_add(page_offset) == *cursor,
-                control_area,
-                cx,
-                theme,
-            )
-        {
-            continue;
-        }
-        let style = if field.disabled {
-            theme.muted
-        } else if index.saturating_add(page_offset) == *cursor || errors.contains_key(&field.id) {
-            theme.focused
-        } else {
-            theme.text
-        };
-        cx.write_line_with_fallback_style(
-            LocalRect::terminal(control_area),
-            &Line::raw(row.text.clone()),
-            theme.background.patch(style),
-        );
+    let mut column = Column::new().id("prompt.form.fields");
+    for (index, row) in rows.iter().enumerate() {
+        column = column.child(FormFieldComponent {
+            id: format!("prompt.form.field.{}", index.saturating_add(page_offset)),
+            field: fields[index],
+            values,
+            editors,
+            errors,
+            focused: index.saturating_add(page_offset) == *cursor,
+            text: row.text.clone(),
+            theme,
+        });
     }
+    let retained_scroll = Cell::new(*scroll);
+    let viewport = ScrollViewComponent::new(
+        "prompt.form.viewport",
+        LogicalSize::new(fields_area.width, usize::from(fields_area.height)),
+        *scroll,
+        column,
+    )
+    .retain_state(&retained_scroll)
+    .reveal(format!("prompt.form.field.{cursor}"));
+    paint_retained_scroll(&viewport, fields_area, &mut active.scroll_layout, cx);
+    *scroll = retained_scroll.get();
     if actions_height > 0 {
         let actions = [
             ActionButton::new("submit", active.envelope.request.submit_label.clone()),
@@ -1657,7 +1707,7 @@ fn render_form(
 }
 
 fn render_multi_toggle(
-    active: &ActivePrompt,
+    active: &mut ActivePrompt,
     content: Rect,
     cx: &mut PaintCx<'_, '_>,
     theme: bmux_tui_components::modal_frame::ModalTheme,
@@ -1669,37 +1719,57 @@ fn render_multi_toggle(
         cursor,
         selected,
         scroll,
-    } = &active.state
+    } = &mut active.state
     else {
         return false;
     };
-    let visible = usize::from(content.height);
-    let start = (*scroll).min(options.len().saturating_sub(visible));
-    let end = start.saturating_add(visible).min(options.len());
-    for (visible_row, (index, option)) in
-        options.iter().enumerate().take(end).skip(start).enumerate()
-    {
-        let Ok(row) = u16::try_from(visible_row) else {
-            break;
-        };
-        let mut state = CheckboxState::new(selected.contains(&index));
-        state.set_focused(index == *cursor);
-        paint_checkbox(
-            format!("prompt.multi-toggle.{index}"),
-            &option.label,
-            state,
-            CheckboxStyles {
-                normal: theme.text,
-                focused: theme.focused,
-                hovered: theme.focused,
-                pressed: theme.focused,
-                disabled: theme.muted,
-            },
-            theme.background,
-            Rect::new(content.x, content.y.saturating_add(row), content.width, 1),
-            cx,
+    let states = options
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let mut state = CheckboxState::new(selected.contains(&index));
+            state.set_focused(index == *cursor);
+            Cell::new(state)
+        })
+        .collect::<Vec<_>>();
+    let mut column = Column::new().id("prompt.multi-toggle.options");
+    for (index, (option, state)) in options.iter().zip(&states).enumerate() {
+        column = column.child(
+            SizeBox::new(
+                CheckboxComponent::new(
+                    format!("prompt.multi-toggle.{index}"),
+                    &option.label,
+                    state,
+                )
+                .styles(CheckboxStyles {
+                    normal: theme.text,
+                    focused: theme.focused,
+                    hovered: theme.focused,
+                    pressed: theme.focused,
+                    disabled: theme.muted,
+                })
+                .fallback_style(theme.background),
+            )
+            .height(1),
         );
     }
+    let content = Rect::new(
+        content.x,
+        content.y,
+        content.width,
+        content.height.saturating_sub(u16::from(content.height > 1)),
+    );
+    let retained = Cell::new(*scroll);
+    let viewport = ScrollViewComponent::new(
+        "prompt.multi-toggle.viewport",
+        LogicalSize::new(content.width, usize::from(content.height)),
+        *scroll,
+        column,
+    )
+    .retain_state(&retained)
+    .reveal(format!("prompt.multi-toggle.{cursor}"));
+    paint_retained_scroll(&viewport, content, &mut active.scroll_layout, cx);
+    *scroll = retained.get();
     true
 }
 
@@ -1808,7 +1878,11 @@ fn render_single_select(
     let PromptField::SingleSelect { options, .. } = &active.envelope.request.field else {
         return false;
     };
-    let PromptWidgetState::SingleSelect { selected, scroll } = &mut active.state else {
+    let PromptWidgetState::SingleSelect {
+        selected,
+        list: state,
+    } = &mut active.state
+    else {
         return false;
     };
     let items = options.iter().enumerate().fold(
@@ -1843,19 +1917,16 @@ fn render_single_select(
             )
         },
     );
-    let mut state = VirtualListState::new(0);
-    state.scroll.set_vertical_offset(*scroll);
-    items.sync(content.width, &mut state, &mut LayoutCx::new());
+    items.sync(content.width, state, &mut LayoutCx::new());
     if !options.is_empty() {
-        items.ensure_item_visible(&mut state, selected, usize::from(content.height));
+        items.ensure_item_visible(state, selected, usize::from(content.height));
     }
-    *scroll = state.scroll.vertical_offset();
     cx.with_child(
         i32::from(content.x),
         i64::from(content.y),
         LocalRect::new(0, 0, content.width, content.height),
         |cx| {
-            items.paint(Rect::new(0, 0, content.width, content.height), &state, cx);
+            items.paint(Rect::new(0, 0, content.width, content.height), state, cx);
         },
     );
     true
@@ -2772,23 +2843,6 @@ fn fuzzy_score(query: &str, candidate: &str) -> Option<i64> {
     Some(score)
 }
 
-fn adjust_scroll(current: usize, cursor: usize, total: usize, visible: usize) -> usize {
-    if total == 0 {
-        return 0;
-    }
-    let visible = visible.max(1);
-    let max_scroll = total.saturating_sub(visible);
-    if cursor < current {
-        cursor
-    } else if cursor >= current.saturating_add(visible) {
-        cursor
-            .saturating_sub(visible.saturating_sub(1))
-            .min(max_scroll)
-    } else {
-        current.min(max_scroll)
-    }
-}
-
 fn wrap_lines(input: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![String::new()];
@@ -2876,7 +2930,7 @@ fn run_prompt_validation(
 mod tests {
     use super::{
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, PromptWidgetState,
-        adjust_scroll, filtered_option_indices, prompt_overlay_layout,
+        filtered_option_indices, prompt_overlay_layout,
     };
     use crate::runtime::attach::input::TerminalGeometry;
     use crate::runtime::attach::tui_surface::{component_theme, parse_tui_color};
@@ -2905,6 +2959,71 @@ mod tests {
             modifiers,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn paged_form_click_targets_global_field_after_resize() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::form(
+                "Paged",
+                vec![
+                    PromptFormSection::new(
+                        "one",
+                        "One",
+                        vec![PromptFormField::new(
+                            "first",
+                            "First",
+                            PromptFormFieldKind::Bool { default: false },
+                        )],
+                    ),
+                    PromptFormSection::new(
+                        "two",
+                        "Two",
+                        vec![PromptFormField::new(
+                            "second",
+                            "Second",
+                            PromptFormFieldKind::Bool { default: false },
+                        )],
+                    ),
+                ],
+            )
+            .form_paged_on_small(true),
+            AttachInternalPromptAction::QuitSession,
+        );
+        state.handle_key_event(&key_event(KeyCode::PageDown));
+        for geometry in [
+            TerminalGeometry { cols: 24, rows: 10 },
+            TerminalGeometry { cols: 80, rows: 24 },
+        ] {
+            state
+                .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+                .expect("render");
+            let active = state.active.as_ref().expect("active");
+            let area = active
+                .hits
+                .regions()
+                .iter()
+                .find(|hit| hit.id.as_str() == "prompt.form.field.1")
+                .expect("second field visible")
+                .area;
+            state.handle_mouse_event(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                geometry,
+            );
+            let PromptWidgetState::Form { cursor, values, .. } =
+                &state.active.as_ref().expect("active").state
+            else {
+                panic!("form");
+            };
+            assert_eq!(*cursor, 1);
+            assert_eq!(values.get("first"), Some(&PromptFormValue::Bool(false)));
         }
     }
 
@@ -3389,14 +3508,6 @@ mod tests {
     }
 
     #[test]
-    fn adjust_scroll_keeps_cursor_visible() {
-        assert_eq!(adjust_scroll(0, 0, 10, 4), 0);
-        assert_eq!(adjust_scroll(0, 5, 10, 4), 2);
-        assert_eq!(adjust_scroll(6, 2, 10, 4), 2);
-        assert_eq!(adjust_scroll(8, 9, 10, 4), 6);
-    }
-
-    #[test]
     fn confirm_prompt_submits_on_enter() {
         let mut state = AttachPromptState::default();
         state.enqueue_internal(
@@ -3583,6 +3694,10 @@ mod tests {
 
         let _ = state.handle_key_event(&key_event(KeyCode::PageDown));
         let _ = state.handle_key_event(&key_event(KeyCode::PageDown));
+        // Selection is revealed against measured item geometry during rendering.
+        let _ = state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .expect("palette should render updated selection");
         let active = state.active.as_ref().expect("active prompt");
         let expected_index = match &active.state {
             PromptWidgetState::SearchSelect {
@@ -3765,6 +3880,74 @@ mod tests {
     }
 
     #[test]
+    fn single_select_wrapped_row_click_uses_retained_item_geometry() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::single_select(
+                "Choose",
+                vec![
+                    PromptOption::new(
+                        "first",
+                        "A long option label that wraps across several terminal rows",
+                    ),
+                    PromptOption::new("second", "Second"),
+                ],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let geometry = TerminalGeometry { cols: 28, rows: 20 };
+        let mut previous = None;
+        let mut previous_misses = None;
+        for _ in 0..2 {
+            state
+                .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+                .expect("render");
+            let active = state.active.as_ref().expect("active");
+            let region = active
+                .hits
+                .regions()
+                .iter()
+                .find(|hit| hit.id.as_str() == "single-select-list.item.0")
+                .expect("first item");
+            assert!(region.area.height > 1, "fixture must wrap");
+            if let Some(area) = previous {
+                assert_eq!(region.area, area);
+            }
+            previous = Some(region.area);
+            let PromptWidgetState::SingleSelect { list, .. } = &active.state else {
+                panic!("single select");
+            };
+            assert!(list.total_height() > 2);
+            let misses = list.layout_cache().stats().misses;
+            assert!(misses > 0);
+            if let Some(previous) = previous_misses {
+                assert_eq!(
+                    misses, previous,
+                    "unchanged render must reuse measured layouts"
+                );
+            }
+            previous_misses = Some(misses);
+        }
+        let area = previous.expect("painted item");
+        let outcome = state.handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            geometry,
+        );
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected completion");
+        };
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Single("first".to_string()))
+        );
+    }
+
+    #[test]
     fn single_select_prompt_moves_with_arrow_keys() {
         let mut state = AttachPromptState::default();
         state.enqueue_internal(
@@ -3791,6 +3974,72 @@ mod tests {
             completion.response,
             PromptResponse::Submitted(PromptValue::Single("wide".to_string()))
         );
+    }
+
+    #[test]
+    fn form_focus_reveals_last_field_and_clicks_resolved_geometry() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::form(
+                "Settings",
+                vec![PromptFormSection::new(
+                    "general",
+                    "General",
+                    (0..30)
+                        .map(|index| {
+                            PromptFormField::new(
+                                format!("field-{index}"),
+                                format!("Field {index}"),
+                                PromptFormFieldKind::Bool { default: false },
+                            )
+                        })
+                        .collect(),
+                )],
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        let PromptWidgetState::Form { cursor, .. } =
+            &mut state.active.as_mut().expect("active").state
+        else {
+            panic!("form");
+        };
+        *cursor = 29;
+        let geometry = TerminalGeometry { cols: 80, rows: 16 };
+        for _ in 0..2 {
+            state
+                .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+                .expect("render");
+        }
+        let active = state.active.as_ref().expect("active");
+        let PromptWidgetState::Form { scroll, .. } = &active.state else {
+            panic!("form");
+        };
+        assert!(scroll.vertical_offset() > 0);
+        assert_eq!(active.scroll_layout.len(), 1);
+        assert_eq!(active.scroll_layout.stats().misses, 1);
+        assert!(active.scroll_layout.stats().hits > 0);
+        let area = active
+            .hits
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == "prompt.form.field.29")
+            .unwrap_or_else(|| panic!("last field visible: {:?}", active.hits.regions()))
+            .area;
+        state.handle_mouse_event(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            geometry,
+        );
+        let PromptWidgetState::Form { values, .. } = &state.active.as_ref().expect("active").state
+        else {
+            panic!("form");
+        };
+        assert_eq!(values.get("field-29"), Some(&PromptFormValue::Bool(true)));
+        assert_eq!(values.get("field-0"), Some(&PromptFormValue::Bool(false)));
     }
 
     #[test]
@@ -3823,6 +4072,9 @@ mod tests {
             AttachInternalPromptAction::QuitSession,
         );
         let geometry = TerminalGeometry { cols: 80, rows: 24 };
+        state
+            .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+            .expect("form should paint interaction geometry");
         let surface = state.overlay_surface(geometry).expect("overlay");
         let mouse = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -4067,6 +4319,80 @@ mod tests {
         assert_eq!(
             values.get("rally_ms"),
             Some(&PromptFormValue::Integer(8_000))
+        );
+    }
+
+    #[test]
+    fn multi_toggle_reveals_selection_beyond_viewport() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::multi_toggle(
+                "Features",
+                (0..30)
+                    .map(|i| PromptOption::new(format!("option-{i}"), format!("Option {i}")))
+                    .collect(),
+            ),
+            AttachInternalPromptAction::QuitSession,
+        );
+        for _ in 0..29 {
+            state.handle_key_event(&key_event(KeyCode::Down));
+        }
+        for geometry in [
+            TerminalGeometry { cols: 80, rows: 16 },
+            TerminalGeometry { cols: 40, rows: 10 },
+            TerminalGeometry {
+                cols: 100,
+                rows: 24,
+            },
+        ] {
+            state
+                .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+                .expect("render");
+            let active = state.active.as_ref().expect("active");
+            let area = active
+                .hits
+                .regions()
+                .iter()
+                .find(|hit| hit.id.as_str() == "prompt.multi-toggle.29")
+                .expect("focused checkbox must be visible after resize")
+                .area;
+            assert!(area.height > 0 && area.width > 0);
+            assert!(area.bottom() < geometry.rows);
+            let misses = active.scroll_layout.stats().misses;
+            assert_eq!(active.scroll_layout.len(), 1);
+            state
+                .attach_prompt_overlay_render(geometry, &RuntimeAppearance::default(), false)
+                .expect("repeat render");
+            let cache = &state.active.as_ref().expect("active").scroll_layout;
+            assert_eq!(cache.stats().misses, misses);
+            assert!(cache.stats().hits > 0);
+        }
+        assert!(
+            state
+                .active
+                .as_ref()
+                .expect("active")
+                .scroll_layout
+                .stats()
+                .released
+                >= 2
+        );
+        let PromptWidgetState::MultiToggle { cursor, scroll, .. } =
+            &state.active.as_ref().expect("active").state
+        else {
+            panic!("multi toggle");
+        };
+        assert_eq!(*cursor, 29);
+        assert!(scroll.vertical_offset() > 0);
+        state.handle_key_event(&key_event(KeyCode::Char(' ')));
+        let PromptKeyDisposition::Completed(completion) =
+            state.handle_key_event(&key_event(KeyCode::Enter))
+        else {
+            panic!("completion");
+        };
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Multi(vec!["option-29".to_string()]))
         );
     }
 

@@ -31,6 +31,7 @@ pub struct TextInput<'buffer> {
     placeholder_style: Style,
     cursor_visible: bool,
     vertical_scroll: usize,
+    wrapped: Option<&'buffer bmux_text_edit::WrapLayout>,
 }
 
 impl<'buffer> TextInput<'buffer> {
@@ -46,7 +47,15 @@ impl<'buffer> TextInput<'buffer> {
             placeholder_style: Style::new(),
             cursor_visible: true,
             vertical_scroll: 0,
+            wrapped: None,
         }
+    }
+
+    /// Use a projection measured for the current buffer, cursor, and paint width.
+    #[must_use]
+    pub const fn wrapped_layout(mut self, layout: &'buffer bmux_text_edit::WrapLayout) -> Self {
+        self.wrapped = Some(layout);
+        self
     }
 
     /// Set stable layout identity.
@@ -138,16 +147,23 @@ impl<'buffer> TextInput<'buffer> {
             return;
         }
 
-        let layout = self.buffer.wrapped_layout(usize::from(area.width.max(1)));
+        let measured = self
+            .wrapped
+            .is_none()
+            .then(|| self.buffer.wrapped_layout(usize::from(area.width.max(1))));
+        let layout = self
+            .wrapped
+            .or(measured.as_ref())
+            .expect("wrapped projection");
         let vertical_scroll = if self.vertical_scroll == usize::MAX {
             scroll_offset_for_cursor_row(layout.cursor.row, area.height)
         } else {
             self.vertical_scroll
         };
-        let projection = Self::project_with_layout(&layout, vertical_scroll, area.height);
+        let projection = Self::project_with_layout(layout, vertical_scroll, area.height);
         let rendered_lines = selected_wrapped_lines(
             self.buffer.text(),
-            &layout,
+            layout,
             self.buffer.selection(),
             self.style,
             self.selection_style,

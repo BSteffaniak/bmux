@@ -175,6 +175,7 @@ impl Component for KeyHintBarComponent<'_> {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
         format!("{:?}", self.bar.hints).hash(&mut layout);
+        self.bar.policy.background.hash(&mut layout);
         self.bar.policy.separator.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
@@ -187,11 +188,28 @@ impl Component for KeyHintBarComponent<'_> {
         cx.record_measurement();
         let width = u16::try_from(display_width(&self.bar.text())).unwrap_or(u16::MAX);
         let height = usize::from(!self.bar.hints.is_empty());
-        LayoutNode::leaf(
-            self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, height)),
-        )
-        .with_metadata(LayoutMetadata::new().semantic("hint"))
+        let size = constraints.constrain(LogicalSize::new(width, height));
+        let children = if self.bar.policy.background {
+            vec![bmux_tui::component::ChildLayout::new(
+                0,
+                0,
+                bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                    .background(self.bar.styles.background)
+                    .layout(
+                        Constraints::new(
+                            size.width,
+                            size.width,
+                            size.height.min(1),
+                            Some(size.height.min(1)),
+                        ),
+                        cx,
+                    ),
+            )]
+        } else {
+            Vec::new()
+        };
+        LayoutNode::with_children(self.id.clone(), size, children)
+            .with_metadata(LayoutMetadata::new().semantic("hint"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -205,8 +223,10 @@ impl Component for KeyHintBarComponent<'_> {
             return;
         }
         let area = LocalRect::new(0, 0, layout.size.width, 1);
-        if self.bar.policy.background {
-            cx.fill(area, " ", self.bar.styles.background);
+        if let Some(surface) = layout.children.first() {
+            bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                .background(self.bar.styles.background)
+                .paint(&surface.node, cx);
         }
         let line = if display_width(&text) > usize::from(layout.size.width) {
             self.bar
@@ -449,7 +469,7 @@ mod tests {
         let background = KeyHintBarComponent::new("hints", &hints)
             .policy(KeyHintBarPolicy::compact().background(true))
             .revision();
-        assert_eq!(initial.layout, background.layout);
+        assert_ne!(initial.layout, background.layout);
         assert_ne!(initial.paint, background.paint);
 
         let separator = KeyHintBarComponent::new("hints", &hints)

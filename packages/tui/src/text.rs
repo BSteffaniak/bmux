@@ -527,11 +527,13 @@ impl WrapSink {
 }
 
 /// Count character-wrapped rows without allocating rendered spans or strings.
+#[cfg(test)]
 pub(crate) fn character_row_count(line: &Line, geometry: TextWrapGeometry) -> usize {
     character_row_count_up_to(line, geometry, usize::MAX)
 }
 
 /// Count at most `limit` rows, stopping traversal once that bound is reached.
+#[cfg(test)]
 pub(crate) fn character_row_count_up_to(
     line: &Line,
     geometry: TextWrapGeometry,
@@ -621,11 +623,13 @@ pub(crate) fn word_rows(
 }
 
 /// Count word-wrapped rows without constructing rendered text.
+#[cfg(test)]
 pub(crate) fn word_row_count(line: &Line, geometry: TextWrapGeometry) -> usize {
     word_row_count_up_to(line, geometry, usize::MAX)
 }
 
 /// Count at most `limit` rows without constructing rendered text.
+#[cfg(test)]
 pub(crate) fn word_row_count_up_to(line: &Line, geometry: TextWrapGeometry, limit: usize) -> usize {
     word_rows_with_mode(word_segments(line), geometry, true)
         .take(limit)

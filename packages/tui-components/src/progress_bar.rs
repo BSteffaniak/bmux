@@ -296,6 +296,7 @@ impl Component for ProgressBarComponent<'_> {
         self.policy.partial.hash(&mut paint);
         self.policy.pulse.hash(&mut paint);
         self.policy.pulse_width.hash(&mut paint);
+        self.policy.background.hash(&mut layout);
         self.policy.background.hash(&mut paint);
         self.styles.filled.hash(&mut paint);
         self.styles.empty.hash(&mut paint);
@@ -320,11 +321,28 @@ impl Component for ProgressBarComponent<'_> {
             ProgressLabelPlacement::Hidden | ProgressLabelPlacement::Right => 1,
         };
         let size = constraints.constrain(LogicalSize::new(u16_saturating(intrinsic_width), 0));
-        LayoutNode::leaf(
-            self.id.clone(),
-            constraints.constrain(LogicalSize::new(size.width, usize::from(size.width > 0))),
-        )
-        .with_metadata(LayoutMetadata::new().semantic("progress"))
+        let size = constraints.constrain(LogicalSize::new(size.width, usize::from(size.width > 0)));
+        let children = if self.policy.background {
+            vec![bmux_tui::component::ChildLayout::new(
+                0,
+                0,
+                bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                    .background(self.styles.background)
+                    .layout(
+                        Constraints::new(
+                            size.width,
+                            size.width,
+                            size.height.min(1),
+                            Some(size.height.min(1)),
+                        ),
+                        cx,
+                    ),
+            )]
+        } else {
+            Vec::new()
+        };
+        LayoutNode::with_children(self.id.clone(), size, children)
+            .with_metadata(LayoutMetadata::new().semantic("progress"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -332,8 +350,10 @@ impl Component for ProgressBarComponent<'_> {
             return;
         }
         let area = LocalRect::new(0, 0, layout.size.width, 1);
-        if self.policy.background {
-            cx.fill(area, " ", self.styles.background);
+        if let Some(surface) = layout.children.first() {
+            bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                .background(self.styles.background)
+                .paint(&surface.node, cx);
         }
         let line = match self.value {
             ProgressBarValue::Determinate { .. }

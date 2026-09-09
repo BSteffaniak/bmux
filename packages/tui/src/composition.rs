@@ -259,22 +259,15 @@ impl TextBlock {
         ComponentRevision::new(layout, paint)
     }
 
-    /// Project wrapped rows back to UTF-8 byte ranges in the logical text.
+    /// Project measured rows back to UTF-8 byte ranges in the logical text.
     ///
-    /// Source lines are treated as newline-separated. Ranges exclude synthetic
-    /// newline separators and whitespace consumed by a word-wrap boundary.
+    /// Pass this component's resolved layout, with a matching layout revision.
+    /// Paint-only style changes may reuse it. Source lines are newline-separated;
+    /// ranges exclude separators and whitespace consumed by word wrapping.
+    /// This returns the complete measured content, before viewport scrolling.
     #[must_use]
-    pub fn projection(&self, width: u16) -> Vec<TextProjectionRow> {
-        self.projection_rows(width).collect()
-    }
-
-    fn rendered_line_rows<'a>(
-        &'a self,
-        line: &'a Line,
-        width: u16,
-    ) -> impl Iterator<Item = Line> + 'a {
-        self.raw_line_rows(line, width)
-            .map(|row| if self.trim { trim_line_end(row) } else { row })
+    pub fn projection(&self, layout: &LayoutNode) -> Vec<TextProjectionRow> {
+        self.measured_rows(layout, 0).collect()
     }
 
     fn raw_line_rows<'a>(&'a self, line: &'a Line, width: u16) -> impl Iterator<Item = Line> + 'a {
@@ -363,21 +356,14 @@ impl TextBlock {
             return;
         }
         let first = self.vertical_scroll.saturating_add(visible.start);
-        let (source_skip, row_skip) = self.source_start(layout.size.width, first);
         for (index, row) in self
-            .projection_rows_from(layout.size.width, source_skip)
-            .skip(row_skip)
+            .measured_rows(layout, first)
             .take(visible.len())
             .enumerate()
         {
             let row_index = visible.start.saturating_add(index);
             let text = row.line.plain_text();
-            let line_width = u16::try_from(row.line.width()).unwrap_or(u16::MAX);
-            let x = match self.alignment {
-                Alignment::Left => 0,
-                Alignment::Center => layout.size.width.saturating_sub(line_width) / 2,
-                Alignment::Right => layout.size.width.saturating_sub(line_width),
-            };
+            let x = self.row_alignment_offset(&row.line, layout.size.width);
             let y = i64::try_from(row_index).unwrap_or(i64::MAX);
             cx.with_child(0, y, LocalRect::new(0, 0, layout.size.width, 1), |cx| {
                 for fragment in plain_text_fragments(
@@ -392,6 +378,52 @@ impl TextBlock {
                     cx.push_selection_fragment(fragment);
                 }
             });
+        }
+    }
+
+    fn measured_rows<'a>(
+        &'a self,
+        layout: &'a LayoutNode,
+        first: usize,
+    ) -> impl Iterator<Item = TextProjectionRow> + 'a {
+        layout
+            .metadata
+            .text_rows
+            .iter()
+            .flat_map(|rows| rows.iter())
+            .skip(first)
+            .map(|row| {
+                let base = self.source_line_offsets[row.source_line];
+                let range = row.source_range.start.saturating_sub(base)
+                    ..row.source_range.end.saturating_sub(base);
+                let mut offset = 0usize;
+                let spans = self.text.lines[row.source_line]
+                    .spans
+                    .iter()
+                    .filter_map(|span| {
+                        let start = range.start.saturating_sub(offset).min(span.content.len());
+                        let end = range.end.saturating_sub(offset).min(span.content.len());
+                        offset = offset.saturating_add(span.content.len());
+                        (start < end).then(|| {
+                            crate::text::Span::styled(&span.content[start..end], span.style)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                TextProjectionRow {
+                    source_line: row.source_line,
+                    source_range: row.source_range.clone(),
+                    line: Line::from_spans(spans),
+                }
+            })
+    }
+
+    fn row_alignment_offset(&self, line: &Line, width: u16) -> u16 {
+        let line_width = u16::try_from(line.width()).unwrap_or(u16::MAX);
+        let remaining = width.saturating_sub(line_width);
+        match self.alignment {
+            Alignment::Left => 0,
+            Alignment::Center => remaining / 2,
+            Alignment::Right => remaining,
         }
     }
 
@@ -412,6 +444,7 @@ impl TextBlock {
         first..end
     }
 
+    #[cfg(test)]
     fn line_row_count(&self, line: &Line, width: u16) -> usize {
         let geometry = TextWrapGeometry::uniform(usize::from(width.max(1)));
         match self.wrap {
@@ -423,6 +456,7 @@ impl TextBlock {
 
     /// Locate a display row without constructing preceding rendered lines.
     /// The returned offset is relative to the first retained source line.
+    #[cfg(test)]
     fn source_start(&self, width: u16, mut row: usize) -> (usize, usize) {
         if self.wrap == TextWrap::None {
             return (row.min(self.text.lines.len()), 0);
@@ -450,6 +484,7 @@ impl TextBlock {
         (self.text.lines.len(), 0)
     }
 
+    #[cfg(test)]
     fn row_count(&self, width: u16) -> usize {
         if self.wrap == TextWrap::None {
             return self.text.lines.len();
@@ -521,8 +556,17 @@ impl Component for TextBlock {
                 .unwrap_or(u16::MAX)
                 .clamp(constraints.min_width(), constraints.max_width())
         };
-        let size = constraints.constrain(LogicalSize::new(width, self.row_count(width)));
-        LayoutNode::leaf(self.id.clone(), size)
+        let rows = self
+            .projection_rows(width)
+            .map(|row| crate::component::TextRowGeometry {
+                source_line: row.source_line,
+                source_range: row.source_range,
+            })
+            .collect::<Vec<_>>();
+        let size = constraints.constrain(LogicalSize::new(width, rows.len()));
+        let mut node = LayoutNode::leaf(self.id.clone(), size);
+        node.metadata.text_rows = Some(rows.into());
+        node
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -530,25 +574,14 @@ impl Component for TextBlock {
         if visible.is_empty() {
             return;
         }
-        // Skip complete source lines before cloning, wrapping, or trimming output.
         let first = self.vertical_scroll.saturating_add(visible.start);
-        let (source_skip, row_skip) = self.source_start(layout.size.width, first);
         for (index, mut line) in self
-            .text
-            .lines
-            .iter()
-            .skip(source_skip)
-            .flat_map(|line| self.rendered_line_rows(line, layout.size.width))
-            .skip(row_skip)
+            .measured_rows(layout, first)
+            .map(|row| row.line)
             .take(visible.len())
             .enumerate()
         {
-            let line_width = u16::try_from(line.width()).unwrap_or(u16::MAX);
-            let x = match self.alignment {
-                Alignment::Left => 0,
-                Alignment::Center => layout.size.width.saturating_sub(line_width) / 2,
-                Alignment::Right => layout.size.width.saturating_sub(line_width),
-            };
+            let x = self.row_alignment_offset(&line, layout.size.width);
             if x > 0 {
                 line.spans
                     .insert(0, crate::text::Span::raw(" ".repeat(usize::from(x))));
@@ -2055,6 +2088,78 @@ mod tests {
     }
 
     #[test]
+    fn cached_text_geometry_survives_all_paint_only_channels() {
+        use crate::component::LayoutCache;
+        use crate::text::{Line, Span, Text, TextWrap};
+        use crate::text_block::Alignment;
+
+        let original = TextBlock::new("ab cd\n界ef").wrap(TextWrap::Word);
+        let changed = TextBlock::new(Text::from_lines([
+            Line::from_spans([Span::styled("ab cd", Style::new().fg(Color::Green))]),
+            Line::raw("界ef"),
+        ]))
+        .wrap(TextWrap::Word);
+        let mut cache = LayoutCache::new();
+        let mut cx = LayoutCx::new();
+        let constraints = Constraints::for_width(4);
+        let original_layout = cache.layout(LayoutId::new("text"), &original, constraints, &mut cx);
+        let measured = cx.measured_nodes();
+        for alignment in [Alignment::Left, Alignment::Center, Alignment::Right] {
+            for scroll in [0, 1, usize::MAX] {
+                let component = changed
+                    .clone()
+                    .alignment(alignment)
+                    .vertical_scroll(scroll)
+                    .style(Style::new().fg(Color::Blue).bg(Color::Red));
+                assert_eq!(original.revision().layout, component.revision().layout);
+                let cached = cache.layout(LayoutId::new("text"), &component, constraints, &mut cx);
+                assert_eq!(cx.measured_nodes(), measured);
+                assert!(std::sync::Arc::ptr_eq(
+                    original_layout.metadata.text_rows.as_ref().unwrap(),
+                    cached.metadata.text_rows.as_ref().unwrap(),
+                ));
+                let fresh = component.layout(constraints, &mut LayoutCx::new());
+                let render = |layout: &LayoutNode| {
+                    let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 3));
+                    let mut frame = Frame::new(&mut buffer);
+                    component.paint(layout, &mut PaintCx::new(&mut frame));
+                    component.register_selection(
+                        layout,
+                        &mut PaintCx::new(&mut frame),
+                        "scope",
+                        "text",
+                        0,
+                        1,
+                    );
+                    let fragments = frame.selection().fragments().to_vec();
+                    (buffer, fragments)
+                };
+                assert_eq!(render(&cached), render(&fresh));
+                assert_eq!(component.projection(&cached), component.projection(&fresh));
+            }
+        }
+    }
+
+    #[test]
+    fn retained_text_rows_use_current_paint_styles_without_rewrapping() {
+        use crate::text::{Line, Span, Text};
+        let original = TextBlock::new(Text::from_lines([Line::from_spans([
+            Span::styled("ab", Style::new().fg(Color::Red)),
+            Span::raw("cd"),
+        ])]));
+        let changed = TextBlock::new(Text::from_lines([Line::from_spans([
+            Span::styled("a", Style::new().fg(Color::Blue)),
+            Span::styled("bcd", Style::new().fg(Color::Green)),
+        ])]));
+        let layout = original.layout(Constraints::for_width(2), &mut LayoutCx::new());
+        let rows = changed.measured_rows(&layout, 1).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].line.plain_text(), "cd");
+        assert_eq!(rows[0].source_range, 2..4);
+        assert_eq!(rows[0].line.spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
     fn incremental_projection_preserves_offsets_across_source_lines() {
         let component = TextBlock::new("abcd\né🙂\nz").wrap(crate::text::TextWrap::Character);
         let mut rows = component.projection_rows(2);
@@ -2095,7 +2200,14 @@ mod tests {
                             component.layout(Constraints::for_width(width), &mut LayoutCx::new());
                         assert_eq!(
                             layout.size.height,
-                            component.projection(width).len(),
+                            component
+                                .projection(
+                                    &component.layout(
+                                        Constraints::for_width(width),
+                                        &mut LayoutCx::new()
+                                    )
+                                )
+                                .len(),
                             "text={text:?}, wrap={wrap:?}, trim={trim}, width={width}"
                         );
                     }
@@ -2113,7 +2225,9 @@ mod tests {
                 for trim in [false, true] {
                     for width in [0, 1, 2, 5, 20] {
                         let block = TextBlock::new(text).wrap(wrap).trim(trim);
-                        let all = block.projection(width);
+                        let all = block.projection(
+                            &block.layout(Constraints::for_width(width), &mut LayoutCx::new()),
+                        );
                         for first in (0..=all.len()).chain([usize::MAX]) {
                             let (source, offset) = block.source_start(width, first);
                             let suffix: Vec<_> = block
@@ -2123,7 +2237,7 @@ mod tests {
                             let expected = &all[first.min(all.len())..];
                             assert_eq!(suffix.len(), expected.len());
                             for (actual, expected) in suffix.iter().zip(expected) {
-                                assert_eq!(actual.line, expected.line);
+                                assert_eq!(actual.line.plain_text(), expected.line.plain_text());
                                 assert_eq!(actual.source_line, expected.source_line);
                                 assert_eq!(actual.source_range, expected.source_range);
                             }
@@ -2314,7 +2428,8 @@ mod tests {
         let component = TextBlock::new("a   b")
             .wrap(crate::text::TextWrap::Character)
             .trim(true);
-        let rows = component.projection(2);
+        let rows = component
+            .projection(&component.layout(Constraints::for_width(2), &mut LayoutCx::new()));
         assert_eq!(
             rows.iter()
                 .map(|row| row.line.plain_text())
@@ -2390,7 +2505,8 @@ mod tests {
     fn source_line_index_handles_empty_and_trailing_lines() {
         for source in ["", "\n", "界\n\n", "a\ne\u{301}\nlast"] {
             let component = TextBlock::new(source).wrap(crate::text::TextWrap::None);
-            let rows = component.projection(10);
+            let rows = component
+                .projection(&component.layout(Constraints::for_width(10), &mut LayoutCx::new()));
             let mut expected_offset = 0;
             for (index, line) in component.text().lines.iter().enumerate() {
                 assert_eq!(rows[index].source_range.start, expected_offset);
@@ -2426,13 +2542,18 @@ mod tests {
         ]))
         .wrap(crate::text::TextWrap::None)
         .trim(true);
-        let all = component.projection(3);
+        let all = component
+            .projection(&component.layout(Constraints::for_width(3), &mut LayoutCx::new()));
         for first in 0..=5 {
             let suffix: Vec<_> = component.projection_rows_from(3, first).collect();
             let expected: Vec<_> = all.iter().skip(first).collect();
             assert_eq!(suffix.len(), expected.len());
             for (actual, expected) in suffix.iter().zip(expected) {
-                assert_eq!(actual.line, expected.line);
+                if actual.line.plain_text().is_empty() {
+                    assert!(expected.line.plain_text().is_empty());
+                } else {
+                    assert_eq!(actual.line, expected.line);
+                }
                 assert_eq!(actual.source_line, expected.source_line);
                 assert_eq!(actual.source_range, expected.source_range);
             }
@@ -2457,7 +2578,8 @@ mod tests {
         ]))
         .wrap(crate::text::TextWrap::Character)
         .trim(true);
-        let rows = component.projection(4);
+        let rows = component
+            .projection(&component.layout(Constraints::for_width(4), &mut LayoutCx::new()));
 
         assert_eq!(
             component
@@ -2489,7 +2611,8 @@ mod tests {
         ]))
         .wrap(crate::text::TextWrap::Word)
         .trim(true);
-        let rows = component.projection(4);
+        let rows = component
+            .projection(&component.layout(Constraints::for_width(4), &mut LayoutCx::new()));
         assert_eq!(
             rows.iter()
                 .map(|row| row.line.plain_text())
@@ -2590,7 +2713,9 @@ mod tests {
                 for width in 1..=8 {
                     let block = TextBlock::new(text.clone()).wrap(TextWrap::Word).trim(trim);
                     let mut cursor = 0;
-                    for row in block.projection(width) {
+                    for row in block.projection(
+                        &block.layout(Constraints::for_width(width), &mut LayoutCx::new()),
+                    ) {
                         let rendered = row.line.plain_text();
                         let start = if rendered.is_empty() {
                             cursor
@@ -2619,7 +2744,8 @@ mod tests {
             crate::text::Line::raw("one  two"),
             crate::text::Line::raw("éx"),
         ]));
-        let rows = component.projection(5);
+        let rows = component
+            .projection(&component.layout(Constraints::for_width(5), &mut LayoutCx::new()));
         assert_eq!(
             rows.iter()
                 .map(|row| (

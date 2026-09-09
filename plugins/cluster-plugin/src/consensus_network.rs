@@ -455,9 +455,21 @@ impl<C> ControlServiceHandle<C> {
     where
         C: ServiceCaller + Send + Sync + 'static,
     {
-        self.read_linearizable_or_forward()
-            .await
-            .map(|view| view.members)
+        // Membership changes can briefly leave the local node without a leader
+        // hint. Wait for discovery without weakening the linearizable read or
+        // replaying a mutation; other errors remain immediately visible.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match self.read_linearizable_or_forward().await {
+                Err(ControlServiceError::NotLeader {
+                    leader_node_id: None,
+                    leader_endpoint: None,
+                }) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                result => return result.map(|view| view.members),
+            }
+        }
     }
 }
 

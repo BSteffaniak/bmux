@@ -261,12 +261,20 @@ impl ChildLayout {
     }
 }
 
+/// Measured source geometry for one text row, without paint-time styling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TextRowGeometry {
+    pub source_line: usize,
+    pub source_range: std::ops::Range<usize>,
+}
+
 /// Additional component-owned metadata attached to authoritative layout.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LayoutMetadata {
     /// Stable semantic labels/roles consumed by accessibility and inspection
     /// layers without reconstructing component geometry.
     pub semantics: Vec<String>,
+    pub(crate) text_rows: Option<std::sync::Arc<[TextRowGeometry]>>,
 }
 
 impl LayoutMetadata {
@@ -275,6 +283,7 @@ impl LayoutMetadata {
     pub const fn new() -> Self {
         Self {
             semantics: Vec::new(),
+            text_rows: None,
         }
     }
 

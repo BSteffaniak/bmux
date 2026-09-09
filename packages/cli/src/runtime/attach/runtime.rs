@@ -39,9 +39,7 @@ use bmux_ipc::InvokeServiceKind;
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_pane_runtime_plugin_api::pane_runtime_events as pane_events;
 use bmux_permissions_plugin_api::session_policy_state;
-use bmux_plugin::layout::{
-    PluginLayoutRequest, global_plugin_layout_registry, resolve_plugin_layout,
-};
+use bmux_plugin::layout::{PluginLayoutRequest, resolve_plugin_layout};
 use bmux_plugin::{
     AttachInputEvent, AttachInputHook, AttachInputModifiers, AttachInputPaneContext,
     AttachInputResult, AttachVisualProjectionUpdate, ExtensionRect,
@@ -3556,13 +3554,15 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     // sees a valid initial payload. Subsequent layout refreshes update
     // the retained value via `publish_attach_layout_snapshot`. The
     // channel is process-wide; re-registration is a no-op.
-    let _ = bmux_plugin::global_event_bus().register_state_channel::<AttachLayoutSnapshot>(
-        ATTACH_LAYOUT_STATE_KIND,
-        AttachLayoutSnapshot {
-            surfaces: Vec::new(),
-            revision: 0,
-        },
-    );
+    let _ = view_state
+        .presentation_events
+        .register_state_channel::<AttachLayoutSnapshot>(
+            ATTACH_LAYOUT_STATE_KIND,
+            AttachLayoutSnapshot {
+                surfaces: Vec::new(),
+                revision: 0,
+            },
+        );
 
     // Register the windows-plugin's `windows-list` state channel in
     // this attach process's event bus. The windows plugin publishes
@@ -3574,28 +3574,35 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     // call a few lines down reads from this channel.
     //
     // Re-registration is a no-op, so harmless if this runs twice.
-    let _ = bmux_plugin::global_event_bus()
+    let _ = view_state
+        .presentation_events
         .register_state_channel::<AttachLocalPresentationSnapshot>(
             ATTACH_LOCAL_PRESENTATION_STATE_KIND,
             AttachLocalPresentationSnapshot::initial(),
         );
-    let _ = bmux_plugin::global_event_bus()
+    let _ = view_state
+        .presentation_events
         .register_state_channel::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
-        bmux_windows_plugin_api::windows_list::STATE_KIND,
-        bmux_windows_plugin_api::windows_list::WindowListSnapshot {
-            windows: Vec::new(),
-            revision: 0,
-        },
-    );
-    let _ = bmux_plugin::global_event_bus().register_state_channel(
+            bmux_windows_plugin_api::windows_list::STATE_KIND,
+            bmux_windows_plugin_api::windows_list::WindowListSnapshot {
+                windows: Vec::new(),
+                revision: 0,
+            },
+        );
+    let _ = view_state.presentation_events.register_state_channel(
         bmux_windows_plugin_api::windows_local_view::STATE_KIND,
         bmux_windows_plugin_api::windows_local_view::WindowSelection {
             context_id: view_state.attached_context_id,
         },
     );
+    let mut started_companions = Vec::new();
     for companion in bmux_plugin::registered_attach_companions() {
-        if let Err(error) = companion.start() {
-            tracing::warn!(companion_id = companion.id(), %error, "failed starting attach companion");
+        let id = companion.id().to_owned();
+        match companion.start_owned() {
+            Ok(started) => started_companions.push(started),
+            Err(error) => {
+                tracing::warn!(companion_id = id, %error, "failed starting attach companion");
+            }
         }
     }
 
@@ -3614,11 +3621,9 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         }
     }
 
-    let mut layout_revision_rx = global_plugin_layout_registry().subscribe();
-    let mut surface_revision_rx =
-        bmux_plugin::surface::global_plugin_surface_registry().subscribe();
-    update_attach_viewport_with_geometry(&mut client, view_state.attached_id, terminal.geometry())
-        .await?;
+    let mut layout_revision_rx = view_state.presentation_layouts.subscribe();
+    let mut surface_revision_rx = view_state.presentation_surfaces.subscribe();
+    update_attach_viewport_with_geometry(&mut client, &view_state, terminal.geometry()).await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
     maybe_sync_remote_clipboard(
         &mut client,
@@ -3716,7 +3721,8 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     // activated), the tab bar falls back to `cached_contexts` in raw
     // server order — baseline behavior per AGENTS.md.
     let (mut last_window_list_revision, mut window_list_rx) =
-        match bmux_plugin::global_event_bus()
+        match view_state
+            .presentation_events
             .subscribe_state::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
             &bmux_windows_plugin_api::windows_list::STATE_KIND,
         ) {
@@ -3744,7 +3750,8 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         let snapshot = authoritative_window_list_snapshot(entries, 0);
         last_window_list_revision = snapshot.revision;
         view_state.cached_window_list = Some(std::sync::Arc::new(snapshot.clone()));
-        let _ = bmux_plugin::global_event_bus()
+        let _ = view_state
+            .presentation_events
             .publish_state(&bmux_windows_plugin_api::windows_list::STATE_KIND, snapshot);
     }
 
@@ -3955,7 +3962,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                 }
                 update_attach_viewport_with_geometry(
                     &mut client,
-                    view_state.attached_id,
+                    &view_state,
                                 terminal.geometry(),
                 )
                 .await?;
@@ -4053,7 +4060,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         let selection = bmux_windows_plugin_api::windows_local_view::WindowSelection {
             context_id: view_state.attached_context_id,
         };
-        let bus = bmux_plugin::global_event_bus();
+        let bus = &view_state.presentation_events;
         if bus
             .subscribe_state::<bmux_windows_plugin_api::windows_local_view::WindowSelection>(
                 &bmux_windows_plugin_api::windows_local_view::STATE_KIND,
@@ -4074,6 +4081,8 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
             &runtime_appearance,
         );
         super::local_presentation::publish_notification(
+            &view_state.presentation_layouts,
+            &view_state.presentation_surfaces,
             view_state.transient_status.as_deref(),
             geometry.cols,
             geometry.rows,
@@ -4634,14 +4643,10 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     );
 
     terminal.restore_after_attach_ui()?;
-    for companion in bmux_plugin::registered_attach_companions() {
-        if let Err(error) = companion.stop() {
-            tracing::warn!(companion_id = companion.id(), %error, "failed stopping attach companion");
-        }
-    }
-    super::local_presentation::uninstall();
-    bmux_plugin::surface::global_plugin_surface_registry().clear();
-    bmux_plugin::layout::global_plugin_layout_registry().clear();
+    drop(started_companions);
+    super::local_presentation::uninstall(&view_state.presentation_surfaces);
+    view_state.presentation_surfaces.clear();
+    view_state.presentation_layouts.clear();
 
     if exit_reason != AttachExitReason::Detached {
         let _ = client.detach().await;
@@ -4999,7 +5004,7 @@ async fn handle_attach_stream_server_event(
                 payload,
             ) {
                 Ok(snapshot) => {
-                    let current = bmux_plugin::global_event_bus()
+                    let current = view_state.presentation_events
                         .subscribe_state::<bmux_windows_plugin_api::windows_list::WindowListSnapshot>(
                             &bmux_windows_plugin_api::windows_list::STATE_KIND,
                         )
@@ -5011,7 +5016,7 @@ async fn handle_attach_stream_server_event(
                             |(snapshot, _)| snapshot.as_ref().clone(),
                         );
                     let snapshot = prefer_nonempty_window_list_snapshot(&current, snapshot);
-                    let _ = bmux_plugin::global_event_bus().publish_state(
+                    let _ = view_state.presentation_events.publish_state(
                         &bmux_windows_plugin_api::windows_list::STATE_KIND,
                         snapshot,
                     );
@@ -5034,7 +5039,8 @@ async fn handle_attach_stream_server_event(
                         status_background = %appearance.status.background,
                         "attach received forwarded runtime appearance update",
                     );
-                    let _ = bmux_plugin::global_event_bus()
+                    let _ = view_state
+                        .presentation_events
                         .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
                     view_state
                         .dirty
@@ -5048,7 +5054,7 @@ async fn handle_attach_stream_server_event(
                     );
                 }
             }
-        } else if let Err(error) = bmux_plugin::global_event_bus().emit_from_bytes(
+        } else if let Err(error) = view_state.presentation_events.emit_from_bytes(
             &bmux_plugin::PluginEventKind::from_owned(kind.clone()),
             payload,
         ) {
@@ -5448,7 +5454,7 @@ pub async fn retarget_attach_to_context(
     );
     let retarget_service_started = Instant::now();
     let geometry = current_attach_terminal_geometry();
-    let insets = resolved_attach_viewport_insets(geometry);
+    let insets = resolved_attach_viewport_insets(geometry, &view_state.presentation_layouts);
     let attach_info = client
         .retarget_attach_context_with_insets(
             context_id,
@@ -7315,7 +7321,8 @@ fn publish_attach_local_presentation(
         .as_ref()
         .map_or(1, |previous| previous.revision.saturating_add(1).max(1));
     view_state.local_presentation = Some(snapshot.clone());
-    let _ = bmux_plugin::global_event_bus()
+    let _ = view_state
+        .presentation_events
         .publish_state(&ATTACH_LOCAL_PRESENTATION_STATE_KIND, snapshot);
 }
 
@@ -7454,8 +7461,14 @@ struct AttachViewportInsets {
     left: u16,
 }
 
-fn resolved_attach_viewport_insets(geometry: TerminalGeometry) -> AttachViewportInsets {
-    let requests = global_plugin_layout_registry().requests();
+#[cfg(test)]
+use bmux_plugin::layout::global_plugin_layout_registry;
+
+fn resolved_attach_viewport_insets(
+    geometry: TerminalGeometry,
+    layouts: &bmux_plugin::layout::PluginLayoutRegistry,
+) -> AttachViewportInsets {
+    let requests = layouts.requests();
     resolved_attach_viewport_insets_for_requests(geometry, &requests)
 }
 
@@ -8120,21 +8133,29 @@ impl RetainedFramePlan {
     }
 }
 
-fn retained_plugin_surfaces(viewport: DamageRect) -> Vec<RetainedSurface> {
+fn retained_plugin_surfaces(
+    view_state: &AttachViewState,
+    viewport: DamageRect,
+) -> Vec<RetainedSurface> {
     let plugin_layout = resolve_plugin_layout(
         ExtensionRect::new(viewport.x, viewport.y, viewport.w, viewport.h),
         (1, 1),
-        &global_plugin_layout_registry().requests(),
+        &view_state.presentation_layouts.requests(),
     );
     let Ok(plugin_layout) = plugin_layout else {
         return Vec::new();
     };
+    for allocation in &plugin_layout.allocations {
+        view_state
+            .presentation_allocations
+            .notify(&allocation.id, allocation.rect);
+    }
     let allocations = plugin_layout
         .allocations
         .into_iter()
         .map(|allocation| (allocation.id, allocation.rect))
         .collect::<BTreeMap<_, _>>();
-    let surfaces = bmux_plugin::surface::global_plugin_surface_registry().surfaces();
+    let surfaces = view_state.presentation_surfaces.surfaces();
     retained_surfaces_from_plugin_surfaces(&surfaces, &allocations, viewport)
 }
 
@@ -8201,7 +8222,7 @@ fn build_retained_frame_plan(
         retained_damage_from_absolute_rects(explicit_ui_damage_rects, viewport, damage_policy);
     let mut retained_surfaces = retained_surfaces_from_attach_scene(&layout_state.scene);
     if view_state.dirty.retained_surfaces_need_reconcile {
-        let plugin_surfaces = retained_plugin_surfaces(viewport);
+        let plugin_surfaces = retained_plugin_surfaces(view_state, viewport);
         view_state.retained_plugin_surface_ids =
             plugin_surfaces.iter().map(|surface| surface.id).collect();
         retained_surfaces.extend(plugin_surfaces);
@@ -8919,7 +8940,7 @@ pub async fn reconcile_attached_session_from_catalog(
     view_state.last_attach_view_revision = None;
     view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
     view_state.can_write = attach_info.can_write;
-    update_attach_viewport(client, view_state.attached_id).await?;
+    update_attach_viewport(client, view_state).await?;
     hydrate_attach_state_from_snapshot(client, view_state).await?;
     view_state.ui_mode = AttachUiMode::Normal;
 
@@ -9387,24 +9408,24 @@ impl Drop for RawModeGuard {
 
 pub async fn update_attach_viewport(
     client: &mut StreamingBmuxClient,
-    session_id: Uuid,
+    view_state: &AttachViewState,
 ) -> std::result::Result<(), ClientError> {
-    update_attach_viewport_with_geometry(client, session_id, current_attach_terminal_geometry())
+    update_attach_viewport_with_geometry(client, view_state, current_attach_terminal_geometry())
         .await
 }
 
 pub async fn update_attach_viewport_with_geometry(
     client: &mut StreamingBmuxClient,
-    session_id: Uuid,
+    view_state: &AttachViewState,
     geometry: TerminalGeometry,
 ) -> std::result::Result<(), ClientError> {
     if geometry.cols == 0 || geometry.rows == 0 {
         return Ok(());
     }
-    let insets = resolved_attach_viewport_insets(geometry);
+    let insets = resolved_attach_viewport_insets(geometry, &view_state.presentation_layouts);
     client
         .attach_set_viewport_with_insets(
-            session_id,
+            view_state.attached_id,
             geometry.cols,
             geometry.rows,
             insets.top,
@@ -10477,7 +10498,7 @@ async fn handle_clients_plugin_event(
             view_state.last_attach_view_revision = None;
             view_state.attached_context_id = attach_info.context_id.or(context_id);
             view_state.can_write = attach_info.can_write;
-            update_attach_viewport(client, view_state.attached_id).await?;
+            update_attach_viewport(client, view_state).await?;
             hydrate_attach_state_from_snapshot(client, view_state)
                 .await
                 .map_err(map_attach_client_error)?;
@@ -10577,7 +10598,7 @@ pub async fn recover_attach_after_session_removed(
         view_state.last_attach_view_revision = None;
         view_state.attached_context_id = attach_info.context_id;
         view_state.can_write = attach_info.can_write;
-        update_attach_viewport(client, view_state.attached_id).await?;
+        update_attach_viewport(client, view_state).await?;
         hydrate_attach_state_from_snapshot(client, view_state).await?;
         refresh_attach_status_catalog_best_effort(client, view_state).await;
         view_state.ui_mode = AttachUiMode::Normal;
@@ -10936,7 +10957,7 @@ pub async fn handle_attach_terminal_event(
         // Immutable pins keep their coordinate identity while live history may
         // reflow. Capture logical endpoints before changing presentation size.
         prepare_attach_selections_for_resize(view_state);
-        update_attach_viewport_with_geometry(client, view_state.attached_id, geometry).await?;
+        update_attach_viewport_with_geometry(client, view_state, geometry).await?;
     }
 
     if view_state.prompt.is_active() {
@@ -11269,7 +11290,7 @@ async fn retarget_attach_to_session(
     view_state.last_attach_view_revision = None;
     view_state.attached_context_id = attach_info.context_id;
     view_state.can_write = attach_info.can_write;
-    update_attach_viewport(client, view_state.attached_id).await?;
+    update_attach_viewport(client, view_state).await?;
     hydrate_attach_state_from_snapshot(client, view_state).await?;
     refresh_attach_status_catalog_best_effort(client, view_state).await;
     view_state.ui_mode = AttachUiMode::Normal;
@@ -11758,9 +11779,7 @@ async fn invoke_plugin_surface_pointer_event(
         focused_pane: None,
         hovered_pane: None,
     };
-    let result = if let Some(result) =
-        bmux_plugin::invoke_attach_presentation_input_handler(&endpoint, &input)
-    {
+    let result = if let Some(result) = view_state.presentation_input.invoke(&endpoint, &input) {
         result
     } else {
         let payload = bmux_plugin_sdk::encode_service_message(&input).map_err(|error| {
@@ -11982,9 +12001,7 @@ async fn try_handle_plugin_surface_key(
         focused_pane: attach_input_focused_context(view_state),
         hovered_pane: None,
     };
-    let result = if let Some(result) =
-        bmux_plugin::invoke_attach_presentation_input_handler(&endpoint, &input)
-    {
+    let result = if let Some(result) = view_state.presentation_input.invoke(&endpoint, &input) {
         result
     } else {
         let payload = bmux_plugin_sdk::encode_service_message(&input).map_err(|error| {
@@ -16142,17 +16159,22 @@ mod tests {
             );
         };
         publish(1, 12);
+        let view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::from_u128(1),
+            can_write: true,
+        });
 
         let mut compositor = bmux_attach_pipeline::RetainedCompositor::new();
         let initial = compositor.replace_surfaces(
-            retained_plugin_surfaces(viewport),
+            retained_plugin_surfaces(&view_state, viewport),
             viewport,
             DamageCoalescingPolicy::default(),
         );
         assert_eq!(initial.rects(), &[DamageRect::new(0, 0, 12, 24)]);
         let mut reconnected_compositor = bmux_attach_pipeline::RetainedCompositor::new();
         let reconnect_hydration = reconnected_compositor.replace_surfaces(
-            retained_plugin_surfaces(viewport),
+            retained_plugin_surfaces(&view_state, viewport),
             viewport,
             DamageCoalescingPolicy::default(),
         );
@@ -16169,7 +16191,7 @@ mod tests {
         assert!(global_plugin_surface_registry().remove_owner(owner));
         assert!(global_plugin_layout_registry().remove_owner(owner));
         let removed = compositor.replace_surfaces(
-            retained_plugin_surfaces(viewport),
+            retained_plugin_surfaces(&view_state, viewport),
             viewport,
             DamageCoalescingPolicy::default(),
         );
@@ -16178,7 +16200,7 @@ mod tests {
 
         publish(2, 16);
         let rehydrated = compositor.replace_surfaces(
-            retained_plugin_surfaces(viewport),
+            retained_plugin_surfaces(&view_state, viewport),
             viewport,
             DamageCoalescingPolicy::default(),
         );

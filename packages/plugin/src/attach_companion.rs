@@ -15,7 +15,30 @@ pub struct AttachCompanion {
     stop: AttachCompanionCallback,
 }
 
+/// A successfully started companion owned by one runtime invocation.
+/// Dropping it stops the captured registration, even if the registry changed.
+pub struct StartedAttachCompanion {
+    companion: AttachCompanion,
+}
+
+impl Drop for StartedAttachCompanion {
+    fn drop(&mut self) {
+        if let Err(error) = self.companion.stop() {
+            tracing::warn!(companion_id = self.companion.id(), %error, "failed stopping attach companion");
+        }
+    }
+}
+
 impl AttachCompanion {
+    /// Start and retain this exact registration until runtime teardown.
+    ///
+    /// # Errors
+    /// Returns startup failure after attempting to clean up partial startup.
+    pub fn start_owned(self) -> Result<StartedAttachCompanion, String> {
+        let started = StartedAttachCompanion { companion: self };
+        started.companion.start()?;
+        Ok(started)
+    }
     #[must_use]
     pub fn new(
         id: impl Into<String>,
@@ -106,6 +129,45 @@ pub fn registered_attach_companions() -> Vec<AttachCompanion> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn owned_lifecycle_stops_original_registration_after_replacement() {
+        let registry = AttachCompanionRegistry::new();
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let counter = stopped.clone();
+        registry.register(AttachCompanion::new(
+            "example",
+            Arc::new(|| Ok(())),
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }),
+        ));
+        let started = registry.snapshot().pop().unwrap().start_owned().unwrap();
+        registry.register(AttachCompanion::new(
+            "example",
+            Arc::new(|| Ok(())),
+            Arc::new(|| panic!("replacement must not be stopped")),
+        ));
+        drop(started);
+        assert_eq!(stopped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn failed_owned_start_cleans_up_partial_startup() {
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let counter = stopped.clone();
+        let companion = AttachCompanion::new(
+            "example",
+            Arc::new(|| Err("startup failed".into())),
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }),
+        );
+        assert!(companion.start_owned().is_err());
+        assert_eq!(stopped.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn duplicate_registration_replaces_callbacks() {

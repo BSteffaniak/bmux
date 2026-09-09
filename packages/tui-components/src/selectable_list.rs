@@ -465,7 +465,11 @@ impl<'a> SelectableList<'a> {
             i64::from(area.y),
             LocalRect::terminal(local),
             |cx| {
-                cx.fill(LocalRect::terminal(local), " ", fallback);
+                if let Some(surface) = layout.children.get(1) {
+                    bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                        .background(fallback)
+                        .paint(&surface.node, cx);
+                }
                 cx.with_child(
                     i32::from(content_area.x),
                     i64::from(content_area.y),
@@ -585,6 +589,15 @@ impl<'a> SelectableList<'a> {
     }
 
     pub(crate) fn layout_with(&self, id: &LayoutId, constraints: Constraints) -> LayoutNode {
+        self.layout_with_cx(id, constraints, &mut LayoutCx::new())
+    }
+
+    fn layout_with_cx(
+        &self,
+        id: &LayoutId,
+        constraints: Constraints,
+        cx: &mut LayoutCx,
+    ) -> LayoutNode {
         let scroll_view = self.scroll_view();
         let (natural_width, _) = self.size();
         let width = constraints
@@ -604,11 +617,23 @@ impl<'a> SelectableList<'a> {
         LayoutNode::with_children(
             id.clone(),
             size,
-            vec![ChildLayout::new(
-                content_area.x,
-                usize::from(content_area.y),
-                viewport,
-            )],
+            vec![
+                ChildLayout::new(content_area.x, usize::from(content_area.y), viewport),
+                ChildLayout::new(
+                    0,
+                    0,
+                    bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                        .layout(
+                            Constraints::new(
+                                size.width,
+                                size.width,
+                                size.height,
+                                Some(size.height),
+                            ),
+                            cx,
+                        ),
+                ),
+            ],
         )
         .with_metadata(LayoutMetadata::new().semantic("list"))
     }
@@ -1230,7 +1255,7 @@ impl Component for SelectableListComponent<'_, '_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        self.list.layout_with(&self.id, constraints)
+        self.list.layout_with_cx(&self.id, constraints, cx)
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -1425,7 +1450,7 @@ mod tests {
         let layout = component.layout(Constraints::for_width(12), &mut cx);
         assert_eq!(layout.size.width, 12);
         assert_eq!(layout.size.height, 4);
-        assert_eq!(cx.measured_nodes(), 1);
+        assert_eq!(cx.measured_nodes(), 3);
 
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 6));
         let mut frame = Frame::new(&mut buffer);

@@ -702,6 +702,19 @@ impl ScrollView {
         ScrollViewOutcome::Ignored
     }
 
+    /// Project a content row range into viewport-local rows, clipping both ends.
+    /// Empty and entirely hidden ranges produce no geometry. Use the same result
+    /// for painting and interaction regions when adapting retained content.
+    #[must_use]
+    pub fn project_rows(
+        visible: &std::ops::Range<usize>,
+        content: std::ops::Range<usize>,
+    ) -> Option<std::ops::Range<usize>> {
+        let start = content.start.max(visible.start);
+        let end = content.end.min(visible.end);
+        (start < end).then(|| start - visible.start..end - visible.start)
+    }
+
     /// Return the maximum logical offset from an authoritative viewport layout.
     #[must_use]
     pub fn max_vertical_offset(layout: &LayoutNode) -> usize {

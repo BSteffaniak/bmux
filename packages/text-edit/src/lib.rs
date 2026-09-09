@@ -33,6 +33,59 @@ pub struct WrapLayout {
     pub cursor: VisualCursor,
 }
 
+impl WrapLayout {
+    /// Project a cursor using retained ranges. `text` must be the source of this layout.
+    #[must_use]
+    pub fn cursor_for_byte_index(&self, text: &str, cursor: usize) -> VisualCursor {
+        let cursor = cursor.min(text.len());
+        let mut row = self
+            .line_ranges
+            .partition_point(|range| range.start <= cursor)
+            .saturating_sub(1);
+        let Some(range) = self.line_ranges.get(row) else {
+            return VisualCursor { row: 0, col: 0 };
+        };
+        // Wrapping only splits at grapheme boundaries, so snapping within this
+        // visual line avoids scanning every preceding source line.
+        let cursor = range.start
+            + snap_to_grapheme_boundary(
+                &text[range.clone()],
+                cursor.min(range.end).saturating_sub(range.start),
+            );
+        if row > 0
+            && self.line_ranges[row].start == cursor
+            && !text[..cursor].ends_with('\n')
+            && self.line_ranges[row - 1].start < cursor
+        {
+            row -= 1;
+        }
+        let Some(range) = self.line_ranges.get(row) else {
+            return VisualCursor { row: 0, col: 0 };
+        };
+        let end = cursor.clamp(range.start, range.end);
+        VisualCursor {
+            row,
+            col: UnicodeWidthStr::width(&text[range.start..end]),
+        }
+    }
+
+    /// Return the source byte index nearest a visual position without rewrapping.
+    #[must_use]
+    pub fn byte_index_for_position(&self, row: usize, col: usize) -> usize {
+        self.lines
+            .get(row)
+            .zip(self.line_ranges.get(row))
+            .map_or_else(
+                || self.line_ranges.last().map_or(0, |range| range.end),
+                |(line, range)| {
+                    range
+                        .start
+                        .saturating_add(byte_index_for_visual_col(line, col))
+                },
+            )
+    }
+}
+
 /// A single-line viewport projection and the projected cursor column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -621,15 +674,7 @@ impl TextEditBuffer {
     /// Return the byte index nearest to a soft-wrapped row and column.
     #[must_use]
     pub fn byte_index_for_wrapped_position(&self, width: usize, row: usize, col: usize) -> usize {
-        let layout = self.wrapped_layout(width);
-        let Some(line) = layout.lines.get(row) else {
-            return self.text.len();
-        };
-        let line_start = self.wrapped_row_start_byte_index(width, row);
-        snap_to_grapheme_boundary(
-            &self.text,
-            line_start.saturating_add(byte_index_for_visual_col(line, col)),
-        )
+        self.wrapped_layout(width).byte_index_for_position(row, col)
     }
 
     /// Move the cursor to a soft-wrapped row and column.
@@ -1140,6 +1185,62 @@ mod tests {
             vec!["a界".to_string(), "👋🏽e\u{301}b".to_string()]
         );
         assert_eq!(layout.cursor, VisualCursor { row: 1, col: 3 });
+    }
+
+    #[test]
+    fn retained_cursor_projection_matches_fresh_wrapping() {
+        for text in [
+            "",
+            "hello world again",
+            "ab界e\u{301}🙂",
+            "a\n\nb\n",
+            "ab   cd ",
+        ] {
+            for width in 1..12 {
+                let mut buffer = TextEditBuffer::from_text(text);
+                let layout = buffer.wrapped_layout(width);
+                for cursor in 0..=text.len() {
+                    buffer.move_cursor(TextMotion::Absolute(cursor));
+                    assert_eq!(
+                        layout.cursor_for_byte_index(text, cursor),
+                        buffer.wrapped_layout(width).cursor,
+                        "text={text:?} width={width} cursor={cursor}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retained_projection_hit_testing_matches_source_geometry() {
+        for text in [
+            "",
+            "hello world again",
+            "ab界e\u{301}🙂",
+            "a\n\nb\n",
+            "ab   cd ",
+        ] {
+            let buffer = TextEditBuffer::from_text(text);
+            for width in 1..12 {
+                let layout = buffer.wrapped_layout(width);
+                for row in 0..layout.lines.len() + 2 {
+                    for col in 0..15 {
+                        let expected = layout.lines.get(row).map_or(text.len(), |line| {
+                            snap_to_grapheme_boundary(
+                                text,
+                                buffer.wrapped_row_start_byte_index(width, row)
+                                    + byte_index_for_visual_col(line, col),
+                            )
+                        });
+                        assert_eq!(
+                            layout.byte_index_for_position(row, col),
+                            expected,
+                            "text={text:?} width={width} row={row} col={col}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

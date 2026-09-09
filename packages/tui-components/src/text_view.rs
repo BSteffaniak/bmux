@@ -473,6 +473,7 @@ impl Component for TextViewComponent<'_, '_> {
         text.paint.hash(&mut paint);
         self.policy.keyboard.hash(&mut paint);
         self.policy.mouse_wheel.hash(&mut paint);
+        self.policy.background.hash(&mut layout);
         self.policy.background.hash(&mut paint);
         self.styles.empty.hash(&mut paint);
         self.styles.background.hash(&mut paint);
@@ -508,16 +509,25 @@ impl Component for TextViewComponent<'_, '_> {
             LogicalSize::new(content_area.width, usize::from(content_area.height)),
             content,
         );
-        LayoutNode::with_children(
-            self.id.clone(),
-            size,
-            vec![ChildLayout::new(
-                content_area.x,
-                usize::from(content_area.y),
-                viewport,
-            )],
-        )
-        .with_metadata(LayoutMetadata::new().semantic("text-view"))
+        let mut children = vec![ChildLayout::new(
+            content_area.x,
+            usize::from(content_area.y),
+            viewport,
+        )];
+        if self.policy.background {
+            let surface = bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                .background(self.styles.background);
+            children.push(ChildLayout::new(
+                0,
+                0,
+                surface.layout(
+                    Constraints::new(size.width, size.width, size.height, Some(size.height)),
+                    cx,
+                ),
+            ));
+        }
+        LayoutNode::with_children(self.id.clone(), size, children)
+            .with_metadata(LayoutMetadata::new().semantic("text-view"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -525,12 +535,10 @@ impl Component for TextViewComponent<'_, '_> {
         if outer.is_empty() {
             return;
         }
-        if self.policy.background {
-            cx.fill(
-                LocalRect::new(0, 0, outer.width, outer.height),
-                " ",
-                self.styles.background,
-            );
+        if let Some(surface) = layout.children.get(1) {
+            bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                .background(self.styles.background)
+                .paint(&surface.node, cx);
         }
         if self.lines.is_empty() {
             cx.write_line_with_fallback_style(

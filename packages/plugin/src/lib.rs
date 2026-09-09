@@ -44,8 +44,8 @@ pub use attach_presentation_input::{
     AttachPresentationCommittedHandler, AttachPresentationFocusLostHandler,
     AttachPresentationInputHandler, AttachPresentationInputRegistry,
     AttachPresentationPasteHandler, global_attach_presentation_input_registry,
-    invoke_attach_presentation_input_handler, register_attach_presentation_input_handler,
-    remove_attach_presentation_input_handler,
+    global_attach_presentation_input_registry_handle, invoke_attach_presentation_input_handler,
+    register_attach_presentation_input_handler, remove_attach_presentation_input_handler,
 };
 pub use bmux_plugin_runtime::{
     ConcurrencyGate, EffectiveConcurrencyPolicy, PluginConcurrencyConfig,

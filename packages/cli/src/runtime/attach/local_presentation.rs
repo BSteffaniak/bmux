@@ -1,7 +1,7 @@
-use bmux_plugin::layout::{global_plugin_layout_registry, resolve_plugin_layout};
+use bmux_plugin::layout::{PluginLayoutRegistry, resolve_plugin_layout};
 use bmux_plugin::surface::{
-    PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, PluginSurfaceTarget,
-    global_plugin_surface_registry,
+    PluginSurface, PluginSurfaceId, PluginSurfaceRegistry, PluginSurfaceSnapshot,
+    PluginSurfaceTarget,
 };
 use bmux_plugin::{ExtensionRect, RenderOp, RenderStyle};
 use uuid::Uuid;
@@ -9,8 +9,13 @@ use uuid::Uuid;
 const OWNER: &str = "bmux.attach_local";
 const SURFACE_ID: &str = "notification";
 
-pub fn publish_notification(message: Option<&str>, cols: u16, rows: u16) {
-    let registry = global_plugin_surface_registry();
+pub fn publish_notification(
+    layouts: &PluginLayoutRegistry,
+    registry: &PluginSurfaceRegistry,
+    message: Option<&str>,
+    cols: u16,
+    rows: u16,
+) {
     let previous = registry.owner_snapshot(OWNER);
     let revision = previous
         .as_ref()
@@ -19,12 +24,8 @@ pub fn publish_notification(message: Option<&str>, cols: u16, rows: u16) {
         .filter(|message| !message.is_empty() && cols > 0 && rows > 0)
         .map(|message| {
             let viewport = ExtensionRect::new(0, 0, cols, rows);
-            let remaining = resolve_plugin_layout(
-                viewport,
-                (1, 1),
-                &global_plugin_layout_registry().requests(),
-            )
-            .map_or(viewport, |layout| layout.remaining);
+            let remaining = resolve_plugin_layout(viewport, (1, 1), &layouts.requests())
+                .map_or(viewport, |layout| layout.remaining);
             let row = remaining.y.saturating_add(remaining.h).saturating_sub(1);
             let rect = ExtensionRect::new(remaining.x, row, remaining.w, 1);
             PluginSurface {
@@ -60,8 +61,8 @@ pub fn publish_notification(message: Option<&str>, cols: u16, rows: u16) {
     let _ = registry.publish(OWNER, PluginSurfaceSnapshot { revision, surfaces });
 }
 
-pub fn uninstall() {
-    global_plugin_surface_registry().remove_owner(OWNER);
+pub fn uninstall(registry: &PluginSurfaceRegistry) {
+    registry.remove_owner(OWNER);
 }
 
 fn snapshots_match(previous: &[PluginSurface], current: &[PluginSurface]) -> bool {
@@ -88,19 +89,13 @@ mod tests {
     use bmux_plugin::layout::{
         LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
     };
-    use serial_test::serial;
-
-    fn clear_presentation_registries() {
-        uninstall();
-        global_plugin_layout_registry().clear();
-    }
 
     #[test]
-    #[serial]
     fn notification_uses_generic_explicit_surface_and_removes_cleanly() {
-        clear_presentation_registries();
-        publish_notification(Some("saved"), 80, 24);
-        let snapshot = global_plugin_surface_registry()
+        let layouts = PluginLayoutRegistry::new(4);
+        let surfaces = PluginSurfaceRegistry::new(4);
+        publish_notification(&layouts, &surfaces, Some("saved"), 80, 24);
+        let snapshot = surfaces
             .owner_snapshot(OWNER)
             .expect("notification snapshot");
         assert_eq!(snapshot.surfaces.len(), 1);
@@ -109,19 +104,19 @@ mod tests {
             PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 23, 80, 1))
         );
 
-        publish_notification(None, 80, 24);
-        let removed = global_plugin_surface_registry()
+        publish_notification(&layouts, &surfaces, None, 80, 24);
+        let removed = surfaces
             .owner_snapshot(OWNER)
             .expect("empty replacement snapshot");
         assert!(removed.surfaces.is_empty());
-        uninstall();
+        uninstall(&surfaces);
     }
 
     #[test]
-    #[serial]
     fn notification_avoids_bottom_layout_reservations() {
-        clear_presentation_registries();
-        global_plugin_layout_registry()
+        let layouts = PluginLayoutRegistry::new(4);
+        let surfaces = PluginSurfaceRegistry::new(4);
+        layouts
             .publish(
                 "test.bottom",
                 PluginLayoutSnapshot {
@@ -136,8 +131,8 @@ mod tests {
             )
             .expect("bottom layout should publish");
 
-        publish_notification(Some("saved"), 80, 24);
-        let snapshot = global_plugin_surface_registry()
+        publish_notification(&layouts, &surfaces, Some("saved"), 80, 24);
+        let snapshot = surfaces
             .owner_snapshot(OWNER)
             .expect("notification snapshot");
         assert_eq!(
@@ -145,6 +140,6 @@ mod tests {
             PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 22, 80, 1))
         );
 
-        clear_presentation_registries();
+        uninstall(&surfaces);
     }
 }

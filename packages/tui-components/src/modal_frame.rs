@@ -5,6 +5,8 @@
 //! surfaces opaque by default so underlying content cannot bleed through blank
 //! rows or short text lines.
 
+use std::hash::{Hash, Hasher};
+
 use bmux_tui::chrome::Border;
 use bmux_tui::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
@@ -196,40 +198,43 @@ impl ModalFrame {
     /// Return the resolved modal panel area for a parent area.
     #[must_use]
     pub fn panel_area(&self, parent: Rect) -> Rect {
-        let size = self.sizing.resolve_size(parent);
-        let x = match self.placement {
-            ModalPlacement::Centered | ModalPlacement::UpperThird | ModalPlacement::LowerThird => {
-                parent
-                    .x
-                    .saturating_add(parent.width.saturating_sub(size.width) / 2)
-            }
-            ModalPlacement::Anchored(point) => {
-                point.x.min(parent.right().saturating_sub(size.width))
-            }
-        };
-        let y = match self.placement {
-            ModalPlacement::Centered => parent
-                .y
-                .saturating_add(parent.height.saturating_sub(size.height) / 2),
-            ModalPlacement::UpperThird => parent
-                .y
-                .saturating_add(parent.height.saturating_sub(size.height) / 3),
-            ModalPlacement::LowerThird => parent
-                .y
-                .saturating_add(parent.height.saturating_sub(size.height) * 2 / 3),
-            ModalPlacement::Anchored(point) => {
-                point.y.min(parent.bottom().saturating_sub(size.height))
-            }
-        };
-        Rect::new(x, y, size.width, size.height)
+        self.resolved_area(parent, "modal.area.surface")
     }
 
     /// Return the resolved modal content area for a parent area.
     #[must_use]
     pub fn content_area(&self, parent: Rect) -> Rect {
-        self.panel_area(parent)
-            .inset(self.border.sides.insets())
-            .inset(self.padding)
+        self.resolved_area(parent, "modal.area.content")
+    }
+
+    fn resolved_area(&self, parent: Rect, id: &'static str) -> Rect {
+        let mut frame = self.clone();
+        // Area helpers historically request the maximum panel extent and take
+        // anchored points in the parent's coordinate space.
+        frame.sizing.min = frame.sizing.resolve_size(parent);
+        if let ModalPlacement::Anchored(point) = frame.placement {
+            frame.placement = ModalPlacement::Anchored(Point::new(
+                point.x.saturating_sub(parent.x),
+                point.y.saturating_sub(parent.y),
+            ));
+        }
+        let child = SizeBox::new(Stack::new())
+            .id("modal.area.content")
+            .min_width(u16::MAX)
+            .min_height(usize::from(u16::MAX));
+        let component = ModalFrameComponent::new("modal.area", frame, child);
+        let layout = component.layout(Constraints::tight(parent.size()), &mut LayoutCx::new());
+        let Some(area) = layout.find_logical_rect(&LayoutId::new(id)) else {
+            return Rect::default();
+        };
+        Rect::new(
+            parent.x.saturating_add(area.x),
+            parent
+                .y
+                .saturating_add(u16::try_from(area.y).unwrap_or(u16::MAX)),
+            area.width,
+            u16::try_from(area.height).unwrap_or(u16::MAX),
+        )
     }
 
     /// Return this modal's visual theme.
@@ -262,31 +267,32 @@ impl Component for ComponentRef<'_> {
 #[derive(Clone, Copy)]
 struct Scrim(Style);
 
+impl Scrim {
+    fn surface(&self, size: LogicalSize) -> SizeBox<'static> {
+        SizeBox::new(Surface::new(Stack::new()).background(self.0))
+            .id("modal-scrim")
+            .width(size.width)
+            .height(size.height)
+    }
+}
+
 impl Component for Scrim {
+    fn revision(&self) -> ComponentRevision {
+        self.surface(LogicalSize::new(0, 0)).revision()
+    }
+
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
-        cx.record_measurement();
-        LayoutNode::leaf(
-            LayoutId::new("modal-scrim"),
-            LogicalSize::new(
-                constraints.max_width(),
-                constraints
-                    .max_height()
-                    .unwrap_or_else(|| constraints.min_height()),
-            ),
-        )
+        let size = LogicalSize::new(
+            constraints.max_width(),
+            constraints
+                .max_height()
+                .unwrap_or_else(|| constraints.min_height()),
+        );
+        self.surface(size).layout(constraints, cx)
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        cx.fill(
-            bmux_tui::paint::LocalRect::new(
-                0,
-                0,
-                layout.size.width,
-                u16::try_from(layout.size.height).unwrap_or(u16::MAX),
-            ),
-            " ",
-            self.0,
-        );
+        self.surface(layout.size).paint(layout, cx);
     }
 }
 
@@ -315,7 +321,14 @@ impl<'a> ModalPlacementComponent<'a> {
 
 impl Component for ModalPlacementComponent<'_> {
     fn revision(&self) -> ComponentRevision {
-        self.child.revision()
+        let mut layout = std::collections::hash_map::DefaultHasher::new();
+        self.id.as_str().hash(&mut layout);
+        format!("{:?}", self.placement).hash(&mut layout);
+        self.margin.top.hash(&mut layout);
+        self.margin.right.hash(&mut layout);
+        self.margin.bottom.hash(&mut layout);
+        self.margin.left.hash(&mut layout);
+        ComponentRevision::new(layout.finish(), 0).combine(self.child.revision())
     }
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
@@ -412,6 +425,17 @@ impl<'a> ModalFrameComponent<'a> {
         self
     }
 
+    fn title_component(&self) -> bmux_tui::composition::TextBlock {
+        bmux_tui::composition::TextBlock::new(bmux_tui::text::Text::from_lines(vec![
+            self.frame
+                .title
+                .clone()
+                .unwrap_or_default()
+                .with_fallback_style(self.frame.theme.title),
+        ]))
+        .wrap(bmux_tui::text::TextWrap::None)
+    }
+
     fn tree(&self) -> Stack<'_> {
         let sizing = self.frame.sizing;
         let panel = Surface::new(ComponentRef(&self.child))
@@ -421,6 +445,11 @@ impl<'a> ModalFrameComponent<'a> {
             .border(self.frame.border.clone())
             .paint_border(self.chrome)
             .padding(self.frame.padding);
+        let panel = ModalChrome {
+            id: LayoutId::new(format!("{}.chrome", self.id.as_str())),
+            panel,
+            title: self.frame.title.as_ref().map(|_| self.title_component()),
+        };
         let panel = SizeBox::new(panel)
             .id(format!("{}.size", self.id.as_str()))
             .min_width(sizing.min.width)
@@ -441,6 +470,59 @@ impl<'a> ModalFrameComponent<'a> {
     }
 }
 
+/// Decoration shares the panel's measured extent without affecting content sizing.
+struct ModalChrome<'a> {
+    id: LayoutId,
+    panel: Surface<'a>,
+    title: Option<bmux_tui::composition::TextBlock>,
+}
+
+impl Component for ModalChrome<'_> {
+    fn revision(&self) -> ComponentRevision {
+        let own = ComponentRevision::new(u64::from(self.title.is_some()), 0);
+        let revision = own.combine(self.panel.revision());
+        self.title
+            .as_ref()
+            .map_or(revision, |title| revision.combine(title.revision()))
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        let panel = self.panel.layout(constraints, cx);
+        let size = panel.size;
+        let mut children = vec![ChildLayout::new(0, 0, panel)];
+        if let Some(title) = &self.title {
+            let width = size.width.saturating_sub(2);
+            let height = size.height.min(1);
+            children.push(ChildLayout::new(
+                1,
+                0,
+                title.layout(Constraints::new(width, width, height, Some(height)), cx),
+            ));
+        }
+        LayoutNode::with_children(self.id.clone(), size, children)
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        if let Some(panel) = layout.children.first() {
+            self.panel.paint(&panel.node, cx);
+        }
+        if let (Some(title), Some(node)) = (&self.title, layout.children.get(1)) {
+            cx.with_child_size(i32::from(node.x), 0, node.node.size, |cx| {
+                title.paint(&node.node, cx);
+            });
+        }
+    }
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        layout
+            .children
+            .first()
+            .map_or(EventOutcome::Ignored, |panel| {
+                cx.with_child(panel, |cx| self.panel.event(event, &panel.node, cx))
+            })
+    }
+}
+
 impl Component for ModalFrameComponent<'_> {
     fn revision(&self) -> ComponentRevision {
         self.tree().revision()
@@ -452,26 +534,6 @@ impl Component for ModalFrameComponent<'_> {
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         self.tree().paint(layout, cx);
-        let Some(title) = &self.frame.title else {
-            return;
-        };
-        let surface_id = LayoutId::new(format!("{}.surface", self.id.as_str()));
-        let Some(surface) = layout.find_logical_rect(&surface_id) else {
-            return;
-        };
-        let width = surface.width.saturating_sub(2);
-        if width == 0 {
-            return;
-        }
-        cx.write_line(
-            bmux_tui::paint::LocalRect::new(
-                i32::from(surface.x.saturating_add(1)),
-                i64::try_from(surface.y).unwrap_or(i64::MAX),
-                width,
-                1,
-            ),
-            &title.clone().with_fallback_style(self.frame.theme.title),
-        );
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
@@ -574,6 +636,77 @@ mod tests {
             .expect("surface geometry");
         assert_eq!(surface.x, 7);
         assert_eq!(surface.y, 3);
+    }
+
+    #[test]
+    fn modal_placement_and_margin_invalidate_layout() {
+        let make = |placement, margin| {
+            ModalFrameComponent::new(
+                "modal",
+                ModalFrame::new(
+                    ModalSizing::new(Size::new(8, 4), Size::new(8, 4), margin),
+                    ModalTheme::dark(Color::Cyan),
+                )
+                .placement(placement),
+                TextBlock::new("content"),
+            )
+        };
+        let initial = make(ModalPlacement::Centered, Insets::all(0));
+        let moved = make(ModalPlacement::Anchored(Point::new(1, 2)), Insets::all(0));
+        let inset = make(ModalPlacement::Centered, Insets::all(2));
+        assert_ne!(initial.revision().layout, moved.revision().layout);
+        assert_ne!(initial.revision().layout, inset.revision().layout);
+    }
+
+    #[test]
+    fn area_helpers_resolve_translated_and_clamped_anchors() {
+        let frame = ModalFrame::new(
+            ModalSizing::new(Size::new(8, 4), Size::new(8, 4), Insets::all(0)),
+            ModalTheme::dark(Color::Cyan),
+        )
+        .placement(ModalPlacement::Anchored(Point::new(13, 9)));
+        let parent = Rect::new(10, 6, 20, 10);
+        assert_eq!(frame.panel_area(parent), Rect::new(13, 9, 8, 4));
+        assert_eq!(
+            frame
+                .clone()
+                .placement(ModalPlacement::Anchored(Point::new(0, 0)))
+                .panel_area(parent),
+            Rect::new(10, 6, 8, 4)
+        );
+        let panel = frame.panel_area(parent);
+        assert_eq!(
+            frame.content_area(parent),
+            panel
+                .inset(frame.border.sides.insets())
+                .inset(frame.padding)
+        );
+    }
+
+    #[test]
+    fn title_is_nested_in_the_shared_tree_and_invalidates_layout() {
+        let make = |title: Option<&str>| {
+            let mut frame = ModalFrame::new(
+                ModalSizing::new(Size::new(8, 4), Size::new(8, 4), Insets::all(0)),
+                ModalTheme::dark(Color::Cyan),
+            );
+            if let Some(title) = title {
+                frame = frame.title(title);
+            }
+            ModalFrameComponent::new("modal", frame, TextBlock::new("content"))
+        };
+        let plain = make(None);
+        let titled = make(Some("Title"));
+        assert_ne!(plain.revision().layout, titled.revision().layout);
+        let constraints = Constraints::new(40, 40, 20, Some(20));
+        let plain_layout = plain.layout(constraints, &mut LayoutCx::new());
+        let titled_layout = titled.layout(constraints, &mut LayoutCx::new());
+        assert_eq!(plain_layout.children.len(), titled_layout.children.len());
+        let id = bmux_tui::component::LayoutId::new("modal.surface");
+        assert_eq!(
+            plain_layout.find_logical_rect(&id),
+            titled_layout.find_logical_rect(&id)
+        );
     }
 
     #[test]

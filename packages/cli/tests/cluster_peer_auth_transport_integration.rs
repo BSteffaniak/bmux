@@ -165,8 +165,10 @@ fn ssh_join_and_leave_require_real_mutual_peer_authentication() {
         std::fs::set_permissions(&remote_bmux, wrapper_permissions)
             .expect("set remote wrapper permissions");
     }
+    // Readiness launches an SSH process and a remote CLI. Give that inner
+    // deadline its own full-suite budget, below the 30-second IPC deadline.
     joiner.write_config(&format!(
-        "[general]\nserver_timeout = 30000\n\n[connections.targets.issuer]\ntransport = \"ssh\"\nhost = \"127.0.0.1\"\nuser = \"{}\"\nport = {port}\nidentity_file = \"{}\"\nknown_hosts_file = \"{}\"\nstrict_host_key_checking = false\nremote_bmux_path = \"{}\"\nserver_start_mode = \"require_running\"\n",
+        "[general]\nserver_timeout = 30000\n\n[connections.targets.issuer]\ntransport = \"ssh\"\nconnect_timeout_ms = 20000\nhost = \"127.0.0.1\"\nuser = \"{}\"\nport = {port}\nidentity_file = \"{}\"\nknown_hosts_file = \"{}\"\nstrict_host_key_checking = false\nremote_bmux_path = \"{}\"\nserver_start_mode = \"require_running\"\n",
         std::env::var("USER").expect("USER is set"),
         client_key.display(),
         known_hosts.display(),

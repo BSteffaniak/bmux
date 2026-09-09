@@ -20,17 +20,32 @@ use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::Style;
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::scroll_view::{ScrollView, ScrollViewComponent, ScrollViewState};
+
 const DEFAULT_MULTI_CLICK_WINDOW: Duration = Duration::from_millis(500);
 const DEFAULT_MULTI_CLICK_DISTANCE: u16 = 2;
 
 /// Stateful text input data used by [`TextInputControl`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TextInputState {
     buffer: TextEditBuffer,
     content_area: Rect,
-    vertical_scroll: usize,
+    scroll: ScrollViewState,
     mouse_selection: MouseSelectionState,
+    wrapped: RefCell<Option<(u16, usize, bmux_text_edit::WrapLayout)>>,
 }
+
+// Derived measurement state must not change the meaning of editor equality.
+impl PartialEq for TextInputState {
+    fn eq(&self, other: &Self) -> bool {
+        self.buffer == other.buffer
+            && self.content_area == other.content_area
+            && self.scroll == other.scroll
+            && self.mouse_selection == other.mouse_selection
+    }
+}
+
+impl Eq for TextInputState {}
 
 impl Default for TextInputState {
     fn default() -> Self {
@@ -45,9 +60,33 @@ impl TextInputState {
         Self {
             buffer,
             content_area: Rect::new(0, 0, 1, 1),
-            vertical_scroll: 0,
+            scroll: ScrollViewState::new(),
             mouse_selection: MouseSelectionState::default(),
+            wrapped: RefCell::new(None),
         }
+    }
+
+    fn wrapped_layout(&self, width: u16) -> std::cell::Ref<'_, bmux_text_edit::WrapLayout> {
+        let stale = self
+            .wrapped
+            .borrow()
+            .as_ref()
+            .is_none_or(|(cached_width, _, _)| *cached_width != width);
+        if stale {
+            *self.wrapped.borrow_mut() = Some((
+                width,
+                self.buffer.cursor_byte_index(),
+                self.buffer.wrapped_layout(usize::from(width.max(1))),
+            ));
+        } else if let Some((_, cursor, layout)) = self.wrapped.borrow_mut().as_mut()
+            && *cursor != self.buffer.cursor_byte_index()
+        {
+            *cursor = self.buffer.cursor_byte_index();
+            layout.cursor = layout.cursor_for_byte_index(self.buffer.text(), *cursor);
+        }
+        std::cell::Ref::map(self.wrapped.borrow(), |cached| {
+            &cached.as_ref().expect("measured projection").2
+        })
     }
 
     /// Return the edit buffer.
@@ -56,8 +95,9 @@ impl TextInputState {
         &self.buffer
     }
 
-    /// Return the mutable edit buffer.
-    pub const fn buffer_mut(&mut self) -> &mut TextEditBuffer {
+    /// Return the mutable edit buffer, releasing derived layout before arbitrary edits.
+    pub fn buffer_mut(&mut self) -> &mut TextEditBuffer {
+        *self.wrapped.get_mut() = None;
         &mut self.buffer
     }
 
@@ -70,13 +110,16 @@ impl TextInputState {
     /// Return the vertical viewport scroll in wrapped rows.
     #[must_use]
     pub const fn vertical_scroll(&self) -> usize {
-        self.vertical_scroll
+        self.scroll.vertical_offset()
     }
 
     /// Store the latest content area.
     pub fn set_content_area(&mut self, area: Rect, policy: &TextInputPolicy) {
         self.content_area = area;
         self.sync_scroll_to_cursor(policy);
+        let rows = self.wrapped_layout(area.width).lines.len();
+        let viewport = editor_viewport(area, rows);
+        ScrollView::scroll_vertical_by(&viewport, &mut self.scroll, 0);
     }
 
     /// Synchronize vertical scroll so the cursor is visible if policy allows.
@@ -84,7 +127,7 @@ impl TextInputState {
         let Some(offset) = self.cursor_scroll_offset(policy) else {
             return;
         };
-        self.vertical_scroll = offset;
+        self.scroll.set_vertical_offset(offset);
     }
 
     /// Return the scroll offset that keeps the cursor visible.
@@ -93,13 +136,15 @@ impl TextInputState {
         if !policy.viewport.auto_scroll_to_cursor || self.content_area.height == 0 {
             return None;
         }
-        let layout = self
-            .buffer
-            .wrapped_layout(usize::from(self.content_area.width.max(1)));
-        Some(scroll_offset_for_cursor_row(
-            layout.cursor.row,
-            self.content_area.height,
-        ))
+        let layout = self.wrapped_layout(self.content_area.width);
+        let viewport = editor_viewport(
+            self.content_area,
+            layout.lines.len().max(layout.cursor.row.saturating_add(1)),
+        );
+        // Preserve the editor's cursor-at-bottom policy while sharing reveal/clamping.
+        let mut scroll = ScrollViewState::new();
+        ScrollView::new().ensure_visible(&viewport, &mut scroll, layout.cursor.row, 1);
+        Some(scroll.vertical_offset())
     }
 
     /// Return whether a mouse selection drag is active.
@@ -226,7 +271,9 @@ impl Component for TextInputComponent<'_, '_> {
         let area = Rect::new(0, 0, layout.size.width, height);
         let mut state = self.state.borrow_mut();
         state.set_content_area(area, self.policy);
+        let wrapped = state.wrapped_layout(area.width);
         let mut input = TextInput::new(state.buffer())
+            .wrapped_layout(&wrapped)
             .id(self.id.clone())
             .style(self.style)
             .selection_style(self.selection_style)
@@ -290,12 +337,7 @@ impl<'policy> TextInputControl<'policy> {
     /// Return visible content rows for a terminal width.
     #[must_use]
     pub fn visible_rows_for_width(&self, state: &TextInputState, width: u16) -> u16 {
-        let wrapped_rows = state
-            .buffer
-            .wrapped_layout(usize::from(width.max(1)))
-            .lines
-            .len()
-            .max(1);
+        let wrapped_rows = state.wrapped_layout(width).lines.len().max(1);
         usize_to_u16_saturating(wrapped_rows)
             .max(self.policy.viewport.min_rows.max(1))
             .min(self.policy.viewport.max_rows.unwrap_or(u16::MAX))
@@ -315,9 +357,9 @@ impl<'policy> TextInputControl<'policy> {
 
     /// Handle bracketed pasted text.
     pub fn handle_paste(&self, state: &mut TextInputState, text: &str) -> TextInputOutcome {
-        state.buffer.paste(text);
+        state.buffer_mut().paste(text);
         if self.policy.viewport.auto_scroll_to_cursor {
-            state.vertical_scroll = usize::MAX;
+            state.scroll.set_vertical_offset(usize::MAX);
         }
         TextInputOutcome::Edited
     }
@@ -333,7 +375,7 @@ impl<'policy> TextInputControl<'policy> {
         if self.policy.keyboard.selection_keys
             && let Some(motion) = selection_motion(stroke)
         {
-            extend_selection(&mut state.buffer, state.content_area, motion);
+            extend_selection(state, motion);
             state.sync_scroll_to_cursor(self.policy);
             return TextInputOutcome::Edited;
         }
@@ -343,7 +385,11 @@ impl<'policy> TextInputControl<'policy> {
         let Some(command) = self.policy.keyboard.keymap.command_for_key(stroke) else {
             return TextInputOutcome::Ignored;
         };
-        state.buffer.apply_command(command);
+        if matches!(command, bmux_text_edit::TextEditCommand::Move(_)) {
+            state.buffer.apply_command(command);
+        } else {
+            state.buffer_mut().apply_command(command);
+        }
         state.sync_scroll_to_cursor(self.policy);
         TextInputOutcome::Edited
     }
@@ -409,8 +455,7 @@ impl<'policy> TextInputControl<'policy> {
         if !stroke.modifiers.is_empty() {
             return None;
         }
-        let width = usize::from(state.content_area.width.max(1));
-        let layout = state.buffer.wrapped_layout(width);
+        let layout = state.wrapped_layout(state.content_area.width);
         match stroke.key {
             KeyCode::Up if layout.cursor.row == 0 && self.policy.edge.up_at_first_row => {
                 Some(TextInputOutcome::EdgeUp)
@@ -455,7 +500,10 @@ impl<'policy> TextInputControl<'policy> {
         } else {
             SelectionGranularity::Disabled
         };
-        apply_selection_granularity(&mut state.buffer, state.content_area, row, col, granularity);
+        let byte_index = state
+            .wrapped_layout(state.content_area.width)
+            .byte_index_for_position(row, col);
+        apply_selection_granularity(&mut state.buffer, byte_index, granularity);
         state.sync_scroll_to_cursor(self.policy);
         TextInputOutcome::Redraw
     }
@@ -468,11 +516,12 @@ impl<'policy> TextInputControl<'policy> {
         ) else {
             return TextInputOutcome::Ignored;
         };
+        let byte_index = state
+            .wrapped_layout(state.content_area.width)
+            .byte_index_for_position(position.row, position.col);
         extend_selection_to_granularity(
             &mut state.buffer,
-            state.content_area,
-            position.row,
-            position.col,
+            byte_index,
             state.mouse_selection.active,
         );
         if !position.scrolled {
@@ -811,7 +860,7 @@ fn apply_enter_behavior(
     match behavior {
         EnterBehavior::Ignore => TextInputOutcome::Ignored,
         EnterBehavior::InsertNewline => {
-            state.buffer.insert_newline();
+            state.buffer_mut().insert_newline();
             state.sync_scroll_to_cursor(policy);
             TextInputOutcome::Edited
         }
@@ -854,17 +903,19 @@ const fn selection_motion(stroke: KeyStroke) -> Option<TextMotion> {
     }
 }
 
-fn extend_selection(buffer: &mut TextEditBuffer, area: Rect, motion: TextMotion) {
+fn extend_selection(state: &mut TextInputState, motion: TextMotion) {
     match motion {
-        TextMotion::VisualUp => extend_visual_selection(buffer, area, -1),
-        TextMotion::VisualDown => extend_visual_selection(buffer, area, 1),
-        motion => buffer.move_cursor_with_selection(motion, SelectionMode::Extend),
+        TextMotion::VisualUp => extend_visual_selection(state, -1),
+        TextMotion::VisualDown => extend_visual_selection(state, 1),
+        motion => state
+            .buffer
+            .move_cursor_with_selection(motion, SelectionMode::Extend),
     }
 }
 
-fn extend_visual_selection(buffer: &mut TextEditBuffer, area: Rect, delta: isize) {
-    let width = usize::from(area.width.max(1));
-    let layout = buffer.wrapped_layout(width);
+fn extend_visual_selection(state: &mut TextInputState, delta: isize) {
+    let width = state.content_area.width;
+    let layout = state.wrapped_layout(width);
     let target_row = if delta.is_negative() {
         layout.cursor.row.saturating_sub(delta.unsigned_abs())
     } else {
@@ -874,13 +925,11 @@ fn extend_visual_selection(buffer: &mut TextEditBuffer, area: Rect, delta: isize
             .saturating_add(delta.unsigned_abs())
             .min(layout.lines.len().saturating_sub(1))
     };
-    buffer.select_to_wrapped_position(width, target_row, layout.cursor.col);
-}
-
-fn scroll_offset_for_cursor_row(cursor_row: usize, height: u16) -> usize {
-    cursor_row
-        .saturating_add(1)
-        .saturating_sub(usize::from(height))
+    let byte_index = layout.byte_index_for_position(target_row, layout.cursor.col);
+    drop(layout);
+    state
+        .buffer
+        .move_cursor_with_selection(TextMotion::Absolute(byte_index), SelectionMode::Extend);
 }
 
 fn mouse_wrapped_position(state: &TextInputState, mouse: MouseEvent) -> Option<(usize, usize)> {
@@ -892,7 +941,8 @@ fn mouse_wrapped_position(state: &TextInputState, mouse: MouseEvent) -> Option<(
         return None;
     }
     Some((
-        usize::from(mouse.position.y.saturating_sub(area.y)).saturating_add(state.vertical_scroll),
+        usize::from(mouse.position.y.saturating_sub(area.y))
+            .saturating_add(state.vertical_scroll()),
         usize::from(mouse.position.x.saturating_sub(area.x)),
     ))
 }
@@ -918,34 +968,33 @@ fn drag_wrapped_position(
         if !edge_scroll {
             return None;
         }
-        let previous = state.vertical_scroll;
-        state.vertical_scroll = state.vertical_scroll.saturating_sub(1);
+        let previous = state.vertical_scroll();
+        let viewport = editor_viewport(area, state.wrapped_layout(area.width).lines.len());
+        ScrollView::scroll_vertical_by(&viewport, &mut state.scroll, -1);
         return Some(DragPosition {
-            row: state.vertical_scroll,
+            row: state.vertical_scroll(),
             col,
-            scrolled: state.vertical_scroll != previous,
+            scrolled: state.vertical_scroll() != previous,
         });
     }
     if mouse.position.y >= area.bottom() {
         if !edge_scroll {
             return None;
         }
-        let previous = state.vertical_scroll;
-        state.vertical_scroll = state
-            .vertical_scroll
-            .saturating_add(1)
-            .min(max_vertical_scroll(&state.buffer, area));
+        let previous = state.vertical_scroll();
+        let viewport = editor_viewport(area, state.wrapped_layout(area.width).lines.len());
+        ScrollView::scroll_vertical_by(&viewport, &mut state.scroll, 1);
         return Some(DragPosition {
             row: state
-                .vertical_scroll
+                .vertical_scroll()
                 .saturating_add(usize::from(area.height).saturating_sub(1)),
             col,
-            scrolled: state.vertical_scroll != previous,
+            scrolled: state.vertical_scroll() != previous,
         });
     }
     Some(DragPosition {
         row: usize::from(mouse.position.y.saturating_sub(area.y))
-            .saturating_add(state.vertical_scroll),
+            .saturating_add(state.vertical_scroll()),
         col,
         scrolled: false,
     })
@@ -961,23 +1010,22 @@ fn clamped_mouse_col(area: Rect, x: u16) -> usize {
     }
 }
 
-fn max_vertical_scroll(buffer: &TextEditBuffer, area: Rect) -> usize {
-    buffer
-        .wrapped_layout(usize::from(area.width.max(1)))
-        .lines
-        .len()
-        .saturating_sub(usize::from(area.height))
+fn editor_viewport(area: Rect, rows: usize) -> LayoutNode {
+    ScrollViewComponent::viewport_layout(
+        LayoutId::new("text-input.viewport"),
+        LogicalSize::new(area.width, usize::from(area.height)),
+        LayoutNode::leaf(
+            LayoutId::new("text-input.content"),
+            LogicalSize::new(area.width, rows),
+        ),
+    )
 }
 
 fn apply_selection_granularity(
     buffer: &mut TextEditBuffer,
-    area: Rect,
-    row: usize,
-    col: usize,
+    byte_index: usize,
     granularity: SelectionGranularity,
 ) {
-    let width = usize::from(area.width.max(1));
-    let byte_index = buffer.byte_index_for_wrapped_position(width, row, col);
     match granularity {
         SelectionGranularity::Character | SelectionGranularity::Disabled => {
             buffer.move_cursor(TextMotion::Absolute(byte_index));
@@ -989,13 +1037,9 @@ fn apply_selection_granularity(
 
 fn extend_selection_to_granularity(
     buffer: &mut TextEditBuffer,
-    area: Rect,
-    row: usize,
-    col: usize,
+    byte_index: usize,
     granularity: SelectionGranularity,
 ) {
-    let width = usize::from(area.width.max(1));
-    let byte_index = buffer.byte_index_for_wrapped_position(width, row, col);
     match granularity {
         SelectionGranularity::Character => {
             buffer.move_cursor_with_selection(
@@ -1093,6 +1137,152 @@ mod tests {
 
     fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
         MouseEvent::new(kind, Point::new(x, y))
+    }
+
+    #[test]
+    fn wrapped_cache_reuses_and_invalidates_without_affecting_equality() {
+        let mut state = TextInputState::new(TextEditBuffer::from_text("abcdef"));
+        let unchanged = state.clone();
+        let first = state.wrapped_layout(3).lines.as_ptr();
+        assert_eq!(first, state.wrapped_layout(3).lines.as_ptr());
+        assert_eq!(state, unchanged);
+        assert_eq!(*state.wrapped_layout(2), state.buffer().wrapped_layout(2));
+        state.buffer_mut().move_cursor(TextMotion::Left);
+        assert_eq!(*state.wrapped_layout(2), state.buffer().wrapped_layout(2));
+        *state.buffer_mut() = TextEditBuffer::from_text("uvwxyz");
+        assert_eq!(*state.wrapped_layout(2), state.buffer().wrapped_layout(2));
+        assert_eq!(state.wrapped_layout(2).lines[0], "uv");
+    }
+
+    #[test]
+    fn input_events_retain_cursor_geometry_and_invalidate_text_geometry() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("hello 界world"));
+        state.set_content_area(Rect::new(0, 0, 5, 2), &policy);
+        let lines = state.wrapped_layout(5).lines.as_ptr();
+        for stroke in [
+            key(KeyCode::Left),
+            shift_key(KeyCode::Left),
+            shift_key(KeyCode::Up),
+        ] {
+            control.handle_key(&mut state, stroke);
+            assert_eq!(state.wrapped_layout(5).lines.as_ptr(), lines);
+            assert_eq!(*state.wrapped_layout(5), state.buffer().wrapped_layout(5));
+        }
+        for event in [
+            Event::Key(key(KeyCode::Char('!'))),
+            Event::Key(key(KeyCode::Backspace)),
+            Event::Paste("long pasted 界text".to_string()),
+            Event::Key(shift_key(KeyCode::Enter)),
+        ] {
+            let previous = state.buffer().text().to_string();
+            control.handle_event(&mut state, &event);
+            assert_ne!(state.buffer().text(), previous);
+            assert_eq!(*state.wrapped_layout(5), state.buffer().wrapped_layout(5));
+        }
+        *state.buffer_mut() = TextEditBuffer::from_text("replacement");
+        assert!(state.wrapped.borrow().is_none());
+        assert_eq!(*state.wrapped_layout(5), state.buffer().wrapped_layout(5));
+        let cloned = state.clone();
+        state.buffer_mut().clear();
+        assert_eq!(*state.wrapped_layout(5), state.buffer().wrapped_layout(5));
+        assert_eq!(*cloned.wrapped_layout(5), cloned.buffer().wrapped_layout(5));
+    }
+
+    #[test]
+    fn resize_and_content_replacement_clamp_manual_scroll() {
+        let mut policy = TextInputPolicy::chat_composer();
+        policy.viewport.auto_scroll_to_cursor = false;
+        let mut state = TextInputState::new(TextEditBuffer::from_text("0\n1\n2\n3\n4"));
+        state.scroll.set_vertical_offset(3);
+        state.set_content_area(Rect::new(0, 0, 4, 4), &policy);
+        assert_eq!(state.vertical_scroll(), 1);
+        *state.buffer_mut() = TextEditBuffer::from_text("short");
+        state.set_content_area(Rect::new(0, 0, 8, 4), &policy);
+        assert_eq!(state.vertical_scroll(), 0);
+    }
+
+    #[test]
+    fn wrapped_unicode_pointer_selection_preserves_source_range_on_resize() {
+        let mut policy = TextInputPolicy::chat_composer();
+        policy.viewport.auto_scroll_to_cursor = false;
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("ab界cd"));
+        state.set_content_area(Rect::new(0, 0, 4, 2), &policy);
+        control.handle_mouse(
+            &mut state,
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, 0),
+        );
+        assert_eq!(state.buffer().cursor_byte_index(), 2);
+        control.handle_mouse(
+            &mut state,
+            mouse(MouseEventKind::Drag(MouseButton::Left), 1, 1),
+        );
+        assert_eq!(state.buffer().selected_text().as_deref(), Some("界c"));
+        assert_eq!(state.buffer().cursor_byte_index(), 6);
+        assert_eq!(state.vertical_scroll(), 0);
+        state.set_content_area(Rect::new(0, 0, 6, 2), &policy);
+        assert_eq!(state.buffer().selected_text().as_deref(), Some("界c"));
+        assert_eq!(
+            state.wrapped_layout(6).cursor,
+            bmux_text_edit::VisualCursor { row: 0, col: 5 }
+        );
+        let state = RefCell::new(state);
+        let component = TextInputComponent::new("editor", &state, &policy).focused(true);
+        let layout = component.layout(Constraints::tight(Size::new(6, 2)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 6, 2));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.cursor().unwrap().position, Point::new(5, 0));
+    }
+
+    #[test]
+    fn retained_render_matches_fresh_after_pointer_scroll_and_resize() {
+        let policy = TextInputPolicy::chat_composer();
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text(
+            "hello 界world\nsecond line\nthird e\u{301} line",
+        )));
+        for (width, event) in [
+            (
+                6,
+                Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0)),
+            ),
+            (
+                6,
+                Event::Mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 4, 3)),
+            ),
+            (9, Event::Key(shift_key(KeyCode::Up))),
+            (4, Event::Paste("changed 界".to_string())),
+        ] {
+            let component = TextInputComponent::new("editor", &state, &policy).focused(true);
+            let layout = component.layout(
+                Constraints::tight(Size::new(width, 2)),
+                &mut LayoutCx::new(),
+            );
+            let mut event_cx = EventCx::with_clip(&layout, Rect::new(0, 0, width, 2));
+            component.event(&event, &layout, &mut event_cx);
+            let fresh = RefCell::new(state.borrow().clone());
+            *fresh.borrow_mut().wrapped.get_mut() = None;
+            let mut retained_buffer = Buffer::empty(Rect::new(0, 0, width, 2));
+            let mut fresh_buffer = retained_buffer.clone();
+            let mut retained_frame = Frame::new(&mut retained_buffer);
+            let mut fresh_frame = Frame::new(&mut fresh_buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut retained_frame));
+            TextInputComponent::new("editor", &fresh, &policy)
+                .focused(true)
+                .paint(&layout, &mut PaintCx::new(&mut fresh_frame));
+            assert_eq!(retained_frame.buffer(), fresh_frame.buffer());
+            assert_eq!(retained_frame.cursor(), fresh_frame.cursor());
+            assert_eq!(
+                state.borrow().buffer().selection(),
+                fresh.borrow().buffer().selection()
+            );
+            assert_eq!(
+                state.borrow().vertical_scroll(),
+                fresh.borrow().vertical_scroll()
+            );
+        }
     }
 
     #[test]

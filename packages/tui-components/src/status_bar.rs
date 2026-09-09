@@ -211,6 +211,38 @@ impl<'a> StatusBarComponent<'a> {
     }
 }
 
+fn bar_surface(style: Style) -> bmux_tui::composition::Surface<'static> {
+    bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new()).background(style)
+}
+
+fn bar_layout(
+    id: LayoutId,
+    size: LogicalSize,
+    background: bool,
+    style: Style,
+    cx: &mut LayoutCx,
+) -> LayoutNode {
+    let children = if background {
+        vec![bmux_tui::component::ChildLayout::new(
+            0,
+            0,
+            bar_surface(style).layout(
+                Constraints::new(
+                    size.width,
+                    size.width,
+                    size.height.min(1),
+                    Some(size.height.min(1)),
+                ),
+                cx,
+            ),
+        )]
+    } else {
+        Vec::new()
+    };
+    LayoutNode::with_children(id, size, children)
+        .with_metadata(LayoutMetadata::new().semantic("status"))
+}
+
 impl Component for StatusBarComponent<'_> {
     fn revision(&self) -> ComponentRevision {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
@@ -221,6 +253,7 @@ impl Component for StatusBarComponent<'_> {
                 segment.text.hash(&mut layout);
             }
         }
+        self.bar.policy.background.hash(&mut layout);
         self.bar.policy.separator.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
@@ -244,11 +277,14 @@ impl Component for StatusBarComponent<'_> {
         } else {
             center.saturating_add(left.max(right).saturating_mul(2))
         };
-        LayoutNode::leaf(
+        let size = constraints.constrain(LogicalSize::new(width, 1));
+        bar_layout(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, 1)),
+            size,
+            self.bar.policy.background,
+            self.bar.styles.background,
+            cx,
         )
-        .with_metadata(LayoutMetadata::new().semantic("status"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -256,8 +292,8 @@ impl Component for StatusBarComponent<'_> {
             return;
         }
         let area = LocalRect::new(0, 0, layout.size.width, 1);
-        if self.bar.policy.background {
-            cx.fill(area, " ", self.bar.styles.background);
+        if let Some(surface) = layout.children.first() {
+            bar_surface(self.bar.styles.background).paint(&surface.node, cx);
         }
         self.paint_group(cx, layout.size.width, self.bar.left, BarAlign::Left);
         self.paint_group(cx, layout.size.width, self.bar.center, BarAlign::Center);
@@ -452,6 +488,7 @@ impl Component for MessageBarComponent<'_> {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
         self.bar.message.text.hash(&mut layout);
+        self.bar.policy.background.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         format!("{:?}", self.bar).hash(&mut paint);
@@ -460,14 +497,17 @@ impl Component for MessageBarComponent<'_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        LayoutNode::leaf(
+        let size = constraints.constrain(LogicalSize::new(
+            u16_saturating(display_width(self.bar.message.text)),
+            1,
+        ));
+        bar_layout(
             self.id.clone(),
-            constraints.constrain(LogicalSize::new(
-                u16_saturating(display_width(self.bar.message.text)),
-                1,
-            )),
+            size,
+            self.bar.policy.background,
+            self.bar.styles.background,
+            cx,
         )
-        .with_metadata(LayoutMetadata::new().semantic("status"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -475,8 +515,8 @@ impl Component for MessageBarComponent<'_> {
             return;
         }
         let area = LocalRect::new(0, 0, layout.size.width, 1);
-        if self.bar.policy.background {
-            cx.fill(area, " ", self.bar.styles.background);
+        if let Some(surface) = layout.children.first() {
+            bar_surface(self.bar.styles.background).paint(&surface.node, cx);
         }
         StatusBarComponent::new(self.id.clone())
             .policy(self.bar.policy)
@@ -853,7 +893,7 @@ mod tests {
             .left(&left)
             .policy(StatusBarPolicy::compact().background(true))
             .revision();
-        assert_eq!(initial.layout, policy.layout);
+        assert_ne!(initial.layout, policy.layout);
         assert_ne!(initial.paint, policy.paint);
 
         let longer = [StatusSegment::new("healthy")];

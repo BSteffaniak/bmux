@@ -239,6 +239,7 @@ impl Component for SparklineComponent<'_> {
         self.policy.highlight_first.hash(&mut paint);
         self.policy.highlight_high.hash(&mut paint);
         self.policy.highlight_low.hash(&mut paint);
+        self.policy.background.hash(&mut layout);
         self.policy.background.hash(&mut paint);
         self.styles.normal.hash(&mut paint);
         self.styles.latest.hash(&mut paint);
@@ -278,11 +279,28 @@ impl Component for SparklineComponent<'_> {
                 .clamp(constraints.min_width(), constraints.max_width())
         };
         let height = usize::from(width > 0);
-        LayoutNode::leaf(
-            self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, height)),
-        )
-        .with_metadata(LayoutMetadata::new().semantic("chart"))
+        let size = constraints.constrain(LogicalSize::new(width, height));
+        let children = if self.policy.background {
+            vec![bmux_tui::component::ChildLayout::new(
+                0,
+                0,
+                bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                    .background(self.styles.background)
+                    .layout(
+                        Constraints::new(
+                            size.width,
+                            size.width,
+                            size.height.min(1),
+                            Some(size.height.min(1)),
+                        ),
+                        cx,
+                    ),
+            )]
+        } else {
+            Vec::new()
+        };
+        LayoutNode::with_children(self.id.clone(), size, children)
+            .with_metadata(LayoutMetadata::new().semantic("chart"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -290,8 +308,10 @@ impl Component for SparklineComponent<'_> {
             return;
         }
         let area = LocalRect::new(0, 0, layout.size.width, 1);
-        if self.policy.background {
-            cx.fill(area, " ", self.styles.background);
+        if let Some(surface) = layout.children.first() {
+            bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                .background(self.styles.background)
+                .paint(&surface.node, cx);
         }
         let samples = self.visible_samples(layout.size.width);
         if samples.is_empty() || self.policy.symbols.is_empty() {

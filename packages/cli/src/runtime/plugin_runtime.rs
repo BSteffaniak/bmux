@@ -168,14 +168,10 @@ fn install_bundled_client_adapter(plugin_id: &str, settings: Option<&toml::Value
         if let Err(error) = bmux_sidebar_plugin::install(settings) {
             tracing::warn!(%error, "failed installing sidebar attach companion");
         } else {
-            bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::new(
-                plugin_id,
-                std::sync::Arc::new(bmux_sidebar_plugin::start),
-                std::sync::Arc::new(|| {
-                    bmux_sidebar_plugin::uninstall();
-                    Ok(())
-                }),
-            ));
+            match bmux_sidebar_plugin::installed_companion() {
+                Ok(companion) => bmux_plugin::register_attach_companion(companion),
+                Err(error) => tracing::warn!(%error, "failed capturing sidebar attach companion"),
+            }
         }
     }
 }

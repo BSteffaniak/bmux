@@ -3,8 +3,8 @@
 use std::hash::{Hash, Hasher};
 
 use bmux_tui::component::{
-    Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata, LayoutNode,
-    LogicalSize,
+    ChildLayout, Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutMetadata,
+    LayoutNode, LogicalSize,
 };
 use bmux_tui::geometry::{Insets, Rect};
 use bmux_tui::paint::{LocalRect, PaintCx};
@@ -209,6 +209,7 @@ impl Component for EmptyStateComponent<'_> {
                 span.style.hash(&mut paint);
             }
         }
+        self.policy.background.hash(&mut layout);
         self.policy.background.hash(&mut paint);
         self.styles.icon.hash(&mut paint);
         self.styles.title.hash(&mut paint);
@@ -237,11 +238,23 @@ impl Component for EmptyStateComponent<'_> {
         let content_width = width.saturating_sub(self.policy.padding.horizontal());
         let content_height = wrapped_lines(&lines, content_width, self.policy.wrap).len();
         let height = content_height.saturating_add(usize::from(self.policy.padding.vertical()));
-        LayoutNode::leaf(
-            self.id.clone(),
-            constraints.constrain(LogicalSize::new(width, height)),
-        )
-        .with_metadata(LayoutMetadata::new().semantic("status"))
+        let size = constraints.constrain(LogicalSize::new(width, height));
+        let surface = bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+            .background(self.styles.background);
+        let children = if self.policy.background {
+            vec![ChildLayout::new(
+                0,
+                0,
+                surface.layout(
+                    Constraints::new(size.width, size.width, size.height, Some(size.height)),
+                    cx,
+                ),
+            )]
+        } else {
+            Vec::new()
+        };
+        LayoutNode::with_children(self.id.clone(), size, children)
+            .with_metadata(LayoutMetadata::new().semantic("status"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -254,8 +267,10 @@ impl Component for EmptyStateComponent<'_> {
             layout.size.width,
             u16::try_from(layout.size.height).unwrap_or(u16::MAX),
         );
-        if self.policy.background {
-            cx.fill(full, " ", self.styles.background);
+        if let Some(surface) = layout.children.first() {
+            bmux_tui::composition::Surface::new(bmux_tui::composition::Stack::new())
+                .background(self.styles.background)
+                .paint(&surface.node, cx);
         }
 
         let horizontal_padding = self.policy.padding.horizontal();

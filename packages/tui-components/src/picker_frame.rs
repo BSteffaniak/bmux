@@ -7,7 +7,7 @@ use bmux_tui::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, EventCx, LayoutCx, LayoutId,
     LayoutNode, LogicalSize, combine_child_revisions,
 };
-use bmux_tui::composition::Surface;
+use bmux_tui::composition::{Surface, TextBlock};
 use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use bmux_tui::paint::{LocalRect, PaintCx};
@@ -371,11 +371,38 @@ impl<'a> PickerFrameComponent<'a> {
         surface
     }
 
+    fn chrome_component(&self, name: &str) -> Element<'_> {
+        let text = |line: Line, style| {
+            Element::new(
+                TextBlock::new(bmux_tui::text::Text::from_lines(vec![
+                    line.with_fallback_style(style),
+                ]))
+                .wrap(bmux_tui::text::TextWrap::None),
+            )
+        };
+        match name {
+            "title" => text(
+                Line::from(self.frame.title.unwrap_or_default()),
+                self.frame.styles.border,
+            ),
+            "header" => text(
+                self.frame.header.clone().unwrap_or_default(),
+                self.frame.styles.header,
+            ),
+            "footer" => text(
+                self.frame.footer.clone().unwrap_or_default(),
+                self.frame.styles.footer,
+            ),
+            "input" => Element::new(Surface::new(EmptyContent).background(self.frame.styles.input)),
+            "list" => Element::new(Surface::new(EmptyContent).background(self.frame.styles.list)),
+            _ => Element::new(EmptyContent),
+        }
+    }
+
     fn paint_chrome(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let Some(panel) = layout.children.first() else {
             return;
         };
-        let local = self.local_layout(panel.node.size);
         let panel_height = u16::try_from(panel.node.size.height).unwrap_or(u16::MAX);
         cx.with_child(
             i32::from(panel.x),
@@ -383,43 +410,26 @@ impl<'a> PickerFrameComponent<'a> {
             LocalRect::new(0, 0, panel.node.size.width, panel_height),
             |cx| {
                 let surface = self.panel_surface();
-                let surface_layout =
-                    surface.layout(Constraints::tight(local.panel.size()), &mut LayoutCx::new());
-                surface.paint(&surface_layout, cx);
-                if self.frame.policy.chrome
-                    && let Some(title) = self.frame.title
-                {
-                    let width = local.panel.width.saturating_sub(2);
-                    if width > 0 {
-                        cx.write_line_with_fallback_style(
+                let Some(surface_layout) = panel.node.children.last() else {
+                    return;
+                };
+                surface.paint(&surface_layout.node, cx);
+                let prefix = format!("{}.chrome.", self.id.as_str());
+                for child in &panel.node.children {
+                    if let Some(name) = child.node.id.as_str().strip_prefix(&prefix) {
+                        let component = self.chrome_component(name);
+                        cx.with_child(
+                            i32::from(child.x),
+                            i64::try_from(child.y).unwrap_or(i64::MAX),
                             LocalRect::new(
-                                i32::from(local.panel.x.saturating_add(1)),
-                                i64::from(local.panel.y),
-                                width,
-                                1,
+                                0,
+                                0,
+                                child.node.size.width,
+                                u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
                             ),
-                            &Line::from(title),
-                            self.frame.styles.border,
+                            |cx| component.paint(&child.node, cx),
                         );
                     }
-                }
-                if let (Some(area), Some(header)) = (local.header, &self.frame.header) {
-                    cx.write_line_with_fallback_style(
-                        LocalRect::terminal(area),
-                        header,
-                        self.frame.styles.header,
-                    );
-                }
-                if let Some(area) = local.input {
-                    cx.fill(LocalRect::terminal(area), " ", self.frame.styles.input);
-                }
-                cx.fill(LocalRect::terminal(local.list), " ", self.frame.styles.list);
-                if let (Some(area), Some(footer)) = (local.footer, &self.frame.footer) {
-                    cx.write_line_with_fallback_style(
-                        LocalRect::terminal(area),
-                        footer,
-                        self.frame.styles.footer,
-                    );
                 }
             },
         );
@@ -446,6 +456,7 @@ impl Component for PickerFrameComponent<'_> {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
         format!("{:?}", self.frame.policy).hash(&mut layout);
+        self.frame.title.is_some().hash(&mut layout);
         self.frame.header.is_some().hash(&mut layout);
         self.frame.footer.is_some().hash(&mut layout);
         self.input.is_some().hash(&mut layout);
@@ -456,6 +467,11 @@ impl Component for PickerFrameComponent<'_> {
         format!("{:?}", self.frame.footer).hash(&mut paint);
         self.frame.styles.hash(&mut paint);
         let own = ComponentRevision::new(layout.finish(), paint.finish());
+        let own = combine_child_revisions(
+            own,
+            ["title", "header", "input", "list", "footer"]
+                .map(|name| self.chrome_component(name).revision()),
+        );
         combine_child_revisions(
             own,
             self.input
@@ -497,6 +513,33 @@ impl Component for PickerFrameComponent<'_> {
             usize::from(local.list.y),
             list,
         ));
+        for (name, area) in [
+            (
+                "title",
+                (self.frame.policy.chrome && self.frame.title.is_some()).then_some(Rect::new(
+                    1,
+                    0,
+                    local.panel.width.saturating_sub(2),
+                    1,
+                )),
+            ),
+            ("header", local.header),
+            ("input", local.input),
+            ("list", Some(local.list)),
+            ("footer", local.footer),
+        ] {
+            if let Some(area) = area {
+                let mut node = self
+                    .chrome_component(name)
+                    .layout(Constraints::tight(area.size()), cx);
+                node.id = LayoutId::new(format!("{}.chrome.{name}", self.id.as_str()));
+                children.push(ChildLayout::new(area.x, usize::from(area.y), node));
+            }
+        }
+        let surface = self
+            .panel_surface()
+            .layout(Constraints::tight(local.panel.size()), cx);
+        children.push(ChildLayout::new(0, 0, surface));
         let panel = LayoutNode::with_children(
             LayoutId::new(format!("{}.panel", self.id.as_str())),
             panel_size,
@@ -535,7 +578,13 @@ impl Component for PickerFrameComponent<'_> {
             return EventOutcome::Ignored;
         };
         let mut components = self.input.iter().chain(std::iter::once(&self.list));
-        for child in panel.node.children.iter().rev() {
+        for child in panel
+            .node
+            .children
+            .iter()
+            .take(usize::from(self.input.is_some()) + 1)
+            .rev()
+        {
             let Some(component) = components.next_back() else {
                 break;
             };
@@ -725,6 +774,21 @@ mod tests {
     }
 
     #[test]
+    fn chrome_text_changes_invalidate_retained_layout() {
+        let make = |header| {
+            PickerFrameComponent::new(
+                "picker",
+                PickerFrame::new().header(header),
+                TextBlock::new("list"),
+            )
+        };
+        assert_ne!(
+            make("before").revision().layout,
+            make("after").revision().layout
+        );
+    }
+
+    #[test]
     fn component_owns_picker_geometry_and_child_placement() {
         let picker = PickerFrame::new()
             .title("Pick")
@@ -749,7 +813,11 @@ mod tests {
         assert_eq!((panel.x, panel.y), (3, 2));
         assert_eq!(panel.node.size.width, 20);
         assert_eq!(panel.node.size.height, 8);
-        assert_eq!(panel.node.children.len(), 2);
+        assert_eq!(panel.node.children.len(), 7);
+        assert_eq!(
+            panel.node.children.last().unwrap().node.size,
+            panel.node.size
+        );
         assert_eq!(panel.node.children[0].node.id.as_str(), "picker.input");
         assert_eq!(panel.node.children[1].node.id.as_str(), "picker.list");
 
@@ -790,7 +858,7 @@ mod tests {
         );
         let layout = component.layout(Constraints::new(12, 12, 5, Some(5)), &mut LayoutCx::new());
 
-        assert_eq!(layout.children[0].node.children.len(), 1);
+        assert_eq!(layout.children[0].node.children.len(), 4);
         assert_eq!(
             layout.children[0].node.children[0].node.id.as_str(),
             "picker.list"

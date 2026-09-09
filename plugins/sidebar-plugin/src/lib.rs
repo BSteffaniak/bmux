@@ -21,7 +21,6 @@ use bmux_presentation_state::{
     global_presentation_fact_host_service,
 };
 use bmux_windows_plugin_api::{windows_commands, windows_list};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
@@ -164,17 +163,49 @@ impl Settings {
 }
 
 #[derive(Debug, Clone)]
+struct MeasuredSidebarItem {
+    title: String,
+    description: String,
+    status: String,
+    width: usize,
+    fields: Vec<bmux_tui::composition::TextBlock>,
+    layout: bmux_tui::component::LayoutNode,
+}
+
+#[derive(Debug)]
 struct CompanionState {
+    // None selects the legacy process-local presentation until runtime ownership
+    // is threaded through installation; explicit owners never publish globally.
+    surfaces: Option<std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>>,
+    subscription: Option<tokio::task::JoinHandle<()>>,
+    allocation: Option<ExtensionRect>,
+    allocation_publication_pending: bool,
     settings: Settings,
     revision: u64,
     snapshot: windows_list::WindowListSnapshot,
     hovered_window_id: Option<Uuid>,
-    scroll_offset: usize,
+    scroll: bmux_tui_components::scroll_view::ScrollViewState,
+    measured_items: std::cell::RefCell<std::collections::BTreeMap<Uuid, MeasuredSidebarItem>>,
+}
+
+impl Drop for CompanionState {
+    fn drop(&mut self) {
+        if let Some(task) = self.subscription.take() {
+            task.abort();
+        }
+        if let Some(registry) = &self.surfaces {
+            registry.remove_owner(OWNER);
+        }
+    }
 }
 
 impl CompanionState {
     const fn new(settings: Settings) -> Self {
         Self {
+            surfaces: None,
+            subscription: None,
+            allocation: None,
+            allocation_publication_pending: false,
             settings,
             revision: 0,
             snapshot: windows_list::WindowListSnapshot {
@@ -182,45 +213,251 @@ impl CompanionState {
                 revision: 0,
             },
             hovered_window_id: None,
-            scroll_offset: 0,
+            scroll: bmux_tui_components::scroll_view::ScrollViewState::new(),
+            measured_items: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    const fn allocated_width(&self) -> u16 {
+        match self.allocation {
+            Some(rect) => rect.w,
+            None => self.settings.width,
+        }
+    }
+
+    fn resize(&mut self, rect: ExtensionRect) -> bool {
+        if self.allocation == Some(rect) {
+            return false;
+        }
+        self.allocation = Some(rect);
+        let layout = self.scroll_layout();
+        bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
+            &layout,
+            &mut self.scroll,
+            0,
+        );
+        if let Some(index) = self
+            .snapshot
+            .windows
+            .iter()
+            .position(|window| window.active)
+        {
+            self.reveal(index);
+        }
+        true
+    }
+
+    fn publish_allocation(
+        &mut self,
+        rect: ExtensionRect,
+        publish: impl FnOnce(&Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let changed = self.resize(rect);
+        if !changed && !self.allocation_publication_pending {
+            return Ok(());
+        }
+        self.allocation_publication_pending = true;
+        publish(self)?;
+        self.allocation_publication_pending = false;
+        Ok(())
+    }
+
+    fn measure_item(
+        &self,
+        id: Uuid,
+        title: String,
+        description: String,
+        status: String,
+        width: usize,
+    ) -> std::cell::Ref<'_, MeasuredSidebarItem> {
+        let stale = self.measured_items.borrow().get(&id).is_none_or(|item| {
+            item.title != title
+                || item.description != description
+                || item.status != status
+                || item.width != width
+        });
+        if stale {
+            use bmux_tui::component::{Component, Constraints, LayoutCx};
+            use bmux_tui::composition::{Column, TextBlock};
+            use bmux_tui::text::{Line, Text};
+            let description_lines = if description.trim().is_empty() || width <= 1 {
+                Vec::new()
+            } else {
+                bmux_tui::text::wrap_text(
+                    description.trim(),
+                    bmux_tui::text::TextWrapGeometry::uniform(width - 1),
+                    bmux_tui::text::TextWrap::Word,
+                )
+                .into_iter()
+                .take(2)
+                .collect::<Vec<_>>()
+            };
+            let mut fields = vec![
+                TextBlock::new(Text::from_lines(vec![Line::raw(truncate_to_width(
+                    &title, width,
+                ))]))
+                .id("title"),
+            ];
+            if !description_lines.is_empty() {
+                fields.push(
+                    TextBlock::new(Text::from_lines(
+                        description_lines
+                            .iter()
+                            .map(|line| Line::raw(format!(" {line}")))
+                            .collect::<Vec<_>>(),
+                    ))
+                    .id("description"),
+                );
+            }
+            if !status.is_empty() {
+                fields.push(
+                    TextBlock::new(Text::from_lines(vec![Line::raw(format!(
+                        " {}",
+                        truncate_to_width(&status, width.saturating_sub(1))
+                    ))]))
+                    .id("status"),
+                );
+            }
+            let content = fields
+                .iter()
+                .fold(Column::new().id(format!("window:{id}")), |column, field| {
+                    column.child(field.clone())
+                });
+            let layout = content.layout(
+                Constraints::for_width(u16::try_from(width).unwrap_or(u16::MAX)),
+                &mut LayoutCx::new(),
+            );
+            self.measured_items.borrow_mut().insert(
+                id,
+                MeasuredSidebarItem {
+                    title,
+                    description,
+                    status,
+                    width,
+                    fields,
+                    layout,
+                },
+            );
+        }
+        std::cell::Ref::map(self.measured_items.borrow(), |items| &items[&id])
+    }
+
+    fn measured_window(&self, index: usize) -> std::cell::Ref<'_, MeasuredSidebarItem> {
+        let window = &self.snapshot.windows[index];
+        let fact = window_fact(window);
+        let render = |template: &str| {
+            render_template(
+                template,
+                window,
+                index,
+                self.settings.show_index,
+                fact.as_ref(),
+            )
+        };
+        self.measure_item(
+            window.id,
+            render(&self.settings.title_template),
+            render(&self.settings.description_template),
+            render(&self.settings.status_template),
+            usize::from(self.allocated_width().saturating_sub(4)),
+        )
+    }
+
+    fn scroll_layout(&self) -> bmux_tui::component::LayoutNode {
+        use bmux_tui::component::{ChildLayout, LayoutId, LayoutNode, LogicalSize};
+        let mut content = LayoutNode::leaf(
+            LayoutId::new("sidebar.items"),
+            LogicalSize::new(self.settings.width, 0),
+        );
+        for index in 0..self.snapshot.windows.len() {
+            let item = self.measured_window(index);
+            let y = content.size.height;
+            content.size.height = y.saturating_add(item.layout.size.height);
+            content
+                .children
+                .push(ChildLayout::new(0, y, item.layout.clone()));
+        }
+        let viewport_height = content
+            .children
+            .iter()
+            .take(self.settings.maximum_visible_items)
+            .map(|child| child.node.size.height)
+            .sum();
+        bmux_tui_components::scroll_view::ScrollViewComponent::viewport_layout(
+            LayoutId::new("sidebar.viewport"),
+            LogicalSize::new(
+                self.allocated_width(),
+                self.allocation.map_or(viewport_height, |rect| {
+                    usize::from(rect.h.saturating_sub(2))
+                }),
+            ),
+            content,
+        )
+    }
+
+    fn reveal(&mut self, index: usize) {
+        let layout = self.scroll_layout();
+        let Some(item) = layout.children[0].node.children.get(index) else {
+            return;
+        };
+        bmux_tui_components::scroll_view::ScrollView::new().ensure_visible(
+            &layout,
+            &mut self.scroll,
+            item.y,
+            item.node.size.height,
+        );
     }
 
     fn replace_windows(&mut self, snapshot: windows_list::WindowListSnapshot) {
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
-            let maximum_offset = self
-                .snapshot
-                .windows
-                .len()
-                .saturating_sub(self.settings.maximum_visible_items);
-            self.scroll_offset = self.scroll_offset.min(maximum_offset);
+            self.measured_items
+                .get_mut()
+                .retain(|id, _| self.snapshot.windows.iter().any(|window| window.id == *id));
+            let layout = self.scroll_layout();
+            bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
+                &layout,
+                &mut self.scroll,
+                0,
+            );
             if let Some(active) = self
                 .snapshot
                 .windows
                 .iter()
                 .position(|window| window.active)
             {
-                if active < self.scroll_offset {
-                    self.scroll_offset = active;
-                } else if active
-                    >= self
-                        .scroll_offset
-                        .saturating_add(self.settings.maximum_visible_items)
-                {
-                    self.scroll_offset = active
-                        .saturating_add(1)
-                        .saturating_sub(self.settings.maximum_visible_items);
-                }
+                self.reveal(active);
             }
             self.revision = self.revision.saturating_add(1).max(1);
         }
     }
 }
 
-fn state() -> &'static Mutex<Option<CompanionState>> {
-    static STATE: OnceLock<Mutex<Option<CompanionState>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(None))
+type CompanionHandle = std::sync::Arc<Mutex<Option<CompanionState>>>;
+
+fn installations() -> &'static Mutex<CompanionHandle> {
+    static STATE: OnceLock<Mutex<CompanionHandle>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(std::sync::Arc::new(Mutex::new(None))))
+}
+
+fn state() -> CompanionHandle {
+    installations()
+        .lock()
+        .expect("sidebar installation lock poisoned")
+        .clone()
+}
+
+fn replace_installation(settings: Settings) -> Result<CompanionHandle, String> {
+    let next = std::sync::Arc::new(Mutex::new(Some(CompanionState::new(settings))));
+    let mut current = installations()
+        .lock()
+        .map_err(|_| "sidebar installation lock poisoned".to_string())?;
+    *current
+        .lock()
+        .map_err(|_| "sidebar state lock poisoned".to_string())? = None;
+    *current = next.clone();
+    drop(current);
+    Ok(next)
 }
 
 #[derive(Default)]
@@ -231,10 +468,7 @@ impl RustPlugin for SidebarPlugin {
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         let settings = Settings::parse(context.settings.as_ref())?;
-        *state()
-            .lock()
-            .map_err(|_| PluginCommandError::failed("sidebar state lock poisoned"))? =
-            Some(CompanionState::new(settings));
+        replace_installation(settings).map_err(PluginCommandError::failed)?;
         Ok(EXIT_OK)
     }
 
@@ -264,39 +498,182 @@ fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
     }
 }
 
-/// Configure this process-local attach companion.
+/// An independently owned sidebar presentation. Hosts retain this value until
+/// teardown and route geometry/input through the supplied registries.
+pub struct SidebarPresentation {
+    owner: CompanionHandle,
+    layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
+    allocations: std::sync::Arc<bmux_plugin::layout::AllocationRegistry>,
+    input: std::sync::Arc<bmux_plugin::AttachPresentationInputRegistry>,
+}
+
+impl SidebarPresentation {
+    /// Install into presentation-local registries.
+    ///
+    /// # Errors
+    /// Returns invalid settings or layout publication errors.
+    pub fn install(
+        settings: Option<&toml::Value>,
+        layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
+        allocations: std::sync::Arc<bmux_plugin::layout::AllocationRegistry>,
+        input: std::sync::Arc<bmux_plugin::AttachPresentationInputRegistry>,
+        surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
+    ) -> Result<Self, String> {
+        let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
+        let request = layout_request(&settings);
+        let mut companion = CompanionState::new(settings);
+        companion.surfaces = Some(surfaces);
+        let owner = std::sync::Arc::new(Mutex::new(Some(companion)));
+        layouts
+            .publish(
+                OWNER,
+                PluginLayoutSnapshot {
+                    revision: 1,
+                    requests: vec![request],
+                },
+            )
+            .map_err(|error| format!("publishing sidebar layout: {error:?}"))?;
+        register_input_callbacks(
+            &owner,
+            &|id, handler| allocations.register(id, handler),
+            &|endpoint, handler| input.register(endpoint, handler),
+        );
+        Ok(Self {
+            owner,
+            layouts,
+            allocations,
+            input,
+        })
+    }
+
+    /// Subscribe this presentation to its host's authoritative state bus.
+    /// Replaces any previous subscription; teardown aborts the owned task.
+    ///
+    /// # Errors
+    /// Returns subscription, publication, or task startup errors.
+    pub fn start(&self, bus: &bmux_plugin::EventBus) -> Result<(), String> {
+        start_for_installation(&self.owner, bus)
+    }
+
+    /// Apply the authoritative snapshot for this presentation.
+    ///
+    /// # Errors
+    /// Returns state-lock or surface-publication errors.
+    pub fn publish(&self, snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
+        publish_for_installation(&self.owner, snapshot)
+    }
+}
+
+impl Drop for SidebarPresentation {
+    fn drop(&mut self) {
+        self.allocations
+            .remove(&PluginLayoutId::new(OWNER, LAYOUT_ID));
+        self.input.remove(&input_endpoint());
+        if let Ok(mut owner) = self.owner.lock() {
+            *owner = None;
+        }
+        self.layouts.remove_owner(OWNER);
+    }
+}
+
+fn default_presentation() -> &'static Mutex<Option<SidebarPresentation>> {
+    static PRESENTATION: OnceLock<Mutex<Option<SidebarPresentation>>> = OnceLock::new();
+    PRESENTATION.get_or_init(|| Mutex::new(None))
+}
+
+/// Install the default process-local presentation.
 ///
 /// # Errors
-///
-/// Returns an error for invalid settings or rejected retained publication.
+/// Returns configuration, registry publication, or lock errors.
 pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
-    let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
-    let request = layout_request(&settings);
-    let mut guard = state()
+    // Reject invalid configuration before tearing down a working installation.
+    Settings::parse(settings).map_err(|error| error.to_string())?;
+    let mut current = default_presentation()
         .lock()
-        .map_err(|_| "sidebar state lock poisoned".to_string())?;
-    *guard = Some(CompanionState::new(settings));
-    drop(guard);
-
-    let _ = global_plugin_layout_registry().remove_owner(OWNER);
-    let _ = global_plugin_surface_registry().remove_owner(OWNER);
-    global_plugin_layout_registry()
-        .publish(
-            OWNER,
-            PluginLayoutSnapshot {
-                revision: 1,
-                requests: vec![request],
-            },
-        )
-        .map_err(|error| format!("publishing sidebar layout: {error:?}"))?;
-    bmux_plugin::register_attach_presentation_input_handler(
-        input_endpoint(),
-        std::sync::Arc::new(handle_local_input),
-    );
+        .map_err(|_| "sidebar presentation lock poisoned".to_string())?;
+    *current = None;
+    let presentation = SidebarPresentation::install(
+        settings,
+        bmux_plugin::layout::global_plugin_layout_registry_handle(),
+        bmux_plugin::layout::global_allocation_registry_handle(),
+        bmux_plugin::global_attach_presentation_input_registry_handle(),
+        bmux_plugin::surface::global_plugin_surface_registry_handle(),
+    )?;
+    let mut installed = installations()
+        .lock()
+        .map_err(|_| "sidebar installation lock poisoned".to_string())?;
+    *installed
+        .lock()
+        .map_err(|_| "sidebar state lock poisoned".to_string())? = None;
+    *installed = presentation.owner.clone();
+    drop(installed);
+    *current = Some(presentation);
+    drop(current);
     Ok(())
 }
 
-static ATTACH_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Capture lifecycle callbacks for the current installation.
+///
+/// # Errors
+/// Returns an error if no presentation is installed or its lock is poisoned.
+pub fn installed_companion() -> Result<bmux_plugin::AttachCompanion, String> {
+    let current = default_presentation()
+        .lock()
+        .map_err(|_| "sidebar presentation lock poisoned".to_string())?;
+    let owner = current
+        .as_ref()
+        .ok_or_else(|| "sidebar companion is not installed".to_string())?
+        .owner
+        .clone();
+    drop(current);
+    let start_owner = owner.clone();
+    Ok(bmux_plugin::AttachCompanion::new(
+        OWNER,
+        std::sync::Arc::new(move || {
+            start_for_installation(&start_owner, &bmux_plugin::global_event_bus())
+        }),
+        std::sync::Arc::new(move || {
+            let mut current = default_presentation()
+                .lock()
+                .map_err(|_| "sidebar presentation lock poisoned".to_string())?;
+            // A stale runtime must not remove a newer installation's registrations.
+            if current
+                .as_ref()
+                .is_some_and(|presentation| std::sync::Arc::ptr_eq(&presentation.owner, &owner))
+            {
+                *current = None;
+            }
+            drop(current);
+            Ok(())
+        }),
+    ))
+}
+
+fn register_input_callbacks(
+    owner: &CompanionHandle,
+    allocation: &dyn Fn(PluginLayoutId, bmux_plugin::layout::AllocationHandler),
+    input: &dyn Fn(bmux_plugin::AttachInputEndpoint, bmux_plugin::AttachPresentationInputHandler),
+) {
+    let allocation_owner = owner.clone();
+    allocation(
+        PluginLayoutId::new(OWNER, LAYOUT_ID),
+        std::sync::Arc::new(move |rect| {
+            let Ok(mut guard) = allocation_owner.lock() else {
+                return;
+            };
+            if let Some(companion) = guard.as_mut()
+                && let Err(error) = companion.publish_allocation(rect, publish_companion)
+            {
+                tracing::warn!(%error, "sidebar resize publication failed");
+            }
+        }),
+    );
+    let owner = owner.clone();
+    input(
+        input_endpoint(),
+        std::sync::Arc::new(move |event| handle_local_input(&owner, event)),
+    );
+}
 
 /// Subscribe the configured companion to authoritative window state.
 ///
@@ -304,30 +681,55 @@ static ATTACH_GENERATION: AtomicU64 = AtomicU64::new(0);
 ///
 /// Returns an error when state subscription, initial publication, or task startup fails.
 pub fn start() -> Result<(), String> {
-    let generation = ATTACH_GENERATION
-        .fetch_add(1, Ordering::AcqRel)
-        .saturating_add(1);
-    let (initial, mut receiver) = bmux_plugin::global_event_bus()
-        .subscribe_state::<windows_list::WindowListSnapshot>(&windows_list::STATE_KIND)
-        .map_err(|error| format!("subscribing to windows list: {error}"))?;
-    publish(initial.as_ref().clone())?;
+    let current = default_presentation()
+        .lock()
+        .map_err(|_| "sidebar presentation lock poisoned".to_string())?;
+    current
+        .as_ref()
+        .ok_or_else(|| "sidebar companion is not installed".to_string())?
+        .start(&bmux_plugin::global_event_bus())
+}
+
+fn start_for_installation(
+    owner: &CompanionHandle,
+    bus: &bmux_plugin::EventBus,
+) -> Result<(), String> {
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("sidebar companion requires an async runtime: {error}"))?;
-    handle.spawn(async move {
-        while ATTACH_GENERATION.load(Ordering::Acquire) == generation
-            && receiver.changed().await.is_ok()
-        {
+    let (initial, mut receiver) = bus
+        .subscribe_state::<windows_list::WindowListSnapshot>(&windows_list::STATE_KIND)
+        .map_err(|error| format!("subscribing to windows list: {error}"))?;
+    publish_for_installation(owner, initial.as_ref().clone())?;
+    let mut guard = owner
+        .lock()
+        .map_err(|_| "sidebar state lock poisoned".to_string())?;
+    let companion = guard
+        .as_mut()
+        .ok_or_else(|| "sidebar companion is not installed".to_string())?;
+    if let Some(previous) = companion.subscription.take() {
+        previous.abort();
+    }
+    let subscriber_owner = std::sync::Arc::downgrade(owner);
+    companion.subscription = Some(handle.spawn(async move {
+        while receiver.changed().await.is_ok() {
             let snapshot = receiver.borrow_and_update().as_ref().clone();
-            if let Err(error) = publish(snapshot) {
+            let Some(owner) = subscriber_owner.upgrade() else {
+                break;
+            };
+            if let Err(error) = publish_for_installation(&owner, snapshot) {
                 tracing::warn!(%error, "sidebar publication failed");
             }
         }
-    });
+    }));
+    drop(guard);
     Ok(())
 }
 
 pub fn uninstall() {
-    ATTACH_GENERATION.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut current) = default_presentation().lock() {
+        *current = None;
+    }
+    bmux_plugin::layout::remove_allocation_handler(&PluginLayoutId::new(OWNER, LAYOUT_ID));
     bmux_plugin::remove_attach_presentation_input_handler(&input_endpoint());
     let _ = global_plugin_layout_registry().remove_owner(OWNER);
     let _ = global_plugin_surface_registry().remove_owner(OWNER);
@@ -352,24 +754,32 @@ fn layout_request(settings: &Settings) -> PluginLayoutRequest {
     )
 }
 
-// The companion lock must cover registry publication so multiple retained-state
-// subscriber tasks cannot race the same owner revision.
-#[allow(clippy::significant_drop_tightening)]
+#[cfg(test)]
 fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
-    let mut guard = state()
-        .lock()
-        .map_err(|_| "sidebar state lock poisoned".to_string())?;
-    let Some(companion) = guard.as_mut() else {
-        return Ok(());
-    };
-    companion.replace_windows(snapshot);
-    let revision = companion.revision.max(1);
-    let surface = build_surface(companion, revision);
-    publish_surface(revision, &surface)
+    publish_for_installation(&state(), snapshot)
 }
 
-fn publish_surface(revision: u64, surface: &PluginSurface) -> Result<(), String> {
-    global_plugin_surface_registry()
+fn publish_for_installation(
+    owner: &CompanionHandle,
+    snapshot: windows_list::WindowListSnapshot,
+) -> Result<(), String> {
+    let mut guard = owner
+        .lock()
+        .map_err(|_| "sidebar state lock poisoned".to_string())?;
+    if let Some(companion) = guard.as_mut() {
+        companion.replace_windows(snapshot);
+        return publish_companion(companion);
+    }
+    drop(guard);
+    Ok(())
+}
+
+fn publish_surface(
+    registry: &bmux_plugin::surface::PluginSurfaceRegistry,
+    revision: u64,
+    surface: &PluginSurface,
+) -> Result<(), String> {
+    registry
         .publish_advancing(
             OWNER,
             PluginSurfaceSnapshot {
@@ -384,7 +794,11 @@ fn publish_surface(revision: u64, surface: &PluginSurface) -> Result<(), String>
 fn publish_companion(companion: &CompanionState) -> Result<(), String> {
     let revision = companion.revision.max(1);
     let surface = build_surface(companion, revision);
-    publish_surface(revision, &surface)
+    let registry = companion
+        .surfaces
+        .as_deref()
+        .unwrap_or_else(|| global_plugin_surface_registry());
+    publish_surface(registry, revision, &surface)
 }
 
 fn truncate_to_width(value: &str, maximum: usize) -> String {
@@ -483,6 +897,7 @@ fn render_template(
         .replace('\u{1}', "}")
 }
 
+#[cfg(test)]
 fn push_wrapped_text(
     ops: &mut Vec<RenderOp>,
     text: &str,
@@ -495,46 +910,97 @@ fn push_wrapped_text(
     if text.is_empty() || width == 0 || maximum_rows == 0 {
         return 0;
     }
+    let lines = bmux_tui::text::wrap_text(
+        text.trim(),
+        bmux_tui::text::TextWrapGeometry::uniform(width),
+        bmux_tui::text::TextWrap::Word,
+    );
     let mut rows = 0_u16;
-    let mut remaining = text.trim();
-    while !remaining.is_empty() && rows < maximum_rows {
-        let mut split = remaining.len();
-        let mut cells = 0_usize;
-        let mut last_space = None;
-        for (offset, ch) in remaining.char_indices() {
-            let next =
-                cells.saturating_add(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0));
-            if next > width {
-                split = last_space.unwrap_or(offset);
-                break;
-            }
-            cells = next;
-            if ch.is_whitespace() {
-                last_space = Some(offset);
-            }
-        }
-        let (line, tail) = remaining.split_at(split);
-        let line = line.trim_end();
-        if !line.is_empty() {
-            ops.push(RenderOp::text_run(
-                x,
-                start_row.saturating_add(rows),
-                line,
-                style,
-            ));
-            rows = rows.saturating_add(1);
-        }
-        remaining = tail.trim_start();
-        if split == 0 {
-            break;
-        }
+    for line in lines.iter().take(usize::from(maximum_rows)) {
+        ops.push(RenderOp::text_run(
+            x,
+            start_row.saturating_add(rows),
+            line,
+            style,
+        ));
+        rows = rows.saturating_add(1);
     }
     rows
 }
 
 #[allow(clippy::too_many_lines)] // Scene construction is one ordered retained projection; splitting obscures row accounting.
+// The surface wire format uses text runs; let the component painter resolve
+// clipping and grapheme cells before adapting its plain field to that format.
+fn paint_sidebar_field(
+    field: &bmux_tui::composition::TextBlock,
+    child: &bmux_tui::component::ChildLayout,
+    placement: &(usize, std::ops::Range<usize>),
+    style: RenderStyle,
+    ops: &mut Vec<RenderOp>,
+) {
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::component::Component;
+    use bmux_tui::frame::Frame;
+    use bmux_tui::geometry::Rect;
+    use bmux_tui::paint::PaintCx;
+
+    let width = child.node.size.width;
+    if width == 0 {
+        return;
+    }
+    let height = u16::try_from(child.node.size.height).unwrap_or(u16::MAX);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+    field.paint(&child.node, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+    for (offset, cells) in buffer.cells().chunks(usize::from(width)).enumerate() {
+        let text = cells
+            .iter()
+            .filter(|cell| !cell.is_wide_continuation())
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        let logical_row = placement.0.saturating_add(child.y).saturating_add(offset);
+        let Some(projected) = bmux_tui_components::scroll_view::ScrollView::project_rows(
+            &placement.1,
+            logical_row..logical_row.saturating_add(1),
+        ) else {
+            continue;
+        };
+        ops.push(RenderOp::text_run(
+            2_u16.saturating_add(child.x),
+            u16::try_from(projected.start + 1).unwrap_or(u16::MAX),
+            text.trim_end(),
+            style,
+        ));
+    }
+}
+
+const fn sidebar_title_style(
+    is_active: bool,
+    hovered: bool,
+    active: RenderStyle,
+    inactive: RenderStyle,
+) -> RenderStyle {
+    if is_active {
+        active
+    } else if hovered {
+        inactive
+            .named_foreground(RenderNamedColor::BrightWhite)
+            .named_background(RenderNamedColor::Blue)
+    } else {
+        inactive
+    }
+}
+
+fn sidebar_region(id: Uuid, width: u16, row: u16, height: u16) -> PluginSurfaceRegion {
+    PluginSurfaceRegion::new(
+        format!("window:{id}"),
+        ExtensionRect::new(1, row, width.saturating_sub(2), height.max(1)),
+    )
+    .endpoint(input_endpoint())
+    .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer)
+}
+
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
-    let width = state.settings.width;
+    let width = state.allocated_width();
     let background = RenderStyle::new()
         .named_foreground(RenderNamedColor::White)
         .named_background(RenderNamedColor::Black);
@@ -545,19 +1011,8 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     let inactive = RenderStyle::new()
         .named_foreground(RenderNamedColor::White)
         .named_background(RenderNamedColor::Black);
-    let height = if state.settings.content_height {
-        u16::try_from(
-            state
-                .snapshot
-                .windows
-                .len()
-                .min(state.settings.maximum_visible_items)
-                .saturating_add(2),
-        )
-        .unwrap_or(u16::MAX)
-    } else {
-        u16::MAX
-    };
+    // Content-sized surfaces are finalized from the emitted item geometry below.
+    let height = u16::MAX;
     let mut ops = vec![
         RenderOp::fill_rect(ExtensionRect::new(0, 0, width, height), ' ', background),
         RenderOp::border(
@@ -568,91 +1023,55 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         RenderOp::text_run(2, 0, format!(" {} ", state.settings.heading), active),
     ];
     let mut regions = Vec::with_capacity(state.snapshot.windows.len());
-    let content_width = usize::from(width.saturating_sub(4));
+    let layout = state.scroll_layout();
+    let visible = state.scroll.vertical_offset()
+        ..state
+            .scroll
+            .vertical_offset()
+            .saturating_add(layout.size.height);
     let mut row = 1_u16;
-    for (index, window) in state
-        .snapshot
-        .windows
-        .iter()
-        .enumerate()
-        .skip(state.scroll_offset)
-        .take(state.settings.maximum_visible_items)
-    {
+    for (index, window) in state.snapshot.windows.iter().enumerate() {
+        let item = &layout.children[0].node.children[index];
+        let item_end = item.y.saturating_add(item.node.size.height);
+        let Some(projected) =
+            bmux_tui_components::scroll_view::ScrollView::project_rows(&visible, item.y..item_end)
+        else {
+            continue;
+        };
         let fact = window_fact(window);
-        let start_row = row;
-        let title = render_template(
-            &state.settings.title_template,
-            window,
-            index,
-            state.settings.show_index,
-            fact.as_ref(),
-        );
-        let title = truncate_to_width(&title, content_width);
+        let start_row = u16::try_from(projected.start + 1).unwrap_or(u16::MAX);
+        let measured = state.measured_window(index);
         let item_style = fact.as_ref().map_or_else(
             || {
-                if window.active {
-                    active
-                } else if state.hovered_window_id == Some(window.id) {
-                    inactive
-                        .named_foreground(RenderNamedColor::BrightWhite)
-                        .named_background(RenderNamedColor::Blue)
-                } else {
-                    inactive
-                }
+                sidebar_title_style(
+                    window.active,
+                    state.hovered_window_id == Some(window.id),
+                    active,
+                    inactive,
+                )
             },
             |fact| fact_style(fact.role, if window.active { active } else { inactive }),
         );
-        ops.push(RenderOp::text_run(2, row, title, item_style));
-        row = row.saturating_add(1);
-        let description = render_template(
-            &state.settings.description_template,
-            window,
-            index,
-            state.settings.show_index,
-            fact.as_ref(),
-        );
-        row = row.saturating_add(push_wrapped_text(
-            &mut ops,
-            &description,
-            3,
-            row,
-            content_width.saturating_sub(1),
-            2,
-            inactive.dim(),
-        ));
-        let status = render_template(
-            &state.settings.status_template,
-            window,
-            index,
-            state.settings.show_index,
-            fact.as_ref(),
-        );
-        if !status.is_empty() {
-            ops.push(RenderOp::text_run(
-                3,
-                row,
-                truncate_to_width(&status, content_width.saturating_sub(1)),
-                if window.active {
-                    active
-                } else {
-                    inactive.dim()
-                },
-            ));
-            row = row.saturating_add(1);
+        for (field, child) in measured.fields.iter().zip(&measured.layout.children) {
+            let style = match child.node.id.as_str() {
+                "title" => item_style,
+                "status" if window.active => active,
+                _ => inactive.dim(),
+            };
+            paint_sidebar_field(field, child, &(item.y, visible.clone()), style, &mut ops);
         }
-        regions.push(
-            PluginSurfaceRegion::new(
-                format!("window:{}", window.id),
-                ExtensionRect::new(
-                    1,
-                    start_row,
-                    width.saturating_sub(2),
-                    row.saturating_sub(start_row).max(1),
-                ),
-            )
-            .endpoint(input_endpoint())
-            .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
-        );
+        row = u16::try_from(projected.end + 1).unwrap_or(u16::MAX);
+        regions.push(sidebar_region(
+            window.id,
+            width,
+            start_row,
+            row.saturating_sub(start_row),
+        ));
+    }
+    if state.settings.content_height {
+        let rect = ExtensionRect::new(0, 0, width, row.saturating_add(1));
+        ops[0] = RenderOp::fill_rect(rect, ' ', background);
+        ops[1] = RenderOp::border(rect, BorderGlyphs::square(), background);
     }
     let mut surface = PluginSurface::layout(
         PluginSurfaceId::new(OWNER, SURFACE_ID, RETAINED_ID),
@@ -667,7 +1086,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     surface
 }
 
-fn update_hover(event: &AttachInputEvent) -> bool {
+fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let target = event
         .hook_id
         .strip_prefix("bmux.sidebar:sidebar:window:")
@@ -677,7 +1096,7 @@ fn update_hover(event: &AttachInputEvent) -> bool {
         "leave" => None,
         _ => return false,
     };
-    let Ok(mut guard) = state().lock() else {
+    let Ok(mut guard) = owner.lock() else {
         return false;
     };
     let Some(companion) = guard.as_mut() else {
@@ -691,38 +1110,31 @@ fn update_hover(event: &AttachInputEvent) -> bool {
     publish_companion(companion).is_ok()
 }
 
-fn update_scroll(event: &AttachInputEvent) -> bool {
+fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     if event.phase != "wheel" || event.wheel_delta == 0 {
         return false;
     }
-    let Ok(mut guard) = state().lock() else {
+    let Ok(mut guard) = owner.lock() else {
         return false;
     };
     let Some(companion) = guard.as_mut() else {
         return false;
     };
-    let maximum = companion
-        .snapshot
-        .windows
-        .len()
-        .saturating_sub(companion.settings.maximum_visible_items);
-    let next = if event.wheel_delta > 0 {
-        companion.scroll_offset.saturating_sub(1)
-    } else {
-        companion.scroll_offset.saturating_add(1).min(maximum)
-    };
-    if next == companion.scroll_offset {
+    let previous = companion.scroll.vertical_offset();
+    let layout = companion.scroll_layout();
+    bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
+        &layout,
+        &mut companion.scroll,
+        if event.wheel_delta > 0 { -1 } else { 1 },
+    );
+    if previous == companion.scroll.vertical_offset() {
         return true;
     }
-    companion.scroll_offset = next;
     companion.revision = companion.revision.saturating_add(1).max(1);
     publish_companion(companion).is_ok()
 }
 
-fn update_keyboard(
-    context: &NativeServiceContext,
-    event: &AttachInputEvent,
-) -> Option<AttachInputResult> {
+fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<AttachInputResult> {
     if event.event_kind != "key" || !matches!(event.phase.as_str(), "press" | "repeat") {
         return None;
     }
@@ -730,7 +1142,7 @@ fn update_keyboard(
         .hook_id
         .strip_prefix("bmux.sidebar:sidebar:window:")
         .and_then(|target| Uuid::parse_str(target).ok())?;
-    let mut guard = state().lock().ok()?;
+    let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     let index = companion
         .snapshot
@@ -740,7 +1152,7 @@ fn update_keyboard(
     match event.key.as_deref()? {
         "up" => {
             let next = index.saturating_sub(1);
-            companion.scroll_offset = companion.scroll_offset.min(next);
+            companion.reveal(next);
             companion.hovered_window_id =
                 companion.snapshot.windows.get(next).map(|window| window.id);
         }
@@ -748,42 +1160,9 @@ fn update_keyboard(
             let next = index
                 .saturating_add(1)
                 .min(companion.snapshot.windows.len().saturating_sub(1));
-            let visible_end = companion
-                .scroll_offset
-                .saturating_add(companion.settings.maximum_visible_items);
-            if next >= visible_end {
-                companion.scroll_offset = next
-                    .saturating_add(1)
-                    .saturating_sub(companion.settings.maximum_visible_items);
-            }
+            companion.reveal(next);
             companion.hovered_window_id =
                 companion.snapshot.windows.get(next).map(|window| window.id);
-        }
-        "enter" => {
-            drop(guard);
-            let mut client = ServiceCallerDispatchClient::new(context);
-            return Some(
-                match block_on_typed_dispatch(windows_commands::client::switch_window(
-                    &mut client,
-                    target.to_string(),
-                )) {
-                    Ok(Ok(_)) => AttachInputResult {
-                        consumed: true,
-                        dirty: true,
-                        ..AttachInputResult::default()
-                    },
-                    Ok(Err(error)) => AttachInputResult {
-                        consumed: true,
-                        status_message: Some(format!("window switch failed: {error:?}")),
-                        ..AttachInputResult::default()
-                    },
-                    Err(error) => AttachInputResult {
-                        consumed: true,
-                        status_message: Some(format!("window switch unavailable: {error}")),
-                        ..AttachInputResult::default()
-                    },
-                },
-            );
         }
         _ => return None,
     }
@@ -791,6 +1170,7 @@ fn update_keyboard(
         companion.revision = companion.revision.saturating_add(1).max(1);
         publish_companion(companion).is_ok()
     };
+    drop(guard);
     Some(AttachInputResult {
         consumed: true,
         dirty,
@@ -798,18 +1178,24 @@ fn update_keyboard(
     })
 }
 
-fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
+fn handle_local_input(
+    owner: &CompanionHandle,
+    event: &AttachInputEvent,
+) -> Option<AttachInputResult> {
+    if let Some(result) = update_keyboard(owner, event) {
+        return Some(result);
+    }
     if event.event_kind != "pointer" {
         return None;
     }
-    if update_scroll(event) {
+    if update_scroll(owner, event) {
         return Some(AttachInputResult {
             consumed: true,
             dirty: true,
             ..AttachInputResult::default()
         });
     }
-    if update_hover(event) {
+    if update_hover(owner, event) {
         return Some(AttachInputResult {
             consumed: false,
             dirty: true,
@@ -820,13 +1206,13 @@ fn handle_local_input(event: &AttachInputEvent) -> Option<AttachInputResult> {
 }
 
 fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
-    if let Some(result) = update_keyboard(context, event) {
-        return result;
-    }
-    if event.event_kind != "pointer"
-        || event.phase != "down"
-        || event.button.as_deref() != Some("left")
-    {
+    let activate_key = event.event_kind == "key"
+        && matches!(event.phase.as_str(), "press" | "repeat")
+        && event.key.as_deref() == Some("enter");
+    let activate_pointer = event.event_kind == "pointer"
+        && event.phase == "down"
+        && event.button.as_deref() == Some("left");
+    if !activate_key && !activate_pointer {
         return AttachInputResult::default();
     }
     let Some(target) = event.hook_id.strip_prefix("bmux.sidebar:sidebar:window:") else {
@@ -892,6 +1278,35 @@ mod tests {
                 .revision,
             10
         );
+        let foreign_identity = std::sync::Arc::new(Mutex::new(None));
+        publish_for_installation(
+            &foreign_identity,
+            windows_list::WindowListSnapshot {
+                windows: Vec::new(),
+                revision: 99,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            global_plugin_surface_registry()
+                .owner_snapshot(OWNER)
+                .unwrap()
+                .revision,
+            10
+        );
+        let old_companion = installed_companion().unwrap();
+        install(None).unwrap();
+        let replacement = state();
+        old_companion.stop().unwrap();
+        assert!(replacement.lock().unwrap().is_some());
+        assert!(
+            global_plugin_layout_registry()
+                .requests()
+                .iter()
+                .any(|request| request.id.owner_plugin_id == OWNER)
+        );
+        installed_companion().unwrap().stop().unwrap();
+        assert!(replacement.lock().unwrap().is_none());
         uninstall();
     }
 
@@ -1035,6 +1450,245 @@ mod tests {
         assert_ne!(before.ops[4], after.ops[4]);
     }
 
+    #[tokio::test]
+    async fn presentation_subscription_uses_local_bus_and_stops_on_drop() {
+        let bus = bmux_plugin::EventBus::new();
+        let snapshot = |revision| windows_list::WindowListSnapshot {
+            windows: Vec::new(),
+            revision,
+        };
+        bus.register_state_channel(windows_list::STATE_KIND, snapshot(1));
+        let presentation = SidebarPresentation::install(
+            None,
+            std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4)),
+            std::sync::Arc::new(bmux_plugin::layout::AllocationRegistry::default()),
+            std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
+            std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4)),
+        )
+        .unwrap();
+        presentation.start(&bus).unwrap();
+        assert_eq!(
+            presentation
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .revision,
+            1
+        );
+        bus.publish_state(&windows_list::STATE_KIND, snapshot(2))
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if presentation
+                    .owner
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .revision
+                    == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let owner = presentation.owner.clone();
+        drop(presentation);
+        bus.publish_state(&windows_list::STATE_KIND, snapshot(3))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(owner.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn independent_installations_route_allocations_and_release_registries() {
+        let create = || {
+            let layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4));
+            let allocations =
+                std::sync::Arc::new(bmux_plugin::layout::AllocationRegistry::default());
+            let input = std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new());
+            let surfaces = std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
+            let presentation = SidebarPresentation::install(
+                None,
+                layouts.clone(),
+                allocations.clone(),
+                input,
+                surfaces.clone(),
+            )
+            .unwrap();
+            (presentation, layouts, allocations, surfaces)
+        };
+        let (first, first_layouts, first_allocations, first_surfaces) = create();
+        let (second, second_layouts, second_allocations, second_surfaces) = create();
+        let id = PluginLayoutId::new(OWNER, LAYOUT_ID);
+        first_allocations.notify(&id, ExtensionRect::new(0, 0, 12, 5));
+        second_allocations.notify(&id, ExtensionRect::new(0, 0, 30, 10));
+        let saved = second_surfaces.owner_snapshot(OWNER).unwrap();
+        assert_ne!(
+            first_surfaces.owner_snapshot(OWNER).unwrap().surfaces,
+            saved.surfaces
+        );
+        drop(first);
+        first_allocations.notify(&id, ExtensionRect::new(0, 0, 40, 10));
+        assert!(first_surfaces.owner_snapshot(OWNER).is_none());
+        assert!(first_layouts.requests().is_empty());
+        assert_eq!(
+            second_surfaces.owner_snapshot(OWNER).unwrap().surfaces,
+            saved.surfaces
+        );
+        assert_eq!(second_layouts.requests().len(), 1);
+        drop(second);
+        assert!(second_surfaces.owner_snapshot(OWNER).is_none());
+    }
+
+    #[test]
+    fn owned_presentations_publish_and_teardown_independently() {
+        let first_registry =
+            std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
+        let second_registry =
+            std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
+        let mut first = CompanionState::new(Settings::default());
+        first.surfaces = Some(first_registry.clone());
+        let mut second = CompanionState::new(Settings::default());
+        second.surfaces = Some(second_registry.clone());
+        first
+            .publish_allocation(ExtensionRect::new(0, 0, 12, 5), publish_companion)
+            .unwrap();
+        second
+            .publish_allocation(ExtensionRect::new(0, 0, 30, 10), publish_companion)
+            .unwrap();
+        let saved = second_registry.owner_snapshot(OWNER).unwrap();
+        assert_ne!(
+            first_registry.owner_snapshot(OWNER).unwrap().surfaces,
+            saved.surfaces
+        );
+        first
+            .publish_allocation(ExtensionRect::new(0, 0, 20, 5), publish_companion)
+            .unwrap();
+        assert_eq!(
+            second_registry.owner_snapshot(OWNER).unwrap().surfaces,
+            saved.surfaces
+        );
+        drop(first);
+        assert!(first_registry.owner_snapshot(OWNER).is_none());
+        assert!(second_registry.owner_snapshot(OWNER).is_some());
+        drop(second);
+        assert!(second_registry.owner_snapshot(OWNER).is_none());
+    }
+
+    #[test]
+    fn dropping_companion_releases_idle_subscription() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (_sender, mut receiver) = tokio::sync::watch::channel(());
+            let retained = std::sync::Arc::new(());
+            let owned = retained.clone();
+            let mut companion = CompanionState::new(Settings::default());
+            companion.subscription = Some(tokio::spawn(async move {
+                let _ = receiver.changed().await;
+                drop(owned);
+            }));
+            tokio::task::yield_now().await;
+            assert_eq!(std::sync::Arc::strong_count(&retained), 2);
+            drop(companion);
+            tokio::task::yield_now().await;
+            assert_eq!(std::sync::Arc::strong_count(&retained), 1);
+        });
+    }
+
+    #[test]
+    fn allocation_publication_retries_without_reapplying_resize() {
+        let mut state = CompanionState::new(Settings::default());
+        let rect = ExtensionRect::new(0, 0, 12, 5);
+        assert!(
+            state
+                .publish_allocation(rect, |_| Err("rejected".to_string()))
+                .is_err()
+        );
+        assert!(state.allocation_publication_pending);
+        state.scroll.set_vertical_offset(1);
+        state
+            .publish_allocation(rect, |current| {
+                assert_eq!(current.scroll.vertical_offset(), 1);
+                Ok(())
+            })
+            .unwrap();
+        assert!(!state.allocation_publication_pending);
+        state
+            .publish_allocation(rect, |_| {
+                panic!("unchanged successful allocation republished")
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn measured_scroll_clips_partial_items_and_reveals_full_extent() {
+        let mut state = CompanionState::new(Settings {
+            maximum_visible_items: 1,
+            description_template: "description".to_string(),
+            ..Settings::default()
+        });
+        state.replace_windows(windows_list::WindowListSnapshot {
+            windows: (0..3)
+                .map(|index| windows_list::WindowListEntry {
+                    id: Uuid::from_u128(index),
+                    name: format!("window-{index}"),
+                    active: false,
+                    workspace: "default".to_string(),
+                    workspace_id: Uuid::nil(),
+                })
+                .collect(),
+            revision: 1,
+        });
+        let layout = state.scroll_layout();
+        assert_eq!(layout.size.height, 2);
+        assert_eq!(layout.children[0].node.size.height, 6);
+        bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
+            &layout,
+            &mut state.scroll,
+            1,
+        );
+        let surface = build_surface(&state, 1);
+        assert_eq!(surface.interactive_regions.len(), 2);
+        assert_eq!(
+            surface.interactive_regions[0].rect,
+            ExtensionRect::new(1, 1, state.settings.width - 2, 1)
+        );
+        assert_eq!(
+            surface.interactive_regions[1].rect,
+            ExtensionRect::new(1, 2, state.settings.width - 2, 1)
+        );
+        assert!(
+            surface
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    RenderOp::TextRun { y, .. } => Some(*y),
+                    _ => None,
+                })
+                .all(|y| y <= 2)
+        );
+        state.reveal(2);
+        assert_eq!(state.scroll.vertical_offset(), 4);
+        assert_eq!(build_surface(&state, 2).interactive_regions.len(), 1);
+        assert!(state.resize(ExtensionRect::new(0, 0, 12, 5)));
+        assert_eq!(state.scroll_layout().size.height, 3);
+        assert_eq!(state.allocated_width(), 12);
+        assert_eq!(state.scroll.vertical_offset(), 4);
+        assert!(!state.resize(ExtensionRect::new(0, 0, 12, 5)));
+        assert!(state.resize(ExtensionRect::new(0, 0, 12, 1)));
+        assert!(build_surface(&state, 3).interactive_regions.is_empty());
+    }
+
     #[test]
     fn virtual_window_realigns_to_active_and_bounds_projected_items() {
         let settings = Settings {
@@ -1054,7 +1708,7 @@ mod tests {
                 .collect(),
             revision: 1,
         });
-        assert_eq!(state.scroll_offset, 3);
+        assert_eq!(state.scroll.vertical_offset(), 3);
         let surface = build_surface(&state, 1);
         assert_eq!(surface.interactive_regions.len(), 2);
         assert_eq!(
@@ -1182,7 +1836,7 @@ mod tests {
         });
         let surface = build_surface(&state, 2);
         assert_eq!(surface.interactive_regions.len(), 32);
-        assert_eq!(state.scroll_offset, 1_968);
+        assert_eq!(state.scroll.vertical_offset(), 1_968);
     }
 
     #[test]

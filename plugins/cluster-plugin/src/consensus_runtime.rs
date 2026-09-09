@@ -1306,24 +1306,39 @@ pub(crate) mod tests {
                 nodes[index].raft().clone(),
             );
         }
-        // Restored peers may have elected a different leader during isolation.
-        let leader_id = wait_for_leader(&nodes.iter().collect::<Vec<_>>()).await;
-        let leader = &nodes[ids.iter().position(|id| *id == leader_id).unwrap()];
-        crate::consensus_membership::publish_members(
-            leader.clone(),
-            &member.node_id,
-            [member.clone()],
-        )
+        // A successful quorum probe cannot prevent a subsequent leadership change.
+        // Retry the idempotent publication sequence, not arbitrary errors, while
+        // the restored cluster settles. The deadline keeps non-recovery fatal.
+        let view = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let leader_id = wait_for_leader(&nodes.iter().collect::<Vec<_>>()).await;
+                let leader = &nodes[ids.iter().position(|id| *id == leader_id).unwrap()];
+                let attempt = async {
+                    for _ in 0..2 {
+                        crate::consensus_membership::publish_members(
+                            leader.clone(),
+                            &member.node_id,
+                            [member.clone()],
+                        )
+                        .await?;
+                    }
+                    leader
+                        .read_linearizable_view()
+                        .await
+                        .map_err(|error| format!("{error:?}"))
+                }
+                .await;
+                match attempt {
+                    Ok(view) => break view,
+                    Err(error) if error.contains("NotLeader") => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!("publication after quorum restoration failed: {error}"),
+                }
+            }
+        })
         .await
-        .unwrap();
-        crate::consensus_membership::publish_members(
-            leader.clone(),
-            &member.node_id,
-            [member.clone()],
-        )
-        .await
-        .unwrap();
-        let view = leader.read_linearizable_view().await.unwrap();
+        .expect("restored quorum should accept membership publication");
         assert_eq!(view.members, vec![member]);
 
         for node in nodes {

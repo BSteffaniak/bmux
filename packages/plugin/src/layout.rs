@@ -26,6 +26,72 @@ impl PluginLayoutId {
     }
 }
 
+/// Process-local allocation consumer, paired with a local presentation companion.
+/// Hosts notify after resolution and before reading the resulting surface snapshot.
+pub type AllocationHandler = std::sync::Arc<dyn Fn(ExtensionRect) + Send + Sync>;
+
+/// Allocation callbacks owned by one presentation. Independent instances may
+/// reuse layout identities without replacing or notifying each other's handlers.
+#[derive(Default)]
+pub struct AllocationRegistry {
+    handlers: RwLock<BTreeMap<PluginLayoutId, AllocationHandler>>,
+}
+
+impl AllocationRegistry {
+    /// Register or replace a callback within this presentation.
+    pub fn register(&self, id: PluginLayoutId, handler: AllocationHandler) {
+        if let Ok(mut handlers) = self.handlers.write() {
+            handlers.insert(id, handler);
+        }
+    }
+
+    /// Release a callback within this presentation.
+    pub fn remove(&self, id: &PluginLayoutId) {
+        if let Ok(mut handlers) = self.handlers.write() {
+            handlers.remove(id);
+        }
+    }
+
+    /// Deliver geometry outside the registry lock, permitting reentrant removal.
+    /// Consumers must suppress unchanged successful publications.
+    pub fn notify(&self, id: &PluginLayoutId, rect: ExtensionRect) {
+        let handler = self
+            .handlers
+            .read()
+            .ok()
+            .and_then(|handlers| handlers.get(id).cloned());
+        if let Some(handler) = handler {
+            handler(rect);
+        }
+    }
+}
+
+fn allocation_handlers() -> &'static std::sync::Arc<AllocationRegistry> {
+    static HANDLERS: OnceLock<std::sync::Arc<AllocationRegistry>> = OnceLock::new();
+    HANDLERS.get_or_init(|| std::sync::Arc::new(AllocationRegistry::default()))
+}
+
+/// Shared ownership of the default presentation's allocation registry.
+#[must_use]
+pub fn global_allocation_registry_handle() -> std::sync::Arc<AllocationRegistry> {
+    allocation_handlers().clone()
+}
+
+/// Register an allocation consumer for the default process-local presentation.
+pub fn register_allocation_handler(id: PluginLayoutId, handler: AllocationHandler) {
+    allocation_handlers().register(id, handler);
+}
+
+/// Release a default process-local presentation's allocation consumer.
+pub fn remove_allocation_handler(id: &PluginLayoutId) {
+    allocation_handlers().remove(id);
+}
+
+/// Deliver resolved geometry to the default process-local presentation.
+pub fn notify_allocation(id: &PluginLayoutId, rect: ExtensionRect) {
+    allocation_handlers().notify(id, rect);
+}
+
 /// Viewport edge from which a region is split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutEdge {
@@ -410,12 +476,21 @@ fn validate_snapshot(
     Ok(())
 }
 
-static GLOBAL_PLUGIN_LAYOUT_REGISTRY: OnceLock<PluginLayoutRegistry> = OnceLock::new();
+static GLOBAL_PLUGIN_LAYOUT_REGISTRY: OnceLock<std::sync::Arc<PluginLayoutRegistry>> =
+    OnceLock::new();
 
 /// Process-global retained layout registry used by the attach host.
 #[must_use]
 pub fn global_plugin_layout_registry() -> &'static PluginLayoutRegistry {
-    GLOBAL_PLUGIN_LAYOUT_REGISTRY.get_or_init(|| PluginLayoutRegistry::new(64))
+    GLOBAL_PLUGIN_LAYOUT_REGISTRY.get_or_init(|| std::sync::Arc::new(PluginLayoutRegistry::new(64)))
+}
+
+/// Shared ownership of the default presentation's layout registry.
+#[must_use]
+pub fn global_plugin_layout_registry_handle() -> std::sync::Arc<PluginLayoutRegistry> {
+    GLOBAL_PLUGIN_LAYOUT_REGISTRY
+        .get_or_init(|| std::sync::Arc::new(PluginLayoutRegistry::new(64)))
+        .clone()
 }
 
 /// Resolve flat root-viewport requests in `(order, owner_plugin_id, local_id)`
@@ -528,6 +603,48 @@ fn split_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_registries_isolate_identical_layout_ids() {
+        let first = AllocationRegistry::default();
+        let second = AllocationRegistry::default();
+        let id = PluginLayoutId::new("example", "content");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        first.register(
+            id.clone(),
+            std::sync::Arc::new(move |_| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        );
+        second.register(
+            id.clone(),
+            std::sync::Arc::new(|_| panic!("foreign presentation notified")),
+        );
+        first.notify(&id, ExtensionRect::new(0, 0, 10, 10));
+        second.remove(&id);
+        first.notify(&id, ExtensionRect::new(0, 0, 20, 20));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn allocation_handler_can_unregister_during_notification() {
+        let id = PluginLayoutId::new("allocation-lifecycle-test", "content");
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let target = id.clone();
+        register_allocation_handler(
+            id.clone(),
+            std::sync::Arc::new(move |rect| {
+                assert_eq!(rect, ExtensionRect::new(1, 2, 3, 4));
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                remove_allocation_handler(&target);
+            }),
+        );
+        notify_allocation(&id, ExtensionRect::new(1, 2, 3, 4));
+        notify_allocation(&id, ExtensionRect::new(1, 2, 3, 4));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
 
     fn request(
         owner: &str,

@@ -240,6 +240,11 @@ impl AttachDirtyFlags {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
+    pub presentation_events: std::sync::Arc<bmux_plugin::EventBus>,
+    pub presentation_layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
+    pub presentation_allocations: std::sync::Arc<bmux_plugin::layout::AllocationRegistry>,
+    pub presentation_surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
+    pub presentation_input: std::sync::Arc<bmux_plugin::AttachPresentationInputRegistry>,
     pub self_client_id: Option<Uuid>,
     pub attached_id: Uuid,
     pub attached_context_id: Option<Uuid>,
@@ -568,6 +573,11 @@ pub struct AttachMouseResizeAxisDrag {
 impl AttachViewState {
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
+            presentation_events: bmux_plugin::global_event_bus(),
+            presentation_layouts: bmux_plugin::layout::global_plugin_layout_registry_handle(),
+            presentation_allocations: bmux_plugin::layout::global_allocation_registry_handle(),
+            presentation_surfaces: bmux_plugin::surface::global_plugin_surface_registry_handle(),
+            presentation_input: bmux_plugin::global_attach_presentation_input_registry_handle(),
             self_client_id: None,
             attached_id: attach_info.session_id,
             attached_context_id: attach_info.context_id,

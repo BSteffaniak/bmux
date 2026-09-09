@@ -806,11 +806,21 @@ fn render_op_text_bytes(op: &RenderOp) -> usize {
     }
 }
 
-static GLOBAL_PLUGIN_SURFACE_REGISTRY: OnceLock<PluginSurfaceRegistry> = OnceLock::new();
+static GLOBAL_PLUGIN_SURFACE_REGISTRY: OnceLock<std::sync::Arc<PluginSurfaceRegistry>> =
+    OnceLock::new();
 
 #[must_use]
 pub fn global_plugin_surface_registry() -> &'static PluginSurfaceRegistry {
-    GLOBAL_PLUGIN_SURFACE_REGISTRY.get_or_init(|| PluginSurfaceRegistry::new(64))
+    GLOBAL_PLUGIN_SURFACE_REGISTRY
+        .get_or_init(|| std::sync::Arc::new(PluginSurfaceRegistry::new(64)))
+}
+
+/// Shared ownership of the default presentation's surface registry.
+#[must_use]
+pub fn global_plugin_surface_registry_handle() -> std::sync::Arc<PluginSurfaceRegistry> {
+    GLOBAL_PLUGIN_SURFACE_REGISTRY
+        .get_or_init(|| std::sync::Arc::new(PluginSurfaceRegistry::new(64)))
+        .clone()
 }
 
 #[cfg(test)]

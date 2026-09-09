@@ -141,11 +141,19 @@ impl AttachPresentationInputRegistry {
     }
 }
 
-static GLOBAL_REGISTRY: OnceLock<AttachPresentationInputRegistry> = OnceLock::new();
+static GLOBAL_REGISTRY: OnceLock<Arc<AttachPresentationInputRegistry>> = OnceLock::new();
 
 #[must_use]
 pub fn global_attach_presentation_input_registry() -> &'static AttachPresentationInputRegistry {
-    GLOBAL_REGISTRY.get_or_init(AttachPresentationInputRegistry::new)
+    GLOBAL_REGISTRY.get_or_init(|| Arc::new(AttachPresentationInputRegistry::new()))
+}
+
+/// Shared ownership of the default presentation's input registry.
+#[must_use]
+pub fn global_attach_presentation_input_registry_handle() -> Arc<AttachPresentationInputRegistry> {
+    GLOBAL_REGISTRY
+        .get_or_init(|| Arc::new(AttachPresentationInputRegistry::new()))
+        .clone()
 }
 
 pub fn register_attach_presentation_input_handler(
