@@ -591,7 +591,7 @@ impl ScrollView {
         }
         if let Some(scrollbar_area) = resolved.horizontal_scrollbar {
             let scrollbar = scrollbar_state(
-                usize::from(content_width(layout)),
+                content_width(layout),
                 usize::from(layout.size.width),
                 state.horizontal_offset,
             );
@@ -682,7 +682,7 @@ impl ScrollView {
             && state.dragging != Some(ScrollbarOrientation::Vertical)
         {
             let mut scrollbar = scrollbar_state(
-                usize::from(content_width(layout)),
+                content_width(layout),
                 usize::from(layout.size.width),
                 state.horizontal_offset,
             );
@@ -733,9 +733,7 @@ impl ScrollView {
     /// Return the maximum logical horizontal offset from an authoritative viewport layout.
     #[must_use]
     pub fn max_horizontal_offset(layout: &LayoutNode) -> usize {
-        layout.children.first().map_or(0, |child| {
-            usize::from(child.node.size.width.saturating_sub(layout.size.width))
-        })
+        content_width(layout).saturating_sub(usize::from(layout.size.width))
     }
 
     /// Move vertically by a signed logical-row delta and clamp to layout.
@@ -1129,11 +1127,11 @@ fn content_height(layout: &LayoutNode) -> usize {
         .map_or(0, |child| child.node.size.height)
 }
 
-fn content_width(layout: &LayoutNode) -> u16 {
+fn content_width(layout: &LayoutNode) -> usize {
     layout
         .children
         .first()
-        .map_or(0, |child| child.node.size.width)
+        .map_or(0, |child| usize::from(child.node.size.width))
 }
 
 fn logical_offset_from_scrollbar(
