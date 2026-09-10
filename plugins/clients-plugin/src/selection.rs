@@ -233,6 +233,53 @@ mod tests {
     }
 
     #[test]
+    fn reset_paths_fence_inflight_selection() {
+        use bmux_client_state::FollowStateWriter;
+        let client = ClientId(Uuid::from_u128(1));
+        for clear_follow in [false, true] {
+            let mut state = FollowState::default();
+            state.connect_client(client);
+            state.set_selected_target(client, None, Some(SessionId(Uuid::from_u128(10))));
+            let reserved = state
+                .begin_selection(client, state.selection(client).unwrap().revision)
+                .unwrap();
+            let inner = std::sync::Arc::new(std::sync::RwLock::new(state));
+            let adapter = crate::FollowStateAdapter {
+                inner: inner.clone(),
+            };
+            if clear_follow {
+                adapter.clear_all_follow_state();
+            } else {
+                adapter.clear_all_selections();
+            }
+            assert_eq!(
+                inner.write().unwrap().commit_selection(
+                    client,
+                    reserved.revision,
+                    None,
+                    Some(Uuid::from_u128(10))
+                ),
+                Err(SelectionError::Conflict)
+            );
+            assert_eq!(
+                inner.read().unwrap().selected_target(client),
+                Some((None, None))
+            );
+        }
+    }
+
+    #[test]
+    fn revision_exhaustion_keeps_input_suspended() {
+        let mut state = FollowState::default();
+        let client = ClientId(Uuid::from_u128(1));
+        state.connect_client(client);
+        state.selection_revisions.insert(client, u64::MAX);
+        state.set_selected_target(client, None, Some(SessionId(Uuid::from_u128(10))));
+        assert_eq!(state.selected_target(client), Some((None, None)));
+        assert!(state.recover_selection(client, u64::MAX).is_err());
+    }
+
+    #[test]
     fn commit_requires_reservation_and_coherent_target() {
         let mut state = FollowState::default();
         let client = ClientId(Uuid::from_u128(1));

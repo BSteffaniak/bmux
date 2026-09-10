@@ -160,8 +160,7 @@ impl FollowStateWriter for FollowStateAdapter {
             |state| {
                 let clients: Vec<ClientId> = state.connected_clients.iter().copied().collect();
                 for client_id in clients {
-                    state.selected_contexts.insert(client_id, None);
-                    state.selected_sessions.insert(client_id, None);
+                    state.set_selected_target(client_id, None, None);
                 }
             },
             (),
@@ -206,8 +205,10 @@ impl FollowStateWriter for FollowStateAdapter {
         self.with_write(
             |state| {
                 state.follows.clear();
-                state.selected_contexts.clear();
-                state.selected_sessions.clear();
+                let clients: Vec<_> = state.connected_clients.iter().copied().collect();
+                for client in clients {
+                    state.set_selected_target(client, None, None);
+                }
             },
             (),
         );
@@ -256,6 +257,16 @@ impl FollowStateWriter for FollowStateAdapter {
     fn restore_snapshot(&self, snapshot: FollowStateSnapshot) {
         self.with_write(
             |state| {
+                let restored_clients = snapshot
+                    .connected_clients
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                // Fence reservations before replacing their underlying target.
+                for client in &restored_clients {
+                    let revision = state.selection_revisions.entry(*client).or_default();
+                    *revision = revision.saturating_add(1);
+                }
                 state.connected_clients = snapshot.connected_clients;
                 state.selected_contexts = snapshot.selected_contexts;
                 state.selected_sessions = snapshot.selected_sessions;

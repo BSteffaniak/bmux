@@ -98,7 +98,12 @@ impl FollowState {
     ) {
         if self.connected_clients.contains(&client_id) {
             let revision = self.selection_revisions.entry(client_id).or_default();
-            *revision = revision.saturating_add(1);
+            let Some(next_revision) = revision.checked_add(1) else {
+                // Exhaustion cannot permit an ABA match with an old reservation.
+                self.selection_reservations.insert(client_id, u64::MAX);
+                return;
+            };
+            *revision = next_revision;
             self.selected_contexts.insert(client_id, context_id);
             self.selected_sessions.insert(client_id, session_id);
         }
