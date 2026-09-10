@@ -50,6 +50,15 @@ fails. `revision()` exposes the captured content revision for caller invalidatio
 `has_more_above`, `has_more_below`, and `history_truncated` distinguish a selected
 window from missing source history. This is not a persistent snapshot format.
 
+For live previews, use `grid.capture_viewport(identity, budget)` instead of
+`capture_content`. It captures only the main viewport, joins its soft-wrapped
+rows, and retains the blank cursor row needed for live sizing. It never copies
+pending history, even when a long logical line crosses the viewport boundary.
+`viewport_prefix_continues()` identifies that case: the visible fragment starts
+at capture-local logical `(line: 0, column: 0)`, and widening cannot reveal its
+hidden prefix. Anchors and width preparation work identically to content
+captures. Alternate mode returns `Unavailable`; choose positioned cropping there.
+
 For positioned output, use `screen_window(columns, rows, budget)` instead. It
 crops the active screen without reflow, accepts horizontal offsets, and blanks
 clipped wide-glyph fragments. Narrowing then widening does not destroy source

@@ -57,6 +57,7 @@ pub struct ContentProjection {
     lines: Vec<ContentLine>,
     more_above: bool,
     history_truncated: bool,
+    viewport_prefix_continues: bool,
     index: Option<WidthIndex>,
 }
 
@@ -129,27 +130,7 @@ impl TerminalGrid {
                 pending_used = true;
             }
             for row in self.main_rows.range(start..end) {
-                // Wrapped physical rows preserve implicit padding to the capture
-                // width; hard-ended rows need only their materialized extent.
-                let columns = if row.wrapped() {
-                    self.width
-                } else {
-                    row.cells().len()
-                };
-                budget.charge(columns.max(1), 0)?;
-                for col in 0..columns {
-                    if let Some(cell) = row.cells().get(col) {
-                        if !cell.is_wide_continuation() {
-                            copy_cell(&mut cells, cell, &mut budget)?;
-                        }
-                    } else {
-                        copy_cell(
-                            &mut cells,
-                            &Cell::blank(crate::StyleId::DEFAULT),
-                            &mut budget,
-                        )?;
-                    }
-                }
+                copy_physical_row(&mut cells, row, self.width, &mut budget)?;
             }
             push_line(
                 &mut lines,
@@ -192,6 +173,60 @@ impl TerminalGrid {
                 || (!pending_used && !self.pending_history_cells.is_empty())
                 || history_used < self.main_history.len(),
             history_truncated: self.history_truncated,
+            viewport_prefix_continues: false,
+            index: None,
+        })
+    }
+
+    /// Capture only the main-screen viewport for a live transcript.
+    ///
+    /// Soft-wrapped rows inside the viewport remain joined. A continuation from
+    /// history starts a capture-local logical fragment at column zero: hidden
+    /// progress/history cells are neither copied nor revealed when widening.
+    /// [`ContentProjection::viewport_prefix_continues`] reports that boundary.
+    /// The final blank cursor row is retained, unlike completed content capture.
+    /// Alternate screens are positioned output; use [`Self::screen_window`].
+    ///
+    /// # Errors
+    /// Returns `Unavailable` in alternate mode and `BudgetExhausted` when the
+    /// viewport exceeds the supplied work or allocation allowances.
+    pub fn capture_viewport(
+        &self,
+        capture: u128,
+        mut budget: ContentBudget,
+    ) -> Result<ContentProjection, HistorySliceError> {
+        if self.mode != GridMode::Main {
+            return Err(HistorySliceError::Unavailable);
+        }
+        let mut end = self.main_rows.len().min(self.height);
+        while end > self.cursor.row.saturating_add(1) {
+            let row = &self.main_rows[end - 1];
+            budget.charge(row.cells().len().max(1), 0)?;
+            if !row.cells().is_empty() {
+                break;
+            }
+            end -= 1;
+        }
+        let mut lines = Vec::new();
+        let mut cells = Vec::new();
+        for (index, row) in self.main_rows.range(..end).enumerate() {
+            copy_physical_row(&mut cells, row, self.width, &mut budget)?;
+            if !row.wrapped() || index + 1 == end {
+                push_line(
+                    &mut lines,
+                    std::mem::take(&mut cells),
+                    row.wrapped(),
+                    &mut budget,
+                )?;
+            }
+        }
+        Ok(ContentProjection {
+            capture,
+            revision: self.content_revision,
+            lines,
+            more_above: !self.main_history.is_empty() || !self.pending_history_cells.is_empty(),
+            history_truncated: self.history_truncated,
+            viewport_prefix_continues: !self.pending_history_cells.is_empty(),
             index: None,
         })
     }
@@ -280,6 +315,31 @@ fn copy_cell(
     Ok(())
 }
 
+fn copy_physical_row(
+    cells: &mut Vec<Cell>,
+    row: &PhysicalRow,
+    width: usize,
+    budget: &mut ContentBudget,
+) -> Result<(), HistorySliceError> {
+    // Soft continuations include implicit padding at execution width.
+    let columns = if row.wrapped() {
+        width
+    } else {
+        row.cells().len()
+    };
+    budget.charge(columns.max(1), 0)?;
+    for col in 0..columns {
+        if let Some(cell) = row.cells().get(col) {
+            if !cell.is_wide_continuation() {
+                copy_cell(cells, cell, budget)?;
+            }
+        } else {
+            copy_cell(cells, &Cell::blank(crate::StyleId::DEFAULT), budget)?;
+        }
+    }
+    Ok(())
+}
+
 fn copy_cells(
     output: &mut Vec<Cell>,
     cells: &[Cell],
@@ -307,6 +367,14 @@ fn push_line(
 }
 
 impl ContentProjection {
+    /// Whether a viewport capture begins mid-line with its prefix outside the
+    /// viewport. The first visible fragment's logical origin is `(line: 0,
+    /// column: 0)` in this capture, not an offset into hidden history.
+    #[must_use]
+    pub const fn viewport_prefix_continues(&self) -> bool {
+        self.viewport_prefix_continues
+    }
+
     /// Content revision captured from the source grid.
     #[must_use]
     pub const fn revision(&self) -> u64 {

@@ -30,6 +30,88 @@ fn texts(rows: &[PhysicalRow]) -> Vec<String> {
 }
 
 #[test]
+fn viewport_reflow_excludes_scrolled_progress_and_retains_cursor_row() {
+    let (stream, _) = capture(
+        "progress 20%\r\ncompile one\r\ncompile two\r\nprogress 30%",
+        40,
+        3,
+    );
+    let before = stream.grid().snapshot(0, 20);
+    let mut live = stream.grid().capture_viewport(10, budget()).unwrap();
+    live.prepare(80, budget()).unwrap();
+    assert_eq!(
+        texts(&live.tail(28, budget().bytes).unwrap().rows),
+        ["compile one", "compile two", "progress 30%"]
+    );
+    assert!(!live.viewport_prefix_continues());
+    live.prepare(7, budget()).unwrap();
+    let narrow = live.tail(28, budget().bytes).unwrap();
+    assert_eq!(
+        texts(&narrow.rows),
+        ["compile", " one", "compile", " two", "progres", "s 30%"]
+    );
+    let anchor = narrow.anchors[1];
+    live.prepare(80, budget()).unwrap();
+    assert_eq!(live.resolve(anchor), Some(0));
+    assert_eq!(stream.grid().snapshot(0, 20), before);
+
+    let (stream, _) = capture("hello\r\n", 8, 3);
+    let mut live = stream.grid().capture_viewport(11, budget()).unwrap();
+    live.prepare(80, budget()).unwrap();
+    assert_eq!(
+        texts(&live.tail(28, budget().bytes).unwrap().rows),
+        ["hello", ""]
+    );
+}
+
+#[test]
+fn viewport_soft_prefix_is_explicit_and_never_recaptured() {
+    let (stream, _) = capture("abcdefghijkl", 4, 2);
+    let mut live = stream.grid().capture_viewport(10, budget()).unwrap();
+    assert!(live.viewport_prefix_continues());
+    live.prepare(20, budget()).unwrap();
+    let wide = live.tail(20, budget().bytes).unwrap();
+    assert_eq!(texts(&wide.rows), ["efghijkl"]);
+    assert!(wide.has_more_above);
+    assert_eq!(
+        wide.anchors[0],
+        ContentAnchor {
+            capture: 10,
+            line: 0,
+            column: 0
+        }
+    );
+    live.prepare(3, budget()).unwrap();
+    assert_eq!(
+        texts(&live.tail(20, budget().bytes).unwrap().rows),
+        ["efg", "hij", "kl"]
+    );
+}
+
+#[test]
+fn viewport_budget_is_independent_of_hidden_history() {
+    let (stream, _) = capture(&"x".repeat(100_000), 8, 2);
+    let allowance = ContentBudget {
+        cells: 64,
+        bytes: 4096,
+    };
+    let mut live = stream.grid().capture_viewport(1, allowance).unwrap();
+    live.prepare(16, allowance).unwrap();
+    assert_eq!(live.row_count(), Some(1));
+    assert!(matches!(
+        stream
+            .grid()
+            .capture_viewport(2, ContentBudget { cells: 0, bytes: 0 }),
+        Err(HistorySliceError::BudgetExhausted)
+    ));
+    let (alternate, _) = capture("\x1b[?1049h", 8, 2);
+    assert!(matches!(
+        alternate.grid().capture_viewport(3, budget()),
+        Err(HistorySliceError::Unavailable)
+    ));
+}
+
+#[test]
 fn projection_work_report_for_long_history_and_single_line() {
     use std::time::Instant;
     for (name, text) in [
