@@ -210,9 +210,11 @@ struct CompanionState {
     revision: u64,
     snapshot: tabs_list::TabListSnapshot,
     hovered_tab_id: Option<Uuid>,
-    scroll_offset: usize,
-    manual_scroll: bool,
+    scroll_anchor: Option<Uuid>,
     measurements: projection::ProjectionMeasurements,
+    pending_projection: std::collections::VecDeque<(u64, projection::ProjectedBar)>,
+    committed_projection: Option<projection::ProjectedBar>,
+    committed_projection_revision: u64,
     pointer_source: Option<Uuid>,
     pointer_started_col: u16,
     pointer_started_row: u16,
@@ -233,6 +235,19 @@ struct CompanionState {
 }
 
 impl CompanionState {
+    fn acknowledge_projection(&mut self, revision: u64) {
+        if revision <= self.committed_projection_revision {
+            return;
+        }
+        self.committed_projection_revision = revision;
+        self.committed_projection = self
+            .pending_projection
+            .iter()
+            .find(|(id, _)| *id == revision)
+            .map(|(_, projection)| projection.clone());
+        self.pending_projection.retain(|(id, _)| *id > revision);
+    }
+
     fn new(settings: Settings) -> Self {
         Self {
             surfaces: bmux_plugin::surface::global_plugin_surface_registry_handle(),
@@ -244,9 +259,11 @@ impl CompanionState {
                 revision: 0,
             },
             hovered_tab_id: None,
-            scroll_offset: 0,
-            manual_scroll: false,
+            scroll_anchor: None,
             measurements: projection::ProjectionMeasurements::default(),
+            pending_projection: std::collections::VecDeque::new(),
+            committed_projection: None,
+            committed_projection_revision: 0,
             pointer_source: None,
             pointer_started_col: 0,
             pointer_started_row: 0,
@@ -308,11 +325,10 @@ impl CompanionState {
             let active_id = |tabs: &[tabs_list::TabListEntry]| {
                 tabs.iter().find(|tab| tab.active).map(|tab| tab.id)
             };
-            let retained_anchor = (self.manual_scroll
-                && active_id(&self.snapshot.tabs) == active_id(&snapshot.tabs))
-            .then(|| self.snapshot.tabs.get(self.scroll_offset).map(|tab| tab.id))
-            .flatten()
-            .and_then(|id| snapshot.tabs.iter().position(|tab| tab.id == id));
+            self.scroll_anchor = self.scroll_anchor.filter(|id| {
+                active_id(&self.snapshot.tabs) == active_id(&snapshot.tabs)
+                    && snapshot.tabs.iter().any(|window| window.id == *id)
+            });
             self.snapshot = snapshot;
             if self
                 .menu_tab_id
@@ -327,15 +343,7 @@ impl CompanionState {
                 self.editing_tab_id = None;
                 self.edit_buffer.clear();
             }
-            self.manual_scroll = retained_anchor.is_some();
-            if let Some(anchor) = retained_anchor {
-                self.scroll_offset = anchor;
-                self.revision = self.revision.saturating_add(1).max(1);
-                return;
-            }
-            // Automatic reveal is resolved by the width-budgeted projection.
-            // This offset is only meaningful while manual scrolling is active.
-            self.scroll_offset = 0;
+            // A missing anchor requests automatic active-tab reveal.
             self.revision = self.revision.saturating_add(1).max(1);
         }
     }
@@ -451,6 +459,7 @@ fn register_presentation_input(
             if let Ok(mut guard) = committed_owner.lock()
                 && let Some(companion) = guard.as_mut()
             {
+                companion.acknowledge_projection(revision);
                 rename_input::acknowledge(&mut companion.edit_buffer, revision);
                 companion.menu.geometry.acknowledge(revision);
             }
@@ -603,7 +612,7 @@ fn apply_presentation_update(
             companion.menu_tab_id = None;
             companion.pointer_source = None;
             companion.drag_target = None;
-            companion.scroll_offset = 0;
+            companion.scroll_anchor = None;
             companion.replace_tabs(companion.catalog.clone());
         }
     }
@@ -746,7 +755,7 @@ fn publish_selection(context_id: Option<Uuid>) -> Result<(), String> {
     companion.menu_tab_id = None;
     companion.pointer_source = None;
     companion.drag_target = None;
-    companion.scroll_offset = 0;
+    companion.scroll_anchor = None;
     companion.replace_tabs(companion.catalog.clone());
     publish_companion(companion)
 }
@@ -767,10 +776,16 @@ fn publish_surface(
 
 fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
     let revision = companion.revision.max(1);
-    let (surface, viewport) = build_surface_with_editor(companion, revision);
+    let (surface, viewport, projection) = build_surface_with_editor(companion, revision);
     let mut surfaces = vec![surface];
     surfaces.extend(menu::surfaces(companion, revision));
     let revision = publish_surface(&companion.surfaces, revision, surfaces)?;
+    if companion.pending_projection.len() == 32 {
+        companion.pending_projection.pop_front();
+    }
+    companion
+        .pending_projection
+        .push_back((revision, projection));
     rename_input::stage(&mut companion.edit_buffer, revision, viewport);
     let viewport = menu::viewport(companion);
     companion.menu.geometry.stage(revision, viewport);
@@ -1005,7 +1020,7 @@ fn adjust_rgb(value: (u8, u8, u8), delta: i16) -> (u8, u8, u8) {
 fn projection_interaction(state: &CompanionState) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
         measurements: Some(&state.measurements),
-        scroll_anchor: state.manual_scroll.then_some(state.scroll_offset),
+        scroll_anchor: state.scroll_anchor,
         editing_tab_id: state.editing_tab_id,
         edit_text: Some(state.edit_buffer.text()),
         edit_selection: state
@@ -1032,6 +1047,7 @@ fn build_surface_with_editor(
 ) -> (
     PluginSurface,
     Option<bmux_plugin::component_viewport::ComponentViewport>,
+    projection::ProjectedBar,
 ) {
     let mut editor_viewport = None;
     let styles = BarStyles::resolve(&state.settings, &state.local_presentation);
@@ -1053,15 +1069,12 @@ fn build_surface_with_editor(
     );
     let mut ops = vec![RenderOp::fill_rect(rect, ' ', styles.base)];
     let mut regions = Vec::with_capacity(state.snapshot.tabs.len());
-    let mut x = 0_u16;
-    for segment in projected.segments {
-        let width = u16::try_from(unicode_width::UnicodeWidthStr::width(segment.text.as_str()))
-            .unwrap_or(u16::MAX);
+    for (segment, x, width) in projected.positioned_segments() {
         if !segment.text.is_empty() {
             ops.push(RenderOp::text_run(
                 x,
                 0,
-                segment.text,
+                segment.text.clone(),
                 styles.for_kind(segment.kind),
             ));
         }
@@ -1123,7 +1136,6 @@ fn build_surface_with_editor(
                 .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
             );
         }
-        x = x.saturating_add(width);
     }
     if let Some(viewport) = &editor_viewport {
         let id = state
@@ -1160,7 +1172,7 @@ fn build_surface_with_editor(
     for region in regions {
         surface = surface.interactive_region(region);
     }
-    (surface, editor_viewport)
+    (surface, editor_viewport, projected)
 }
 
 fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
@@ -1197,42 +1209,28 @@ fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let Some(companion) = guard.as_mut() else {
         return false;
     };
-    let ranges = projected_bar(companion).tab_ranges();
-    let Some(first) = ranges.first().and_then(|range| {
-        companion
-            .snapshot
-            .tabs
-            .iter()
-            .position(|tab| tab.id == range.tab_id)
-    }) else {
+    let Some(projection) = companion.committed_projection.as_ref() else {
         return true;
     };
-    let last = ranges
-        .last()
-        .and_then(|range| {
-            companion
-                .snapshot
-                .tabs
-                .iter()
-                .position(|tab| tab.id == range.tab_id)
-        })
-        .unwrap_or(first);
-    let next = if event.wheel_delta > 0 {
-        first.saturating_sub(1)
-    } else if last + 1 < companion.snapshot.tabs.len() {
-        first + 1
-    } else {
-        first
+    let Some(next) = projection.scroll_target(event.wheel_delta < 0) else {
+        return true;
     };
-    if next == first {
+    // The committed target is an identity, not a position in a newer snapshot.
+    // If it was removed, wait for a new presented projection rather than guess.
+    if !companion
+        .snapshot
+        .tabs
+        .iter()
+        .any(|window| window.id == next)
+    {
         return true;
     }
-    companion.scroll_offset = next;
-    companion.manual_scroll = true;
+    companion.scroll_anchor = Some(next);
     companion.revision = companion.revision.saturating_add(1).max(1);
     publish_companion(companion).is_ok()
 }
 
+#[cfg(test)]
 fn projected_bar(state: &CompanionState) -> projection::ProjectedBar {
     projection::project_bar(
         &state.settings,
@@ -1243,12 +1241,13 @@ fn projected_bar(state: &CompanionState) -> projection::ProjectedBar {
     )
 }
 
+#[cfg(test)]
 fn projection_interaction_without_marker(
     state: &CompanionState,
 ) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
         measurements: Some(&state.measurements),
-        scroll_anchor: state.manual_scroll.then_some(state.scroll_offset),
+        scroll_anchor: state.scroll_anchor,
         editing_tab_id: state.editing_tab_id,
         edit_text: Some(state.edit_buffer.text()),
         edit_selection: state
@@ -1344,7 +1343,10 @@ fn update_drag_local(
             })
         }
         "drag" if companion.pointer_source == Some(source) => {
-            let target = projected_bar(companion).drop_target_at_col(col);
+            let target = companion
+                .committed_projection
+                .as_ref()
+                .and_then(|projection| projection.drop_target_at_col(col));
             let moved = companion.pointer_moved
                 || col
                     .abs_diff(companion.pointer_started_col)
@@ -2040,6 +2042,10 @@ mod tests {
             hovered_pane: None,
         };
         for resources in [&first_resources, &second_resources, &first_resources] {
+            resources.input.committed(
+                &input_endpoint(),
+                resources.surfaces.owner_snapshot(OWNER).unwrap().revision,
+            );
             assert!(
                 resources
                     .input
@@ -2049,12 +2055,12 @@ mod tests {
             );
         }
         assert_eq!(
-            first.owner.lock().unwrap().as_ref().unwrap().scroll_offset,
-            2
+            first.owner.lock().unwrap().as_ref().unwrap().scroll_anchor,
+            Some(Uuid::from_u128(102))
         );
         assert_eq!(
-            second.owner.lock().unwrap().as_ref().unwrap().scroll_offset,
-            1
+            second.owner.lock().unwrap().as_ref().unwrap().scroll_anchor,
+            Some(Uuid::from_u128(201))
         );
         for (resources, target) in [(&first_resources, 102), (&second_resources, 201)] {
             event.event_kind = "pointer".into();
@@ -2353,7 +2359,7 @@ mod tests {
                 companion.editing_tab_id = Some(Uuid::nil());
             }
             companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text("x").into();
-            let (_, viewport) = build_surface_with_editor(&companion, 1);
+            let (_, viewport, _) = build_surface_with_editor(&companion, 1);
             rename_input::stage(&mut companion.edit_buffer, 1, viewport);
             rename_input::acknowledge(&mut companion.edit_buffer, 1);
             let initial = companion.edit_buffer.visible_rect().unwrap();
@@ -2361,7 +2367,7 @@ mod tests {
             companion
                 .edit_buffer
                 .dispatch(&bmux_tui::event::Event::Paste("界界long".to_string()));
-            let (_, viewport) = build_surface_with_editor(&companion, 2);
+            let (_, viewport, _) = build_surface_with_editor(&companion, 2);
             assert!(viewport.as_ref().unwrap().visible_rect().width > initial.width);
             rename_input::stage(&mut companion.edit_buffer, 2, viewport);
             assert_eq!(companion.edit_buffer.visible_rect(), Some(initial));
@@ -2372,7 +2378,7 @@ mod tests {
                 "backspace",
                 bmux_plugin::AttachInputModifiers::default(),
             );
-            let (_, viewport) = build_surface_with_editor(&companion, 3);
+            let (_, viewport, _) = build_surface_with_editor(&companion, 3);
             assert_eq!(viewport.unwrap().visible_rect().width, 1);
             assert!(cancel_rename(&mut companion));
             assert_eq!(companion.workspace_label.as_deref(), Some("saved"));
@@ -2828,6 +2834,40 @@ bar_bg = "#112233"
     }
 
     #[test]
+    fn projection_authority_waits_for_commit_and_ignores_old_acknowledgments() {
+        let mut state = CompanionState::new(Settings::default());
+        state.surfaces = std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64));
+        state.local_presentation.viewport_cols = 80;
+        publish_companion(&mut state).unwrap();
+        let first = state.pending_projection.back().unwrap().0;
+        assert!(state.committed_projection.is_none());
+        state.acknowledge_projection(first);
+        let displayed = state.committed_projection.clone();
+        state.local_presentation.viewport_cols = 20;
+        state.revision += 1;
+        publish_companion(&mut state).unwrap();
+        assert_eq!(state.committed_projection, displayed);
+        state.acknowledge_projection(first);
+        assert_eq!(state.committed_projection, displayed);
+        let second = state.pending_projection.back().unwrap().0;
+        state.acknowledge_projection(second);
+        let displayed = state.committed_projection.clone();
+        state.acknowledge_projection(first);
+        assert_eq!(state.committed_projection, displayed);
+        state.acknowledge_projection(second + 100);
+        assert!(state.committed_projection.is_none());
+    }
+
+    fn commit_scroll_projection(owner: &CompanionHandle) {
+        let mut guard = owner.lock().unwrap();
+        let state = guard.as_mut().unwrap();
+        publish_companion(state).unwrap();
+        let revision = state.surfaces.owner_snapshot(OWNER).unwrap().revision;
+        state.acknowledge_projection(revision);
+        drop(guard);
+    }
+
+    #[test]
     fn wheel_scrolls_width_overflow_with_no_count_cap() {
         let mut state = CompanionState::new(Settings::default());
         state.surfaces = std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64));
@@ -2858,11 +2898,12 @@ bar_bg = "#112233"
             focused_pane: None,
             hovered_pane: None,
         };
+        commit_scroll_projection(&owner);
         assert!(handle_local_input(&owner, &event).unwrap().consumed);
         {
             let guard = owner.lock().unwrap();
             let state = guard.as_ref().unwrap();
-            assert_eq!(state.scroll_offset, 1);
+            assert_eq!(state.scroll_anchor, Some(Uuid::from_u128(1)));
             assert_eq!(
                 projected_bar(state).tab_ranges()[0].tab_id,
                 Uuid::from_u128(1)
@@ -2870,10 +2911,11 @@ bar_bg = "#112233"
             drop(guard);
         }
         event.wheel_delta = 1;
+        commit_scroll_projection(&owner);
         assert!(handle_local_input(&owner, &event).unwrap().consumed);
         let guard = owner.lock().unwrap();
         let state = guard.as_ref().unwrap();
-        assert_eq!(state.scroll_offset, 0);
+        assert_eq!(state.scroll_anchor, Some(Uuid::from_u128(0)));
         assert_eq!(
             projected_bar(state).tab_ranges()[0].tab_id,
             Uuid::from_u128(0)
@@ -2881,6 +2923,7 @@ bar_bg = "#112233"
         drop(guard);
         event.wheel_delta = -1;
         for _ in 0..40 {
+            commit_scroll_projection(&owner);
             assert!(handle_local_input(&owner, &event).unwrap().consumed);
         }
         let mut guard = owner.lock().unwrap();
@@ -2889,18 +2932,19 @@ bar_bg = "#112233"
             projected_bar(state).tab_ranges().last().unwrap().tab_id,
             Uuid::from_u128(19)
         );
-        let stopped_at = state.scroll_offset;
+        let stopped_at = state.scroll_anchor;
         state.replace_local_presentation(AttachLocalPresentationSnapshot {
             viewport_cols: 100,
             revision: 2,
             ..state.local_presentation.clone()
         });
-        assert_eq!(state.scroll_offset, stopped_at);
-        assert!(state.manual_scroll);
+        assert_eq!(state.scroll_anchor, stopped_at);
+        assert!(state.scroll_anchor.is_some());
         drop(guard);
+        commit_scroll_projection(&owner);
         assert!(handle_local_input(&owner, &event).unwrap().consumed);
         assert_eq!(
-            owner.lock().unwrap().as_ref().unwrap().scroll_offset,
+            owner.lock().unwrap().as_ref().unwrap().scroll_anchor,
             stopped_at
         );
     }
@@ -2924,38 +2968,40 @@ bar_bg = "#112233"
                 .collect(),
             revision: 1,
         });
-        assert!(!state.manual_scroll);
+        assert!(state.scroll_anchor.is_none());
         assert_eq!(
             projected_bar(&state).tab_ranges().last().unwrap().tab_id,
             Uuid::from_u128(4)
         );
-        state.manual_scroll = true;
-        state.scroll_offset = 1;
+        state.scroll_anchor = Some(Uuid::from_u128(1));
         let mut updated = state.snapshot.clone();
         updated.revision += 1;
         state.replace_tabs(updated.clone());
-        assert!(state.manual_scroll);
-        assert_eq!(state.scroll_offset, 1);
+        assert!(state.scroll_anchor.is_some());
+        assert_eq!(state.scroll_anchor, Some(Uuid::from_u128(1)));
         updated.tabs.swap(0, 1);
         updated.revision += 1;
         state.replace_tabs(updated.clone());
-        assert!(state.manual_scroll);
-        assert_eq!(state.scroll_offset, 0, "anchor follows stable tab identity");
+        assert!(state.scroll_anchor.is_some());
+        assert_eq!(
+            state.scroll_anchor,
+            Some(Uuid::from_u128(1)),
+            "anchor follows stable tab identity"
+        );
         updated.tabs.swap(0, 1);
         updated.tabs[4].active = false;
         updated.tabs[0].active = true;
         updated.revision += 1;
         state.replace_tabs(updated.clone());
         assert!(
-            !state.manual_scroll,
+            state.scroll_anchor.is_none(),
             "selection changes restore active reveal"
         );
         updated.tabs[0].active = false;
         updated.tabs[4].active = true;
         updated.revision += 1;
         state.replace_tabs(updated);
-        state.manual_scroll = true;
-        state.scroll_offset = 0;
+        state.scroll_anchor = Some(Uuid::from_u128(0));
         let scrolled = build_surface(&state, 1);
         let scrolled_tabs: Vec<_> = scrolled
             .interactive_regions
@@ -2970,7 +3016,7 @@ bar_bg = "#112233"
                 format!("tab:{}", Uuid::from_u128(1)),
             ]
         );
-        state.manual_scroll = false;
+        state.scroll_anchor = None;
         let surface = build_surface(&state, 1);
         let tabs: Vec<_> = surface
             .interactive_regions
@@ -2995,7 +3041,7 @@ bar_bg = "#112233"
             ..Settings::default()
         };
         let mut state = CompanionState::new(settings);
-        state.scroll_offset = 1;
+        state.scroll_anchor = Some(Uuid::from_u128(1));
         state.snapshot.tabs = (0..4)
             .map(|index| tabs_list::TabListEntry {
                 id: Uuid::from_u128(index),

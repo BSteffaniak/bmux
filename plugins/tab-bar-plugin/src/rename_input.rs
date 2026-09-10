@@ -2,11 +2,12 @@
 use bmux_plugin::component_viewport::ComponentViewport;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::{
-    component::{LayoutNode, LogicalSize},
+    component::{ChildLayout, LayoutNode, LogicalSize},
     event::{Event, MouseButton, MouseEvent, MouseEventKind},
     geometry::{Point, Rect},
     style::Modifier,
 };
+use bmux_tui_components::scroll_view::{ScrollView, ScrollViewState};
 use bmux_tui_components::text_input::{TextInputComponent, TextInputPolicy, TextInputState};
 use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
@@ -130,13 +131,20 @@ pub fn paint(
         .is_some_and(|range| range.start == 0 && range.end == input.text().len());
     let cursor_col =
         unicode_width::UnicodeWidthStr::width(&input.text()[..input.cursor_byte_index()]);
-    let mut offset = if selected_all {
-        0
-    } else {
-        cursor_col
-            .saturating_add(1)
-            .saturating_sub(usize::from(width))
-    };
+    let content = LayoutNode::leaf(
+        "rename".into(),
+        LogicalSize::new(u64::from(content_width), 1),
+    );
+    let layout = LayoutNode::with_children(
+        "rename.viewport".into(),
+        LogicalSize::new(u64::from(width), 1),
+        vec![ChildLayout::new(0, 0, content)],
+    );
+    let mut scroll = ScrollViewState::new();
+    if !selected_all {
+        ScrollView::ensure_horizontal_visible(&layout, &mut scroll, cursor_col as u64, 1);
+    }
+    let mut offset = usize::try_from(scroll.horizontal_offset()).unwrap_or(usize::MAX);
     let mut boundary = 0;
     for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(input.text(), true) {
         let next = boundary + unicode_width::UnicodeWidthStr::width(grapheme);

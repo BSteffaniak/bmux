@@ -18,10 +18,14 @@ fn main() -> Result<()> {
 
         loop {
             terminal.draw(|cx| demo.render(cx))?;
+            demo.commit_hits(terminal.hits());
             if let Some(event) = poll_event(Duration::from_millis(100))? {
                 match event {
                     Event::Key(stroke) if should_quit(stroke) => break,
-                    Event::Resize(size) => terminal.resize(rect_from_size(size)),
+                    Event::Resize(size) => {
+                        terminal.resize(rect_from_size(size));
+                        demo.handle_event(&Event::Resize(size));
+                    }
                     Event::Key(_)
                     | Event::Mouse(_)
                     | Event::Paste(_)

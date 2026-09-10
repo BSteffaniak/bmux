@@ -40,7 +40,63 @@ use bmux_tui_components::tree_view::{
 pub const WIDTH: u16 = 72;
 pub const HEIGHT: u16 = 18;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Breadcrumbs,
+    Tabs,
+    Tree,
+    List,
+    Menu,
+    Scroll,
+    Table,
+    Text,
+    Pane,
+}
+
+impl Target {
+    const ORDER: [Self; 9] = [
+        Self::Tabs,
+        Self::Breadcrumbs,
+        Self::List,
+        Self::Menu,
+        Self::Tree,
+        Self::Scroll,
+        Self::Table,
+        Self::Text,
+        Self::Pane,
+    ];
+
+    fn next(self, backwards: bool) -> Self {
+        let index = Self::ORDER
+            .iter()
+            .position(|target| *target == self)
+            .expect("target in focus order");
+        Self::ORDER[(index + if backwards { Self::ORDER.len() - 1 } else { 1 }) % Self::ORDER.len()]
+    }
+
+    fn at(point: bmux_tui::geometry::Point) -> Option<Self> {
+        [
+            (Self::Tabs, TABS_AREA),
+            (Self::Breadcrumbs, Rect::new(30, 0, 38, 1)),
+            (Self::Tree, TREE_AREA),
+            (Self::List, LIST_AREA),
+            (Self::Menu, Rect::new(30, 1, 18, 2)),
+            (Self::Scroll, Rect::new(1, 6, 24, 2)),
+            (Self::Table, TABLE_AREA),
+            (Self::Text, Rect::new(1, 13, 68, 2)),
+            (Self::Pane, scroll_delegate_pane_area()),
+        ]
+        .into_iter()
+        .find_map(|(target, area)| area.contains(point).then_some(target))
+    }
+}
+
 pub struct NavigationDemo {
+    focused: Target,
+    terminal_focused: bool,
+    captured: Option<Target>,
+    hovered: Option<Target>,
+    committed_hits: Option<bmux_tui::hit::HitMap>,
     breadcrumbs: BreadcrumbsState,
     tabs: TabBarState,
     tree: TreeViewState,
@@ -57,6 +113,11 @@ impl NavigationDemo {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            focused: Target::Tabs,
+            terminal_focused: true,
+            captured: None,
+            hovered: None,
+            committed_hits: None,
             breadcrumbs: BreadcrumbsState::new(Some(1)),
             tabs: TabBarState::new(Some(0)),
             tree: {
@@ -78,6 +139,91 @@ impl NavigationDemo {
         }
     }
 
+    /// Install geometry only after terminal output has committed successfully.
+    pub fn commit_hits(&mut self, hits: &bmux_tui::hit::HitMap) {
+        self.committed_hits = Some(hits.clone());
+        for target in [self.captured, self.hovered].into_iter().flatten() {
+            if !self.target_visible(target) {
+                self.dispatch_target(
+                    &Event::Focus(bmux_tui::event::FocusEvent::Lost),
+                    Some(target),
+                );
+            }
+        }
+        if self
+            .captured
+            .is_some_and(|target| !self.target_visible(target))
+        {
+            self.captured = None;
+        }
+        if self
+            .hovered
+            .is_some_and(|target| !self.target_visible(target))
+        {
+            self.hovered = None;
+        }
+        self.sync_focus();
+    }
+
+    fn target_visible(&self, target: Target) -> bool {
+        self.committed_hits.as_ref().is_none_or(|hits| {
+            hits.regions().iter().any(|region| {
+                region.enabled
+                    && !region.area.is_empty()
+                    && Self::target_for_id(region.id.as_str()) == Some(target)
+            })
+        })
+    }
+
+    fn sync_focus(&mut self) {
+        let active = self.terminal_focused && self.target_visible(self.focused);
+        self.tabs
+            .set_focused(active && self.focused == Target::Tabs);
+        self.breadcrumbs
+            .set_focused(active && self.focused == Target::Breadcrumbs);
+        self.tree.interaction.focused = active && self.focused == Target::Tree;
+        self.list.interaction.focused = active && self.focused == Target::List;
+        self.menu.list.interaction.focused = active && self.focused == Target::Menu;
+        self.table.interaction.focused = active && self.focused == Target::Table;
+    }
+
+    fn target_at(&self, point: bmux_tui::geometry::Point) -> Option<Target> {
+        let Some(hits) = &self.committed_hits else {
+            return Target::at(point);
+        };
+        let hit = hits.hit_test(point)?;
+        Self::target_for_id(hit.id().as_str())
+    }
+
+    fn mouse_target(&self, mouse: bmux_tui::event::MouseEvent) -> Option<Target> {
+        let Some(hits) = &self.committed_hits else {
+            return self.target_at(mouse.position);
+        };
+        Self::target_for_id(hits.hit_mouse(mouse)?.id().as_str())
+    }
+
+    fn target_for_id(id: &str) -> Option<Target> {
+        [
+            ("navigation.breadcrumbs", Target::Breadcrumbs),
+            ("navigation.tabs", Target::Tabs),
+            ("navigation.tree", Target::Tree),
+            ("navigation.list", Target::List),
+            ("navigation.menu", Target::Menu),
+            ("navigation.scroll-pane", Target::Pane),
+            ("navigation.scroll", Target::Scroll),
+            ("navigation.table", Target::Table),
+            ("navigation.text", Target::Text),
+        ]
+        .into_iter()
+        .find_map(|(prefix, target)| {
+            (id == prefix
+                || id
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('.')))
+            .then_some(target)
+        })
+    }
+
     pub fn render(&self, cx: &mut PaintCx<'_, '_>) {
         render_navigation_with_state(cx, self);
     }
@@ -86,189 +232,275 @@ impl NavigationDemo {
         if matches!(event, Event::Key(stroke) if should_quit(*stroke)) {
             return true;
         }
-        let breadcrumb_items = breadcrumb_items();
-        let breadcrumb_state = Cell::new(self.breadcrumbs);
-        let component = BreadcrumbsComponent::new(
-            "navigation.breadcrumbs",
-            &breadcrumb_items,
-            &breadcrumb_state,
-        );
-        let area = Rect::new(30, 0, 38, 1);
-        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        let outcome = EventCx::new(&layout).with_transform(
-            0,
-            0,
-            i32::from(area.x),
-            i64::from(area.y),
-            area,
-            |cx| component.handle_event(event, &layout, cx),
-        );
-        self.breadcrumbs = breadcrumb_state.get();
-        if let BreadcrumbsOutcome::Activated { id, .. } = outcome {
-            self.message = format!("Breadcrumb activated: {id}");
+        if matches!(event, Event::Focus(_) | Event::Resize(_)) {
+            if let Event::Focus(focus) = event {
+                self.terminal_focused = *focus == bmux_tui::event::FocusEvent::Gained;
+            }
+            self.captured = None;
+            self.hovered = None;
+            for target in Target::ORDER {
+                self.dispatch_target(event, Some(target));
+            }
+            self.sync_focus();
             return false;
         }
-
-        let tab_items = tab_items();
-        let previous_selection = self.tabs.selected();
-        let tab_state = RefCell::new(std::mem::take(&mut self.tabs));
-        let component = TabBarComponent::new("navigation.tabs", &tab_items, &tab_state);
-        let area = Rect::new(1, 0, 42, 1);
-        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        EventCx::new(&layout).with_transform(
-            0,
-            0,
-            i32::from(area.x),
-            i64::from(area.y),
-            area,
-            |cx| component.event(event, &layout, cx),
-        );
-        self.tabs = tab_state.into_inner();
-        if self.tabs.selected() != previous_selection
-            && let Some(index) = self.tabs.selected()
-        {
-            self.message = format!("Tab selected: {}", tab_items[index].label());
+        if !self.terminal_focused {
             return false;
         }
-
-        let tree_items = tree_items();
-        let tree_state = RefCell::new(std::mem::take(&mut self.tree));
-        let component = TreeViewComponent::new("navigation.tree", &tree_items, &tree_state);
-        let area = TREE_AREA;
-        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        let outcome = EventCx::new(&layout).with_transform(
-            0,
-            0,
-            i32::from(area.x),
-            i64::from(area.y),
-            area,
-            |cx| component.handle_event(event, &layout, cx),
-        );
-        self.tree = tree_state.into_inner();
-        match outcome {
-            TreeViewOutcome::Selected { source, .. } => {
-                self.message = format!("Tree selected: {}", tree_items[source].label);
-                return false;
-            }
-            TreeViewOutcome::Toggled {
-                source, expanded, ..
-            } => {
-                self.message = format!("Tree {} expanded: {expanded}", tree_items[source].label);
-                return false;
-            }
-            TreeViewOutcome::Focused { source, .. } => {
-                self.message = format!("Tree focus: {}", tree_items[source].label);
-                return false;
-            }
-            TreeViewOutcome::Ignored | TreeViewOutcome::Redraw => {}
-        }
-
-        let list_items = list_items();
-        let list_state = Cell::new(self.list);
-        let component = SelectableListComponent::new("navigation.list", &list_items, &list_state);
-        let area = Rect::new(1, 1, 24, 3);
-        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        let outcome = EventCx::new(&layout).with_transform(
-            0,
-            0,
-            i32::from(area.x),
-            i64::from(area.y),
-            area,
-            |cx| component.handle_event(event, &layout, cx),
-        );
-        self.list = list_state.get();
-        match outcome {
-            SelectableListOutcome::Selected(index) => {
-                self.message = format!("List selected: {}", list_item_text(&list_items[index]));
-                return false;
-            }
-            SelectableListOutcome::Focused(index) => {
-                self.message = format!("List focus: {}", list_item_text(&list_items[index]));
-                return false;
-            }
-            SelectableListOutcome::Ignored | SelectableListOutcome::Redraw => {}
-        }
-
-        let menu_items = menu_items();
-        let menu_state = Cell::new(self.menu);
-        let component = MenuComponent::new("navigation.menu", &menu_items, &menu_state);
-        let area = Rect::new(30, 1, 18, 2);
-        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        let outcome = EventCx::new(&layout).with_transform(
-            0,
-            0,
-            i32::from(area.x),
-            i64::from(area.y),
-            area,
-            |cx| component.handle_event(event, &layout, cx),
-        );
-        self.menu = menu_state.get();
-        match outcome {
-            MenuOutcome::Activated { id, .. } => self.message = format!("Menu action: {id}"),
-            MenuOutcome::Cancelled => self.message = "Menu cancelled".to_string(),
-            MenuOutcome::Ignored
-            | MenuOutcome::Redraw
-            | MenuOutcome::Focused(_)
-            | MenuOutcome::Typeahead(_) => {}
-        }
-
-        let lines = scroll_lines();
-        let area = Rect::new(1, 6, 24, 2);
-        let layout = scroll_layout("navigation.scroll", area, &lines, self.scroll);
-        if let bmux_tui_components::scroll_view::ScrollViewOutcome::Scrolled { vertical_offset } =
-            ScrollView::new().handle_event(area, &layout, &mut self.scroll, event)
+        if let Event::Key(stroke) = event
+            && stroke.key == KeyCode::Tab
+            && !stroke.modifiers.ctrl
+            && !stroke.modifiers.alt
+            && !stroke.modifiers.super_key
         {
-            self.message = format!("Scroll offset: {vertical_offset}");
-        }
-
-        let table_columns = table_columns();
-        let table_rows = table_rows();
-        let table_state = RefCell::new(std::mem::take(&mut self.table));
-        let component = TableComponent::new(
-            "navigation.table",
-            &table_columns,
-            &table_rows,
-            &table_state,
-        );
-        let area = Rect::new(1, 9, 24, 4);
-        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-        let outcome = EventCx::new(&layout).with_transform(
-            0,
-            0,
-            i32::from(area.x),
-            i64::from(area.y),
-            area,
-            |cx| component.handle_event(event, &layout, cx),
-        );
-        self.table = table_state.into_inner();
-        match outcome {
-            TableOutcome::Selected(index) => {
-                self.message = format!("Table selected: {}", table_rows[index].cell_plain_text(0));
-                return false;
+            for _ in Target::ORDER {
+                self.focused = self.focused.next(stroke.modifiers.shift);
+                if self.target_visible(self.focused) {
+                    break;
+                }
             }
-            TableOutcome::Focused(index) => {
-                self.message = format!("Table focus: {}", table_rows[index].cell_plain_text(0));
-                return false;
-            }
-            TableOutcome::Ignored | TableOutcome::Redraw => {}
-        }
-
-        let text_lines = text_view_lines();
-        let text_highlights = text_view_highlights();
-        let text_state = Cell::new(self.text);
-        let text_area = Rect::new(1, 13, 68, 2);
-        let text_view = text_view_component(&text_lines, &text_highlights, &text_state);
-        let text_layout =
-            text_view.layout(Constraints::tight(text_area.size()), &mut LayoutCx::new());
-        let text_outcome = text_view.handle_event(text_area, &text_layout, event);
-        self.text = text_state.get();
-        if let bmux_tui_components::scroll_view::ScrollViewOutcome::Scrolled { vertical_offset } =
-            text_outcome
-        {
-            self.message = format!("Text scrolled: {vertical_offset}");
+            self.sync_focus();
             return false;
         }
+        if let Event::Mouse(mouse) = event
+            && matches!(mouse.kind, bmux_tui::event::MouseEventKind::Move)
+        {
+            let next = self.target_at(mouse.position);
+            if self.hovered != next {
+                if let Some(previous) = self.hovered {
+                    // The old control receives the outside position to clear hover;
+                    // this is not an activation or keyboard broadcast.
+                    self.dispatch_target(event, Some(previous));
+                }
+                self.hovered = next;
+            }
+        }
+        let target = match event {
+            Event::Mouse(mouse) => {
+                use bmux_tui::event::MouseEventKind;
+                match mouse.kind {
+                    MouseEventKind::Down(_) => {
+                        self.captured = self.mouse_target(*mouse);
+                        if let Some(target) = self.captured {
+                            self.focused = target;
+                        }
+                        self.captured
+                    }
+                    MouseEventKind::Drag(_) => self.captured,
+                    MouseEventKind::Up(_) => self.captured.take(),
+                    _ => self.mouse_target(*mouse),
+                }
+            }
+            Event::Key(_) | Event::Paste(_) => {
+                self.target_visible(self.focused).then_some(self.focused)
+            }
+            _ => None,
+        };
+        let outcome = self.dispatch_target(event, target);
+        self.sync_focus();
+        outcome
+    }
 
+    fn dispatch_target(&mut self, event: &Event, target: Option<Target>) -> bool {
+        if target == Some(Target::Breadcrumbs) {
+            let breadcrumb_items = breadcrumb_items();
+            let breadcrumb_state = Cell::new(self.breadcrumbs);
+            let component = BreadcrumbsComponent::new(
+                "navigation.breadcrumbs",
+                &breadcrumb_items,
+                &breadcrumb_state,
+            );
+            let area = Rect::new(30, 0, 38, 1);
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            let outcome = EventCx::new(&layout).with_transform(
+                0,
+                0,
+                i32::from(area.x),
+                i64::from(area.y),
+                area,
+                |cx| component.handle_event(event, &layout, cx),
+            );
+            self.breadcrumbs = breadcrumb_state.get();
+            if let BreadcrumbsOutcome::Activated { id, .. } = outcome {
+                self.message = format!("Breadcrumb activated: {id}");
+                return false;
+            }
+        }
+        if target == Some(Target::Tabs) {
+            let tab_items = tab_items();
+            let previous_selection = self.tabs.selected();
+            let tab_state = RefCell::new(std::mem::take(&mut self.tabs));
+            let component = TabBarComponent::new("navigation.tabs", &tab_items, &tab_state);
+            let area = TABS_AREA;
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            EventCx::new(&layout).with_transform(
+                0,
+                0,
+                i32::from(area.x),
+                i64::from(area.y),
+                area,
+                |cx| component.event(event, &layout, cx),
+            );
+            self.tabs = tab_state.into_inner();
+            if self.tabs.selected() != previous_selection
+                && let Some(index) = self.tabs.selected()
+            {
+                self.message = format!("Tab selected: {}", tab_items[index].label());
+                return false;
+            }
+        }
+        if target == Some(Target::Tree) {
+            let tree_items = tree_items();
+            let tree_state = RefCell::new(std::mem::take(&mut self.tree));
+            let component = TreeViewComponent::new("navigation.tree", &tree_items, &tree_state);
+            let area = TREE_AREA;
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            let outcome = EventCx::new(&layout).with_transform(
+                0,
+                0,
+                i32::from(area.x),
+                i64::from(area.y),
+                area,
+                |cx| component.handle_event(event, &layout, cx),
+            );
+            self.tree = tree_state.into_inner();
+            match outcome {
+                TreeViewOutcome::Selected { source, .. } => {
+                    self.message = format!("Tree selected: {}", tree_items[source].label);
+                    return false;
+                }
+                TreeViewOutcome::Toggled {
+                    source, expanded, ..
+                } => {
+                    self.message =
+                        format!("Tree {} expanded: {expanded}", tree_items[source].label);
+                    return false;
+                }
+                TreeViewOutcome::Focused { source, .. } => {
+                    self.message = format!("Tree focus: {}", tree_items[source].label);
+                    return false;
+                }
+                TreeViewOutcome::Ignored | TreeViewOutcome::Redraw => {}
+            }
+        }
+        if target == Some(Target::List) {
+            let list_items = list_items();
+            let list_state = Cell::new(self.list);
+            let component =
+                SelectableListComponent::new("navigation.list", &list_items, &list_state);
+            let area = LIST_AREA;
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            let outcome = EventCx::new(&layout).with_transform(
+                0,
+                0,
+                i32::from(area.x),
+                i64::from(area.y),
+                area,
+                |cx| component.handle_event(event, &layout, cx),
+            );
+            self.list = list_state.get();
+            match outcome {
+                SelectableListOutcome::Selected(index) => {
+                    self.message = format!("List selected: {}", list_item_text(&list_items[index]));
+                    return false;
+                }
+                SelectableListOutcome::Focused(index) => {
+                    self.message = format!("List focus: {}", list_item_text(&list_items[index]));
+                    return false;
+                }
+                SelectableListOutcome::Ignored | SelectableListOutcome::Redraw => {}
+            }
+        }
+        if target == Some(Target::Menu) {
+            let menu_items = menu_items();
+            let menu_state = Cell::new(self.menu);
+            let component = MenuComponent::new("navigation.menu", &menu_items, &menu_state);
+            let area = Rect::new(30, 1, 18, 2);
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            let outcome = EventCx::new(&layout).with_transform(
+                0,
+                0,
+                i32::from(area.x),
+                i64::from(area.y),
+                area,
+                |cx| component.handle_event(event, &layout, cx),
+            );
+            self.menu = menu_state.get();
+            match outcome {
+                MenuOutcome::Activated { id, .. } => self.message = format!("Menu action: {id}"),
+                MenuOutcome::Cancelled => self.message = "Menu cancelled".to_string(),
+                MenuOutcome::Ignored
+                | MenuOutcome::Redraw
+                | MenuOutcome::Focused(_)
+                | MenuOutcome::Typeahead(_) => {}
+            }
+        }
+        if target == Some(Target::Scroll) {
+            let lines = scroll_lines();
+            let area = Rect::new(1, 6, 24, 2);
+            let layout = scroll_layout("navigation.scroll", area, &lines, self.scroll);
+            if let bmux_tui_components::scroll_view::ScrollViewOutcome::Scrolled {
+                vertical_offset,
+            } = ScrollView::new().handle_event(area, &layout, &mut self.scroll, event)
+            {
+                self.message = format!("Scroll offset: {vertical_offset}");
+            }
+        }
+        if target == Some(Target::Table) {
+            let table_columns = table_columns();
+            let table_rows = table_rows();
+            let table_state = RefCell::new(std::mem::take(&mut self.table));
+            let component = TableComponent::new(
+                "navigation.table",
+                &table_columns,
+                &table_rows,
+                &table_state,
+            );
+            let area = TABLE_AREA;
+            let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+            let outcome = EventCx::new(&layout).with_transform(
+                0,
+                0,
+                i32::from(area.x),
+                i64::from(area.y),
+                area,
+                |cx| component.handle_event(event, &layout, cx),
+            );
+            self.table = table_state.into_inner();
+            match outcome {
+                TableOutcome::Selected(index) => {
+                    self.message =
+                        format!("Table selected: {}", table_rows[index].cell_plain_text(0));
+                    return false;
+                }
+                TableOutcome::Focused(index) => {
+                    self.message = format!("Table focus: {}", table_rows[index].cell_plain_text(0));
+                    return false;
+                }
+                TableOutcome::Ignored | TableOutcome::Redraw => {}
+            }
+        }
+        if target == Some(Target::Text) {
+            let text_lines = text_view_lines();
+            let text_highlights = text_view_highlights();
+            let text_state = Cell::new(self.text);
+            let text_area = Rect::new(1, 13, 68, 2);
+            let text_view = text_view_component(&text_lines, &text_highlights, &text_state);
+            let text_layout =
+                text_view.layout(Constraints::tight(text_area.size()), &mut LayoutCx::new());
+            let text_outcome = text_view.handle_event(text_area, &text_layout, event);
+            self.text = text_state.get();
+            if let bmux_tui_components::scroll_view::ScrollViewOutcome::Scrolled {
+                vertical_offset,
+            } = text_outcome
+            {
+                self.message = format!("Text scrolled: {vertical_offset}");
+                return false;
+            }
+        }
+        if target != Some(Target::Pane) {
+            return false;
+        }
         let pane = scroll_delegate_pane();
         let mut pane_state = PaneState::new(scroll_delegate_pane_area());
         if let PaneOutcome::ScrollDelegated { direction } =
@@ -341,6 +573,9 @@ fn scroll_layout(
     .layout(Constraints::tight(area.size()), &mut LayoutCx::new())
 }
 
+const TABS_AREA: Rect = Rect::new(1, 0, 26, 1);
+const LIST_AREA: Rect = Rect::new(1, 1, 24, 4);
+const TABLE_AREA: Rect = Rect::new(1, 9, 32, 4);
 const TREE_AREA: Rect = Rect::new(48, 1, 22, 6);
 
 fn render_component(component: &impl Component, area: Rect, cx: &mut PaintCx<'_, '_>) {
@@ -369,7 +604,7 @@ fn render_navigation_with_state(cx: &mut PaintCx<'_, '_>, demo: &NavigationDemo)
             disabled: Style::new().fg(Color::BrightBlack),
             separator: Style::new().fg(Color::BrightBlack),
         }),
-        Rect::new(1, 0, 26, 1),
+        TABS_AREA,
         cx,
     );
 
@@ -389,7 +624,7 @@ fn render_navigation_with_state(cx: &mut PaintCx<'_, '_>, demo: &NavigationDemo)
     let list_state = Cell::new(demo.list);
     render_component(
         &SelectableListComponent::new("navigation.list", &list_items, &list_state),
-        Rect::new(1, 1, 24, 4),
+        LIST_AREA,
         cx,
     );
 
@@ -459,7 +694,7 @@ fn render_navigation_with_state(cx: &mut PaintCx<'_, '_>, demo: &NavigationDemo)
             &table_rows,
             &table_state,
         ),
-        Rect::new(1, 9, 32, 4),
+        TABLE_AREA,
         cx,
     );
 
@@ -610,6 +845,7 @@ pub fn demonstrate_tree_selection() -> String {
 
 pub fn demonstrate_breadcrumb_activation() -> String {
     let mut demo = NavigationDemo::new();
+    demo.focused = Target::Breadcrumbs;
     let _ = demo.handle_event(&Event::Key(KeyStroke::simple(KeyCode::Enter)));
     demo.message
 }
@@ -841,6 +1077,158 @@ mod tests {
         demonstrate_table_selection, demonstrate_text_view_scroll, demonstrate_tree_selection,
         render_navigation, rows,
     };
+
+    #[test]
+    fn focus_traversal_and_resize_clear_capture_without_broadcasting_keys() {
+        let mut demo = super::NavigationDemo::new();
+        let mut tab = bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Tab);
+        demo.handle_event(&bmux_tui::event::Event::Key(tab));
+        assert!(demo.focused == super::Target::Breadcrumbs);
+        tab.modifiers.shift = true;
+        demo.handle_event(&bmux_tui::event::Event::Key(tab));
+        assert!(demo.focused == super::Target::Tabs);
+        demo.captured = Some(super::Target::List);
+        demo.hovered = Some(super::Target::List);
+        demo.handle_event(&bmux_tui::event::Event::Resize(
+            bmux_tui::geometry::Size::new(72, 18),
+        ));
+        assert!(demo.captured.is_none());
+        assert!(demo.hovered.is_none());
+        assert_eq!(demo.tabs.selected(), Some(0));
+    }
+
+    #[test]
+    fn focus_loss_clears_visual_focus_and_suspends_input() {
+        let mut demo = super::NavigationDemo::new();
+        demo.focused = super::Target::List;
+        demo.sync_focus();
+        assert!(demo.list.interaction.focused);
+        demo.handle_event(&bmux_tui::event::Event::Focus(
+            bmux_tui::event::FocusEvent::Lost,
+        ));
+        assert!(!demo.list.interaction.focused);
+        let before = demo.list.selected();
+        demo.handle_event(&bmux_tui::event::Event::Key(
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Down),
+        ));
+        assert_eq!(demo.list.selected(), before);
+    }
+
+    #[test]
+    fn committed_pane_wheel_reaches_delegated_content() {
+        let mut demo = super::NavigationDemo::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            Vec::<u8>::new(),
+            bmux_tui::geometry::Rect::new(0, 0, 72, 18),
+        );
+        terminal.draw(|cx| demo.render(cx)).unwrap();
+        demo.commit_hits(terminal.hits());
+        demo.handle_event(&bmux_tui::event::Event::Mouse(
+            bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::ScrollDown,
+                bmux_tui::geometry::Point::new(32, 8),
+            ),
+        ));
+        assert!(demo.pane_scroll.vertical_offset() > 0);
+    }
+
+    #[test]
+    fn committed_wheel_routes_to_visible_scroll_content() {
+        let mut demo = super::NavigationDemo::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            Vec::<u8>::new(),
+            bmux_tui::geometry::Rect::new(0, 0, 72, 18),
+        );
+        terminal.draw(|cx| demo.render(cx)).unwrap();
+        demo.commit_hits(terminal.hits());
+        for point in [
+            bmux_tui::geometry::Point::new(2, 6),
+            bmux_tui::geometry::Point::new(2, 13),
+        ] {
+            let before = (demo.scroll.vertical_offset(), demo.text.vertical_offset());
+            demo.handle_event(&bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(
+                    bmux_tui::event::MouseEventKind::ScrollDown,
+                    point,
+                ),
+            ));
+            assert_ne!(
+                (demo.scroll.vertical_offset(), demo.text.vertical_offset()),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn committed_empty_scene_excludes_unpainted_allocations() {
+        let mut demo = super::NavigationDemo::new();
+        demo.commit_hits(&bmux_tui::hit::HitMap::new());
+        assert!(
+            demo.target_at(bmux_tui::geometry::Point::new(2, 1))
+                .is_none()
+        );
+        let mut hits = bmux_tui::hit::HitMap::new();
+        // Use a real committed terminal scene to preserve clipping and hit order.
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            Vec::<u8>::new(),
+            bmux_tui::geometry::Rect::new(0, 0, 10, 2),
+        );
+        terminal.draw(|cx| demo.render(cx)).unwrap();
+        hits.clone_from(terminal.hits());
+        demo.commit_hits(&hits);
+        assert!(
+            demo.target_at(bmux_tui::geometry::Point::new(50, 2))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ignored_focused_key_does_not_reach_other_controls() {
+        let mut demo = super::NavigationDemo::new();
+        demo.focused = super::Target::Menu;
+        let tabs = demo.tabs.selected();
+        let scroll = demo.scroll.vertical_offset();
+        demo.handle_event(&bmux_tui::event::Event::Key(
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Right),
+        ));
+        assert_eq!(demo.tabs.selected(), tabs);
+        assert_eq!(demo.scroll.vertical_offset(), scroll);
+    }
+
+    #[test]
+    fn pointer_release_does_not_transfer_capture_to_another_control() {
+        let mut demo = super::NavigationDemo::new();
+        for (kind, point) in [
+            (
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(2, 1),
+            ),
+            (
+                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(10, 0),
+            ),
+        ] {
+            demo.handle_event(&bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(kind, point),
+            ));
+        }
+        assert_eq!(demo.tabs.selected(), Some(0));
+        assert!(demo.captured.is_none());
+    }
+
+    #[test]
+    fn table_input_reaches_the_painted_right_edge() {
+        let mut demo = super::NavigationDemo::new();
+        for kind in [
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+        ] {
+            demo.handle_event(&bmux_tui::event::Event::Mouse(
+                bmux_tui::event::MouseEvent::new(kind, bmux_tui::geometry::Point::new(30, 11)),
+            ));
+        }
+        assert_eq!(demo.table.selected(), Some(1));
+    }
 
     #[test]
     fn tab_mouse_selection_updates_navigation_message() {

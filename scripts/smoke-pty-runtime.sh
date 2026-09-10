@@ -13,7 +13,6 @@ create_sandbox() {
   local root
   root="$(mktemp -d "${TMPDIR:-/tmp}/bmux-smoke.XXXXXX")"
   mkdir -p "$root/config" "$root/data" "$root/runtime" "$root/state" "$root/logs" "$root/tmp"
-  SMOKE_SANDBOXES+=("$root")
   printf '%s' "$root"
 }
 
@@ -69,6 +68,7 @@ run_smoke_with_retry() {
 
   while (( attempt <= max_attempts )); do
     sandbox="$(create_sandbox)"
+    SMOKE_SANDBOXES+=("$sandbox")
     cat >"$sandbox/smoke.toml" <<'EOF'
 [keybindings]
 initial_mode = "normal"
@@ -78,8 +78,8 @@ EOF
       set -euo pipefail
       (
 ${payload}
-      ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_STATE_HOME=\"$sandbox/state\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_CONFIG_DIR=\"$sandbox/config\" BMUX_DATA_DIR=\"$sandbox/data\" BMUX_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_STATE_DIR=\"$sandbox/state\" BMUX_LOG_DIR=\"$sandbox/logs\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null bash -lc 'stty rows 24 cols 80; exec \"${BMUX_SMOKE_BINARY:?}\" --config \"$sandbox/smoke.toml\"' >/dev/null 2>&1
-    "
+      ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_STATE_HOME=\"$sandbox/state\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_CONFIG_DIR=\"$sandbox/config\" BMUX_DATA_DIR=\"$sandbox/data\" BMUX_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_STATE_DIR=\"$sandbox/state\" BMUX_LOG_DIR=\"$sandbox/logs\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null bash -lc 'stty rows 24 cols 80; exec \"${BMUX_SMOKE_BINARY:?}\" --config \"$sandbox/smoke.toml\"'
+    " >"$sandbox/pty.log" 2>&1
     status=$?
     set -e
 
@@ -90,6 +90,7 @@ ${payload}
 
     if [[ $status -ne 143 ]]; then
       echo "fail: ${non_timeout_failure_message} ${status}"
+      tail -c 8192 "$sandbox/pty.log"
       return 1
     fi
 

@@ -62,6 +62,7 @@ tab-bar = ["keyboard-input"]
 table = ["keyboard-input", "scroll-view"]
 terminal-viewer = ["dep:bmux_terminal_grid"]
 text-input = [
+    "scroll-view",
     "keyboard-input",
     "dep:bmux_text_edit",
     "dep:unicode-segmentation",

@@ -1,4 +1,6 @@
 use bmux_attach_view_protocol::AttachLocalPresentationSnapshot;
+use bmux_tui::component::{Component, Constraints, LayoutCx, LayoutNode};
+use bmux_tui::composition::{Row, TextBlock};
 use bmux_tui::measured_list::MeasuredListIndex;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -35,6 +37,9 @@ pub struct ProjectedSegment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectedBar {
     pub(super) segments: Vec<ProjectedSegment>,
+    layout: LayoutNode,
+    previous_anchor: Option<Uuid>,
+    next_anchor: Option<Uuid>,
 }
 
 pub struct ProjectedTabRange {
@@ -99,12 +104,46 @@ impl ProjectedBar {
             tabs: self.tab_ranges(),
         }
     }
+    fn new(segments: Vec<ProjectedSegment>) -> Self {
+        let layout = {
+            let row = segments.iter().fold(Row::new(), |row, segment| {
+                row.child(TextBlock::new(segment.text.as_str()))
+            });
+            row.layout(
+                Constraints::new(0, u64::MAX, 1, Some(1)),
+                &mut LayoutCx::new(),
+            )
+        };
+        Self {
+            segments,
+            layout,
+            previous_anchor: None,
+            next_anchor: None,
+        }
+    }
+
+    pub const fn scroll_target(&self, forward: bool) -> Option<Uuid> {
+        if forward {
+            self.next_anchor
+        } else {
+            self.previous_anchor
+        }
+    }
+
+    pub fn positioned_segments(&self) -> impl Iterator<Item = (&ProjectedSegment, u16, u16)> {
+        self.segments
+            .iter()
+            .zip(&self.layout.children)
+            .map(|(segment, child)| {
+                let x = u16::try_from(child.x).unwrap_or(u16::MAX);
+                let width = u16::try_from(child.node.size.width).unwrap_or(u16::MAX);
+                (segment, x, width)
+            })
+    }
+
     pub fn tab_ranges(&self) -> Vec<ProjectedTabRange> {
         let mut ranges: Vec<ProjectedTabRange> = Vec::new();
-        let mut x = 0_u16;
-        for segment in &self.segments {
-            let width =
-                u16::try_from(UnicodeWidthStr::width(segment.text.as_str())).unwrap_or(u16::MAX);
+        for (segment, x, width) in self.positioned_segments() {
             if let Some(tab_id) = segment.tab_id {
                 if let Some(last) = ranges.last_mut()
                     && last.tab_id == tab_id
@@ -119,7 +158,6 @@ impl ProjectedBar {
                     });
                 }
             }
-            x = x.saturating_add(width);
         }
         ranges
     }
@@ -130,13 +168,10 @@ impl ProjectedBar {
 
     #[cfg(test)]
     pub fn tab_at_col(&self, col: u16) -> Option<Uuid> {
-        let mut x = 0_u16;
-        for segment in &self.segments {
-            let width = u16::try_from(UnicodeWidthStr::width(segment.text.as_str())).ok()?;
+        for (segment, x, width) in self.positioned_segments() {
             if col >= x && col < x.saturating_add(width) {
                 return segment.tab_id;
             }
-            x = x.saturating_add(width);
         }
         None
     }
@@ -258,6 +293,17 @@ impl RenderStyle {
 #[derive(Clone, Debug)]
 pub struct ProjectionMeasurements(RefCell<MeasuredListIndex<Uuid>>);
 
+impl ProjectionMeasurements {
+    pub fn step_anchor(&self, first: Uuid, last: Uuid, forward: bool) -> Option<Uuid> {
+        bmux_tui_components::scroll_view::ScrollView::step_item_anchor(
+            &self.0.borrow(),
+            &first,
+            &last,
+            forward,
+        )
+    }
+}
+
 impl Default for ProjectionMeasurements {
     fn default() -> Self {
         Self(RefCell::new(MeasuredListIndex::new(0)))
@@ -267,7 +313,7 @@ impl Default for ProjectionMeasurements {
 #[derive(Default)]
 pub struct ProjectionInteraction<'a> {
     pub(super) measurements: Option<&'a ProjectionMeasurements>,
-    pub(super) scroll_anchor: Option<usize>,
+    pub(super) scroll_anchor: Option<Uuid>,
     pub(super) editing_tab_id: Option<Uuid>,
     pub(super) edit_text: Option<&'a str>,
     pub(super) edit_selection: Option<(usize, usize)>,
@@ -445,7 +491,13 @@ pub fn project_bar(
             edit_cursor_offset: None,
         });
     }
-    ProjectedBar { segments }
+    let mut projected = ProjectedBar::new(segments);
+    let ranges = projected.tab_ranges();
+    if let Some((first, last)) = ranges.first().zip(ranges.last()) {
+        projected.previous_anchor = measurements.step_anchor(first.tab_id, last.tab_id, false);
+        projected.next_anchor = measurements.step_anchor(first.tab_id, last.tab_id, true);
+    }
+    projected
 }
 
 fn append_menu(
@@ -629,7 +681,7 @@ fn visible_tabs_for_layout(
     settings: &Settings,
     style: &RenderStyle,
     budget: usize,
-    scroll_anchor: Option<usize>,
+    scroll_anchor: Option<Uuid>,
     measurements: &mut MeasuredListIndex<Uuid>,
 ) -> TabTab {
     if tokens.is_empty() {
@@ -665,58 +717,52 @@ fn visible_tabs_for_layout(
         );
     }
     let anchor = scroll_anchor
-        .unwrap_or_else(|| tokens.iter().position(|token| token.active).unwrap_or(0))
-        .min(tokens.len() - 1);
-    let cap = settings.maximum_visible_tabs.unwrap_or(usize::MAX).max(1);
-    let mut start = anchor;
-    let mut end = anchor + 1;
-    let prefer_left_first = matches!(settings.align_active, ActiveAlignment::FocusBias);
-    let mut extend_left = prefer_left_first;
-    loop {
-        if end.saturating_sub(start) >= cap {
-            break;
-        }
-        let left = if scroll_anchor.is_some() {
-            None
-        } else {
-            start.checked_sub(1)
-        };
-        let right = (end < tokens.len()).then_some(end);
-        let candidates = if extend_left {
-            [left, right]
-        } else {
-            [right, left]
-        };
-        let mut expanded = false;
-        for candidate in candidates.into_iter().flatten() {
-            let proposed = if candidate < start {
-                TabTab {
-                    start: candidate,
-                    end,
-                }
-            } else {
-                TabTab {
-                    start,
-                    end: candidate + 1,
-                }
-            };
-            if tab_window_width(measurements, &proposed, style, settings.overflow_style)
-                <= budget as u64
-            {
-                start = proposed.start;
-                end = proposed.end;
-                expanded = true;
-                break;
-            }
-        }
-        if !expanded {
-            break;
-        }
-        extend_left = !extend_left;
+        .filter(|key| measurements.index_of(key).is_some())
+        .unwrap_or_else(|| {
+            tokens
+                .iter()
+                .find(|token| token.active)
+                .unwrap_or(&tokens[0])
+                .tab_id
+        });
+    let range = bmux_tui_components::scroll_view::ScrollView::item_viewport(
+        measurements,
+        &anchor,
+        bmux_tui_components::scroll_view::ItemViewportPolicy {
+            extent: budget as u64,
+            maximum_items: settings.maximum_visible_tabs.unwrap_or(usize::MAX),
+            extend_before: scroll_anchor.is_none(),
+            prefer_before: matches!(settings.align_active, ActiveAlignment::FocusBias),
+        },
+        |range| overflow_width(tokens.len(), &range, style, settings.overflow_style),
+    )
+    .expect("the selected anchor belongs to the synchronized measurements");
+    TabTab {
+        start: range.start,
+        end: range.end,
     }
-    TabTab { start, end }
 }
 
+fn overflow_width(
+    count: usize,
+    range: &std::ops::Range<usize>,
+    style: &RenderStyle,
+    overflow_style: OverflowStyle,
+) -> u64 {
+    let separator = UnicodeWidthStr::width(style.tab_separator.as_str()) as u64;
+    [range.start, count.saturating_sub(range.end)]
+        .into_iter()
+        .filter(|hidden| *hidden > 0)
+        .fold(0_u64, |width, hidden| {
+            width
+                .saturating_add(UnicodeWidthStr::width(
+                    style.overflow(hidden, overflow_style).as_str(),
+                ) as u64)
+                .saturating_add(separator)
+        })
+}
+
+#[cfg(test)]
 fn tab_window_width(
     measurements: &MeasuredListIndex<Uuid>,
     tab: &TabTab,
@@ -902,6 +948,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scroll_targets_remain_bound_to_the_projected_order() {
+        let settings = Settings {
+            maximum_visible_tabs: Some(1),
+            ..Settings::default()
+        };
+        let measurements = ProjectionMeasurements::default();
+        let interaction = ProjectionInteraction {
+            measurements: Some(&measurements),
+            ..ProjectionInteraction::default()
+        };
+        let mut windows = vec![
+            tab(1, "one", true),
+            tab(2, "two", false),
+            tab(3, "three", false),
+        ];
+        let displayed = project_bar(&settings, &windows, &local(80), None, &interaction);
+        assert_eq!(displayed.scroll_target(true), Some(Uuid::from_u128(2)));
+        windows.swap(1, 2);
+        let pending = project_bar(&settings, &windows, &local(80), None, &interaction);
+        assert_eq!(pending.scroll_target(true), Some(Uuid::from_u128(3)));
+        assert_eq!(displayed.scroll_target(true), Some(Uuid::from_u128(2)));
+        windows.clear();
+        project_bar(&settings, &windows, &local(80), None, &interaction);
+        assert_eq!(displayed.scroll_target(true), Some(Uuid::from_u128(2)));
+    }
+
+    #[test]
     fn retained_projection_reconciles_width_order_and_empty_content() {
         let settings = Settings::default();
         let measurements = ProjectionMeasurements::default();
@@ -991,7 +1064,7 @@ mod tests {
                 &local(width),
                 None,
                 &ProjectionInteraction {
-                    scroll_anchor: Some(1),
+                    scroll_anchor: Some(Uuid::from_u128(2)),
                     ..ProjectionInteraction::default()
                 },
             );
@@ -1025,7 +1098,7 @@ mod tests {
                 &local(width),
                 None,
                 &ProjectionInteraction {
-                    scroll_anchor: Some(1),
+                    scroll_anchor: Some(Uuid::from_u128(2)),
                     ..ProjectionInteraction::default()
                 },
             );
@@ -1268,28 +1341,26 @@ mod tests {
     #[test]
     fn insertion_ignores_separator_text_and_uses_display_cell_widths() {
         for separator in [">", "│", "界", "   ", " → ", "", "e\u{301}"] {
-            let projected = ProjectedBar {
-                segments: vec![
-                    ProjectedSegment {
-                        text: "界ab".into(),
-                        kind: SegmentKind::ActiveTab,
-                        tab_id: Some(Uuid::from_u128(1)),
-                        edit_cursor_offset: None,
-                    },
-                    ProjectedSegment {
-                        text: separator.into(),
-                        kind: SegmentKind::Base,
-                        tab_id: None,
-                        edit_cursor_offset: None,
-                    },
-                    ProjectedSegment {
-                        text: "next".into(),
-                        kind: SegmentKind::InactiveTab,
-                        tab_id: Some(Uuid::from_u128(2)),
-                        edit_cursor_offset: None,
-                    },
-                ],
-            };
+            let projected = ProjectedBar::new(vec![
+                ProjectedSegment {
+                    text: "界ab".into(),
+                    kind: SegmentKind::ActiveTab,
+                    tab_id: Some(Uuid::from_u128(1)),
+                    edit_cursor_offset: None,
+                },
+                ProjectedSegment {
+                    text: separator.into(),
+                    kind: SegmentKind::Base,
+                    tab_id: None,
+                    edit_cursor_offset: None,
+                },
+                ProjectedSegment {
+                    text: "next".into(),
+                    kind: SegmentKind::InactiveTab,
+                    tab_id: Some(Uuid::from_u128(2)),
+                    edit_cursor_offset: None,
+                },
+            ]);
             let ranges = projected.tab_ranges();
             assert_eq!(ranges[0].end, 4);
             for col in ranges[0].end..ranges[1].start {

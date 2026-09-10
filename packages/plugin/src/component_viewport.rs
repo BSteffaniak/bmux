@@ -42,12 +42,11 @@ impl ComponentViewport {
     /// Returns `None` for empty or oversized raster allocations.
     #[must_use]
     pub fn new(layout: LayoutNode, viewport: Rect, offset: Point) -> Option<Self> {
-        let width = u16::try_from(layout.size.width).ok()?;
-        let height = u16::try_from(layout.size.height).ok()?;
-        let cells = usize::from(width).checked_mul(usize::from(height))?;
-        if cells == 0
-            || cells > 65_536
+        if layout.size.width == 0
+            || layout.size.height == 0
             || viewport.is_empty()
+            || offset.x.checked_add(viewport.width).is_none()
+            || offset.y.checked_add(viewport.height).is_none()
             || usize::from(viewport.width) * usize::from(viewport.height) > 65_536
         {
             return None;
@@ -56,7 +55,10 @@ impl ComponentViewport {
             layout,
             viewport,
             offset,
-            raster: Rect::new(0, 0, width, height),
+            // Keep raster coordinates component-local so selection, cursor, and
+            // event metadata retain their existing coordinate contract. Only the
+            // visible allocation consumes cells, not the full logical extent.
+            raster: Rect::new(offset.x, offset.y, viewport.width, viewport.height),
         })
     }
 
@@ -128,16 +130,10 @@ impl ComponentViewport {
     pub fn event(&self, component: &dyn Component, event: &Event) -> EventOutcome {
         let mut event = event.clone();
         if let Event::Mouse(mouse) = &mut event {
-            mouse.position.x = mouse
-                .position
-                .x
-                .saturating_add(self.offset.x)
-                .saturating_sub(self.viewport.x);
-            mouse.position.y = mouse
-                .position
-                .y
-                .saturating_add(self.offset.y)
-                .saturating_sub(self.viewport.y);
+            mouse.position.x =
+                Self::unproject_axis(mouse.position.x, self.viewport.x, self.offset.x);
+            mouse.position.y =
+                Self::unproject_axis(mouse.position.y, self.viewport.y, self.offset.y);
         }
         component.event(&event, &self.layout, &mut EventCx::new(&self.layout))
     }
@@ -164,6 +160,11 @@ impl ComponentViewport {
         self.viewport
     }
 
+    fn unproject_axis(position: u16, origin: u16, offset: u16) -> u16 {
+        let logical = i32::from(position) - i32::from(origin) + i32::from(offset);
+        u16::try_from(logical.clamp(0, i32::from(u16::MAX))).expect("clamped coordinate fits u16")
+    }
+
     fn project(&self, point: Point) -> Option<Point> {
         let x = point.x.checked_sub(self.offset.x)?;
         let y = point.y.checked_sub(self.offset.y)?;
@@ -179,13 +180,71 @@ mod tests {
     use super::*;
     use bmux_tui::component::{LayoutId, LogicalSize};
 
+    #[test]
+    fn logical_extent_does_not_determine_raster_allocation() {
+        let viewport = ComponentViewport::new(
+            LayoutNode::leaf("large".into(), LogicalSize::new(1_000_000, 1_000_000)),
+            Rect::new(3, 4, 8, 2),
+            Point::new(100, 200),
+        )
+        .unwrap();
+        let buffer = Buffer::empty(viewport.raster);
+        assert_eq!(buffer.cells().len(), 16);
+        assert_eq!(buffer.area(), Rect::new(100, 200, 8, 2));
+        assert_eq!(
+            viewport.project(Point::new(102, 201)),
+            Some(Point::new(5, 5))
+        );
+        assert_eq!(viewport.project(Point::new(99, 200)), None);
+    }
+
+    #[test]
+    fn translated_input_does_not_saturate_before_subtracting_origin() {
+        assert_eq!(
+            ComponentViewport::unproject_axis(60_002, 60_000, 10_000),
+            10_002
+        );
+        assert_eq!(ComponentViewport::unproject_axis(5, 10, 100), 95);
+        assert_eq!(ComponentViewport::unproject_axis(0, 10, 2), 0);
+        assert!(
+            ComponentViewport::new(
+                LayoutNode::leaf("overflow".into(), LogicalSize::new(100_000, 1)),
+                Rect::new(0, 0, 10, 1),
+                Point::new(65_530, 0),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn clipped_raster_preserves_component_coordinates() {
+        use bmux_tui::component::{Constraints, LayoutCx};
+        let text = bmux_tui::composition::TextBlock::new("zero\none\ntwo\nthree");
+        let layout = text.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let viewport =
+            ComponentViewport::new(layout, Rect::new(3, 4, 8, 1), Point::new(0, 2)).unwrap();
+        let painted = viewport.paint(&text);
+        let row: String = painted
+            .buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert_eq!(row.trim_end(), "two");
+    }
+
     fn viewport(width: u64, height: u64) -> Option<ComponentViewport> {
         ComponentViewport::new(
             LayoutNode::leaf(
                 LayoutId::new("raster-test"),
                 LogicalSize::new(width, height),
             ),
-            Rect::new(0, 0, 10, 10),
+            Rect::new(
+                0,
+                0,
+                u16::try_from(width).ok()?,
+                u16::try_from(height).ok()?,
+            ),
             Point::new(0, 0),
         )
     }

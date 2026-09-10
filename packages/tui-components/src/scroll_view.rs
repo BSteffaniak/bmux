@@ -26,6 +26,19 @@ use crate::scrollbar::{
 };
 use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
 
+/// Admission policy for a viewport that preserves whole measured items.
+#[derive(Debug, Clone, Copy)]
+pub struct ItemViewportPolicy {
+    /// Available main-axis cells, including caller-owned chrome.
+    pub extent: u64,
+    /// Maximum admitted items; zero is treated as one for the anchor.
+    pub maximum_items: usize,
+    /// Allow items before the anchor (false pins the anchor to the start).
+    pub extend_before: bool,
+    /// Prefer extending before the anchor first, then alternate directions.
+    pub prefer_before: bool,
+}
+
 /// Stable layout identity and viewport-relative position used across relayout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrollAnchor {
@@ -736,6 +749,78 @@ impl ScrollView {
         content_width(layout).saturating_sub(layout.size.width)
     }
 
+    /// Admit a contiguous measured range around a stable anchor.
+    ///
+    /// The anchor is retained even when oversized; painting must clip it.
+    /// `chrome` supplies extra main-axis extent for a proposed range (for
+    /// example overflow indicators). Product labels and chrome remain caller-owned.
+    /// Missing anchors return `None`. Work is bounded by the collection size.
+    #[must_use]
+    pub fn item_viewport<K: Clone + Ord>(
+        index: &bmux_tui::measured_list::MeasuredListIndex<K>,
+        anchor: &K,
+        policy: ItemViewportPolicy,
+        mut chrome: impl FnMut(std::ops::Range<usize>) -> u64,
+    ) -> Option<std::ops::Range<usize>> {
+        let anchor = index.index_of(anchor)?;
+        let mut range = anchor..anchor + 1;
+        let mut before = policy.prefer_before;
+        while range.len() < policy.maximum_items.max(1) {
+            let left = policy
+                .extend_before
+                .then(|| range.start.checked_sub(1))
+                .flatten();
+            let right = (range.end < index.len()).then_some(range.end);
+            let candidates = if before { [left, right] } else { [right, left] };
+            let mut admitted = None;
+            for candidate in candidates.into_iter().flatten() {
+                let proposed = range.start.min(candidate)..range.end.max(candidate + 1);
+                let last = proposed.end - 1;
+                let end = index
+                    .item_offset(last)?
+                    .saturating_add(index.item(last)?.height);
+                let extent = end.saturating_sub(index.item_offset(proposed.start)?);
+                if extent.saturating_add(chrome(proposed.clone())) <= policy.extent {
+                    admitted = Some(proposed);
+                    break;
+                }
+            }
+            let Some(next) = admitted else { break };
+            range = next;
+            before = !before;
+        }
+        Some(range)
+    }
+
+    /// Resolve a one-item viewport step from visible stable-key boundaries.
+    ///
+    /// The caller supplies the actually visible first/last items after its
+    /// admission policy. A forward step stops once the last item is visible;
+    /// a backward step stops at the first item. Missing or reversed boundaries
+    /// return `None` rather than guessing a target from stale geometry.
+    #[must_use]
+    pub fn step_item_anchor<K: Clone + Ord>(
+        index: &bmux_tui::measured_list::MeasuredListIndex<K>,
+        first_visible: &K,
+        last_visible: &K,
+        forward: bool,
+    ) -> Option<K> {
+        let first = index.index_of(first_visible)?;
+        let last = index.index_of(last_visible)?;
+        if first > last {
+            return None;
+        }
+        let next = if forward {
+            if last.checked_add(1)? >= index.len() {
+                return None;
+            }
+            first.checked_add(1)?
+        } else {
+            first.checked_sub(1)?
+        };
+        index.item(next).map(|item| item.key.clone())
+    }
+
     /// Move vertically by a signed logical-row delta and clamp to layout.
     ///
     /// Scrolling to the final row starts following appends; any other
@@ -1190,6 +1275,62 @@ pub(crate) const fn reveal_offset(offset: u64, viewport: u64, start: u64, height
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn item_viewport_admits_measured_ranges_and_preserves_oversized_anchor() {
+        use super::ItemViewportPolicy;
+        let mut index = bmux_tui::measured_list::MeasuredListIndex::new(2);
+        index.sync([(10, 0), (20, 0), (30, 0)], 1, 0, |_| 70_000);
+        let mut policy = ItemViewportPolicy {
+            extent: 140_007,
+            maximum_items: 3,
+            extend_before: true,
+            prefer_before: true,
+        };
+        assert_eq!(
+            ScrollView::item_viewport(&index, &20, policy, |_| 5),
+            Some(0..2)
+        );
+        policy.prefer_before = false;
+        assert_eq!(
+            ScrollView::item_viewport(&index, &20, policy, |_| 5),
+            Some(1..3)
+        );
+        policy.extent = 1;
+        assert_eq!(
+            ScrollView::item_viewport(&index, &20, policy, |_| 5),
+            Some(1..2)
+        );
+        assert_eq!(ScrollView::item_viewport(&index, &99, policy, |_| 0), None);
+        policy.extent = u64::MAX;
+        policy.extend_before = false;
+        assert_eq!(
+            ScrollView::item_viewport(&index, &20, policy, |_| 0),
+            Some(1..3)
+        );
+    }
+    #[test]
+    fn item_anchor_steps_use_keys_and_actual_visible_edges() {
+        let mut index = bmux_tui::measured_list::MeasuredListIndex::new(2);
+        index.sync([(10, 0), (20, 0), (30, 0), (40, 0)], 1, 0, |_| 70_000);
+        assert_eq!(
+            ScrollView::step_item_anchor(&index, &10, &20, true),
+            Some(20)
+        );
+        assert_eq!(
+            ScrollView::step_item_anchor(&index, &20, &30, false),
+            Some(10)
+        );
+        assert_eq!(ScrollView::step_item_anchor(&index, &10, &20, false), None);
+        assert_eq!(ScrollView::step_item_anchor(&index, &20, &40, true), None);
+        assert_eq!(ScrollView::step_item_anchor(&index, &30, &20, true), None);
+        assert_eq!(ScrollView::step_item_anchor(&index, &99, &30, true), None);
+        index.sync([(30, 0), (10, 0), (40, 0)], 1, 0, |_| 70_000);
+        assert_eq!(
+            ScrollView::step_item_anchor(&index, &30, &10, true),
+            Some(10)
+        );
+        assert_eq!(ScrollView::step_item_anchor(&index, &20, &40, false), None);
+    }
     #[test]
     fn shared_reveal_offset_handles_edges_and_saturation() {
         for (offset, viewport, start, height, expected) in [

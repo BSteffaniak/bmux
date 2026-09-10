@@ -938,19 +938,29 @@ fn paint_sidebar_field(
     if width == 0 {
         return;
     }
-    let height = u16::try_from(child.node.size.height).unwrap_or(u16::MAX);
+    let start = placement.0.saturating_add(child.y);
+    let end = start.saturating_add(child.node.size.height);
+    let visible_start = start.max(placement.1.start);
+    let visible_end = end.min(placement.1.end);
+    if visible_start >= visible_end {
+        return;
+    }
+    let height = u16::try_from(visible_end - visible_start).unwrap_or(u16::MAX);
+    let offset = i64::try_from(visible_start - start).unwrap_or(i64::MAX);
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-    field.paint(&child.node, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+    PaintCx::new(&mut Frame::new(&mut buffer)).with_child(
+        0,
+        -offset,
+        bmux_tui::paint::LocalRect::new(0, offset, width, height),
+        |cx| field.paint(&child.node, cx),
+    );
     for (offset, cells) in buffer.cells().chunks(usize::from(width)).enumerate() {
         let text = cells
             .iter()
             .filter(|cell| !cell.is_wide_continuation())
             .map(|cell| cell.symbol.as_str())
             .collect::<String>();
-        let logical_row = placement
-            .0
-            .saturating_add(child.y)
-            .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
+        let logical_row = visible_start.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
         let Some(projected) = bmux_tui_components::scroll_view::ScrollView::project_rows(
             &placement.1,
             logical_row..logical_row.saturating_add(1),
@@ -1236,6 +1246,24 @@ bmux_plugin_sdk::export_plugin!(SidebarPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn field_paints_visible_rows_beyond_terminal_coordinate_limit() {
+        use bmux_tui::component::{ChildLayout, Component, Constraints, LayoutCx};
+        let text = format!("{}deep", "row\n".repeat(70_000));
+        let field = bmux_tui::composition::TextBlock::new(text.as_str());
+        let layout = field.layout(Constraints::for_width(4), &mut LayoutCx::new());
+        let child = ChildLayout::new(0, 0, layout);
+        let mut ops = Vec::new();
+        super::paint_sidebar_field(
+            &field,
+            &child,
+            &(0, 70_000..70_001),
+            super::RenderStyle::new(),
+            &mut ops,
+        );
+        assert_eq!(ops.len(), 1);
+        assert!(matches!(&ops[0], super::RenderOp::TextRun { text, .. } if text == "deep"));
+    }
     use super::*;
 
     #[test]
