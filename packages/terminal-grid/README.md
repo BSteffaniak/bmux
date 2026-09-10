@@ -65,6 +65,21 @@ clipped wide-glyph fragments. Narrowing then widening does not destroy source
 cells. Applications own overflow indicators, horizontal navigation, and the
 choice between main-history projection and active-screen presentation.
 
+`ContentRows.sources` parallels `rows` and `anchors` with half-open logical
+source ranges. Their end columns count source cells, not display width: a wide
+glyph projected at width one still consumes two logical columns. Empty lines
+have equal start/end anchors but represent a visible row; `continues` distinguishes
+soft continuation (including outside the capture) from a hard end. An exclusive
+end is range metadata, not necessarily a resolvable content anchor. Consumers
+must not reconstruct these ranges from painted text. Range metadata is included
+in the projection allocation budget and does not scan unselected line prefixes.
+
+For positioned selection, `screen_window_with_sources` adds one source-column
+range per row, the content revision, and flags for blanked left/right wide-glyph
+fragments. Display columns map by adding the source range start, including
+implicit blanks; blanked fragments must not be copied as partial source glyphs.
+The existing `screen_window` remains available without metadata overhead.
+
 The generic `bmux_tui_components::terminal_viewer` uses these primitives for its
 bounded compatibility renderer. Performance-sensitive live consumers should
 retain the stream and capture themselves instead of passing cumulative bytes to

@@ -27,11 +27,43 @@ pub struct ContentAnchor {
     pub column: usize,
 }
 
+/// Source extent of one projected row. Both anchors address the same logical
+/// line; `end` is exclusive, including when a wide glyph occupies one display
+/// column. An empty line has equal start/end anchors but is still a visible row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentRowSource {
+    pub start: ContentAnchor,
+    pub end: ContentAnchor,
+    /// The row continues into another projected row or outside this capture.
+    pub continues: bool,
+}
+
+/// A positioned screen row's source coordinates. Display column `x` maps to
+/// `columns.start + x`, including implicit blank cells. A clipped wide-glyph
+/// fragment is blanked, not a selectable partial source glyph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenRowSource {
+    pub row: usize,
+    pub columns: Range<usize>,
+    pub clipped_left: bool,
+    pub clipped_right: bool,
+}
+
+/// Bounded active-screen crop with correspondence from the same grid revision.
+#[derive(Debug)]
+pub struct ScreenRows {
+    pub rows: Vec<PhysicalRow>,
+    pub sources: Vec<ScreenRowSource>,
+    pub revision: u64,
+}
+
 /// A bounded projected window, with source positions for its row starts.
 #[derive(Debug)]
 pub struct ContentRows {
     pub rows: Vec<PhysicalRow>,
     pub anchors: Vec<ContentAnchor>,
+    /// One source range per row, in exactly the same order as `rows`/`anchors`.
+    pub sources: Vec<ContentRowSource>,
     pub has_more_above: bool,
     pub has_more_below: bool,
     /// The source grid has already evicted history. No missing prefix is invented.
@@ -228,6 +260,60 @@ impl TerminalGrid {
             history_truncated: self.history_truncated,
             viewport_prefix_continues: !self.pending_history_cells.is_empty(),
             index: None,
+        })
+    }
+
+    /// Crop positioned output and return source-column correspondence.
+    /// No terminal state is changed. Metadata is admitted before row allocation.
+    /// A source range describes physical columns, not UTF-8 bytes; edge flags
+    /// mark blanked fragments of wide glyphs that selection must not copy.
+    ///
+    /// # Errors
+    /// Returns `BudgetExhausted` when metadata, scanning, or row allocations
+    /// exceed the caller's allowances.
+    pub fn screen_window_with_sources(
+        &self,
+        columns: Range<usize>,
+        rows: Range<usize>,
+        mut budget: ContentBudget,
+    ) -> Result<ScreenRows, HistorySliceError> {
+        let start = columns.start.min(self.width);
+        let end = columns.end.min(self.width).max(start);
+        let first_row = rows.start.min(self.height);
+        let last_row = rows.end.min(self.height).max(first_row);
+        let count = last_row - first_row;
+        let metadata = count
+            .checked_mul(std::mem::size_of::<ScreenRowSource>())
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        budget.charge(count, metadata)?;
+        let mut sources = Vec::new();
+        sources
+            .try_reserve_exact(count)
+            .map_err(|_| HistorySliceError::BudgetExhausted)?;
+        for row in first_row..last_row {
+            let source = self
+                .viewport_row_ref(row)
+                .ok_or(HistorySliceError::Unavailable)?;
+            sources.push(ScreenRowSource {
+                row,
+                columns: start..end,
+                clipped_left: start < end
+                    && source
+                        .cells()
+                        .get(start)
+                        .is_some_and(Cell::is_wide_continuation),
+                clipped_right: start < end
+                    && source
+                        .cells()
+                        .get(end)
+                        .is_some_and(Cell::is_wide_continuation),
+            });
+        }
+        let rows = self.screen_window(start..end, first_row..last_row, budget)?;
+        Ok(ScreenRows {
+            rows,
+            sources,
+            revision: self.content_revision,
         })
     }
 
@@ -466,13 +552,21 @@ impl ContentProjection {
         let end = range.end.min(index.rows.len()).max(start);
         let count = end - start;
         let metadata = count
-            .checked_mul(std::mem::size_of::<PhysicalRow>() + std::mem::size_of::<ContentAnchor>())
+            .checked_mul(
+                std::mem::size_of::<PhysicalRow>()
+                    + std::mem::size_of::<ContentAnchor>()
+                    + std::mem::size_of::<ContentRowSource>(),
+            )
             .ok_or(HistorySliceError::BudgetExhausted)?;
         bytes = bytes
             .checked_sub(metadata)
             .ok_or(HistorySliceError::BudgetExhausted)?;
         let mut rows = Vec::new();
         let mut anchors = Vec::new();
+        let mut sources = Vec::new();
+        sources
+            .try_reserve_exact(count)
+            .map_err(|_| HistorySliceError::BudgetExhausted)?;
         rows.try_reserve_exact(count)
             .map_err(|_| HistorySliceError::BudgetExhausted)?;
         anchors
@@ -481,8 +575,12 @@ impl ContentProjection {
         for selected in &index.rows[start..end] {
             let source = &self.lines[selected.line];
             // Admission precedes materialization, including wide-cell slots.
+            let mut end_column = selected.column;
             for cell in &source.cells[selected.cells.clone()] {
                 charge_projected_cell(&mut bytes, cell)?;
+                end_column = end_column
+                    .checked_add(usize::from(cell.width()).max(1))
+                    .ok_or(HistorySliceError::BudgetExhausted)?;
             }
             let mut row = crate::reflow::try_project_logical_line_window_retained(
                 &source.cells[selected.cells.clone()],
@@ -494,15 +592,25 @@ impl ContentProjection {
             .ok_or(HistorySliceError::BudgetExhausted)?;
             row.set_wrapped(selected.wrapped);
             rows.push(row);
-            anchors.push(ContentAnchor {
+            let anchor = ContentAnchor {
                 capture: self.capture,
                 line: selected.line,
                 column: selected.column,
+            };
+            anchors.push(anchor);
+            sources.push(ContentRowSource {
+                start: anchor,
+                end: ContentAnchor {
+                    column: end_column,
+                    ..anchor
+                },
+                continues: selected.wrapped,
             });
         }
         Ok(ContentRows {
             rows,
             anchors,
+            sources,
             has_more_above: self.more_above || start > 0,
             has_more_below: end < index.rows.len(),
             history_truncated: self.history_truncated,

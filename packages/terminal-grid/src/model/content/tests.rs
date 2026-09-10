@@ -112,6 +112,76 @@ fn viewport_budget_is_independent_of_hidden_history() {
 }
 
 #[test]
+fn source_ranges_preserve_wide_columns_empty_lines_and_continuations() {
+    let (_, mut projection) = capture("界z\r\n\r\nlast", 8, 4);
+    projection.prepare(1, budget()).unwrap();
+    let window = projection.tail(30, budget().bytes).unwrap();
+    assert_eq!(window.sources.len(), window.rows.len());
+    assert_eq!(window.sources[0].start.column, 0);
+    assert_eq!(window.sources[0].end.column, 2);
+    assert!(window.sources[0].continues);
+    assert_eq!(window.sources[1].start.column, 2);
+    assert_eq!(window.sources[1].end.column, 3);
+    assert!(!window.sources[1].continues);
+    let empty = window.sources[2];
+    assert_eq!(empty.start, empty.end);
+    assert!(!empty.continues);
+    assert_eq!(projection.resolve(empty.start), Some(2));
+    for (anchor, source) in window.anchors.iter().zip(&window.sources) {
+        assert_eq!(*anchor, source.start);
+    }
+    let selected = projection.window(0..1, budget().bytes).unwrap();
+    assert!(selected.sources[0].continues);
+    assert!(selected.has_more_below);
+}
+
+#[test]
+fn screen_source_ranges_mark_both_clipped_edges_and_charge_metadata() {
+    let (stream, _) = capture("\x1b[?1049h界a界", 8, 2);
+    let before = stream.grid().snapshot(0, 2);
+    let crop = stream
+        .grid()
+        .screen_window_with_sources(1..4, 0..1, budget())
+        .unwrap();
+    assert_eq!(
+        crop.sources,
+        vec![ScreenRowSource {
+            row: 0,
+            columns: 1..4,
+            clipped_left: true,
+            clipped_right: true
+        }]
+    );
+    assert_eq!(texts(&crop.rows), [" a"]);
+    assert_eq!(crop.revision, stream.grid().content_revision());
+    let full = stream
+        .grid()
+        .screen_window_with_sources(0..8, 0..1, budget())
+        .unwrap();
+    assert!(!full.sources[0].clipped_left);
+    assert!(!full.sources[0].clipped_right);
+    assert_eq!(texts(&full.rows), ["界a界"]);
+    assert_eq!(stream.grid().snapshot(0, 2), before);
+    assert!(matches!(
+        stream.grid().screen_window_with_sources(
+            0..8,
+            0..1,
+            ContentBudget {
+                cells: 100,
+                bytes: 0
+            }
+        ),
+        Err(HistorySliceError::BudgetExhausted)
+    ));
+    let empty = stream
+        .grid()
+        .screen_window_with_sources(99..100, 0..1, budget())
+        .unwrap();
+    assert_eq!(empty.sources[0].columns, 8..8);
+    assert!(!empty.sources[0].clipped_left);
+}
+
+#[test]
 fn projection_work_report_for_long_history_and_single_line() {
     use std::time::Instant;
     for (name, text) in [

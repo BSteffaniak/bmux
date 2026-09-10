@@ -2,7 +2,10 @@ use crate::reflow::{project_logical_line, projected_logical_line_row_count};
 mod content;
 use crate::snapshot::{GridSnapshot, RowSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
-pub use content::{ContentAnchor, ContentBudget, ContentProjection, ContentRows};
+pub use content::{
+    ContentAnchor, ContentBudget, ContentProjection, ContentRowSource, ContentRows,
+    ScreenRowSource, ScreenRows,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
