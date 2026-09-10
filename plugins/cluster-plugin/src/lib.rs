@@ -284,6 +284,11 @@ impl RustPlugin for ClusterPlugin {
             *identity.node_id(),
             nodes.clone(),
         ));
+        let publication: Arc<dyn bmux_cluster_plugin_api::cluster_capability_publication::ClusterCapabilityPublicationService + Send + Sync> = control.clone();
+        let _ = bmux_cluster_plugin_api::cluster_capability_publication::register_provider(
+            registry,
+            publication,
+        );
         let refresh: Arc<
             dyn bmux_cluster_plugin_api::cluster_protocol_refresh::ClusterProtocolRefreshService
                 + Send

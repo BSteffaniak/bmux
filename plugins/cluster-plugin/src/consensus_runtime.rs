@@ -138,6 +138,7 @@ impl std::error::Error for ConsensusReadError {}
 pub struct ConsensusNode {
     raft: openraft::Raft<ControlRaftConfig>,
     storage: ConsensusLogStore,
+    membership_submission: std::sync::Arc<tokio::sync::Mutex<()>>,
     node_id: NodeId,
     cluster_id: String,
 }
@@ -173,6 +174,7 @@ impl ConsensusNode {
         Ok(Self {
             raft,
             storage,
+            membership_submission: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             node_id,
             cluster_id: cluster_id.to_string(),
         })
@@ -277,6 +279,7 @@ impl ConsensusNode {
         &self,
         voters: std::collections::BTreeMap<NodeId, BasicNode>,
     ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
+        let _submission = self.membership_submission.lock().await;
         let authenticated = voters
             .into_iter()
             .map(|(node_id, node)| {
@@ -304,6 +307,32 @@ impl ConsensusNode {
             }
             Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(error))) => {
                 return Err(ConsensusWriteError::QuorumUnavailable(error.to_string()));
+            }
+        }
+        // Retained publication commands/snapshots require their decoder even
+        // before activation advances the schema floor. Endpoint authentication
+        // does not prove that a newly added learner can consume this history.
+        let state = self.persisted_control_state().map_err(|error| {
+            ConsensusWriteError::Membership(format!(
+                "cannot verify retained compatibility: {error}"
+            ))
+        })?;
+        if state.requires_publication_decoder() {
+            let existing = self.storage.state_machine().map_err(|error| {
+                ConsensusWriteError::Membership(format!(
+                    "cannot read committed membership: {error}"
+                ))
+            })?;
+            if authenticated.keys().any(|id| {
+                existing
+                    .committed_membership()
+                    .membership()
+                    .get_node(id)
+                    .is_none()
+            }) {
+                return Err(ConsensusWriteError::Membership(
+                    "new recipients require capability-publication decoder admission proof".into(),
+                ));
             }
         }
         let voter_ids = authenticated
@@ -348,6 +377,58 @@ impl ConsensusNode {
         let command_id = command.command_id.clone();
         let encoded = crate::control_codec::encode_feature_activation(&command);
         Self::decode_write_response(&command_id, self.write(encoded).await)
+    }
+
+    /// Publishes supported capabilities for an isolated single-member authority.
+    /// Multi-member publication requires reconnect-bound decoder negotiation first.
+    /// # Errors
+    /// Rejects incomplete authority, incompatible evidence and failed durable writes.
+    pub async fn publish_capabilities(
+        &self,
+        reports: Vec<bmux_cluster_plugin_api::cluster_capability_types::CapabilityReport>,
+    ) -> Result<ControlResponse, ControlServiceError> {
+        let _submission = self.membership_submission.lock().await;
+        self.linearizable_control_state()
+            .await
+            .map_err(control_read_error)?;
+        let snapshot =
+            self.storage
+                .state_machine()
+                .map_err(|error| ControlServiceError::Internal {
+                    reason: error.to_string(),
+                })?;
+        let membership = snapshot.committed_membership();
+        let effective = self.raft.metrics().borrow().membership_config.clone();
+        if &*effective != membership
+            || membership.membership().nodes().count() != 1
+            || membership.membership().voter_ids().collect::<Vec<_>>() != vec![self.node_id]
+        {
+            return Err(ControlServiceError::RuntimeUnavailable { reason: "publication requires an isolated single-member authority until peer decoder negotiation is available".into() });
+        }
+        let command = crate::capability_publication::PublicationCommand {
+            reports,
+            verified_at_unix_ms: crate::now_unix_ms(),
+        };
+        let bytes = command
+            .encode()
+            .map_err(|reason| ControlServiceError::RuntimeUnavailable { reason })?;
+        let mut state = snapshot.control_state().clone();
+        state
+            .apply_publication(&command, membership)
+            .map_err(|reason| ControlServiceError::Rejected {
+                error:
+                    bmux_cluster_plugin_api::cluster_types::ControlCommandError::InvalidTransition {
+                        reason,
+                    },
+            })?;
+        // No remote recipient exists and membership changes share this lock.
+        // Do not use the raw writer, which deliberately rejects publication.
+        let result = self
+            .raft
+            .client_write(ControlRequest(bytes))
+            .await
+            .map_err(client_write_error);
+        Self::decode_write_response(&command.reports[0].command_id, result)
     }
 
     /// Submits a signed protocol refresh using quorum-confirmed authority.
@@ -880,6 +961,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         wait_for_leader(&[&node]).await;
+        assert!(matches!(
+            node.publish_capabilities(Vec::new()).await,
+            Err(ControlServiceError::RuntimeUnavailable { .. })
+        ));
         let before = node.persisted_control_state().unwrap();
         let result = node.write(b"BMCAP001".to_vec()).await;
         assert!(
@@ -1705,6 +1790,118 @@ pub(crate) mod tests {
                 .is_err()
         );
         recovered.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn publication_commit_survives_restart_and_rejects_unqualified_admission() {
+        use crate::membership::{
+            ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
+        };
+        use bmux_cluster_plugin_api::cluster_capability_types::CapabilityReport;
+        let root = TempDir::new().unwrap();
+        let identity = NodeIdentity::new_for_test(96);
+        let id = *identity.node_id();
+        let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000096"
+            .parse()
+            .unwrap();
+        let network = InMemoryNetworkFactory::default();
+        let node = ConsensusNode::start(root.path(), &cluster.to_string(), id, network.clone())
+            .await
+            .unwrap();
+        node.initialize_single(id, "node").await.unwrap();
+        wait_for_leader(&[&node]).await;
+        let member = issue_test_member(
+            &identity,
+            cluster,
+            &identity,
+            "tls://127.0.0.1:49996",
+            initializer_capabilities(),
+            crate::now_unix_ms(),
+        );
+        crate::consensus_membership::publish_members(
+            node.clone(),
+            &id.to_string(),
+            [member.clone()],
+        )
+        .await
+        .unwrap();
+        let snapshot = node.storage.state_machine().unwrap();
+        let position = snapshot.committed_membership().log_id().unwrap();
+        let mut report = CapabilityReport {
+            report_version: 1,
+            cluster_id: cluster.to_string(),
+            node_id: id.to_string(),
+            credential_serial: member.credential_serial.clone(),
+            membership_term: position.leader_id.term,
+            membership_leader_id: position.leader_id.node_id.to_string(),
+            membership_log_index: position.index,
+            expected_report_revision: 0,
+            command_id: CommandId {
+                value: uuid::Uuid::new_v4(),
+            },
+            schema_min: 1,
+            schema_max: 4,
+            features: vec![
+                "capability-publication-v1".into(),
+                "protocol-refresh-v1".into(),
+            ],
+            signature: Vec::new(),
+        };
+        report.signature =
+            identity.sign(&crate::capability_publication::signing_payload(&report).unwrap());
+        let revision = snapshot.control_state().revision;
+        drop(snapshot);
+        let result = node
+            .publish_capabilities(vec![report.clone()])
+            .await
+            .unwrap();
+        assert_eq!(result.control_revision, revision + 1);
+        assert!(
+            node.persisted_control_state()
+                .unwrap()
+                .requires_publication_decoder()
+        );
+        node.shutdown().await.unwrap();
+        drop(node);
+        let recovered = ConsensusNode::start(root.path(), &cluster.to_string(), id, network)
+            .await
+            .unwrap();
+        wait_for_leader(&[&recovered]).await;
+        assert_eq!(
+            recovered
+                .publish_capabilities(vec![report.clone()])
+                .await
+                .unwrap(),
+            result
+        );
+        assert_unqualified_admission_rejected(&recovered, id).await;
+        let mut conflict = report;
+        conflict.schema_max = 5;
+        conflict.signature =
+            identity.sign(&crate::capability_publication::signing_payload(&conflict).unwrap());
+        assert!(
+            recovered
+                .publish_capabilities(vec![conflict])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            recovered.persisted_control_state().unwrap().revision,
+            result.control_revision
+        );
+        recovered.shutdown().await.unwrap();
+    }
+
+    async fn assert_unqualified_admission_rejected(node: &ConsensusNode, id: NodeId) {
+        let admission = node
+            .change_voters(BTreeMap::from([
+                (id, BasicNode::new("node")),
+                (NodeId::from(97), BasicNode::new("new-node")),
+            ]))
+            .await;
+        assert!(
+            matches!(admission, Err(ConsensusWriteError::Membership(reason)) if reason.contains("decoder admission proof"))
+        );
     }
 
     #[tokio::test]

@@ -402,6 +402,7 @@ mod tests {
         let bytes = state.encode_snapshot().unwrap();
         assert!(bytes.starts_with(b"BMSTA006"));
         let mut restored = ControlState::decode_snapshot(&bytes).unwrap();
+        assert!(restored.requires_publication_decoder());
         assert_eq!(state, restored);
         let mut retry = command.clone();
         retry.verified_at_unix_ms = 44;

@@ -156,6 +156,13 @@ impl ControlState {
         }
     }
 
+    /// Whether retained state requires the capability-publication decoder.
+    /// This remains true even if the active feature floor has not advanced.
+    #[must_use]
+    pub const fn requires_publication_decoder(&self) -> bool {
+        !self.publication_history.is_empty()
+    }
+
     /// Applies a complete signed publication batch atomically in log order.
     /// # Errors
     /// Rejects stale revisions, conflicting identities, invalid authority and exhaustion.

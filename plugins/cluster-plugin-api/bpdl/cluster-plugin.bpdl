@@ -723,6 +723,13 @@ interface cluster-principal-bootstrap {
     command submit(proof: cluster-principal-bootstrap-types.bootstrap-proof, expected_control_revision: u64) -> result<cluster-types.control-response, cluster-types.control-service-error>;
 }
 
+// Reports carry node proofs; the authority assigns credential verification time.
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-capability-publication {
+    command submit(reports: list<cluster-capability-types.capability-report>) -> result<cluster-types.control-response, cluster-types.control-service-error>;
+}
+
 @capability(CLUSTER_WRITE)
 @interface-version(1)
 interface cluster-control-command {

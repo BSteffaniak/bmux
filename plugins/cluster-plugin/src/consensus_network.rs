@@ -779,6 +779,25 @@ fn validate_feature_activation_member_sets(
     Ok(())
 }
 
+impl<C> bmux_cluster_plugin_api::cluster_capability_publication::ClusterCapabilityPublicationService
+    for ControlServiceHandle<C>
+where
+    C: ServiceCaller + Send + Sync + 'static,
+{
+    fn submit<'a>(
+        &'a self,
+        reports: Vec<bmux_cluster_plugin_api::cluster_capability_types::CapabilityReport>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ControlResponse, ControlServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move { self.active()?.publish_capabilities(reports).await })
+    }
+}
+
 impl<C> bmux_cluster_plugin_api::cluster_protocol_refresh::ClusterProtocolRefreshService
     for ControlServiceHandle<C>
 where
