@@ -4,6 +4,8 @@
 //! cancellation, deadline, and backpressure primitives owned by the BMUX host
 //! runtime rather than plugin API contracts or product-domain plugins.
 
+pub mod background;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;

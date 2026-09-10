@@ -256,6 +256,7 @@ where
 #[derive(Default)]
 pub struct EventBus {
     entries: RwLock<HashMap<PluginEventKind, ChannelEntry>>,
+    registrations: watch::Sender<()>,
 }
 
 impl std::fmt::Debug for EventBus {
@@ -263,7 +264,7 @@ impl std::fmt::Debug for EventBus {
         let count = self.entries.read().map_or(0, |g| g.len());
         f.debug_struct("EventBus")
             .field("channels", &count)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -272,6 +273,29 @@ impl EventBus {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Await a broadcast provider's registration without polling. Subscribing
+    /// to registration changes before checking the catalog prevents lost wakes.
+    ///
+    /// # Errors
+    /// Returns incompatible channel type or delivery errors immediately.
+    pub async fn subscribe_when_registered<E>(
+        &self,
+        interface: &PluginEventKind,
+    ) -> EventBusResult<broadcast::Receiver<Arc<E>>>
+    where
+        E: Any + Send + Sync + 'static,
+    {
+        let mut registrations = self.registrations.subscribe();
+        loop {
+            match self.subscribe::<E>(interface) {
+                Err(EventBusError::ChannelNotRegistered { .. }) => {
+                    let _ = registrations.changed().await;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Register a broadcast channel for `E` keyed by `interface`.
@@ -387,6 +411,8 @@ impl EventBus {
         };
         let mut guard = self.entries.write().expect("event bus lock poisoned");
         guard.insert(interface, entry);
+        drop(guard);
+        self.registrations.send_replace(());
         sender
     }
 
@@ -455,6 +481,8 @@ impl EventBus {
         };
         let mut guard = self.entries.write().expect("event bus lock poisoned");
         guard.insert(interface, entry);
+        drop(guard);
+        self.registrations.send_replace(());
         sender
     }
 
@@ -865,6 +893,8 @@ impl EventBus {
         };
         let mut guard = self.entries.write().expect("event bus lock poisoned");
         guard.insert(interface, entry);
+        drop(guard);
+        self.registrations.send_replace(());
         sender
     }
 
@@ -1423,6 +1453,28 @@ mod tests {
             }
             other => panic!("expected delivery mismatch, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn registration_wait_is_event_driven_and_validates_delivery() {
+        use std::future::Future;
+        let bus = EventBus::new();
+        let kind = TEST_IFACE;
+        let waiting = bus.subscribe_when_registered::<SampleEvent>(&kind);
+        tokio::pin!(waiting);
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                waiting.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        bus.register_channel::<SampleEvent>(kind.clone());
+        let _receiver = waiting.await.unwrap();
+        bus.register_state_channel(kind.clone(), 1_u64);
+        assert!(matches!(
+            bus.subscribe_when_registered::<u64>(&kind).await,
+            Err(EventBusError::ChannelDeliveryMismatch { .. })
+        ));
     }
 
     #[test]

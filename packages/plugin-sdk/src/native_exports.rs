@@ -481,13 +481,52 @@ pub struct TypedServiceRegistrationContext<'a> {
 #[derive(Debug, Clone)]
 pub struct HostAsyncHandle {
     inner: switchy::unsync::runtime::Handle,
+    background: Option<bmux_plugin_runtime::background::BackgroundTasks>,
 }
 
 impl HostAsyncHandle {
     /// Wrap a switchy async runtime handle.
     #[must_use]
     pub const fn new(inner: switchy::unsync::runtime::Handle) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            background: None,
+        }
+    }
+
+    /// Bind background task ownership to one host-managed activation.
+    #[must_use]
+    pub fn with_background_tasks(
+        mut self,
+        tasks: bmux_plugin_runtime::background::BackgroundTasks,
+    ) -> Self {
+        self.background = Some(tasks);
+        self
+    }
+
+    /// Start cooperative work owned by this activation.
+    ///
+    /// # Errors
+    /// Rejects unscoped handles and closed or full task scopes.
+    pub fn spawn_background<F, Fut>(&self, name: &str, work: F) -> Result<(), String>
+    where
+        F: FnOnce(bmux_plugin_runtime::background::TaskCancellation) -> Fut,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let task_name = name.to_string();
+        self.background
+            .as_ref()
+            .ok_or("host activation task scope unavailable")?
+            .spawn(name, move |cancel| {
+                let future = work(cancel);
+                async move {
+                    let result = future.await;
+                    if let Err(error) = &result {
+                        tracing::error!(task = %task_name, %error, "plugin background task failed");
+                    }
+                    result
+                }
+            })
     }
 
     /// Try to capture the async runtime currently entered on this thread.

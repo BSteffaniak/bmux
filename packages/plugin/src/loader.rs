@@ -1691,6 +1691,7 @@ pub struct LoadedPlugin {
     pub declaration: PluginDeclaration,
     backend: PluginBackend,
     native_service_buffers: NativeServiceBufferConfig,
+    background_tasks: Box<Mutex<Option<bmux_plugin_runtime::background::BackgroundTasks>>>,
     concurrency_gate: ConcurrencyGate,
 }
 
@@ -2079,7 +2080,30 @@ impl LoadedPlugin {
         async_handle: bmux_plugin_sdk::HostAsyncHandle,
     ) -> Result<i32> {
         if let PluginBackend::Static(vtable) = &self.backend {
-            Ok((vtable.activate_with_async)(context.clone(), async_handle))
+            let mut scope =
+                self.background_tasks
+                    .lock()
+                    .map_err(|_| PluginError::ServiceProtocol {
+                        details: "activation task scope poisoned".into(),
+                    })?;
+            if scope.is_some() {
+                return Err(PluginError::ServiceProtocol {
+                    details: "plugin activation already owns background tasks".into(),
+                });
+            }
+            let tasks = bmux_plugin_runtime::background::BackgroundTasks::new();
+            *scope = Some(tasks.clone());
+            drop(scope);
+            let status = (vtable.activate_with_async)(
+                context.clone(),
+                async_handle.with_background_tasks(tasks),
+            );
+            if status != 0 {
+                return Err(PluginError::ServiceProtocol {
+                    details: format!("plugin activation failed with status {status}"),
+                });
+            }
+            Ok(status)
         } else {
             self.activate(context)
         }
@@ -2089,7 +2113,70 @@ impl LoadedPlugin {
     ///
     /// Returns an error when the lifecycle symbol cannot be loaded or the
     /// lifecycle payload cannot be encoded.
+    /// Signal cancellation before any provider is deactivated.
+    ///
+    /// # Errors
+    /// Reports poisoned activation scope state.
+    pub fn cancel_background_tasks(&self) -> Result<()> {
+        let scope = self
+            .background_tasks
+            .lock()
+            .map_err(|_| PluginError::ServiceProtocol {
+                details: "activation task scope poisoned".into(),
+            })?;
+        if let Some(tasks) = scope.as_ref() {
+            tasks
+                .cancel()
+                .map_err(|details| PluginError::ServiceProtocol { details })?;
+        }
+        drop(scope);
+        Ok(())
+    }
+
+    /// Drain activation work before calling synchronous plugin cleanup.
+    ///
+    /// # Errors
+    /// A failed drain leaves ownership intact and does not run cleanup.
+    pub async fn drain_background_tasks(&self) -> Result<()> {
+        let tasks = self
+            .background_tasks
+            .lock()
+            .map_err(|_| PluginError::ServiceProtocol {
+                details: "activation task scope poisoned".into(),
+            })?
+            .clone();
+        if let Some(tasks) = tasks {
+            tasks
+                .shutdown(std::time::Duration::from_secs(10))
+                .await
+                .map_err(|details| PluginError::ServiceProtocol { details })?;
+            *self
+                .background_tasks
+                .lock()
+                .map_err(|_| PluginError::ServiceProtocol {
+                    details: "activation task scope poisoned".into(),
+                })? = None;
+        }
+        Ok(())
+    }
+
+    /// Run cleanup for a plugin with no outstanding activation scope.
+    ///
+    /// # Errors
+    /// Rejects scoped work that has not been drained, or lifecycle dispatch failure.
     pub fn deactivate(&self, context: &NativeLifecycleContext) -> Result<i32> {
+        if self
+            .background_tasks
+            .lock()
+            .map_err(|_| PluginError::ServiceProtocol {
+                details: "activation task scope poisoned".into(),
+            })?
+            .is_some()
+        {
+            return Err(PluginError::ServiceProtocol {
+                details: "activation tasks require async deactivation".into(),
+            });
+        }
         self.run_lifecycle_symbol(DEFAULT_NATIVE_DEACTIVATE_SYMBOL, context)
     }
 
@@ -2662,6 +2749,7 @@ impl NativePluginLoader {
                     metrics: Arc::new(ProcessRuntimeMetrics::default()),
                 }),
                 native_service_buffers: self.native_service_buffers,
+                background_tasks: Box::default(),
                 concurrency_gate: concurrency_gate_for(&registered_plugin.declaration),
             });
         }
@@ -2701,6 +2789,7 @@ impl NativePluginLoader {
             declaration: declaration.clone(),
             backend: PluginBackend::Dynamic(library),
             native_service_buffers: self.native_service_buffers,
+            background_tasks: Box::default(),
             concurrency_gate: concurrency_gate_for(&declaration),
         })
     }
@@ -2807,6 +2896,7 @@ pub fn load_static_plugin_with_native_service_buffer_config(
         declaration: declaration.clone(),
         backend: PluginBackend::Static(vtable),
         native_service_buffers,
+        background_tasks: Box::default(),
         concurrency_gate: concurrency_gate_for(&declaration),
     })
 }
@@ -2852,6 +2942,7 @@ pub fn load_trusted_static_plugin_with_native_service_buffer_config(
         declaration: registered_plugin.declaration.clone(),
         backend: PluginBackend::Static(vtable),
         native_service_buffers,
+        background_tasks: Box::default(),
         concurrency_gate: concurrency_gate_for(&registered_plugin.declaration),
     })
 }
@@ -3320,6 +3411,7 @@ minimum = "1.0"
                 .expect("declaration should build"),
             backend: PluginBackend::Dynamic(library),
             native_service_buffers: NativeServiceBufferConfig::default(),
+            background_tasks: Box::default(),
             concurrency_gate: ConcurrencyGate::new(
                 bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
             ),
@@ -3435,6 +3527,7 @@ minimum = "1.0"
                 .expect("declaration should build"),
             backend: PluginBackend::Static(vtable),
             native_service_buffers: NativeServiceBufferConfig::default(),
+            background_tasks: Box::default(),
             concurrency_gate: ConcurrencyGate::new(
                 bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
             ),
@@ -4505,6 +4598,7 @@ minimum = "1.0"
             },
             backend: PluginBackend::Dynamic(library),
             native_service_buffers: NativeServiceBufferConfig::default(),
+            background_tasks: Box::default(),
             concurrency_gate: ConcurrencyGate::new(
                 bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
             ),

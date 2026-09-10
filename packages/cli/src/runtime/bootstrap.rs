@@ -208,8 +208,27 @@ fn server_start_child_arguments(
     arguments
 }
 
+// Keep the server lifecycle future off callers stack frames.
+pub(super) fn run_server_start(
+    daemon: bool,
+    foreground_internal: bool,
+    rolling_enabled_override: Option<bool>,
+    rolling_options: RecordingRollingStartOptions,
+    pane_shell_integration_override: Option<bool>,
+    startup_recording: Option<ManualRecordingStartOptions>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u8>> + Send>> {
+    Box::pin(run_server_start_inner(
+        daemon,
+        foreground_internal,
+        rolling_enabled_override,
+        rolling_options,
+        pane_shell_integration_override,
+        startup_recording,
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
-pub(super) async fn run_server_start(
+async fn run_server_start_inner(
     daemon: bool,
     foreground_internal: bool,
     rolling_enabled_override: Option<bool>,
@@ -331,7 +350,7 @@ pub(super) async fn run_server_start(
     );
     register_snapshot_plugin_config(&config, &paths);
     register_pane_runtime_plugin_config(&config, &paths, pane_shell_integration_override);
-    activate_loaded_plugins(&loaded_plugins, &config, &paths)?;
+    Box::pin(activate_loaded_plugins(&loaded_plugins, &config, &paths)).await?;
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;
     let server = BmuxServer::from_config_paths_with_start_options(
         &paths,
@@ -485,10 +504,10 @@ pub(super) async fn run_server_start(
     {
         warn!("failed delivering server_stopping plugin event: {error}");
     }
-    if let Err(error) = deactivate_loaded_plugins(&loaded_plugins, &config, &paths) {
-        warn!("failed deactivating plugins during server shutdown: {error}");
-    }
+    let shutdown_result =
+        Box::pin(deactivate_loaded_plugins(&loaded_plugins, &config, &paths)).await;
     let _ = remove_server_pid_file();
+    shutdown_result?;
     run_result?;
     Ok(0)
 }

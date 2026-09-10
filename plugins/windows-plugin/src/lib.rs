@@ -1296,6 +1296,63 @@ impl RustPlugin for WindowsPlugin {
         })
     }
 
+    fn activate_with_async(
+        &mut self,
+        context: NativeLifecycleContext,
+        async_handle: bmux_plugin_sdk::HostAsyncHandle,
+    ) -> Result<i32, PluginCommandError> {
+        let result = self.activate(context.clone())?;
+        let shared = WindowsSharedState {
+            caller: Arc::new(TypedServiceCaller::from_lifecycle_context(&context)),
+            last_selected_by_client: self.last_selected_by_client.clone(),
+            runtime_state: self.runtime_state.clone(),
+        };
+        let worker = async_handle.clone();
+        async_handle.spawn_background("windows-catalog-observer", move |mut cancellation| async move {
+            let bus = bmux_plugin::global_event_bus();
+            let mut contexts = None;
+            let mut workspaces = None;
+            loop {
+                use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
+                use bmux_workspaces_plugin_api::workspaces_events::{self, WorkspaceEvent};
+                let contexts_kind = contexts_events::EVENT_KIND;
+                let workspaces_kind = workspaces_events::EVENT_KIND;
+                let event = tokio::select! {
+                    () = cancellation.cancelled() => return Ok(()),
+                    ready = bus.subscribe_when_registered::<ContextEvent>(&contexts_kind), if contexts.is_none() => {
+                        contexts = Some(ready.map_err(|error| error.to_string())?);
+                        None
+                    }
+                    ready = bus.subscribe_when_registered::<WorkspaceEvent>(&workspaces_kind), if workspaces.is_none() => {
+                        workspaces = Some(ready.map_err(|error| error.to_string())?);
+                        None
+                    }
+                    event = receive_catalog_event(&mut contexts) => {
+                        match event {
+                            Ok(event) => Some(event),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => None,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => { contexts = None; continue; }
+                        }
+                    }
+                    event = receive_catalog_event(&mut workspaces) => {
+                        match event {
+                            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => None,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => { workspaces = None; continue; }
+                        }
+                    }
+                };
+                let shared = shared.clone();
+                // Serialize effects and await blocking work even during shutdown:
+                // cancellation cannot make an in-flight service call disappear.
+                worker.spawn_blocking(move || {
+                    if let Some(event) = event { handle_context_event(&shared, &event); }
+                    else { publish_window_list_snapshot(shared.caller.as_ref(), &shared.runtime_state); }
+                }).await.map_err(|error| error.to_string())?;
+            }
+        }).map_err(PluginCommandError::failed)?;
+        Ok(result)
+    }
+
     fn register_typed_services(
         &self,
         context: TypedServiceRegistrationContext<'_>,
@@ -1320,20 +1377,6 @@ impl RustPlugin for WindowsPlugin {
             Arc::new(WindowsStateHandle::new(shared.clone()));
         let _ = windows_state::register_provider(registry, state);
         let handle_register_us = handles_started.elapsed().as_micros();
-
-        // Spawn the contexts-events subscriber. The windows plugin is
-        // an authoritative projection of context lifecycle: every
-        // Created/Closed/Selected/SessionActiveContextChanged event
-        // flows through here and updates `windows.order` + the
-        // `windows-list` state channel.
-        //
-        // Subscription happens here (not in `activate`) because
-        // `TypedServiceCaller::from_registration_context` needs the
-        // typed registration context that `activate` does not receive.
-        let subscriber_started = Instant::now();
-        spawn_contexts_events_subscriber(shared.clone());
-        spawn_workspace_events_subscriber(shared.clone());
-        let subscriber_us = subscriber_started.elapsed().as_micros();
 
         // Publish the initial window-list snapshot populated from the
         // plugin's persisted `windows.order` storage projected through
@@ -1362,7 +1405,6 @@ impl RustPlugin for WindowsPlugin {
             &PhasePayload::new("bmux.windows.typed_services")
                 .field("plugin_id", "bmux.windows")
                 .field("handle_register_us", handle_register_us)
-                .field("subscriber_us", subscriber_us)
                 .field("snapshot_publish_us", snapshot_publish_us)
                 .field("total_us", total_started.elapsed().as_micros())
                 .finish(),
@@ -1370,86 +1412,13 @@ impl RustPlugin for WindowsPlugin {
     }
 }
 
-/// Spawn a dedicated thread that subscribes to `contexts-events` and
-/// drives windows-plugin state transitions.
-///
-/// The thread owns a current-thread tokio runtime so it can `await`
-/// on the subscription's `recv` without interfering with host
-/// scheduling. It runs until the plugin process terminates.
-fn spawn_workspace_events_subscriber(shared: WindowsSharedState) {
-    std::thread::spawn(move || {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        runtime.block_on(observe_workspace_changes(
-            &bmux_plugin::global_event_bus(),
-            || publish_window_list_snapshot(shared.caller.as_ref(), &shared.runtime_state),
-        ));
-    });
-}
-
-async fn observe_workspace_changes(bus: &bmux_plugin::EventBus, mut refresh: impl FnMut()) {
-    use bmux_workspaces_plugin_api::workspaces_events::{self, WorkspaceEvent};
-
-    // Workspaces is optional and may activate after windows. Do not permanently
-    // lose notifications just because its channel is absent during startup.
-    let mut receiver = loop {
-        match bus.subscribe::<WorkspaceEvent>(&workspaces_events::EVENT_KIND) {
-            Ok(receiver) => break receiver,
-            Err(bmux_plugin::EventBusError::ChannelNotRegistered { .. }) => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            Err(error) => {
-                eprintln!("subscribing to workspace changes: {error}");
-                return;
-            }
-        }
-    };
-    // Repair changes made before subscription, including workspace activation.
-    refresh();
-    loop {
-        match receiver.recv().await {
-            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => refresh(),
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-        }
+async fn receive_catalog_event<E: Send + Sync>(
+    receiver: &mut Option<tokio::sync::broadcast::Receiver<Arc<E>>>,
+) -> Result<Arc<E>, tokio::sync::broadcast::error::RecvError> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
     }
-}
-
-fn spawn_contexts_events_subscriber(shared: WindowsSharedState) {
-    use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
-
-    std::thread::spawn(move || {
-        let mut rx = if let Ok(rx) =
-            bmux_plugin::global_event_bus().subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)
-        {
-            rx
-        } else {
-            // Contexts may not have registered the channel yet during
-            // startup. Retry inside this worker so typed-service
-            // registration never pays the sleep on the critical path.
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let Ok(rx) = bmux_plugin::global_event_bus()
-                .subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)
-            else {
-                return;
-            };
-            rx
-        };
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
-        rt.block_on(async move {
-            while let Ok(event) = rx.recv().await {
-                handle_context_event(&shared, &event);
-            }
-        });
-    });
 }
 
 /// Dispatch a single `ContextEvent` against the windows-plugin's
@@ -4350,57 +4319,6 @@ fn interface_ids_match_bpdl_constants() {
 
 #[cfg(test)]
 mod tests {
-    #[tokio::test]
-    async fn workspace_observer_repairs_late_activation_and_lag() {
-        use bmux_workspaces_plugin_api::workspaces_events::{self, WorkspaceEvent};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let bus = bmux_plugin::EventBus::new();
-        let refreshes = AtomicUsize::new(0);
-        let observer = super::observe_workspace_changes(&bus, || {
-            refreshes.fetch_add(1, Ordering::SeqCst);
-        });
-        tokio::pin!(observer);
-        // Poll before the owner has registered its channel.
-        tokio::select! {
-            () = &mut observer => panic!("observer exited before workspace activation"),
-            () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
-        }
-        let sender =
-            bus.register_channel_with_capacity::<WorkspaceEvent>(workspaces_events::EVENT_KIND, 1);
-        let refreshes = &refreshes;
-        let wait_for = |count| async move {
-            while refreshes.load(Ordering::SeqCst) < count {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-        };
-        tokio::select! {
-            () = &mut observer => panic!("observer exited after workspace activation"),
-            result = tokio::time::timeout(std::time::Duration::from_secs(2), wait_for(1)) => result.unwrap(),
-        }
-        for index in 0..4 {
-            sender
-                .send(std::sync::Arc::new(WorkspaceEvent::Renamed {
-                    workspace_id: uuid::Uuid::nil(),
-                    name: format!("workspace-{index}"),
-                }))
-                .unwrap();
-        }
-        tokio::select! {
-            () = &mut observer => panic!("lag terminated workspace observer"),
-            result = tokio::time::timeout(std::time::Duration::from_secs(2), wait_for(3)) => result.unwrap(),
-        }
-        sender
-            .send(std::sync::Arc::new(WorkspaceEvent::Renamed {
-                workspace_id: uuid::Uuid::nil(),
-                name: "latest".into(),
-            }))
-            .unwrap();
-        tokio::select! {
-            () = &mut observer => panic!("workspace observer stopped"),
-            result = tokio::time::timeout(std::time::Duration::from_secs(2), wait_for(4)) => result.unwrap(),
-        }
-    }
     use super::*;
     use bmux_contexts_plugin_api::contexts_state::ContextSummary as SessionSummary;
     use bmux_plugin::ServiceCaller;
