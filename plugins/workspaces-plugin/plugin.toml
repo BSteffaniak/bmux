@@ -27,6 +27,23 @@ capability   = "bmux.workspaces.read"
 interface_id = "workspaces-events"
 kind         = "event"
 
+[[services]]
+capability   = "bmux.workspaces.write"
+interface_id = "workspaces-activation-v1"
+kind         = "command"
+
+[[commands]]
+expose_in_cli = true
+name          = "activate-tab"
+path          = ["workspace", "activate-tab"]
+summary       = "Activate an exact tab across workspaces"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "context-id"
+required   = true
+value_name = "CONTEXT_ID"
+
 [[event_publications]]
 delivery                     = "broadcast"
 forward_to_streaming_clients = true

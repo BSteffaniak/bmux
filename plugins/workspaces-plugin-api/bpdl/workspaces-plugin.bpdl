@@ -64,6 +64,14 @@ interface workspaces-commands {
     ) -> result<workspace-ack, workspace-command-error>;
 }
 
+@capability(WORKSPACES_WRITE)
+interface workspaces-activation-v1 {
+    // Exact durable target activation, independent of the current workspace.
+    // No fallback target is selected when this ID no longer exists.
+    command activate-tab(context-id: uuid)
+        -> result<workspaces-commands.workspace-ack, workspaces-commands.workspace-command-error>;
+}
+
 interface workspaces-events {
     variant workspace-event {
         created { workspace-id: uuid, name: string },

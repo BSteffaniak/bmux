@@ -14,6 +14,7 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext, TypedServiceRegistry,
 };
+use bmux_workspaces_plugin_api::workspaces_activation_v1::{self, WorkspacesActivationV1Service};
 use bmux_workspaces_plugin_api::workspaces_commands::{
     self, WorkspaceAck, WorkspaceCommandError, WorkspacesCommandsService,
 };
@@ -175,6 +176,11 @@ impl RustPlugin for WorkspacesPlugin {
                     kill_workspace(ctx, &req.selector)
                 )
             },
+            "workspaces-activation-v1", "activate-tab" => |req: workspaces_activation_v1::client::ActivateTabRequest, ctx| {
+                Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
+                    client_id(ctx.caller_client_id).and_then(|id| activate_tab_for_client(ctx, req.context_id, id))
+                )
+            },
             "workspaces-commands", "switch-workspace" => |req: SelectorArgs, ctx| {
                 Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
                     switch_workspace(ctx, &req.selector)
@@ -213,6 +219,11 @@ impl RustPlugin for WorkspacesPlugin {
             Arc::new(WorkspacesStateHandle {
                 caller: Arc::clone(&caller),
             });
+        let activation: Arc<dyn WorkspacesActivationV1Service + Send + Sync> =
+            Arc::new(WorkspacesCommandsHandle {
+                caller: caller.clone(),
+            });
+        let _ = workspaces_activation_v1::register_provider(registry, activation);
         let commands: Arc<dyn WorkspacesCommandsService + Send + Sync> =
             Arc::new(WorkspacesCommandsHandle { caller });
         let _ = workspaces_state::register_provider(registry, state);
@@ -581,10 +592,42 @@ fn most_recent_context_in_workspace(
         .map(|context| context.id)
 }
 
+fn activate_tab_for_client(
+    caller: &(impl HostRuntimeApi + Sync),
+    context_id: Uuid,
+    client_id: Uuid,
+) -> Result<WorkspaceAck, WorkspaceCommandError> {
+    let contexts =
+        list_contexts(caller).map_err(|reason| WorkspaceCommandError::Failed { reason })?;
+    let target = contexts
+        .iter()
+        .find(|context| context.id == context_id)
+        .ok_or(WorkspaceCommandError::NotFound)?;
+    let workspace_id = context_workspace_id(target);
+    select_workspace_target(
+        caller,
+        &WorkspaceSelector {
+            id: Some(workspace_id),
+            name: None,
+        },
+        client_id,
+        Some(context_id),
+    )
+}
+
 fn switch_workspace_for_client(
     caller: &(impl HostRuntimeApi + Sync),
     selector: &WorkspaceSelector,
     client_id: Uuid,
+) -> Result<WorkspaceAck, WorkspaceCommandError> {
+    select_workspace_target(caller, selector, client_id, None)
+}
+
+fn select_workspace_target(
+    caller: &(impl HostRuntimeApi + Sync),
+    selector: &WorkspaceSelector,
+    client_id: Uuid,
+    exact_context_id: Option<Uuid>,
 ) -> Result<WorkspaceAck, WorkspaceCommandError> {
     let contexts =
         list_contexts(caller).map_err(|reason| WorkspaceCommandError::Failed { reason })?;
@@ -622,12 +665,20 @@ fn switch_workspace_for_client(
                 .iter()
                 .any(|context| context.id == *id && context_workspace_id(context) == workspace_id)
         });
-    let context_id = Some(
+    let context_id = Some(if let Some(id) = exact_context_id {
+        if !contexts
+            .iter()
+            .any(|context| context.id == id && context_workspace_id(context) == workspace_id)
+        {
+            return Err(WorkspaceCommandError::NotFound);
+        }
+        id
+    } else {
         match remembered.or_else(|| most_recent_context_in_workspace(&contexts, workspace_id)) {
             Some(id) => id,
             None => create_workspace_context(caller, workspace_id)?,
-        },
-    );
+        }
+    });
     if let Some(context_id) = context_id {
         select_context(caller, context_id)?;
     }
@@ -854,6 +905,16 @@ fn run_command(context: &NativeCommandContext) -> Result<(), String> {
             record_outcome(&ack);
             Ok(())
         }
+        "activate-tab" => {
+            let id = positional_value_at(&context.arguments, 0).ok_or("missing CONTEXT_ID")?;
+            let id = Uuid::parse_str(&id).map_err(|error| error.to_string())?;
+            let caller_id =
+                client_id(context.caller_client_id).map_err(|error| format!("{error:?}"))?;
+            let ack = activate_tab_for_client(context, id, caller_id)
+                .map_err(|error| format!("{error:?}"))?;
+            record_outcome(&ack);
+            Ok(())
+        }
         "switch-workspace" => command_switch(context, &parse_selector_argument(context, 0)?),
         "next-workspace" => command_cycle(context, 1),
         "prev-workspace" => command_cycle(context, -1),
@@ -1017,6 +1078,19 @@ impl WorkspacesStateService for WorkspacesStateHandle {
 struct WorkspacesCommandsHandle {
     caller: Arc<TypedServiceCaller>,
 }
+impl WorkspacesActivationV1Service for WorkspacesCommandsHandle {
+    fn activate_tab<'a>(
+        &'a self,
+        context_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<WorkspaceAck, WorkspaceCommandError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let client_id = client_id(resolve_client_id(self.caller.as_ref()))?;
+            activate_tab_for_client(self.caller.as_ref(), context_id, client_id)
+        })
+    }
+}
+
 impl WorkspacesCommandsService for WorkspacesCommandsHandle {
     fn new_workspace<'a>(
         &'a self,
@@ -1400,6 +1474,53 @@ mod tests {
         assert_eq!(state.records.len(), 1);
         assert_eq!(state.active_id(client), replacement);
         assert_eq!(state.previous_by_client.get(&client), Some(&replacement));
+    }
+
+    #[test]
+    fn exact_activation_resolves_membership_without_fallback() {
+        let _test_guard = TEST_STATE_LOCK.lock().unwrap();
+        let client = Uuid::from_u128(1);
+        let other = Uuid::from_u128(4);
+        let target = context(102, other);
+        let host = Arc::new(MockHost::new(
+            client,
+            vec![
+                context(101, Uuid::nil()),
+                target.clone(),
+                context(103, other),
+            ],
+        ));
+        let _router = install_host_router(host.clone());
+        install_workspace_state(WorkspaceState {
+            records: vec![
+                WorkspaceRecord {
+                    id: Uuid::nil(),
+                    name: "default".into(),
+                },
+                WorkspaceRecord {
+                    id: other,
+                    name: "workspace-4".into(),
+                },
+            ],
+            selected_context_by_client_workspace: HashMap::from([(
+                (client, other),
+                Uuid::from_u128(103),
+            )]),
+            ..WorkspaceState::default()
+        });
+        let ack = activate_tab_for_client(host.as_ref(), target.id, client).unwrap();
+        assert_eq!(ack.id, other);
+        assert_eq!(ack.selected_context_id, Some(target.id));
+        assert_eq!(*host.selected_contexts.lock().unwrap(), vec![target.id]);
+        host.contexts
+            .lock()
+            .unwrap()
+            .retain(|context| context.id != target.id);
+        assert_eq!(
+            activate_tab_for_client(host.as_ref(), target.id, client),
+            Err(WorkspaceCommandError::NotFound)
+        );
+        assert_eq!(*host.selected_contexts.lock().unwrap(), vec![target.id]);
     }
 
     #[test]

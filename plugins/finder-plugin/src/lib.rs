@@ -262,7 +262,7 @@ async fn handle_response(
         warn!(selected, "finder: invalid selection");
         return;
     };
-    let action = format!("plugin:bmux.windows:switch-window {}", entry.context_id);
+    let action = format!("plugin:bmux.workspaces:activate-tab {}", entry.context_id);
     if let Err(error) = action_dispatch::dispatch(&action) {
         warn!(%error, "finder: tab switch failed");
     }
@@ -273,6 +273,32 @@ bmux_plugin_sdk::export_plugin!(FinderPlugin, include_str!("../plugin.toml"));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn finder_dispatches_one_exact_activation_action() {
+        let (actions, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let _host = action_dispatch::register_host(actions);
+        let id = Uuid::from_u128(42);
+        let (response, selection) = tokio::sync::oneshot::channel();
+        response
+            .send(PromptResponse::Submitted(PromptValue::Single("0".into())))
+            .unwrap();
+        handle_response(
+            vec![FinderEntry {
+                context_id: id,
+                label: "other/tab".into(),
+                detail: String::new(),
+                search_text: String::new(),
+            }],
+            selection,
+        )
+        .await;
+        assert_eq!(
+            received.recv().await.unwrap().action,
+            format!("plugin:bmux.workspaces:activate-tab {id}")
+        );
+        assert!(received.try_recv().is_err());
+    }
 
     fn window(
         id: u128,
