@@ -21,6 +21,7 @@ pub struct ComponentViewport {
     viewport: Rect,
     offset: Point,
     raster: Rect,
+    logical_offset: Option<(i32, i64)>,
 }
 
 pub struct ComponentViewportPaint {
@@ -55,6 +56,7 @@ impl ComponentViewport {
             layout,
             viewport,
             offset,
+            logical_offset: None,
             // Keep raster coordinates component-local so selection, cursor, and
             // event metadata retain their existing coordinate contract. Only the
             // visible allocation consumes cells, not the full logical extent.
@@ -62,19 +64,54 @@ impl ComponentViewport {
         })
     }
 
+    /// Construct a viewport using scoped logical transforms rather than a
+    /// component-coordinate raster. Metadata is returned in surface coordinates;
+    /// the buffer remains viewport-local. Components must honor scoped geometry
+    /// for both painting and event routing.
+    #[must_use]
+    pub fn with_logical_offset(
+        layout: LayoutNode,
+        viewport: Rect,
+        offset_x: u64,
+        offset_y: u64,
+    ) -> Option<Self> {
+        let x = i32::try_from(offset_x).ok()?;
+        let y = i64::try_from(offset_y).ok()?;
+        viewport.x.checked_add(viewport.width)?;
+        viewport.y.checked_add(viewport.height)?;
+        let mut result = Self::new(layout, viewport, Point::new(0, 0))?;
+        result.logical_offset = Some((x, y));
+        result.raster = viewport;
+        Some(result)
+    }
+
     #[must_use]
     pub fn paint(&self, component: &dyn Component) -> ComponentViewportPaint {
         let mut buffer = Buffer::empty(self.raster);
         let mut frame = Frame::new(&mut buffer);
-        component.paint(&self.layout, &mut PaintCx::new(&mut frame));
+        if let Some((x, y)) = self.logical_offset {
+            PaintCx::new(&mut frame).with_child_size(
+                i32::from(self.viewport.x) - x,
+                i64::from(self.viewport.y) - y,
+                self.layout.size,
+                |cx| component.paint(&self.layout, cx),
+            );
+        } else {
+            component.paint(&self.layout, &mut PaintCx::new(&mut frame));
+        }
+        let raster_origin = if self.logical_offset.is_some() {
+            Point::new(self.viewport.x, self.viewport.y)
+        } else {
+            self.offset
+        };
         let hits = frame
             .hits()
             .regions()
             .iter()
             .filter_map(|region| {
                 let visible = region.area.intersection(Rect::new(
-                    self.offset.x,
-                    self.offset.y,
+                    raster_origin.x,
+                    raster_origin.y,
                     self.viewport.width,
                     self.viewport.height,
                 ));
@@ -85,10 +122,10 @@ impl ComponentViewport {
                 region.area = Rect::new(
                     self.viewport
                         .x
-                        .saturating_add(visible.x.saturating_sub(self.offset.x)),
+                        .saturating_add(visible.x.saturating_sub(raster_origin.x)),
                     self.viewport
                         .y
-                        .saturating_add(visible.y.saturating_sub(self.offset.y)),
+                        .saturating_add(visible.y.saturating_sub(raster_origin.y)),
                     visible.width,
                     visible.height,
                 );
@@ -99,15 +136,17 @@ impl ComponentViewport {
         let selection = frame.selection().clone();
         let images = frame.images().to_vec();
         let cursor = frame.cursor().and_then(|mut cursor| {
-            cursor.position = self.project(cursor.position)?;
+            if self.logical_offset.is_none() {
+                cursor.position = self.project(cursor.position)?;
+            }
             Some(cursor)
         });
         let mut visible = Buffer::empty(Rect::new(0, 0, self.viewport.width, self.viewport.height));
         for y in 0..self.viewport.height {
             for x in 0..self.viewport.width {
                 let source = Point::new(
-                    x.saturating_add(self.offset.x),
-                    y.saturating_add(self.offset.y),
+                    x.saturating_add(raster_origin.x),
+                    y.saturating_add(raster_origin.y),
                 );
                 if let Some(cell) = buffer.get(source)
                     && let Some(target) = visible.get_mut(Point::new(x, y))
@@ -128,6 +167,16 @@ impl ComponentViewport {
 
     /// Dispatch an already-routed event. Captured drags may be outside the viewport.
     pub fn event(&self, component: &dyn Component, event: &Event) -> EventOutcome {
+        if let Some((x, y)) = self.logical_offset {
+            return EventCx::new(&self.layout).with_transform(
+                0,
+                0,
+                i32::from(self.viewport.x) - x,
+                i64::from(self.viewport.y) - y,
+                self.viewport,
+                |cx| component.event(event, &self.layout, cx),
+            );
+        }
         let mut event = event.clone();
         if let Event::Mouse(mouse) = &mut event {
             mouse.position.x =
@@ -231,6 +280,51 @@ mod tests {
             .map(|cell| cell.symbol.as_str())
             .collect();
         assert_eq!(row.trim_end(), "two");
+    }
+
+    #[test]
+    fn logical_viewport_paints_beyond_terminal_coordinates() {
+        use bmux_tui::component::{Constraints, LayoutCx};
+        let text = bmux_tui::composition::TextBlock::new(format!("{}end", "row\n".repeat(70_000)));
+        let layout = text.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let viewport =
+            ComponentViewport::with_logical_offset(layout, Rect::new(3, 4, 8, 1), 0, 70_000)
+                .unwrap();
+        let painted = viewport.paint(&text);
+        assert_eq!(painted.buffer.cells().len(), 8);
+        let row: String = painted
+            .buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert_eq!(row.trim_end(), "end");
+    }
+
+    #[test]
+    fn logical_viewport_routes_events_through_the_paint_transform() {
+        use bmux_tui::component::{Constraints, LayoutCx, LogicalRect};
+        struct Target;
+        impl Component for Target {
+            fn layout(&self, _: Constraints, _: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::leaf("target".into(), LogicalSize::new(100_000, 100_000))
+            }
+            fn paint(&self, _: &LayoutNode, _: &mut PaintCx<'_, '_>) {}
+            fn event(&self, _: &Event, _: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+                assert_eq!(
+                    cx.visible_rect(LogicalRect::new(70_002, 80_001, 2, 1)),
+                    Rect::new(5, 5, 2, 1)
+                );
+                assert!(cx.visible_rect(LogicalRect::new(0, 0, 2, 1)).is_empty());
+                EventOutcome::Redraw
+            }
+        }
+        let target = Target;
+        let layout = target.layout(Constraints::for_width(8), &mut LayoutCx::new());
+        let viewport =
+            ComponentViewport::with_logical_offset(layout, Rect::new(3, 4, 8, 2), 70_000, 80_000)
+                .unwrap();
+        assert_eq!(viewport.event(&target, &Event::Tick), EventOutcome::Redraw);
     }
 
     fn viewport(width: u64, height: u64) -> Option<ComponentViewport> {
