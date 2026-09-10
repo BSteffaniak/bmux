@@ -328,37 +328,26 @@ pub fn attach_session(
         return Err(AttachCommandError::SessionNotFound);
     };
 
-    // Transition client membership off the old session if changing.
-    let previous_session = follow.0.selected_session(client_id);
-    if let Some(prev) = previous_session
-        && prev != next_session_id
-    {
-        manager.0.remove_client(prev, &client_id);
-    }
-
+    // Resolve every fallible dependency before changing membership or selection.
+    // Missing runtime state is a recovery condition, not permission to delete
+    // durable context mappings.
+    let contexts = context_state()?;
+    let tokens = attach_token_handle()?;
     if !manager.0.contains(next_session_id) {
-        // Session vanished between selector resolution and the add
-        // attempt; prune any stale context mappings.
-        let _ = context_state()?
-            .0
-            .remove_contexts_for_session(next_session_id);
         return Err(AttachCommandError::SessionNotFound);
     }
-
+    let selected_context = contexts.0.context_for_session(next_session_id);
+    let previous_session = follow.0.selected_session(client_id);
     manager.0.add_client(next_session_id, client_id);
-
-    // Update FollowState. Preserve any existing selected context
-    // unless one maps to the chosen session.
-    let selected_context = context_state()?
-        .0
-        .context_for_session(next_session_id)
-        .or_else(|| follow.0.selected_context(client_id));
+    if let Some(previous) = previous_session.filter(|id| *id != next_session_id) {
+        manager.0.remove_client(previous, &client_id);
+    }
     follow
         .0
         .set_selected_target(client_id, selected_context, Some(next_session_id));
 
     // Issue the grant with context decoration.
-    let mut grant = attach_token_handle()?.0.issue(next_session_id);
+    let mut grant = tokens.0.issue(next_session_id);
     grant.context_id = selected_context;
     Ok(to_api_grant(&grant))
 }
@@ -372,15 +361,22 @@ pub fn attach_context(
     let contexts = context_state()?;
     let follow = follow_state()?;
 
-    let context = contexts
+    let context_id = contexts
         .0
-        .select_for_client(client_id, &context_selector_to_ipc(&req.selector)?)
-        .map_err(|m| failed(m.to_string()))?;
-
-    let Some(next_session_id) = contexts.0.current_session_for_client(client_id) else {
+        .resolve_id(&context_selector_to_ipc(&req.selector)?)
+        .map_err(|_| AttachCommandError::ContextNotFound)?;
+    let snapshot = contexts.0.snapshot();
+    let Some(next_session_id) = snapshot.session_by_context.get(&context_id).copied() else {
         return Err(failed("context has no attached runtime"));
     };
-
+    let tokens = attach_token_handle()?;
+    if !manager.0.contains(next_session_id) {
+        return Err(AttachCommandError::SessionNotFound);
+    }
+    let context = contexts
+        .0
+        .select_for_client(client_id, &PrimitiveContextSelector::ById(context_id))
+        .map_err(|message| failed(message.to_string()))?;
     let previous_session = follow.0.selected_session(client_id);
     if let Some(prev) = previous_session
         && prev != next_session_id
@@ -388,17 +384,12 @@ pub fn attach_context(
         manager.0.remove_client(prev, &client_id);
     }
 
-    if !manager.0.contains(next_session_id) {
-        let _ = contexts.0.remove_contexts_for_session(next_session_id);
-        return Err(AttachCommandError::SessionNotFound);
-    }
-
     manager.0.add_client(next_session_id, client_id);
     follow
         .0
         .set_selected_target(client_id, Some(context.id), Some(next_session_id));
 
-    let mut grant = attach_token_handle()?.0.issue(next_session_id);
+    let mut grant = tokens.0.issue(next_session_id);
     grant.context_id = Some(context.id);
     Ok(to_api_grant(&grant))
 }
@@ -502,6 +493,18 @@ pub fn attach_open(
     }
 }
 
+fn validate_input_selection(
+    selected: Option<SessionId>,
+    requested: SessionId,
+) -> Result<(), AttachCommandError> {
+    if selected == Some(requested) {
+        return Ok(());
+    }
+    Err(AttachCommandError::Denied {
+        reason: "input target no longer matches the caller selection".to_string(),
+    })
+}
+
 pub fn attach_input(
     req: AttachInputArgs,
     ctx: &NativeServiceContext,
@@ -513,6 +516,7 @@ pub fn attach_input(
     let session_id = SessionId(req.session_id);
     let runtime = super::session_runtime_handle()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    validate_input_selection(follow_state()?.0.selected_session(client_id), session_id)?;
     if !runtime.0.client_can_write(session_id, client_id) {
         return Err(AttachCommandError::Denied {
             reason: "client does not have write permission for this attach stream".to_string(),
@@ -758,4 +762,23 @@ pub fn detach(ctx: &NativeServiceContext) -> Result<u8, AttachCommandError> {
         follow.0.set_selected_target(client_id, None, None);
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    #[test]
+    fn stale_and_suspended_input_targets_are_rejected() {
+        let old = SessionId(Uuid::from_u128(1));
+        let current = SessionId(Uuid::from_u128(2));
+        assert!(validate_input_selection(Some(current), current).is_ok());
+        assert!(matches!(
+            validate_input_selection(Some(current), old),
+            Err(AttachCommandError::Denied { .. })
+        ));
+        assert!(matches!(
+            validate_input_selection(None, old),
+            Err(AttachCommandError::Denied { .. })
+        ));
+    }
 }
