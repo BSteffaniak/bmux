@@ -31,9 +31,12 @@ impl Default for Cell {
 
 impl Cell {
     /// Create a cell from a single-cell symbol and style.
+    ///
+    /// Control-containing symbols become a visible replacement character. Parse ANSI
+    /// into styled text before constructing cells when terminal styling is intended.
     #[must_use]
     pub fn new(symbol: impl Into<String>, style: Style) -> Self {
-        let symbol = symbol.into();
+        let symbol = safe_symbol(symbol.into());
         Self {
             width: u8::try_from(grapheme_width(&symbol).max(1)).unwrap_or(2),
             symbol,
@@ -44,7 +47,7 @@ impl Cell {
 
     /// Set this cell's symbol and style as a standalone logical cell.
     pub fn set(&mut self, symbol: impl Into<String>, style: Style) {
-        let symbol = symbol.into();
+        let symbol = safe_symbol(symbol.into());
         self.width = u8::try_from(grapheme_width(&symbol).max(1)).unwrap_or(2);
         self.symbol = symbol;
         self.style = style;
@@ -224,7 +227,7 @@ impl Buffer {
             return;
         }
         self.clear_span_at(point);
-        let symbol = symbol.into();
+        let symbol = safe_symbol(symbol.into());
         let width = grapheme_width(&symbol);
         if width == 2 && point.x.saturating_add(1) < self.area.right() {
             self.clear_span_at(Point::new(point.x.saturating_add(1), point.y));
@@ -349,7 +352,20 @@ impl Buffer {
     }
 }
 
+// Ordinary cells are text, not terminal protocol. Replace a control-containing
+// symbol with one visible cell; callers wanting ANSI styles must parse first.
+fn safe_symbol(symbol: String) -> String {
+    if symbol.chars().any(char::is_control) {
+        "\u{fffd}".to_owned()
+    } else {
+        symbol
+    }
+}
+
 fn grapheme_width(grapheme: &str) -> u16 {
+    if grapheme.chars().any(char::is_control) {
+        return 1;
+    }
     match UnicodeWidthStr::width(grapheme) {
         0 => 0,
         1 => 1,
@@ -363,6 +379,23 @@ mod tests {
     use crate::geometry::{Point, Rect};
     use crate::style::{Color, Style};
     use crate::text::{Line, Span};
+
+    #[test]
+    fn cell_controls_are_replaced_before_width_accounting() {
+        for text in ["\x1b", "\r\n", "\t", "\x07", "\u{9b}", "\x1b[2J"] {
+            let mut cell = super::Cell::new(text, Style::new());
+            assert_eq!(cell.symbol, "�");
+            assert_eq!(cell.width(), 1);
+            cell.set(text, Style::new());
+            assert_eq!(cell.symbol, "�");
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+            buffer.set_cell(Point::new(0, 0), text, Style::new());
+            assert_eq!(buffer.row_symbols(0).unwrap(), "�       ");
+        }
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
+        buffer.write_line(buffer.area(), &Line::raw("\x1b[31mred\x1b[0m"));
+        assert_eq!(buffer.row_symbols(0).unwrap(), "�[31mred�[0m        ");
+    }
 
     #[test]
     fn clipped_fill_matches_repeated_text_rendering() {

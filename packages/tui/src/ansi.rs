@@ -240,6 +240,16 @@ fn emit_row_cells(
             x = x.saturating_add(1);
             continue;
         }
+        // `Cell::symbol` is public, so defend even against callers bypassing buffer
+        // setters. Never let cell text inject terminal protocol or shift the cursor.
+        if cell.symbol.chars().any(char::is_control) {
+            let width = u16::from(cell.width()).max(1).min(end - x);
+            for _ in 0..width {
+                writer.write_all(b" ")?;
+            }
+            x = x.saturating_add(width);
+            continue;
+        }
         writer.write_all(cell.symbol.as_bytes())?;
         let width = u16::from(cell.width()).max(
             u16::try_from(display_width(&cell.symbol))
@@ -575,6 +585,35 @@ mod tests {
     use crate::geometry::{Point, Rect};
     use crate::style::{Color, Modifier, Style};
     use crate::text::Line;
+
+    #[test]
+    fn raw_cell_controls_cannot_escape_full_or_diff_output() {
+        for payload in ["\x1b[2J", "\x1b]0;injected\x07", "\r\n", "\t", "\u{9b}2J"] {
+            let previous = Buffer::empty(Rect::new(0, 0, 8, 1));
+            let mut current = previous.clone();
+            current.get_mut(Point::new(0, 0)).unwrap().symbol = payload.to_owned();
+            current.set_cell(Point::new(1, 0), "X", Style::new());
+            let mut output = Vec::new();
+            let mut style = Style::new();
+            super::emit_row_cells(&mut output, &current, 0, 0, 8, &mut style).unwrap();
+            assert_eq!(output, b" X      ");
+            let mut expected = current.clone();
+            expected.set_cell(Point::new(0, 0), " ", Style::new());
+            let mut actual = Vec::new();
+            let mut safe = Vec::new();
+            write_ansi_frame(&mut actual, &current, None).unwrap();
+            write_ansi_frame(&mut safe, &expected, None).unwrap();
+            assert_eq!(actual, safe);
+            // A changed first cell may widen the diff span, but never emits its payload.
+            actual.clear();
+            write_ansi_frame_diff(&mut actual, &previous, &current, None).unwrap();
+            assert!(
+                !actual
+                    .windows(payload.len())
+                    .any(|bytes| bytes == payload.as_bytes())
+            );
+        }
+    }
 
     #[test]
     fn ansi_to_lines_preserves_sgr_styles() {
