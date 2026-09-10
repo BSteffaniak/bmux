@@ -438,6 +438,9 @@ impl RustPlugin for ClientsPlugin {
             "clients-selection-state-v1", "current" => |_req: (), ctx| {
                 Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(ctx.caller_client_id, |state, client| state.selection(client)))
             },
+            "clients-selection-commands-v1", "recover" => |req: clients_selection_commands_v1::client::RecoverRequest, ctx| {
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(ctx.caller_client_id, |state, client| state.recover_selection(client, req.expected_revision)))
+            },
             "clients-selection-commands-v1", "begin" => |req: clients_selection_commands_v1::client::BeginRequest, ctx| {
                 Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(ctx.caller_client_id, |state, client| state.begin_selection(client, req.expected_revision)))
             },

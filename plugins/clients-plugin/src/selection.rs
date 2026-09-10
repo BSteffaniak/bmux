@@ -26,6 +26,27 @@ impl FollowState {
         })
     }
 
+    pub(crate) fn recover_selection(
+        &mut self,
+        client: ClientId,
+        expected: u64,
+    ) -> Result<Selection, SelectionError> {
+        let current = self.selection(client)?;
+        if current.revision != expected || !current.suspended {
+            return Err(SelectionError::Conflict);
+        }
+        let revision = expected
+            .checked_add(1)
+            .ok_or_else(|| SelectionError::Failed {
+                reason: "selection revision exhausted".into(),
+            })?;
+        self.selected_contexts.insert(client, None);
+        self.selected_sessions.insert(client, None);
+        self.selection_revisions.insert(client, revision);
+        self.selection_reservations.remove(&client);
+        self.selection(client)
+    }
+
     pub(crate) fn begin_selection(
         &mut self,
         client: ClientId,
@@ -104,6 +125,32 @@ mod tests {
             Err(SelectionError::Conflict)
         );
         assert!(state.selection(a).unwrap().suspended);
+    }
+
+    #[test]
+    fn recovery_clears_target_and_fences_stale_recovery() {
+        let mut state = FollowState::default();
+        let client = ClientId(Uuid::from_u128(1));
+        state.connected_clients.insert(client);
+        state.set_selected_target(client, None, Some(SessionId(Uuid::from_u128(10))));
+        let reserved = state
+            .begin_selection(client, state.selection(client).unwrap().revision)
+            .unwrap();
+        state.set_selected_target(client, None, Some(SessionId(Uuid::from_u128(20))));
+        assert_eq!(
+            state.recover_selection(client, reserved.revision),
+            Err(SelectionError::Conflict)
+        );
+        let recovered = state
+            .recover_selection(client, state.selection(client).unwrap().revision)
+            .unwrap();
+        assert!(!recovered.suspended);
+        assert_eq!(state.selected_target(client), Some((None, None)));
+        assert_eq!(
+            state.commit_selection(client, reserved.revision, None, Some(Uuid::from_u128(10))),
+            Err(SelectionError::Conflict)
+        );
+        assert!(state.begin_selection(client, recovered.revision).is_ok());
     }
 
     #[test]

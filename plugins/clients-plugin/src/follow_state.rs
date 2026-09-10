@@ -205,11 +205,9 @@ impl FollowState {
         self.connected_clients
             .iter()
             .map(|client_id| {
-                let selected_session_id = self
-                    .selected_sessions
-                    .get(client_id)
-                    .and_then(|selected| selected.map(|session_id| session_id.0));
-                let selected_context_id = self.selected_contexts.get(client_id).copied().flatten();
+                let (selected_context_id, selected_session) =
+                    self.selected_target(*client_id).unwrap_or((None, None));
+                let selected_session_id = selected_session.map(|id| id.0);
                 let (following_client_id, following_global) =
                     self.follows.get(client_id).map_or((None, false), |entry| {
                         (Some(entry.leader_client_id.0), entry.global)

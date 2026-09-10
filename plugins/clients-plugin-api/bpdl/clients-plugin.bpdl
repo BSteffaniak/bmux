@@ -88,6 +88,10 @@ interface clients-selection-state-v1 {
 
 @capability(CLIENTS_WRITE)
 interface clients-selection-commands-v1 {
+    // Explicitly abandon a suspended transition. This never restores a stale
+    // input target: the caller must activate a target again after recovery.
+    command recover(expected-revision: u64)
+        -> result<clients-selection-state-v1.selection, clients-selection-state-v1.selection-error>;
     command begin(expected-revision: u64)
         -> result<clients-selection-state-v1.selection, clients-selection-state-v1.selection-error>;
     command commit(expected-revision: u64, context-id: uuid?, session-id: uuid?)
