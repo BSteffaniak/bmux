@@ -53,7 +53,11 @@ pub fn component_theme(appearance: &RuntimeAppearance) -> ComponentTheme {
             scrim: None,
         },
         text: Style::new().fg(foreground),
-        focused: Style::new().fg(cursor),
+        // Cursor and foreground colors may be identical (including in the
+        // default appearance). Focus must not depend on color contrast alone.
+        focused: Style::new()
+            .fg(cursor)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINE),
         selected: Style::new().fg(background).bg(selection),
         disabled: Style::new()
             .fg(Color::BrightBlack)

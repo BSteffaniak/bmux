@@ -1576,7 +1576,7 @@ const fn form_text_input_styles(
 ) -> TextInputBoxStyles {
     TextInputBoxStyles {
         text: theme.text,
-        focused_text: theme.text,
+        focused_text: theme.focused,
         disabled_text: theme.muted,
         placeholder: theme.muted,
         selection: theme.focused,
@@ -3436,6 +3436,128 @@ mod tests {
                 style_for(&before, "First label"),
                 style_for(&restored, "First label")
             );
+        }
+    }
+
+    fn modal_focus_cases() -> Vec<(PromptRequest, KeyCode)> {
+        let form = PromptRequest::form(
+            "Form",
+            vec![PromptFormSection::new(
+                "main",
+                "Main",
+                vec![
+                    PromptFormField::new(
+                        "first",
+                        "First",
+                        PromptFormFieldKind::SingleSelect {
+                            options: vec![PromptOption::new("first", "First choice")],
+                            default_index: 0,
+                        },
+                    ),
+                    PromptFormField::new(
+                        "second",
+                        "Second",
+                        PromptFormFieldKind::Bool { default: false },
+                    ),
+                ],
+            )],
+        );
+        let mut cases = vec![
+            (
+                PromptRequest::confirm("Confirm").confirm_labels("First", "Second"),
+                KeyCode::Tab,
+            ),
+            (
+                PromptRequest::multi_toggle(
+                    "Toggle",
+                    vec![
+                        PromptOption::new("first", "First"),
+                        PromptOption::new("second", "Second"),
+                    ],
+                ),
+                KeyCode::Down,
+            ),
+            (form, KeyCode::Tab),
+        ];
+        for kind in [
+            PromptFormFieldKind::Text {
+                initial_value: "First value".to_owned(),
+                placeholder: None,
+                validation: None,
+            },
+            PromptFormFieldKind::Number {
+                initial_value: "12345".to_owned(),
+                min: None,
+                max: None,
+            },
+            PromptFormFieldKind::Integer {
+                initial_value: 12345,
+                min: None,
+                max: None,
+            },
+        ] {
+            cases.push((
+                PromptRequest::form(
+                    "Edit",
+                    vec![PromptFormSection::new(
+                        "main",
+                        "Main",
+                        vec![
+                            PromptFormField::new("first", "First", kind),
+                            PromptFormField::new(
+                                "second",
+                                "Second",
+                                PromptFormFieldKind::Bool { default: false },
+                            ),
+                        ],
+                    )],
+                ),
+                KeyCode::Tab,
+            ));
+        }
+        cases
+    }
+
+    #[test]
+    fn modal_controls_keep_focus_visible_without_color_contrast() {
+        for (request, key) in modal_focus_cases() {
+            let first_label = match &request.field {
+                PromptField::Form { sections, .. } => match &sections[0].fields[0].kind {
+                    PromptFormFieldKind::Number { .. } | PromptFormFieldKind::Integer { .. } => {
+                        "12345"
+                    }
+                    PromptFormFieldKind::Text { .. } => "First value",
+                    _ => "First",
+                },
+                _ => "First",
+            };
+            let mut state = AttachPromptState::default();
+            state.enqueue_internal(request, AttachInternalPromptAction::QuitSession);
+            let appearance = RuntimeAppearance {
+                foreground: "#ffffff".to_owned(),
+                cursor: "#ffffff".to_owned(),
+                ..RuntimeAppearance::default()
+            };
+            let geometry = TerminalGeometry { cols: 80, rows: 24 };
+            let before = state
+                .attach_prompt_overlay_render(geometry, &appearance, false)
+                .unwrap();
+            state.handle_key_event(&key_event(key));
+            let after = state
+                .attach_prompt_overlay_render(geometry, &appearance, false)
+                .unwrap();
+            let focused = |render: &super::AttachPromptOverlayRender, label: &str| {
+                render.ops.iter().any(|op| {
+                    matches!(op,
+                    bmux_plugin::RenderOp::TextRun { text, style, .. }
+                    if text.contains(label) && style.bold && style.underline)
+                })
+            };
+            // Confirm defaults to No; other controls start at the first item.
+            let initially_first = focused(&before, first_label);
+            assert_ne!(initially_first, focused(&before, "Second"));
+            assert_ne!(initially_first, focused(&after, first_label));
+            assert_eq!(initially_first, focused(&after, "Second"));
         }
     }
 

@@ -50,11 +50,19 @@ struct DialogContent<'a, 'state> {
 impl<'a, 'state: 'a> DialogContent<'a, 'state> {
     fn new(id: &LayoutId, dialog: &Dialog<'a>, state: &'state Cell<ActionRowState>) -> Self {
         let body = TextBlock::new(Text::from_lines(dialog.body.to_vec()))
-            .id(format!("{}.body", id.as_str()));
+            .id(format!("{}.body", id.as_str()))
+            .style(dialog.theme.background.patch(dialog.theme.text));
         let actions = (!dialog.actions.is_empty()).then(|| {
             Element::new(
                 ActionRowComponent::new(format!("{}.actions", id.as_str()), dialog.actions, state)
-                    .spacing(dialog.action_spacing),
+                    .spacing(dialog.action_spacing)
+                    .styles(crate::button::ButtonStyles {
+                        normal: dialog.theme.background.patch(dialog.theme.text),
+                        focused: dialog.theme.background.patch(dialog.theme.focused),
+                        hovered: dialog.theme.background.patch(dialog.theme.focused),
+                        pressed: dialog.theme.background.patch(dialog.theme.focused),
+                        disabled: dialog.theme.background.patch(dialog.theme.muted),
+                    }),
             )
         });
         Self {
