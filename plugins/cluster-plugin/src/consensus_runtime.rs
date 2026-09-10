@@ -350,6 +350,88 @@ impl ConsensusNode {
         Self::decode_write_response(&command_id, self.write(encoded).await)
     }
 
+    /// Submits a signed protocol refresh using quorum-confirmed authority.
+    /// The caller supplies proofs, never the time used to validate credentials.
+    /// Apply rechecks preconditions in log order and persistence precedes the reply.
+    ///
+    /// # Errors
+    /// Rejects missing quorum, inactive features, invalid proofs and failed commits.
+    pub async fn refresh_member_protocol(
+        &self,
+        command_id: bmux_cluster_plugin_api::cluster_types::CommandId,
+        replacement: bmux_cluster_plugin_api::cluster_types::ClusterMember,
+        expected_serial: String,
+        expected_revision: u64,
+        node_signature: Vec<u8>,
+    ) -> Result<ControlResponse, ControlServiceError> {
+        let mut state = self
+            .linearizable_control_state()
+            .await
+            .map_err(control_read_error)?;
+        let command = crate::control_codec::ProtocolRefreshCommand {
+            command_id: command_id.value,
+            replacement,
+            expected_serial,
+            expected_revision,
+            node_signature,
+            verified_at_unix_ms: crate::now_unix_ms(),
+        };
+        let encoded = command
+            .encode()
+            .map_err(|error| ControlServiceError::Internal {
+                reason: error.to_string(),
+            })?;
+        let preflight = state.apply_refresh_command(&command);
+        if let bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Rejected { error } =
+            preflight.result
+        {
+            return Err(ControlServiceError::Rejected { error });
+        }
+        Self::decode_write_response(&command_id, self.write(encoded).await)
+    }
+
+    /// Validates bootstrap proof using current authority and submits it durably.
+    /// Verification time is assigned here, never accepted from a service caller.
+    ///
+    /// # Errors
+    /// Rejects missing quorum, invalid proof/preconditions and failed commits.
+    pub async fn bootstrap_principal(
+        &self,
+        proof: bmux_cluster_plugin_api::cluster_principal_bootstrap_types::BootstrapProof,
+        expected_control_revision: u64,
+    ) -> Result<ControlResponse, ControlServiceError> {
+        self.linearizable_control_state()
+            .await
+            .map_err(control_read_error)?;
+        let snapshot =
+            self.storage
+                .state_machine()
+                .map_err(|error| ControlServiceError::Internal {
+                    reason: error.to_string(),
+                })?;
+        let command = crate::principal_bootstrap::BootstrapCommand {
+            proof,
+            expected_control_revision,
+            verified_at_unix_ms: crate::now_unix_ms(),
+        };
+        // The preflight uses one persisted state/membership snapshot. Apply checks
+        // again in log order, so intervening membership or revision changes reject.
+        let mut state = snapshot.control_state().clone();
+        let preflight = state.apply_bootstrap_command(&command, snapshot.committed_membership());
+        if let bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Rejected { error } =
+            preflight.result
+        {
+            return Err(ControlServiceError::Rejected { error });
+        }
+        let encoded = command
+            .encode()
+            .map_err(|reason| ControlServiceError::Internal { reason })?;
+        Self::decode_write_response(
+            &command.proof.statement.command_id,
+            self.write(encoded).await,
+        )
+    }
+
     fn decode_write_response(
         command_id: &bmux_cluster_plugin_api::cluster_types::CommandId,
         result: Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError>,
@@ -675,6 +757,104 @@ pub(crate) mod tests {
                 RemoteError::new_with_node(self.target, self.expected.clone(), error).into()
             })
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_submission_rejects_uninitialized_authority() {
+        use bmux_cluster_plugin_api::cluster_principal_bootstrap_types::{
+            BootstrapProof, BootstrapStatement,
+        };
+        let root = TempDir::new().unwrap();
+        let node = ConsensusNode::start(
+            root.path(),
+            "bootstrap-test",
+            NodeId::from(91),
+            InMemoryNetworkFactory::default(),
+        )
+        .await
+        .unwrap();
+        let result = node
+            .bootstrap_principal(
+                BootstrapProof {
+                    statement: BootstrapStatement {
+                        schema_version: 1,
+                        cluster_id: "bootstrap-test".into(),
+                        membership_term: 0,
+                        membership_leader_id: NodeId::from(91).to_string(),
+                        membership_log_index: 0,
+                        principal_id: uuid::Uuid::new_v4(),
+                        principal_public_key: String::new(),
+                        command_id: bmux_cluster_plugin_api::cluster_types::CommandId {
+                            value: uuid::Uuid::new_v4(),
+                        },
+                    },
+                    principal_signature: Vec::new(),
+                    voter_approvals: Vec::new(),
+                },
+                0,
+            )
+            .await;
+        assert!(matches!(result, Err(ControlServiceError::NotLeader { .. })));
+        assert!(
+            node.persisted_control_state()
+                .unwrap()
+                .principal_bootstrap
+                .is_none()
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_submission_requires_quorum_and_activation() {
+        use crate::membership::{
+            ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
+        };
+        let root = TempDir::new().unwrap();
+        let identity = NodeIdentity::new_for_test(92);
+        let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000092"
+            .parse()
+            .unwrap();
+        let node = ConsensusNode::start(
+            root.path(),
+            &cluster.to_string(),
+            *identity.node_id(),
+            InMemoryNetworkFactory::default(),
+        )
+        .await
+        .unwrap();
+        let member = issue_test_member(
+            &identity,
+            cluster,
+            &identity,
+            "tls://127.0.0.1:49992",
+            initializer_capabilities(),
+            42,
+        );
+        let submit = || {
+            node.refresh_member_protocol(
+                CommandId {
+                    value: uuid::Uuid::new_v4(),
+                },
+                member.clone(),
+                member.credential_serial.clone(),
+                0,
+                vec![0; 64],
+            )
+        };
+        assert!(matches!(
+            submit().await,
+            Err(ControlServiceError::NotLeader { .. })
+        ));
+        node.initialize_single(*identity.node_id(), "node")
+            .await
+            .unwrap();
+        wait_for_leader(&[&node]).await;
+        assert!(matches!(
+            submit().await,
+            Err(ControlServiceError::Rejected { .. })
+        ));
+        assert_eq!(node.persisted_control_state().unwrap().revision, 0);
+        node.shutdown().await.unwrap();
     }
 
     pub async fn wait_for_leader(nodes: &[&ConsensusNode]) -> NodeId {
@@ -1344,6 +1524,155 @@ pub(crate) mod tests {
         for node in nodes {
             node.shutdown().await.unwrap();
         }
+    }
+
+    async fn assert_bootstrap_activation_service(node: &ConsensusNode, id: NodeId) {
+        use bmux_cluster_plugin_api::cluster_control_command_v2::ClusterControlCommandService;
+        let registry = crate::consensus_network::ConsensusNodeRegistry::default();
+        registry.insert(id, node.clone()).unwrap();
+        let service = crate::consensus_network::ControlServiceHandle::new(
+            Arc::new(FailingCaller),
+            id,
+            registry.clone(),
+        );
+        let revision = node.linearizable_control_state().await.unwrap().revision;
+        let command_id = bmux_cluster_plugin_api::cluster_types::CommandId {
+            value: uuid::Uuid::new_v4(),
+        };
+        let now = crate::now_unix_ms();
+        let first = service
+            .activate_feature(
+                command_id.clone(),
+                id.to_string(),
+                now,
+                revision,
+                3,
+                3,
+                "principal-bootstrap-v1".into(),
+            )
+            .await
+            .unwrap();
+        let retry = service
+            .activate_feature(
+                command_id.clone(),
+                id.to_string(),
+                now,
+                revision,
+                3,
+                3,
+                "principal-bootstrap-v1".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, retry);
+        let conflict = service
+            .activate_feature(
+                command_id,
+                id.to_string(),
+                now,
+                revision,
+                3,
+                3,
+                "different-feature".into(),
+            )
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(ControlServiceError::Rejected {
+                error:
+                    bmux_cluster_plugin_api::cluster_types::ControlCommandError::CommandIdConflict
+            })
+        ));
+        registry.remove(id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_commit_survives_restart_and_preserves_retry_revision() {
+        use crate::membership::{
+            ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
+        };
+        use bmux_cluster_plugin_api::cluster_principal_bootstrap_types::{
+            BootstrapProof, BootstrapStatement, VoterApproval,
+        };
+        let root = TempDir::new().unwrap();
+        let network = InMemoryNetworkFactory::default();
+        let identity = NodeIdentity::new_for_test(95);
+        let id = *identity.node_id();
+        let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000095"
+            .parse()
+            .unwrap();
+        let node = ConsensusNode::start(root.path(), &cluster.to_string(), id, network.clone())
+            .await
+            .unwrap();
+        node.initialize_single(id, "tls://127.0.0.1:49995")
+            .await
+            .unwrap();
+        wait_for_leader(&[&node]).await;
+        let member = issue_test_member(
+            &identity,
+            cluster,
+            &identity,
+            "tls://127.0.0.1:49995",
+            initializer_capabilities(),
+            crate::now_unix_ms(),
+        );
+        crate::consensus_membership::publish_members(node.clone(), &id.to_string(), [member])
+            .await
+            .unwrap();
+        assert_bootstrap_activation_service(&node, id).await;
+        let snapshot = node.storage.state_machine().unwrap();
+        let membership = snapshot.committed_membership().log_id().unwrap();
+        let key = iroh::SecretKey::from_bytes(&[95; 32]);
+        let statement = BootstrapStatement {
+            schema_version: 1,
+            cluster_id: cluster.to_string(),
+            membership_term: membership.leader_id.term,
+            membership_leader_id: membership.leader_id.node_id.to_string(),
+            membership_log_index: membership.index,
+            principal_id: uuid::Uuid::new_v4(),
+            principal_public_key: key.public().to_string(),
+            command_id: bmux_cluster_plugin_api::cluster_types::CommandId {
+                value: uuid::Uuid::new_v4(),
+            },
+        };
+        let payload = crate::principal_bootstrap::signing_payload(&statement).unwrap();
+        let proof = BootstrapProof {
+            statement,
+            principal_signature: key.sign(&payload).to_bytes().to_vec(),
+            voter_approvals: vec![VoterApproval {
+                node_id: id.to_string(),
+                signature: identity.sign(&payload),
+            }],
+        };
+        let revision = snapshot.control_state().revision;
+        drop(snapshot);
+        let result = node
+            .bootstrap_principal(proof.clone(), revision)
+            .await
+            .unwrap();
+        assert_eq!(result.control_revision, revision + 1);
+        node.shutdown().await.unwrap();
+        drop(node);
+        let recovered = ConsensusNode::start(root.path(), &cluster.to_string(), id, network)
+            .await
+            .unwrap();
+        wait_for_leader(&[&recovered]).await;
+        assert_eq!(
+            recovered
+                .bootstrap_principal(proof.clone(), revision)
+                .await
+                .unwrap(),
+            result
+        );
+        let mut conflict = proof;
+        conflict.statement.principal_id = uuid::Uuid::new_v4();
+        assert!(
+            recovered
+                .bootstrap_principal(conflict, revision)
+                .await
+                .is_err()
+        );
+        recovered.shutdown().await.unwrap();
     }
 
     #[tokio::test]

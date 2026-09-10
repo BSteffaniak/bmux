@@ -555,6 +555,11 @@ impl ConsensusStateMachine {
     }
 
     #[must_use]
+    pub const fn committed_membership(&self) -> &StoredMembership<NodeId, BasicNode> {
+        &self.last_membership
+    }
+
+    #[must_use]
     pub const fn control_state(&self) -> &ControlState {
         &self.control_state
     }
@@ -688,10 +693,26 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
                     replies.push(ControlReply(Vec::new()));
                 }
                 EntryPayload::Normal(request) => {
-                    let response = if crate::control_codec::is_feature_activation(&request.0) {
+                    let response = if crate::principal_bootstrap::is_bootstrap_command(&request.0) {
+                        let command =
+                            crate::principal_bootstrap::BootstrapCommand::decode(&request.0)
+                                .map_err(|error| {
+                                    storage_write_error(std::io::Error::other(error))
+                                })?;
+                        next.control_state
+                            .apply_bootstrap_command(&command, &next.last_membership)
+                    } else if crate::control_codec::is_protocol_refresh(&request.0) {
+                        let command =
+                            crate::control_codec::ProtocolRefreshCommand::decode(&request.0)
+                                .map_err(storage_write_error)?;
+                        next.control_state.apply_refresh_command(&command)
+                    } else if crate::control_codec::is_feature_activation(&request.0) {
                         let command = crate::control_codec::decode_feature_activation(&request.0)
                             .map_err(storage_write_error)?;
-                        next.control_state.apply_feature_activation(&command)
+                        next.control_state.apply_feature_activation_with_membership(
+                            &command,
+                            Some(&next.last_membership),
+                        )
                     } else {
                         let command =
                             decode_control_command(&request.0).map_err(storage_write_error)?;

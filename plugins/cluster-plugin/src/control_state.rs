@@ -104,6 +104,15 @@ struct FeatureDedupRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalBootstrapRecord {
+    pub principal_id: uuid::Uuid,
+    pub public_key: String,
+    pub command_id: uuid::Uuid,
+    pub statement_fingerprint: [u8; 32],
+    pub committed_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlState {
     pub schema_version: u16,
     pub cluster_id: String,
@@ -115,6 +124,10 @@ pub struct ControlState {
     pub workspaces: BTreeMap<uuid::Uuid, WorkspaceRecord>,
     pub tabs: BTreeMap<uuid::Uuid, LogicalTabRecord>,
     pub panes: BTreeMap<uuid::Uuid, LogicalPaneRecord>,
+    /// Permanent bootstrap consumption and retry outcome; never pruned with ordinary dedup.
+    pub principal_bootstrap: Option<PrincipalBootstrapRecord>,
+    // Successful refresh outcomes are bounded and persisted with the member update.
+    refresh_outcomes: BTreeMap<uuid::Uuid, ([u8; 32], u64)>,
     dedup: BTreeMap<DedupKey, DedupRecord>,
     feature_dedup: BTreeMap<DedupKey, FeatureDedupRecord>,
 }
@@ -133,9 +146,260 @@ impl ControlState {
             workspaces: BTreeMap::new(),
             tabs: BTreeMap::new(),
             panes: BTreeMap::new(),
+            principal_bootstrap: None,
+            refresh_outcomes: BTreeMap::new(),
             dedup: BTreeMap::new(),
             feature_dedup: BTreeMap::new(),
         }
+    }
+
+    /// Applies a replicated bootstrap command against the committed voter configuration.
+    /// No wall clock, network, or external policy service is consulted during apply.
+    pub fn apply_bootstrap_command(
+        &mut self,
+        command: &crate::principal_bootstrap::BootstrapCommand,
+        membership: &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
+    ) -> ControlResponse {
+        let outcome = (|| {
+            // A committed successful retry remains valid after membership changes.
+            if self.principal_bootstrap.is_none() {
+                crate::principal_bootstrap::verify_proof(
+                    &command.proof,
+                    &self.cluster_id,
+                    membership,
+                    &self.members,
+                    command.verified_at_unix_ms,
+                )?;
+            }
+            self.apply_principal_bootstrap(
+                &command.proof.statement,
+                command.expected_control_revision,
+            )
+        })();
+        let (control_revision, result) = match outcome {
+            Ok(record) => (
+                record.committed_revision,
+                ControlCommandResult::Accepted {
+                    payload: Vec::new(),
+                },
+            ),
+            Err(reason) => (
+                self.revision,
+                ControlCommandResult::Rejected {
+                    error: ControlCommandError::InvalidTransition { reason },
+                },
+            ),
+        };
+        ControlResponse {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            command_id: command.proof.statement.command_id.clone(),
+            control_revision,
+            workflow_status: ControlWorkflowStatus::Complete,
+            result,
+        }
+    }
+
+    /// Applies a versioned refresh from the committed log; compatibility is checked
+    /// before any member or retry-state mutation. Verification time is leader-assigned.
+    pub fn apply_refresh_command(
+        &mut self,
+        command: &crate::control_codec::ProtocolRefreshCommand,
+    ) -> ControlResponse {
+        let outcome = if self.read_schema_floor < 4
+            || self.write_schema_floor < 4
+            || !self.activated_features.contains("protocol-refresh-v1")
+        {
+            Err("protocol refresh feature is not active".to_string())
+        } else {
+            self.apply_protocol_refresh(
+                command.command_id,
+                &command.replacement,
+                &command.expected_serial,
+                command.expected_revision,
+                &command.node_signature,
+                command.verified_at_unix_ms,
+            )
+        };
+        let (control_revision, result) = match outcome {
+            Ok(revision) => (
+                revision,
+                ControlCommandResult::Accepted {
+                    payload: Vec::new(),
+                },
+            ),
+            Err(reason) => (
+                self.revision,
+                ControlCommandResult::Rejected {
+                    error: ControlCommandError::InvalidTransition { reason },
+                },
+            ),
+        };
+        ControlResponse {
+            schema_version: CONTROL_SCHEMA_VERSION,
+            command_id: bmux_cluster_plugin_api::cluster_types::CommandId {
+                value: command.command_id,
+            },
+            control_revision,
+            workflow_status: ControlWorkflowStatus::Complete,
+            result,
+        }
+    }
+
+    /// Applies a protocol refresh authorized by both the current node key and
+    /// the existing credential issuer. The signed payload binds the predecessor
+    /// credential, expected revision and complete replacement record.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid proof, changed identity/role or incompatible floors.
+    pub fn apply_protocol_refresh(
+        &mut self,
+        command_id: uuid::Uuid,
+        replacement: &ClusterMember,
+        expected_serial: &str,
+        expected_revision: u64,
+        node_signature: &[u8],
+        verified_at_unix_ms: u64,
+    ) -> Result<u64, String> {
+        let payload = Self::protocol_refresh_payload(
+            command_id,
+            replacement,
+            expected_serial,
+            expected_revision,
+        )?;
+        let fingerprint: [u8; 32] = sha2::Sha256::digest(&payload).into();
+        if let Some((recorded, revision)) = self.refresh_outcomes.get(&command_id) {
+            return if recorded == &fingerprint {
+                Ok(*revision)
+            } else {
+                Err("refresh command identity conflict".into())
+            };
+        }
+        if self.refresh_outcomes.len() >= 1024 {
+            return Err("refresh outcome capacity exhausted".into());
+        }
+        let current = self
+            .members
+            .get(&replacement.node_id)
+            .ok_or("refresh member is missing")?;
+        if self.revision != expected_revision || current.credential_serial != expected_serial {
+            return Err("protocol refresh precondition mismatch".into());
+        }
+        if current.state != ClusterMemberState::Active
+            || replacement.state != ClusterMemberState::Active
+            || replacement.cluster_id != self.cluster_id
+            || current.cluster_id != self.cluster_id
+            || current.public_key != replacement.public_key
+            || current.capabilities != replacement.capabilities
+            || current.endpoint != replacement.endpoint
+            || current.credential_issuer_node_id != replacement.credential_issuer_node_id
+            || current.credential_issuer_public_key != replacement.credential_issuer_public_key
+            || replacement.credential_serial == expected_serial
+            || replacement.updated_at_unix_ms <= current.updated_at_unix_ms
+        {
+            return Err("protocol refresh changes membership authority or is stale".into());
+        }
+        crate::membership::verify_membership_credential(current, verified_at_unix_ms)?;
+        crate::membership::verify_membership_credential(replacement, verified_at_unix_ms)?;
+        let key = current
+            .public_key
+            .parse::<iroh::PublicKey>()
+            .map_err(|e| e.to_string())?;
+        let signature = iroh::Signature::try_from(node_signature).map_err(|e| e.to_string())?;
+        key.verify(&payload, &signature)
+            .map_err(|_| "protocol refresh node signature is invalid")?;
+        if replacement.negotiated_protocol.schema_version < u32::from(self.write_schema_floor)
+            || self
+                .activated_features
+                .iter()
+                .any(|feature| !replacement.negotiated_protocol.features.contains(feature))
+        {
+            return Err("protocol refresh violates active feature floors".into());
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or("control revision overflow")?;
+        self.members
+            .insert(replacement.node_id.clone(), replacement.clone());
+        self.revision = revision;
+        self.refresh_outcomes
+            .insert(command_id, (fingerprint, revision));
+        Ok(revision)
+    }
+
+    /// Canonical, domain-separated proof for the explicit protocol refresh transition.
+    ///
+    /// # Errors
+    /// Rejects unbounded member records and predecessor identifiers.
+    pub fn protocol_refresh_payload(
+        command_id: uuid::Uuid,
+        replacement: &ClusterMember,
+        expected_serial: &str,
+        expected_revision: u64,
+    ) -> Result<Vec<u8>, String> {
+        crate::control_codec::validate_member(replacement).map_err(|e| e.to_string())?;
+        if expected_serial.len() > 1024 {
+            return Err("refresh predecessor serial exceeds limit".into());
+        }
+        let mut writer = crate::control_codec::Writer::default();
+        if command_id.is_nil() {
+            return Err("refresh command identity is nil".into());
+        }
+        writer.raw(b"bmux.cluster.protocol-refresh.v1\0");
+        writer.uuid(command_id);
+        writer.string(expected_serial);
+        writer.u64(expected_revision);
+        writer.encode_state_member(replacement);
+        Ok(writer.into_bytes())
+    }
+
+    /// Applies an already verified bootstrap statement with authoritative preconditions.
+    ///
+    /// This deterministic transition performs no external authorization or I/O.
+    /// The consensus integration must validate proof and current membership before
+    /// invoking it, and persist this state before acknowledging success.
+    ///
+    /// # Errors
+    /// Rejects unsupported feature state, conflicts, invalid statements or revisions.
+    pub fn apply_principal_bootstrap(
+        &mut self,
+        statement: &bmux_cluster_plugin_api::cluster_principal_bootstrap_types::BootstrapStatement,
+        expected_revision: u64,
+    ) -> Result<PrincipalBootstrapRecord, String> {
+        let payload = crate::principal_bootstrap::signing_payload(statement)?;
+        let fingerprint: [u8; 32] = sha2::Sha256::digest(&payload).into();
+        if let Some(existing) = &self.principal_bootstrap {
+            return if existing.command_id == statement.command_id.value
+                && existing.statement_fingerprint == fingerprint
+            {
+                Ok(existing.clone())
+            } else {
+                Err("principal bootstrap has already been consumed".into())
+            };
+        }
+        if statement.cluster_id != self.cluster_id || expected_revision != self.revision {
+            return Err("bootstrap cluster or control revision mismatch".into());
+        }
+        if self.read_schema_floor < 3
+            || self.write_schema_floor < 3
+            || !self.activated_features.contains("principal-bootstrap-v1")
+        {
+            return Err("principal bootstrap feature is not active".into());
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or("control revision overflow")?;
+        let record = PrincipalBootstrapRecord {
+            principal_id: statement.principal_id,
+            public_key: statement.principal_public_key.clone(),
+            command_id: statement.command_id.value,
+            statement_fingerprint: fingerprint,
+            committed_revision: revision,
+        };
+        self.principal_bootstrap = Some(record.clone());
+        self.revision = revision;
+        Ok(record)
     }
 
     #[must_use]
@@ -253,6 +517,17 @@ impl ControlState {
         response
     }
 
+    /// Whether this activation identity already has a committed outcome.
+    /// A caller must still compare the complete command through apply; this is
+    /// not permission to accept conflicting reuse.
+    #[must_use]
+    pub fn has_feature_activation_outcome(&self, command: &FeatureActivationCommand) -> bool {
+        self.feature_dedup.contains_key(&DedupKey {
+            principal_id: command.principal_id.clone(),
+            command_id: command.command_id.value,
+        })
+    }
+
     /// Applies one feature-floor activation deterministically.
     ///
     /// # Panics
@@ -262,6 +537,21 @@ impl ControlState {
     pub fn apply_feature_activation(
         &mut self,
         command: &FeatureActivationCommand,
+    ) -> ControlResponse {
+        self.apply_feature_activation_with_membership(command, None)
+    }
+
+    /// Applies against the membership committed immediately before this command.
+    /// Missing membership cannot authorize first bootstrap activation.
+    ///
+    /// # Panics
+    /// Panics on unrecoverable control revision overflow.
+    pub fn apply_feature_activation_with_membership(
+        &mut self,
+        command: &FeatureActivationCommand,
+        membership: Option<
+            &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
+        >,
     ) -> ControlResponse {
         let key = DedupKey {
             principal_id: command.principal_id.clone(),
@@ -276,7 +566,37 @@ impl ControlState {
                 self.feature_error_response(command, ControlCommandError::CommandIdConflict)
             };
         }
-        let result = self.validate_feature_activation(command);
+        let result = self.validate_feature_activation(command).and_then(|()| {
+            if !matches!(
+                command.feature.as_str(),
+                "principal-bootstrap-v1" | "protocol-refresh-v1"
+            ) {
+                return Ok(());
+            }
+            let membership = membership.ok_or_else(|| {
+                invalid_transition("bootstrap activation requires committed membership")
+            })?;
+            let committed = membership
+                .membership()
+                .nodes()
+                .map(|(id, _)| id.to_string())
+                .collect::<BTreeSet<_>>();
+            let active = self
+                .members
+                .values()
+                .filter(|member| member.state == ClusterMemberState::Active)
+                .map(|member| member.node_id.clone())
+                .collect::<BTreeSet<_>>();
+            if membership.log_id().is_none()
+                || membership.membership().voter_ids().next().is_none()
+                || committed != active
+            {
+                return Err(invalid_transition(
+                    "bootstrap activation member records do not match committed membership",
+                ));
+            }
+            Ok(())
+        });
         let mut next = self.clone();
         let response_result = match result {
             Ok(()) => {
@@ -327,6 +647,43 @@ impl ControlState {
             return Err(invalid_transition(
                 "feature activation floors or feature identity are invalid",
             ));
+        }
+        if matches!(
+            command.feature.as_str(),
+            "principal-bootstrap-v1" | "protocol-refresh-v1"
+        ) {
+            let minimum_schema = if command.feature == "protocol-refresh-v1" {
+                4
+            } else {
+                3
+            };
+            if command.read_schema_floor < minimum_schema
+                || command.write_schema_floor < minimum_schema
+            {
+                return Err(invalid_transition(
+                    "membership feature requires its supported schema floor",
+                ));
+            }
+            let active = self
+                .members
+                .values()
+                .filter(|member| member.state == ClusterMemberState::Active)
+                .collect::<Vec<_>>();
+            if active.is_empty()
+                || active.iter().any(|member| {
+                    member.cluster_id != self.cluster_id
+                        || member.negotiated_protocol.schema_version
+                            < u32::from(command.write_schema_floor)
+                        || !member
+                            .negotiated_protocol
+                            .features
+                            .contains(&command.feature)
+                })
+            {
+                return Err(invalid_transition(
+                    "principal bootstrap requires compatible active members",
+                ));
+            }
         }
         Ok(())
     }
@@ -381,6 +738,11 @@ impl ControlState {
                     ));
                 }
                 if let Some(existing) = self.members.get(&member.node_id) {
+                    if existing.negotiated_protocol != member.negotiated_protocol {
+                        return Err(invalid_transition(
+                            "protocol capability changes require an explicit authenticated refresh transition",
+                        ));
+                    }
                     if existing.state == ClusterMemberState::Active
                         && existing.capabilities.consensus_role
                             == bmux_cluster_plugin_api::cluster_types::ClusterConsensusRole::Voter
@@ -1134,6 +1496,102 @@ mod tests {
         assert_eq!(state.panes[&id(30)].availability, PaneAvailability::Pending);
     }
 
+    fn assert_protocol_refresh_rejected(
+        state: &mut ControlState,
+        identity: &crate::membership::NodeIdentity,
+        cluster_id: crate::membership::ClusterId,
+        member: &bmux_cluster_plugin_api::cluster_types::ClusterMember,
+        issued_at_unix_ms: u64,
+    ) {
+        let mut protocol = member.negotiated_protocol.clone();
+        protocol.schema_version += 1;
+        let mut refreshed = crate::membership::issue_membership_credential(
+            identity,
+            cluster_id,
+            identity.node_id().to_string(),
+            identity.public_key().to_string(),
+            crate::membership::initializer_capabilities(),
+            protocol,
+            issued_at_unix_ms + 1,
+        )
+        .unwrap();
+        refreshed.endpoint.clone_from(&member.endpoint);
+        let command_id = uuid::Uuid::new_v4();
+        let payload = ControlState::protocol_refresh_payload(
+            command_id,
+            &refreshed,
+            &member.credential_serial,
+            state.revision,
+        )
+        .unwrap();
+        let mut refreshed_state = state.clone();
+        assert!(
+            refreshed_state
+                .apply_protocol_refresh(
+                    command_id,
+                    &refreshed,
+                    &member.credential_serial,
+                    state.revision,
+                    &[0; 64],
+                    issued_at_unix_ms + 1
+                )
+                .is_err()
+        );
+        assert_eq!(refreshed_state, *state);
+        refreshed_state
+            .apply_protocol_refresh(
+                command_id,
+                &refreshed,
+                &member.credential_serial,
+                state.revision,
+                &identity.sign(&payload),
+                issued_at_unix_ms + 1,
+            )
+            .unwrap();
+        assert_eq!(refreshed_state.members[&member.node_id], refreshed);
+        assert_eq!(refreshed_state.revision, state.revision + 1);
+        let bytes = refreshed_state.encode_snapshot().unwrap();
+        let mut restored = ControlState::decode_snapshot(&bytes).unwrap();
+        assert_eq!(restored, refreshed_state);
+        assert_eq!(
+            restored
+                .apply_protocol_refresh(
+                    command_id,
+                    &refreshed,
+                    &member.credential_serial,
+                    state.revision,
+                    &identity.sign(&payload),
+                    issued_at_unix_ms + 1
+                )
+                .unwrap(),
+            refreshed_state.revision
+        );
+        let mut conflicting = refreshed.clone();
+        conflicting.updated_at_unix_ms += 1;
+        assert!(
+            restored
+                .apply_protocol_refresh(
+                    command_id,
+                    &conflicting,
+                    &member.credential_serial,
+                    state.revision,
+                    &identity.sign(&payload),
+                    issued_at_unix_ms + 1
+                )
+                .is_err()
+        );
+        let mut refresh = command(
+            55,
+            ControlCommandRequest::UpsertMember { member: refreshed },
+        );
+        refresh.issued_at_unix_ms = issued_at_unix_ms + 1;
+        assert!(
+            matches!(state.apply(&refresh).result, ControlCommandResult::Rejected {
+            error: ControlCommandError::InvalidTransition { ref reason }
+        } if reason.contains("explicit authenticated refresh"))
+        );
+    }
+
     #[test]
     fn membership_updates_reject_stale_and_same_timestamp_conflicts() {
         let identity = crate::membership::NodeIdentity::new_for_test(1);
@@ -1210,6 +1668,14 @@ mod tests {
             state.apply(&wrong_node_command).result,
             ControlCommandResult::Rejected { .. }
         ));
+
+        assert_protocol_refresh_rejected(
+            &mut state,
+            &identity,
+            cluster_id,
+            &member,
+            issued_at_unix_ms,
+        );
 
         let duplicate_identity = crate::membership::NodeIdentity::new_for_test(2);
         let mut duplicate = crate::membership::issue_membership_credential(
@@ -1309,6 +1775,183 @@ mod tests {
                 .encode_snapshot()
                 .unwrap(),
             canonical
+        );
+    }
+
+    #[test]
+    fn bootstrap_activation_rejects_missing_learner_record() {
+        use crate::membership::{
+            ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
+        };
+        use openraft::{BasicNode, CommittedLeaderId, LogId, Membership, StoredMembership};
+        let identity = NodeIdentity::new_for_test(96);
+        let id = *identity.node_id();
+        let learner = crate::membership::NodeId::from(97);
+        let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000096"
+            .parse()
+            .unwrap();
+        let mut state = ControlState::new(cluster.to_string());
+        let member = issue_test_member(
+            &identity,
+            cluster,
+            &identity,
+            "tls://127.0.0.1:49996",
+            initializer_capabilities(),
+            42,
+        );
+        state.members.insert(member.node_id.clone(), member);
+        let membership = StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(1, id), 1)),
+            Membership::new(
+                vec![BTreeSet::from([id])],
+                BTreeMap::from([
+                    (id, BasicNode::new("node")),
+                    (learner, BasicNode::new("learner")),
+                ]),
+            ),
+        );
+        let command = FeatureActivationCommand {
+            principal_id: id.to_string(),
+            command_id: CommandId {
+                value: uuid::Uuid::new_v4(),
+            },
+            issued_at_unix_ms: 42,
+            expected_control_revision: 0,
+            read_schema_floor: 3,
+            write_schema_floor: 3,
+            feature: "principal-bootstrap-v1".into(),
+        };
+        let response = state.apply_feature_activation_with_membership(&command, Some(&membership));
+        assert!(matches!(
+            response.result,
+            ControlCommandResult::Rejected { .. }
+        ));
+        assert_eq!(state.revision, 0);
+        assert!(!state.activated_features.contains("principal-bootstrap-v1"));
+        assert_eq!(
+            state.apply_feature_activation_with_membership(&command, None),
+            response
+        );
+    }
+
+    #[test]
+    fn bootstrap_activation_requires_replicated_compatible_members() {
+        let mut state = ControlState::new("cluster:test");
+        let command = FeatureActivationCommand {
+            principal_id: "principal:test".into(),
+            command_id: CommandId { value: id(98) },
+            issued_at_unix_ms: 42,
+            expected_control_revision: 0,
+            read_schema_floor: 3,
+            write_schema_floor: 3,
+            feature: "principal-bootstrap-v1".into(),
+        };
+        assert!(matches!(
+            state.apply_feature_activation(&command).result,
+            ControlCommandResult::Rejected { .. }
+        ));
+        assert_eq!(state.write_schema_floor, 1);
+        assert!(state.activated_features.is_empty());
+        assert_eq!(state.revision, 0);
+    }
+
+    #[test]
+    fn refresh_activation_requires_schema_and_exact_committed_membership() {
+        use crate::membership::{
+            ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
+        };
+        use openraft::{BasicNode, CommittedLeaderId, LogId, Membership, StoredMembership};
+        let identity = NodeIdentity::new_for_test(96);
+        let node = *identity.node_id();
+        let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000096"
+            .parse()
+            .unwrap();
+        let mut state = ControlState::new(cluster.to_string());
+        let mut member = issue_test_member(
+            &identity,
+            cluster,
+            &identity,
+            "tls://127.0.0.1:49996",
+            initializer_capabilities(),
+            42,
+        );
+        // Activation consumes already committed capability records; credential
+        // validation belongs to the member installation transition.
+        member.negotiated_protocol.schema_version = 4;
+        member
+            .negotiated_protocol
+            .features
+            .push("protocol-refresh-v1".into());
+        state.members.insert(member.node_id.clone(), member);
+        let membership = StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(1, node), 1)),
+            Membership::new(
+                vec![BTreeSet::from([node])],
+                BTreeMap::from([(node, BasicNode::new("node"))]),
+            ),
+        );
+        let command = FeatureActivationCommand {
+            principal_id: node.to_string(),
+            command_id: CommandId { value: id(96) },
+            issued_at_unix_ms: 42,
+            expected_control_revision: 0,
+            read_schema_floor: 4,
+            write_schema_floor: 4,
+            feature: "protocol-refresh-v1".into(),
+        };
+        let rejected =
+            |state: &mut ControlState, command: &FeatureActivationCommand, membership| {
+                assert!(matches!(
+                    state
+                        .apply_feature_activation_with_membership(command, membership)
+                        .result,
+                    ControlCommandResult::Rejected { .. }
+                ));
+                assert_eq!(state.revision, 0);
+                assert_eq!(state.write_schema_floor, 1);
+                assert!(!state.activated_features.contains("protocol-refresh-v1"));
+            };
+        rejected(&mut state.clone(), &command, None);
+        let mut old_floor = command.clone();
+        old_floor.read_schema_floor = 3;
+        old_floor.write_schema_floor = 3;
+        rejected(&mut state.clone(), &old_floor, Some(&membership));
+        let mut incompatible = state.clone();
+        incompatible
+            .members
+            .get_mut(&node.to_string())
+            .unwrap()
+            .negotiated_protocol
+            .schema_version = 3;
+        rejected(&mut incompatible, &command, Some(&membership));
+        let mut missing_feature = state.clone();
+        missing_feature
+            .members
+            .get_mut(&node.to_string())
+            .unwrap()
+            .negotiated_protocol
+            .features
+            .clear();
+        rejected(&mut missing_feature, &command, Some(&membership));
+        let learner = crate::membership::NodeId::from(97);
+        let mismatch = StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(1, node), 1)),
+            Membership::new(
+                vec![BTreeSet::from([node])],
+                BTreeMap::from([
+                    (node, BasicNode::new("node")),
+                    (learner, BasicNode::new("learner")),
+                ]),
+            ),
+        );
+        rejected(&mut state.clone(), &command, Some(&mismatch));
+        let response = state.apply_feature_activation_with_membership(&command, Some(&membership));
+        assert_accepted(&response);
+        assert_eq!(state.revision, 1);
+        assert_eq!(state.write_schema_floor, 4);
+        assert_eq!(
+            state.apply_feature_activation_with_membership(&command, Some(&membership)),
+            response
         );
     }
 

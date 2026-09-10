@@ -571,15 +571,7 @@ where
             }
             Err(error) => return Err(control_read_service_error(error)),
         };
-        validate_feature_activation_membership(
-            &node,
-            &state,
-            expected_control_revision,
-            read_schema_floor,
-            write_schema_floor,
-            &feature,
-        )?;
-        node.activate_feature(crate::control_codec::FeatureActivationCommand {
+        let command = crate::control_codec::FeatureActivationCommand {
             principal_id,
             command_id,
             issued_at_unix_ms,
@@ -587,8 +579,21 @@ where
             read_schema_floor,
             write_schema_floor,
             feature,
-        })
-        .await
+        };
+        // A quorum-confirmed outcome predates current revision and membership.
+        // Dispatch it through apply again to preserve byte-exact conflict checks.
+        if state.has_feature_activation_outcome(&command) {
+            return node.activate_feature(command).await;
+        }
+        validate_feature_activation_membership(
+            &node,
+            &state,
+            expected_control_revision,
+            read_schema_floor,
+            write_schema_floor,
+            &command.feature,
+        )?;
+        node.activate_feature(command).await
     }
 
     async fn forward_linearizable_read(
@@ -772,6 +777,65 @@ fn validate_feature_activation_member_sets(
         });
     }
     Ok(())
+}
+
+impl<C> bmux_cluster_plugin_api::cluster_protocol_refresh::ClusterProtocolRefreshService
+    for ControlServiceHandle<C>
+where
+    C: ServiceCaller + Send + Sync + 'static,
+{
+    fn submit<'a>(
+        &'a self,
+        command_id: bmux_cluster_plugin_api::cluster_types::CommandId,
+        replacement: bmux_cluster_plugin_api::cluster_types::ClusterMember,
+        expected_serial: String,
+        expected_revision: u64,
+        node_signature: Vec<u8>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ControlResponse, ControlServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.active()?
+                .refresh_member_protocol(
+                    command_id,
+                    replacement,
+                    expected_serial,
+                    expected_revision,
+                    node_signature,
+                )
+                .await
+        })
+    }
+}
+
+impl<C> bmux_cluster_plugin_api::cluster_principal_bootstrap::ClusterPrincipalBootstrapService
+    for ControlServiceHandle<C>
+where
+    C: ServiceCaller + Send + Sync + 'static,
+{
+    fn submit<'a>(
+        &'a self,
+        proof: bmux_cluster_plugin_api::cluster_principal_bootstrap_types::BootstrapProof,
+        expected_control_revision: u64,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ControlResponse, ControlServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            // Return typed leader guidance; callers negotiate this interface at
+            // the authority, rather than forwarding a caller-selected timestamp.
+            self.active()?
+                .bootstrap_principal(proof, expected_control_revision)
+                .await
+        })
+    }
 }
 
 impl<C> bmux_cluster_plugin_api::cluster_control_command_v2::ClusterControlCommandService

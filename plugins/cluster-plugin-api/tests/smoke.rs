@@ -536,12 +536,14 @@ fn interface_ids_and_operations_match_schema() {
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 13);
+    assert_eq!(services.len(), 15);
     let service_ids = services
         .iter()
         .map(|service| service.interface_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     for interface_id in [
+        "cluster-protocol-refresh/v1",
+        "cluster-principal-bootstrap/v1",
         "cluster-control-command/v1",
         "cluster-control-command/v2",
         "cluster-control-state/v1",

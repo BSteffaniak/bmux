@@ -25,7 +25,39 @@ impl From<CodecError> for StateCodecError {
     }
 }
 
+fn encode_refresh_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCodecError> {
+    if state.refresh_outcomes.len() > 1024 {
+        return Err(StateCodecError::LimitExceeded("refresh outcomes"));
+    }
+    let mut base = state.clone();
+    base.refresh_outcomes.clear();
+    let mut writer = Writer::default();
+    writer.raw(b"BMSTA005");
+    writer.bytes(&encode_snapshot(&base)?);
+    write_count(&mut writer, state.refresh_outcomes.len())?;
+    for (id, (fingerprint, revision)) in &state.refresh_outcomes {
+        if id.is_nil() || *revision == 0 || *revision > state.revision {
+            return Err(StateCodecError::InvalidState("invalid refresh outcome"));
+        }
+        writer.uuid(*id);
+        writer.raw(fingerprint);
+        writer.u64(*revision);
+    }
+    let bytes = writer.into_bytes();
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(StateCodecError::LimitExceeded("bytes"));
+    }
+    Ok(bytes)
+}
+
 pub(super) fn encode_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCodecError> {
+    if !state.refresh_outcomes.is_empty() {
+        return encode_refresh_snapshot(state);
+    }
+    encode_base_snapshot(state)
+}
+
+fn encode_base_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCodecError> {
     if state.schema_version != CONTROL_SCHEMA_VERSION {
         return Err(StateCodecError::UnsupportedSchema(state.schema_version));
     }
@@ -33,7 +65,16 @@ pub(super) fn encode_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCode
     let advanced = state.read_schema_floor != CONTROL_SCHEMA_VERSION
         || state.write_schema_floor != CONTROL_SCHEMA_VERSION
         || !state.activated_features.is_empty();
-    if advanced {
+    let bootstrap_format = state.principal_bootstrap.is_some();
+    if bootstrap_format {
+        if !advanced || state.read_schema_floor < 3 || state.write_schema_floor < 3 {
+            return Err(StateCodecError::InvalidState(
+                "bootstrap requires schema floor 3",
+            ));
+        }
+        writer.raw(b"BMSTA004");
+        writer.u16(4);
+    } else if advanced {
         writer.raw(SNAPSHOT_MAGIC);
         writer.u16(SNAPSHOT_FORMAT_VERSION);
     } else {
@@ -115,6 +156,9 @@ pub(super) fn encode_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCode
         }
     }
 
+    if let Some(record) = &state.principal_bootstrap {
+        encode_bootstrap_record(&mut writer, record, state.revision)?;
+    }
     let bytes = writer.into_bytes();
     if bytes.len() > MAX_SNAPSHOT_BYTES {
         return Err(StateCodecError::LimitExceeded("bytes"));
@@ -129,9 +173,41 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
     }
     let mut reader = Reader::new(bytes);
     let magic = reader.take(SNAPSHOT_MAGIC.len())?;
-    let (schema_version, advanced) = if magic == SNAPSHOT_MAGIC {
+    if magic == b"BMSTA005" {
+        let base = reader.bytes()?;
+        if base.starts_with(b"BMSTA005") {
+            return Err(StateCodecError::InvalidState("nested refresh snapshot"));
+        }
+        let mut state = decode_snapshot(&base)?;
+        state.refresh_outcomes = read_map(&mut reader, |reader| {
+            let id = reader.uuid()?;
+            let fingerprint = reader
+                .take(32)?
+                .try_into()
+                .expect("exact fingerprint length");
+            let revision = reader.u64()?;
+            if id.is_nil() || revision == 0 || revision > state.revision {
+                return Err(StateCodecError::InvalidState("invalid refresh outcome"));
+            }
+            Ok((id, (fingerprint, revision)))
+        })?;
+        if state.refresh_outcomes.is_empty() || state.refresh_outcomes.len() > 1024 {
+            return Err(StateCodecError::InvalidState(
+                "invalid refresh outcome count",
+            ));
+        }
+        reader.finish()?;
+        return Ok(state);
+    }
+    let bootstrap_format = magic == b"BMSTA004";
+    let (schema_version, advanced) = if magic == SNAPSHOT_MAGIC || bootstrap_format {
         let format_version = reader.u16()?;
-        if format_version != SNAPSHOT_FORMAT_VERSION {
+        let expected_format = if bootstrap_format {
+            4
+        } else {
+            SNAPSHOT_FORMAT_VERSION
+        };
+        if format_version != expected_format {
             return Err(StateCodecError::UnsupportedSnapshotFormat(format_version));
         }
         let codec_version = reader.u16()?;
@@ -282,6 +358,27 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
     } else {
         std::collections::BTreeMap::new()
     };
+    let principal_bootstrap = if bootstrap_format {
+        if read_schema_floor < 3 || write_schema_floor < 3 {
+            return Err(StateCodecError::InvalidState(
+                "bootstrap requires schema floor 3",
+            ));
+        }
+        let record = super::PrincipalBootstrapRecord {
+            principal_id: reader.uuid()?,
+            public_key: reader.string()?,
+            command_id: reader.uuid()?,
+            statement_fingerprint: reader
+                .take(32)?
+                .try_into()
+                .expect("exact fingerprint length"),
+            committed_revision: reader.u64()?,
+        };
+        validate_bootstrap_record(&record, revision)?;
+        Some(record)
+    } else {
+        None
+    };
     reader.finish()?;
 
     let state = ControlState {
@@ -295,11 +392,46 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
         workspaces,
         tabs,
         panes,
+        principal_bootstrap,
+        refresh_outcomes: std::collections::BTreeMap::new(),
         dedup,
         feature_dedup,
     };
     validate_references(&state)?;
     Ok(state)
+}
+
+fn encode_bootstrap_record(
+    writer: &mut Writer,
+    record: &super::PrincipalBootstrapRecord,
+    revision: u64,
+) -> Result<(), StateCodecError> {
+    validate_bootstrap_record(record, revision)?;
+    writer.uuid(record.principal_id);
+    writer.string(&record.public_key);
+    writer.uuid(record.command_id);
+    writer.raw(&record.statement_fingerprint);
+    writer.u64(record.committed_revision);
+    Ok(())
+}
+
+fn validate_bootstrap_record(
+    record: &super::PrincipalBootstrapRecord,
+    revision: u64,
+) -> Result<(), StateCodecError> {
+    let key: iroh::PublicKey = record
+        .public_key
+        .parse()
+        .map_err(|_| StateCodecError::InvalidState("invalid principal key"))?;
+    if key.to_string() != record.public_key
+        || record.principal_id.is_nil()
+        || record.command_id.is_nil()
+        || record.committed_revision == 0
+        || record.committed_revision > revision
+    {
+        return Err(StateCodecError::InvalidState("invalid bootstrap record"));
+    }
+    Ok(())
 }
 
 fn migrate_legacy_snapshot_header(

@@ -28,7 +28,7 @@ const ENROLLMENT_TOKEN_PREFIX: &str = "bmux-enroll-v1";
 const CLUSTER_PEER_REVISION_MIN: u32 = 1;
 const CLUSTER_PEER_REVISION_MAX: u32 = 1;
 const CLUSTER_SCHEMA_VERSION_MIN: u32 = 1;
-const CLUSTER_SCHEMA_VERSION_MAX: u32 = 2;
+const CLUSTER_SCHEMA_VERSION_MAX: u32 = 3;
 const CLUSTER_PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const ATOMIC_LAYOUT_FEATURE: &str = "atomic-layout-mutation-v2";
 const MANDATORY_CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
@@ -41,6 +41,7 @@ const CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
     "node-possession-proof-v1",
     "single-use-enrollment-v1",
     ATOMIC_LAYOUT_FEATURE,
+    "principal-bootstrap-v1",
 ];
 
 pub const fn initializer_capabilities() -> ClusterNodeCapabilities {
@@ -2823,4 +2824,36 @@ pub fn dedupe_preserve_order(values: Vec<String>) -> Vec<String> {
         }
     }
     deduped
+}
+
+#[cfg(test)]
+mod bootstrap_negotiation_tests {
+    use super::{current_protocol_offer, negotiate_protocol};
+
+    #[test]
+    fn bootstrap_support_is_negotiated_without_activating_or_upgrading_old_peers() {
+        let current = current_protocol_offer();
+        let negotiated = negotiate_protocol(&current, &current).unwrap();
+        assert_eq!(negotiated.schema_version, 3);
+        assert!(
+            negotiated
+                .features
+                .iter()
+                .any(|f| f == "principal-bootstrap-v1")
+        );
+        let mut previous = current.clone();
+        previous.schema_version_max = 2;
+        previous.features.retain(|f| f != "principal-bootstrap-v1");
+        let old_peer = negotiate_protocol(&current, &previous).unwrap();
+        assert_eq!(old_peer.schema_version, 2);
+        assert!(
+            !old_peer
+                .features
+                .iter()
+                .any(|f| f == "principal-bootstrap-v1")
+        );
+        let state = crate::control_state::ControlState::new("negotiation-test");
+        assert_eq!(state.write_schema_floor, 1);
+        assert!(state.activated_features.is_empty());
+    }
 }

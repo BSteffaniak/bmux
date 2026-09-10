@@ -62,6 +62,84 @@ pub fn request_fingerprint(command: &ControlCommand) -> [u8; 32] {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolRefreshCommand {
+    pub command_id: uuid::Uuid,
+    pub replacement: ClusterMember,
+    pub expected_serial: String,
+    pub expected_revision: u64,
+    pub node_signature: Vec<u8>,
+    pub verified_at_unix_ms: u64,
+}
+
+impl ProtocolRefreshCommand {
+    /// Encodes the bounded schema-4 refresh command independently of Rust layout.
+    /// # Errors
+    /// Rejects invalid proof bounds and member fields.
+    pub fn encode(&self) -> Result<Vec<u8>, CodecError> {
+        validate_member(&self.replacement)?;
+        if self.command_id.is_nil()
+            || self.expected_serial.len() > 1024
+            || self.node_signature.len() != 64
+        {
+            return Err(CodecError::LimitExceeded("refresh proof"));
+        }
+        let mut writer = Writer::default();
+        writer.raw(b"BMRFR001");
+        writer.u16(4);
+        writer.uuid(self.command_id);
+        writer.string(&self.expected_serial);
+        writer.u64(self.expected_revision);
+        writer.u64(self.verified_at_unix_ms);
+        encode_member(&mut writer, &self.replacement);
+        writer.bytes(&self.node_signature);
+        let bytes = writer.into_bytes();
+        if bytes.len() > MAX_BYTES {
+            return Err(CodecError::LimitExceeded("refresh command"));
+        }
+        Ok(bytes)
+    }
+
+    /// Decodes only the supported canonical refresh representation.
+    /// # Errors
+    /// Rejects unknown versions, malformed fields and trailing data.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        if bytes.len() > MAX_BYTES {
+            return Err(CodecError::LimitExceeded("refresh command"));
+        }
+        let mut reader = Reader::new(bytes);
+        if reader.take(8)? != b"BMRFR001" {
+            return Err(CodecError::InvalidMagic);
+        }
+        let version = reader.u16()?;
+        if version != 4 {
+            return Err(CodecError::UnsupportedSchema(version));
+        }
+        let command_id = reader.uuid()?;
+        let expected_serial = reader.string()?;
+        let expected_revision = reader.u64()?;
+        let verified_at_unix_ms = reader.u64()?;
+        let replacement = decode_member(&mut reader)?;
+        let node_signature = reader.bytes()?;
+        reader.finish()?;
+        let command = Self {
+            command_id,
+            replacement,
+            expected_serial,
+            expected_revision,
+            node_signature,
+            verified_at_unix_ms,
+        };
+        command.encode()?;
+        Ok(command)
+    }
+}
+
+#[must_use]
+pub fn is_protocol_refresh(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"BMRFR001")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureActivationCommand {
     pub principal_id: String,
     pub command_id: CommandId,
@@ -355,7 +433,7 @@ fn validate_assignment(assignment: &ExecutionAssignment) -> Result<(), CodecErro
     validate_string(&assignment.node_id)
 }
 
-fn validate_member(member: &ClusterMember) -> Result<(), CodecError> {
+pub(crate) fn validate_member(member: &ClusterMember) -> Result<(), CodecError> {
     for value in [
         &member.cluster_id,
         &member.node_id,

@@ -52,6 +52,16 @@ required_capabilities = [
 version = "0.0.1-alpha.0"
 
 [[services]]
+capability   = "bmux.server_clusters.auth"
+interface_id = "cluster-protocol-refresh/v1"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.server_clusters.auth"
+interface_id = "cluster-principal-bootstrap/v1"
+kind         = "command"
+
+[[services]]
 capability   = "bmux.server_clusters.read"
 interface_id = "cluster-query/v1"
 kind         = "query"

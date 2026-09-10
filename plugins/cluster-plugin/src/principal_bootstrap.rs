@@ -9,6 +9,122 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::membership::NodeId;
 
+const COMMAND_MAGIC: &[u8; 8] = b"BMBST001";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapCommand {
+    pub proof: BootstrapProof,
+    pub expected_control_revision: u64,
+    pub verified_at_unix_ms: u64,
+}
+
+impl BootstrapCommand {
+    /// Encodes the bounded versioned consensus command, independently of Rust layout.
+    ///
+    /// # Errors
+    /// Rejects malformed statements and oversized signatures or approval lists.
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        signing_payload(&self.proof.statement)?;
+        if self.proof.voter_approvals.len() > MAX_APPROVALS
+            || self.proof.principal_signature.len() != 64
+            || self
+                .proof
+                .voter_approvals
+                .iter()
+                .any(|a| a.node_id.len() > 128 || a.signature.len() != 64)
+        {
+            return Err("invalid bootstrap proof bounds".into());
+        }
+        let mut w = crate::control_codec::Writer::default();
+        w.raw(COMMAND_MAGIC);
+        w.u16(3);
+        w.u64(self.expected_control_revision);
+        w.u64(self.verified_at_unix_ms);
+        let s = &self.proof.statement;
+        w.u16(s.schema_version);
+        w.string(&s.cluster_id);
+        w.u64(s.membership_term);
+        w.string(&s.membership_leader_id);
+        w.u64(s.membership_log_index);
+        w.uuid(s.principal_id);
+        w.string(&s.principal_public_key);
+        w.uuid(s.command_id.value);
+        w.bytes(&self.proof.principal_signature);
+        w.u16(u16::try_from(self.proof.voter_approvals.len()).map_err(|_| "too many approvals")?);
+        for a in &self.proof.voter_approvals {
+            w.string(&a.node_id);
+            w.bytes(&a.signature);
+        }
+        Ok(w.into_bytes())
+    }
+
+    /// Decodes only the supported canonical bootstrap representation.
+    ///
+    /// # Errors
+    /// Rejects unknown versions, malformed fields, trailing bytes and oversized commands.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        use bmux_cluster_plugin_api::cluster_principal_bootstrap_types::VoterApproval;
+        use bmux_cluster_plugin_api::cluster_types::CommandId;
+        if bytes.len() > 32768 {
+            return Err("bootstrap command exceeds limit".into());
+        }
+        let parse = || -> Result<Self, crate::control_codec::CodecError> {
+            let mut r = crate::control_codec::Reader::new(bytes);
+            if r.take(8)? != COMMAND_MAGIC {
+                return Err(crate::control_codec::CodecError::InvalidMagic);
+            }
+            let version = r.u16()?;
+            if version != 3 {
+                return Err(crate::control_codec::CodecError::UnsupportedSchema(version));
+            }
+            let expected_control_revision = r.u64()?;
+            let verified_at_unix_ms = r.u64()?;
+            let statement = BootstrapStatement {
+                schema_version: r.u16()?,
+                cluster_id: r.string()?,
+                membership_term: r.u64()?,
+                membership_leader_id: r.string()?,
+                membership_log_index: r.u64()?,
+                principal_id: r.uuid()?,
+                principal_public_key: r.string()?,
+                command_id: CommandId { value: r.uuid()? },
+            };
+            let principal_signature = r.bytes()?;
+            let count = usize::from(r.u16()?);
+            if count > MAX_APPROVALS {
+                return Err(crate::control_codec::CodecError::LimitExceeded("approvals"));
+            }
+            let mut voter_approvals = Vec::with_capacity(count);
+            for _ in 0..count {
+                voter_approvals.push(VoterApproval {
+                    node_id: r.string()?,
+                    signature: r.bytes()?,
+                });
+            }
+            r.finish()?;
+            Ok(Self {
+                proof: BootstrapProof {
+                    statement,
+                    principal_signature,
+                    voter_approvals,
+                },
+                expected_control_revision,
+                verified_at_unix_ms,
+            })
+        };
+        let command = parse().map_err(|e| e.to_string())?;
+        if command.encode()? != bytes {
+            return Err("noncanonical bootstrap command".into());
+        }
+        Ok(command)
+    }
+}
+
+#[must_use]
+pub fn is_bootstrap_command(bytes: &[u8]) -> bool {
+    bytes.starts_with(COMMAND_MAGIC)
+}
+
 const DOMAIN: &[u8] = b"bmux.cluster.principal-bootstrap.v1\0";
 const MAX_APPROVALS: usize = 128;
 
@@ -152,6 +268,36 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_consumption_survives_snapshot_and_preserves_retry_result() {
+        let mut state = crate::control_state::ControlState::new("cluster:test");
+        state.read_schema_floor = 3;
+        state.write_schema_floor = 3;
+        state
+            .activated_features
+            .insert("principal-bootstrap-v1".into());
+        let statement = statement();
+        let accepted = state.apply_principal_bootstrap(&statement, 0).unwrap();
+        let bytes = state.encode_snapshot().unwrap();
+        assert!(bytes.starts_with(b"BMSTA004"));
+        let mut restored = crate::control_state::ControlState::decode_snapshot(&bytes).unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(
+            restored.apply_principal_bootstrap(&statement, 0),
+            Ok(accepted)
+        );
+        let mut conflict = statement;
+        conflict.principal_id = uuid::Uuid::from_u128(999);
+        assert!(restored.apply_principal_bootstrap(&conflict, 1).is_err());
+        let legacy = crate::control_state::ControlState::new("cluster:test");
+        assert!(
+            crate::control_state::ControlState::decode_snapshot(&legacy.encode_snapshot().unwrap())
+                .unwrap()
+                .principal_bootstrap
+                .is_none()
+        );
+    }
+
+    #[test]
     fn canonical_payload_binds_every_statement_field() {
         let original = statement();
         let bytes = signing_payload(&original).unwrap();
@@ -175,6 +321,54 @@ mod tests {
         let mut invalid = original;
         invalid.schema_version = 2;
         assert!(signing_payload(&invalid).is_err());
+    }
+
+    fn assert_command_application(
+        proof: &BootstrapProof,
+        cluster: &str,
+        membership: &StoredMembership<NodeId, BasicNode>,
+        members: &BTreeMap<String, ClusterMember>,
+    ) {
+        let command = super::BootstrapCommand {
+            proof: proof.clone(),
+            expected_control_revision: 0,
+            verified_at_unix_ms: 100,
+        };
+        let encoded = command.encode().unwrap();
+        assert_eq!(super::BootstrapCommand::decode(&encoded).unwrap(), command);
+        for end in 0..encoded.len() {
+            assert!(super::BootstrapCommand::decode(&encoded[..end]).is_err());
+        }
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(super::BootstrapCommand::decode(&trailing).is_err());
+        let mut unsupported = encoded;
+        unsupported[8] = 255;
+        assert!(super::BootstrapCommand::decode(&unsupported).is_err());
+        let mut state = crate::control_state::ControlState::new(cluster.to_string());
+        state.members.clone_from(members);
+        state.read_schema_floor = 3;
+        state.write_schema_floor = 3;
+        state
+            .activated_features
+            .insert("principal-bootstrap-v1".into());
+        let stale_membership = StoredMembership::default();
+        let rejected = state.apply_bootstrap_command(&command, &stale_membership);
+        assert!(matches!(
+            rejected.result,
+            bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Rejected { .. }
+        ));
+        assert!(state.principal_bootstrap.is_none());
+        let accepted = state.apply_bootstrap_command(&command, membership);
+        assert!(matches!(
+            accepted.result,
+            bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Accepted { .. }
+        ));
+        assert_eq!(accepted.control_revision, 1);
+        assert_eq!(
+            state.apply_bootstrap_command(&command, &stale_membership),
+            accepted
+        );
     }
 
     #[test]
@@ -248,6 +442,7 @@ mod tests {
             verify_proof(&proof, &cluster.to_string(), &membership, &members, 100),
             Ok(())
         );
+        assert_command_application(&proof, &cluster.to_string(), &membership, &members);
         let last = proof.voter_approvals.pop().unwrap();
         assert!(
             verify_proof(&proof, &cluster.to_string(), &membership, &members, 100)

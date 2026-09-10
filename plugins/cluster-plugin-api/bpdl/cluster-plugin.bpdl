@@ -11,8 +11,8 @@ capability CLUSTER_READ = bmux.server_clusters.read;
 capability CLUSTER_WRITE = bmux.server_clusters.write;
 capability CLUSTER_AUTH = bmux.server_clusters.auth;
 
-// Proof contract only: bootstrap mutation is not advertised until durable
-// application, capability negotiation, and snapshot preservation are connected.
+// Bootstrap proof is independent of node connectivity credentials; mutation
+// additionally requires committed feature/schema activation.
 interface cluster-principal-bootstrap-types {
     record bootstrap-statement {
         schema-version: u16,
@@ -688,6 +688,20 @@ interface cluster-command {
     command pane_new(host: string, name: string?) -> cluster-types.cluster-pane-mutation-result;
     command pane_retry(pane: string?) -> cluster-types.cluster-pane-mutation-result;
     command pane_move(pane: string?, host: string) -> cluster-types.cluster-pane-mutation-result;
+}
+
+// Proof-bearing refresh is separate from generic membership metadata updates.
+// Verification time is assigned by the authoritative runtime, not this contract.
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-protocol-refresh {
+    command submit(command_id: cluster-types.command-id, replacement: cluster-types.cluster-member, expected_serial: string, expected_revision: u64, node_signature: bytes) -> result<cluster-types.control-response, cluster-types.control-service-error>;
+}
+
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-principal-bootstrap {
+    command submit(proof: cluster-principal-bootstrap-types.bootstrap-proof, expected_control_revision: u64) -> result<cluster-types.control-response, cluster-types.control-service-error>;
 }
 
 @capability(CLUSTER_WRITE)

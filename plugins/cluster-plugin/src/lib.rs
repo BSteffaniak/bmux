@@ -153,6 +153,28 @@ async fn ensure_persistent_consensus_runtime(
         .map_err(|error| format!("failed reading committed membership at startup: {error:?}"))?
         .members;
     if single_member && committed_members.is_empty() {
+        // initialize() records membership before the asynchronous election finishes.
+        // Do not publish the first control mutation until this node can establish
+        // quorum authority; a stale local view is not evidence of leadership.
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match node.linearizable_control_state().await {
+                    Ok(_) => return Ok(()),
+                    Err(consensus_runtime::ConsensusReadError::NotLeader(_)) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(error) => return Err(format!("initial quorum read failed: {error:?}")),
+                }
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for initial quorum authority".to_string())
+        .and_then(std::convert::identity);
+        if let Err(error) = ready {
+            let _ = nodes.remove(node_id);
+            let _ = node.shutdown().await;
+            return Err(error);
+        }
         consensus_membership::publish_members(
             node.clone(),
             &identity.node_id().to_string(),
@@ -261,6 +283,17 @@ impl RustPlugin for ClusterPlugin {
             *identity.node_id(),
             nodes.clone(),
         ));
+        let refresh: Arc<
+            dyn bmux_cluster_plugin_api::cluster_protocol_refresh::ClusterProtocolRefreshService
+                + Send
+                + Sync,
+        > = control.clone();
+        let _ =
+            bmux_cluster_plugin_api::cluster_protocol_refresh::register_provider(registry, refresh);
+        let bootstrap: Arc<dyn bmux_cluster_plugin_api::cluster_principal_bootstrap::ClusterPrincipalBootstrapService + Send + Sync> = control.clone();
+        let _ = bmux_cluster_plugin_api::cluster_principal_bootstrap::register_provider(
+            registry, bootstrap,
+        );
         let control_commands: Arc<
             dyn bmux_cluster_plugin_api::cluster_control_command::ClusterControlCommandService
                 + Send
