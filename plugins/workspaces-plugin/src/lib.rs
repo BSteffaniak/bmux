@@ -657,6 +657,23 @@ fn switch_workspace_for_client(
     select_workspace_target(caller, selector, client_id, None)
 }
 
+fn activate_exact_target(
+    caller: &(impl ServiceCaller + Sync),
+    context_id: Uuid,
+) -> Result<(), WorkspaceCommandError> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_contexts_plugin_api::contexts_activation_v1::client::activate(&mut client, context_id),
+    )
+    .map_err(|error| WorkspaceCommandError::Failed {
+        reason: error.to_string(),
+    })?
+    .map_err(|error| WorkspaceCommandError::Failed {
+        reason: format!("exact activation failed: {error:?}"),
+    })?;
+    Ok(())
+}
+
 fn select_workspace_target(
     caller: &(impl HostRuntimeApi + Sync),
     selector: &WorkspaceSelector,
@@ -714,7 +731,11 @@ fn select_workspace_target(
         }
     });
     if let Some(context_id) = context_id {
-        select_context(caller, context_id)?;
+        if exact_context_id.is_some() {
+            activate_exact_target(caller, context_id)?;
+        } else {
+            select_context(caller, context_id)?;
+        }
     }
     let (active_by_client, previous_by_client) = {
         let mut guard = state.write().map_err(|_| WorkspaceCommandError::Failed {
@@ -1263,6 +1284,8 @@ mod tests {
     }
 
     impl ServiceCaller for MockHost {
+        // Test router keeps the supported fake service operations together.
+        #[allow(clippy::too_many_lines)]
         fn call_service_raw(
             &self,
             _capability: &str,
@@ -1293,6 +1316,21 @@ mod tests {
                         .expect("contexts lock should succeed")
                         .clone(),
                 ),
+                ("contexts-activation-v1", "activate") => {
+                    let request: bmux_contexts_plugin_api::contexts_activation_v1::client::ActivateRequest = decode_service_message(&payload)?;
+                    self.selected_contexts
+                        .lock()
+                        .unwrap()
+                        .push(request.context_id);
+                    let result: Result<
+                        ContextAck,
+                        bmux_contexts_plugin_api::contexts_commands::SelectContextError,
+                    > = Ok(ContextAck {
+                        id: request.context_id,
+                        session_id: None,
+                    });
+                    encode_service_message(&result)
+                }
                 ("contexts-commands", "select-context") => {
                     #[derive(Deserialize)]
                     struct Args {

@@ -112,6 +112,13 @@ interface contexts-commands {
     ) -> result<context-ack, set-context-attributes-error>;
 }
 
+@capability(CONTEXTS_WRITE)
+interface contexts-activation-v1 {
+    // Exact activation never allocates or replaces a missing execution.
+    command activate(context-id: uuid)
+        -> result<contexts-commands.context-ack, contexts-commands.select-context-error>;
+}
+
 interface contexts-events {
     // A single event describing a context lifecycle change.
     variant context-event {

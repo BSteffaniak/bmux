@@ -18,6 +18,11 @@ interface_id = "contexts-commands"
 kind         = "command"
 
 [[services]]
+capability   = "bmux.contexts.write"
+interface_id = "contexts-activation-v1"
+kind         = "command"
+
+[[services]]
 capability   = "bmux.contexts.read"
 interface_id = "contexts-events"
 kind         = "event"

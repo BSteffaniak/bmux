@@ -20,6 +20,7 @@ use bmux_context_state::{
     ContextStateSnapshot, ContextStateWriter, ContextSummary as PrimitiveContextSummary,
     RuntimeContext,
 };
+use bmux_contexts_plugin_api::contexts_activation_v1::{self, ContextsActivationV1Service};
 use bmux_contexts_plugin_api::contexts_commands::{
     self, CloseContextError, ContextAck, ContextsCommandsService, CreateContextError,
     RenameContextError, SelectContextError, SetContextAttributesError,
@@ -437,6 +438,9 @@ impl RustPlugin for ContextsPlugin {
                     create_context_local(ctx, ctx.caller_client_id, req.name, req.attributes)
                 )
             },
+            "contexts-activation-v1", "activate" => |req: contexts_activation_v1::client::ActivateRequest, ctx| {
+                Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(activate_context_exact(ctx, ctx.caller_client_id, req.context_id))
+            },
             "contexts-commands", "select-context" => |req: SelectorArgs, ctx| {
                 Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(
                     select_context_local(ctx, ctx.caller_client_id, &req.selector)
@@ -471,6 +475,9 @@ impl RustPlugin for ContextsPlugin {
             Arc::new(ContextsStateHandle::new(Arc::clone(&caller)));
         let _ = contexts_state::register_provider(registry, state);
 
+        let activation: Arc<dyn ContextsActivationV1Service + Send + Sync> =
+            Arc::new(ContextsCommandsHandle::new(caller.clone()));
+        let _ = contexts_activation_v1::register_provider(registry, activation);
         let commands: Arc<dyn ContextsCommandsService + Send + Sync> =
             Arc::new(ContextsCommandsHandle::new(caller));
         let _ = contexts_commands::register_provider(registry, commands);
@@ -725,6 +732,55 @@ fn mutate_state_create(
         session_id = tracing::field::Empty,
     ),
 )]
+fn activate_context_exact(
+    caller: &(impl ServiceCaller + Sync),
+    caller_client_id: Option<Uuid>,
+    context_id: Uuid,
+) -> Result<ContextAck, SelectContextError> {
+    let client_id = resolve_caller_client_id(caller, caller_client_id)
+        .map_err(|reason| SelectContextError::Denied { reason })?;
+    let session_id = {
+        let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
+        let guard = state.read().map_err(|_| SelectContextError::Denied {
+            reason: "context state lock poisoned".into(),
+        })?;
+        if !guard.contexts.contains_key(&context_id) {
+            return Err(SelectContextError::NotFound);
+        }
+        guard
+            .session_by_context
+            .get(&context_id)
+            .copied()
+            .ok_or_else(|| SelectContextError::Denied {
+                reason: "context execution unavailable; explicit recovery required".into(),
+            })?
+    };
+    if !try_select_session_via_sessions_plugin(caller, session_id)
+        .map_err(|reason| SelectContextError::Denied { reason })?
+    {
+        return Err(SelectContextError::Denied {
+            reason: "context execution unavailable; explicit recovery required".into(),
+        });
+    }
+    mutate_state_select(client_id, &PrimitiveContextSelector::ById(context_id))?;
+    let _ = global_event_bus().emit(
+        &contexts_events::EVENT_KIND,
+        ContextEvent::Selected { context_id },
+    );
+    let _ = global_event_bus().emit(
+        &contexts_events::EVENT_KIND,
+        ContextEvent::SessionActiveContextChanged {
+            session_id: session_id.0,
+            context_id,
+            initiator_client_id: Some(client_id.0),
+        },
+    );
+    Ok(ContextAck {
+        id: context_id,
+        session_id: Some(session_id.0),
+    })
+}
+
 fn select_context_local(
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<::uuid::Uuid>,
@@ -1280,6 +1336,15 @@ pub struct ContextsCommandsHandle {
 impl ContextsCommandsHandle {
     const fn new(caller: Arc<TypedServiceCaller>) -> Self {
         Self { caller }
+    }
+}
+
+impl ContextsActivationV1Service for ContextsCommandsHandle {
+    fn activate<'a>(
+        &'a self,
+        context_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<ContextAck, SelectContextError>> + Send + 'a>> {
+        Box::pin(async move { activate_context_exact(self.caller.as_ref(), None, context_id) })
     }
 }
 
