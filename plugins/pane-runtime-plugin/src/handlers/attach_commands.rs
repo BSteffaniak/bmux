@@ -335,6 +335,36 @@ fn reserve_selection(
     .map_err(|error| failed(format!("selection conflict: {error:?}")))
 }
 
+fn resolve_failed_selection<T>(
+    ctx: &NativeServiceContext,
+    revision: u64,
+    result: Result<T, AttachCommandError>,
+) -> Result<T, AttachCommandError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(original) => {
+            let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
+            let recovery = bmux_plugin::block_on_typed_dispatch(
+                bmux_clients_plugin_api::clients_selection_commands_v1::client::recover(
+                    &mut client,
+                    revision,
+                ),
+            );
+            match recovery {
+                Ok(Ok(_)) => Err(original),
+                Ok(Err(
+                    bmux_clients_plugin_api::clients_selection_state_v1::SelectionError::Conflict,
+                )) => Err(failed(format!(
+                    "selection failed ({original:?}); recovery conflicted with newer selection"
+                ))),
+                other => Err(failed(format!(
+                    "selection failed ({original:?}); recovery incomplete, input may remain suspended: {other:?}"
+                ))),
+            }
+        }
+    }
+}
+
 fn commit_selection(
     ctx: &NativeServiceContext,
     revision: u64,
@@ -342,7 +372,7 @@ fn commit_selection(
     session: SessionId,
 ) -> Result<(), AttachCommandError> {
     let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
-    bmux_plugin::block_on_typed_dispatch(
+    let result = bmux_plugin::block_on_typed_dispatch(
         bmux_clients_plugin_api::clients_selection_commands_v1::client::commit(
             &mut client,
             revision,
@@ -350,13 +380,12 @@ fn commit_selection(
             Some(session.0),
         ),
     )
-    .map_err(|error| failed(error.to_string()))?
-    .map_err(|error| {
-        failed(format!(
-            "selection commit failed; input suspended: {error:?}"
-        ))
-    })?;
-    Ok(())
+    .map_err(|error| failed(error.to_string()))
+    .and_then(|result| {
+        result.map_err(|error| failed(format!("selection commit failed: {error:?}")))
+    })
+    .map(|_| ());
+    resolve_failed_selection(ctx, revision, result)
 }
 
 pub fn attach_session(
@@ -417,10 +446,14 @@ pub fn attach_context(
     }
     let previous_session = follow.0.selected_session(client_id);
     let reservation = reserve_selection(ctx)?;
-    let context = contexts
-        .0
-        .select_for_client(client_id, &PrimitiveContextSelector::ById(context_id))
-        .map_err(|message| failed(message.to_string()))?;
+    let context = resolve_failed_selection(
+        ctx,
+        reservation.revision,
+        contexts
+            .0
+            .select_for_client(client_id, &PrimitiveContextSelector::ById(context_id))
+            .map_err(|message| failed(message.to_string())),
+    )?;
     if let Some(prev) = previous_session
         && prev != next_session_id
     {
@@ -734,7 +767,7 @@ pub fn attach_retarget_context(
             if !selection_already_applied {
                 restore_context_selection(&contexts, client_id, previous_context_id);
             }
-            return Err(error);
+            return resolve_failed_selection(ctx, reservation.revision, Err(error));
         }
     };
     let (cols, rows, top, right, bottom, left) = retargeted;
