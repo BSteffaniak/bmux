@@ -73,22 +73,6 @@ impl Target {
             .expect("target in focus order");
         Self::ORDER[(index + if backwards { Self::ORDER.len() - 1 } else { 1 }) % Self::ORDER.len()]
     }
-
-    fn at(point: bmux_tui::geometry::Point) -> Option<Self> {
-        [
-            (Self::Tabs, TABS_AREA),
-            (Self::Breadcrumbs, Rect::new(30, 0, 38, 1)),
-            (Self::Tree, TREE_AREA),
-            (Self::List, LIST_AREA),
-            (Self::Menu, Rect::new(30, 1, 18, 2)),
-            (Self::Scroll, Rect::new(1, 6, 24, 2)),
-            (Self::Table, TABLE_AREA),
-            (Self::Text, Rect::new(1, 13, 68, 2)),
-            (Self::Pane, scroll_delegate_pane_area()),
-        ]
-        .into_iter()
-        .find_map(|(target, area)| area.contains(point).then_some(target))
-    }
 }
 
 pub struct NavigationDemo {
@@ -166,7 +150,7 @@ impl NavigationDemo {
     }
 
     fn target_visible(&self, target: Target) -> bool {
-        self.committed_hits.as_ref().is_none_or(|hits| {
+        self.committed_hits.as_ref().is_some_and(|hits| {
             hits.regions().iter().any(|region| {
                 region.enabled
                     && !region.area.is_empty()
@@ -188,9 +172,7 @@ impl NavigationDemo {
     }
 
     fn target_at(&self, point: bmux_tui::geometry::Point) -> Option<Target> {
-        let Some(hits) = &self.committed_hits else {
-            return Target::at(point);
-        };
+        let hits = self.committed_hits.as_ref()?;
         let hit = hits.hit_test(point)?;
         Self::target_for_id(hit.id().as_str())
     }
@@ -794,6 +776,17 @@ fn render_navigation_with_state(cx: &mut PaintCx<'_, '_>, demo: &NavigationDemo)
     );
 }
 
+fn committed_demo() -> NavigationDemo {
+    let mut demo = NavigationDemo::new();
+    let mut terminal =
+        bmux_tui::terminal::Terminal::new(std::io::sink(), Rect::new(0, 0, WIDTH, HEIGHT));
+    terminal
+        .draw(|cx| demo.render(cx))
+        .expect("headless draw succeeds");
+    demo.commit_hits(terminal.hits());
+    demo
+}
+
 pub fn demonstrate_menu_activation() -> MenuOutcome {
     let items = menu_items();
     let state = Cell::new(MenuState::new(Some(0)));
@@ -822,7 +815,7 @@ pub fn demonstrate_pane_scroll_delegation() -> PaneOutcome {
 }
 
 pub fn demonstrate_delegated_pane_scroll_offset() -> u64 {
-    let mut demo = NavigationDemo::new();
+    let mut demo = committed_demo();
     let _ = demo.handle_event(&Event::Mouse(bmux_tui::event::MouseEvent::new(
         bmux_tui::event::MouseEventKind::ScrollDown,
         bmux_tui::geometry::Point::new(32, 8),
@@ -831,7 +824,7 @@ pub fn demonstrate_delegated_pane_scroll_offset() -> u64 {
 }
 
 pub fn demonstrate_tree_selection() -> String {
-    let mut demo = NavigationDemo::new();
+    let mut demo = committed_demo();
     let _ = demo.handle_event(&Event::Mouse(bmux_tui::event::MouseEvent::new(
         bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
         bmux_tui::geometry::Point::new(50, 3),
@@ -844,14 +837,14 @@ pub fn demonstrate_tree_selection() -> String {
 }
 
 pub fn demonstrate_breadcrumb_activation() -> String {
-    let mut demo = NavigationDemo::new();
+    let mut demo = committed_demo();
     demo.focused = Target::Breadcrumbs;
     let _ = demo.handle_event(&Event::Key(KeyStroke::simple(KeyCode::Enter)));
     demo.message
 }
 
 pub fn demonstrate_text_view_scroll() -> u64 {
-    let mut demo = NavigationDemo::new();
+    let mut demo = committed_demo();
     let _ = demo.handle_event(&Event::Mouse(bmux_tui::event::MouseEvent::new(
         bmux_tui::event::MouseEventKind::ScrollDown,
         bmux_tui::geometry::Point::new(2, 13),
@@ -1080,7 +1073,7 @@ mod tests {
 
     #[test]
     fn focus_traversal_and_resize_clear_capture_without_broadcasting_keys() {
-        let mut demo = super::NavigationDemo::new();
+        let mut demo = super::committed_demo();
         let mut tab = bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Tab);
         demo.handle_event(&bmux_tui::event::Event::Key(tab));
         assert!(demo.focused == super::Target::Breadcrumbs);
@@ -1099,7 +1092,7 @@ mod tests {
 
     #[test]
     fn focus_loss_clears_visual_focus_and_suspends_input() {
-        let mut demo = super::NavigationDemo::new();
+        let mut demo = super::committed_demo();
         demo.focused = super::Target::List;
         demo.sync_focus();
         assert!(demo.list.interaction.focused);
@@ -1116,7 +1109,7 @@ mod tests {
 
     #[test]
     fn committed_pane_wheel_reaches_delegated_content() {
-        let mut demo = super::NavigationDemo::new();
+        let mut demo = super::committed_demo();
         let mut terminal = bmux_tui::terminal::Terminal::new(
             Vec::<u8>::new(),
             bmux_tui::geometry::Rect::new(0, 0, 72, 18),
@@ -1134,7 +1127,7 @@ mod tests {
 
     #[test]
     fn committed_wheel_routes_to_visible_scroll_content() {
-        let mut demo = super::NavigationDemo::new();
+        let mut demo = super::committed_demo();
         let mut terminal = bmux_tui::terminal::Terminal::new(
             Vec::<u8>::new(),
             bmux_tui::geometry::Rect::new(0, 0, 72, 18),
@@ -1161,7 +1154,7 @@ mod tests {
 
     #[test]
     fn committed_empty_scene_excludes_unpainted_allocations() {
-        let mut demo = super::NavigationDemo::new();
+        let mut demo = super::committed_demo();
         demo.commit_hits(&bmux_tui::hit::HitMap::new());
         assert!(
             demo.target_at(bmux_tui::geometry::Point::new(2, 1))
@@ -1184,7 +1177,7 @@ mod tests {
 
     #[test]
     fn ignored_focused_key_does_not_reach_other_controls() {
-        let mut demo = super::NavigationDemo::new();
+        let mut demo = super::committed_demo();
         demo.focused = super::Target::Menu;
         let tabs = demo.tabs.selected();
         let scroll = demo.scroll.vertical_offset();
@@ -1197,7 +1190,7 @@ mod tests {
 
     #[test]
     fn pointer_release_does_not_transfer_capture_to_another_control() {
-        let mut demo = super::NavigationDemo::new();
+        let mut demo = super::committed_demo();
         for (kind, point) in [
             (
                 bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
@@ -1217,8 +1210,21 @@ mod tests {
     }
 
     #[test]
-    fn table_input_reaches_the_painted_right_edge() {
+    fn uncommitted_input_has_no_target() {
         let mut demo = super::NavigationDemo::new();
+        assert!(
+            demo.target_at(bmux_tui::geometry::Point::new(2, 1))
+                .is_none()
+        );
+        demo.handle_event(&bmux_tui::event::Event::Key(
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Right),
+        ));
+        assert_eq!(demo.tabs.selected(), Some(0));
+    }
+
+    #[test]
+    fn committed_overlap_does_not_select_the_underlying_table() {
+        let mut demo = super::committed_demo();
         for kind in [
             bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
             bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
@@ -1227,12 +1233,12 @@ mod tests {
                 bmux_tui::event::MouseEvent::new(kind, bmux_tui::geometry::Point::new(30, 11)),
             ));
         }
-        assert_eq!(demo.table.selected(), Some(1));
+        assert_eq!(demo.table.selected(), Some(0));
     }
 
     #[test]
     fn tab_mouse_selection_updates_navigation_message() {
-        let mut demo = super::NavigationDemo::new();
+        let mut demo = super::committed_demo();
         for kind in [
             bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
             bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
@@ -1252,7 +1258,7 @@ mod tests {
 
     #[test]
     fn list_mouse_selection_updates_navigation_message() {
-        let mut demo = super::NavigationDemo::new();
+        let mut demo = super::committed_demo();
         for kind in [
             bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
             bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
@@ -1320,7 +1326,7 @@ mod tests {
 
     #[test]
     fn table_mouse_selection_updates_navigation_message() {
-        let mut demo = super::NavigationDemo::new();
+        let mut demo = super::committed_demo();
         for kind in [
             bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
             bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
