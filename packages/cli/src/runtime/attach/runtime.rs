@@ -8397,12 +8397,18 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         .reconcile(&view_state.retained_compositor)
         && let Some((endpoint, hook)) = old_focus
     {
-        let _ = bmux_plugin::global_attach_presentation_input_registry()
+        let _ = view_state
+            .presentation_input
             .notify_focus_lost(&endpoint, &hook);
     }
     let _ = view_state
         .plugin_pointer_router
         .reconcile(&view_state.retained_compositor);
+    acknowledge_plugin_surface_output(view_state);
+    result
+}
+
+fn acknowledge_plugin_surface_output(view_state: &AttachViewState) {
     let mut published = std::collections::BTreeSet::new();
     for surface in view_state.retained_compositor.surfaces().values() {
         if let Some(revision) = surface.revision {
@@ -8414,9 +8420,8 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         }
     }
     for (endpoint, revision) in published {
-        bmux_plugin::global_attach_presentation_input_registry().committed(&endpoint, revision);
+        view_state.presentation_input.committed(&endpoint, revision);
     }
-    result
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -11922,7 +11927,8 @@ fn clear_plugin_surface_focus(view_state: &mut AttachViewState) {
         "{}:{}:{}",
         target.owner_plugin_id, target.surface_local_id, target.region_local_id
     );
-    if bmux_plugin::global_attach_presentation_input_registry()
+    if view_state
+        .presentation_input
         .notify_focus_lost(endpoint, &hook_id)
     {
         view_state
@@ -11941,10 +11947,7 @@ fn dismiss_plugin_focus_on_pointer_down(view_state: &mut AttachViewState, mouse_
             .plugin_focus
             .focused()
             .and_then(|id| view_state.retained_compositor.endpoint_for_region(id))
-            .is_some_and(|endpoint| {
-                bmux_plugin::global_attach_presentation_input_registry()
-                    .observes_focus_loss(endpoint)
-            });
+            .is_some_and(|endpoint| view_state.presentation_input.observes_focus_loss(endpoint));
         if observes_loss && view_state.plugin_focus.focused() != target {
             clear_plugin_surface_focus(view_state);
         }
@@ -11995,9 +11998,7 @@ fn try_handle_plugin_surface_paste(view_state: &mut AttachViewState, text: &str)
         "{}:{}:{}",
         target.owner_plugin_id, target.surface_local_id, target.region_local_id
     );
-    let Some(result) =
-        bmux_plugin::global_attach_presentation_input_registry().paste(endpoint, &hook, text)
-    else {
+    let Some(result) = view_state.presentation_input.paste(endpoint, &hook, text) else {
         return false;
     };
     if result.dirty {
@@ -14878,6 +14879,87 @@ mod tests {
         assert!(survivor.transient_status.is_none());
         server.await.unwrap();
     }
+    #[cfg(feature = "bundled-plugin-tab-strip")]
+    #[tokio::test]
+    async fn inline_rename_uses_attachment_local_output_and_input() {
+        for workspace in [false, true] {
+            let mut state = AttachViewState::new(AttachOpenInfo {
+                context_id: None,
+                session_id: Uuid::new_v4(),
+                can_write: true,
+            });
+            let (_installation, resources) = installed_menu_action(&mut state);
+            let endpoint = bmux_plugin::AttachInputEndpoint {
+                capability: "bmux.tab_strip.input".into(),
+                interface_id: "presentation-input".into(),
+                operation: "handle-input".into(),
+            };
+            let target = if workspace {
+                format!("workspace:{}", Uuid::nil())
+            } else {
+                format!("window:{}", Uuid::from_u128(42))
+            };
+            let mut event = bmux_plugin::AttachInputEvent {
+                hook_id: format!("bmux.tab_strip:strip:{target}"),
+                event_kind: "pointer".into(),
+                phase: "down".into(),
+                button: Some("left".into()),
+                key: None,
+                col: Some(0),
+                row: Some(0),
+                wheel_delta: 0,
+                modifiers: bmux_plugin::AttachInputModifiers::default(),
+                focused_pane: None,
+                hovered_pane: None,
+            };
+            resources.input.invoke(&endpoint, &event).unwrap();
+            resources.input.invoke(&endpoint, &event).unwrap();
+            let viewport = DamageRect::new(0, 0, 80, 24);
+            let surfaces = super::retained_plugin_surfaces(&state, viewport);
+            super::replace_retained_surfaces(
+                &mut state,
+                surfaces,
+                viewport,
+                DamageCoalescingPolicy::default(),
+            );
+            let hit = (0..24)
+                .flat_map(|y| (0..80).map(move |x| (x, y)))
+                .filter_map(|(x, y)| state.retained_compositor.hit_test(x, y))
+                .find(|hit| {
+                    hit.region_id
+                        .as_ref()
+                        .is_some_and(|id| id.region_local_id == target)
+                })
+                .expect("rename field");
+            state
+                .plugin_focus
+                .focus_hit(&state.retained_compositor, &hit);
+            super::acknowledge_plugin_surface_output(&state);
+            event.event_kind = "key".into();
+            event.phase = "press".into();
+            event.key = Some("backspace".into());
+            assert!(resources.input.invoke(&endpoint, &event).unwrap().consumed);
+            event.key = Some("enter".into());
+            let empty = resources.input.invoke(&endpoint, &event).unwrap();
+            assert!(empty.status_message.unwrap().contains("must not be empty"));
+            assert!(empty.service_invocation.is_none());
+            event.key = Some("界".into());
+            assert!(resources.input.invoke(&endpoint, &event).unwrap().consumed);
+            assert!(super::try_handle_plugin_surface_paste(
+                &mut state, " renamed"
+            ));
+            event.key = Some("enter".into());
+            let result = resources.input.invoke(&endpoint, &event).unwrap();
+            let invocation = result.service_invocation.expect("rename submission");
+            assert!(
+                invocation
+                    .payload
+                    .windows("界 renamed".len())
+                    .any(|bytes| bytes == "界 renamed".as_bytes())
+            );
+        }
+    }
+
     struct FailingWriter {
         fail_flush: bool,
     }
@@ -15735,7 +15817,7 @@ mod tests {
         };
         let notified = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = notified.clone();
-        let registry = bmux_plugin::global_attach_presentation_input_registry();
+        let registry = std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::default());
         registry.register_focus_lost(
             endpoint.clone(),
             std::sync::Arc::new(move |_| {
@@ -15765,6 +15847,7 @@ mod tests {
             session_id: Uuid::from_u128(1),
             can_write: true,
         });
+        view.presentation_input = registry.clone();
         let _ = view.retained_compositor.replace_surfaces(
             retained_surfaces_from_plugin_surfaces(
                 &[surface],
