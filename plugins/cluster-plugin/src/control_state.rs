@@ -127,6 +127,8 @@ pub struct ControlState {
     /// Permanent bootstrap consumption and retry outcome; never pruned with ordinary dedup.
     pub principal_bootstrap: Option<PrincipalBootstrapRecord>,
     // Successful refresh outcomes are bounded and persisted with the member update.
+    // Bounded committed publication batches retain report revisions and retry outcomes.
+    publication_history: Vec<(crate::capability_publication::PublicationCommand, u64)>,
     refresh_outcomes: BTreeMap<uuid::Uuid, ([u8; 32], u64)>,
     dedup: BTreeMap<DedupKey, DedupRecord>,
     feature_dedup: BTreeMap<DedupKey, FeatureDedupRecord>,
@@ -147,10 +149,74 @@ impl ControlState {
             tabs: BTreeMap::new(),
             panes: BTreeMap::new(),
             principal_bootstrap: None,
+            publication_history: Vec::new(),
             refresh_outcomes: BTreeMap::new(),
             dedup: BTreeMap::new(),
             feature_dedup: BTreeMap::new(),
         }
+    }
+
+    /// Applies a complete signed publication batch atomically in log order.
+    /// # Errors
+    /// Rejects stale revisions, conflicting identities, invalid authority and exhaustion.
+    pub fn apply_publication(
+        &mut self,
+        command: &crate::capability_publication::PublicationCommand,
+        membership: &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
+    ) -> Result<u64, String> {
+        command.encode()?;
+        for (previous, revision) in &self.publication_history {
+            if previous.reports == command.reports {
+                return Ok(*revision);
+            }
+            if previous.reports.iter().any(|old| {
+                command
+                    .reports
+                    .iter()
+                    .any(|new| old.command_id == new.command_id)
+            }) {
+                return Err("publication command identity conflict".into());
+            }
+        }
+        if self.publication_history.len() >= 64 {
+            return Err("publication history capacity exhausted".into());
+        }
+        crate::capability_publication::verify_bridge(
+            &command.reports,
+            &self.members,
+            membership,
+            &self.cluster_id,
+            command.verified_at_unix_ms,
+        )?;
+        for report in &command.reports {
+            let current = self
+                .publication_history
+                .iter()
+                .rev()
+                .find_map(|(batch, _)| {
+                    batch
+                        .reports
+                        .iter()
+                        .find(|old| old.node_id == report.node_id)
+                });
+            let expected = match current {
+                Some(old) => old
+                    .expected_report_revision
+                    .checked_add(1)
+                    .ok_or("report revision overflow")?,
+                None => 0,
+            };
+            if report.expected_report_revision != expected {
+                return Err("publication report revision mismatch".into());
+            }
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or("control revision overflow")?;
+        self.publication_history.push((command.clone(), revision));
+        self.revision = revision;
+        Ok(revision)
     }
 
     /// Applies a replicated bootstrap command against the committed voter configuration.

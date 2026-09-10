@@ -51,6 +51,33 @@ fn encode_refresh_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCodecEr
 }
 
 pub(super) fn encode_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCodecError> {
+    if !state.publication_history.is_empty() {
+        if state.publication_history.len() > 64 {
+            return Err(StateCodecError::LimitExceeded("publication history"));
+        }
+        let mut base = state.clone();
+        base.publication_history.clear();
+        let mut w = Writer::default();
+        w.raw(b"BMSTA006");
+        w.bytes(&encode_snapshot(&base)?);
+        w.u16(
+            u16::try_from(state.publication_history.len())
+                .map_err(|_| StateCodecError::LimitExceeded("publication history"))?,
+        );
+        for (command, revision) in &state.publication_history {
+            w.bytes(
+                &command
+                    .encode()
+                    .map_err(|_| StateCodecError::InvalidState("invalid publication"))?,
+            );
+            w.u64(*revision);
+        }
+        let bytes = w.into_bytes();
+        if bytes.len() > MAX_SNAPSHOT_BYTES {
+            return Err(StateCodecError::LimitExceeded("bytes"));
+        }
+        return Ok(bytes);
+    }
     if !state.refresh_outcomes.is_empty() {
         return encode_refresh_snapshot(state);
     }
@@ -173,9 +200,50 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
     }
     let mut reader = Reader::new(bytes);
     let magic = reader.take(SNAPSHOT_MAGIC.len())?;
+    if magic == b"BMSTA006" {
+        let base = reader.bytes()?;
+        if base.starts_with(b"BMSTA006") {
+            return Err(StateCodecError::InvalidState("nested publication snapshot"));
+        }
+        let mut state = decode_snapshot(&base)?;
+        let count = reader.u16()?;
+        if count == 0 || count > 64 {
+            return Err(StateCodecError::LimitExceeded("publication history"));
+        }
+        let mut last_revision = 0;
+        let mut ids = std::collections::BTreeSet::new();
+        let mut revisions = std::collections::BTreeMap::new();
+        for _ in 0..count {
+            let command =
+                crate::capability_publication::PublicationCommand::decode(&reader.bytes()?)
+                    .map_err(|_| StateCodecError::InvalidState("invalid publication command"))?;
+            let revision = reader.u64()?;
+            if revision <= last_revision || revision > state.revision {
+                return Err(StateCodecError::InvalidState(
+                    "invalid publication revision",
+                ));
+            }
+            for report in &command.reports {
+                let expected = revisions.entry(report.node_id.clone()).or_insert(0_u64);
+                if report.cluster_id != state.cluster_id
+                    || report.expected_report_revision != *expected
+                    || !ids.insert(report.command_id.value)
+                {
+                    return Err(StateCodecError::InvalidState("invalid publication history"));
+                }
+                *expected = expected
+                    .checked_add(1)
+                    .ok_or(StateCodecError::InvalidState("report revision overflow"))?;
+            }
+            last_revision = revision;
+            state.publication_history.push((command, revision));
+        }
+        reader.finish()?;
+        return Ok(state);
+    }
     if magic == b"BMSTA005" {
         let base = reader.bytes()?;
-        if base.starts_with(b"BMSTA005") {
+        if base.starts_with(b"BMSTA005") || base.starts_with(b"BMSTA006") {
             return Err(StateCodecError::InvalidState("nested refresh snapshot"));
         }
         let mut state = decode_snapshot(&base)?;
@@ -393,6 +461,7 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
         tabs,
         panes,
         principal_bootstrap,
+        publication_history: Vec::new(),
         refresh_outcomes: std::collections::BTreeMap::new(),
         dedup,
         feature_dedup,

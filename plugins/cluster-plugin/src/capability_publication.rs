@@ -354,6 +354,7 @@ mod tests {
             )
             .is_err()
         );
+        assert_publication_state(&bridge, &member, &membership);
         let learner = NodeId::from(94);
         let expanded = StoredMembership::new(
             *membership.log_id(),
@@ -368,6 +369,35 @@ mod tests {
         assert!(verify_bridge(&[bridge], &members, &expanded, &cluster.to_string(), 43).is_err());
         assert_publication_codec(&report);
         assert_report_mutations_rejected(report, &member, &membership, cluster, &identity);
+    }
+
+    fn assert_publication_state(
+        report: &CapabilityReport,
+        member: &ClusterMember,
+        membership: &StoredMembership<NodeId, BasicNode>,
+    ) {
+        use crate::control_state::ControlState;
+        let mut state = ControlState::new(&report.cluster_id);
+        state.members.insert(member.node_id.clone(), member.clone());
+        let command = PublicationCommand {
+            reports: vec![report.clone()],
+            verified_at_unix_ms: 43,
+        };
+        assert_eq!(state.apply_publication(&command, membership).unwrap(), 1);
+        let bytes = state.encode_snapshot().unwrap();
+        assert!(bytes.starts_with(b"BMSTA006"));
+        let mut restored = ControlState::decode_snapshot(&bytes).unwrap();
+        assert_eq!(state, restored);
+        let mut retry = command.clone();
+        retry.verified_at_unix_ms = 44;
+        assert_eq!(restored.apply_publication(&retry, membership).unwrap(), 1);
+        let mut conflict = command;
+        conflict.reports[0].schema_max += 1;
+        assert!(restored.apply_publication(&conflict, membership).is_err());
+        assert_eq!(restored, state);
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(ControlState::decode_snapshot(&trailing).is_err());
     }
 
     fn assert_publication_codec(report: &CapabilityReport) {

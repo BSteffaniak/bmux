@@ -701,6 +701,39 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
                                 })?;
                         next.control_state
                             .apply_bootstrap_command(&command, &next.last_membership)
+                    } else if request.0.starts_with(b"BMCAP001") {
+                        use bmux_cluster_plugin_api::cluster_types::{
+                            ControlCommandError, ControlCommandResult, ControlResponse,
+                            ControlWorkflowStatus,
+                        };
+                        let command = crate::capability_publication::PublicationCommand::decode(
+                            &request.0,
+                        )
+                        .map_err(|error| storage_write_error(std::io::Error::other(error)))?;
+                        let outcome = next
+                            .control_state
+                            .apply_publication(&command, &next.last_membership);
+                        let (control_revision, result) = match outcome {
+                            Ok(revision) => (
+                                revision,
+                                ControlCommandResult::Accepted {
+                                    payload: Vec::new(),
+                                },
+                            ),
+                            Err(reason) => (
+                                next.control_state.revision,
+                                ControlCommandResult::Rejected {
+                                    error: ControlCommandError::InvalidTransition { reason },
+                                },
+                            ),
+                        };
+                        ControlResponse {
+                            schema_version: 1,
+                            command_id: command.reports[0].command_id.clone(),
+                            control_revision,
+                            workflow_status: ControlWorkflowStatus::Complete,
+                            result,
+                        }
                     } else if crate::control_codec::is_protocol_refresh(&request.0) {
                         let command =
                             crate::control_codec::ProtocolRefreshCommand::decode(&request.0)
