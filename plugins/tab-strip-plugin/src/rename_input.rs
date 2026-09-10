@@ -147,7 +147,10 @@ pub fn paint(
         boundary = next;
     }
     let viewport = ComponentViewport::new(
-        LayoutNode::leaf("rename".into(), LogicalSize::new(content_width, 1)),
+        LayoutNode::leaf(
+            "rename".into(),
+            LogicalSize::new(u64::from(content_width), 1),
+        ),
         Rect::new(x, 0, width, 1),
         Point::new(u16::try_from(offset).unwrap_or(u16::MAX), 0),
     );

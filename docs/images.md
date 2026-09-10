@@ -19,7 +19,7 @@ When a program running inside a bmux pane emits image escape sequences, bmux:
 3. **Re-emits** the image to the host terminal using the appropriate protocol for display
 4. **Tracks changes** -- when images scroll, move, or are removed, the registry updates automatically
 
-This is transparent to programs. Any application that displays images in a terminal will work inside bmux without modification.
+Applications can use the implemented image operations without a bmux-specific API. Compatibility depends on the host terminal, protocol operations, image format, and build features; support for a protocol does not imply support for every animation, transport, or placement extension. Test the applications and terminals you intend to use.
 
 ## Testing Image Support
 

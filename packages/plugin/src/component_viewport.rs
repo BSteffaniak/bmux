@@ -17,6 +17,7 @@ pub struct ComponentViewport {
     layout: LayoutNode,
     viewport: Rect,
     offset: Point,
+    raster: Rect,
 }
 
 pub struct ComponentViewportPaint {
@@ -38,7 +39,9 @@ impl ComponentViewport {
     /// Returns `None` for empty or oversized raster allocations.
     #[must_use]
     pub fn new(layout: LayoutNode, viewport: Rect, offset: Point) -> Option<Self> {
-        let cells = usize::from(layout.size.width).checked_mul(layout.size.height)?;
+        let width = u16::try_from(layout.size.width).ok()?;
+        let height = u16::try_from(layout.size.height).ok()?;
+        let cells = usize::from(width).checked_mul(usize::from(height))?;
         if cells == 0
             || cells > 65_536
             || viewport.is_empty()
@@ -50,13 +53,13 @@ impl ComponentViewport {
             layout,
             viewport,
             offset,
+            raster: Rect::new(0, 0, width, height),
         })
     }
 
     #[must_use]
     pub fn paint(&self, component: &dyn Component) -> ComponentViewportPaint {
-        let height = u16::try_from(self.layout.size.height).unwrap_or(u16::MAX);
-        let mut buffer = Buffer::empty(Rect::new(0, 0, self.layout.size.width, height));
+        let mut buffer = Buffer::empty(self.raster);
         let mut frame = Frame::new(&mut buffer);
         component.paint(&self.layout, &mut PaintCx::new(&mut frame));
         let hits = frame
@@ -155,5 +158,43 @@ impl ComponentViewport {
             self.viewport.x.saturating_add(x),
             self.viewport.y.saturating_add(y),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_tui::component::{LayoutId, LogicalSize};
+
+    fn viewport(width: u64, height: u64) -> Option<ComponentViewport> {
+        ComponentViewport::new(
+            LayoutNode::leaf(
+                LayoutId::new("raster-test"),
+                LogicalSize::new(width, height),
+            ),
+            Rect::new(0, 0, 10, 10),
+            Point::new(0, 0),
+        )
+    }
+
+    #[test]
+    fn rejects_unrepresentable_or_oversized_rasters() {
+        for (width, height) in [
+            (65_536, 1),
+            (1, 65_536),
+            (u64::MAX, u64::MAX),
+            (0, 1),
+            (1, 0),
+            (257, 256),
+        ] {
+            assert!(viewport(width, height).is_none());
+        }
+    }
+
+    #[test]
+    fn retains_exact_dimensions_at_allocation_limit() {
+        let view = viewport(256, 256).expect("bounded raster");
+        assert_eq!(view.raster, Rect::new(0, 0, 256, 256));
+        assert!(viewport(65_535, 1).is_some());
     }
 }

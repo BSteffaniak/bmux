@@ -1,370 +1,83 @@
 # bmux
 
-[![Rust](https://github.com/BSteffaniak/bmux/workflows/Rust/badge.svg)](https://github.com/BSteffaniak/bmux/actions)
-[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
+[![Build and Test](https://github.com/BSteffaniak/bmux/actions/workflows/ci.yml/badge.svg)](https://github.com/BSteffaniak/bmux/actions/workflows/ci.yml)
 
-> **Work in Progress**: bmux is in active development. The architecture is moving quickly, and the current CLI surface is already usable while the broader experience continues to take shape.
+**A Rust terminal multiplexer and reusable terminal UI framework.**
 
-**bmux** is a modern terminal multiplexer written in Rust, built for flexible multi-client workflows, modal interaction, and deep customization. bmux is plugin-driven by design, making extensibility a first-class part of the product rather than an afterthought.
+bmux combines server-backed terminal sessions with independent client views, modal interaction, typed plugin services, and composable themes. The UI framework can also be used without the multiplexer.
 
-## Why bmux
+> **Early alpha.** APIs, configuration, and terminal compatibility are evolving. Source installation is the supported path described here. Package-release workflows exist, but npm/package-server availability must not be inferred from those workflows.
 
-- Multi-client sessions with independent views
-- Modal, keyboard-driven interaction
-- Plugin-driven extensibility and customization
-- A modern Rust implementation focused on performance and reliability
-- A server-backed CLI built for reusable session workflows
+## Capabilities
 
-## Extensibility
-
-Extensibility in bmux is built in, not bolted on.
-
-Plugins are not an afterthought in bmux - they are part of the architecture and part of how bmux works. That makes bmux flexible to adapt, easier to customize, and better suited for workflows that do not fit a one-size-fits-all terminal multiplexer.
-
-## Current Status
-
-Today, bmux includes a working server-backed CLI, session and window management workflows, multi-client foundations, diagnostics, and plugin-driven extensibility. It is still early, but it is no longer just a skeleton or roadmap.
+- Persistent server-backed sessions and multi-client views.
+- Plugin-owned session, window, workspace, permission, and command behavior.
+- A domain-neutral TUI framework with layout, painting, input, selection, damage tracking, and reusable controls.
+- Additive theme stacks, mode-aware overlays, and plugin-owned interactive components.
+- Kitty, Sixel, and iTerm2 image handling, subject to host-terminal support and implemented protocol operations.
+- Remote connections, recording/export, and runtime diagnostics.
 
 ## Installation
 
-### Source build
+Install Git, stable Rust, and a native build toolchain. macOS and Linux are primary terminal environments; the repository also contains Windows support and platform-specific release configuration. A release target is not a guarantee of identical behavior on every terminal/OS combination.
 
-```bash
+```sh
 git clone https://github.com/BSteffaniak/bmux.git
 cd bmux
-cargo build --all-targets
-cargo test --all-targets
+cargo build --locked --release -p bmux_cli --bin bmux
+./target/release/bmux --help
+./target/release/bmux
 ```
 
-### npm
-
-```bash
-npm install -g bmux
-# or
-npm install -g @bmux/cli
-```
-
-### packages.bmux.dev channels
-
-Stable is the default channel.
-
-```bash
-curl -fsSL https://packages.bmux.dev/install | sh
-curl -fsSL "https://packages.bmux.dev/install?channel=nightly" | sh
-```
-
-APT and RPM repository roots:
-
-- `https://packages.bmux.dev/stable/apt`
-- `https://packages.bmux.dev/stable/rpm`
-- `https://packages.bmux.dev/nightly/apt`
-- `https://packages.bmux.dev/nightly/rpm`
+On Windows, use `target\release\bmux.exe`. Use the built binary's full path, or add its directory to `PATH` before using the examples below.
 
 ## Current CLI Workflow
 
-The current CLI is server-backed by default. Running `bmux` with no subcommand starts or reuses a server, creates a session when needed, and attaches.
+Running without a subcommand starts or reuses a local server, creates a session when needed, and attaches.
 
-```bash
-# Start or inspect the server
-bmux server start
-bmux server status
-bmux server stop
-
-# Create and attach sessions
+```sh
 bmux new-session dev
 bmux list-sessions
 bmux attach dev
-
-# Work with named workspaces and tabs
-bmux workspace new --name project
-bmux tab new --name editor
-bmux tab list
-bmux workspace switch project
-
-# Multi-client collaboration
-bmux list-clients
-bmux follow <client-uuid>
-bmux unfollow
-
-# Remote targets over SSH
-bmux connect prod app
-bmux connect prod                # picker when multiple sessions
-bmux remote list
-bmux remote test prod
-bmux remote doctor prod --fix
-bmux remote init prod --ssh bmux@prod.example.com --set-default
-bmux remote install-server prod
-bmux remote upgrade prod
-bmux --target prod list-sessions
-bmux connect prod --reconnect-forever
-bmux remote complete targets
-bmux remote complete sessions prod
-
-# Streamlined hosted workflow (p2p default, no bmux control-plane required)
-bmux setup
-bmux host
-# Optional runtime instance selection (for parallel local runtimes)
-bmux --runtime dev server start --daemon
-bmux --runtime dev host
-
-# Native per-user login autostart (launchd, systemd user service, or Task Scheduler)
-bmux server autostart install
-bmux server autostart status
-bmux server autostart print      # side-effect-free declaration output
-bmux server autostart uninstall
-# Named runtimes receive isolated native service identities:
-bmux --runtime dev server autostart install
-# Ephemeral sandbox run (fully isolated config/runtime/data/state/logs)
-bmux sandbox run -- server status
-bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode inherit -- --version
-bmux sandbox dev -- server status
-bmux sandbox list --limit 10
-bmux sandbox status --json
-bmux sandbox list --source playbook --limit 10
-bmux sandbox inspect --latest
-bmux sandbox inspect --latest --source recording-verify
-bmux sandbox inspect --latest-failed --tail 120
-bmux sandbox tail --latest-failed --tail 120 --json
-bmux sandbox open --latest-failed --json
-bmux sandbox rerun --latest-failed --bmux-bin ./target/debug/bmux --json
-bmux sandbox triage --json
-bmux sandbox triage --latest-failed --bundle --bundle-output ./sandbox-artifacts --json
-bmux sandbox triage --latest-failed --bundle --bundle-strict-verify --json
-bmux sandbox triage --latest-failed --rerun --bmux-bin ./target/debug/bmux
-bmux sandbox bundle bmux-sbx-123 --output ./sandbox-artifacts
-bmux sandbox bundle bmux-sbx-123 --include-env --verify --json
-bmux sandbox verify-bundle ./sandbox-artifacts/bmux-sbx-123-1700000000000 --json
-bmux sandbox verify-bundle ./sandbox-artifacts/bmux-sbx-123-1700000000000 --strict --json
-bmux sandbox doctor --json
-bmux sandbox doctor --fix --dry-run --json
-bmux sandbox cleanup --dry-run --json
-bmux sandbox clean --dry-run --json
-bmux sandbox cleanup --all-status --source playbook --older-than 0
-bmux sandbox cleanup --source recording-verify --older-than 600
-# Optional control-plane mode for account/share links
-bmux setup --mode control-plane
-bmux host --mode control-plane
-bmux share --name my-host
-bmux join bmux://my-host
-
-# Bash/Zsh/Fish completion can call:
-# bmux remote complete targets
-# bmux remote complete sessions <target>
-
-# Internet-accessible TLS gateway
-bmux server gateway --listen 0.0.0.0:7443 --quick
-bmux connect tls-prod app
-
-# Or start the TLS gateway automatically with the local server by adding:
-# [server.gateway]
-# enabled = true
-# listen = "0.0.0.0:7443"
-# quick = true
-# Restart the bmux server after changing gateway settings.
-
-# Reverse-SSH hosted helper (prints public URL in ssh output)
-bmux server gateway --listen 127.0.0.1:7443 --quick --host --host-mode ssh
-bmux connect https://your-public-url app
-
-# Iroh hosted mode (default for --host)
-bmux server gateway --listen 127.0.0.1:7443 --host
-# prints: iroh://<endpoint_id>?relay=<url>
-bmux connect iroh://<endpoint_id>?relay=<url> app
-
-# Logging
-bmux logs path
-bmux logs level
-bmux logs tail
-bmux logs path --json
-bmux logs level --json
-bmux logs tail --since 15m --lines 200
-bmux logs watch --exclude "bmux server listening"
-bmux logs watch --profile incident-db
-bmux logs profiles list
 ```
 
-A TLS gateway can also start automatically with the local server:
+Inside an attached session, `bmux detach` disconnects the client without intentionally terminating the session. Read [configuration profiles](docs/config-profiles.md) for modal and tmux-compatible interaction rather than assuming another multiplexer’s keybindings.
 
-```toml
-[server.gateway]
-enabled = true
-listen = "0.0.0.0:7443"
-quick = true
-```
+## Architecture
 
-For a production certificate, disable quick mode by omitting `quick` and provide both PEM files:
+| Layer                                            | Responsibility                                                                       |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------ |
+| [`bmux_tui`](packages/tui)                       | Domain-neutral geometry, layout, paint, scenes, and terminal presentation primitives |
+| [`bmux_tui_components`](packages/tui-components) | Reusable controls with caller-owned state                                            |
+| [`bmux_tui_runtime`](packages/tui-runtime)       | Scheduling, events, and presentation lifecycle                                       |
+| [Plugin APIs and services](docs/plugins.md)      | Typed product behavior and extension contracts                                       |
+| [Theme plugin](plugins/theme-plugin)             | Theme selection and composition                                                      |
+| [Image handling](docs/images.md)                 | Protocol interception, storage, and presentation                                     |
 
-```toml
-[server.gateway]
-enabled = true
-listen = "0.0.0.0:7443"
-cert_file = "/etc/bmux/gateway-cert.pem"
-key_file = "/etc/bmux/gateway-key.pem"
-```
+Read the [TUI framework guide](docs/tui-framework.md) for reusable APIs and ownership boundaries. Sessions surviving client disconnects do not imply that arbitrary foreground processes survive a machine restart.
 
-Restart the bmux server after changing gateway settings. Listening on `0.0.0.0` exposes the gateway to reachable networks; apply appropriate firewall and access controls. Reverse-SSH and Iroh hosting remain explicit `bmux server gateway --host ...` command flows.
+## Documentation
 
-`bmux logs watch` uses a ratatui interface and supports Vim-style navigation (`j`/`k`, `g`/`G`, `Ctrl-u`/`Ctrl-d`).
+- [CLI workflows and advanced examples](docs/cli-workflows.md)
+- [Concepts](docs/concepts.md) and [configuration profiles](docs/config-profiles.md)
+- [Plugins](docs/plugins.md) and [window presentation](docs/window-presentations.md)
+- [Images and compression](docs/images.md)
+- [Operations](docs/operations.md) and [testing](TESTING.md)
 
-Top-level and grouped command forms are supported in many areas of the CLI.
-
-All list commands with `--json` output a bare JSON array.
-
-Logging defaults:
-
-- file sink is enabled by default
-- default level is `info`
-- `--verbose` raises level to `debug`
-- `--log-level` supports `error|warn|info|debug|trace`
-
-Environment overrides:
-
-- `BMUX_LOG_LEVEL`: effective runtime log level
-
-A native autostart service runs foreground `bmux server start` so the operating system owns supervision; it does not use `--daemon`. Installation is explicit and starts immediately unless `--no-start` is passed. Existing `[server.gateway]` configuration is loaded normally, so an enabled gateway also starts at login.
-
-Imperative installation refuses symlinked, read-only, conflicting, or externally managed declarations. Nix/Home Manager users should define `${pkgs.bmux}/bin/bmux server start` through `systemd.user.services` or `launchd.agents` and let Nix own the declaration; bmux never mutates `bmux.toml`. Linux autostart begins at login and does not enable lingering automatically.
-
-Runtime selection vs sandbox isolation:
-
-- Use `--runtime <name>` to run multiple local bmux runtime instances side-by-side while still using your normal config/data/state roots.
-- Use `bmux sandbox ...` when you want a throwaway isolated environment (config/runtime/data/state/logs/home/tmp) for safe local build testing and failure triage.
-- `BMUX_LOG_DIR`: explicit log directory
-- `BMUX_STATE_DIR`: explicit state directory
-- `BMUX_TARGET`: default command target (same behavior as `--target`)
-
-Connection targets can be configured in `bmux.toml`:
-
-```toml
-[connections]
-hosted_mode = "p2p" # or "control_plane" (hard-fail on control-plane errors)
-default_target = "local"
-
-[connections.targets.prod]
-transport = "ssh"
-host = "prod.example.com"
-user = "bmux"
-port = 22
-identity_file = "~/.ssh/id_ed25519"
-known_hosts_file = "~/.ssh/known_hosts"
-strict_host_key_checking = true
-jump = "ops@bastion.example.com"
-remote_bmux_path = "bmux"
-connect_timeout_ms = 8000
-default_session = "main"
-
-[connections.targets.tls-prod]
-transport = "tls"
-host = "gateway.example.com"
-port = 7443
-server_name = "gateway.example.com"
-ca_file = "~/.config/bmux/gateway-ca.pem"
-```
-
-Example shell wiring for target/session completion:
-
-```bash
-# Bash helper functions
-_bmux_targets() {
-  bmux remote complete targets 2>/dev/null
-}
-
-_bmux_sessions() {
-  local target="$1"
-  bmux remote complete sessions "$target" 2>/dev/null
-}
-
-# Usage examples:
-# _bmux_targets
-# _bmux_sessions prod
-```
-
-Plugin command ownership policy is optional and declarative:
-
-```toml
-[plugins.routing]
-conflict_mode = "fail_startup"
-
-[[plugins.routing.required_namespaces]]
-namespace = "plugin"
-
-[[plugins.routing.required_paths]]
-path = ["recording", "start"]
-```
-
-Role policy: `owner` controls session and window mutations plus role changes, `writer` can send attach input, and `observer` is read-only.
-
-Window presentation settings and the tab-strip/sidebar enablement combinations
-are documented in [Window presentation plugins](docs/window-presentations.md).
-
-## Examples
-
-- Prompt showcase (isolated in-process sandbox + attach prompt API):
-
-  ```bash
-  cargo run -p bmux_prompt_showcase
-  ```
-
-- Plugin-provided prompt showcase (reuses `example.native` prompt sequence):
-
-  ```bash
-  cargo run -p bmux_prompt_plugin_showcase
-  ```
-
-- Native plugin example:
-
-  ```bash
-  cargo build -p bmux_example_native_plugin
-  ./scripts/install-example-plugin.sh
-  ```
-
-- Minimal hello plugin example:
-
-  ```bash
-  cargo build -p bmux_example_hello_plugin
-  ```
+Remote gateways and login startup are opt-in operations. Review their network exposure and supervision behavior before enabling them. Do not copy gateway examples into an internet-facing deployment without appropriate access controls.
 
 ## Development
 
-Useful commands:
-
-```bash
-cargo check
-cargo test --all
-cargo clippy --all-targets --all-features
+```sh
 cargo fmt
+cargo check -p bmux_cli
+cargo test -p bmux_cli
 ```
 
-For active development:
+For code changes, follow [AGENTS.md](AGENTS.md): warning-free clippy, the nextest suite, dependency checks, and relevant PTY/compatibility tests. Docs-only changes use link, Markdown, and documentation-snippet checks. Report the platform and terminal alongside non-sensitive reproductions in [GitHub Issues](https://github.com/BSteffaniak/bmux/issues).
 
-```bash
-cargo install cargo-watch
-cargo watch -x check
-bmux plugin rebuild
-```
-
-Build specific plugins by bundled id, short name, or crate name:
-
-```bash
-bmux plugin rebuild bmux.windows
-bmux plugin rebuild windows permissions
-bmux plugin rebuild bmux_windows_plugin --release
-```
-
-### Nix + direnv
-
-If you use Nix, bmux provides a flake-based development shell:
-
-```bash
-nix develop
-```
-
-To automatically load the shell when entering the repository:
-
-```bash
-direnv allow
-```
+Native plugins are trusted code, not sandboxed extensions. Report security-sensitive issues privately to [bradensteffaniak@gmail.com](mailto:bradensteffaniak@gmail.com), without credentials or private recordings. No response-time guarantee is implied.
 
 ## License
 
-bmux is licensed under the [Mozilla Public License 2.0](LICENSE).
+[Mozilla Public License 2.0](LICENSE). Bundled fonts retain their [upstream licenses](packages/fonts/licenses).
