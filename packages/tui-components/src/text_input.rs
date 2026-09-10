@@ -380,9 +380,7 @@ impl<'policy> TextInputControl<'policy> {
     /// Handle bracketed pasted text.
     pub fn handle_paste(&self, state: &mut TextInputState, text: &str) -> TextInputOutcome {
         state.buffer_mut().paste(text);
-        if self.policy.viewport.auto_scroll_to_cursor {
-            state.scroll.set_vertical_offset(u64::MAX);
-        }
+        state.sync_scroll_to_cursor(self.policy);
         TextInputOutcome::Edited
     }
 
@@ -1163,6 +1161,18 @@ mod tests {
 
     fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
         MouseEvent::new(kind, Point::new(x, y))
+    }
+
+    #[test]
+    fn paste_reveals_cursor_instead_of_document_bottom() {
+        let policy = TextInputPolicy::chat_composer();
+        let mut state =
+            TextInputState::new(TextEditBuffer::from_text("zero\none\ntwo\nthree\nfour"));
+        state.buffer_mut().move_cursor_to_wrapped_position(20, 1, 0);
+        state.set_content_area(Rect::new(0, 0, 20, 2), &policy);
+        TextInputControl::new(&policy).handle_paste(&mut state, "inserted");
+        assert_eq!(state.vertical_scroll(), 0);
+        assert!(state.buffer().text().contains("insertedone"));
     }
 
     #[test]
