@@ -71,6 +71,50 @@ Once a feature writes state that old versions cannot understand, the cluster flo
 
 Leader election must not select a node unable to apply the current cluster write floor. Incompatible nodes remain non-serving/rejected rather than partially participating.
 
+## Authenticated supported-capability publication
+
+Supported capabilities and the active negotiated protocol are distinct state. A
+signed report that a node can read/apply a newer representation does not change
+its membership credential, role, negotiated protocol, or cluster feature floors.
+In particular, publishing support must not require activation of the feature it
+is intended to enable.
+
+The initial upgrade uses a compatibility bridge:
+
+1. Install a bridge release that can decode the capability-publication command
+   and snapshot representation while retaining the existing active protocol.
+   An old binary that cannot decode that representation is not an eligible
+   recipient; a new BPDL endpoint alone does not establish compatibility.
+2. Obtain authenticated compatibility evidence from every committed recipient,
+   including learners, bound to the current membership position and node
+   identity. Refuse publication if that evidence is absent, stale, or incomplete.
+   Recheck membership before proposing the first new command. A membership
+   change invalidates the preflight rather than silently extending its scope.
+3. Commit signed supported-capability reports separately from member credential
+   replacement. Reports bind cluster/node identity, current credential serial,
+   supported representation ranges/features, an expected report revision, and a
+   mutation identity. The authoritative submission assigns verification time;
+   deterministic apply validates proof and current authority again in log order.
+4. Activate the new schema/feature floor only after authoritative reports cover
+   the exact committed membership and required serving roles. This remains a
+   separate committed operation, not a side effect of report publication.
+
+Reports are consensus-owned public metadata, not ingress-local authority. Their
+storage representation must preserve canonical membership and existing state.
+Report revision, mutation fingerprint/outcome, and applied position commit
+atomically and survive snapshots. Matching retries return the original outcome;
+conflicting reuse is rejected. Credential replacement, revocation, or membership
+change invalidates stale evidence. No report carries reusable private credentials.
+
+Interruption before commit leaves the prior authoritative report intact; an
+uncertain acknowledgment is resolved by retrying the same mutation identity.
+Snapshot installation and restart reject unsupported representations explicitly.
+A bridge release must define and test its read/write window before advertising
+support; this decision does not authorize sending unknown commands to schema-3
+binaries or interpreting negotiated protocol fields as supported-capability
+reports. Until that bridge is implemented and qualified, initial publication
+must remain unavailable rather than bypass activation or membership guards.
+
 ## Supported rolling window
 
 Before the first stable federation release, compatibility is guaranteed by explicit protocol/schema versions rather than semantic-version labels. At stable release, bmux will support rolling operation between **two adjacent released federation protocol revisions within the same epoch**, provided the cluster feature floor has not advanced beyond the older revision.

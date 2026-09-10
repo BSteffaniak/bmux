@@ -4,6 +4,7 @@
 #![allow(clippy::wildcard_imports)] // Focused private modules expose a crate-internal domain facade.
 
 pub(crate) mod attach_state;
+pub mod capability_publication;
 pub(crate) mod commands;
 pub mod consensus_membership;
 pub mod consensus_network;

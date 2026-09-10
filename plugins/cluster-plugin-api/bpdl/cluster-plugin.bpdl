@@ -37,6 +37,25 @@ interface cluster-principal-bootstrap-types {
     }
 }
 
+// Supported capability evidence is distinct from active negotiated protocol.
+interface cluster-capability-types {
+    record capability-report {
+        report-version: u16,
+        cluster-id: string,
+        node-id: string,
+        credential-serial: string,
+        membership-term: u64,
+        membership-leader-id: string,
+        membership-log-index: u64,
+        expected-report-revision: u64,
+        command-id: cluster-types.command-id,
+        schema-min: u32,
+        schema-max: u32,
+        features: list<string>,
+        signature: bytes,
+    }
+}
+
 interface cluster-types {
     enum cluster-host-state {
         ready,
