@@ -39,4 +39,3 @@ See [`../../docs/tui-runtime.md`](../../docs/tui-runtime.md) for the full archit
 - `image-kitty`: Kitty graphics output.
 - `image-sixel`: Sixel output.
 - `image-iterm2`: iTerm2 inline-image output.
-

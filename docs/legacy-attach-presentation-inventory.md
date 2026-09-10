@@ -96,7 +96,6 @@ belong in an attach-client presentation companion; sessions, contexts, clients,
 and permissions are consumed through their generated foundational contracts.
 No module may retain a hidden status-row geometry path after extraction.
 
-
 - Status can be top, bottom, or disabled.
 - Tabs support configurable scope/order, templates, index visibility, Unicode
   width limits, active/inactive/hover styling, narrow-width overflow, and active
@@ -200,7 +199,6 @@ these local Phase 0 budgets:
 Final p95 frame/render latency and terminal-write latency are compared from the
 canonical attach telemetry on the same host/profile; the migration may not
 claim success from projection microbenchmarks alone.
-
 
 Current CLI unit and playbook suites already cover tab templating, styling,
 overflow, hitbox bounds, click, hover, drag, rename, menu behavior, and resize.

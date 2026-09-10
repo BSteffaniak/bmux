@@ -257,10 +257,11 @@ jobs:
           sudo apt-get install -y dpkg-dev apt-utils gnupg createrepo-c
 
       - name: Import repository signing key
-        if: ${{ secrets.GPG_PRIVATE_KEY != '' && secrets.GPG_KEY_ID != '' }}
+        if: ${{ env.GPG_PRIVATE_KEY != '' && env.GPG_KEY_ID != '' }}
         shell: bash
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
         run: |
           printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
 
@@ -304,7 +305,7 @@ jobs:
           EOF
 
       - name: Export public signing key
-        if: ${{ secrets.GPG_KEY_ID != '' }}
+        if: ${{ env.GPG_KEY_ID != '' }}
         shell: bash
         env:
           GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
