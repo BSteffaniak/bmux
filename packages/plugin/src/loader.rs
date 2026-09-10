@@ -1173,6 +1173,7 @@ pub fn call_service_raw(
             .declaration
             .required_capabilities
             .iter()
+            .chain(loaded.declaration.optional_capabilities.iter())
             .map(ToString::to_string)
             .collect(),
         provided_capabilities: loaded
@@ -3072,6 +3073,12 @@ fn compare_manifest_and_embedded(
     )?;
     ensure_match(
         registered_plugin.declaration.id.as_str(),
+        "optional_capabilities",
+        &format!("{:?}", registered_plugin.declaration.optional_capabilities),
+        &format!("{:?}", declaration.optional_capabilities),
+    )?;
+    ensure_match(
+        registered_plugin.declaration.id.as_str(),
         "required_capabilities",
         &format!("{:?}", registered_plugin.declaration.required_capabilities),
         &format!("{:?}", declaration.required_capabilities),
@@ -4583,6 +4590,7 @@ minimum = "1.0"
                 concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
                 owns_namespaces: BTreeSet::new(),
                 owns_paths: BTreeSet::new(),
+                optional_capabilities: BTreeSet::new(),
                 required_capabilities: BTreeSet::new(),
                 provided_capabilities: BTreeSet::new(),
                 provided_features: BTreeSet::new(),

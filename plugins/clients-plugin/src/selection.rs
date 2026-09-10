@@ -201,6 +201,38 @@ mod tests {
     }
 
     #[test]
+    fn selection_policy_denial_and_failure_are_not_missing_provider_fallback() {
+        struct PolicyHost(u8);
+        impl bmux_plugin::ServiceCaller for PolicyHost {
+            fn call_service_raw(
+                &self,
+                _: &str,
+                _: bmux_plugin_sdk::ServiceKind,
+                _: &str,
+                _: &str,
+                _: Vec<u8>,
+            ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+                match self.0 {
+                    0 => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation { operation: "call_service" }),
+                    1 => bmux_plugin_sdk::encode_service_message(&bmux_permissions_plugin_api::session_policy_state::SessionPolicyCheckResponse { allowed: false, reason: Some("denied".into()) }),
+                    _ => Err(bmux_plugin_sdk::PluginError::ServiceProtocol { details: "policy storage failed".into() }),
+                }
+            }
+            fn execute_kernel_request(
+                &self,
+                _: bmux_ipc::Request,
+            ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+                panic!("policy must use typed services")
+            }
+        }
+        let client = Uuid::from_u128(1);
+        let session = Uuid::from_u128(2);
+        assert!(crate::authorize_selection(&PolicyHost(0), client, None, session).is_ok());
+        assert!(crate::authorize_selection(&PolicyHost(1), client, None, session).is_err());
+        assert!(crate::authorize_selection(&PolicyHost(2), client, None, session).is_err());
+    }
+
+    #[test]
     fn commit_requires_reservation_and_coherent_target() {
         let mut state = FollowState::default();
         let client = ClientId(Uuid::from_u128(1));

@@ -109,8 +109,10 @@ pub struct PluginManifest {
     pub plugin_api: PluginManifestCompatibility,
     #[serde(default)]
     pub native_abi: PluginManifestCompatibility,
+    /// Capabilities that may be invoked when a provider is available.
     #[serde(default)]
-    #[serde(alias = "required_host_scopes")]
+    pub optional_capabilities: BTreeSet<HostScope>,
+    #[serde(default, alias = "required_host_scopes")]
     pub required_capabilities: BTreeSet<HostScope>,
     #[serde(default)]
     pub provided_capabilities: BTreeSet<HostScope>,
@@ -220,6 +222,7 @@ impl PluginManifest {
             concurrency: self.concurrency,
             owns_namespaces: self.owns_namespaces.clone(),
             owns_paths: self.owns_paths.clone(),
+            optional_capabilities: self.optional_capabilities.clone(),
             required_capabilities: self.required_capabilities.clone(),
             provided_capabilities: self.provided_capabilities.clone(),
             provided_features: self.provided_features.clone(),

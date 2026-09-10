@@ -1078,6 +1078,7 @@ pub(super) fn plugin_lifecycle_context(
         required_capabilities: declaration
             .required_capabilities
             .iter()
+            .chain(declaration.optional_capabilities.iter())
             .map(ToString::to_string)
             .collect(),
         provided_capabilities: declaration
@@ -1128,6 +1129,7 @@ pub(super) fn plugin_command_context(
         required_capabilities: declaration
             .required_capabilities
             .iter()
+            .chain(declaration.optional_capabilities.iter())
             .map(ToString::to_string)
             .collect(),
         provided_capabilities: declaration
@@ -1269,6 +1271,7 @@ fn install_typed_service_registry(
             .declaration
             .required_capabilities
             .iter()
+            .chain(plugin.declaration.optional_capabilities.iter())
             .map(ToString::to_string)
             .collect();
         let provided_caps: Vec<String> = plugin
@@ -3103,6 +3106,7 @@ allow_hyphen_values=true
             concurrency: bmux_plugin::PluginConcurrencyConfig::Concurrent,
             owns_namespaces: std::collections::BTreeSet::new(),
             owns_paths: std::collections::BTreeSet::new(),
+            optional_capabilities: std::collections::BTreeSet::new(),
             required_capabilities: std::collections::BTreeSet::from([
                 bmux_plugin_sdk::HostScope::new("bmux.commands").expect("capability should parse"),
             ]),
@@ -3233,6 +3237,7 @@ allow_hyphen_values=true
             concurrency: bmux_plugin::PluginConcurrencyConfig::Concurrent,
             owns_namespaces: std::collections::BTreeSet::new(),
             owns_paths: std::collections::BTreeSet::new(),
+            optional_capabilities: std::collections::BTreeSet::new(),
             required_capabilities: std::collections::BTreeSet::from([
                 bmux_plugin_sdk::HostScope::new("bmux.commands").expect("capability should parse"),
                 bmux_plugin_sdk::HostScope::new("example.base.read")

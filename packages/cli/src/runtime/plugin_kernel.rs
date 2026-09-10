@@ -796,6 +796,7 @@ pub(super) fn register_plugin_service_handlers(
                             required_capabilities: provider_declaration
                                 .required_capabilities
                                 .iter()
+                                .chain(provider_declaration.optional_capabilities.iter())
                                 .map(ToString::to_string)
                                 .collect(),
                             provided_capabilities: provider_declaration

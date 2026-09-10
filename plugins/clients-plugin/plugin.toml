@@ -1,6 +1,7 @@
 execution_class = "native_fast"
 id = "bmux.clients"
 name = "bmux Clients"
+optional_capabilities = ["bmux.sessions.policy"]
 owns_namespaces = []
 provided_capabilities = ["bmux.clients.read", "bmux.clients.write"]
 provided_features = ["bmux.clients"]

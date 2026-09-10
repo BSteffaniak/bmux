@@ -557,11 +557,13 @@ impl clients_selection_commands_v1::ClientsSelectionCommandsV1Service for Select
 }
 
 fn commit_client_selection(
-    _caller: &(impl ServiceCaller + Sync),
+    caller: &(impl ServiceCaller + Sync),
     client: Option<Uuid>,
     req: &clients_selection_commands_v1::client::CommitRequest,
 ) -> Result<Selection, SelectionError> {
+    let client_id = client.ok_or(SelectionError::NoCurrentClient)?;
     if let Some(session) = req.session_id {
+        authorize_selection(caller, client_id, req.context_id, session)?;
         let manager = global_plugin_state_registry()
             .get::<SessionManagerHandle>()
             .ok_or(SelectionError::InvalidTarget)?;
@@ -605,6 +607,90 @@ fn commit_client_selection(
             req.session_id,
         )
     })
+}
+
+struct SelectionPolicyCaller<'a, C> {
+    caller: &'a C,
+    missing: std::sync::atomic::AtomicBool,
+}
+impl<C: ServiceCaller + Sync> ServiceCaller for SelectionPolicyCaller<'_, C> {
+    fn call_service_raw(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+        let result = self
+            .caller
+            .call_service_raw(capability, kind, interface, operation, payload);
+        if matches!(
+            &result,
+            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                operation: "call_service"
+            })
+        ) {
+            self.missing
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+    fn execute_kernel_request(
+        &self,
+        _request: bmux_ipc::Request,
+    ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+        Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+            operation: "selection policy kernel access",
+        })
+    }
+}
+
+fn authorize_selection(
+    caller: &(impl ServiceCaller + Sync),
+    client: Uuid,
+    context: Option<Uuid>,
+    session: Uuid,
+) -> Result<(), SelectionError> {
+    let principal = global_plugin_state_registry()
+        .get::<bmux_client_state::ClientPrincipalHandle>()
+        .and_then(|handle| handle.read().ok().map(|value| value.clone()))
+        .and_then(|handle| handle.0.get(ClientId(client)))
+        .unwrap_or_else(Uuid::nil);
+    let policy = SelectionPolicyCaller {
+        caller,
+        missing: std::sync::atomic::AtomicBool::new(false),
+    };
+    let mut dispatch = dispatch_client(&policy);
+    let decision = match bmux_plugin::block_on_typed_dispatch(
+        bmux_permissions_plugin_api::session_policy_state::client::check(
+            &mut dispatch,
+            session,
+            context,
+            client,
+            principal,
+            "session.select".to_string(),
+            None,
+            None,
+            None,
+        ),
+    ) {
+        Ok(decision) => decision,
+        Err(_) if policy.missing.load(std::sync::atomic::Ordering::Relaxed) => return Ok(()),
+        Err(error) => {
+            return Err(SelectionError::Failed {
+                reason: format!("selection authorization failed: {error}"),
+            });
+        }
+    };
+    if !decision.allowed {
+        return Err(SelectionError::Failed {
+            reason: decision
+                .reason
+                .unwrap_or_else(|| "selection denied".to_string()),
+        });
+    }
+    Ok(())
 }
 
 fn validate_selection_binding(

@@ -128,7 +128,8 @@ pub struct PluginDeclaration {
     #[serde(default)]
     pub owns_paths: BTreeSet<PluginOwnedPath>,
     #[serde(default)]
-    #[serde(alias = "required_host_scopes")]
+    pub optional_capabilities: BTreeSet<HostScope>,
+    #[serde(default, alias = "required_host_scopes")]
     pub required_capabilities: BTreeSet<HostScope>,
     #[serde(default)]
     pub provided_capabilities: BTreeSet<HostScope>,
@@ -379,6 +380,7 @@ mod tests {
             concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
             owns_namespaces: BTreeSet::new(),
             owns_paths: BTreeSet::new(),
+            optional_capabilities: BTreeSet::new(),
             required_capabilities: BTreeSet::new(),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
@@ -439,6 +441,7 @@ mod tests {
             concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
             owns_namespaces: BTreeSet::new(),
             owns_paths: BTreeSet::new(),
+            optional_capabilities: BTreeSet::new(),
             required_capabilities,
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
@@ -482,6 +485,7 @@ mod tests {
             concurrency: bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
             owns_namespaces: BTreeSet::new(),
             owns_paths: BTreeSet::new(),
+            optional_capabilities: BTreeSet::new(),
             required_capabilities: BTreeSet::new(),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
