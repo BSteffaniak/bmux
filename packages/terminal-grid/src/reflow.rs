@@ -213,6 +213,41 @@ pub(crate) fn try_project_logical_line_window_retained(
     Some(rows)
 }
 
+/// Visit row boundaries without copying cells. The same wide-cell and
+/// one-column overflow rules drive both indexed and ordinary projection.
+pub(crate) fn visit_logical_rows<E>(
+    cells: &[Cell],
+    width: usize,
+    mut visit: impl FnMut(std::ops::Range<usize>, usize, bool) -> Result<(), E>,
+) -> Result<(), E> {
+    let width = width.max(1);
+    let mut start = 0;
+    let mut col = 0;
+    let mut logical = 0;
+    let mut row_column = 0;
+    for (index, cell) in cells.iter().enumerate() {
+        let size = usize::from(cell.width()).max(1);
+        if col > 0 && col + size > width {
+            visit(start..index, row_column, true)?;
+            start = index;
+            row_column = logical;
+            col = 0;
+        }
+        col = (col + size).min(width);
+        logical += size;
+        if col == width {
+            visit(start..index + 1, row_column, index + 1 < cells.len())?;
+            start = index + 1;
+            row_column = logical;
+            col = 0;
+        }
+    }
+    if start < cells.len() || cells.is_empty() {
+        visit(start..cells.len(), row_column, false)?;
+    }
+    Ok(())
+}
+
 fn push_reflowed_logical_line(
     rows: &mut VecDeque<PhysicalRow>,
     cells: &[Cell],
@@ -224,64 +259,28 @@ fn push_reflowed_logical_line(
     if range.is_empty() {
         return Some(());
     }
-    if cells.is_empty() {
-        if range.contains(&0) {
-            rows.push_back(PhysicalRow::new());
-        }
-        return Some(());
-    }
-
+    let cells = projection_cells(cells, retain);
     let mut index = 0;
-    let mut current = PhysicalRow::new();
-    let mut col = 0_usize;
-    let mut emitted_any = false;
-
-    for cell in projection_cells(cells, retain) {
-        // Seeing another cell proves the last emitted row is a continuation.
-        // If the line ended exactly there, the finalization below instead
-        // clears its wrap flag.
+    // The visitor is shared with the caller-owned width index. Stop traversal
+    // once the requested range has been emitted.
+    let result = visit_logical_rows(cells, width, |selected, _, wrapped| {
         if index >= range.end {
-            return Some(());
+            return Err(false);
         }
-        let cell_width = usize::from(cell.width()).max(1);
-        if col > 0 && col + cell_width > width {
-            current.set_wrapped(true);
-            if range.contains(&index) {
-                rows.push_back(current);
-            }
-            index += 1;
-            current = PhysicalRow::new();
-            col = 0;
-        }
-
         if range.contains(&index) {
-            current.try_set_projected_cell(col, cell, width)?;
-        }
-        col = col.saturating_add(cell_width).min(width);
-        emitted_any = true;
-
-        if col >= width {
-            current.set_wrapped(true);
-            if range.contains(&index) {
-                rows.push_back(current);
+            let mut row = PhysicalRow::new();
+            let mut col = 0;
+            for cell in &cells[selected] {
+                row.try_set_projected_cell(col, cell, width).ok_or(true)?;
+                col = (col + usize::from(cell.width()).max(1)).min(width);
             }
-            index += 1;
-            current = PhysicalRow::new();
-            col = 0;
+            row.set_wrapped(wrapped);
+            rows.push_back(row);
         }
-    }
-
-    if !emitted_any || col > 0 {
-        if range.contains(&index) {
-            current.set_wrapped(false);
-            rows.push_back(current);
-        }
-    } else if range.contains(&index.saturating_sub(1))
-        && let Some(last) = rows.back_mut()
-    {
-        last.set_wrapped(false);
-    }
-    Some(())
+        index += 1;
+        Ok(())
+    });
+    if result == Err(true) { None } else { Some(()) }
 }
 
 /// Logical column at the start of a projected row. Uses the same trimming,

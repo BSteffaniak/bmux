@@ -1,6 +1,8 @@
 use crate::reflow::{project_logical_line, projected_logical_line_row_count};
+mod content;
 use crate::snapshot::{GridSnapshot, RowSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
+pub use content::{ContentAnchor, ContentBudget, ContentProjection, ContentRows};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
@@ -1459,9 +1461,23 @@ impl TerminalGrid {
     /// Materialize the tail of retained main-screen content rows.
     #[must_use]
     pub fn main_content_tail_rows(&self, max_rows: usize) -> Vec<PhysicalRow> {
-        let rows = self.main_content_rows();
-        let start = rows.len().saturating_sub(max_rows);
-        rows[start..].to_vec()
+        if max_rows == 0 {
+            return Vec::new();
+        }
+        let mut offset = 0;
+        loop {
+            let mut rows = self.main_display_rows(offset, max_rows);
+            let before = rows.len();
+            trim_trailing_unused_rows(&mut rows);
+            let removed = before - rows.len();
+            if removed == 0 || before == 0 {
+                return rows;
+            }
+            offset = offset.saturating_add(removed);
+            if !rows.is_empty() {
+                return self.main_display_rows(offset, max_rows);
+            }
+        }
     }
 
     #[must_use]

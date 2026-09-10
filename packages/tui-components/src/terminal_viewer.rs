@@ -1,8 +1,8 @@
 //! Generic bounded terminal transcript viewer component.
 
 use bmux_terminal_grid::{
-    Color as GridColor, GridLimits, PhysicalRow, Style as GridStyle, TerminalGrid,
-    TerminalGridStream,
+    Color as GridColor, ContentBudget, GridLimits, GridMode, PhysicalRow, Style as GridStyle,
+    TerminalGrid, TerminalGridStream,
 };
 use bmux_tui::ansi::ansi_to_lines;
 use bmux_tui::geometry::Rect;
@@ -35,6 +35,15 @@ impl TerminalViewerLiveState {
     /// Grow the reserved live terminal rows from an already-decoded row count.
     pub fn update_rows(&mut self, content_rows: usize, max_rows: usize) {
         self.visible_rows = self.visible_rows.max(content_rows).min(max_rows);
+    }
+
+    /// Grow live rows using presentation width rather than execution columns.
+    /// `width` is the outer component width, including its four-column prefix.
+    pub fn update_at_width(&mut self, input: TerminalViewerInput<'_>, width: u16, max_rows: usize) {
+        let mut measuring = input;
+        measuring.sizing = TerminalViewerSizing::Compact;
+        let count = terminal_output_lines(&measuring, width.saturating_sub(4)).len();
+        self.update_rows(count, max_rows);
     }
 
     /// Grow the reserved live terminal rows to fit `input`, capped by `max_rows`.
@@ -84,7 +93,7 @@ pub fn register_terminal_viewer_selection(
     if !policy.enabled || content_area.is_empty() {
         return scope_outcome;
     }
-    let lines = terminal_output_lines(&input);
+    let lines = terminal_output_lines(&input, area.width.saturating_sub(4));
     let mut source_offset = 0_usize;
     let mut fragments = 0_usize;
     for (index, line) in lines
@@ -172,7 +181,7 @@ pub fn terminal_viewer_rows(input: TerminalViewerInput<'_>, width: u16) -> Vec<L
             muted_style(),
         );
     }
-    for line in terminal_output_lines(&input) {
+    for line in terminal_output_lines(&input, width.saturating_sub(4)) {
         rows.push(prefix_line(line, "    ", muted_style()));
     }
     rows
@@ -238,7 +247,7 @@ fn terminal_viewer_chrome_row_count(input: &TerminalViewerInput<'_>, width: u16)
     u16::try_from(rows.len()).unwrap_or(u16::MAX)
 }
 
-fn terminal_output_lines(input: &TerminalViewerInput<'_>) -> Vec<Line> {
+fn terminal_output_lines(input: &TerminalViewerInput<'_>, width: u16) -> Vec<Line> {
     let Ok(mut stream) = TerminalGridStream::new(
         input.columns.max(1),
         input.rows.max(1),
@@ -254,7 +263,25 @@ fn terminal_output_lines(input: &TerminalViewerInput<'_>) -> Vec<Line> {
         TerminalViewerSizing::Compact => MAX_INLINE_TERMINAL_ROWS,
         TerminalViewerSizing::Live { max_rows, .. } => max_rows,
     };
-    let rows = grid.main_content_tail_rows(max_rows);
+    let budget = ContentBudget {
+        cells: 1_000_000,
+        bytes: 16 * 1024 * 1024,
+    };
+    let width = usize::from(width.max(1));
+    let projected = if grid.mode() == GridMode::Alternate {
+        grid.screen_window(0..width, 0..max_rows, budget)
+    } else {
+        grid.capture_content(0, max_rows, budget)
+            .and_then(|mut projection| {
+                projection.prepare(width, budget)?;
+                projection
+                    .tail(max_rows, budget.bytes)
+                    .map(|window| window.rows)
+            })
+    };
+    let Ok(rows) = projected else {
+        return vec![Line::from("terminal preview exceeds projection budget")];
+    };
     let mut lines = rows
         .iter()
         .map(|row| terminal_grid_row_to_line(grid, row))
@@ -475,6 +502,34 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn transcript_reflows_to_body_width_without_changing_capture_dimensions() {
+        let input = TerminalViewerInput {
+            output: "abcdefghij",
+            columns: 4,
+            rows: 3,
+            exit_code: None,
+            timed_out: None,
+            elapsed: None,
+            show_status: false,
+            output_truncated: false,
+            output_bytes: None,
+            retained_output_bytes: None,
+            sizing: TerminalViewerSizing::Compact,
+        };
+        assert_eq!(
+            rendered_text(&terminal_viewer_rows(input, 14)),
+            "    abcdefghij"
+        );
+        assert_eq!(
+            rendered_text(&terminal_viewer_rows(input, 7)),
+            "    abc\n    def\n    ghi\n    j"
+        );
+        let mut state = TerminalViewerLiveState::default();
+        state.update_at_width(input, 7, 28);
+        assert_eq!(state.visible_rows(), 4);
     }
 
     #[test]
@@ -716,7 +771,7 @@ mod tests {
                 .iter()
                 .any(|fragment| fragment.source_range == (0..1))
         );
-        let decoded_len = terminal_output_lines(&input)
+        let decoded_len = terminal_output_lines(&input, input.columns)
             .iter()
             .map(|line| line.plain_text().len().saturating_add(1))
             .sum::<usize>();
