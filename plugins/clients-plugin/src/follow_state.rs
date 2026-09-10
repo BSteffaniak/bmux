@@ -55,6 +55,12 @@ impl FollowState {
     /// for any clients that were following it.
     pub fn disconnect_client(&mut self, client_id: ClientId) -> Vec<FollowTargetGoneUpdate> {
         self.connected_clients.remove(&client_id);
+        // Retain the revision as a tombstone: reusing an ID must not revive an
+        // old reservation. Reservations themselves are connection-local.
+        if let Some(revision) = self.selection_revisions.get_mut(&client_id) {
+            *revision = revision.saturating_add(1);
+        }
+        self.selection_reservations.remove(&client_id);
         self.selected_contexts.remove(&client_id);
         self.selected_sessions.remove(&client_id);
         self.attached_stream_sessions.remove(&client_id);

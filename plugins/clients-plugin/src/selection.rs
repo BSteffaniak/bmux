@@ -154,6 +154,21 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_does_not_revive_an_old_reservation() {
+        let mut state = FollowState::default();
+        let client = ClientId(Uuid::from_u128(1));
+        state.connect_client(client);
+        let reserved = state.begin_selection(client, 0).unwrap();
+        state.disconnect_client(client);
+        state.connect_client(client);
+        assert!(!state.selection(client).unwrap().suspended);
+        assert_eq!(
+            state.commit_selection(client, reserved.revision, None, None),
+            Err(SelectionError::Conflict)
+        );
+    }
+
+    #[test]
     fn commit_requires_reservation_and_coherent_target() {
         let mut state = FollowState::default();
         let client = ClientId(Uuid::from_u128(1));

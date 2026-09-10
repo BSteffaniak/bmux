@@ -480,9 +480,78 @@ impl RustPlugin for ClientsPlugin {
             Arc::new(ClientsStateHandle::new(Arc::clone(&caller)));
         let _ = clients_state::register_provider(registry, state);
 
+        let selection = Arc::new(SelectionHandle {
+            caller: caller.clone(),
+        });
+        let _ = bmux_clients_plugin_api::clients_selection_state_v1::register_provider(
+            registry,
+            selection.clone(),
+        );
+        let _ = clients_selection_commands_v1::register_provider(registry, selection);
         let commands: Arc<dyn ClientsCommandsService + Send + Sync> =
             Arc::new(ClientsCommandsHandle::new(caller));
         let _ = clients_commands::register_provider(registry, commands);
+    }
+}
+
+struct SelectionHandle {
+    caller: Arc<TypedServiceCaller>,
+}
+
+impl bmux_clients_plugin_api::clients_selection_state_v1::ClientsSelectionStateV1Service
+    for SelectionHandle
+{
+    fn current<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Selection, SelectionError>> + Send + 'a>> {
+        Box::pin(async move {
+            selection_operation(
+                current_client_id_for_typed_handle(&self.caller),
+                |state, client| state.selection(client),
+            )
+        })
+    }
+}
+
+impl clients_selection_commands_v1::ClientsSelectionCommandsV1Service for SelectionHandle {
+    fn begin<'a>(
+        &'a self,
+        expected_revision: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Selection, SelectionError>> + Send + 'a>> {
+        Box::pin(async move {
+            selection_operation(
+                current_client_id_for_typed_handle(&self.caller),
+                |state, client| state.begin_selection(client, expected_revision),
+            )
+        })
+    }
+    fn recover<'a>(
+        &'a self,
+        expected_revision: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Selection, SelectionError>> + Send + 'a>> {
+        Box::pin(async move {
+            selection_operation(
+                current_client_id_for_typed_handle(&self.caller),
+                |state, client| state.recover_selection(client, expected_revision),
+            )
+        })
+    }
+    fn commit<'a>(
+        &'a self,
+        expected_revision: u64,
+        context_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<Selection, SelectionError>> + Send + 'a>> {
+        Box::pin(async move {
+            commit_client_selection(
+                current_client_id_for_typed_handle(&self.caller),
+                &clients_selection_commands_v1::client::CommitRequest {
+                    expected_revision,
+                    context_id,
+                    session_id,
+                },
+            )
+        })
     }
 }
 
