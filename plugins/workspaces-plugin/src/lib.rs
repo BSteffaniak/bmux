@@ -35,6 +35,16 @@ const SELECTED_CONTEXT_OUTCOME_KEY: &str = "bmux.contexts.selected_context_id";
 const ACTIVE_BY_CLIENT_KEY: &str = "workspaces.active_by_client";
 const PREVIOUS_BY_CLIENT_KEY: &str = "workspaces.previous_by_client";
 
+const HISTORY_KEY: &str = "workspaces.navigation_history.v1";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NavigationHistory {
+    version: u32,
+    active_by_client: HashMap<Uuid, Uuid>,
+    previous_by_client: HashMap<Uuid, Uuid>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct WorkspaceRecord {
     id: Uuid,
@@ -125,11 +135,10 @@ impl RustPlugin for WorkspacesPlugin {
     type Contract = bmux_workspaces_plugin_api::Contract;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        let records = load_catalog(&context).unwrap_or_default();
-        let active_by_client =
-            load_client_workspace_map(&context, ACTIVE_BY_CLIENT_KEY).unwrap_or_default();
-        let previous_by_client =
-            load_client_workspace_map(&context, PREVIOUS_BY_CLIENT_KEY).unwrap_or_default();
+        let records = load_catalog(&context).map_err(PluginCommandError::failed)?;
+        let history = load_navigation_history(&context).map_err(PluginCommandError::failed)?;
+        let active_by_client = history.active_by_client;
+        let previous_by_client = history.previous_by_client;
         let mut state = WorkspaceState {
             records,
             active_by_client,
@@ -692,8 +701,14 @@ fn select_workspace_target(
             guard.previous_by_client.clone(),
         )
     };
-    save_client_workspace_map(caller, ACTIVE_BY_CLIENT_KEY, &active_by_client)?;
-    save_client_workspace_map(caller, PREVIOUS_BY_CLIENT_KEY, &previous_by_client)?;
+    save_navigation_history(
+        caller,
+        &NavigationHistory {
+            version: 1,
+            active_by_client,
+            previous_by_client,
+        },
+    )?;
     if let Some(context_id) = context_id {
         let _ = global_event_bus().emit(
             &workspaces_events::EVENT_KIND,
@@ -797,6 +812,50 @@ fn move_tab(
     })
 }
 
+fn load_navigation_history(caller: &impl HostRuntimeApi) -> Result<NavigationHistory, String> {
+    let value = caller
+        .storage_get(&StorageGetRequest::new(
+            bmux_plugin_sdk::StorageKey::new(HISTORY_KEY).map_err(|error| error.to_string())?,
+        ))
+        .map_err(|error| error.to_string())?
+        .value;
+    if let Some(value) = value {
+        let history: NavigationHistory =
+            serde_json::from_slice(&value).map_err(|error| error.to_string())?;
+        if history.version != 1 {
+            return Err(format!(
+                "unsupported workspace navigation history version {}",
+                history.version
+            ));
+        }
+        return Ok(history);
+    }
+    let history = NavigationHistory {
+        version: 1,
+        active_by_client: load_client_workspace_map(caller, ACTIVE_BY_CLIENT_KEY)?,
+        previous_by_client: load_client_workspace_map(caller, PREVIOUS_BY_CLIENT_KEY)?,
+    };
+    save_navigation_history(caller, &history).map_err(|error| format!("{error:?}"))?;
+    Ok(history)
+}
+
+fn save_navigation_history(
+    caller: &impl HostRuntimeApi,
+    history: &NavigationHistory,
+) -> Result<(), WorkspaceCommandError> {
+    let value = serde_json::to_vec(history).map_err(|error| WorkspaceCommandError::Failed {
+        reason: error.to_string(),
+    })?;
+    caller
+        .storage_set(&StorageSetRequest::new(
+            bmux_plugin_sdk::storage_key!("workspaces.navigation_history.v1"),
+            value,
+        ))
+        .map_err(|error| WorkspaceCommandError::Failed {
+            reason: error.to_string(),
+        })
+}
+
 fn load_client_workspace_map(
     caller: &impl HostRuntimeApi,
     key: &str,
@@ -812,31 +871,18 @@ fn load_client_workspace_map(
     )
 }
 
-fn save_client_workspace_map(
-    caller: &impl HostRuntimeApi,
-    key: &str,
-    values: &HashMap<Uuid, Uuid>,
-) -> Result<(), WorkspaceCommandError> {
-    let value = serde_json::to_vec(values).map_err(|error| WorkspaceCommandError::Failed {
-        reason: error.to_string(),
-    })?;
-    let key =
-        bmux_plugin_sdk::StorageKey::new(key).map_err(|error| WorkspaceCommandError::Failed {
-            reason: error.to_string(),
-        })?;
-    caller
-        .storage_set(&StorageSetRequest::new(key, value))
-        .map_err(|error| WorkspaceCommandError::Failed {
-            reason: error.to_string(),
-        })
-}
-
 fn persist_client_selection(
     caller: &impl HostRuntimeApi,
     state: &WorkspaceState,
 ) -> Result<(), WorkspaceCommandError> {
-    save_client_workspace_map(caller, ACTIVE_BY_CLIENT_KEY, &state.active_by_client)?;
-    save_client_workspace_map(caller, PREVIOUS_BY_CLIENT_KEY, &state.previous_by_client)
+    save_navigation_history(
+        caller,
+        &NavigationHistory {
+            version: 1,
+            active_by_client: state.active_by_client.clone(),
+            previous_by_client: state.previous_by_client.clone(),
+        },
+    )
 }
 
 fn load_catalog(caller: &impl HostRuntimeApi) -> Result<Vec<WorkspaceRecord>, String> {
@@ -1414,6 +1460,41 @@ mod tests {
     }
 
     #[test]
+    fn navigation_history_migration_preserves_legacy_and_rejects_unknown_versions() {
+        let host = MockHost::new(Uuid::from_u128(1), Vec::new());
+        let original =
+            serde_json::to_vec(&HashMap::from([(Uuid::from_u128(1), Uuid::from_u128(4))])).unwrap();
+        host.storage
+            .lock()
+            .unwrap()
+            .insert(ACTIVE_BY_CLIENT_KEY.into(), original.clone());
+        let history = load_navigation_history(&host).unwrap();
+        assert_eq!(
+            history.active_by_client.get(&Uuid::from_u128(1)),
+            Some(&Uuid::from_u128(4))
+        );
+        assert_eq!(host.storage.lock().unwrap()[ACTIVE_BY_CLIENT_KEY], original);
+        host.storage
+            .lock()
+            .unwrap()
+            .insert(ACTIVE_BY_CLIENT_KEY.into(), b"broken".to_vec());
+        assert!(load_navigation_history(&host).is_ok());
+        let mut future = history;
+        future.version = 2;
+        host.storage
+            .lock()
+            .unwrap()
+            .insert(HISTORY_KEY.into(), serde_json::to_vec(&future).unwrap());
+        assert!(
+            load_navigation_history(&host)
+                .unwrap_err()
+                .contains("unsupported")
+        );
+        host.storage.lock().unwrap().remove(HISTORY_KEY);
+        assert!(load_navigation_history(&host).is_err());
+    }
+
+    #[test]
     fn client_selection_maps_round_trip_through_storage() {
         let client_id = Uuid::from_u128(1);
         let workspace_id = Uuid::from_u128(2);
@@ -1671,14 +1752,17 @@ mod tests {
         assert_eq!(context_workspace_id(&contexts[0]), fallback_workspace);
         drop(contexts);
         let storage = host.storage.lock().expect("storage lock should succeed");
-        let active: HashMap<Uuid, Uuid> = serde_json::from_slice(
+        let history: NavigationHistory = serde_json::from_slice(
             storage
-                .get(ACTIVE_BY_CLIENT_KEY)
-                .expect("active client map should persist"),
+                .get(HISTORY_KEY)
+                .expect("navigation history should persist"),
         )
-        .expect("active client map should decode");
+        .expect("navigation history should decode");
         drop(storage);
-        assert_eq!(active.get(&viewing_client), Some(&fallback_workspace));
+        assert_eq!(
+            history.active_by_client.get(&viewing_client),
+            Some(&fallback_workspace)
+        );
     }
 
     #[test]
