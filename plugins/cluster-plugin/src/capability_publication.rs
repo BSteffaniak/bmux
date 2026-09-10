@@ -395,6 +395,39 @@ mod tests {
         conflict.reports[0].schema_max += 1;
         assert!(restored.apply_publication(&conflict, membership).is_err());
         assert_eq!(restored, state);
+        let activation = crate::control_codec::FeatureActivationCommand {
+            principal_id: member.node_id.clone(),
+            command_id: bmux_cluster_plugin_api::cluster_types::CommandId {
+                value: uuid::Uuid::new_v4(),
+            },
+            issued_at_unix_ms: 44,
+            expected_control_revision: 1,
+            read_schema_floor: 4,
+            write_schema_floor: 4,
+            feature: "protocol-refresh-v1".into(),
+        };
+        let mut invalidated = restored.clone();
+        invalidated
+            .members
+            .get_mut(&member.node_id)
+            .unwrap()
+            .credential_serial
+            .push('x');
+        assert!(matches!(
+            invalidated
+                .apply_feature_activation_with_membership(&activation, Some(membership))
+                .result,
+            bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Rejected { .. }
+        ));
+        assert_eq!(invalidated.write_schema_floor, 1);
+        let response =
+            restored.apply_feature_activation_with_membership(&activation, Some(membership));
+        assert!(matches!(
+            response.result,
+            bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Accepted { .. }
+        ));
+        assert_eq!(restored.write_schema_floor, 4);
+        assert_eq!(restored.members[&member.node_id], *member);
         let mut trailing = bytes;
         trailing.push(0);
         assert!(ControlState::decode_snapshot(&trailing).is_err());

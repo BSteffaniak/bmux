@@ -632,37 +632,39 @@ impl ControlState {
                 self.feature_error_response(command, ControlCommandError::CommandIdConflict)
             };
         }
-        let result = self.validate_feature_activation(command).and_then(|()| {
-            if !matches!(
-                command.feature.as_str(),
-                "principal-bootstrap-v1" | "protocol-refresh-v1"
-            ) {
-                return Ok(());
-            }
-            let membership = membership.ok_or_else(|| {
-                invalid_transition("bootstrap activation requires committed membership")
-            })?;
-            let committed = membership
-                .membership()
-                .nodes()
-                .map(|(id, _)| id.to_string())
-                .collect::<BTreeSet<_>>();
-            let active = self
-                .members
-                .values()
-                .filter(|member| member.state == ClusterMemberState::Active)
-                .map(|member| member.node_id.clone())
-                .collect::<BTreeSet<_>>();
-            if membership.log_id().is_none()
-                || membership.membership().voter_ids().next().is_none()
-                || committed != active
-            {
-                return Err(invalid_transition(
-                    "bootstrap activation member records do not match committed membership",
-                ));
-            }
-            Ok(())
-        });
+        let result = self
+            .validate_feature_activation(command, membership)
+            .and_then(|()| {
+                if !matches!(
+                    command.feature.as_str(),
+                    "principal-bootstrap-v1" | "protocol-refresh-v1"
+                ) {
+                    return Ok(());
+                }
+                let membership = membership.ok_or_else(|| {
+                    invalid_transition("bootstrap activation requires committed membership")
+                })?;
+                let committed = membership
+                    .membership()
+                    .nodes()
+                    .map(|(id, _)| id.to_string())
+                    .collect::<BTreeSet<_>>();
+                let active = self
+                    .members
+                    .values()
+                    .filter(|member| member.state == ClusterMemberState::Active)
+                    .map(|member| member.node_id.clone())
+                    .collect::<BTreeSet<_>>();
+                if membership.log_id().is_none()
+                    || membership.membership().voter_ids().next().is_none()
+                    || committed != active
+                {
+                    return Err(invalid_transition(
+                        "bootstrap activation member records do not match committed membership",
+                    ));
+                }
+                Ok(())
+            });
         let mut next = self.clone();
         let response_result = match result {
             Ok(()) => {
@@ -702,6 +704,9 @@ impl ControlState {
     fn validate_feature_activation(
         &self,
         command: &FeatureActivationCommand,
+        membership: Option<
+            &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
+        >,
     ) -> Result<(), ControlCommandError> {
         require_revision(command.expected_control_revision, self.revision)?;
         if command.feature.trim().is_empty()
@@ -738,12 +743,13 @@ impl ControlState {
             if active.is_empty()
                 || active.iter().any(|member| {
                     member.cluster_id != self.cluster_id
-                        || member.negotiated_protocol.schema_version
-                            < u32::from(command.write_schema_floor)
-                        || !member
-                            .negotiated_protocol
-                            .features
-                            .contains(&command.feature)
+                        || (!self.published_refresh_support(member, command, membership)
+                            && (member.negotiated_protocol.schema_version
+                                < u32::from(command.write_schema_floor)
+                                || !member
+                                    .negotiated_protocol
+                                    .features
+                                    .contains(&command.feature)))
                 })
             {
                 return Err(invalid_transition(
@@ -752,6 +758,46 @@ impl ControlState {
             }
         }
         Ok(())
+    }
+
+    fn published_refresh_support(
+        &self,
+        member: &ClusterMember,
+        command: &FeatureActivationCommand,
+        membership: Option<
+            &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
+        >,
+    ) -> bool {
+        if command.feature != "protocol-refresh-v1" {
+            return false;
+        }
+        let Some(membership) = membership else {
+            return false;
+        };
+        let Some(report) = self
+            .publication_history
+            .iter()
+            .rev()
+            .find_map(|(batch, _)| {
+                batch
+                    .reports
+                    .iter()
+                    .find(|report| report.node_id == member.node_id)
+            })
+        else {
+            return false;
+        };
+        report.schema_min <= u32::from(command.read_schema_floor)
+            && report.schema_max >= u32::from(command.write_schema_floor)
+            && report.features.contains(&command.feature)
+            && crate::capability_publication::verify_report(
+                report,
+                member,
+                membership,
+                &self.cluster_id,
+                command.issued_at_unix_ms,
+            )
+            .is_ok()
     }
 
     fn feature_error_response(
