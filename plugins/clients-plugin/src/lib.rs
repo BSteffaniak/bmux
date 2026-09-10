@@ -225,8 +225,7 @@ impl FollowStateWriter for FollowStateAdapter {
                     .collect();
 
                 for client_id in &affected_clients {
-                    state.selected_contexts.insert(*client_id, None);
-                    state.selected_sessions.insert(*client_id, None);
+                    state.set_selected_target(*client_id, None, None);
                 }
                 for client_id in affected_clients {
                     let _ = state.sync_followers_from_leader(client_id, None, None);

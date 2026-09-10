@@ -316,6 +316,49 @@ fn to_api_grant(grant: &AttachGrant) -> AttachGrantRecord {
 
 // ── Handler bodies ───────────────────────────────────────────────
 
+fn reserve_selection(
+    ctx: &NativeServiceContext,
+) -> Result<bmux_clients_plugin_api::clients_selection_state_v1::Selection, AttachCommandError> {
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
+    let current = bmux_plugin::block_on_typed_dispatch(
+        bmux_clients_plugin_api::clients_selection_state_v1::client::current(&mut client),
+    )
+    .map_err(|error| failed(error.to_string()))?
+    .map_err(|error| failed(format!("selection unavailable: {error:?}")))?;
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_clients_plugin_api::clients_selection_commands_v1::client::begin(
+            &mut client,
+            current.revision,
+        ),
+    )
+    .map_err(|error| failed(error.to_string()))?
+    .map_err(|error| failed(format!("selection conflict: {error:?}")))
+}
+
+fn commit_selection(
+    ctx: &NativeServiceContext,
+    revision: u64,
+    context: Option<Uuid>,
+    session: SessionId,
+) -> Result<(), AttachCommandError> {
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_clients_plugin_api::clients_selection_commands_v1::client::commit(
+            &mut client,
+            revision,
+            context,
+            Some(session.0),
+        ),
+    )
+    .map_err(|error| failed(error.to_string()))?
+    .map_err(|error| {
+        failed(format!(
+            "selection commit failed; input suspended: {error:?}"
+        ))
+    })?;
+    Ok(())
+}
+
 pub fn attach_session(
     req: &AttachSessionArgs,
     ctx: &NativeServiceContext,
@@ -338,13 +381,12 @@ pub fn attach_session(
     }
     let selected_context = contexts.0.context_for_session(next_session_id);
     let previous_session = follow.0.selected_session(client_id);
+    let reservation = reserve_selection(ctx)?;
     manager.0.add_client(next_session_id, client_id);
     if let Some(previous) = previous_session.filter(|id| *id != next_session_id) {
         manager.0.remove_client(previous, &client_id);
     }
-    follow
-        .0
-        .set_selected_target(client_id, selected_context, Some(next_session_id));
+    commit_selection(ctx, reservation.revision, selected_context, next_session_id)?;
 
     // Issue the grant with context decoration.
     let mut grant = tokens.0.issue(next_session_id);
@@ -373,11 +415,12 @@ pub fn attach_context(
     if !manager.0.contains(next_session_id) {
         return Err(AttachCommandError::SessionNotFound);
     }
+    let previous_session = follow.0.selected_session(client_id);
+    let reservation = reserve_selection(ctx)?;
     let context = contexts
         .0
         .select_for_client(client_id, &PrimitiveContextSelector::ById(context_id))
         .map_err(|message| failed(message.to_string()))?;
-    let previous_session = follow.0.selected_session(client_id);
     if let Some(prev) = previous_session
         && prev != next_session_id
     {
@@ -385,9 +428,7 @@ pub fn attach_context(
     }
 
     manager.0.add_client(next_session_id, client_id);
-    follow
-        .0
-        .set_selected_target(client_id, Some(context.id), Some(next_session_id));
+    commit_selection(ctx, reservation.revision, Some(context.id), next_session_id)?;
 
     let mut grant = tokens.0.issue(next_session_id);
     grant.context_id = Some(context.id);
@@ -673,6 +714,7 @@ pub fn attach_retarget_context(
         }
     };
 
+    let reservation = reserve_selection(ctx)?;
     let retargeted = match retarget_attach_stream(
         &runtime,
         &follow,
@@ -702,11 +744,7 @@ pub fn attach_retarget_context(
         manager.0.remove_client(prev, &client_id);
     }
     manager.0.add_client(next_session_id, client_id);
-    if !selection_already_applied {
-        follow
-            .0
-            .set_selected_target(client_id, Some(context_id), Some(next_session_id));
-    }
+    commit_selection(ctx, reservation.revision, Some(context_id), next_session_id)?;
     runtime
         .0
         .set_client_write_permission(next_session_id, client_id, can_write);

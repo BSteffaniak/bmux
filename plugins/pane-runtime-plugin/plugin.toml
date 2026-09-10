@@ -11,6 +11,7 @@ provided_capabilities = [
 provided_features = ["bmux.pane_runtime"]
 required_capabilities = [
     "bmux.clients.read",
+    "bmux.clients.write",
     "bmux.contexts.read",
     "bmux.contexts.write",
     "bmux.sessions.read",

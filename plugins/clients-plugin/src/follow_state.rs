@@ -146,20 +146,10 @@ impl FollowState {
         );
 
         if global {
-            let leader_context = self
-                .selected_contexts
-                .get(&leader_client_id)
-                .copied()
-                .flatten();
-            let leader_session = self
-                .selected_sessions
-                .get(&leader_client_id)
-                .copied()
-                .flatten();
-            self.selected_contexts
-                .insert(follower_client_id, leader_context);
-            self.selected_sessions
-                .insert(follower_client_id, leader_session);
+            let (leader_context, leader_session) = self
+                .selected_target(leader_client_id)
+                .unwrap_or((None, None));
+            self.set_selected_target(follower_client_id, leader_context, leader_session);
             return Ok((leader_context, leader_session));
         }
 
@@ -193,8 +183,7 @@ impl FollowState {
             if self.connected_clients.contains(&follower_id) {
                 let previous = self.selected_sessions.get(&follower_id).copied().flatten();
                 let previous_context = self.selected_contexts.get(&follower_id).copied().flatten();
-                self.selected_contexts.insert(follower_id, selected_context);
-                self.selected_sessions.insert(follower_id, selected_session);
+                self.set_selected_target(follower_id, selected_context, selected_session);
                 let changed = previous != selected_session || previous_context != selected_context;
                 if changed {
                     updates.push(FollowTargetUpdate {
