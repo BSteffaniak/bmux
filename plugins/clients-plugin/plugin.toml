@@ -34,6 +34,16 @@ capability   = "bmux.clients.read"
 interface_id = "clients-events"
 kind         = "event"
 
+[[services]]
+capability   = "bmux.clients.write"
+interface_id = "clients-selection-commands-v1"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.clients.read"
+interface_id = "clients-selection-state-v1"
+kind         = "query"
+
 [[event_publications]]
 delivery                     = "broadcast"
 forward_to_streaming_clients = true

@@ -9,6 +9,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod follow_state;
+mod selection;
 pub use follow_state::FollowState;
 
 use bmux_client_state::{
@@ -19,6 +20,8 @@ use bmux_clients_plugin_api::clients_commands::{
     self, ClientAck, ClientsCommandsService, SetCurrentSessionError, SetFollowingError,
 };
 use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
+use bmux_clients_plugin_api::clients_selection_commands_v1;
+use bmux_clients_plugin_api::clients_selection_state_v1::{Selection, SelectionError};
 use bmux_clients_plugin_api::clients_state::{
     self, ClientQueryError, ClientSummary, ClientsStateService,
 };
@@ -76,14 +79,22 @@ impl FollowStateAdapter {
 impl FollowStateReader for FollowStateAdapter {
     fn selected_session(&self, client_id: ClientId) -> Option<SessionId> {
         self.with_read(
-            |state| state.selected_sessions.get(&client_id).copied().flatten(),
+            |state| {
+                state
+                    .selected_target(client_id)
+                    .and_then(|(_, session)| session)
+            },
             None,
         )
     }
 
     fn selected_context(&self, client_id: ClientId) -> Option<Uuid> {
         self.with_read(
-            |state| state.selected_contexts.get(&client_id).copied().flatten(),
+            |state| {
+                state
+                    .selected_target(client_id)
+                    .and_then(|(context, _)| context)
+            },
             None,
         )
     }
@@ -425,6 +436,15 @@ impl RustPlugin for ClientsPlugin {
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
+            "clients-selection-state-v1", "current" => |_req: (), ctx| {
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(ctx.caller_client_id, |state, client| state.selection(client)))
+            },
+            "clients-selection-commands-v1", "begin" => |req: clients_selection_commands_v1::client::BeginRequest, ctx| {
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(ctx.caller_client_id, |state, client| state.begin_selection(client, req.expected_revision)))
+            },
+            "clients-selection-commands-v1", "commit" => |req: clients_selection_commands_v1::client::CommitRequest, ctx| {
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(commit_client_selection(ctx.caller_client_id, &req))
+            },
             "clients-state", "list-clients" => |_req: (), _ctx| {
                 list_clients_local()
                     .map_err(|e| ServiceResponse::error("list_failed", e))
@@ -462,6 +482,49 @@ impl RustPlugin for ClientsPlugin {
             Arc::new(ClientsCommandsHandle::new(caller));
         let _ = clients_commands::register_provider(registry, commands);
     }
+}
+
+fn commit_client_selection(
+    client: Option<Uuid>,
+    req: &clients_selection_commands_v1::client::CommitRequest,
+) -> Result<Selection, SelectionError> {
+    if let Some(session) = req.session_id {
+        let manager = global_plugin_state_registry()
+            .get::<SessionManagerHandle>()
+            .ok_or(SelectionError::InvalidTarget)?;
+        if !manager
+            .read()
+            .map_err(|_| SelectionError::InvalidTarget)?
+            .0
+            .contains(SessionId(session))
+        {
+            return Err(SelectionError::InvalidTarget);
+        }
+    }
+    selection_operation(client, |state, client| {
+        state.commit_selection(
+            client,
+            req.expected_revision,
+            req.context_id,
+            req.session_id,
+        )
+    })
+}
+
+fn selection_operation(
+    client: Option<Uuid>,
+    operation: impl FnOnce(&mut FollowState, ClientId) -> Result<Selection, SelectionError>,
+) -> Result<Selection, SelectionError> {
+    let client = ClientId(client.ok_or(SelectionError::NoCurrentClient)?);
+    let state = global_plugin_state_registry()
+        .get::<FollowState>()
+        .ok_or_else(|| SelectionError::Failed {
+            reason: "clients state unavailable".into(),
+        })?;
+    let mut guard = state.write().map_err(|_| SelectionError::Failed {
+        reason: "clients state poisoned".into(),
+    })?;
+    operation(&mut guard, client)
 }
 
 // ── IPC helpers ──────────────────────────────────────────────────────

@@ -69,6 +69,31 @@ interface clients-commands {
         -> result<client-ack, set-following-error>;
 }
 
+@capability(CLIENTS_READ)
+interface clients-selection-state-v1 {
+    record selection {
+        revision: u64,
+        context-id: uuid?,
+        session-id: uuid?,
+        suspended: bool,
+    }
+    variant selection-error {
+        no-current-client,
+        conflict,
+        invalid-target,
+        failed { reason: string },
+    }
+    query current() -> result<selection, selection-error>;
+}
+
+@capability(CLIENTS_WRITE)
+interface clients-selection-commands-v1 {
+    command begin(expected-revision: u64)
+        -> result<clients-selection-state-v1.selection, clients-selection-state-v1.selection-error>;
+    command commit(expected-revision: u64, context-id: uuid?, session-id: uuid?)
+        -> result<clients-selection-state-v1.selection, clients-selection-state-v1.selection-error>;
+}
+
 interface clients-events {
     // A single event describing a client lifecycle change.
     variant client-event {

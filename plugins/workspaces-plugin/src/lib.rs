@@ -387,27 +387,44 @@ fn set_context_workspace(
         })
 }
 
+fn effective_workspace(
+    selection: Option<Uuid>,
+    contexts: &[contexts_state::ContextSummary],
+    history: Uuid,
+) -> Result<Uuid, String> {
+    selection.map_or(Ok(history), |id| {
+        contexts
+            .iter()
+            .find(|context| context.id == id)
+            .map(context_workspace_id)
+            .ok_or_else(|| {
+                "selected context is unavailable; workspace selection requires recovery".to_string()
+            })
+    })
+}
+
+fn selected_workspace(
+    caller: &(impl ServiceCaller + Sync),
+    contexts: &[contexts_state::ContextSummary],
+    caller_client_id: Option<Uuid>,
+    history: Uuid,
+) -> Result<Uuid, String> {
+    let Some(caller_id) = caller_client_id else {
+        return Ok(history);
+    };
+    let mut client = dispatch_client(caller);
+    let summary =
+        bmux_plugin::block_on_typed_dispatch(clients_state::client::current_client(&mut client))
+            .map_err(|error| format!("reading authoritative client selection: {error}"))?
+            .map_err(|error| format!("reading authoritative client selection: {error:?}"))?;
+    if summary.id != caller_id {
+        return Err("client selection identity mismatch".to_string());
+    }
+    effective_workspace(summary.selected_context_id, contexts, history)
+}
+
 fn list_workspaces(caller: &(impl ServiceCaller + Sync)) -> Result<Vec<WorkspaceSummary>, String> {
-    let contexts = list_contexts(caller)?;
-    let state = state()?;
-    let guard = state
-        .read()
-        .map_err(|_| "workspace state lock poisoned".to_string())?;
-    let active = resolve_client_id(caller).map_or_else(Uuid::nil, |id| guard.active_id(id));
-    Ok(guard
-        .records
-        .iter()
-        .map(|workspace| WorkspaceSummary {
-            id: workspace.id,
-            name: workspace.name.clone(),
-            tab_ids: contexts
-                .iter()
-                .filter(|context| context_workspace_id(context) == workspace.id)
-                .map(|context| context.id)
-                .collect(),
-            active: workspace.id == active,
-        })
-        .collect())
+    list_workspaces_for_client(caller, resolve_client_id(caller))
 }
 
 fn resolve_client_id(caller: &(impl ServiceCaller + Sync)) -> Option<Uuid> {
@@ -424,12 +441,20 @@ fn list_workspaces_for_client(
 ) -> Result<Vec<WorkspaceSummary>, String> {
     let contexts = list_contexts(caller)?;
     let state = state()?;
-    let guard = state
-        .read()
-        .map_err(|_| "workspace state lock poisoned".to_string())?;
-    let active = caller_client_id.map_or_else(Uuid::nil, |id| guard.active_id(id));
-    Ok(guard
-        .records
+    let (records, history) = {
+        let guard = state
+            .read()
+            .map_err(|_| "workspace state lock poisoned".to_string())?;
+        (
+            guard.records.clone(),
+            caller_client_id.map_or_else(Uuid::nil, |id| guard.active_id(id)),
+        )
+    };
+    let active = selected_workspace(caller, &contexts, caller_client_id, history)?;
+    if !records.iter().any(|record| record.id == active) {
+        return Err("selected workspace is unavailable; recovery required".to_string());
+    }
+    Ok(records
         .iter()
         .map(|workspace| WorkspaceSummary {
             id: workspace.id,
@@ -1492,6 +1517,24 @@ mod tests {
         );
         host.storage.lock().unwrap().remove(HISTORY_KEY);
         assert!(load_navigation_history(&host).is_err());
+    }
+
+    #[test]
+    fn effective_workspace_follows_selected_context_not_saved_history() {
+        let other = Uuid::from_u128(4);
+        let target = context(100, other);
+        assert_eq!(
+            effective_workspace(Some(target.id), std::slice::from_ref(&target), Uuid::nil())
+                .unwrap(),
+            other
+        );
+        assert!(effective_workspace(Some(target.id), &[], Uuid::nil()).is_err());
+        let moved = context(100, Uuid::nil());
+        assert_eq!(
+            effective_workspace(Some(target.id), &[moved], other).unwrap(),
+            Uuid::nil()
+        );
+        assert_eq!(effective_workspace(None, &[], other).unwrap(), other);
     }
 
     #[test]

@@ -24,6 +24,8 @@ use uuid::Uuid;
 /// context/session, and follow relationships between clients.
 #[derive(Debug, Default)]
 pub struct FollowState {
+    pub selection_revisions: BTreeMap<ClientId, u64>,
+    pub selection_reservations: BTreeMap<ClientId, u64>,
     pub connected_clients: BTreeSet<ClientId>,
     pub selected_contexts: BTreeMap<ClientId, Option<Uuid>>,
     pub selected_sessions: BTreeMap<ClientId, Option<SessionId>>,
@@ -89,6 +91,8 @@ impl FollowState {
         session_id: Option<SessionId>,
     ) {
         if self.connected_clients.contains(&client_id) {
+            let revision = self.selection_revisions.entry(client_id).or_default();
+            *revision = revision.saturating_add(1);
             self.selected_contexts.insert(client_id, context_id);
             self.selected_sessions.insert(client_id, session_id);
         }
@@ -101,6 +105,9 @@ impl FollowState {
         &self,
         client_id: ClientId,
     ) -> Option<(Option<Uuid>, Option<SessionId>)> {
+        if self.selection_reservations.contains_key(&client_id) {
+            return Some((None, None));
+        }
         Some((
             self.selected_contexts.get(&client_id).copied()?,
             self.selected_sessions.get(&client_id).copied()?,
