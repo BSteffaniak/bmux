@@ -38,6 +38,24 @@ pub struct ContentRowSource {
     pub continues: bool,
 }
 
+/// One complete source cell's display geometry and UTF-8 byte interval.
+/// Byte coordinates are local to the identified logical line (or screen row).
+/// Combining characters stay with their owning cell; clipped screen fragments
+/// have no mapping. Display and source widths need not agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionCell {
+    pub columns: Range<usize>,
+    pub bytes: Range<usize>,
+}
+
+/// Selection correspondence for one projected row.
+#[derive(Debug)]
+pub struct ContentSelectionRow {
+    pub source: ContentRowSource,
+    pub bytes: Range<usize>,
+    pub cells: Vec<SelectionCell>,
+}
+
 /// A positioned screen row's source coordinates. Display column `x` maps to
 /// `columns.start + x`, including implicit blank cells. A clipped wide-glyph
 /// fragment is blanked, not a selectable partial source glyph.
@@ -47,6 +65,17 @@ pub struct ScreenRowSource {
     pub columns: Range<usize>,
     pub clipped_left: bool,
     pub clipped_right: bool,
+}
+
+/// Selection-ready positioned row. `text` is the admitted source interval;
+/// `byte_start` locates it in the full physical source row. Mappings omit
+/// clipped wide-cell fragments and include implicit blanks inside the screen.
+#[derive(Debug)]
+pub struct ScreenSelectionRow {
+    pub source: ScreenRowSource,
+    pub byte_start: usize,
+    pub text: String,
+    pub cells: Vec<SelectionCell>,
 }
 
 /// Bounded active-screen crop with correspondence from the same grid revision.
@@ -73,6 +102,7 @@ pub struct ContentRows {
 #[derive(Debug)]
 struct ContentLine {
     cells: Vec<Cell>,
+    byte_offsets: Vec<usize>,
     open: bool,
 }
 
@@ -263,6 +293,88 @@ impl TerminalGrid {
         })
     }
 
+    /// Capture selection text and geometry for active positioned screen rows.
+    ///
+    /// Requires the exact content revision. UTF-8 coordinates count source cells
+    /// from column zero, including implicit blanks. Scanning to the requested
+    /// columns is charged; source prefixes are never copied. Clipped wide-cell
+    /// fragments are excluded from both exported text and selectable geometry.
+    ///
+    /// # Errors
+    /// Rejects stale revisions and exhausted work/allocation allowances.
+    pub fn screen_selection(
+        &self,
+        revision: u64,
+        columns: Range<usize>,
+        rows: Range<usize>,
+        mut budget: ContentBudget,
+    ) -> Result<Vec<ScreenSelectionRow>, HistorySliceError> {
+        if revision != self.content_revision {
+            return Err(HistorySliceError::StaleRevision);
+        }
+        let start = columns.start.min(self.width);
+        let end = columns.end.min(self.width).max(start);
+        let mut output = Vec::new();
+        for y in rows.start.min(self.height)..rows.end.min(self.height) {
+            budget.charge(end.max(1), 0)?;
+            let row = self
+                .viewport_row_ref(y)
+                .ok_or(HistorySliceError::Unavailable)?;
+            reserve_item(&mut output, &mut budget.bytes)?;
+            let source = ScreenRowSource {
+                row: y,
+                columns: start..end,
+                clipped_left: start < end
+                    && row
+                        .cells()
+                        .get(start)
+                        .is_some_and(Cell::is_wide_continuation),
+                clipped_right: start < end
+                    && row.cells().get(end).is_some_and(Cell::is_wide_continuation),
+            };
+            let mut selected = ScreenSelectionRow {
+                source,
+                byte_start: 0,
+                text: String::new(),
+                cells: Vec::new(),
+            };
+            let mut offset = 0_usize;
+            for x in 0..end {
+                let cell = row.cells().get(x);
+                if cell.is_some_and(Cell::is_wide_continuation) {
+                    continue;
+                }
+                let text = cell.map_or(" ", Cell::text);
+                let width = cell.map_or(1, |cell| usize::from(cell.width()).max(1));
+                let next = offset
+                    .checked_add(text.len())
+                    .ok_or(HistorySliceError::BudgetExhausted)?;
+                if x >= start && x.saturating_add(width) <= end {
+                    if selected.cells.is_empty() {
+                        selected.byte_start = offset;
+                    }
+                    reserve_item(&mut selected.cells, &mut budget.bytes)?;
+                    budget.charge(0, text.len())?;
+                    selected
+                        .text
+                        .try_reserve_exact(text.len())
+                        .map_err(|_| HistorySliceError::BudgetExhausted)?;
+                    selected.text.push_str(text);
+                    selected.cells.push(SelectionCell {
+                        columns: x - start..x - start + width,
+                        bytes: offset..next,
+                    });
+                }
+                offset = next;
+            }
+            if selected.cells.is_empty() {
+                selected.byte_start = offset;
+            }
+            output.push(selected);
+        }
+        Ok(output)
+    }
+
     /// Crop positioned output and return source-column correspondence.
     /// No terminal state is changed. Metadata is admitted before row allocation.
     /// A source range describes physical columns, not UTF-8 bytes; edge flags
@@ -447,8 +559,36 @@ fn push_line(
     while !open && cells.last().is_some_and(Cell::is_discardable_blank) {
         cells.pop();
     }
+    let count = cells
+        .len()
+        .checked_add(1)
+        .ok_or(HistorySliceError::BudgetExhausted)?;
+    budget.charge(
+        cells.len(),
+        count
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or(HistorySliceError::BudgetExhausted)?,
+    )?;
+    let mut byte_offsets = Vec::new();
+    byte_offsets
+        .try_reserve_exact(count)
+        .map_err(|_| HistorySliceError::BudgetExhausted)?;
+    byte_offsets.push(0_usize);
+    for cell in &cells {
+        let end = byte_offsets
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(cell.text().len())
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        byte_offsets.push(end);
+    }
     reserve_item(lines, &mut budget.bytes)?;
-    lines.push(ContentLine { cells, open });
+    lines.push(ContentLine {
+        cells,
+        byte_offsets,
+        open,
+    });
     Ok(())
 }
 
@@ -503,6 +643,104 @@ impl ContentProjection {
         }
         self.index = Some(WidthIndex { width, rows });
         Ok(())
+    }
+
+    /// Return per-cell UTF-8 correspondence for a prepared row window.
+    ///
+    /// Coordinates are capture/line scoped and stable across width changes.
+    /// Soft wraps never introduce bytes. Hard breaks are represented by
+    /// `source.continues == false`; callers insert separators between logical
+    /// lines, not between projected rows. Empty lines retain an empty interval.
+    ///
+    /// # Errors
+    /// Returns `Unavailable` before preparation or `BudgetExhausted` when work
+    /// or metadata exceeds the explicit allowance. No prefix scanning occurs.
+    pub fn selection_window(
+        &self,
+        range: Range<usize>,
+        mut budget: ContentBudget,
+    ) -> Result<Vec<ContentSelectionRow>, HistorySliceError> {
+        let index = self.index.as_ref().ok_or(HistorySliceError::Unavailable)?;
+        let start = range.start.min(index.rows.len());
+        let end = range.end.min(index.rows.len()).max(start);
+        let mut output = Vec::new();
+        for row in &index.rows[start..end] {
+            budget.charge(row.cells.len().max(1), 0)?;
+            reserve_item(&mut output, &mut budget.bytes)?;
+            let line = &self.lines[row.line];
+            let mut cells = Vec::new();
+            let mut column = 0_usize;
+            let mut logical_end = row.column;
+            for i in row.cells.clone() {
+                let cell = &line.cells[i];
+                let width = usize::from(cell.width()).max(1);
+                let end = column.saturating_add(width).min(index.width);
+                reserve_item(&mut cells, &mut budget.bytes)?;
+                cells.push(SelectionCell {
+                    columns: column..end,
+                    bytes: line.byte_offsets[i]..line.byte_offsets[i + 1],
+                });
+                column = end;
+                logical_end += width;
+            }
+            let anchor = ContentAnchor {
+                capture: self.capture,
+                line: row.line,
+                column: row.column,
+            };
+            output.push(ContentSelectionRow {
+                source: ContentRowSource {
+                    start: anchor,
+                    end: ContentAnchor {
+                        column: logical_end,
+                        ..anchor
+                    },
+                    continues: row.wrapped,
+                },
+                bytes: line.byte_offsets[row.cells.start]..line.byte_offsets[row.cells.end],
+                cells,
+            });
+        }
+        Ok(output)
+    }
+
+    /// Export a cell-aligned UTF-8 interval from one captured logical line.
+    /// No newlines are synthesized, and selection never splits a combining
+    /// sequence or wide glyph. Callers own hard-line separator policy.
+    ///
+    /// # Errors
+    /// Rejects a foreign capture, missing line, non-cell boundaries, reversed
+    /// ranges, or insufficient work/text allocation allowance.
+    pub fn export_text(
+        &self,
+        capture: u128,
+        line: usize,
+        bytes: Range<usize>,
+        mut budget: ContentBudget,
+    ) -> Result<String, HistorySliceError> {
+        if capture != self.capture {
+            return Err(HistorySliceError::StaleRevision);
+        }
+        let line = self.lines.get(line).ok_or(HistorySliceError::Unavailable)?;
+        if bytes.start > bytes.end {
+            return Err(HistorySliceError::InvalidOffset);
+        }
+        let start = line
+            .byte_offsets
+            .binary_search(&bytes.start)
+            .map_err(|_| HistorySliceError::InvalidOffset)?;
+        let end = line
+            .byte_offsets
+            .binary_search(&bytes.end)
+            .map_err(|_| HistorySliceError::InvalidOffset)?;
+        budget.charge(end - start, bytes.end - bytes.start)?;
+        let mut text = String::new();
+        text.try_reserve_exact(bytes.end - bytes.start)
+            .map_err(|_| HistorySliceError::BudgetExhausted)?;
+        for cell in &line.cells[start..end] {
+            text.push_str(cell.text());
+        }
+        Ok(text)
     }
 
     /// Number of rows at the prepared width; unavailable before `prepare`.

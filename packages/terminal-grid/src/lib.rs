@@ -21,11 +21,11 @@ mod style;
 
 pub use delta::{GridDeltaApplyError, GridDeltaBatch, RowUpdateSnapshot};
 pub use model::{
-    Cell, ContentAnchor, ContentBudget, ContentProjection, ContentRowSource, ContentRows, Cursor,
-    GridLimits, GridMode, GridRowWindow, HistoryLineAssembly, HistorySlice, HistorySliceEnd,
-    HistorySliceError, MouseProtocolEncoding, MouseProtocolMode, PhysicalRow, ProjectedRows,
-    ProtocolState, ScreenRowSource, ScreenRows, TerminalGrid, TerminalGridError,
-    physical_row_is_blank,
+    Cell, ContentAnchor, ContentBudget, ContentProjection, ContentRowSource, ContentRows,
+    ContentSelectionRow, Cursor, GridLimits, GridMode, GridRowWindow, HistoryLineAssembly,
+    HistorySlice, HistorySliceEnd, HistorySliceError, MouseProtocolEncoding, MouseProtocolMode,
+    PhysicalRow, ProjectedRows, ProtocolState, ScreenRowSource, ScreenRows, ScreenSelectionRow,
+    SelectionCell, TerminalGrid, TerminalGridError, physical_row_is_blank,
 };
 pub use parser::{
     ProtocolProcessOutcome, TerminalGridStream, TerminalGridStreamDeltaError,

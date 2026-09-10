@@ -182,6 +182,97 @@ fn screen_source_ranges_mark_both_clipped_edges_and_charge_metadata() {
 }
 
 #[test]
+fn selection_bytes_survive_unicode_reflow_and_export_complete_cells() {
+    let (_, mut projection) = capture("界e\u{301}z\r\n\r\nnext", 12, 4);
+    projection.prepare(1, budget()).unwrap();
+    let rows = projection.selection_window(0..20, budget()).unwrap();
+    assert_eq!(
+        rows[0].cells[0],
+        SelectionCell {
+            columns: 0..1,
+            bytes: 0..3
+        }
+    );
+    assert_eq!(rows[1].cells[0].bytes, 3..6);
+    assert_eq!(
+        projection.export_text(42, 0, 0..7, budget()).unwrap(),
+        "界e\u{301}z"
+    );
+    assert_eq!(
+        projection.export_text(42, 0, 4..6, budget()),
+        Err(HistorySliceError::InvalidOffset)
+    );
+    assert_eq!(
+        projection.export_text(99, 0, 0..3, budget()),
+        Err(HistorySliceError::StaleRevision)
+    );
+    assert!(rows[3].cells.is_empty());
+    assert_eq!(rows[3].bytes, 0..0);
+    projection.prepare(20, budget()).unwrap();
+    let wide = projection.selection_window(0..1, budget()).unwrap();
+    assert_eq!(wide[0].bytes, 0..7);
+    assert_eq!(wide[0].cells[0].columns, 0..2);
+    assert_eq!(wide[0].cells[1].bytes, rows[1].cells[0].bytes);
+    assert!(
+        projection
+            .selection_window(0..1, ContentBudget { cells: 0, bytes: 0 })
+            .is_err()
+    );
+    assert!(
+        projection
+            .export_text(
+                42,
+                0,
+                0..7,
+                ContentBudget {
+                    cells: 20,
+                    bytes: 1
+                }
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn screen_selection_omits_clipped_glyphs_and_keeps_global_byte_offsets() {
+    let (stream, _) = capture("\x1b[?1049h界a界", 8, 2);
+    let grid = stream.grid();
+    let selected = grid
+        .screen_selection(grid.content_revision(), 1..4, 0..1, budget())
+        .unwrap();
+    assert_eq!(selected[0].text, "a");
+    assert_eq!(selected[0].byte_start, 3);
+    assert_eq!(
+        selected[0].cells,
+        vec![SelectionCell {
+            columns: 1..2,
+            bytes: 3..4
+        }]
+    );
+    let full = grid
+        .screen_selection(grid.content_revision(), 0..8, 0..1, budget())
+        .unwrap();
+    assert_eq!(full[0].text, "界a界   ");
+    assert_eq!(full[0].cells[1].bytes, selected[0].cells[0].bytes);
+    assert!(
+        grid.screen_selection(grid.content_revision() + 1, 0..8, 0..1, budget())
+            .is_err()
+    );
+    assert!(
+        grid.screen_selection(
+            grid.content_revision(),
+            0..8,
+            0..1,
+            ContentBudget {
+                cells: 1,
+                bytes: 1000
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn projection_work_report_for_long_history_and_single_line() {
     use std::time::Instant;
     for (name, text) in [

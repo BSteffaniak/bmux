@@ -84,3 +84,28 @@ The generic `bmux_tui_components::terminal_viewer` uses these primitives for its
 bounded compatibility renderer. Performance-sensitive live consumers should
 retain the stream and capture themselves instead of passing cumulative bytes to
 that stateless convenience component on every draw.
+
+## Source-aware selection and copy
+
+`ContentProjection::selection_window` returns per-cell display-column geometry
+and UTF-8 byte ranges scoped to the capture and logical line. These are separate
+from logical-column anchors: a wide glyph at display width one still exports all
+of its UTF-8 bytes, and combining characters remain with their source cell.
+Offsets are indexed once during capture, remain stable across width changes, and
+selected windows do not scan line prefixes. Metadata and cell work are budgeted.
+
+Use `export_text(capture, line, bytes, budget)` to copy those intervals. It rejects
+foreign captures, non-cell-aligned boundaries, and insufficient budgets. It does
+not invent newlines: join soft-wrapped fragments of one logical line directly;
+insert the caller's chosen separator only between hard-ended logical lines.
+Empty lines have an empty byte interval and retain their line identity. Export
+is normalized terminal text, not the original ANSI stream.
+
+For positioned screens, `screen_selection(revision, columns, rows, budget)`
+returns admitted text plus per-cell geometry and byte ranges in the full source
+row. `byte_start` locates the returned text in that row. Implicit blanks count as
+spaces; clipped wide-glyph fragments have neither text nor selectable geometry.
+Scanning the source prefix to determine byte offsets is charged against the work
+allowance, but the prefix is not copied. Retain returned data with the committed
+frame, and reject old selection against a newer content revision. None of these
+APIs changes terminal state or creates a durable selection identity.

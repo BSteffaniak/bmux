@@ -4,7 +4,7 @@ use crate::snapshot::{GridSnapshot, RowSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
 pub use content::{
     ContentAnchor, ContentBudget, ContentProjection, ContentRowSource, ContentRows,
-    ScreenRowSource, ScreenRows,
+    ContentSelectionRow, ScreenRowSource, ScreenRows, ScreenSelectionRow, SelectionCell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
