@@ -1359,6 +1359,7 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_client_state",
  "bmux_clients_plugin_api",
+ "bmux_context_state",
  "bmux_contexts_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",

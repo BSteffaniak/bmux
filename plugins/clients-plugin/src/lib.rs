@@ -557,7 +557,7 @@ impl clients_selection_commands_v1::ClientsSelectionCommandsV1Service for Select
 }
 
 fn commit_client_selection(
-    caller: &(impl ServiceCaller + Sync),
+    _caller: &(impl ServiceCaller + Sync),
     client: Option<Uuid>,
     req: &clients_selection_commands_v1::client::CommitRequest,
 ) -> Result<Selection, SelectionError> {
@@ -575,20 +575,26 @@ fn commit_client_selection(
         }
     }
     if let Some(context_id) = req.context_id {
-        let mut dispatch = dispatch_client(caller);
-        let context = bmux_plugin::block_on_typed_dispatch(
-            bmux_contexts_plugin_api::contexts_state::client::get_context(
-                &mut dispatch,
-                ContextSelector {
-                    id: Some(context_id),
-                    name: None,
-                },
-            ),
-        )
-        .map_err(|error| SelectionError::Failed {
-            reason: error.to_string(),
-        })?
-        .map_err(|_| SelectionError::InvalidTarget)?;
+        // Read the published reader contract directly. Re-entering contexts
+        // service dispatch here can deadlock behind a waiting plugin writer.
+        let handle = global_plugin_state_registry()
+            .get::<bmux_context_state::ContextStateHandle>()
+            .ok_or(SelectionError::InvalidTarget)?;
+        let handle = handle
+            .read()
+            .map_err(|_| SelectionError::InvalidTarget)?
+            .clone();
+        let context = handle
+            .0
+            .list()
+            .into_iter()
+            .find(|context| context.id == context_id)
+            .ok_or(SelectionError::InvalidTarget)?;
+        let context = bmux_contexts_plugin_api::contexts_state::ContextSummary {
+            id: context.id,
+            name: context.name,
+            attributes: context.attributes,
+        };
         validate_selection_binding(context_id, req.session_id, &context)?;
     }
     selection_operation(client, |state, client| {
@@ -669,7 +675,7 @@ fn set_current_session_local(
         });
     };
 
-    let (previous_session, follower_previous_sessions, follower_updates) = {
+    let (previous_session, follower_previous_sessions, reservation) = {
         let mut follow_state =
             state_handle
                 .write()
@@ -702,18 +708,19 @@ fn set_current_session_local(
             })
             .collect::<Vec<_>>();
 
-        // Explicit session selection is not context selection. Clearing
-        // the context avoids pairing a stale context with the new session.
-        follow_state.set_selected_target(self_client_id, None, Some(next_session));
-        let follower_updates =
-            follow_state.sync_followers_from_leader(self_client_id, None, Some(next_session));
+        let revision = follow_state
+            .selection(self_client_id)
+            .map_err(|error| SetCurrentSessionError::Denied {
+                reason: format!("{error:?}"),
+            })?
+            .revision;
+        let reservation = follow_state
+            .begin_selection(self_client_id, revision)
+            .map_err(|error| SetCurrentSessionError::Denied {
+                reason: format!("{error:?}"),
+            })?;
         drop(follow_state);
-
-        (
-            previous_session,
-            follower_previous_sessions,
-            follower_updates,
-        )
+        (previous_session, follower_previous_sessions, reservation)
     };
 
     if previous_session != Some(next_session) {
@@ -725,6 +732,25 @@ fn set_current_session_local(
         )
         .map_err(|reason| SetCurrentSessionError::Denied { reason })?;
     }
+
+    commit_client_selection(
+        caller,
+        Some(self_id),
+        &clients_selection_commands_v1::client::CommitRequest {
+            expected_revision: reservation.revision,
+            context_id: None,
+            session_id: Some(session_id),
+        },
+    )
+    .map_err(|error| SetCurrentSessionError::Denied {
+        reason: format!("selection commit failed; input suspended: {error:?}"),
+    })?;
+    let follower_updates = state_handle
+        .write()
+        .map_err(|_| SetCurrentSessionError::Denied {
+            reason: "follow state lock poisoned".into(),
+        })?
+        .sync_followers_from_leader(self_client_id, None, Some(next_session));
 
     let _ = global_event_bus().emit(
         &clients_events::EVENT_KIND,
