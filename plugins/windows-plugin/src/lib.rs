@@ -1377,26 +1377,45 @@ impl RustPlugin for WindowsPlugin {
 /// on the subscription's `recv` without interfering with host
 /// scheduling. It runs until the plugin process terminates.
 fn spawn_workspace_events_subscriber(shared: WindowsSharedState) {
-    use bmux_workspaces_plugin_api::workspaces_events::{self, WorkspaceEvent};
-
     std::thread::spawn(move || {
-        let Ok(mut receiver) = bmux_plugin::global_event_bus()
-            .subscribe::<WorkspaceEvent>(&workspaces_events::EVENT_KIND)
-        else {
-            return;
-        };
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         else {
             return;
         };
-        runtime.block_on(async move {
-            while let Ok(_event) = receiver.recv().await {
-                publish_window_list_snapshot(shared.caller.as_ref(), &shared.runtime_state);
-            }
-        });
+        runtime.block_on(observe_workspace_changes(
+            &bmux_plugin::global_event_bus(),
+            || publish_window_list_snapshot(shared.caller.as_ref(), &shared.runtime_state),
+        ));
     });
+}
+
+async fn observe_workspace_changes(bus: &bmux_plugin::EventBus, mut refresh: impl FnMut()) {
+    use bmux_workspaces_plugin_api::workspaces_events::{self, WorkspaceEvent};
+
+    // Workspaces is optional and may activate after windows. Do not permanently
+    // lose notifications just because its channel is absent during startup.
+    let mut receiver = loop {
+        match bus.subscribe::<WorkspaceEvent>(&workspaces_events::EVENT_KIND) {
+            Ok(receiver) => break receiver,
+            Err(bmux_plugin::EventBusError::ChannelNotRegistered { .. }) => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                eprintln!("subscribing to workspace changes: {error}");
+                return;
+            }
+        }
+    };
+    // Repair changes made before subscription, including workspace activation.
+    refresh();
+    loop {
+        match receiver.recv().await {
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => refresh(),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
 }
 
 fn spawn_contexts_events_subscriber(shared: WindowsSharedState) {
@@ -4331,6 +4350,57 @@ fn interface_ids_match_bpdl_constants() {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn workspace_observer_repairs_late_activation_and_lag() {
+        use bmux_workspaces_plugin_api::workspaces_events::{self, WorkspaceEvent};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let bus = bmux_plugin::EventBus::new();
+        let refreshes = AtomicUsize::new(0);
+        let observer = super::observe_workspace_changes(&bus, || {
+            refreshes.fetch_add(1, Ordering::SeqCst);
+        });
+        tokio::pin!(observer);
+        // Poll before the owner has registered its channel.
+        tokio::select! {
+            () = &mut observer => panic!("observer exited before workspace activation"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+        }
+        let sender =
+            bus.register_channel_with_capacity::<WorkspaceEvent>(workspaces_events::EVENT_KIND, 1);
+        let refreshes = &refreshes;
+        let wait_for = |count| async move {
+            while refreshes.load(Ordering::SeqCst) < count {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            () = &mut observer => panic!("observer exited after workspace activation"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(2), wait_for(1)) => result.unwrap(),
+        }
+        for index in 0..4 {
+            sender
+                .send(std::sync::Arc::new(WorkspaceEvent::Renamed {
+                    workspace_id: uuid::Uuid::nil(),
+                    name: format!("workspace-{index}"),
+                }))
+                .unwrap();
+        }
+        tokio::select! {
+            () = &mut observer => panic!("lag terminated workspace observer"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(2), wait_for(3)) => result.unwrap(),
+        }
+        sender
+            .send(std::sync::Arc::new(WorkspaceEvent::Renamed {
+                workspace_id: uuid::Uuid::nil(),
+                name: "latest".into(),
+            }))
+            .unwrap();
+        tokio::select! {
+            () = &mut observer => panic!("workspace observer stopped"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(2), wait_for(4)) => result.unwrap(),
+        }
+    }
     use super::*;
     use bmux_contexts_plugin_api::contexts_state::ContextSummary as SessionSummary;
     use bmux_plugin::ServiceCaller;
