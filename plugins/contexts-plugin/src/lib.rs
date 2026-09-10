@@ -739,8 +739,17 @@ fn activate_context_exact(
 ) -> Result<ContextAck, SelectContextError> {
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| SelectContextError::Denied { reason })?;
+    let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
+    activate_context_exact_in_state(caller, &state, client_id, context_id)
+}
+
+fn activate_context_exact_in_state(
+    caller: &(impl ServiceCaller + Sync),
+    state: &RwLock<ContextState>,
+    client_id: ClientId,
+    context_id: Uuid,
+) -> Result<ContextAck, SelectContextError> {
     let session_id = {
-        let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
         let guard = state.read().map_err(|_| SelectContextError::Denied {
             reason: "context state lock poisoned".into(),
         })?;
@@ -762,7 +771,19 @@ fn activate_context_exact(
             reason: "context execution unavailable; explicit recovery required".into(),
         });
     }
-    mutate_state_select(client_id, &PrimitiveContextSelector::ById(context_id))?;
+    {
+        let mut guard = state.write().map_err(|_| SelectContextError::Denied {
+            reason: "context state lock poisoned".into(),
+        })?;
+        if guard.session_by_context.get(&context_id) != Some(&session_id) {
+            return Err(SelectContextError::Denied {
+                reason: "context execution changed during activation".into(),
+            });
+        }
+        guard
+            .select_for_client(client_id, &PrimitiveContextSelector::ById(context_id))
+            .map_err(|_| SelectContextError::NotFound)?;
+    }
     let _ = global_event_bus().emit(
         &contexts_events::EVENT_KIND,
         ContextEvent::Selected { context_id },
@@ -1443,6 +1464,96 @@ mod tests {
     use super::*;
     use bmux_plugin_sdk::{ServiceKind as SdkServiceKind, encode_service_message};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn restored_non_default_context_activates_without_creating_replacement() {
+        struct ExistingSession {
+            id: SessionId,
+            available: bool,
+        }
+        impl ServiceCaller for ExistingSession {
+            fn call_service_raw(
+                &self,
+                _: &str,
+                _: SdkServiceKind,
+                interface: &str,
+                operation: &str,
+                _: Vec<u8>,
+            ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+                assert_eq!(
+                    (interface, operation),
+                    ("sessions-commands", "select-session")
+                );
+                let result: Result<
+                    bmux_sessions_plugin_api::sessions_commands::SessionAck,
+                    bmux_sessions_plugin_api::sessions_commands::SelectSessionError,
+                > = if self.available {
+                    Ok(bmux_sessions_plugin_api::sessions_commands::SessionAck { id: self.id.0 })
+                } else {
+                    Err(bmux_sessions_plugin_api::sessions_commands::SelectSessionError::NotFound)
+                };
+                encode_service_message(&result)
+            }
+            fn execute_kernel_request(
+                &self,
+                _: bmux_ipc::Request,
+            ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+                panic!("no kernel calls")
+            }
+        }
+        let client = ClientId::new();
+        let session = SessionId::new();
+        let workspace = Uuid::new_v4();
+        let source = Arc::new(RwLock::new(ContextState::default()));
+        let source_adapter = ContextStateAdapter { inner: source };
+        let default = source_adapter.create(client, Some("default".into()), BTreeMap::new());
+        let target = source_adapter.create(
+            client,
+            Some("restored".into()),
+            BTreeMap::from([("workspace".into(), workspace.to_string())]),
+        );
+        source_adapter.bind_session(target.id, session).unwrap();
+        source_adapter
+            .select_for_client(client, &PrimitiveContextSelector::ById(default.id))
+            .unwrap();
+        let restored = Arc::new(RwLock::new(ContextState::default()));
+        let adapter = ContextStateAdapter {
+            inner: restored.clone(),
+        };
+        adapter.restore_snapshot(source_adapter.snapshot());
+        assert_eq!(adapter.context_for_session(session), Some(target.id));
+        let missing = activate_context_exact_in_state(
+            &ExistingSession {
+                id: session,
+                available: false,
+            },
+            &restored,
+            client,
+            target.id,
+        );
+        assert!(missing.is_err());
+        assert_eq!(adapter.current_for_client(client).unwrap().id, default.id);
+        let ack = activate_context_exact_in_state(
+            &ExistingSession {
+                id: session,
+                available: true,
+            },
+            &restored,
+            client,
+            target.id,
+        )
+        .unwrap();
+        assert_eq!(ack.session_id, Some(session.0));
+        assert_eq!(
+            adapter
+                .current_for_client(client)
+                .unwrap()
+                .attributes
+                .get("workspace"),
+            Some(&workspace.to_string())
+        );
+        assert_eq!(adapter.list().len(), 2);
+    }
 
     #[test]
     fn remove_contexts_for_session_clears_mapping_and_reselects_client() {
