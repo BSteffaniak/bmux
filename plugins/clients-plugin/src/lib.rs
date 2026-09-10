@@ -445,7 +445,7 @@ impl RustPlugin for ClientsPlugin {
                 Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(ctx.caller_client_id, |state, client| state.begin_selection(client, req.expected_revision)))
             },
             "clients-selection-commands-v1", "commit" => |req: clients_selection_commands_v1::client::CommitRequest, ctx| {
-                Ok::<Result<Selection, SelectionError>, ServiceResponse>(commit_client_selection(ctx.caller_client_id, &req))
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(commit_client_selection(ctx, ctx.caller_client_id, &req))
             },
             "clients-state", "list-clients" => |_req: (), _ctx| {
                 list_clients_local()
@@ -544,6 +544,7 @@ impl clients_selection_commands_v1::ClientsSelectionCommandsV1Service for Select
     ) -> Pin<Box<dyn Future<Output = Result<Selection, SelectionError>> + Send + 'a>> {
         Box::pin(async move {
             commit_client_selection(
+                self.caller.as_ref(),
                 current_client_id_for_typed_handle(&self.caller),
                 &clients_selection_commands_v1::client::CommitRequest {
                     expected_revision,
@@ -556,6 +557,7 @@ impl clients_selection_commands_v1::ClientsSelectionCommandsV1Service for Select
 }
 
 fn commit_client_selection(
+    caller: &(impl ServiceCaller + Sync),
     client: Option<Uuid>,
     req: &clients_selection_commands_v1::client::CommitRequest,
 ) -> Result<Selection, SelectionError> {
@@ -572,6 +574,23 @@ fn commit_client_selection(
             return Err(SelectionError::InvalidTarget);
         }
     }
+    if let Some(context_id) = req.context_id {
+        let mut dispatch = dispatch_client(caller);
+        let context = bmux_plugin::block_on_typed_dispatch(
+            bmux_contexts_plugin_api::contexts_state::client::get_context(
+                &mut dispatch,
+                ContextSelector {
+                    id: Some(context_id),
+                    name: None,
+                },
+            ),
+        )
+        .map_err(|error| SelectionError::Failed {
+            reason: error.to_string(),
+        })?
+        .map_err(|_| SelectionError::InvalidTarget)?;
+        validate_selection_binding(context_id, req.session_id, &context)?;
+    }
     selection_operation(client, |state, client| {
         state.commit_selection(
             client,
@@ -580,6 +599,21 @@ fn commit_client_selection(
             req.session_id,
         )
     })
+}
+
+fn validate_selection_binding(
+    context_id: Uuid,
+    session_id: Option<Uuid>,
+    context: &bmux_contexts_plugin_api::contexts_state::ContextSummary,
+) -> Result<(), SelectionError> {
+    let binding = context
+        .attributes
+        .get("bmux.session_id")
+        .and_then(|value| Uuid::parse_str(value).ok());
+    if context.id != context_id || session_id.is_none() || binding != session_id {
+        return Err(SelectionError::InvalidTarget);
+    }
+    Ok(())
 }
 
 fn selection_operation(

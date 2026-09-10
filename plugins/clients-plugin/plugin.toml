@@ -1,11 +1,15 @@
-execution_class       = "native_fast"
-id                    = "bmux.clients"
-name                  = "bmux Clients"
-owns_namespaces       = []
+execution_class = "native_fast"
+id = "bmux.clients"
+name = "bmux Clients"
+owns_namespaces = []
 provided_capabilities = ["bmux.clients.read", "bmux.clients.write"]
-provided_features     = ["bmux.clients"]
-required_capabilities = ["bmux.contexts.write", "bmux.sessions.write"]
-version               = "0.0.1-alpha.0"
+provided_features = ["bmux.clients"]
+required_capabilities = [
+    "bmux.contexts.read",
+    "bmux.contexts.write",
+    "bmux.sessions.write",
+]
+version = "0.0.1-alpha.0"
 
 # clients-plugin's set-following handler dispatches to
 # `contexts-commands::select-context` and

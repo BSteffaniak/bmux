@@ -169,6 +169,38 @@ mod tests {
     }
 
     #[test]
+    fn commit_validation_rejects_mismatched_and_missing_bindings() {
+        let context_id = Uuid::from_u128(1);
+        let session = Uuid::from_u128(2);
+        let mut context = bmux_contexts_plugin_api::contexts_state::ContextSummary {
+            id: context_id,
+            name: None,
+            attributes: std::collections::BTreeMap::from([(
+                "bmux.session_id".to_string(),
+                session.to_string(),
+            )]),
+        };
+        assert!(crate::validate_selection_binding(context_id, Some(session), &context).is_ok());
+        assert_eq!(
+            crate::validate_selection_binding(context_id, Some(Uuid::from_u128(3)), &context),
+            Err(SelectionError::InvalidTarget)
+        );
+        assert_eq!(
+            crate::validate_selection_binding(Uuid::from_u128(4), Some(session), &context),
+            Err(SelectionError::InvalidTarget)
+        );
+        context.attributes.clear();
+        assert_eq!(
+            crate::validate_selection_binding(context_id, Some(session), &context),
+            Err(SelectionError::InvalidTarget)
+        );
+        assert_eq!(
+            crate::validate_selection_binding(context_id, None, &context),
+            Err(SelectionError::InvalidTarget)
+        );
+    }
+
+    #[test]
     fn commit_requires_reservation_and_coherent_target() {
         let mut state = FollowState::default();
         let client = ClientId(Uuid::from_u128(1));
