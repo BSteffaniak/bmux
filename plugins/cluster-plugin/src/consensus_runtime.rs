@@ -510,6 +510,14 @@ impl ConsensusNode {
         &self,
         command: Vec<u8>,
     ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
+        // Publication has a decoder, but no membership-serialized proposal path
+        // yet. Never let the generic raw writer bypass that compatibility boundary:
+        // apply-time rejection cannot protect an older recipient's decoder.
+        if command.starts_with(b"BMCAP001") {
+            return Err(ConsensusWriteError::Membership(
+                "capability publication requires membership-safe negotiated submission".into(),
+            ));
+        }
         match self.raft.ensure_linearizable().await {
             Ok(_) => {}
             Err(RaftError::Fatal(error)) => {
@@ -854,6 +862,30 @@ pub(crate) mod tests {
             Err(ControlServiceError::Rejected { .. })
         ));
         assert_eq!(node.persisted_control_state().unwrap().revision, 0);
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_publication_write_cannot_bypass_compatibility_gate() {
+        let root = TempDir::new().unwrap();
+        let node = ConsensusNode::start(
+            root.path(),
+            "publication-gate",
+            NodeId::from(95),
+            InMemoryNetworkFactory::default(),
+        )
+        .await
+        .unwrap();
+        node.initialize_single(NodeId::from(95), "node")
+            .await
+            .unwrap();
+        wait_for_leader(&[&node]).await;
+        let before = node.persisted_control_state().unwrap();
+        let result = node.write(b"BMCAP001".to_vec()).await;
+        assert!(
+            matches!(result, Err(ConsensusWriteError::Membership(reason)) if reason == "capability publication requires membership-safe negotiated submission")
+        );
+        assert_eq!(node.persisted_control_state().unwrap(), before);
         node.shutdown().await.unwrap();
     }
 

@@ -171,7 +171,11 @@ impl PublicationCommand {
         w.u16(1);
         w.u64(self.verified_at_unix_ms);
         w.u16(u16::try_from(self.reports.len()).map_err(|e| e.to_string())?);
+        let mut command_ids = std::collections::BTreeSet::new();
         for report in &self.reports {
+            if !command_ids.insert(report.command_id.value) {
+                return Err("duplicate publication mutation identity".into());
+            }
             if report.signature.len() != 64 {
                 return Err("invalid report signature length".into());
             }
@@ -383,6 +387,17 @@ mod tests {
             reports: vec![report.clone()],
             verified_at_unix_ms: 43,
         };
+        let mut duplicate_identity = command.clone();
+        let mut other = report.clone();
+        other.node_id.push('x');
+        duplicate_identity.reports.push(other);
+        let before = state.clone();
+        assert!(
+            state
+                .apply_publication(&duplicate_identity, membership)
+                .is_err()
+        );
+        assert_eq!(state, before);
         assert_eq!(state.apply_publication(&command, membership).unwrap(), 1);
         let bytes = state.encode_snapshot().unwrap();
         assert!(bytes.starts_with(b"BMSTA006"));
