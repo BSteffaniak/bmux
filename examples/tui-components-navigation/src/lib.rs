@@ -96,7 +96,7 @@ pub struct NavigationDemo {
 impl NavigationDemo {
     #[must_use]
     pub fn new() -> Self {
-        Self {
+        let mut demo = Self {
             focused: Target::Tabs,
             terminal_focused: true,
             captured: None,
@@ -120,7 +120,10 @@ impl NavigationDemo {
             text: ScrollViewState::new(),
             pane_scroll: ScrollViewState::new(),
             message: "Use arrows/Enter, wheel over scroll pane, q quits".to_string(),
-        }
+        };
+        // No committed scene exists yet, so no control claims visual focus.
+        demo.sync_focus();
+        demo
     }
 
     /// Install geometry only after terminal output has committed successfully.
@@ -153,14 +156,24 @@ impl NavigationDemo {
         self.committed_hits.as_ref().is_some_and(|hits| {
             hits.regions().iter().any(|region| {
                 region.enabled
+                    && region.visible
+                    && region.focus_scope.is_none()
                     && !region.area.is_empty()
                     && Self::target_for_id(region.id.as_str()) == Some(target)
             })
         })
     }
 
+    fn focus_eligible(&self, target: Target) -> bool {
+        self.committed_hits.as_ref().is_some_and(|hits| {
+            hits.focus_targets(None)
+                .iter()
+                .any(|id| Self::target_for_id(id.as_str()) == Some(target))
+        })
+    }
+
     fn sync_focus(&mut self) {
-        let active = self.terminal_focused && self.target_visible(self.focused);
+        let active = self.terminal_focused && self.focus_eligible(self.focused);
         self.tabs
             .set_focused(active && self.focused == Target::Tabs);
         self.breadcrumbs
@@ -237,7 +250,7 @@ impl NavigationDemo {
         {
             for _ in Target::ORDER {
                 self.focused = self.focused.next(stroke.modifiers.shift);
-                if self.target_visible(self.focused) {
+                if self.focus_eligible(self.focused) {
                     break;
                 }
             }
@@ -274,7 +287,7 @@ impl NavigationDemo {
                 }
             }
             Event::Key(_) | Event::Paste(_) => {
-                self.target_visible(self.focused).then_some(self.focused)
+                self.focus_eligible(self.focused).then_some(self.focused)
             }
             _ => None,
         };
@@ -1206,6 +1219,44 @@ mod tests {
             ));
         }
         assert_eq!(demo.tabs.selected(), Some(0));
+        assert!(demo.captured.is_none());
+    }
+
+    #[test]
+    fn pointer_only_region_does_not_grant_keyboard_focus() {
+        let mut demo = super::committed_demo();
+        let mut hits = bmux_tui::hit::HitMap::new();
+        hits.push(
+            bmux_tui::hit::HitRegion::new("navigation.list", super::LIST_AREA).focusable(false),
+        );
+        demo.focused = super::Target::List;
+        demo.commit_hits(&hits);
+        assert!(demo.target_visible(super::Target::List));
+        assert!(!demo.focus_eligible(super::Target::List));
+        assert!(!demo.list.interaction.focused);
+        let before = demo.list.focused();
+        demo.handle_event(&bmux_tui::event::Event::Key(
+            bmux_keyboard::KeyStroke::simple(bmux_keyboard::KeyCode::Down),
+        ));
+        assert_eq!(demo.list.focused(), before);
+    }
+
+    #[test]
+    fn hidden_committed_regions_cannot_keep_focus_or_capture() {
+        let mut demo = super::committed_demo();
+        demo.focused = super::Target::List;
+        demo.captured = Some(super::Target::List);
+        let mut hits = bmux_tui::hit::HitMap::new();
+        hits.push(
+            bmux_tui::hit::HitRegion::new(
+                "navigation.list",
+                bmux_tui::geometry::Rect::new(1, 1, 24, 4),
+            )
+            .visible(false),
+        );
+        demo.commit_hits(&hits);
+        assert!(!demo.target_visible(super::Target::List));
+        assert!(!demo.list.interaction.focused);
         assert!(demo.captured.is_none());
     }
 
