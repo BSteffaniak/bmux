@@ -1301,8 +1301,10 @@ fn handle_core_service_call(
                     details: format!("failed creating storage directory: {error}"),
                 })?;
             }
-            fs::write(path, &request.value).map_err(|error| PluginError::ServiceProtocol {
-                details: format!("failed writing storage value: {error}"),
+            write_storage_value(&path, &request.value).map_err(|error| {
+                PluginError::ServiceProtocol {
+                    details: format!("failed writing storage value: {error}"),
+                }
             })?;
             let fs_us = fs_started.elapsed().as_micros();
             let cache_started = Instant::now();
@@ -1665,6 +1667,33 @@ fn invoke_host_kernel_bridge(bridge: HostKernelBridge, payload: Vec<u8>) -> Resu
     output.truncate(output_len);
     let response: HostKernelBridgeResponse = decode_service_message(&output)?;
     Ok(response.payload)
+}
+
+/// Commit a complete value before publishing it to the process cache.
+fn write_storage_value(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("storage path has no parent"))?;
+    let temporary = path.with_extension(format!(
+        "pending-{}-{}",
+        std::process::id(),
+        NEXT_WRITE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn storage_file_path(connection: &HostConnectionInfo, plugin_id: &str, key: &str) -> PathBuf {

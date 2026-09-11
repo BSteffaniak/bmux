@@ -2,6 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod arrangements;
 mod storage_migration;
 
 use api_contexts_state::{ContextSelector, ContextSummary};
@@ -1139,6 +1140,7 @@ impl RustPlugin for TabsPlugin {
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         storage_migration::migrate(std::path::Path::new(&context.connection.data_dir))
             .map_err(PluginCommandError::failed)?;
+        arrangements::activate(&context).map_err(PluginCommandError::failed)?;
         // Register the typed event-bus channel for pane-event so
         // subscribers (decoration, future UI plugins) can wait on
         // `global_event_bus().subscribe::<PaneEvent>(...)` without
@@ -1176,6 +1178,9 @@ impl RustPlugin for TabsPlugin {
     #[allow(clippy::too_many_lines)] // route_service! covers every tabs-commands op; the block is naturally long.
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
+            "tabs-placement-v1", "place-tab" => |req: PlaceTabArgs, ctx| {
+                Ok(place_tab(ctx, req.context_id, req.workspace_id))
+            },
             "tabs-catalog-v1", "list-tabs" => |_req: (), ctx| {
                 Ok(list_catalog(ctx))
             },
@@ -1379,6 +1384,10 @@ impl RustPlugin for TabsPlugin {
             Arc::new(TabsCommandsHandle::new(shared.clone()));
         let _ = tabs_commands::register_provider(registry, commands);
 
+        let placement: Arc<
+            dyn bmux_tabs_plugin_api::tabs_placement_v1::TabsPlacementV1Service + Send + Sync,
+        > = Arc::new(TabsCommandsHandle::new(shared.clone()));
+        let _ = bmux_tabs_plugin_api::tabs_placement_v1::register_provider(registry, placement);
         let catalog: Arc<dyn TabsCatalogV1Service + Send + Sync> =
             Arc::new(TabsStateHandle::new(shared.clone()));
         let _ = tabs_catalog_v1::register_provider(registry, catalog);
@@ -1479,6 +1488,53 @@ fn handle_context_event(
     }
 }
 
+#[derive(Deserialize)]
+struct PlaceTabArgs {
+    context_id: Uuid,
+    workspace_id: Uuid,
+}
+
+fn place_tab(
+    caller: &(impl HostRuntimeApi + Sync),
+    context_id: Uuid,
+    workspace_id: Uuid,
+) -> Result<(), String> {
+    let mut client = dispatch_client(caller);
+    let workspaces = bmux_plugin::block_on_typed_dispatch(
+        bmux_workspaces_plugin_api::workspaces_state::client::list_workspaces(&mut client),
+    )
+    .map_err(|error| error.to_string())?;
+    if !workspaces
+        .iter()
+        .any(|workspace| workspace.id == workspace_id)
+    {
+        return Err(format!("unknown destination workspace {workspace_id}"));
+    }
+    let _context = list_contexts(caller)?
+        .into_iter()
+        .find(|context| context.id == context_id)
+        .ok_or_else(|| format!("unknown tab {context_id}"))?;
+    append_context_to_workspace_order(caller, workspace_id, context_id)?;
+    let mut client = dispatch_client(caller);
+    // Re-read after the durable append: a retry must preserve unrelated
+    // attributes updated since the transfer began.
+    let context = list_contexts(caller)?
+        .into_iter()
+        .find(|context| context.id == context_id)
+        .ok_or_else(|| format!("tab disappeared during placement: {context_id}"))?;
+    let mut attributes = context.attributes;
+    attributes.insert("workspace".into(), workspace_id.to_string());
+    bmux_plugin::block_on_typed_dispatch(contexts_commands::client::set_context_attributes(
+        &mut client,
+        context_selector_by_id(context_id),
+        attributes,
+    ))
+    .map_err(|error| error.to_string())?
+    .map_err(|error| format!("{error:?}"))?;
+    publish_tab_list_snapshot(caller, &TabRuntimeStateHandle::default());
+    Ok(())
+}
+
 // Serializes read/modify/write operations across command and event dispatch.
 // Readers use persisted state, never attachment-local order caches.
 static TAB_ORDER_MUTATION: Mutex<()> = Mutex::new(());
@@ -1518,6 +1574,12 @@ fn remove_context_from_all_workspace_orders(
     let _mutation = TAB_ORDER_MUTATION
         .lock()
         .map_err(|_| "tab order lock poisoned")?;
+    if let Some(mut orders) = arrangements::read(caller)? {
+        for order in orders.values_mut() {
+            order.retain(|id| *id != context_id);
+        }
+        return arrangements::write(caller, &orders);
+    }
     let mut client = dispatch_client(caller);
     let workspaces = bmux_plugin::block_on_typed_dispatch(
         bmux_workspaces_plugin_api::workspaces_state::client::list_workspaces(&mut client),
@@ -3055,7 +3117,8 @@ fn project_tab_order_ids(mut order_ids: Vec<Uuid>, contexts: &[ContextSummary]) 
         .iter()
         .map(|context| context.id)
         .collect::<HashSet<_>>();
-    order_ids.retain(|id| context_ids.contains(id));
+    let mut seen = HashSet::new();
+    order_ids.retain(|id| context_ids.contains(id) && seen.insert(*id));
     let mut known_ids = order_ids.iter().copied().collect::<HashSet<_>>();
     // Append missing contexts only in the returned projection, never
     // in persisted storage. `contexts` is MRU-first, so persisting
@@ -3085,6 +3148,9 @@ fn get_stored_tab_order_ids_for_workspace(
     caller: &impl HostRuntimeApi,
     workspace_id: Uuid,
 ) -> Result<Vec<Uuid>, String> {
+    if let Some(orders) = arrangements::read(caller)? {
+        return Ok(orders.get(&workspace_id).cloned().unwrap_or_default());
+    }
     let response = caller
         .storage_get(&StorageGetRequest::new(workspace_order_storage_key(
             workspace_id,
@@ -3119,6 +3185,10 @@ fn set_stored_tab_order_ids_for_workspace(
     workspace_id: Uuid,
     order_ids: &[Uuid],
 ) -> Result<(), String> {
+    if let Some(mut orders) = arrangements::read(caller)? {
+        orders.insert(workspace_id, order_ids.to_vec());
+        return arrangements::write(caller, &orders);
+    }
     caller
         .storage_set(&StorageSetRequest::new(
             workspace_order_storage_key(workspace_id),
@@ -3201,6 +3271,16 @@ struct TabsSharedState {
 /// directly without a per-call [`NativeServiceContext`].
 pub struct TabsCommandsHandle {
     shared: TabsSharedState,
+}
+
+impl bmux_tabs_plugin_api::tabs_placement_v1::TabsPlacementV1Service for TabsCommandsHandle {
+    fn place_tab<'a>(
+        &'a self,
+        context_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { place_tab(self.shared.caller.as_ref(), context_id, workspace_id) })
+    }
 }
 
 impl TabsCommandsHandle {
@@ -5271,6 +5351,37 @@ mod tests {
         assert_eq!(
             get_stored_tab_order_ids_for_workspace(&host, Uuid::nil()).unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn canonical_arrangements_override_legacy_and_round_trip_absent_resources() {
+        let host = MockHost::with_sessions(sample_sessions());
+        let absent = Uuid::from_u128(999);
+        let workspace = Uuid::from_u128(42);
+        let orders = BTreeMap::from([(workspace, vec![absent]), (Uuid::nil(), vec![])]);
+        arrangements::write(&host, &orders).unwrap();
+        set_stored_tab_order_ids(&host, &[Uuid::from_u128(1)]).unwrap();
+        assert!(
+            get_stored_tab_order_ids_for_workspace(&host, Uuid::nil())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(arrangements::read(&host).unwrap(), Some(orders));
+        let replacement = BTreeMap::from([(workspace, vec![Uuid::from_u128(1000), absent])]);
+        arrangements::write(&host, &replacement).unwrap();
+        assert_eq!(arrangements::read(&host).unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn canonical_close_removes_references_from_unlisted_workspaces() {
+        let host = MockHost::with_sessions(sample_sessions());
+        let id = Uuid::from_u128(99);
+        arrangements::write(&host, &BTreeMap::from([(Uuid::from_u128(42), vec![id])])).unwrap();
+        remove_context_from_all_workspace_orders(&host, id).unwrap();
+        assert_eq!(
+            arrangements::read(&host).unwrap().unwrap()[&Uuid::from_u128(42)],
+            Vec::<Uuid>::new()
         );
     }
 

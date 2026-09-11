@@ -4,6 +4,8 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+mod snapshot;
+
 use bmux_clients_plugin_api::clients_state;
 use bmux_contexts_plugin_api::{contexts_commands, contexts_state};
 use bmux_plugin::{
@@ -146,7 +148,10 @@ impl RustPlugin for WorkspacesPlugin {
             selected_context_by_client_workspace: HashMap::new(),
         };
         state.ensure_default();
+        save_catalog(&context, &state.records)
+            .map_err(|error| PluginCommandError::failed(format!("{error:?}")))?;
         let state = Arc::new(RwLock::new(state));
+        snapshot::register(&context, Arc::clone(&state)).map_err(PluginCommandError::failed)?;
         global_plugin_state_registry().register::<WorkspaceState>(&state);
         global_event_bus().register_channel::<WorkspaceEvent>(workspaces_events::EVENT_KIND);
         Ok(EXIT_OK)
@@ -365,26 +370,18 @@ fn set_context_workspace(
     context: &contexts_state::ContextSummary,
     workspace_id: Uuid,
 ) -> Result<(), WorkspaceCommandError> {
-    let mut attributes = context.attributes.clone();
-    attributes.insert("workspace".to_string(), workspace_attribute(workspace_id));
     let mut client = dispatch_client(caller);
-    let result =
-        bmux_plugin::block_on_typed_dispatch(contexts_commands::client::set_context_attributes(
+    bmux_plugin::block_on_typed_dispatch(
+        bmux_tabs_plugin_api::tabs_placement_v1::client::place_tab(
             &mut client,
-            contexts_state::ContextSelector {
-                id: Some(context.id),
-                name: None,
-            },
-            attributes,
-        ))
-        .map_err(|error| WorkspaceCommandError::Failed {
-            reason: format!("set-context-attributes failed: {error}"),
-        })?;
-    result
-        .map(|_| ())
-        .map_err(|error| WorkspaceCommandError::Failed {
-            reason: format!("set-context-attributes failed: {error:?}"),
-        })
+            context.id,
+            workspace_id,
+        ),
+    )
+    .map_err(|error| WorkspaceCommandError::Failed {
+        reason: format!("tab placement unavailable: {error}"),
+    })?
+    .map_err(|reason| WorkspaceCommandError::Failed { reason })
 }
 
 fn effective_workspace(
@@ -1355,6 +1352,20 @@ mod tests {
                         session_id: None,
                     });
                     encode_service_message(&result)
+                }
+                ("tabs-placement-v1", "place-tab") => {
+                    let request: bmux_tabs_plugin_api::tabs_placement_v1::client::PlaceTabRequest =
+                        decode_service_message(&payload)?;
+                    let mut contexts = self.contexts.lock().unwrap();
+                    let context = contexts
+                        .iter_mut()
+                        .find(|context| context.id == request.context_id)
+                        .unwrap();
+                    context
+                        .attributes
+                        .insert("workspace".into(), request.workspace_id.to_string());
+                    drop(contexts);
+                    encode_service_message(&Ok::<(), String>(()))
                 }
                 ("contexts-commands", "set-context-attributes") => {
                     #[derive(Deserialize)]

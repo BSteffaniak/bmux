@@ -14,6 +14,14 @@ plugin bmux.tabs version 1;
 capability TABS_READ = bmux.tabs.read;
 capability TABS_WRITE = bmux.tabs.write;
 
+@capability(TABS_WRITE)
+interface tabs-placement-v1 {
+    // Append a live tab to the destination arrangement before changing its
+    // workspace attribute. Source references are retained, never destroyed.
+    // Retrying an interrupted transfer is idempotent.
+    command place-tab(context-id: uuid, workspace-id: uuid) -> result<unit, string>;
+}
+
 @capability(TABS_READ)
 interface tabs-state {
     // A pane's current lifecycle status.
