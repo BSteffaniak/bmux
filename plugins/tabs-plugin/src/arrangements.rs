@@ -9,7 +9,55 @@ use bmux_plugin_sdk::{
     StorageSetRequest,
 };
 use bmux_snapshot_runtime::StatefulPluginRegistry;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct State {
+    pub orders: BTreeMap<uuid::Uuid, Vec<uuid::Uuid>>,
+    pub pending: BTreeMap<uuid::Uuid, uuid::Uuid>,
+}
+
+fn state_key() -> bmux_plugin_sdk::StorageKey {
+    bmux_plugin_sdk::storage_key!("tabs.arrangements.v2")
+}
+
+pub fn read_state(caller: &impl HostRuntimeApi) -> Result<Option<State>, String> {
+    if let Some(bytes) = caller
+        .storage_get(&StorageGetRequest::new(state_key()))
+        .map_err(|error| error.to_string())?
+        .value
+    {
+        return decode_state(&bytes).map(Some);
+    }
+    caller
+        .storage_get(&StorageGetRequest::new(key()))
+        .map_err(|error| error.to_string())?
+        .value
+        .map(|bytes| {
+            decode(&bytes).map(|orders| State {
+                orders,
+                pending: BTreeMap::new(),
+            })
+        })
+        .transpose()
+}
+
+fn decode_state(bytes: &[u8]) -> Result<State, String> {
+    let state: State = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    decode(&serde_json::to_vec(&state.orders).map_err(|error| error.to_string())?)?;
+    Ok(state)
+}
+
+pub fn write_state(caller: &impl HostRuntimeApi, state: &State) -> Result<(), String> {
+    caller
+        .storage_set(&StorageSetRequest::new(
+            state_key(),
+            serde_json::to_vec(state).map_err(|error| error.to_string())?,
+        ))
+        .map_err(|error| error.to_string())
+}
 
 const ID: PluginEventKind = PluginEventKind::from_static("bmux.tabs/arrangements");
 fn key() -> bmux_plugin_sdk::StorageKey {
@@ -19,12 +67,7 @@ fn key() -> bmux_plugin_sdk::StorageKey {
 pub fn read(
     caller: &impl HostRuntimeApi,
 ) -> Result<Option<BTreeMap<uuid::Uuid, Vec<uuid::Uuid>>>, String> {
-    caller
-        .storage_get(&StorageGetRequest::new(key()))
-        .map_err(|error| error.to_string())?
-        .value
-        .map(|bytes| decode(&bytes))
-        .transpose()
+    read_state(caller).map(|state| state.map(|state| state.orders))
 }
 
 fn decode(bytes: &[u8]) -> Result<BTreeMap<uuid::Uuid, Vec<uuid::Uuid>>, String> {
@@ -43,12 +86,9 @@ pub fn write(
     caller: &impl HostRuntimeApi,
     orders: &BTreeMap<uuid::Uuid, Vec<uuid::Uuid>>,
 ) -> Result<(), String> {
-    caller
-        .storage_set(&StorageSetRequest::new(
-            key(),
-            serde_json::to_vec(orders).map_err(|error| error.to_string())?,
-        ))
-        .map_err(|error| error.to_string())?;
+    let mut state = read_state(caller)?.unwrap_or_default();
+    state.orders = orders.clone();
+    write_state(caller, &state)?;
     if let Some(flag) =
         global_plugin_state_registry().get::<bmux_snapshot_runtime::SnapshotDirtyFlagHandle>()
     {
@@ -116,6 +156,17 @@ pub fn activate(context: &NativeLifecycleContext) -> Result<(), String> {
     Ok(())
 }
 
+fn snapshot_state(snapshot: &StatefulPluginSnapshot) -> Result<State, String> {
+    match snapshot.version {
+        1 => decode(&snapshot.bytes).map(|orders| State {
+            orders,
+            pending: BTreeMap::new(),
+        }),
+        2 => decode_state(&snapshot.bytes),
+        version => Err(format!("unsupported arrangement version {version}")),
+    }
+}
+
 struct Arrangements {
     caller: TypedServiceCaller,
 }
@@ -136,7 +187,7 @@ impl StatefulPlugin for Arrangements {
                     plugin: ID.as_str().into(),
                     details: "tab order lock poisoned".into(),
                 })?;
-        let orders = read(&self.caller)
+        let orders = read_state(&self.caller)
             .and_then(|value| value.ok_or_else(|| "arrangement authority missing".into()))
             .map_err(|details| StatefulPluginError::SnapshotFailed {
                 plugin: ID.as_str().into(),
@@ -147,17 +198,17 @@ impl StatefulPlugin for Arrangements {
                 plugin: ID.as_str().into(),
                 details: error.to_string(),
             })?;
-        Ok(StatefulPluginSnapshot::new(ID, 1, bytes))
+        Ok(StatefulPluginSnapshot::new(ID, 2, bytes))
     }
     fn validate_snapshot(&self, snapshot: &StatefulPluginSnapshot) -> StatefulPluginResult<()> {
-        if snapshot.version != 1 {
+        if !matches!(snapshot.version, 1 | 2) {
             return Err(StatefulPluginError::UnsupportedVersion {
                 plugin: ID.as_str().into(),
                 version: snapshot.version,
-                expected: vec![1],
+                expected: vec![1, 2],
             });
         }
-        decode(&snapshot.bytes)
+        snapshot_state(snapshot)
             .map(|_| ())
             .map_err(|details| StatefulPluginError::RestoreFailed {
                 plugin: ID.as_str().into(),
@@ -167,10 +218,12 @@ impl StatefulPlugin for Arrangements {
     fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
         self.validate_snapshot(&snapshot)?;
         let restore = || -> Result<(), String> {
-            let _guard = TAB_ORDER_MUTATION
+            let guard = TAB_ORDER_MUTATION
                 .lock()
                 .map_err(|_| "tab order lock poisoned")?;
-            write(&self.caller, &decode(&snapshot.bytes)?)?;
+            write_state(&self.caller, &snapshot_state(&snapshot)?)?;
+            drop(guard);
+            super::recover_tab_placements(&self.caller)?;
             super::publish_tab_list_snapshot(
                 &self.caller,
                 &super::TabRuntimeStateHandle::default(),
@@ -187,6 +240,19 @@ impl StatefulPlugin for Arrangements {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_versions_preserve_pending_intent_and_reject_unknown_versions() {
+        let state = State {
+            orders: BTreeMap::new(),
+            pending: BTreeMap::from([(uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2))]),
+        };
+        let snapshot = StatefulPluginSnapshot::new(ID, 2, serde_json::to_vec(&state).unwrap());
+        assert_eq!(snapshot_state(&snapshot).unwrap().pending, state.pending);
+        let legacy = StatefulPluginSnapshot::new(ID, 1, b"{}".to_vec());
+        assert!(snapshot_state(&legacy).unwrap().pending.is_empty());
+        assert!(snapshot_state(&StatefulPluginSnapshot::new(ID, 3, b"{}".to_vec())).is_err());
+    }
+
     #[test]
     fn rejects_corrupt_and_duplicate_references() {
         assert!(decode(b"not-json").is_err());

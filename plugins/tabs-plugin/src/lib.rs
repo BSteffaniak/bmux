@@ -1356,6 +1356,9 @@ impl RustPlugin for TabsPlugin {
                 // Serialize effects and await blocking work even during shutdown:
                 // cancellation cannot make an in-flight service call disappear.
                 worker.spawn_blocking(move || {
+                    if let Err(error) = recover_tab_placements(shared.caller.as_ref()) {
+                        log_tab_rename_error(shared.caller.as_ref(), format!("tab placement recovery required: {error}"));
+                    }
                     if let Some(event) = event { handle_context_event(&shared, &event); }
                     else { publish_tab_list_snapshot(shared.caller.as_ref(), &shared.runtime_state); }
                 }).await.map_err(|error| error.to_string())?;
@@ -1514,6 +1517,36 @@ fn place_tab(
         .into_iter()
         .find(|context| context.id == context_id)
         .ok_or_else(|| format!("unknown tab {context_id}"))?;
+    let _transfer = TAB_TRANSFER_MUTATION
+        .lock()
+        .map_err(|_| "tab transfer lock poisoned")?;
+    {
+        let _mutation = TAB_ORDER_MUTATION
+            .lock()
+            .map_err(|_| "tab order lock poisoned")?;
+        let mut state = arrangements::read_state(caller)?.ok_or("arrangement authority missing")?;
+        if state
+            .pending
+            .get(&context_id)
+            .is_some_and(|id| *id != workspace_id)
+        {
+            return Err("tab has an incomplete transfer to another workspace".into());
+        }
+        state.pending.insert(context_id, workspace_id);
+        arrangements::write_state(caller, &state)?;
+    }
+    complete_tab_placement(caller, context_id, workspace_id)?;
+    publish_tab_list_snapshot(caller, &TabRuntimeStateHandle::default());
+    Ok(())
+}
+
+static TAB_TRANSFER_MUTATION: Mutex<()> = Mutex::new(());
+
+fn complete_tab_placement(
+    caller: &(impl HostRuntimeApi + Sync),
+    context_id: Uuid,
+    workspace_id: Uuid,
+) -> Result<(), String> {
     append_context_to_workspace_order(caller, workspace_id, context_id)?;
     let mut client = dispatch_client(caller);
     // Re-read after the durable append: a retry must preserve unrelated
@@ -1531,7 +1564,29 @@ fn place_tab(
     ))
     .map_err(|error| error.to_string())?
     .map_err(|error| format!("{error:?}"))?;
-    publish_tab_list_snapshot(caller, &TabRuntimeStateHandle::default());
+    let _mutation = TAB_ORDER_MUTATION
+        .lock()
+        .map_err(|_| "tab order lock poisoned")?;
+    let mut state = arrangements::read_state(caller)?.ok_or("arrangement authority missing")?;
+    state.pending.remove(&context_id);
+    arrangements::write_state(caller, &state)?;
+    Ok(())
+}
+
+fn recover_tab_placements(caller: &(impl HostRuntimeApi + Sync)) -> Result<(), String> {
+    let _transfer = TAB_TRANSFER_MUTATION
+        .lock()
+        .map_err(|_| "tab transfer lock poisoned")?;
+    let Some(state) = arrangements::read_state(caller)? else {
+        return Ok(());
+    };
+    let contexts = list_contexts(caller)?;
+    for (context_id, workspace_id) in state.pending {
+        // An incomplete restore is not evidence that the resource was deleted.
+        if contexts.iter().any(|context| context.id == context_id) {
+            complete_tab_placement(caller, context_id, workspace_id)?;
+        }
+    }
     Ok(())
 }
 
@@ -1578,7 +1633,10 @@ fn remove_context_from_all_workspace_orders(
         for order in orders.values_mut() {
             order.retain(|id| *id != context_id);
         }
-        return arrangements::write(caller, &orders);
+        let mut state = arrangements::read_state(caller)?.ok_or("arrangement authority missing")?;
+        state.pending.remove(&context_id);
+        state.orders = orders;
+        return arrangements::write_state(caller, &state);
     }
     let mut client = dispatch_client(caller);
     let workspaces = bmux_plugin::block_on_typed_dispatch(
@@ -5371,6 +5429,28 @@ mod tests {
         let replacement = BTreeMap::from([(workspace, vec![Uuid::from_u128(1000), absent])]);
         arrangements::write(&host, &replacement).unwrap();
         assert_eq!(arrangements::read(&host).unwrap(), Some(replacement));
+    }
+
+    #[test]
+    fn pending_transfer_survives_order_mutation_and_snapshot_round_trip() {
+        let host = MockHost::with_sessions(sample_sessions());
+        let context = Uuid::from_u128(99);
+        let workspace = Uuid::from_u128(42);
+        let state = arrangements::State {
+            orders: BTreeMap::from([(workspace, vec![context])]),
+            pending: BTreeMap::from([(context, workspace)]),
+        };
+        arrangements::write_state(&host, &state).unwrap();
+        set_stored_tab_order_ids_for_workspace(&host, Uuid::nil(), &[]).unwrap();
+        let restored = arrangements::read_state(&host).unwrap().unwrap();
+        assert_eq!(restored.pending, state.pending);
+        assert_eq!(restored.orders[&workspace], vec![context]);
+        // Missing resources during restore leave durable intent untouched.
+        recover_tab_placements(&host).unwrap();
+        assert_eq!(
+            arrangements::read_state(&host).unwrap().unwrap().pending,
+            state.pending
+        );
     }
 
     #[test]
