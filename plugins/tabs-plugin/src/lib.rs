@@ -1109,12 +1109,10 @@ fn emit_pane_event(event: bmux_tabs_plugin_api::tabs_events::PaneEvent) {
         bmux_plugin::global_event_bus().emit(&bmux_tabs_plugin_api::tabs_events::EVENT_KIND, event);
 }
 
-/// Shared "last selected pane per client" map. Mutated by the
-/// byte-encoded `switch-tab` handler (via the plugin's mutable
-/// access in `invoke_service`) AND by the typed
-/// [`TabsCommandsService::switch_tab`] impl (via a clone of the
-/// same [`Arc<Mutex<_>>`]). Both paths observe the same state.
-type LastSelectedByClient = Arc<Mutex<BTreeMap<Uuid, Uuid>>>;
+/// Shared previous-tab history keyed by caller and workspace. Callers without
+/// an attachment identity have a separate slot and never supply client history.
+/// Command handlers and typed services share the same map.
+type LastSelectedByClient = Arc<Mutex<BTreeMap<(Option<Uuid>, Uuid), Uuid>>>;
 
 #[derive(Debug, Default)]
 struct TabRuntimeState {
@@ -2553,26 +2551,21 @@ fn switch_tab_with_contexts(
     select_context(caller, context_selector_by_id(context_id))?;
     let context_select_us = select_started.elapsed().as_micros();
     let remember_started = Instant::now();
-    let remembered_for_client = if let Some(client_id) = caller_client_id
-        && let Some(previous) = previous_context
-        && previous != context_id
-        && let Ok(mut map) = last_selected_by_client.lock()
-    {
-        map.insert(client_id, previous);
-        true
-    } else {
-        false
-    };
+    // Crossing a workspace boundary must not replace either workspace's
+    // previous tab. Workspace selection restores the active tab separately.
     if let Some(previous) = previous_context
         && previous != context_id
-        && !remembered_for_client
+        && let Some(previous_summary) = contexts.iter().find(|entry| entry.id == previous)
+        && let Some(selected_summary) = contexts.iter().find(|entry| entry.id == context_id)
+        && context_workspace_id(previous_summary) == context_workspace_id(selected_summary)
     {
-        let _ = set_runtime_context_id(
-            caller,
-            runtime_state,
-            PREVIOUS_TAB_CONTEXT_KEY,
-            Some(previous),
-        );
+        last_selected_by_client
+            .lock()
+            .map_err(|_| "tab history lock poisoned".to_string())?
+            .insert(
+                (caller_client_id, context_workspace_id(selected_summary)),
+                previous,
+            );
     }
     let _ = set_runtime_context_id(
         caller,
@@ -2692,18 +2685,12 @@ fn cycle_tab(
             contexts[(current_index + contexts.len() - 1) % contexts.len()].id
         }
         TabCycleDirection::Last => {
-            let remembered_by_client = caller_client_id.and_then(|client_id| {
-                last_selected_by_client
-                    .lock()
-                    .ok()
-                    .and_then(|map| map.get(&client_id).copied())
-            });
-            let remembered = remembered_by_client
-                .or_else(|| {
-                    get_runtime_context_id(caller, runtime_state, PREVIOUS_TAB_CONTEXT_KEY)
-                        .ok()
-                        .flatten()
-                })
+            let workspace_id = context_workspace_id(&contexts[current_index]);
+            let remembered = last_selected_by_client
+                .lock()
+                .map_err(|_| "tab history lock poisoned".to_string())?
+                .get(&(caller_client_id, workspace_id))
+                .copied()
                 .ok_or_else(|| "no previously active tab available".to_string())?;
             if !contexts.iter().any(|context| context.id == remembered) {
                 return Err("no previously active tab available".to_string());
@@ -4872,6 +4859,22 @@ mod tests {
             payload: Vec<u8>,
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
             match (interface_id, operation) {
+                ("workspaces-state", "current-workspace") => {
+                    let selected = *self.selected_session_id.lock().unwrap();
+                    let workspace = self
+                        .sessions
+                        .iter()
+                        .find(|entry| Some(entry.id) == selected)
+                        .map(|context| {
+                            bmux_workspaces_plugin_api::workspaces_state::WorkspaceSummary {
+                                id: context_workspace_id(context),
+                                name: "test workspace".to_string(),
+                                tab_ids: Vec::new(),
+                                active: true,
+                            }
+                        });
+                    encode_service_message(&workspace)
+                }
                 // Typed contexts-plugin-api interfaces (the canonical
                 // cross-plugin dispatch path used by KernelOps after
                 // the `Request::*Context*` IPC variants were retired).
@@ -5894,6 +5897,118 @@ mod tests {
         assert!(ack.ok);
         let target_text = target_id.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
+    }
+
+    #[test]
+    fn last_tab_history_survives_workspace_round_trips() {
+        for client_id in [None, Some(Uuid::new_v4())] {
+            let workspace_a = Uuid::new_v4();
+            let workspace_b = Uuid::new_v4();
+            let sessions: Vec<_> = [workspace_a, workspace_a, workspace_b, workspace_b]
+                .into_iter()
+                .map(|workspace| SessionSummary {
+                    id: Uuid::new_v4(),
+                    name: None,
+                    attributes: BTreeMap::from([("workspace".to_string(), workspace.to_string())]),
+                })
+                .collect();
+            let ids: Vec<_> = sessions.iter().map(|session| session.id).collect();
+            let host = MockHost::with_sessions(sessions);
+            let history = LastSelectedByClient::default();
+            let runtime = runtime_state();
+
+            // Workspace selection uses the contexts service, then publishes
+            // an active-context update; it does not run a tab navigation command.
+            let restore_workspace = |target| {
+                select_context(&host, context_selector_by_id(target)).unwrap();
+                mark_context_active(&host, &runtime, target).unwrap();
+            };
+            for (target, workspace_switch) in [
+                (ids[1], false),
+                (ids[2], true),
+                (ids[3], false),
+                (ids[1], true),
+            ] {
+                if workspace_switch {
+                    restore_workspace(target);
+                } else {
+                    switch_tab(
+                        &host,
+                        &runtime,
+                        context_selector_by_id(target),
+                        &history,
+                        client_id,
+                    )
+                    .unwrap();
+                }
+            }
+            for expected in [ids[0], ids[1], ids[0]] {
+                let ack = cycle_tab(
+                    &host,
+                    &runtime,
+                    TabCycleDirection::Last,
+                    &history,
+                    client_id,
+                )
+                .unwrap();
+                assert_eq!(ack.id, Some(expected.to_string()));
+            }
+            restore_workspace(ids[3]);
+            let ack = cycle_tab(
+                &host,
+                &runtime,
+                TabCycleDirection::Last,
+                &history,
+                client_id,
+            )
+            .unwrap();
+            assert_eq!(ack.id, Some(ids[2].to_string()));
+
+            // An unrelated attachment cannot borrow this caller's history,
+            // even if the legacy global slot contains a valid tab.
+            set_runtime_context_id(&host, &runtime, PREVIOUS_TAB_CONTEXT_KEY, Some(ids[3]))
+                .unwrap();
+            assert!(
+                cycle_tab(
+                    &host,
+                    &runtime,
+                    TabCycleDirection::Last,
+                    &history,
+                    Some(Uuid::new_v4())
+                )
+                .is_err()
+            );
+
+            // A removed or moved tab must not become an input target.
+            history
+                .lock()
+                .unwrap()
+                .insert((client_id, workspace_b), ids[0]);
+            assert!(
+                cycle_tab(
+                    &host,
+                    &runtime,
+                    TabCycleDirection::Last,
+                    &history,
+                    client_id
+                )
+                .is_err()
+            );
+            history
+                .lock()
+                .unwrap()
+                .insert((client_id, workspace_b), Uuid::new_v4());
+            assert!(
+                cycle_tab(
+                    &host,
+                    &runtime,
+                    TabCycleDirection::Last,
+                    &history,
+                    client_id
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
