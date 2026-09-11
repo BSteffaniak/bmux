@@ -71,7 +71,7 @@ use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::hash::{Hash, Hasher};

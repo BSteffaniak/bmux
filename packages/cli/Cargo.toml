@@ -149,7 +149,7 @@ bmux_image = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm = { workspace = true, features = ["events", "event-stream"] }
 dirs = { workspace = true }
-futures = { workspace = true }
+futures-util = { workspace = true }
 git_sshripped_recipient = { workspace = true }
 git_sshripped_ssh_agent = { workspace = true }
 git_sshripped_ssh_identity = { workspace = true }
