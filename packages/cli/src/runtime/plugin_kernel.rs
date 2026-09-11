@@ -37,6 +37,9 @@ use super::{
 };
 
 thread_local! {
+    // A caller-process command can borrow the invoking transport through a
+    // bounded request pump. Never substitute a fresh connection on this route.
+    static INVOKING_TRANSPORT: RefCell<Option<tokio::sync::mpsc::Sender<InvokingTransportRequest>>> = const { RefCell::new(None) };
     static SERVICE_KERNEL_CONTEXT: RefCell<Option<ServiceInvokeContext>> = const { RefCell::new(None) };
     static HOST_KERNEL_CONNECTION: RefCell<Option<HostConnectionInfo>> = const { RefCell::new(None) };
     static HOST_KERNEL_CLIENT_FACTORY: RefCell<Option<KernelClientFactory>> = const { RefCell::new(None) };
@@ -243,7 +246,38 @@ fn call_host_kernel_via_factory(factory: &KernelClientFactory, payload: &[u8]) -
     bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
 }
 
+pub(super) struct InvokingTransportRequest {
+    pub request: bmux_ipc::Request,
+    pub response: std::sync::mpsc::SyncSender<Result<bmux_ipc::Response>>,
+}
+
+pub(super) struct InvokingTransportGuard;
+
+impl Drop for InvokingTransportGuard {
+    fn drop(&mut self) {
+        INVOKING_TRANSPORT.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+pub(super) fn enter_invoking_transport(
+    sender: tokio::sync::mpsc::Sender<InvokingTransportRequest>,
+) -> InvokingTransportGuard {
+    INVOKING_TRANSPORT.with(|slot| *slot.borrow_mut() = Some(sender));
+    InvokingTransportGuard
+}
+
 fn call_host_kernel_bridge_payload(payload: &[u8]) -> Result<Vec<u8>> {
+    if let Some(sender) = INVOKING_TRANSPORT.with(|slot| slot.borrow().clone()) {
+        let request = bmux_ipc::decode(payload).context("invalid invoking transport request")?;
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        sender
+            .blocking_send(InvokingTransportRequest { request, response })
+            .map_err(|_| anyhow::anyhow!("invoking transport closed"))?;
+        let response = receiver
+            .recv()
+            .context("invoking transport response closed")??;
+        return bmux_ipc::encode(&response).context("invalid invoking transport response");
+    }
     if let Some(context) = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone()) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             tokio::task::block_in_place(|| {

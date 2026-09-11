@@ -5983,14 +5983,38 @@ pub async fn handle_attach_plugin_command_action(
         AttachPluginCommandExecutionRoute::ProviderPipeline => {
             run_attach_plugin_command_pipeline(client, plugin_id, command_name, args).await
         }
-        AttachPluginCommandExecutionRoute::CallerProcess => run_attach_plugin_command_local(
-            plugin_id,
-            command_name,
-            args,
-            kernel_client_factory,
-            view_state.self_client_id,
-            active_keybindings,
-        ),
+        AttachPluginCommandExecutionRoute::CallerProcess => {
+            let (sender, mut requests) = tokio::sync::mpsc::channel::<
+                super::super::plugin_kernel::InvokingTransportRequest,
+            >(1);
+            let plugin_id = plugin_id.to_string();
+            let command_name = command_name.to_string();
+            let args = args.to_vec();
+            let factory = kernel_client_factory.cloned();
+            let caller = view_state.self_client_id;
+            let command = tokio::task::spawn_blocking(move || {
+                let _transport = super::super::plugin_kernel::enter_invoking_transport(sender);
+                run_attach_plugin_command_local(
+                    &plugin_id,
+                    &command_name,
+                    &args,
+                    factory.as_ref(),
+                    caller,
+                    active_keybindings,
+                )
+            });
+            while let Some(request) = requests.recv().await {
+                let response = client
+                    .request_raw(request.request)
+                    .await
+                    .map_err(anyhow::Error::from);
+                let _ = request.response.send(response);
+            }
+            command.await.map_err(|error| ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("caller command task failed: {error}"),
+            })?
+        }
     };
     match command_execution {
         Err(error) => {

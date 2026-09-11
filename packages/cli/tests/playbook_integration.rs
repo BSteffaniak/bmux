@@ -252,6 +252,16 @@ fn playbook_run_interactive_step_controls() {
 
 #[test]
 #[serial]
+fn finder_recency_uses_invoking_attachment_across_workspaces() {
+    let (json, pass) = run_playbook_fixture("finder_cross_workspace_recency.dsl");
+    assert!(
+        pass,
+        "cross-workspace recency should use attachment history: {json:#}"
+    );
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_finder_switches_sandbox_tabs() {
     let (json, pass) = run_playbook_fixture("tab_navigation_finder_real_attach.dsl");
     assert!(
