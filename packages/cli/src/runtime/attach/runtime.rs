@@ -14785,6 +14785,15 @@ mod tests {
             assert!(rendered.contains(label), "missing menu label: {label}");
         }
         assert!(!resources.surfaces.surfaces().is_empty());
+        let popup_snapshot = resources.surfaces.owner_snapshot("bmux.tab_bar").unwrap();
+        for surface in &popup_snapshot.surfaces {
+            for region in &surface.interactive_regions {
+                if let Some(endpoint) = &region.endpoint {
+                    resources.input.committed(endpoint, popup_snapshot.revision);
+                }
+            }
+        }
+        exercise_installed_menu_hover(client, state, resources).await;
         let key = super::super::input::TerminalKeyEvent::from(KeyEvent::new(
             KeyCode::Enter,
             KeyModifiers::NONE,
@@ -14795,6 +14804,75 @@ mod tests {
                 .unwrap()
         );
         assert!(state.plugin_focus.focused().is_none());
+    }
+
+    #[cfg(feature = "bundled-plugin-tab-bar")]
+    async fn exercise_installed_menu_hover(
+        client: &mut bmux_client::StreamingBmuxClient,
+        state: &mut super::AttachViewState,
+        resources: &bmux_plugin::AttachPresentationResources,
+    ) {
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        for item in ["item.1", "item.2", "item.1"] {
+            let before = resources.surfaces.owner_snapshot("bmux.tab_bar").unwrap();
+            let popup = before
+                .surfaces
+                .iter()
+                .find(|surface| surface.id.local_id == "menu")
+                .unwrap();
+            let bmux_plugin::surface::PluginSurfaceTarget::Explicit(rect) = popup.target else {
+                panic!("popup");
+            };
+            let hit = popup
+                .interactive_regions
+                .iter()
+                .find(|hit| hit.local_id == item)
+                .unwrap();
+            let mouse = MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: rect.x + hit.rect.x,
+                row: rect.y + hit.rect.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(
+                super::try_handle_plugin_surface_mouse(client, state, mouse)
+                    .await
+                    .unwrap()
+            );
+            let after = resources.surfaces.owner_snapshot("bmux.tab_bar").unwrap();
+            assert!(after.revision > before.revision);
+            let next_popup = after
+                .surfaces
+                .iter()
+                .find(|surface| surface.id.local_id == "menu")
+                .unwrap();
+            assert_ne!(popup.ops, next_popup.ops);
+            let lowered = super::retained_plugin_surfaces(state, viewport);
+            super::replace_retained_surfaces(
+                state,
+                lowered,
+                viewport,
+                DamageCoalescingPolicy::default(),
+            );
+            for region in &next_popup.interactive_regions {
+                if let Some(endpoint) = &region.endpoint {
+                    resources.input.committed(endpoint, after.revision);
+                }
+            }
+            assert!(
+                super::try_handle_plugin_surface_mouse(client, state, mouse)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                resources
+                    .surfaces
+                    .owner_snapshot("bmux.tab_bar")
+                    .unwrap()
+                    .revision,
+                after.revision
+            );
+        }
     }
 
     #[cfg(feature = "bundled-plugin-tab-bar")]

@@ -6350,6 +6350,12 @@ mod tests {
             hovered_pane: None,
         };
         assert!(resources.input.invoke(&endpoint, &event).unwrap().consumed);
+        let revision = resources
+            .surfaces
+            .owner_snapshot("bmux.tab_bar")
+            .unwrap()
+            .revision;
+        resources.input.committed(&endpoint, revision);
         event.event_kind = "key".into();
         event.phase = "press".into();
         event.key = Some("enter".into());

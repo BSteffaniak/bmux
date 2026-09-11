@@ -221,8 +221,7 @@ struct CompanionState {
     editing_tab_id: Option<Uuid>,
     edit_buffer: rename_input::RenameInput,
     menu_tab_id: Option<Uuid>,
-    menu_selected: usize,
-    menu_pressed: Option<usize>,
+    menu: menu::MenuInput,
     local_presentation: AttachLocalPresentationSnapshot,
     catalog: tabs_list::TabListSnapshot,
     selected_context_id: Option<Uuid>,
@@ -255,8 +254,7 @@ impl CompanionState {
             editing_tab_id: None,
             edit_buffer: rename_input::RenameInput::default(),
             menu_tab_id: None,
-            menu_selected: 0,
-            menu_pressed: None,
+            menu: menu::MenuInput::default(),
             local_presentation: AttachLocalPresentationSnapshot::initial(),
             catalog: tabs_list::TabListSnapshot {
                 tabs: Vec::new(),
@@ -452,6 +450,7 @@ fn register_presentation_input(
                 && let Some(companion) = guard.as_mut()
             {
                 rename_input::acknowledge(&mut companion.edit_buffer, revision);
+                companion.menu.geometry.acknowledge(revision);
             }
         }),
     );
@@ -771,6 +770,8 @@ fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
     surfaces.extend(menu::surfaces(companion, revision));
     let revision = publish_surface(&companion.surfaces, revision, surfaces)?;
     rename_input::stage(&mut companion.edit_buffer, revision, viewport);
+    let viewport = menu::viewport(companion);
+    companion.menu.geometry.stage(revision, viewport);
     Ok(())
 }
 
@@ -1009,7 +1010,7 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
             .selection()
             .map(|selection| (selection.start, selection.end)),
         menu_tab_id: state.menu_tab_id,
-        menu_selected: state.menu_selected,
+        menu_selected: state.menu.state.focused().unwrap_or(0),
         workspace_label: state.workspace_label.as_deref(),
         drag_marker_col: state.drag_target.map(|target| target.marker_col),
         editing_workspace: state.editing_workspace_id.is_some(),
@@ -1251,7 +1252,7 @@ fn projection_interaction_without_marker(
             .selection()
             .map(|selection| (selection.start, selection.end)),
         menu_tab_id: state.menu_tab_id,
-        menu_selected: state.menu_selected,
+        menu_selected: state.menu.state.focused().unwrap_or(0),
         drag_marker_col: None,
         workspace_label: state.workspace_label.as_deref(),
         editing_workspace: state.editing_workspace_id.is_some(),
@@ -2064,6 +2065,8 @@ mod tests {
                     .unwrap()
                     .consumed
             );
+            let revision = resources.surfaces.owner_snapshot(OWNER).unwrap().revision;
+            resources.input.committed(&input_endpoint(), revision);
             event.event_kind = "key".into();
             event.phase = "press".into();
             event.key = Some("enter".into());
@@ -2155,6 +2158,12 @@ mod tests {
             .unwrap();
         assert!(opened.consumed);
         assert_eq!(opened.capture_keyboard, vec!["*"]);
+        let revision = first_resources
+            .surfaces
+            .owner_snapshot(OWNER)
+            .unwrap()
+            .revision;
+        first_resources.input.committed(&input_endpoint(), revision);
         let rejected = second_resources.input.invoke(&input_endpoint(), &event);
         assert!(!rejected.is_some_and(|result| result.consumed));
         assert!(
@@ -2455,8 +2464,7 @@ mod tests {
                 .len(),
             3
         );
-        event.button = Some("left".to_string());
-        event.hook_id = "bmux.tab_bar:menu:item:1".to_string();
+        point_at_rename(&mut event);
         assert!(
             handle_local_input(state(), &event)
                 .unwrap()
@@ -2478,6 +2486,28 @@ mod tests {
         assert!(handle_local_input(state(), &event).is_none());
         exercise_workspace_editor(event);
         uninstall();
+    }
+
+    fn point_at_rename(event: &mut AttachInputEvent) {
+        let snapshot = global_plugin_surface_registry()
+            .owner_snapshot(OWNER)
+            .unwrap();
+        bmux_plugin::global_attach_presentation_input_registry()
+            .committed(&input_endpoint(), snapshot.revision);
+        let popup = snapshot
+            .surfaces
+            .iter()
+            .find(|s| s.id.local_id == "menu")
+            .unwrap();
+        let region = popup
+            .interactive_regions
+            .iter()
+            .find(|r| r.local_id == "item.1")
+            .unwrap();
+        event.col = Some(region.rect.x);
+        event.row = Some(region.rect.y);
+        event.button = Some("left".to_string());
+        event.hook_id = "bmux.tab_bar:menu:item.1".to_string();
     }
 
     fn exercise_workspace_editor(mut event: AttachInputEvent) {

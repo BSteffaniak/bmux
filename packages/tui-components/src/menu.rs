@@ -94,6 +94,8 @@ pub struct MenuPolicy {
     pub escape_cancels: bool,
     /// Whether printable character keys are reported as typeahead requests.
     pub typeahead: bool,
+    /// Whether Tab and Shift-Tab move within the menu rather than escaping it.
+    pub tab_navigation: bool,
     /// Submenu affordance suffix.
     pub submenu_indicator: &'static str,
 }
@@ -106,6 +108,7 @@ impl MenuPolicy {
             list: SelectableListPolicy::interactive(),
             escape_cancels: true,
             typeahead: false,
+            tab_navigation: false,
             submenu_indicator: "›",
         }
     }
@@ -244,6 +247,22 @@ impl<'a> Menu<'a> {
         if state.list.interaction.disabled {
             return MenuOutcome::Ignored;
         }
+        if self.policy.tab_navigation
+            && let Event::Key(stroke) = event
+            && stroke.key == KeyCode::Tab
+            && !stroke.modifiers.ctrl
+            && !stroke.modifiers.alt
+            && !stroke.modifiers.super_key
+            && !stroke.modifiers.hyper
+            && !stroke.modifiers.meta
+        {
+            let key = if stroke.modifiers.shift {
+                KeyCode::Up
+            } else {
+                KeyCode::Down
+            };
+            return self.handle_event(area, state, &Event::Key(KeyStroke::simple(key)));
+        }
         let keyboard_event = matches!(event, Event::Key(_));
         if keyboard_event && matches!(event, Event::Key(stroke) if self.is_cancel_key(*stroke)) {
             return MenuOutcome::Cancelled;
@@ -340,6 +359,7 @@ pub struct MenuComponent<'a, 'state> {
     menu: Menu<'a>,
     state: &'state Cell<MenuState>,
     fallback: Style,
+    outcome: Option<&'state Cell<MenuOutcome>>,
 }
 
 impl<'a, 'state> MenuComponent<'a, 'state> {
@@ -371,6 +391,7 @@ impl<'a, 'state> MenuComponent<'a, 'state> {
             menu: Menu::new(items),
             state,
             fallback: Style::new(),
+            outcome: None,
         }
     }
 
@@ -385,6 +406,13 @@ impl<'a, 'state> MenuComponent<'a, 'state> {
     #[must_use]
     pub const fn styles(mut self, styles: MenuStyles) -> Self {
         self.menu.styles = styles;
+        self
+    }
+
+    /// Record semantic results when this menu is nested in a component tree.
+    #[must_use]
+    pub const fn outcome(mut self, outcome: &'state Cell<MenuOutcome>) -> Self {
+        self.outcome = Some(outcome);
         self
     }
 
@@ -498,7 +526,11 @@ impl Component for MenuComponent<'_, '_> {
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
-        match self.handle_event(event, layout, cx) {
+        let outcome = self.handle_event(event, layout, cx);
+        if let Some(target) = self.outcome {
+            target.set(outcome.clone());
+        }
+        match outcome {
             MenuOutcome::Ignored => EventOutcome::Ignored,
             MenuOutcome::Typeahead(_) | MenuOutcome::Cancelled => EventOutcome::Handled,
             MenuOutcome::Redraw | MenuOutcome::Focused(_) | MenuOutcome::Activated { .. } => {
@@ -549,6 +581,7 @@ mod tests {
                 menu: self.clone(),
                 state: &state,
                 fallback: Style::new(),
+                outcome: None,
             };
             render_component(&component, area, frame);
         }

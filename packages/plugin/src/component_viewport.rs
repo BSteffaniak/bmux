@@ -3,6 +3,9 @@
 //! State stays with the caller. Painting and event dispatch share one layout and
 //! horizontal transform. Producers publish the returned cells through their existing
 //! owner-scoped surface, and retain the viewport only after publication succeeds.
+mod committed;
+pub use committed::CommittedComponentViewport;
+
 use bmux_tui::{
     buffer::Buffer,
     component::{Component, EventCx, LayoutNode},
@@ -135,6 +138,16 @@ impl ComponentViewport {
                 .y
                 .saturating_add(self.offset.y)
                 .saturating_sub(self.viewport.y);
+        }
+        component.event(&event, &self.layout, &mut EventCx::new(&self.layout))
+    }
+
+    /// Dispatch coordinates relative to the published surface allocation.
+    pub fn event_local(&self, component: &dyn Component, event: &Event) -> EventOutcome {
+        let mut event = event.clone();
+        if let Event::Mouse(mouse) = &mut event {
+            mouse.position.x = mouse.position.x.saturating_add(self.offset.x);
+            mouse.position.y = mouse.position.y.saturating_add(self.offset.y);
         }
         component.event(&event, &self.layout, &mut EventCx::new(&self.layout))
     }

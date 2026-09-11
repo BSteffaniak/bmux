@@ -1,42 +1,16 @@
 use bmux_appearance::RuntimeAppearance;
-use bmux_plugin::{RenderColor, RenderNamedColor, RenderOp, RenderStyle};
+#[cfg(test)]
+use bmux_plugin::{RenderColor, RenderOp};
 use bmux_tui::buffer::Buffer;
-use bmux_tui::geometry::{Point, Rect};
+#[cfg(test)]
+use bmux_tui::geometry::Point;
+use bmux_tui::geometry::Rect;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui_components::theme::{ComponentSurfaces, ComponentTheme};
 
-/// Convert a TUI buffer into coalesced retained render operations.
-///
-/// Runs never cross rows or style boundaries. Empty continuation cells are
-/// preserved so the terminal cursor advances exactly as the TUI buffer does.
-#[must_use]
-pub fn buffer_render_ops(buffer: &Buffer) -> Vec<RenderOp> {
-    let area = buffer.area();
-    let mut ops = Vec::new();
-    for y in area.y..area.bottom() {
-        let mut x = area.x;
-        while x < area.right() {
-            let Some(first) = buffer.get(Point::new(x, y)) else {
-                break;
-            };
-            let style = first.style;
-            let start = x;
-            let mut text = String::new();
-            while x < area.right() {
-                let Some(cell) = buffer.get(Point::new(x, y)) else {
-                    break;
-                };
-                if cell.style != style {
-                    break;
-                }
-                text.push_str(&cell.symbol);
-                x = x.saturating_add(1);
-            }
-            ops.push(RenderOp::text_run(start, y, text, render_style(style)));
-        }
-    }
-    ops
-}
+pub use bmux_plugin::component_render::buffer_render_ops;
+#[cfg(test)]
+use bmux_plugin::component_render::render_style;
 
 #[must_use]
 pub fn component_theme(appearance: &RuntimeAppearance) -> ComponentTheme {
@@ -81,52 +55,6 @@ pub fn parse_tui_color(value: &str) -> Option<Color> {
     let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
     let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
     Some(Color::Rgb(r, g, b))
-}
-
-#[must_use]
-pub const fn render_style(style: Style) -> RenderStyle {
-    RenderStyle {
-        fg: convert_optional_color(style.fg),
-        bg: convert_optional_color(style.bg),
-        bold: style.modifiers.contains(Modifier::BOLD),
-        underline: style.modifiers.contains(Modifier::UNDERLINE),
-        italic: style.modifiers.contains(Modifier::ITALIC),
-        reverse: style.modifiers.contains(Modifier::REVERSED),
-        dim: style.modifiers.contains(Modifier::DIM),
-        blink: style.modifiers.contains(Modifier::SLOW_BLINK),
-        strikethrough: style.modifiers.contains(Modifier::CROSSED_OUT),
-    }
-}
-
-const fn convert_optional_color(color: Option<Color>) -> Option<RenderColor> {
-    match color {
-        Some(color) => Some(render_color(color)),
-        None => None,
-    }
-}
-
-const fn render_color(color: Color) -> RenderColor {
-    match color {
-        Color::Default => RenderColor::Default,
-        Color::Black => RenderColor::Named(RenderNamedColor::Black),
-        Color::Red => RenderColor::Named(RenderNamedColor::Red),
-        Color::Green => RenderColor::Named(RenderNamedColor::Green),
-        Color::Yellow => RenderColor::Named(RenderNamedColor::Yellow),
-        Color::Blue => RenderColor::Named(RenderNamedColor::Blue),
-        Color::Magenta => RenderColor::Named(RenderNamedColor::Magenta),
-        Color::Cyan => RenderColor::Named(RenderNamedColor::Cyan),
-        Color::White => RenderColor::Named(RenderNamedColor::White),
-        Color::BrightBlack => RenderColor::Named(RenderNamedColor::BrightBlack),
-        Color::BrightRed => RenderColor::Named(RenderNamedColor::BrightRed),
-        Color::BrightGreen => RenderColor::Named(RenderNamedColor::BrightGreen),
-        Color::BrightYellow => RenderColor::Named(RenderNamedColor::BrightYellow),
-        Color::BrightBlue => RenderColor::Named(RenderNamedColor::BrightBlue),
-        Color::BrightMagenta => RenderColor::Named(RenderNamedColor::BrightMagenta),
-        Color::BrightCyan => RenderColor::Named(RenderNamedColor::BrightCyan),
-        Color::BrightWhite => RenderColor::Named(RenderNamedColor::BrightWhite),
-        Color::Indexed(index) => RenderColor::Indexed(index),
-        Color::Rgb(r, g, b) => RenderColor::Rgb { r, g, b },
-    }
 }
 
 /// Create a buffer whose coordinates match an absolute terminal rectangle.

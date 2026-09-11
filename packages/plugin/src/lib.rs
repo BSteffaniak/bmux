@@ -16,6 +16,8 @@
 pub mod action_dispatch;
 mod attach_companion;
 mod attach_presentation_input;
+pub mod component_input;
+pub mod component_render;
 pub mod component_viewport;
 mod declaration;
 mod discovery;

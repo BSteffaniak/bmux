@@ -4,18 +4,19 @@ use super::{
     CompanionHandle, CompanionState, LAYOUT_ID, OWNER, Placement, command_invocation,
     input_endpoint, republish_companion, tabs_commands,
 };
+use bmux_plugin::component_viewport::{CommittedComponentViewport, ComponentViewport};
 use bmux_plugin::layout::{PluginLayoutId, resolve_plugin_layout};
 use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceTarget,
 };
-use bmux_plugin::{AttachInputEvent, AttachInputResult, ExtensionRect, RenderOp};
+use bmux_plugin::{AttachInputEvent, AttachInputResult, ExtensionRect};
 use bmux_plugin_sdk::TypedServiceEndpoint;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
-use bmux_tui::composition::TextBlock;
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
-use bmux_tui::paint::PaintCx;
-use bmux_tui::prelude::{Buffer, Frame, Style};
-use bmux_tui_components::menu::{Menu, MenuItem, MenuOutcome, MenuPolicy, MenuState};
+use std::cell::Cell;
+
+use bmux_tui::prelude::Style;
+use bmux_tui_components::menu::{MenuComponent, MenuItem, MenuOutcome, MenuPolicy, MenuState};
 use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing, ModalTheme};
 use uuid::Uuid;
 
@@ -61,44 +62,105 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
     Some(ExtensionRect::new(x, y, width, height))
 }
 
+#[derive(Debug, Clone)]
+pub struct MenuInput {
+    pub state: MenuState,
+    pub geometry: CommittedComponentViewport,
+}
+impl Default for MenuInput {
+    fn default() -> Self {
+        Self {
+            state: MenuState::new(Some(0)),
+            geometry: CommittedComponentViewport::default(),
+        }
+    }
+}
+
 fn items() -> [MenuItem; 3] {
-    LABELS.map(|label| MenuItem::new(label, label))
+    std::array::from_fn(|index| MenuItem::new(index.to_string(), LABELS[index]))
 }
 
 const fn policy() -> MenuPolicy {
     let mut policy = MenuPolicy::interactive();
     policy.list.keyboard.wrap = true;
+    policy.tab_navigation = true;
     policy
 }
 
-fn content_rect(rect: ExtensionRect) -> Rect {
-    let inset = u16::from(rect.w >= 4 && rect.h >= 5);
-    Rect::new(
-        inset,
-        inset,
-        rect.w.saturating_sub(inset * 2),
-        rect.h.saturating_sub(inset * 2),
+fn component<'a>(
+    companion: &CompanionState,
+    rect: ExtensionRect,
+    items: &'a [MenuItem],
+    state: &'a Cell<MenuState>,
+    outcome: &'a Cell<MenuOutcome>,
+) -> impl Component + 'a {
+    let color = |value: &str, fallback| {
+        let (r, g, b) = super::parse_hex_color(value).unwrap_or(fallback);
+        bmux_tui::style::Color::Rgb(r, g, b)
+    };
+    let local = &companion.local_presentation;
+    let fg = color(&local.foreground, (220, 220, 220));
+    let bg = color(&local.background, (20, 20, 20));
+    let accent = color(&local.status_active, (110, 170, 240));
+    let base = Style::new().fg(fg).bg(bg);
+    let highlight = Style::new().fg(bg).bg(accent);
+    let theme = ModalTheme::new(base, base.fg(accent), base, base, base, highlight);
+    let styles = bmux_tui_components::menu::MenuStyles {
+        background: base,
+        normal: base,
+        hovered: highlight,
+        pressed: highlight,
+        focused: highlight,
+        selected: base,
+        ..Default::default()
+    };
+    let menu = MenuComponent::new("item", items, state)
+        .policy(policy())
+        .styles(styles)
+        .fallback_style(base)
+        .outcome(outcome);
+    let modal = ModalFrame::new(
+        ModalSizing::fixed(Size::new(rect.w, rect.h), Insets::new(0, 0, 0, 0)),
+        theme,
+    )
+    .padding(Insets::new(0, 0, 0, 0));
+    ModalFrameComponent::new("menu", modal, menu)
+}
+
+pub fn viewport(companion: &CompanionState) -> Option<ComponentViewport> {
+    companion.menu_tab_id?;
+    let rect = popup_rect(companion)?;
+    let items = items();
+    let state = Cell::new(companion.menu.state);
+    let outcome = Cell::new(MenuOutcome::Ignored);
+    let component = component(companion, rect, &items, &state, &outcome);
+    let layout = component.layout(
+        Constraints::tight(Size::new(rect.w, rect.h)),
+        &mut LayoutCx::new(),
+    );
+    ComponentViewport::new(
+        layout,
+        Rect::new(rect.x, rect.y, rect.w, rect.h),
+        Point::new(0, 0),
     )
 }
 
 pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface> {
-    if companion.menu_tab_id.is_none() {
-        return Vec::new();
-    }
-    let Some(rect) = popup_rect(companion) else {
+    let Some(viewport) = viewport(companion) else {
         return Vec::new();
     };
-    let viewport = ExtensionRect::new(
+    let rect = viewport.visible_rect();
+    let items = items();
+    let state = Cell::new(companion.menu.state);
+    let outcome = Cell::new(MenuOutcome::Ignored);
+    let rect = ExtensionRect::new(rect.x, rect.y, rect.width, rect.height);
+    let painted = viewport.paint(&component(companion, rect, &items, &state, &outcome));
+    let full = ExtensionRect::new(
         0,
         0,
         companion.local_presentation.viewport_cols,
         companion.local_presentation.viewport_rows,
     );
-    let content = content_rect(rect);
-    let items = items();
-    let menu = Menu::new(&items).policy(policy());
-    let state = MenuState::new(Some(companion.menu_selected));
-    let ops = paint_menu(companion, rect, &menu, &state);
     let mut backdrop = PluginSurface::layout(
         PluginSurfaceId::new(
             OWNER,
@@ -111,8 +173,8 @@ pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface>
     )
     .order(100, 0)
     .modal(true)
-    .interactive_region(PluginSurfaceRegion::new("dismiss", viewport).endpoint(input_endpoint()));
-    backdrop.target = PluginSurfaceTarget::Explicit(viewport);
+    .interactive_region(PluginSurfaceRegion::new("dismiss", full).endpoint(input_endpoint()));
+    backdrop.target = PluginSurfaceTarget::Explicit(full);
     let mut popup = PluginSurface::layout(
         PluginSurfaceId::new(
             OWNER,
@@ -121,98 +183,20 @@ pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface>
         ),
         revision,
         PluginLayoutId::new(OWNER, LAYOUT_ID),
-        Vec::new(),
+        bmux_plugin::component_render::buffer_render_ops(&painted.buffer),
     )
     .order(100, 1)
     .opaque(true)
     .modal(true);
     popup.target = PluginSurfaceTarget::Explicit(rect);
-    // Keep item regions non-focusable: the originating tab remains the stable
-    // keyboard target, including when Rename transfers into its inline editor.
-    for row in content.y..content.bottom() {
-        let Some(index) = menu.item_index_at(content, &state, Point::new(content.x, row)) else {
-            continue;
-        };
-        popup = popup.interactive_region(
-            PluginSurfaceRegion::new(
-                format!("item:{index}"),
-                ExtensionRect::new(content.x, row, content.width, 1),
-            )
-            .endpoint(input_endpoint()),
-        );
+    for mut hit in painted.hits {
+        hit.rect.x = hit.rect.x.saturating_sub(rect.x);
+        hit.rect.y = hit.rect.y.saturating_sub(rect.y);
+        // The originating tab retains keyboard ownership through Rename.
+        hit.focusable = false;
+        popup = popup.interactive_region(hit.endpoint(input_endpoint()));
     }
-    popup.ops = ops;
     vec![backdrop, popup]
-}
-
-fn paint_menu(
-    companion: &CompanionState,
-    rect: ExtensionRect,
-    menu: &Menu<'_>,
-    state: &MenuState,
-) -> Vec<RenderOp> {
-    let local = &companion.local_presentation;
-    let foreground = super::parse_hex_color(&local.foreground).unwrap_or((220, 220, 220));
-    let background = super::parse_hex_color(&local.background).unwrap_or((20, 20, 20));
-    let accent = super::parse_hex_color(&local.status_active).unwrap_or((110, 170, 240));
-    let base = bmux_plugin::RenderStyle::new()
-        .rgb_foreground(foreground.0, foreground.1, foreground.2)
-        .rgb_background(background.0, background.1, background.2);
-    let selected_style = bmux_plugin::RenderStyle::new()
-        .rgb_foreground(background.0, background.1, background.2)
-        .rgb_background(accent.0, accent.1, accent.2);
-    let border_style = base.rgb_foreground(accent.0, accent.1, accent.2);
-    let area = Rect::new(0, 0, rect.w, rect.h);
-    let content = content_rect(rect);
-    let mut buffer = Buffer::empty(area);
-    let mut frame = Frame::new(&mut buffer);
-    let mut cx = PaintCx::new(&mut frame);
-    let theme = ModalTheme::dark(bmux_tui::style::Color::Rgb(accent.0, accent.1, accent.2));
-    let modal = ModalFrame::new(
-        ModalSizing::fixed(Size::new(rect.w, rect.h), Insets::new(0, 0, 0, 0)),
-        theme,
-    )
-    .padding(Insets::new(0, 0, 0, 0));
-    let chrome = ModalFrameComponent::new("menu", modal, TextBlock::new("")).chrome(content.x > 0);
-    let layout = chrome.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
-    chrome.paint(&layout, &mut cx);
-    menu.paint(content, state, Style::new(), &mut cx);
-    let mut ops = Vec::new();
-    for y in 0..rect.h {
-        for x in 0..rect.w {
-            let Some(cell) = buffer.get(Point::new(x, y)) else {
-                continue;
-            };
-            if cell.is_wide_continuation() {
-                continue;
-            }
-            let selected = menu.item_index_at(content, state, Point::new(x, y))
-                == Some(companion.menu_selected);
-            let border = content.x > 0 && (x == 0 || y == 0 || x + 1 == rect.w || y + 1 == rect.h);
-            let style = if selected {
-                selected_style
-            } else if border {
-                border_style
-            } else {
-                base
-            };
-            if let Some(RenderOp::TextRun {
-                x: start,
-                y: row,
-                text,
-                style: previous,
-            }) = ops.last_mut()
-                && *row == y
-                && *previous == style
-                && usize::from(*start) + text.chars().count() == usize::from(x)
-            {
-                text.push_str(&cell.symbol);
-            } else {
-                ops.push(RenderOp::text_run(x, y, cell.symbol.clone(), style));
-            }
-        }
-    }
-    ops
 }
 
 #[allow(clippy::significant_drop_tightening)] // Publish the surface under the same lock as its interaction state.
@@ -252,8 +236,7 @@ fn transition(
             companion.menu_tab_id = None;
             return Some(AttachInputResult::default());
         }
-        companion.menu_selected = 0;
-        companion.menu_pressed = None;
+        companion.menu = MenuInput::default();
         companion.editing_tab_id = None;
         companion.pointer_source = None;
         companion.drag_target = None;
@@ -268,75 +251,60 @@ fn transition(
         consumed: true,
         ..AttachInputResult::default()
     };
-    let mut activate = false;
-    if pointer {
-        let item = event
-            .hook_id
-            .strip_prefix("bmux.tab_bar:menu:item:")
-            .and_then(|index| index.parse::<usize>().ok())
-            .filter(|index| *index < LABELS.len());
-        if let Some(item) = item {
-            if matches!(event.phase.as_str(), "enter" | "move" | "down") {
-                companion.menu_selected = item;
-                result.dirty = true;
-            }
-            if event.button.as_deref() == Some("left") {
-                if down {
-                    companion.menu_pressed = Some(item);
-                } else if event.phase == "up" {
-                    activate = companion.menu_pressed.take() == Some(item);
-                }
-            }
-        } else if down {
-            companion.menu_pressed = None;
+    if down && event.hook_id == "bmux.tab_bar:menu-dismiss:dismiss" {
+        companion.menu_tab_id = None;
+        result.release_capture = true;
+        result.dirty = true;
+        return Some(result);
+    }
+    // Leave describes the previous hit, not a new pointer position. The paired
+    // enter/move carries authoritative coordinates and updates shared hover state.
+    if event.phase == "leave" {
+        return Some(result);
+    }
+    let Some(mut input) = bmux_plugin::component_input::component_event(event) else {
+        return Some(result);
+    };
+    if event.hook_id == "bmux.tab_bar:menu-dismiss:dismiss" {
+        input = bmux_tui::event::Event::Focus(bmux_tui::event::FocusEvent::Lost);
+    }
+    let Some(viewport) = companion.menu.geometry.get() else {
+        return Some(result);
+    };
+    let rect = viewport.visible_rect();
+    let rect = ExtensionRect::new(rect.x, rect.y, rect.width, rect.height);
+    let items = items();
+    let state = Cell::new(companion.menu.state);
+    let outcome = Cell::new(MenuOutcome::Ignored);
+    viewport.event_local(
+        &component(companion, rect, &items, &state, &outcome),
+        &input,
+    );
+    result.dirty = state.get() != companion.menu.state;
+    companion.menu.state = state.get();
+    match outcome.into_inner() {
+        MenuOutcome::Cancelled => {
             companion.menu_tab_id = None;
             result.release_capture = true;
             result.dirty = true;
         }
-    } else if event.event_kind == "key" && matches!(event.phase.as_str(), "press" | "repeat") {
-        let key = match event.key.as_deref()? {
-            "tab" if event.modifiers.shift => "up",
-            "tab" => "down",
-            key => key,
-        };
-        let Ok(stroke) = bmux_keyboard::parse_key_stroke(key) else {
-            return Some(result);
-        };
-        let items = items();
-        let menu = Menu::new(&items).policy(policy());
-        let mut state = MenuState::new(Some(companion.menu_selected));
-        let area = content_rect(popup_rect(companion)?);
-        match menu.handle_event(area, &mut state, &bmux_tui::event::Event::Key(stroke)) {
-            MenuOutcome::Cancelled => {
-                companion.menu_tab_id = None;
-                result.release_capture = true;
-            }
-            MenuOutcome::Activated { index, .. } => {
-                companion.menu_selected = index;
-                activate = true;
-            }
-            MenuOutcome::Focused(index) => companion.menu_selected = index,
-            MenuOutcome::Redraw => companion.menu_selected = state.focused().unwrap_or(0),
-            MenuOutcome::Ignored | MenuOutcome::Typeahead(_) => return Some(result),
-        }
-        result.dirty = true;
-    }
-    if pointer && event.phase == "up" {
-        companion.menu_pressed = None;
-    }
-    if activate {
-        activate_selection(companion, &mut result);
+        MenuOutcome::Activated { index, .. } => activate_selection(companion, &mut result, index),
+        _ => {}
     }
     Some(result)
 }
 
-fn activate_selection(companion: &mut CompanionState, result: &mut AttachInputResult) {
+fn activate_selection(
+    companion: &mut CompanionState,
+    result: &mut AttachInputResult,
+    index: usize,
+) {
     let Some(target) = companion.menu_tab_id.take() else {
         return;
     };
     result.dirty = true;
     result.release_capture = true;
-    result.service_invocation = match companion.menu_selected {
+    result.service_invocation = match index {
         0 => command_invocation(
             bmux_plugin::AttachInputEndpoint {
                 capability: tabs_commands::client::SwitchTabEndpoint::CAPABILITY.to_string(),
@@ -376,6 +344,7 @@ fn activate_selection(companion: &mut CompanionState, result: &mut AttachInputRe
 mod tests {
     use super::*;
     use crate::{Settings, companion_surfaces, tabs_list};
+    use bmux_plugin::RenderOp;
 
     fn companion() -> CompanionState {
         let mut companion = CompanionState::new(Settings::default());
@@ -401,6 +370,9 @@ mod tests {
         button: Option<&str>,
         hook: String,
     ) -> AttachInputEvent {
+        let item = hook
+            .strip_prefix("bmux.tab_bar:menu:item:")
+            .and_then(|v| v.parse::<u16>().ok());
         AttachInputEvent {
             event_kind: kind.to_string(),
             phase: phase.to_string(),
@@ -408,7 +380,7 @@ mod tests {
             button: button.map(str::to_string),
             hook_id: hook,
             col: Some(3),
-            row: Some(0),
+            row: Some(item.map_or(0, |index| index + 2)),
             wheel_delta: 0,
             modifiers: bmux_plugin::AttachInputModifiers::default(),
             focused_pane: None,
@@ -417,7 +389,7 @@ mod tests {
     }
 
     fn open(companion: &mut CompanionState) -> AttachInputResult {
-        transition(
+        let result = transition(
             companion,
             &event(
                 "pointer",
@@ -427,7 +399,30 @@ mod tests {
                 format!("bmux.tab_bar:strip:tab:{}", Uuid::from_u128(7)),
             ),
         )
-        .unwrap()
+        .unwrap();
+        let viewport = viewport(companion);
+        companion.menu.geometry.stage(1, viewport);
+        companion.menu.geometry.acknowledge(1);
+        result
+    }
+
+    fn pointer_event(companion: &CompanionState, phase: &str, item: &str) -> AttachInputEvent {
+        let popup = surfaces(companion, 1).pop().unwrap();
+        let hit = popup
+            .interactive_regions
+            .iter()
+            .find(|hit| hit.local_id == format!("item.{item}"))
+            .unwrap();
+        let mut event = event(
+            "pointer",
+            phase,
+            None,
+            Some("left"),
+            format!("bmux.tab_bar:menu:{}", hit.local_id),
+        );
+        event.col = Some(hit.rect.x);
+        event.row = Some(hit.rect.y);
+        event
     }
 
     fn key(companion: &mut CompanionState, key: &str) -> Option<AttachInputResult> {
@@ -481,7 +476,7 @@ mod tests {
                 .any(|op| matches!(op, RenderOp::TextRun { text, .. } if text.contains("Rename")))
         );
         key(&mut companion, "down").unwrap();
-        assert_eq!(companion.menu_selected, 1);
+        assert_eq!(companion.menu.state.focused(), Some(1));
         assert_eq!(
             companion_surfaces(&companion, 3)[0].interactive_regions,
             before
@@ -497,7 +492,7 @@ mod tests {
         for selection in [0, 1, 2] {
             let mut companion = companion();
             open(&mut companion);
-            companion.menu_selected = selection;
+            companion.menu.state.set_focused(Some(selection));
             let result = key(&mut companion, "enter").unwrap();
             assert!(companion.menu_tab_id.is_none());
             if selection == 1 {
@@ -526,29 +521,15 @@ mod tests {
     fn pointer_activation_and_outside_dismissal_are_local() {
         let mut companion = companion();
         open(&mut companion);
-        let result = transition(
-            &mut companion,
-            &event(
-                "pointer",
-                "down",
-                None,
-                Some("left"),
-                "bmux.tab_bar:menu:item:2".to_string(),
-            ),
-        )
-        .unwrap();
-        assert!(result.service_invocation.is_none());
-        let result = transition(
-            &mut companion,
-            &event(
-                "pointer",
-                "up",
-                None,
-                Some("left"),
-                "bmux.tab_bar:menu:item:2".to_string(),
-            ),
-        )
-        .unwrap();
+        let down = pointer_event(&companion, "down", "2");
+        let up = pointer_event(&companion, "up", "2");
+        assert!(
+            transition(&mut companion, &down)
+                .unwrap()
+                .service_invocation
+                .is_none()
+        );
+        let result = transition(&mut companion, &up).unwrap();
         assert!(result.release_capture && result.service_invocation.is_some());
         open(&mut companion);
         let result = transition(
@@ -580,7 +561,7 @@ mod tests {
             let mut input = event("key", "press", Some(key), None, String::new());
             input.modifiers.shift = shift;
             assert!(transition(&mut companion, &input).unwrap().consumed);
-            assert_eq!(companion.menu_selected, expected);
+            assert_eq!(companion.menu.state.focused(), Some(expected));
         }
     }
 
@@ -588,29 +569,45 @@ mod tests {
     fn release_over_another_item_does_not_activate() {
         let mut companion = companion();
         open(&mut companion);
-        transition(
-            &mut companion,
-            &event(
-                "pointer",
-                "down",
-                None,
-                Some("left"),
-                "bmux.tab_bar:menu:item:0".to_string(),
-            ),
-        );
-        let result = transition(
-            &mut companion,
-            &event(
-                "pointer",
-                "up",
-                None,
-                Some("left"),
-                "bmux.tab_bar:menu:item:2".to_string(),
-            ),
-        )
-        .unwrap();
+        let down = pointer_event(&companion, "down", "0");
+        let up = pointer_event(&companion, "up", "2");
+        transition(&mut companion, &down);
+        let result = transition(&mut companion, &up).unwrap();
         assert!(result.service_invocation.is_none());
         assert!(companion.menu_tab_id.is_some());
+    }
+
+    #[test]
+    fn hover_survives_committed_revisions_without_republishing_stationary_pointer() {
+        let mut companion = companion();
+        open(&mut companion);
+        for index in ["0", "1", "2", "1", "0"] {
+            let input = pointer_event(&companion, "move", index);
+            let before = surfaces(&companion, 1).pop().unwrap().ops;
+            assert!(transition(&mut companion, &input).unwrap().dirty);
+            let after = surfaces(&companion, 2).pop().unwrap().ops;
+            if index != "0" {
+                assert_ne!(before, after);
+            }
+            let viewport = viewport(&companion);
+            companion.menu.geometry.stage(2, viewport);
+            companion.menu.geometry.acknowledge(2);
+            assert!(!transition(&mut companion, &input).unwrap().dirty);
+        }
+    }
+
+    #[test]
+    fn unpublished_geometry_cannot_receive_input() {
+        let mut companion = companion();
+        open(&mut companion);
+        companion.menu.geometry = CommittedComponentViewport::default();
+        let input = pointer_event(&companion, "move", "1");
+        assert!(!transition(&mut companion, &input).unwrap().dirty);
+        let viewport = viewport(&companion);
+        companion.menu.geometry.stage(2, viewport);
+        assert!(!transition(&mut companion, &input).unwrap().dirty);
+        companion.menu.geometry.acknowledge(2);
+        assert!(transition(&mut companion, &input).unwrap().dirty);
     }
 
     #[test]
