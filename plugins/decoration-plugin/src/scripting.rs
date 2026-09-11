@@ -1599,6 +1599,80 @@ mod tests {
         }
 
         #[test]
+        fn performance_border_combines_memory_cpu_and_pulse_with_smoothing() {
+            use bmux_scene_protocol::scene_protocol::{Color, PaintCommand};
+
+            let backend = make_backend(ScriptHostAccess::default());
+            backend
+                .compile(
+                    Path::new("performance_header.lua"),
+                    include_str!("../assets/decorations/performance_header.lua"),
+                )
+                .expect("compile");
+            let metrics = |cpu: u32, memory: u32, total: u32| {
+                backend
+                    .invoke(&ScriptMessage::Event(ScriptEventMessage {
+                        source: "bmux.performance/metrics-state".to_string(),
+                        kind: "bmux.performance/metrics-state".to_string(),
+                        delivery: ScriptEventDelivery::State,
+                        snapshot: true,
+                        payload: json!({
+                            "system": { "memory_total_bytes": total },
+                            "panes": { "test-pane": {
+                                "available": true,
+                                "cpu_normalized_percent": cpu,
+                                "memory_bytes": memory
+                            } }
+                        }),
+                    }))
+                    .expect("metrics");
+            };
+            let color = |time_ms, visible: bool| {
+                let ScriptMessage::Render(mut message) = render_message() else {
+                    panic!("expected render");
+                };
+                message.time_ms = time_ms;
+                if !visible {
+                    message.panes = json!([]);
+                }
+                let outcome = backend
+                    .invoke(&ScriptMessage::Render(message))
+                    .expect("render");
+                outcome.surfaces.get("test-pane").and_then(|commands| {
+                    commands.iter().find_map(|command| match command {
+                        PaintCommand::SemanticBorder { style, .. } => style.fg.clone(),
+                        _ => None,
+                    })
+                })
+            };
+            for (memory, expected) in [
+                (0, (60, 220, 90)),
+                (5, (60, 220, 90)),
+                (15, (255, 170, 90)),
+                (30, (255, 122, 62)),
+                (50, (255, 75, 35)),
+                (90, (255, 75, 35)),
+            ] {
+                color(500, false); // Removed panes must not retain animation history.
+                metrics(0, memory, 100);
+                let (r, g, b) = expected;
+                assert_eq!(color(500, true), Some(Color::Rgb { r, g, b }));
+            }
+            let rgb = |r, g, b| Some(Color::Rgb { r, g, b });
+            metrics(0, 0, 100);
+            // A new sample at the same timestamp cannot jump straight to green.
+            assert_eq!(color(500, true), rgb(255, 75, 35));
+            assert_eq!(color(10_500, true), rgb(60, 219, 90));
+            color(10_500, false);
+            metrics(100, 0, 100);
+            assert_eq!(color(500, true), rgb(255, 75, 35));
+            assert_eq!(color(1500, true), rgb(153, 45, 21));
+            color(1500, false);
+            metrics(0, 50, 0);
+            assert_eq!(color(500, true), rgb(60, 220, 90));
+        }
+
+        #[test]
         fn bundled_performance_header_script_uses_metrics_state() {
             let backend = make_backend(ScriptHostAccess::default());
             backend

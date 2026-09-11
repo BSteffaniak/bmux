@@ -1,4 +1,8 @@
 # Performance theme - uses bmux.performance metrics to color pane borders and headers.
+# Borders breathe every two seconds with 500ms heat smoothing. The hotter of
+# normalized CPU and memory share of total system RAM sets the hue: memory
+# <=5% green, 15% yellow, 30% orange, >=50% red. Missing total RAM is CPU-only.
+# Headers retain steady brightness; recent growth does not change pulse speed.
 
 background           = "#050505"
 cursor               = "#ffd75f"
@@ -59,6 +63,10 @@ operation    = "get-snapshot"
 [plugins."bmux.decoration".components."performance.border"]
 entrypoint = "border"
 script     = "performance_header"
+
+[plugins."bmux.decoration".components."performance.border".animation]
+hz   = 30
+kind = "pulse"
 
 [plugins."bmux.decoration".components."performance.header"]
 above      = ["performance.border"]
