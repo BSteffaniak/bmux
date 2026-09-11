@@ -1,0 +1,13 @@
+[keybindings]
+initial_mode = "normal"
+
+[keybindings.global]
+"alt+a" = "plugin:bmux.tabs:new-tab --name=deps"
+"alt+b" = "plugin:bmux.tabs:new-tab --name=d-e-p-s"
+"alt+c" = "plugin:bmux.tabs:new-tab --name=current"
+"alt+f" = "plugin:bmux.finder:show"
+"alt+r" = "plugin:bmux.tabs:rename-tab"
+
+[keybindings.modes.normal]
+label       = "NORMAL"
+passthrough = true

@@ -49,6 +49,9 @@ pub struct PromptOption {
     /// hosts search the label, detail, and key hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_text: Option<String>,
+    /// Primary searchable value for ordered relevance; independent of display labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_primary: Option<String>,
     /// Optional secondary description rendered with muted styling by capable hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -75,6 +78,7 @@ impl PromptOption {
             value: value.into(),
             label: label.into(),
             search_text: None,
+            search_primary: None,
             detail: None,
             key_hint: None,
             search_order: None,

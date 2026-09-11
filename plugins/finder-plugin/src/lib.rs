@@ -179,7 +179,7 @@ impl Default for FinderSettings {
             match_mode: MatchMode::Fuzzy,
             entry_format: DEFAULT_ENTRY_FORMAT.to_string(),
             sort_order: SortOrder::LastVisited,
-            filtered_sort_order: FilteredSortOrder::Inherit,
+            filtered_sort_order: FilteredSortOrder::Relevance,
             current_tab: CurrentTab::Hidden,
             wrap_selection: true,
         }
@@ -242,7 +242,7 @@ impl FinderSettings {
             )
         };
         let sort_order = parse_sort(&text("sort_order", "last_visited")?)?;
-        let filtered_sort_order = match text("filtered_sort_order", "inherit")?.as_str() {
+        let filtered_sort_order = match text("filtered_sort_order", "relevance")?.as_str() {
             "inherit" => FilteredSortOrder::Inherit,
             "relevance" => FilteredSortOrder::Relevance,
             other => FilteredSortOrder::Order(parse_sort(other)?),
@@ -328,6 +328,10 @@ fn ordered_options(
             let mut option = PromptOption::new(entry.context_id.to_string(), entry.label.clone())
                 .search_text(entry.search_text.clone())
                 .detail(entry.detail.clone());
+            option.search_primary = tabs
+                .iter()
+                .find(|tab| tab.id == entry.context_id)
+                .map(|tab| tab.name.clone());
             option.search_order = Some(PromptSearchOrder {
                 group: u8::from(
                     settings.current_tab == CurrentTab::Last && active == Some(entry.context_id),
@@ -373,7 +377,7 @@ fn build_entries(
                 .replace("{workspace}", &entry.workspace)
                 .replace("{tab}", &entry.name);
             let search_source = if settings.include_workspace_name {
-                format!("{} {}", entry.workspace, entry.name)
+                format!("{}/{}", entry.workspace, entry.name)
             } else {
                 entry.name.clone()
             };
@@ -560,7 +564,7 @@ mod tests {
     fn default_order_hides_current_and_ranks_visits_across_workspaces() {
         let settings = FinderSettings::default();
         assert_eq!(settings.sort_order, SortOrder::LastVisited);
-        assert_eq!(settings.filtered_sort_order, FilteredSortOrder::Inherit);
+        assert_eq!(settings.filtered_sort_order, FilteredSortOrder::Relevance);
         assert_eq!(settings.current_tab, CurrentTab::Hidden);
         let tabs = vec![
             window(1, 10, "a", "current", true),

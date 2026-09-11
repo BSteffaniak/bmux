@@ -252,6 +252,13 @@ fn playbook_run_interactive_step_controls() {
 
 #[test]
 #[serial]
+fn finder_relevance_prefers_exact_over_recent_loose_match() {
+    let (json, pass) = run_playbook_fixture("finder_relevance.dsl");
+    assert!(pass, "finder relevance regression: {json:#}");
+}
+
+#[test]
+#[serial]
 fn finder_recency_uses_invoking_attachment_across_workspaces() {
     let (json, pass) = run_playbook_fixture("finder_cross_workspace_recency.dsl");
     assert!(

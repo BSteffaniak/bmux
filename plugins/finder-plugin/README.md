@@ -4,8 +4,10 @@ Standalone read-only finder for tabs across workspaces. It consumes retained
 tabs/workspace state and delegates fuzzy matching to bmux's search-select
 prompt.
 
-Defaults search every workspace, order by caller-local last visit, preserve that
-order while filtering, and hide the current tab. `wrap_selection = true` (default)
+Defaults search every workspace, order by caller-local last visit before typing,
+rank filtered results by relevance, and hide the current tab. Use
+`filtered_sort_order = "inherit"` for strict recency even while filtering.
+`wrap_selection = true` (default)
 wraps Up/Down and Ctrl-P/Ctrl-N at the filtered list boundaries; set it to `false`
 to stop at either end. Home/End and page navigation keep their existing behavior.
 Settings also support

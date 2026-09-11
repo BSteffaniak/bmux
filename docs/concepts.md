@@ -46,8 +46,8 @@ match_mode = "fuzzy"
 entry_format = "{workspace}/{tab}"
 # Opening order: "last_visited" (default), "workspace_tab", "alphabetical".
 sort_order = "last_visited"
-# "inherit" (default), "relevance", or an explicit opening-order value.
-filtered_sort_order = "inherit"
+# "relevance" (default), "inherit", or an explicit opening-order value.
+filtered_sort_order = "relevance"
 # "hidden" (default), "last", or "in_order".
 current_tab = "hidden"
 # Wrap Up/Down (and Ctrl-P/Ctrl-N) through filtered results; false clamps at ends.
@@ -58,9 +58,12 @@ wrap_selection = true
 matching uses the workspace name only when `include_workspace_name` is true.
 
 Finder defaults now hide the current tab and show other tabs across all workspaces
-in personal most-recently-visited order. Filtering preserves that order unless
-`filtered_sort_order` selects another policy. `relevance` ranks matches by score,
-using the opening order to break ties. `workspace_tab` follows workspace and tab
+in personal most-recently-visited order when the query is empty or whitespace.
+Filtering defaults to `relevance`: exact names/paths, prefixes, word-boundary
+matches, substrings, then scattered fuzzy matches. Equal-quality contiguous
+matches use opening order to break ties; loose matches use fuzzy score first.
+Clearing the query restores opening order. Set `filtered_sort_order = "inherit"`
+to preserve strict recency while filtering. `workspace_tab` follows workspace and tab
 arrangements; `alphabetical` sorts displayed labels. These projections never
 rearrange the tab bar. `current_tab = "last"` places the current tab after other
 matches regardless of ranking; `in_order` treats it like any other result.

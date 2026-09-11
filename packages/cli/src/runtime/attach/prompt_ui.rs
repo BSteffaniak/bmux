@@ -2939,8 +2939,22 @@ fn filtered_option_indices(
                 .search_text
                 .as_deref()
                 .unwrap_or(option.label.as_str());
-            search_score(query, search_text, match_mode)
-                .map(|score| (index, score, option.label.as_str()))
+            if let PromptSearchMatchMode::OrderedV1 {
+                relevance: true, ..
+            } = match_mode
+            {
+                let quality = match_quality(query, search_text).max(
+                    option
+                        .search_primary
+                        .as_deref()
+                        .map_or(0, |primary| match_quality(query, primary)),
+                );
+                search_score(query, search_text, match_mode)
+                    .map(|score| (index, score, option.label.as_str(), quality))
+            } else {
+                search_score(query, search_text, match_mode)
+                    .map(|score| (index, score, option.label.as_str(), 0))
+            }
         })
         .collect::<Vec<_>>();
     scored.sort_by(|left, right| {
@@ -2964,7 +2978,13 @@ fn filtered_option_indices(
                 .cmp(&right_key.0)
                 .then_with(|| {
                     if relevance && !query.trim().is_empty() {
-                        right.1.cmp(&left.1)
+                        right.3.cmp(&left.3).then_with(|| {
+                            if left.3 == 0 {
+                                right.1.cmp(&left.1)
+                            } else {
+                                std::cmp::Ordering::Equal
+                            }
+                        })
                     } else {
                         std::cmp::Ordering::Equal
                     }
@@ -2978,7 +2998,30 @@ fn filtered_option_indices(
             .then_with(|| left.2.cmp(right.2))
             .then_with(|| left.0.cmp(&right.0))
     });
-    scored.into_iter().map(|(index, _, _)| index).collect()
+    scored.into_iter().map(|(index, _, _, _)| index).collect()
+}
+
+// Classify generic searchable values, never product-specific label syntax.
+fn match_quality(query: &str, candidate: &str) -> u8 {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return 0;
+    }
+    let candidate = candidate.to_ascii_lowercase();
+    if candidate == query {
+        4
+    } else if candidate.starts_with(&query) {
+        3
+    } else if candidate.match_indices(&query).any(|(offset, _)| {
+        candidate[..offset]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| !ch.is_alphanumeric())
+    }) {
+        2
+    } else {
+        u8::from(candidate.contains(&query))
+    }
 }
 
 fn search_score(query: &str, candidate: &str, match_mode: PromptSearchMatchMode) -> Option<i64> {
@@ -4415,6 +4458,55 @@ mod tests {
         assert_eq!(
             filtered[step_search_selection(1, filtered.len(), true, true)],
             0
+        );
+    }
+
+    #[test]
+    fn relevance_prefers_exact_primary_prefix_boundary_and_substring_over_fuzzy() {
+        use bmux_plugin_sdk::prompt::{PromptOrderedMatchMode, PromptSearchOrder};
+        let values = ["d-e-p-s", "mydeps", "update-deps", "deps-cleanup", "deps"];
+        let options: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(rank, value)| {
+                let mut option = PromptOption::new(*value, format!("workspace/{value}"))
+                    .search_text(format!("workspace/{value}"));
+                option.search_primary = Some((*value).to_string());
+                option.search_order = Some(PromptSearchOrder {
+                    group: 0,
+                    initial: rank,
+                    filtered: rank,
+                });
+                option
+            })
+            .collect();
+        let mode = PromptSearchMatchMode::OrderedV1 {
+            matching: PromptOrderedMatchMode::Fuzzy,
+            relevance: true,
+        };
+        assert_eq!(
+            filtered_option_indices(&options, "deps", mode),
+            vec![4, 3, 2, 1, 0]
+        );
+        assert_eq!(
+            filtered_option_indices(&options, " DEPS ", mode),
+            vec![4, 3, 2, 1, 0]
+        );
+        assert_eq!(
+            filtered_option_indices(&options, "  ", mode),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            filtered_option_indices(&options, "workspace/deps", mode)[..2],
+            [4, 3]
+        );
+        let inherit = PromptSearchMatchMode::OrderedV1 {
+            matching: PromptOrderedMatchMode::Fuzzy,
+            relevance: false,
+        };
+        assert_eq!(
+            filtered_option_indices(&options, "deps", inherit),
+            vec![0, 1, 2, 3, 4]
         );
     }
 
