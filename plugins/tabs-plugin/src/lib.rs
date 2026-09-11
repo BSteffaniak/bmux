@@ -1118,7 +1118,9 @@ type LastSelectedByClient = Arc<Mutex<BTreeMap<(Option<Uuid>, Uuid), Uuid>>>;
 struct TabRuntimeState {
     active_context_id: Option<Uuid>,
     previous_context_id: Option<Uuid>,
+    #[cfg(test)]
     tab_order_ids: Option<Vec<Uuid>>,
+    #[cfg(test)]
     tab_order_dirty: bool,
     known_contexts: BTreeMap<Uuid, Option<String>>,
 }
@@ -1477,16 +1479,35 @@ fn handle_context_event(
     }
 }
 
+// Serializes read/modify/write operations across command and event dispatch.
+// Readers use persisted state, never attachment-local order caches.
+static TAB_ORDER_MUTATION: Mutex<()> = Mutex::new(());
+
 fn append_context_to_workspace_order(
-    caller: &impl HostRuntimeApi,
+    caller: &(impl HostRuntimeApi + Sync),
     workspace_id: Uuid,
     context_id: Uuid,
 ) -> Result<(), String> {
+    let _mutation = TAB_ORDER_MUTATION
+        .lock()
+        .map_err(|_| "tab order lock poisoned")?;
     let mut order = get_stored_tab_order_ids_for_workspace(caller, workspace_id)?;
+    // Seed pre-existing resources before appending, including installations
+    // predating persisted order. Never let a new tab precede those resources.
+    let contexts = filter_contexts_for_workspace(list_contexts(caller)?, workspace_id);
+    let existing: Vec<_> = contexts
+        .into_iter()
+        .filter(|context| context.id != context_id)
+        .collect();
+    for id in project_tab_order_ids(order.clone(), &existing) {
+        if !order.contains(&id) {
+            order.push(id);
+        }
+    }
     if !order.contains(&context_id) {
         order.push(context_id);
-        set_stored_tab_order_ids_for_workspace(caller, workspace_id, &order)?;
     }
+    set_stored_tab_order_ids_for_workspace(caller, workspace_id, &order)?;
     Ok(())
 }
 
@@ -1494,11 +1515,14 @@ fn remove_context_from_all_workspace_orders(
     caller: &(impl HostRuntimeApi + Sync),
     context_id: Uuid,
 ) -> Result<(), String> {
+    let _mutation = TAB_ORDER_MUTATION
+        .lock()
+        .map_err(|_| "tab order lock poisoned")?;
     let mut client = dispatch_client(caller);
     let workspaces = bmux_plugin::block_on_typed_dispatch(
         bmux_workspaces_plugin_api::workspaces_state::client::list_workspaces(&mut client),
     )
-    .unwrap_or_default();
+    .map_err(|error| error.to_string())?;
     for workspace in workspaces {
         let mut order = get_stored_tab_order_ids_for_workspace(caller, workspace.id)?;
         let original_len = order.len();
@@ -1553,28 +1577,6 @@ fn append_contexts_to_tab_order(
         state.tab_order_dirty = false;
     }
     Ok(())
-}
-
-fn cache_contexts_to_tab_order(
-    runtime_state: &TabRuntimeStateHandle,
-    context_ids: impl IntoIterator<Item = Uuid>,
-) {
-    let Ok(mut state) = runtime_state.lock() else {
-        return;
-    };
-    let mut order_ids = state.tab_order_ids.clone().unwrap_or_default();
-    let mut known_ids = order_ids.iter().copied().collect::<HashSet<_>>();
-    let mut changed = false;
-    for context_id in context_ids {
-        if known_ids.insert(context_id) {
-            order_ids.push(context_id);
-            changed = true;
-        }
-    }
-    if changed {
-        state.tab_order_ids = Some(order_ids);
-        state.tab_order_dirty = true;
-    }
 }
 
 #[cfg(test)]
@@ -2215,44 +2217,6 @@ fn publish_tab_list_snapshot(
     publish_tab_list_entries(entries);
 }
 
-fn publish_tab_list_ordered_contexts(
-    caller: &(impl ServiceCaller + Sync),
-    contexts: Vec<ContextSummary>,
-    active_context_id: Option<Uuid>,
-) {
-    // A shared catalog must never become a single caller's workspace view.
-    let mut contexts = contexts;
-    if let Ok(all) = list_contexts(caller) {
-        for context in all {
-            if !contexts.iter().any(|known| known.id == context.id) {
-                contexts.push(context);
-            }
-        }
-    }
-    let workspace_names = workspace_names(caller);
-    let entries = contexts
-        .into_iter()
-        .enumerate()
-        .map(|(index, context)| {
-            let workspace_id = context_workspace_id(&context);
-            let workspace = workspace_names
-                .get(&workspace_id)
-                .cloned()
-                .unwrap_or_else(|| "default".to_string());
-            TabEntry {
-                id: context.id.to_string(),
-                name: context
-                    .name
-                    .unwrap_or_else(|| format!("tab-{}", index.saturating_add(1))),
-                active: active_context_id == Some(context.id),
-                workspace,
-                workspace_id,
-            }
-        })
-        .collect();
-    publish_tab_list_entries(entries);
-}
-
 fn publish_tab_list_entries(entries: Vec<TabEntry>) {
     let tabs: Vec<bmux_tabs_plugin_api::tabs_list::TabListEntry> = entries
         .into_iter()
@@ -2288,14 +2252,13 @@ fn reset_tab_order(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
 ) -> Result<usize, String> {
+    let _mutation = TAB_ORDER_MUTATION
+        .lock()
+        .map_err(|_| "tab order lock poisoned")?;
     let contexts = list_contexts_in_active_workspace(caller)?;
     let mut ids: Vec<Uuid> = contexts.iter().map(|context| context.id).collect();
     ids.sort_by_key(uuid::Uuid::as_u128);
     set_stored_tab_order_ids_for_workspace(caller, active_workspace_id(caller), &ids)?;
-    if let Ok(mut state) = runtime_state.lock() {
-        state.tab_order_ids = Some(ids.clone());
-        state.tab_order_dirty = false;
-    }
     publish_tab_list_snapshot(caller, runtime_state);
     Ok(ids.len())
 }
@@ -2324,7 +2287,7 @@ fn create_tab(
     runtime_state: &TabRuntimeStateHandle,
     name: Option<String>,
 ) -> Result<TabAck, String> {
-    let mut contexts = list_contexts_in_active_workspace(caller)?;
+    let contexts = list_contexts_in_active_workspace(caller)?;
     seed_known_contexts(runtime_state, &contexts);
     let resolved_name = name.or_else(|| Some(next_default_tab_name_for_contexts(&contexts)));
     let previous_context =
@@ -2336,15 +2299,9 @@ fn create_tab(
     let context = create_context(caller, resolved_name, attributes)?;
     let context_id = context.id;
     cache_known_context(runtime_state, context_id, context.name.clone());
-    contexts.push(context);
-    let mut order_appends = Vec::with_capacity(2);
-    if let Some(previous) = previous_context {
-        order_appends.push(previous);
-    }
-    order_appends.push(context_id);
-    cache_contexts_to_tab_order(runtime_state, order_appends);
+    append_context_to_workspace_order(caller, context_workspace_id(&context), context_id)?;
     mark_context_active_cached(runtime_state, previous_context, context_id);
-    publish_tab_list_ordered_contexts(caller, contexts, Some(context_id));
+    publish_tab_list_snapshot(caller, runtime_state);
     Ok(TabAck {
         ok: true,
         id: Some(context_id.to_string()),
@@ -2575,7 +2532,7 @@ fn switch_tab_with_contexts(
     );
     let remember_us = remember_started.elapsed().as_micros();
     let publish_started = Instant::now();
-    publish_tab_list_ordered_contexts(caller, contexts.to_vec(), Some(context_id));
+    publish_tab_list_snapshot(caller, runtime_state);
     let publish_us = publish_started.elapsed().as_micros();
     emit_attach_phase_timing(&serde_json::json!({
         "phase": "tabs.switch_tab",
@@ -2621,7 +2578,16 @@ fn move_tab(
         return Err(format!("target tab context not found: {target}"));
     }
 
-    let mut order_ids = resolve_tab_order_ids(caller, runtime_state, &contexts)?;
+    let _mutation = TAB_ORDER_MUTATION
+        .lock()
+        .map_err(|_| "tab order lock poisoned")?;
+    let mut order_ids =
+        get_stored_tab_order_ids_for_workspace(caller, active_workspace_id(caller))?;
+    for id in resolve_tab_order_ids(caller, runtime_state, &contexts)? {
+        if !order_ids.contains(&id) {
+            order_ids.push(id);
+        }
+    }
     let Some(source_index) = order_ids.iter().position(|id| *id == source) else {
         return Err(format!("source tab context not in order: {source}"));
     };
@@ -2636,10 +2602,6 @@ fn move_tab(
     order_ids.insert(insert_index.min(order_ids.len()), source_id);
 
     set_stored_tab_order_ids_for_workspace(caller, active_workspace_id(caller), &order_ids)?;
-    if let Ok(mut state) = runtime_state.lock() {
-        state.tab_order_ids = Some(order_ids);
-        state.tab_order_dirty = false;
-    }
     publish_tab_list_snapshot(caller, runtime_state);
     Ok(TabAck {
         ok: true,
@@ -3040,67 +3002,26 @@ fn order_contexts_for_navigation(
 
 fn resolve_tab_order_ids(
     caller: &impl HostRuntimeApi,
-    runtime_state: &TabRuntimeStateHandle,
+    _runtime_state: &TabRuntimeStateHandle,
     contexts: &[ContextSummary],
 ) -> Result<Vec<Uuid>, String> {
-    if let Some(order_ids) = cached_tab_order_ids(runtime_state) {
-        return Ok(project_tab_order_ids(order_ids, contexts));
+    // A catalog can span workspaces. Never infer its authority from the first
+    // (MRU-ordered) context, and never persist a possibly partial projection.
+    let mut workspaces = BTreeMap::<Uuid, Vec<ContextSummary>>::new();
+    for context in contexts {
+        workspaces
+            .entry(context_workspace_id(context))
+            .or_default()
+            .push(context.clone());
     }
-    let workspace_id = contexts
-        .first()
-        .map_or_else(Uuid::nil, context_workspace_id);
-    let mut order_ids = get_stored_tab_order_ids_for_workspace(caller, workspace_id)?;
-    if order_ids.is_empty() && !contexts.is_empty() {
-        order_ids = contexts.iter().map(|context| context.id).collect();
-        order_ids.sort_by_key(uuid::Uuid::as_u128);
-        set_stored_tab_order_ids_for_workspace(caller, workspace_id, &order_ids)?;
-        if let Ok(mut state) = runtime_state.lock() {
-            state.tab_order_ids = Some(order_ids.clone());
-            state.tab_order_dirty = false;
-        }
-        return Ok(order_ids);
+    let mut ordered = Vec::with_capacity(contexts.len());
+    for (workspace_id, contexts) in workspaces {
+        ordered.extend(project_tab_order_ids(
+            get_stored_tab_order_ids_for_workspace(caller, workspace_id)?,
+            &contexts,
+        ));
     }
-
-    let mut changed = false;
-
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::with_capacity(order_ids.len());
-    for id in order_ids {
-        if seen.insert(id) {
-            deduped.push(id);
-        } else {
-            changed = true;
-        }
-    }
-    order_ids = deduped;
-
-    let context_ids = contexts
-        .iter()
-        .map(|context| context.id)
-        .collect::<HashSet<_>>();
-    let retained_len = order_ids.len();
-    order_ids.retain(|id| context_ids.contains(id));
-    if order_ids.len() != retained_len {
-        changed = true;
-    }
-
-    if changed {
-        set_stored_tab_order_ids_for_workspace(caller, workspace_id, &order_ids)?;
-    }
-
-    let order_ids = project_tab_order_ids(order_ids, contexts);
-    if let Ok(mut state) = runtime_state.lock() {
-        state.tab_order_ids = Some(order_ids.clone());
-        state.tab_order_dirty = false;
-    }
-    Ok(order_ids)
-}
-
-fn cached_tab_order_ids(runtime_state: &TabRuntimeStateHandle) -> Option<Vec<Uuid>> {
-    runtime_state
-        .lock()
-        .ok()
-        .and_then(|state| state.tab_order_ids.clone())
+    Ok(ordered)
 }
 
 fn seed_known_contexts(runtime_state: &TabRuntimeStateHandle, contexts: &[ContextSummary]) {
@@ -3169,17 +3090,11 @@ fn get_stored_tab_order_ids_for_workspace(
             workspace_id,
         )))
         .map_err(|error| error.to_string())?;
-    if let Some(value) = response.value
-        && !value.is_empty()
-    {
+    if let Some(value) = response.value {
         return parse_stored_tab_order_value(value);
     }
     if workspace_id.is_nil() {
-        let legacy = get_stored_tab_order_ids(caller)?;
-        if !legacy.is_empty() {
-            set_stored_tab_order_ids_for_workspace(caller, workspace_id, &legacy)?;
-        }
-        return Ok(legacy);
+        return get_stored_tab_order_ids(caller);
     }
     Ok(Vec::new())
 }
@@ -5284,6 +5199,82 @@ mod tests {
     }
 
     #[test]
+    fn ordering_reads_preserve_partial_restore_and_observe_durable_updates() {
+        let sessions = sample_sessions_three();
+        let host = MockHost::with_sessions(sessions.clone());
+        seed_tab_order(&host, &sessions);
+        let runtime = runtime_state();
+        let contexts = list_contexts(&host).unwrap();
+        let original: Vec<_> = sessions.iter().map(|session| session.id).collect();
+        let storage_before = host.storage.lock().unwrap().clone();
+        assert_eq!(
+            resolve_tab_order_ids(&host, &runtime, &contexts[..1]).unwrap(),
+            vec![contexts[0].id]
+        );
+        assert!(
+            resolve_tab_order_ids(&host, &runtime, &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(*host.storage.lock().unwrap(), storage_before);
+        assert_eq!(
+            resolve_tab_order_ids(&host, &runtime, &contexts).unwrap(),
+            original
+        );
+        let reversed: Vec<_> = original.into_iter().rev().collect();
+        set_stored_tab_order_ids_for_workspace(&host, Uuid::nil(), &reversed).unwrap();
+        assert_eq!(
+            resolve_tab_order_ids(&host, &runtime, &contexts).unwrap(),
+            reversed
+        );
+    }
+
+    #[test]
+    fn ordering_is_workspace_scoped_even_with_shared_runtime_and_mru_input() {
+        let host = MockHost::with_sessions(sample_sessions_three());
+        let mut contexts = list_contexts(&host).unwrap();
+        let workspace = Uuid::from_u128(42);
+        contexts[1]
+            .attributes
+            .insert("workspace".to_string(), workspace.to_string());
+        let first = contexts[0].id;
+        let second = contexts[1].id;
+        let third = contexts[2].id;
+        set_stored_tab_order_ids_for_workspace(&host, Uuid::nil(), &[third, first]).unwrap();
+        set_stored_tab_order_ids_for_workspace(&host, workspace, &[second]).unwrap();
+        let runtime = runtime_state();
+        contexts.reverse();
+        assert_eq!(
+            resolve_tab_order_ids(&host, &runtime, &contexts).unwrap(),
+            vec![third, first, second]
+        );
+        assert_eq!(
+            resolve_tab_order_ids(&host, &runtime, &contexts[1..2]).unwrap(),
+            vec![second]
+        );
+        assert_eq!(
+            resolve_tab_order_ids(&host, &runtime, &contexts).unwrap(),
+            vec![third, first, second]
+        );
+    }
+
+    #[test]
+    fn create_preserves_manual_order_across_restart() {
+        let sessions = sample_sessions_three();
+        let host = MockHost::with_sessions(sessions.clone());
+        let ids: Vec<_> = sessions.iter().rev().map(|session| session.id).collect();
+        set_stored_tab_order_ids_for_workspace(&host, Uuid::nil(), &ids).unwrap();
+        let ack = create_tab(&host, &runtime_state(), Some("new".to_string())).unwrap();
+        let new_id = Uuid::parse_str(ack.id.as_deref().unwrap()).unwrap();
+        let mut expected = ids;
+        expected.push(new_id);
+        assert_eq!(
+            get_stored_tab_order_ids_for_workspace(&host, Uuid::nil()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn list_tabs_projects_sessions_and_marks_first_active() {
         let sessions = sample_sessions();
         let host = MockHost::with_sessions(sessions.clone());
@@ -5458,9 +5449,10 @@ mod tests {
         assert!(ack.ok);
         let created_id = ack.id.expect("create should return context id");
         let created_id = Uuid::parse_str(&created_id).expect("created id should be uuid");
-        let cached_order =
-            cached_tab_order_ids(&runtime_state).expect("order cache should be warm");
-        assert_eq!(cached_order, vec![first_id, created_id]);
+        let persisted_order = get_stored_tab_order_ids_for_workspace(&host, Uuid::nil())
+            .expect("order should be durable");
+        assert!(persisted_order.contains(&first_id));
+        assert_eq!(persisted_order.last(), Some(&created_id));
         let creates: Vec<_> = host
             .creates
             .lock()
@@ -5481,16 +5473,17 @@ mod tests {
             Uuid::parse_str(ack.id.as_deref().expect("create should return context id"))
                 .expect("created id should be uuid");
 
-        let cached_order =
-            cached_tab_order_ids(&runtime_state).expect("order cache should be warm");
-        assert_eq!(cached_order, vec![first_id, created_id]);
+        let persisted_order = get_stored_tab_order_ids_for_workspace(&host, Uuid::nil())
+            .expect("order should be durable");
+        assert!(persisted_order.contains(&first_id));
+        assert_eq!(persisted_order.last(), Some(&created_id));
 
         let tabs = list_tabs(&host, &runtime_state, None).expect("list should succeed");
         let ids = tabs.iter().map(|tab| tab.id.as_str()).collect::<Vec<_>>();
         let first_text = first_id.to_string();
         let created_text = created_id.to_string();
-        assert_eq!(ids[0], first_text.as_str());
-        assert_eq!(ids[1], created_text.as_str());
+        assert!(ids.contains(&first_text.as_str()));
+        assert_eq!(ids.last(), Some(&created_text.as_str()));
     }
 
     #[test]
@@ -5828,7 +5821,10 @@ mod tests {
 
         let stored_order = get_stored_tab_order_ids_for_workspace(&host, Uuid::nil())
             .expect("workspace order lookup should succeed");
-        assert_eq!(stored_order, vec![first_id, second_id, third_id]);
+        assert!(
+            stored_order.is_empty(),
+            "listing must not commit a projection"
+        );
 
         *host
             .mru_context_ids
@@ -6677,7 +6673,10 @@ mod tests {
         let order =
             get_stored_tab_order_ids_for_workspace(&host, Uuid::nil()).expect("order readable");
         assert_eq!(order, vec![third, first, second]);
-        assert_eq!(cached_tab_order_ids(&runtime_state), Some(order));
+        assert_eq!(
+            resolve_tab_order_ids(&host, &runtime_state, &list_contexts(&host).unwrap()).unwrap(),
+            order
+        );
     }
 
     #[test]
@@ -6885,6 +6884,8 @@ mod tests {
             .expect("default workspace order should migrate");
         assert_eq!(migrated, legacy);
 
+        set_stored_tab_order_ids_for_workspace(&host, Uuid::nil(), &migrated)
+            .expect("explicit mutation should commit legacy order");
         set_stored_tab_order_ids(&host, &[]).expect("legacy order should clear");
         let persisted = get_stored_tab_order_ids_for_workspace(&host, Uuid::nil())
             .expect("migrated order should remain");
