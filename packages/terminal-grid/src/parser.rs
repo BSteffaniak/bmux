@@ -965,6 +965,87 @@ mod tests {
     }
 
     #[test]
+    fn tui_ansi_frames_and_scroll_redraw_agree_with_grid_cells() {
+        use bmux_tui::{buffer::Buffer, geometry::Rect, prelude::Line};
+        let area = Rect::new(0, 0, 80, 3);
+        let mut expected = Buffer::empty(area);
+        expected.write_line(
+            Rect::new(0, 0, 80, 1),
+            &Line::raw("│ [界](https://example.com) > [👩‍💻](https://example.com) │"),
+        );
+        let blank = Buffer::empty(area);
+        let mut stream = TerminalGridStream::new(80, 3, GridLimits::default()).unwrap();
+        let mut bytes = Vec::new();
+        bmux_tui::ansi::write_ansi_frame(&mut bytes, &expected, None).unwrap();
+        for byte in &bytes {
+            stream.process(&[*byte]);
+        }
+        for (before, after) in [(&expected, &blank), (&blank, &expected)] {
+            bytes.clear();
+            bmux_tui::ansi::write_ansi_frame_diff(&mut bytes, before, after, None).unwrap();
+            for byte in &bytes {
+                stream.process(&[*byte]);
+            }
+            let rows = stream.grid().viewport_rows();
+            for (y, row) in rows.iter().enumerate() {
+                let cells = row.visual_cells(80);
+                for (x, cell) in cells.iter().enumerate() {
+                    let expected_cell = after
+                        .get(bmux_tui::geometry::Point::new(
+                            u16::try_from(x).unwrap(),
+                            u16::try_from(y).unwrap(),
+                        ))
+                        .unwrap();
+                    assert_eq!(cell.text(), expected_cell.symbol, "at {x},{y}");
+                    assert_eq!(
+                        cell.is_wide_continuation(),
+                        expected_cell.is_wide_continuation()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_graphemes_preserve_width_through_snapshot_and_redraw() {
+        for cluster in ["👩‍💻", "👨‍👩‍👧‍👦", "🇺🇸", "👍🏽", "♥️", "界\u{301}"]
+        {
+            let input = format!("A{cluster}B");
+            for split in 0..=input.len() {
+                let limits = GridLimits::default();
+                let mut stream = TerminalGridStream::new(12, 2, limits).unwrap();
+                stream.process(&input.as_bytes()[..split]);
+                let snapshot = stream.snapshot(0, 2);
+                let mut restored = TerminalGridStream::from_snapshot(&snapshot, limits).unwrap();
+                stream.process(&input.as_bytes()[split..]);
+                restored.process(&input.as_bytes()[split..]);
+                assert_eq!(
+                    stream.snapshot(0, 2),
+                    restored.snapshot(0, 2),
+                    "{cluster} split {split}"
+                );
+                let rows = stream.grid().viewport_rows();
+                assert_eq!(rows[0].cells()[1].text(), cluster);
+                assert_eq!(rows[0].cells()[1].width(), 2);
+                assert!(rows[0].cells()[2].is_wide_continuation());
+                assert_eq!(rows[0].cells()[3].text(), "B");
+                assert_eq!(stream.grid().cursor().col, 4);
+                stream.process(b"\r\x1b[2Kplain");
+                assert_eq!(stream.grid().viewport_rows()[0].cells()[4].text(), "n");
+            }
+        }
+    }
+
+    #[test]
+    fn joined_emoji_extends_at_pending_wrap_before_next_character_wraps() {
+        let mut stream = TerminalGridStream::new(3, 2, GridLimits::default()).unwrap();
+        stream.process("A👩‍💻B".as_bytes());
+        let rows = stream.grid().viewport_rows();
+        assert_eq!(rows[0].cells()[1].text(), "👩‍💻");
+        assert_eq!(rows[1].cells()[0].text(), "B");
+    }
+
+    #[test]
     fn csi_cursor_position_moves_print_location() {
         let mut grid = TerminalGrid::new(10, 3, GridLimits::default()).unwrap();
         grid.process(b"\x1b[2;3HX");

@@ -11,12 +11,14 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-serde         = { workspace = true, features = ["derive", "std"] }
-thiserror     = { workspace = true }
-unicode-width = { workspace = true }
-vte           = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+thiserror            = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width        = { workspace = true }
+vte                  = { workspace = true }
 
 [dev-dependencies]
+bmux_tui   = { workspace = true }
 serde_json = { workspace = true }
 
 [features]

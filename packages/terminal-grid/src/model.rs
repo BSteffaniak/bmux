@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Limits for retained terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,10 +429,6 @@ impl Cell {
             && self.text.as_bytes()[0] == b' '
             && self.style == StyleId::DEFAULT
             && !self.wide_continuation
-    }
-
-    pub(crate) fn append_combining(&mut self, ch: char) {
-        self.text.push(ch);
     }
 }
 
@@ -1121,13 +1118,18 @@ impl TerminalGrid {
     }
 
     pub(crate) fn print_char(&mut self, ch: char) {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if char_width == 0 {
-            self.append_combining(ch);
+        if self.extend_grapheme(ch) {
             self.bump_content_revision();
             return;
         }
-        let char_width = char_width.min(2);
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if char_width == 0 {
+            return;
+        }
+        self.print_grapheme(ch.to_string(), char_width.min(2));
+    }
+
+    fn print_grapheme(&mut self, text: String, char_width: usize) {
         if self.autowrap && self.pending_wrap {
             self.pending_wrap = false;
             self.mark_current_row_wrapped();
@@ -1143,7 +1145,7 @@ impl TerminalGrid {
         let style = self.palette.intern(self.current_style);
         let row = self.cursor_absolute_row();
         let col = self.cursor.col;
-        let cell = Cell::new(ch.to_string(), style, u8::try_from(char_width).unwrap_or(1));
+        let cell = Cell::new(text, style, u8::try_from(char_width).unwrap_or(1));
         self.active_row_mut(row).set_cell(col, cell);
         if char_width == 2 && col + 1 < self.width {
             self.active_row_mut(row)
@@ -2134,14 +2136,64 @@ impl TerminalGrid {
         clamp_cursor_to_dimensions(fallback_cursor, width, height)
     }
 
-    fn append_combining(&mut self, ch: char) {
-        let row = self.cursor_absolute_row();
-        let col = self.cursor.col.saturating_sub(1);
-        if let Some(cell) = self.active_row_mut(row).cell_mut(col)
-            && !cell.is_wide_continuation()
-        {
-            cell.append_combining(ch);
+    // Extend the preceding leader before resolving pending wrap. Input may stop
+    // between any two UTF-8 bytes, so a grapheme is not necessarily one print call.
+    fn extend_grapheme(&mut self, ch: char) -> bool {
+        // Printable ASCII always starts a new cluster; keep the common path
+        // allocation-free without rescanning the preceding cell.
+        if ch.is_ascii() {
+            return false;
         }
+        let row = self.cursor_absolute_row();
+        let Some(mut col) = (if self.pending_wrap {
+            Some(self.cursor.col)
+        } else {
+            self.cursor.col.checked_sub(1)
+        }) else {
+            return false;
+        };
+        if self
+            .active_row_mut(row)
+            .cell_mut(col)
+            .is_some_and(|cell| cell.is_wide_continuation())
+        {
+            col = col.saturating_sub(1);
+        }
+        let Some(cell) = self.active_row_mut(row).cell_mut(col) else {
+            return false;
+        };
+        let old_width = usize::from(cell.width());
+        // Common combining accents do not change cell width. Avoid repeatedly
+        // cloning/scanning an arbitrarily long combining sequence (quadratic work).
+        if ('\u{300}'..='\u{36f}').contains(&ch) {
+            cell.text.push(ch);
+            return true;
+        }
+        let mut text = cell.text().to_owned();
+        text.push(ch);
+        if text.graphemes(true).count() != 1 {
+            return false;
+        }
+        let width = UnicodeWidthStr::width(text.as_str()).clamp(1, 2);
+        if width == old_width {
+            cell.text = text;
+            return true;
+        }
+        let style = cell.style();
+        self.active_row_mut(row).set_cell(col, Cell::blank(style));
+        if old_width == 2 {
+            self.active_row_mut(row)
+                .set_cell(col + 1, Cell::blank(style));
+        }
+        self.cursor.col = col;
+        self.pending_wrap = false;
+        // A variation selector can widen the cluster at the right margin. Move
+        // the complete cluster, never leave half of it on the previous row.
+        let saved_style = self.current_style;
+        self.current_style = self.palette.get(style);
+        self.print_grapheme(text, width);
+        self.current_style = saved_style;
+        true
     }
 
     fn clamp_cursor(&mut self) {
@@ -2477,15 +2529,9 @@ fn row_from_snapshot(snapshot: &RowSnapshot, width: usize) -> PhysicalRow {
     row.set_wrapped(snapshot.wrapped);
     for run in &snapshot.runs {
         let mut col = usize::from(run.start_col).min(width.saturating_sub(1));
-        for ch in run.text.chars() {
-            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0).min(2);
+        for grapheme in run.text.graphemes(true) {
+            let char_width = UnicodeWidthStr::width(grapheme).min(2);
             if char_width == 0 {
-                if col > 0
-                    && let Some(cell) = row.cell_mut(col - 1)
-                    && !cell.is_wide_continuation()
-                {
-                    cell.append_combining(ch);
-                }
                 continue;
             }
             if col >= width {
@@ -2494,7 +2540,7 @@ fn row_from_snapshot(snapshot: &RowSnapshot, width: usize) -> PhysicalRow {
             row.set_cell(
                 col,
                 Cell::new(
-                    ch.to_string(),
+                    grapheme.to_owned(),
                     run.style,
                     u8::try_from(char_width).unwrap_or(1),
                 ),
