@@ -2632,6 +2632,60 @@ mod tests {
     }
 
     #[test]
+    fn performance_and_pulse_compose_without_competing_scripted_borders() {
+        let catalog = vec![
+            ThemeCatalogEntry {
+                name: "performance".to_string(),
+                theme: toml::from_str(include_str!("../assets/themes/performance.toml")).unwrap(),
+            },
+            ThemeCatalogEntry {
+                name: "pulse-demo".to_string(),
+                theme: toml::from_str(include_str!("../assets/themes/pulse-demo.toml")).unwrap(),
+            },
+        ];
+        let settings: ThemePluginSettings = toml::from_str(
+            r#"
+            appearance_themes = ["performance"]
+            component_themes = ["performance", "pulse-demo"]
+            [components."performance.border"]
+            enabled = false
+            [components."pulse.border"]
+            below = ["performance.header"]
+            [components."pulse.border".settings]
+            color-source = "performance-colors-v1"
+            heat-mode = "cpu-memory"
+            smoothing-ms = "500"
+        "#,
+        )
+        .unwrap();
+        let resolved = resolve_theme_stack_with_settings(&catalog, &[], &settings).unwrap();
+        let decoration = &resolved.plugins["bmux.decoration"];
+        let components = &decoration["components"];
+        assert_eq!(
+            components["performance.border"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(components["pulse.border"]["script"].as_str(), Some("pulse"));
+        assert_eq!(
+            components["pulse.border"]["animation"]["hz"].as_integer(),
+            Some(30)
+        );
+        assert_eq!(
+            components["pulse.border"]["settings"]["color-source"].as_str(),
+            Some("performance-colors-v1")
+        );
+        assert_eq!(
+            components["performance.header"]["script"].as_str(),
+            Some("performance_header")
+        );
+        assert_eq!(
+            decoration["script_access"]["state_channels"][0].as_str(),
+            Some("bmux.performance/metrics-state")
+        );
+        assert!(components["performance.border"].get("animation").is_none());
+    }
+
+    #[test]
     fn split_stacks_keep_appearance_base_and_apply_component_targets() {
         let settings = ThemePluginSettings {
             appearance_themes: vec!["performance".to_string()],

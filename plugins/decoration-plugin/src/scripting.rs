@@ -665,6 +665,16 @@ mod lua_backend {
             Ok(t)
         })?;
         bmux.set("rgb", rgb_fn)?;
+        // Only compiled-in, versioned modules are loadable; no filesystem or
+        // package search path is exposed. A fresh module has caller-local state.
+        let module_fn = lua.create_function(|lua, name: String| {
+            let source = super::bundled_decoration_modules()
+                .iter()
+                .find_map(|(id, source)| (*id == name).then_some(*source))
+                .ok_or_else(|| mlua::Error::external("unknown bundled decoration module"))?;
+            lua.load(source).set_name(&name).eval::<Table>()
+        })?;
+        bmux.set("module", module_fn)?;
         // `bmux.named(name) -> table` — named-color helper.
         let named_fn = lua.create_function(|lua, name: String| {
             let t = lua.create_table()?;
@@ -1077,6 +1087,26 @@ mod lua_backend {
             "bright_white" => NamedColor::BrightWhite,
             _ => NamedColor::White,
         }
+    }
+}
+
+/// Versioned reusable modules, separate from executable decoration scripts.
+#[cfg(any(
+    feature = "scripting-luajit",
+    feature = "scripting-luau",
+    feature = "scripting-lua54"
+))]
+fn bundled_decoration_modules() -> &'static [(&'static str, &'static str)] {
+    #[cfg(feature = "bundled-decoration-scripts")]
+    {
+        &[(
+            "performance-colors-v1",
+            include_str!("../assets/decorations/performance_colors_v1.lua"),
+        )]
+    }
+    #[cfg(not(feature = "bundled-decoration-scripts"))]
+    {
+        &[]
     }
 }
 
@@ -1599,14 +1629,78 @@ mod tests {
         }
 
         #[test]
-        fn performance_border_combines_memory_cpu_and_pulse_with_smoothing() {
+        fn performance_color_provider_is_versioned_and_defaults_to_cpu() {
+            let backend = make_backend(ScriptHostAccess::default());
+            backend
+                .compile(
+                    Path::new("provider-test.lua"),
+                    r#"
+                local p = bmux.module("performance-colors-v1")
+                local snapshot = { system = { memory_total_bytes = 100 }, panes = {
+                    durable = { available = true, cpu_normalized_percent = 10, memory_bytes = 50 }
+                } }
+                local pane = { id = "surface", pane_id = "durable" }
+                assert(p.heat(snapshot, pane, {}) == 10)
+                assert(p.heat(snapshot, pane, { ["heat-mode"] = "cpu-memory" }) == 100)
+                assert(p.heat(snapshot, pane, { ["heat-mode"] = "cpu-memory",
+                    ["memory-red-percent"] = "100" }) < 100)
+                assert(not pcall(p.heat, snapshot, pane, { ["heat-mode"] = "unknown" }))
+                assert(not pcall(bmux.module, "../performance-colors-v1"))
+                assert(not pcall(bmux.module, "performance-colors-v2"))
+                function decorate(message) return nil end
+            "#,
+                )
+                .expect("provider contract");
+        }
+
+        #[test]
+        fn standalone_performance_is_steady_and_pulse_falls_back_without_metrics() {
+            for (script, source) in [
+                (
+                    "performance",
+                    include_str!("../assets/decorations/performance_header.lua"),
+                ),
+                ("pulse", include_str!("../assets/decorations/pulse.lua")),
+            ] {
+                let backend = make_backend(ScriptHostAccess::default());
+                let checks = if script == "performance" {
+                    r#"
+                    local pane = { id = "p", focused = true, rect = { x = 0, y = 0 } }
+                    local function color(time)
+                        return decorate({ kind = "render", time_ms = time, panes = { pane } }).surfaces.p[1].style.fg
+                    end
+                    local a, b = color(500), color(1500)
+                    assert(a.r == 60 and a.g == 220 and a.b == 90)
+                    assert(a.r == b.r and a.g == b.g and a.b == b.b)
+                    "#
+                } else {
+                    r#"
+                    local pane = { id = "p", focused = true, rect = {} }
+                    local message = { kind = "render", time_ms = 500, panes = { pane } }
+                    local a = decorate(message).surfaces.p[1].style.fg
+                    assert(a.r == 0 and a.g == 255 and a.b == 200)
+                    message.component = { settings = { ["color-source"] = "performance-colors-v1" } }
+                    local b = decorate(message).surfaces.p[1].style.fg
+                    assert(a.r == b.r and a.g == b.g and a.b == b.b)
+                    pane.focused = false
+                    assert(decorate(message).surfaces.p == nil)
+                    "#
+                };
+                backend
+                    .compile(Path::new(script), &format!("{source}\n{checks}"))
+                    .expect("standalone behavior");
+            }
+        }
+
+        #[test]
+        fn pulse_composes_performance_colors_with_smoothing() {
             use bmux_scene_protocol::scene_protocol::{Color, PaintCommand};
 
             let backend = make_backend(ScriptHostAccess::default());
             backend
                 .compile(
-                    Path::new("performance_header.lua"),
-                    include_str!("../assets/decorations/performance_header.lua"),
+                    Path::new("pulse.lua"),
+                    include_str!("../assets/decorations/pulse.lua"),
                 )
                 .expect("compile");
             let metrics = |cpu: u32, memory: u32, total: u32| {
@@ -1632,6 +1726,11 @@ mod tests {
                     panic!("expected render");
                 };
                 message.time_ms = time_ms;
+                message.component = Some(super::super::ScriptComponentMessage {
+                    id: "pulse.border".to_string(),
+                    entrypoint: None,
+                    settings: json!({ "color-source": "performance-colors-v1", "heat-mode": "cpu-memory", "smoothing-ms": "500" }),
+                });
                 if !visible {
                     message.panes = json!([]);
                 }
@@ -1640,7 +1739,7 @@ mod tests {
                     .expect("render");
                 outcome.surfaces.get("test-pane").and_then(|commands| {
                     commands.iter().find_map(|command| match command {
-                        PaintCommand::SemanticBorder { style, .. } => style.fg.clone(),
+                        PaintCommand::BoxBorder { style, .. } => style.fg.clone(),
                         _ => None,
                     })
                 })

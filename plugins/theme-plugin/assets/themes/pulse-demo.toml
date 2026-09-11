@@ -49,6 +49,9 @@ style         = "double"
 exited  = "✗"
 running = "▶"
 
-[plugins."bmux.decoration".animation]
+[plugins."bmux.decoration".components."pulse.border"]
+script = "pulse"
+
+[plugins."bmux.decoration".components."pulse.border".animation]
 hz   = 30
 kind = "pulse"

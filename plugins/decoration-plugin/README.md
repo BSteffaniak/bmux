@@ -75,6 +75,57 @@ below = ["performance.header"]
 enabled = false
 ```
 
+### Composing performance colors with pulse
+
+Both themes remain independent: `performance` paints steady CPU-colored borders
+and headers; `pulse-demo` pulses lime/cyan on the focused pane. To connect them,
+use this in your BMUX config (no combination theme file is needed):
+
+```toml
+[plugins.settings."bmux.theme"]
+appearance_themes = ["performance"]
+component_themes = ["performance", "pulse-demo"]
+
+[plugins.settings."bmux.theme".components."performance.border"]
+enabled = false
+
+[plugins.settings."bmux.theme".components."pulse.border"]
+below = ["performance.header"]
+
+[plugins.settings."bmux.theme".components."pulse.border".settings]
+color-source = "performance-colors-v1"
+heat-mode = "cpu-memory"
+memory-green-percent = "5"
+memory-yellow-percent = "15"
+memory-orange-percent = "30"
+memory-red-percent = "50"
+period-ms = "2000"
+smoothing-ms = "500"
+brightness-min = "0.6"
+brightness-max = "1"
+```
+
+Performance supplies the existing `bmux.performance/metrics-state` access grant;
+pulse consumes only the channel declared by its color provider. Missing snapshots
+fall back to lime/cyan; missing total system RAM contributes no memory heat.
+Unavailable pane metrics retain performance's system-metric fallback. Memory is
+measured against total physical system RAM, not against recent growth.
+
+Set `all-panes = "true"` in pulse settings to animate all panes (default: focused
+only). Component targets can further restrict that set. Pulse period, smoothing,
+and brightness are animation settings; `heat-mode` (`cpu` by default or
+`cpu-memory`) and increasing memory thresholds belong to the performance color
+provider. The same heat settings can be applied to performance's border/header
+components without animation. The composed header above keeps its original CPU
+color. Growth-sensitive pulse speed is not enabled.
+
+`bmux.module(name)` loads only compiled-in, versioned decoration modules—never
+filesystem paths or external packages. `performance-colors-v1` exposes
+`state_channel`, `metrics(snapshot, pane)`, `heat(snapshot, pane, settings)` (0–100),
+and `color(heat)` (RGB channels). Providers do not paint or animate. Unknown
+modules and unsupported heat modes fail explicitly. Each script owns its module
+instance; no cross-component mutable globals are shared.
+
 ### Script resolution
 
 The `script = "..."` value is resolved in this order:
