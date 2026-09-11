@@ -34,7 +34,11 @@ on:
   workflow_dispatch:
 
 jobs:
+  rust-version:
+    uses: ./.github/workflows/rust-version.yml
+
   docs-check:
+    needs: [rust-version]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,7 +48,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
 
       - name: Install markdownlint-cli
         run: npm install --global markdownlint-cli

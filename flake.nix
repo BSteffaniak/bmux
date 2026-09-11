@@ -59,10 +59,15 @@
         };
       in
       {
+        packages.rust-toolchain = rustToolchain;
+        # Native non-Nix CI can consume this value instead of floating rustup stable.
+        rustVersion = rustToolchain.version;
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             rustToolchain
             cargo-deny
+            cargo-nextest
+            rust-analyzer
             cargo-ndk
             cargoMachete
             markdownlint-cli
@@ -74,6 +79,24 @@
           ];
 
           shellHook = ''
+            for override in RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER; do
+              if [ -n "''${!override:-}" ]; then
+                echo "BMUX: $override conflicts with the Nix-owned compiler; unset it before entering." >&2
+                exit 1
+              fi
+            done
+            export PATH="${rustToolchain}/bin:$PATH"
+            export RUSTC="${rustToolchain}/bin/rustc"
+            export RUSTDOC="${rustToolchain}/bin/rustdoc"
+            export BMUX_NIX_TOOLCHAIN="${rustToolchain}"
+            checkout="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+            export CARGO_TARGET_DIR="$checkout/target/nix/${builtins.baseNameOf rustToolchain}"
+            for tool in cargo rustc cargo-clippy clippy-driver; do
+              if [ "$(command -v "$tool")" != "${rustToolchain}/bin/$tool" ]; then
+                echo "BMUX: $tool does not resolve to the locked Nix toolchain" >&2
+                exit 1
+              fi
+            done
             echo "bmux development environment loaded"
             echo "Available tools:"
             echo "  - cargo ($(cargo --version))"

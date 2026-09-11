@@ -81,7 +81,7 @@ run_matrix() {
 	"${args[@]}"
 }
 
-run_matrix debug "$ROOT_DIR/target/debug/bmux"
-run_matrix release "$ROOT_DIR/target/release/bmux"
+run_matrix debug "${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/bmux"
+run_matrix release "${CARGO_TARGET_DIR:-$ROOT_DIR/target}/release/bmux"
 
 echo

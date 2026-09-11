@@ -1,0 +1,17 @@
+name: Locked Rust version
+on:
+  workflow_call:
+    outputs:
+      version:
+        description: Rust version selected by flake.lock
+        value: ${{ jobs.resolve.outputs.version }}
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.rust.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - id: rust
+        run: echo "version=$(nix eval --raw .#rustVersion.x86_64-linux)" >> "$GITHUB_OUTPUT"

@@ -19,14 +19,15 @@ bmux combines server-backed terminal sessions with independent client views, mod
 
 ## Installation
 
-Install Git, stable Rust, and a native build toolchain. macOS and Linux are primary terminal environments; the repository also contains Windows support and platform-specific release configuration. A release target is not a guarantee of identical behavior on every terminal/OS combination.
+Install Git, Nix, and a native build toolchain. macOS and Linux are primary terminal environments; the repository also contains Windows support and platform-specific release configuration. A release target is not a guarantee of identical behavior on every terminal/OS combination.
 
 ```sh
 git clone https://github.com/BSteffaniak/bmux.git
 cd bmux
+nix develop
 cargo build --locked --release -p bmux_cli --bin bmux
-./target/release/bmux --help
-./target/release/bmux
+"$CARGO_TARGET_DIR/release/bmux" --help
+"$CARGO_TARGET_DIR/release/bmux"
 ```
 
 On Windows, use `target\release\bmux.exe`. Use the built binary's full path, or add its directory to `PATH` before using the examples below.

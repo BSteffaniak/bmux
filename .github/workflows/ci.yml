@@ -5,6 +5,9 @@ on:
     branches: ["master"]
     paths:
       - ".github/workflows/ci.yml"
+      - ".github/workflows/rust-version.yml"
+      - "flake.nix"
+      - "flake.lock"
       - "packages/**"
       - "plugins/**"
       - "examples/**"
@@ -39,7 +42,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  rust-version:
+    uses: ./.github/workflows/rust-version.yml
+
   determine-affected-packages:
+    needs: [rust-version]
     name: Analyze Changes
     runs-on: ubuntu-latest
     outputs:
@@ -62,7 +69,9 @@ jobs:
             echo "value=$(date +%s)$RANDOM" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
 
       - name: Analyze changes and generate comprehensive matrix
         id: analyze
@@ -125,7 +134,7 @@ jobs:
   cargo-deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
-    needs: [determine-affected-packages]
+    needs: [rust-version, determine-affected-packages]
     if: ${{ needs.determine-affected-packages.outputs.has-changes == 'true' }}
 
     steps:
@@ -136,6 +145,7 @@ jobs:
           command: check
 
   build-cargo-machete:
+    needs: [rust-version]
     name: Build Cargo Machete (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -144,7 +154,9 @@ jobs:
         os: [macos-latest, ubuntu-latest, windows-latest]
 
     steps:
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
 
       - uses: actions/checkout@v4
 
@@ -181,13 +193,15 @@ jobs:
   validate-feature-propagation:
     name: Validate Feature Propagation
     runs-on: ubuntu-latest
-    needs: [determine-affected-packages]
+    needs: [rust-version, determine-affected-packages]
     if: ${{ needs.determine-affected-packages.outputs.has-changes == 'true' }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
 
       - name: Validate feature propagation
         uses: MoosicBox/MoosicBox/.github/actions/clippier@master
@@ -199,7 +213,7 @@ jobs:
   plugin-runtime-perf-gates:
     name: Plugin Runtime Perf Gates
     runs-on: ubuntu-latest
-    needs: [determine-affected-packages]
+    needs: [rust-version, determine-affected-packages]
     if: ${{ needs.determine-affected-packages.outputs.has-changes == 'true' }}
 
     steps:
@@ -208,7 +222,9 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
 
       - name: Validate plugin/runtime matcher fixtures
         shell: bash
@@ -361,14 +377,16 @@ jobs:
   sandbox-bundle-regression:
     name: Sandbox Bundle Regression
     runs-on: ubuntu-latest
-    needs: [determine-affected-packages]
+    needs: [rust-version, determine-affected-packages]
     if: ${{ needs.determine-affected-packages.outputs.has-changes == 'true' }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
 
       - name: Run sandbox bundle/verify regression checks
         shell: bash
@@ -378,7 +396,7 @@ jobs:
   build:
     name: ${{ matrix.package.name }}${{ matrix.package.hasMultipleOs && format(' {0}', matrix.package.osEmoji) || '' }}${{ matrix.package.osCount > 1 && format(' {0}', matrix.package.osIndex) || '' }}
     runs-on: ${{ matrix.package.os }}
-    needs: [determine-affected-packages, build-cargo-machete, plugin-runtime-perf-gates]
+    needs: [rust-version, determine-affected-packages, build-cargo-machete, plugin-runtime-perf-gates]
     if: ${{ needs.determine-affected-packages.outputs.has-changes == 'true' }}
     strategy:
       fail-fast: false
@@ -395,6 +413,11 @@ jobs:
           package-json: ${{ toJson(matrix.package) }}
           skip-checkout: "true"
           rust-components: "rustfmt, clippy, llvm-tools-preview"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
+          components: rustfmt, clippy, llvm-tools-preview
 
       - name: Download cargo-machete
         uses: actions/download-artifact@v4
@@ -479,7 +502,7 @@ jobs:
   generate-failures-summary:
     name: Generate Workflow Failures Summary
     runs-on: ubuntu-latest
-    needs: [build]
+    needs: [rust-version, build]
     if: always()
 
     steps:

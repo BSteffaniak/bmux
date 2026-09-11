@@ -50,7 +50,7 @@ if [[ -z "$OUTPUT_DIR" ]]; then
 fi
 mkdir -p "$OUTPUT_DIR"
 
-BMUX_BIN="target/debug/bmux"
+BMUX_BIN="${CARGO_TARGET_DIR:-target}/debug/bmux"
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   cargo build -p bmux_cli
 fi

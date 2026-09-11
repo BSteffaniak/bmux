@@ -148,7 +148,7 @@ run_keybind_case() {
 
 cd "$ROOT_DIR"
 cargo build -q -p bmux_cli
-BMUX_SMOKE_BINARY="$ROOT_DIR/target/debug/bmux"
+BMUX_SMOKE_BINARY="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/bmux"
 
 run_case /bin/sh
 run_case /bin/bash

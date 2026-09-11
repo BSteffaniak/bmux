@@ -94,7 +94,7 @@ cd "$ROOT_DIR"
 
 if [[ -z "$BMUX_PERF_TOOLS_BIN" ]]; then
 	cargo build -q -p bmux_perf_tools
-	BMUX_PERF_TOOLS_BIN="$ROOT_DIR/target/debug/bmux-perf-tools"
+	BMUX_PERF_TOOLS_BIN="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/bmux-perf-tools"
 fi
 
 if [[ ! -x "$BMUX_PERF_TOOLS_BIN" ]]; then
