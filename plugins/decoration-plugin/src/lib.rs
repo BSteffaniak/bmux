@@ -2787,7 +2787,7 @@ impl RustPlugin for DecorationPlugin {
             script_loaded = summary_script_loaded,
             "decoration plugin activate complete",
         );
-        // Spawn the windows-plugin pane-event broadcast subscriber.
+        // Spawn the tabs-plugin pane-event broadcast subscriber.
         // This captures transient focus-change / zoom / lifecycle
         // events emitted by the windows plugin's focus-pane shim.
         // Activation-order races can make this subscriber miss the
@@ -3277,9 +3277,10 @@ fn spawn_windows_pane_event_subscriber(state: SharedState) {
     // any events at all. Once the channel is registered, the
     // subscriber sees every subsequent event.
     let Ok(mut rx) = bmux_plugin::global_event_bus()
-        .subscribe::<bmux_windows_plugin_api::windows_events::PaneEvent>(
-        &bmux_windows_plugin_api::windows_events::EVENT_KIND,
-    ) else {
+        .subscribe::<bmux_tabs_plugin_api::tabs_events::PaneEvent>(
+            &bmux_tabs_plugin_api::tabs_events::EVENT_KIND,
+        )
+    else {
         return;
     };
     let host_async_handle = state.host_async_handle();
@@ -3782,10 +3783,8 @@ fn apply_attach_layout_snapshot(
 /// plugin's local `pane-event` mirror. Both enums are structurally
 /// identical by design; the local mirror exists so the decoration
 /// BPDL doesn't import the windows BPDL.
-fn translate_windows_event(
-    event: &bmux_windows_plugin_api::windows_events::PaneEvent,
-) -> PaneEvent {
-    use bmux_windows_plugin_api::windows_events::PaneEvent as WinEvent;
+fn translate_windows_event(event: &bmux_tabs_plugin_api::tabs_events::PaneEvent) -> PaneEvent {
+    use bmux_tabs_plugin_api::tabs_events::PaneEvent as WinEvent;
     match event {
         WinEvent::Focused { pane_id } => PaneEvent::Focused { pane_id: *pane_id },
         WinEvent::Unfocused { pane_id } => PaneEvent::Unfocused { pane_id: *pane_id },
@@ -3799,7 +3798,7 @@ fn translate_windows_event(
             session_id: *session_id,
         },
         WinEvent::Closed { pane_id } => PaneEvent::Closed { pane_id: *pane_id },
-        // The windows-plugin-api does not carry the exit bit on
+        // The tabs-plugin-api does not carry the exit bit on
         // `status-changed` (the receiver is expected to re-query
         // `pane-state`). The decoration plugin defers to whatever
         // value it currently holds; mark as non-exited so we don't
@@ -5018,12 +5017,10 @@ mod tests {
         use bmux_attach_layout_protocol::attach_layout_protocol::{
             AttachLayoutSnapshot, AttachSurfaceSummary,
         };
-        use bmux_windows_plugin_api::windows_events::PaneEvent as WindowsPaneEvent;
+        use bmux_tabs_plugin_api::tabs_events::PaneEvent as WindowsPaneEvent;
 
         let bus = bmux_plugin::global_event_bus();
-        bus.register_channel::<WindowsPaneEvent>(
-            bmux_windows_plugin_api::windows_events::EVENT_KIND,
-        );
+        bus.register_channel::<WindowsPaneEvent>(bmux_tabs_plugin_api::tabs_events::EVENT_KIND);
 
         let plugin = DecorationPlugin::new();
         spawn_windows_pane_event_subscriber(plugin.state.clone());
@@ -5045,7 +5042,7 @@ mod tests {
         });
 
         bus.emit(
-            &bmux_windows_plugin_api::windows_events::EVENT_KIND,
+            &bmux_tabs_plugin_api::tabs_events::EVENT_KIND,
             WindowsPaneEvent::Focused { pane_id: pane },
         )
         .expect("emit focus event");

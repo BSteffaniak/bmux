@@ -1,22 +1,21 @@
 execution_class = "native_fast"
-id = "bmux.windows"
-name = "bmux Windows"
+id = "bmux.tabs"
+name = "bmux Tabs"
 owns_namespaces = [
-    "window",
     "tab",
-    "new-window",
-    "rename-window",
-    "rename-window-by-id",
-    "list-windows",
-    "kill-window",
-    "kill-all-windows",
-    "switch-window",
-    "move-window",
-    "next-window",
-    "prev-window",
-    "last-window",
-    "goto-window",
-    "close-current-window",
+    "new-tab",
+    "rename-tab",
+    "rename-tab-by-id",
+    "list-tabs",
+    "kill-tab",
+    "kill-all-tabs",
+    "switch-tab",
+    "move-tab",
+    "next-tab",
+    "prev-tab",
+    "last-tab",
+    "goto-tab",
+    "close-current-tab",
     "reset-order",
     "focus-pane-in-direction",
     "split-pane",
@@ -41,8 +40,8 @@ owns_namespaces = [
     "close-active-pane",
     "restart-pane",
 ]
-provided_capabilities = ["bmux.windows.read", "bmux.windows.write"]
-provided_features = ["bmux.windows"]
+provided_capabilities = ["bmux.tabs.read", "bmux.tabs.write"]
+provided_features = ["bmux.tabs"]
 required_capabilities = [
     "bmux.commands",
     "bmux.contexts.read",
@@ -61,34 +60,34 @@ required_capabilities = [
 version = "0.0.1-alpha.0"
 
 [[services]]
-capability   = "bmux.windows.read"
-interface_id = "windows-state"
+capability   = "bmux.tabs.read"
+interface_id = "tabs-state"
 kind         = "query"
 
 [[services]]
-capability   = "bmux.windows.write"
-interface_id = "windows-commands"
+capability   = "bmux.tabs.write"
+interface_id = "tabs-commands"
 kind         = "command"
 
 [[services]]
-capability   = "bmux.windows.read"
-interface_id = "windows-events"
+capability   = "bmux.tabs.read"
+interface_id = "tabs-events"
 kind         = "event"
 
-# Reactive state channel carrying the ordered window list. The server
+# Reactive state channel carrying the ordered tab list. The server
 # forwards every retained-value replacement as a
 # `ServerEvent::PluginBusEvent` so the attach tab bar sees the exact
 # order the plugin maintains — no polling, no round-trip per frame.
 [[event_publications]]
 delivery                     = "state"
 forward_to_streaming_clients = true
-kind                         = "bmux.windows/windows-list"
+kind                         = "bmux.tabs/tabs-list"
 
 [[commands]]
-aliases       = [["window", "new"], ["tab", "new"]]
+aliases       = [["tab", "new"]]
 expose_in_cli = true
-name          = "new-window"
-path          = ["new-window"]
+name          = "new-tab"
+path          = ["new-tab"]
 summary       = "Create a workspace tab"
 
 [[commands.arguments]]
@@ -106,11 +105,11 @@ short      = "n"
 value_name = "NAME"
 
 [[commands]]
-aliases       = [["window", "rename"], ["tab", "rename"]]
+aliases       = [["tab", "rename"]]
 execution     = "caller_process"
 expose_in_cli = true
-name          = "rename-window"
-path          = ["rename-window"]
+name          = "rename-tab"
+path          = ["rename-tab"]
 summary       = "Rename the current workspace tab"
 
 [[commands.arguments]]
@@ -123,9 +122,9 @@ value_name = "NAME"
 [[commands]]
 execution     = "caller_process"
 expose_in_cli = true
-name          = "rename-window-by-id"
-path          = ["rename-window-by-id"]
-summary       = "Rename a specific workspace window by id"
+name          = "rename-tab-by-id"
+path          = ["rename-tab-by-id"]
+summary       = "Rename a specific workspace tab by id"
 
 [[commands.arguments]]
 kind       = "string"
@@ -141,10 +140,10 @@ short      = "n"
 value_name = "NAME"
 
 [[commands]]
-aliases       = [["window", "list"], ["tab", "list"]]
+aliases       = [["tab", "list"]]
 expose_in_cli = true
-name          = "list-windows"
-path          = ["list-windows"]
+name          = "list-tabs"
+path          = ["list-tabs"]
 summary       = "List workspace tabs"
 
 [[commands.arguments]]
@@ -161,10 +160,10 @@ name  = "json"
 short = "j"
 
 [[commands]]
-aliases       = [["window", "kill"], ["tab", "kill"]]
+aliases       = [["tab", "kill"]]
 expose_in_cli = true
-name          = "kill-window"
-path          = ["kill-window"]
+name          = "kill-tab"
+path          = ["kill-tab"]
 summary       = "Kill a workspace tab"
 
 [[commands.arguments]]
@@ -187,11 +186,11 @@ long = "force-local"
 name = "force-local"
 
 [[commands]]
-aliases       = [["window", "kill-all"], ["tab", "kill-all"]]
+aliases       = [["tab", "kill-all"]]
 expose_in_cli = true
-name          = "kill-all-windows"
-path          = ["kill-all-windows"]
-summary       = "Kill all workspace windows"
+name          = "kill-all-tabs"
+path          = ["kill-all-tabs"]
+summary       = "Kill all workspace tabs"
 
 [[commands.arguments]]
 kind       = "string"
@@ -206,11 +205,11 @@ long = "force-local"
 name = "force-local"
 
 [[commands]]
-aliases       = [["window", "switch"], ["tab", "switch"]]
+aliases       = [["tab", "switch"]]
 expose_in_cli = true
-name          = "switch-window"
-path          = ["switch-window"]
-summary       = "Switch active workspace window"
+name          = "switch-tab"
+path          = ["switch-tab"]
+summary       = "Switch active workspace tab"
 
 [[commands.arguments]]
 kind       = "string"
@@ -227,11 +226,11 @@ short      = "s"
 value_name = "SESSION"
 
 [[commands]]
-aliases       = [["window", "move"], ["tab", "move"]]
+aliases       = [["tab", "move"]]
 expose_in_cli = true
-name          = "move-window"
-path          = ["move-window"]
-summary       = "Move a workspace window before or after another window"
+name          = "move-tab"
+path          = ["move-tab"]
+summary       = "Move a workspace tab before or after another tab"
 
 [[commands.arguments]]
 kind       = "string"
@@ -257,33 +256,33 @@ values     = ["before", "after"]
 
 [[commands]]
 accepts_repeat = true
-aliases        = [["window", "next"], ["tab", "next"]]
+aliases        = [["tab", "next"]]
 expose_in_cli  = true
-name           = "next-window"
-path           = ["next-window"]
-summary        = "Switch to the next workspace window"
+name           = "next-tab"
+path           = ["next-tab"]
+summary        = "Switch to the next workspace tab"
 
 [[commands]]
 accepts_repeat = true
-aliases        = [["window", "prev"], ["tab", "prev"]]
+aliases        = [["tab", "prev"]]
 expose_in_cli  = true
-name           = "prev-window"
-path           = ["prev-window"]
-summary        = "Switch to the previous workspace window"
+name           = "prev-tab"
+path           = ["prev-tab"]
+summary        = "Switch to the previous workspace tab"
 
 [[commands]]
-aliases       = [["window", "last"], ["tab", "last"]]
+aliases       = [["tab", "last"]]
 expose_in_cli = true
-name          = "last-window"
-path          = ["last-window"]
-summary       = "Switch to the previously active workspace window"
+name          = "last-tab"
+path          = ["last-tab"]
+summary       = "Switch to the previously active workspace tab"
 
 [[commands]]
-aliases       = [["window", "goto"], ["tab", "goto"]]
+aliases       = [["tab", "goto"]]
 expose_in_cli = true
-name          = "goto-window"
-path          = ["goto-window"]
-summary       = "Switch to a workspace window by 1-based index"
+name          = "goto-tab"
+path          = ["goto-tab"]
+summary       = "Switch to a workspace tab by 1-based index"
 
 [[commands.arguments]]
 kind       = "string"
@@ -293,25 +292,25 @@ required   = true
 value_name = "INDEX"
 
 [[commands]]
-aliases       = [["window", "close-current"], ["tab", "close-current"]]
+aliases       = [["tab", "close-current"]]
 expose_in_cli = true
-name          = "close-current-window"
-path          = ["close-current-window"]
-summary       = "Close the current workspace window"
+name          = "close-current-tab"
+path          = ["close-current-tab"]
+summary       = "Close the current workspace tab"
 
 [[commands]]
-aliases       = [["window", "reset-order"], ["tab", "reset-order"]]
+aliases       = [["tab", "reset-order"]]
 expose_in_cli = true
 name          = "reset-order"
 path          = ["reset-order"]
-summary       = "Reset the persisted window order and rebuild deterministically from current contexts"
+summary       = "Reset the persisted tab order and rebuild deterministically from current contexts"
 
 # ── Pane-level commands ──────────────────────────────────────────────
 # These commands were previously exposed only as typed-service
 # handlers (not reachable by keybinding) and as hardcoded
 # `RuntimeAction::*` variants in core. Exposing them as
 # `[[commands]]` lets keybindings invoke them via
-# `plugin:bmux.windows:<cmd>` and removes the need for core to carry
+# `plugin:bmux.tabs:<cmd>` and removes the need for core to carry
 # domain-specific variants.
 
 [[commands]]
@@ -696,48 +695,48 @@ short      = "s"
 value_name = "SESSION"
 
 [keybindings.runtime]
-# Window lifecycle
-',' = "plugin:bmux.windows:rename-window"
-c   = "plugin:bmux.windows:new-window"
-n   = "plugin:bmux.windows:next-window"
-p   = "plugin:bmux.windows:prev-window"
-w   = "plugin:bmux.windows:last-window"
+# Tab lifecycle
+',' = "plugin:bmux.tabs:rename-tab"
+c   = "plugin:bmux.tabs:new-tab"
+n   = "plugin:bmux.tabs:next-tab"
+p   = "plugin:bmux.tabs:prev-tab"
+w   = "plugin:bmux.tabs:last-tab"
 # Pane focus (hjkl + arrows) — repeat-safe via accepts_repeat on focus-pane-in-direction
-arrow_down  = "plugin:bmux.windows:focus-pane-in-direction --direction down"
-arrow_left  = "plugin:bmux.windows:focus-pane-in-direction --direction left"
-arrow_right = "plugin:bmux.windows:focus-pane-in-direction --direction right"
-arrow_up    = "plugin:bmux.windows:focus-pane-in-direction --direction up"
-h           = "plugin:bmux.windows:focus-pane-in-direction --direction left"
-j           = "plugin:bmux.windows:focus-pane-in-direction --direction down"
-k           = "plugin:bmux.windows:focus-pane-in-direction --direction up"
-l           = "plugin:bmux.windows:focus-pane-in-direction --direction right"
-o           = "plugin:bmux.windows:focus-pane-in-direction --direction next"
+arrow_down  = "plugin:bmux.tabs:focus-pane-in-direction --direction down"
+arrow_left  = "plugin:bmux.tabs:focus-pane-in-direction --direction left"
+arrow_right = "plugin:bmux.tabs:focus-pane-in-direction --direction right"
+arrow_up    = "plugin:bmux.tabs:focus-pane-in-direction --direction up"
+h           = "plugin:bmux.tabs:focus-pane-in-direction --direction left"
+j           = "plugin:bmux.tabs:focus-pane-in-direction --direction down"
+k           = "plugin:bmux.tabs:focus-pane-in-direction --direction up"
+l           = "plugin:bmux.tabs:focus-pane-in-direction --direction right"
+o           = "plugin:bmux.tabs:focus-pane-in-direction --direction next"
 # Pane split
-'"' = "plugin:bmux.windows:split-pane --direction horizontal"
-"%" = "plugin:bmux.windows:split-pane --direction vertical"
+'"' = "plugin:bmux.tabs:split-pane --direction horizontal"
+"%" = "plugin:bmux.tabs:split-pane --direction vertical"
 # Pane resize (repeat-safe)
-"minus"             = "plugin:bmux.windows:resize-pane --direction decrease"
-"plus"              = "plugin:bmux.windows:resize-pane --direction increase"
-"shift+arrow_down"  = "plugin:bmux.windows:resize-pane --direction down"
-"shift+arrow_left"  = "plugin:bmux.windows:resize-pane --direction left"
-"shift+arrow_right" = "plugin:bmux.windows:resize-pane --direction right"
-"shift+arrow_up"    = "plugin:bmux.windows:resize-pane --direction up"
-"shift+h"           = "plugin:bmux.windows:resize-pane --direction left"
-"shift+j"           = "plugin:bmux.windows:resize-pane --direction down"
-"shift+k"           = "plugin:bmux.windows:resize-pane --direction up"
-"shift+l"           = "plugin:bmux.windows:resize-pane --direction right"
+"minus"             = "plugin:bmux.tabs:resize-pane --direction decrease"
+"plus"              = "plugin:bmux.tabs:resize-pane --direction increase"
+"shift+arrow_down"  = "plugin:bmux.tabs:resize-pane --direction down"
+"shift+arrow_left"  = "plugin:bmux.tabs:resize-pane --direction left"
+"shift+arrow_right" = "plugin:bmux.tabs:resize-pane --direction right"
+"shift+arrow_up"    = "plugin:bmux.tabs:resize-pane --direction up"
+"shift+h"           = "plugin:bmux.tabs:resize-pane --direction left"
+"shift+j"           = "plugin:bmux.tabs:resize-pane --direction down"
+"shift+k"           = "plugin:bmux.tabs:resize-pane --direction up"
+"shift+l"           = "plugin:bmux.tabs:resize-pane --direction right"
 # Pane zoom / close / restart
-f         = "plugin:bmux.windows:create-floating-pane"
-r         = "plugin:bmux.windows:restart-pane"
-"shift+f" = "plugin:bmux.windows:focus-next-floating-pane"
-x         = "plugin:bmux.windows:close-active-pane"
-z         = "plugin:bmux.windows:zoom-pane"
+f         = "plugin:bmux.tabs:create-floating-pane"
+r         = "plugin:bmux.tabs:restart-pane"
+"shift+f" = "plugin:bmux.tabs:focus-next-floating-pane"
+x         = "plugin:bmux.tabs:close-active-pane"
+z         = "plugin:bmux.tabs:zoom-pane"
 # Floating pane move/resize (repeat-safe while a floating pane is active)
-"alt+h"       = "plugin:bmux.windows:move-active-floating-pane --direction left"
-"alt+j"       = "plugin:bmux.windows:move-active-floating-pane --direction down"
-"alt+k"       = "plugin:bmux.windows:move-active-floating-pane --direction up"
-"alt+l"       = "plugin:bmux.windows:move-active-floating-pane --direction right"
-"alt+shift+h" = "plugin:bmux.windows:resize-active-floating-pane --direction left"
-"alt+shift+j" = "plugin:bmux.windows:resize-active-floating-pane --direction down"
-"alt+shift+k" = "plugin:bmux.windows:resize-active-floating-pane --direction up"
-"alt+shift+l" = "plugin:bmux.windows:resize-active-floating-pane --direction right"
+"alt+h"       = "plugin:bmux.tabs:move-active-floating-pane --direction left"
+"alt+j"       = "plugin:bmux.tabs:move-active-floating-pane --direction down"
+"alt+k"       = "plugin:bmux.tabs:move-active-floating-pane --direction up"
+"alt+l"       = "plugin:bmux.tabs:move-active-floating-pane --direction right"
+"alt+shift+h" = "plugin:bmux.tabs:resize-active-floating-pane --direction left"
+"alt+shift+j" = "plugin:bmux.tabs:resize-active-floating-pane --direction down"
+"alt+shift+k" = "plugin:bmux.tabs:resize-active-floating-pane --direction up"
+"alt+shift+l" = "plugin:bmux.tabs:resize-active-floating-pane --direction right"

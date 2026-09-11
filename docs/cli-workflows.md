@@ -232,8 +232,8 @@ path = ["recording", "start"]
 
 Role policy: `owner` controls session and window mutations plus role changes, `writer` can send attach input, and `observer` is read-only.
 
-Window presentation settings and the tab-strip/sidebar enablement combinations
-are documented in [Window presentation plugins](window-presentations.md).
+Window presentation settings and the tab-bar/sidebar enablement combinations
+are documented in [Window presentation plugins](tab-presentations.md).
 
 ## Examples
 

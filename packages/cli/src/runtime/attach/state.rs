@@ -18,8 +18,8 @@ use bmux_control_catalog_plugin_api::control_catalog_state::{
     ContextRow, ContextSessionBinding, SessionRow,
 };
 use bmux_plugin::{AttachInputHook, AttachVisualProjectionUpdate, ExtensionRect};
-use bmux_windows_plugin_api::windows_commands::PaneResizeDirection;
-use bmux_windows_plugin_api::windows_list::WindowListSnapshot;
+use bmux_tabs_plugin_api::tabs_commands::PaneResizeDirection;
+use bmux_tabs_plugin_api::tabs_list::TabListSnapshot;
 use crossterm::event::MouseEvent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -272,13 +272,13 @@ pub struct AttachViewState {
     pub transient_status: Option<String>,
     pub transient_status_until: Option<Instant>,
     pub control_catalog_revision: u64,
-    /// Latest ordered window list received from the windows-plugin
-    /// `windows-list` state channel. `None` until the first snapshot
+    /// Latest ordered window list received from the tabs-plugin
+    /// `tabs-list` state channel. `None` until the first snapshot
     /// arrives (or when the plugin is absent, in which case the tab
     /// bar falls back to rendering `cached_contexts` in raw server
     /// order). Updated by the attach loop whenever the plugin
-    /// publishes a new value via `publish_window_list_snapshot`.
-    pub cached_window_list: Option<Arc<WindowListSnapshot>>,
+    /// publishes a new value via `publish_tab_list_snapshot`.
+    pub cached_tab_list: Option<Arc<TabListSnapshot>>,
     pub cached_contexts: Vec<ContextRow>,
     pub cached_sessions: Vec<SessionRow>,
     pub cached_context_session_bindings: Vec<ContextSessionBinding>,
@@ -612,7 +612,7 @@ impl AttachViewState {
             transient_status: None,
             transient_status_until: None,
             control_catalog_revision: 0,
-            cached_window_list: None,
+            cached_tab_list: None,
             cached_contexts: Vec::new(),
             cached_sessions: Vec::new(),
             cached_context_session_bindings: Vec::new(),

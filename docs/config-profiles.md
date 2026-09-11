@@ -79,7 +79,7 @@ server_timeout = 9000
 pane_term = "xterm-256color"
 
 [composition.profiles.team_base.patch.plugins]
-enabled = ["bmux.windows", "bmux.permissions"]
+enabled = ["bmux.tabs", "bmux.permissions"]
 
 [composition.profiles.dev_local]
 extends = ["team_base"]

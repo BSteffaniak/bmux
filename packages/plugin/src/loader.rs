@@ -3312,8 +3312,8 @@ sleep 60
                 &bridge_request.payload,
             )
         {
-            let exit_code = if command_request.plugin_id == "bmux.windows"
-                && command_request.command_name == "new-window"
+            let exit_code = if command_request.plugin_id == "bmux.tabs"
+                && command_request.command_name == "new-tab"
             {
                 0
             } else {
@@ -4411,8 +4411,8 @@ minimum = "1.0"
                 bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1,
                 bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
                 &bmux_plugin_sdk::PluginCliCommandRequest::new(
-                    "bmux.windows".to_string(),
-                    "new-window".to_string(),
+                    "bmux.tabs".to_string(),
+                    "new-tab".to_string(),
                     Vec::new(),
                 ),
             )
@@ -4461,8 +4461,8 @@ minimum = "1.0"
         };
 
         let mut request = bmux_plugin_sdk::PluginCliCommandRequest::new(
-            "bmux.windows".to_string(),
-            "new-window".to_string(),
+            "bmux.tabs".to_string(),
+            "new-tab".to_string(),
             Vec::new(),
         );
         request.protocol_version = bmux_plugin_sdk::CORE_CLI_BRIDGE_PROTOCOL_V1 + 1;
@@ -4636,9 +4636,9 @@ minimum = "1.0"
         // Current typed interface ids also must not be hardcoded in the
         // loader; they belong to plugin manifests and BPDL-generated
         // bindings.
-        assert!(!source.contains("\"windows-state\""));
-        assert!(!source.contains("\"windows-commands\""));
-        assert!(!source.contains("\"windows-events\""));
+        assert!(!source.contains("\"tabs-state\""));
+        assert!(!source.contains("\"tabs-commands\""));
+        assert!(!source.contains("\"tabs-events\""));
     }
 
     // ── Remote typed-service dispatch tests ──────────────────────────

@@ -155,7 +155,7 @@ struct ClusterAttachSession {
     client: BmuxClient,
     cluster: String,
     workspace_id: uuid::Uuid,
-    window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId,
+    tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId,
     principal_id: String,
     snapshot: Option<AttachProviderSnapshot>,
     view_revision: AttachViewRevision,
@@ -180,7 +180,7 @@ impl std::fmt::Debug for ClusterAttachSession {
             .debug_struct("ClusterAttachSession")
             .field("cluster", &self.cluster)
             .field("workspace_id", &self.workspace_id)
-            .field("window_id", &self.window_id)
+            .field("tab_id", &self.tab_id)
             .field("principal_id", &self.principal_id)
             .field("view_revision", &self.view_revision)
             .field("control_revision", &self.control_revision)
@@ -244,7 +244,7 @@ impl ClusterAttachSession {
             client,
             cluster,
             workspace_id,
-            window_id: layout.window_id.clone(),
+            tab_id: layout.tab_id.clone(),
             principal_id,
             snapshot: Some(built.snapshot),
             view_revision,
@@ -314,7 +314,7 @@ impl ClusterAttachSession {
         self.view_revision = AttachViewRevision(self.view_revision.0.saturating_add(1));
         self.event_sequence = AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
         self.control_revision = layout.control_revision;
-        self.window_id = layout.window_id;
+        self.tab_id = layout.tab_id;
         let delta = cluster_reconciliation_delta(
             base_view_revision,
             self.view_revision,
@@ -337,12 +337,12 @@ impl ClusterAttachSession {
         self.zoomed_pane = next_zoomed_pane;
         Ok(bmux_client::AttachProviderEvent::Delta(delta))
     }
-    async fn replace_attached_window(
+    async fn replace_attached_tab(
         &mut self,
-        window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId,
+        tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId,
         action_command_id: &str,
     ) -> Result<(), AttachSessionError> {
-        if window_id == self.window_id {
+        if tab_id == self.tab_id {
             return Ok(());
         }
         let layout = cluster_attach_state::client::layout(
@@ -350,16 +350,16 @@ impl ClusterAttachSession {
             bmux_cluster_plugin_api::cluster_types::WorkspaceId {
                 value: self.workspace_id,
             },
-            Some(window_id),
+            Some(tab_id),
             self.viewport.0,
             self.viewport.1,
         )
         .await
         .map_err(provider_error)?
-        .map_err(|error| provider_reason(format!("logical window selection failed: {error:?}")))?;
+        .map_err(|error| provider_reason(format!("logical tab selection failed: {error:?}")))?;
         if layout.control_revision < self.control_revision {
             return Err(provider_reason(format!(
-                "cluster control revision regressed from {} to {} during window selection",
+                "cluster control revision regressed from {} to {} during tab selection",
                 self.control_revision, layout.control_revision
             )));
         }
@@ -376,7 +376,7 @@ impl ClusterAttachSession {
         self.view_revision = AttachViewRevision(self.view_revision.0.saturating_add(1));
         self.event_sequence = AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
         self.control_revision = layout.control_revision;
-        self.window_id = layout.window_id;
+        self.tab_id = layout.tab_id;
         let delta = cluster_reconciliation_delta(
             base_view_revision,
             self.view_revision,
@@ -401,7 +401,7 @@ impl ClusterAttachSession {
         Ok(())
     }
 
-    async fn select_window(
+    async fn select_tab(
         &mut self,
         action: &str,
         arguments: &[String],
@@ -413,21 +413,21 @@ impl ClusterAttachSession {
             .map_err(|error| provider_reason(format!("control-state read failed: {error:?}")))?;
         if view.revision < self.control_revision {
             return Err(provider_reason(format!(
-                "cluster control revision regressed from {} to {} during window navigation",
+                "cluster control revision regressed from {} to {} during tab navigation",
                 self.control_revision, view.revision
             )));
         }
-        let mut windows = view
-            .windows
+        let mut tabs = view
+            .tabs
             .iter()
-            .filter(|window| window.workspace_id.value == self.workspace_id)
+            .filter(|tab| tab.workspace_id.value == self.workspace_id)
             .collect::<Vec<_>>();
-        windows.sort_by_key(|window| window.window_id.value.as_u128());
-        let selected = select_cluster_window(&windows, &self.window_id, action, arguments)?;
-        if selected.window_id == self.window_id {
+        tabs.sort_by_key(|tab| tab.tab_id.value.as_u128());
+        let selected = select_cluster_tab(&tabs, &self.tab_id, action, arguments)?;
+        if selected.tab_id == self.tab_id {
             return Ok(false);
         }
-        self.replace_attached_window(selected.window_id.clone(), action_command_id)
+        self.replace_attached_tab(selected.tab_id.clone(), action_command_id)
             .await?;
         Ok(true)
     }
@@ -524,7 +524,7 @@ impl AttachSession for ClusterAttachSession {
                         bmux_cluster_plugin_api::cluster_types::WorkspaceId {
                             value: self.workspace_id,
                         },
-                        Some(self.window_id.clone()),
+                        Some(self.tab_id.clone()),
                         self.viewport.0,
                         self.viewport.1,
                     )
@@ -579,7 +579,7 @@ impl AttachSession for ClusterAttachSession {
                                 bmux_cluster_plugin_api::cluster_types::WorkspaceId {
                                     value: self.workspace_id,
                                 },
-                                Some(self.window_id.clone()),
+                                Some(self.tab_id.clone()),
                                 self.viewport.0,
                                 self.viewport.1,
                             )
@@ -779,7 +779,7 @@ impl AttachSession for ClusterAttachSession {
                 bmux_cluster_plugin_api::cluster_types::WorkspaceId {
                     value: self.workspace_id,
                 },
-                Some(self.window_id.clone()),
+                Some(self.tab_id.clone()),
                 viewport.columns,
                 viewport.rows,
             )
@@ -895,18 +895,15 @@ impl AttachSession for ClusterAttachSession {
                 })
             });
         }
-        if matches!(
-            action.action.as_str(),
-            "window-next" | "window-prev" | "window-goto"
-        ) {
+        if matches!(action.action.as_str(), "tab-next" | "tab-prev" | "tab-goto") {
             return Box::pin(async move {
                 let changed = self
-                    .select_window(&action.action, &action.arguments, &action.command_id)
+                    .select_tab(&action.action, &action.arguments, &action.command_id)
                     .await?;
                 Ok(AttachProviderAck {
                     command_id: Some(action.command_id),
                     accepted: true,
-                    message: (!changed).then(|| "logical window did not change".to_string()),
+                    message: (!changed).then(|| "logical tab did not change".to_string()),
                 })
             });
         }
@@ -982,64 +979,62 @@ fn reflow_cluster_build_to_scene(
     Ok(())
 }
 
-fn select_cluster_window<'a>(
-    windows: &[&'a bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord],
-    current: &bmux_cluster_plugin_api::cluster_types::LogicalWindowId,
+fn select_cluster_tab<'a>(
+    tabs: &[&'a bmux_cluster_plugin_api::cluster_types::LogicalTabRecord],
+    current: &bmux_cluster_plugin_api::cluster_types::LogicalTabId,
     action: &str,
     arguments: &[String],
-) -> Result<&'a bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord, AttachSessionError> {
-    if windows.is_empty() {
-        return Err(provider_reason(
-            "logical workspace has no windows".to_string(),
-        ));
+) -> Result<&'a bmux_cluster_plugin_api::cluster_types::LogicalTabRecord, AttachSessionError> {
+    if tabs.is_empty() {
+        return Err(provider_reason("logical workspace has no tabs".to_string()));
     }
-    let current_index = windows
+    let current_index = tabs
         .iter()
-        .position(|window| window.window_id == *current)
-        .ok_or_else(|| provider_reason("current logical window no longer exists".to_string()))?;
+        .position(|tab| tab.tab_id == *current)
+        .ok_or_else(|| provider_reason("current logical tab no longer exists".to_string()))?;
     match action {
-        "window-next" => Ok(windows[(current_index + 1) % windows.len()]),
-        "window-prev" => Ok(windows[(current_index + windows.len() - 1) % windows.len()]),
-        "window-goto" => {
+        "tab-next" => Ok(tabs[(current_index + 1) % tabs.len()]),
+        "tab-prev" => Ok(tabs[(current_index + tabs.len() - 1) % tabs.len()]),
+        "tab-goto" => {
             let target = arguments
                 .iter()
                 .find(|argument| !argument.starts_with('-'))
-                .ok_or_else(|| provider_reason("window-goto requires a target".to_string()))?;
+                .ok_or_else(|| provider_reason("tab-goto requires a target".to_string()))?;
             if let Ok(index) = target.parse::<usize>() {
                 return index
                     .checked_sub(1)
-                    .and_then(|index| windows.get(index).copied())
+                    .and_then(|index| tabs.get(index).copied())
                     .ok_or_else(|| {
                         provider_reason(format!(
-                            "logical window index {index} is out of range for {} windows",
-                            windows.len()
+                            "logical tab index {index} is out of range for {} tabs",
+                            tabs.len()
                         ))
                     });
             }
             if let Ok(id) = target.parse::<uuid::Uuid>() {
-                return windows
+                return tabs
                     .iter()
                     .copied()
-                    .find(|window| window.window_id.value == id)
-                    .ok_or_else(|| provider_reason(format!("logical window {id} was not found")));
+                    .find(|tab| tab.tab_id.value == id)
+                    .ok_or_else(|| provider_reason(format!("logical tab {id} was not found")));
             }
-            let matches = windows
+            let matches = tabs
                 .iter()
                 .copied()
-                .filter(|window| window.name.as_deref() == Some(target.as_str()))
+                .filter(|tab| tab.name.as_deref() == Some(target.as_str()))
                 .collect::<Vec<_>>();
             match matches.as_slice() {
-                [window] => Ok(*window),
+                [tab] => Ok(*tab),
                 [] => Err(provider_reason(format!(
-                    "logical window '{target}' was not found"
+                    "logical tab '{target}' was not found"
                 ))),
                 _ => Err(provider_reason(format!(
-                    "logical window name '{target}' is ambiguous"
+                    "logical tab name '{target}' is ambiguous"
                 ))),
             }
         }
         _ => Err(provider_reason(format!(
-            "unsupported logical window action '{action}'"
+            "unsupported logical tab action '{action}'"
         ))),
     }
 }
@@ -1277,7 +1272,7 @@ async fn build_consistent_cluster_snapshot(
         let confirmed = cluster_attach_state::client::layout(
             client,
             layout.workspace_id.clone(),
-            Some(layout.window_id.clone()),
+            Some(layout.tab_id.clone()),
             viewport.0,
             viewport.1,
         )
@@ -2061,56 +2056,45 @@ mod tests {
     }
 
     #[test]
-    fn logical_window_navigation_is_deterministic_and_rejects_ambiguity() {
+    fn logical_tab_navigation_is_deterministic_and_rejects_ambiguity() {
         let workspace_id = bmux_cluster_plugin_api::cluster_types::WorkspaceId {
             value: uuid::Uuid::from_u128(1),
         };
-        let window =
-            |id: u128, name: &str| bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord {
-                window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
-                    value: uuid::Uuid::from_u128(id),
-                },
-                workspace_id: workspace_id.clone(),
-                name: Some(name.to_string()),
-                layout_schema_version: 1,
-                layout: Vec::new(),
-                revision: 1,
-            };
-        let first = window(1, "one");
-        let second = window(2, "duplicate");
-        let third = window(3, "duplicate");
-        let windows = vec![&first, &second, &third];
+        let tab = |id: u128, name: &str| bmux_cluster_plugin_api::cluster_types::LogicalTabRecord {
+            tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId {
+                value: uuid::Uuid::from_u128(id),
+            },
+            workspace_id: workspace_id.clone(),
+            name: Some(name.to_string()),
+            layout_schema_version: 1,
+            layout: Vec::new(),
+            revision: 1,
+        };
+        let first = tab(1, "one");
+        let second = tab(2, "duplicate");
+        let third = tab(3, "duplicate");
+        let tabs = vec![&first, &second, &third];
         assert_eq!(
-            select_cluster_window(&windows, &first.window_id, "window-next", &[])
+            select_cluster_tab(&tabs, &first.tab_id, "tab-next", &[])
                 .unwrap()
-                .window_id,
-            second.window_id
+                .tab_id,
+            second.tab_id
         );
         assert_eq!(
-            select_cluster_window(&windows, &first.window_id, "window-prev", &[])
+            select_cluster_tab(&tabs, &first.tab_id, "tab-prev", &[])
                 .unwrap()
-                .window_id,
-            third.window_id
+                .tab_id,
+            third.tab_id
         );
         assert_eq!(
-            select_cluster_window(
-                &windows,
-                &first.window_id,
-                "window-goto",
-                &["2".to_string()]
-            )
-            .unwrap()
-            .window_id,
-            second.window_id
+            select_cluster_tab(&tabs, &first.tab_id, "tab-goto", &["2".to_string()])
+                .unwrap()
+                .tab_id,
+            second.tab_id
         );
         assert!(
-            select_cluster_window(
-                &windows,
-                &first.window_id,
-                "window-goto",
-                &["duplicate".to_string()]
-            )
-            .is_err()
+            select_cluster_tab(&tabs, &first.tab_id, "tab-goto", &["duplicate".to_string()])
+                .is_err()
         );
     }
 
@@ -2178,7 +2162,7 @@ mod tests {
         let workspace_id = bmux_cluster_plugin_api::cluster_types::WorkspaceId {
             value: uuid::Uuid::from_u128(1),
         };
-        let window_id = bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
+        let tab_id = bmux_cluster_plugin_api::cluster_types::LogicalTabId {
             value: uuid::Uuid::from_u128(2),
         };
         let ready_id = uuid::Uuid::from_u128(3);
@@ -2194,7 +2178,7 @@ mod tests {
             bmux_cluster_plugin_api::cluster_types::LogicalPaneRecord {
                 pane_id: bmux_cluster_plugin_api::cluster_types::LogicalPaneId { value: id },
                 workspace_id: workspace_id.clone(),
-                window_id: window_id.clone(),
+                tab_id: tab_id.clone(),
                 name: Some(format!("pane-{id}")),
                 restart_policy: bmux_cluster_plugin_api::cluster_types::PaneRestartPolicy::Manual,
                 placement: bmux_cluster_plugin_api::cluster_types::PlacementIntent {
@@ -2210,7 +2194,7 @@ mod tests {
         };
         let layout = bmux_cluster_plugin_api::cluster_types::AttachLayout {
             workspace_id: workspace_id.clone(),
-            window_id: window_id.clone(),
+            tab_id: tab_id.clone(),
             control_revision: 11,
             panes: vec![
                 pane(
@@ -2472,7 +2456,7 @@ mod tests {
             workspace_id: bmux_cluster_plugin_api::cluster_types::WorkspaceId {
                 value: uuid::Uuid::from_u128(1),
             },
-            window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
+            tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId {
                 value: uuid::Uuid::from_u128(2),
             },
             name: None,
@@ -2491,7 +2475,7 @@ mod tests {
             workspace_id: bmux_cluster_plugin_api::cluster_types::WorkspaceId {
                 value: uuid::Uuid::from_u128(1),
             },
-            window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
+            tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId {
                 value: uuid::Uuid::from_u128(2),
             },
             control_revision: 1,

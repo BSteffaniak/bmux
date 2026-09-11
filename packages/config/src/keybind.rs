@@ -109,66 +109,63 @@ impl ResolvedTimeout {
 fn default_global_runtime_bindings() -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     // New pane
-    map.insert("alt+n".to_string(), windows_split_command("horizontal"));
+    map.insert("alt+n".to_string(), tabs_split_command("horizontal"));
     map.insert(
         "ctrl+alt+t".to_string(),
         "plugin:bmux.theme:pick-theme".to_string(),
     );
     // Pane focus navigation and cycling are owned by the windows plugin.
-    map.insert("alt+h".to_string(), windows_focus_command("left"));
-    map.insert("alt+left".to_string(), windows_focus_command("left"));
-    map.insert("alt+j".to_string(), windows_focus_command("down"));
-    map.insert("alt+down".to_string(), windows_focus_command("down"));
-    map.insert("alt+k".to_string(), windows_focus_command("up"));
-    map.insert("alt+up".to_string(), windows_focus_command("up"));
-    map.insert("alt+right".to_string(), windows_focus_command("right"));
-    map.insert("ctrl+k".to_string(), windows_focus_command("prev"));
-    map.insert("ctrl+t".to_string(), windows_focus_command("prev"));
-    map.insert("alt+t".to_string(), windows_focus_command("next"));
-    map.insert("alt+plus".to_string(), windows_resize_command("increase"));
-    map.insert("alt+=".to_string(), windows_resize_command("increase"));
-    map.insert("alt+minus".to_string(), windows_resize_command("decrease"));
+    map.insert("alt+h".to_string(), tabs_focus_command("left"));
+    map.insert("alt+left".to_string(), tabs_focus_command("left"));
+    map.insert("alt+j".to_string(), tabs_focus_command("down"));
+    map.insert("alt+down".to_string(), tabs_focus_command("down"));
+    map.insert("alt+k".to_string(), tabs_focus_command("up"));
+    map.insert("alt+up".to_string(), tabs_focus_command("up"));
+    map.insert("alt+right".to_string(), tabs_focus_command("right"));
+    map.insert("ctrl+k".to_string(), tabs_focus_command("prev"));
+    map.insert("ctrl+t".to_string(), tabs_focus_command("prev"));
+    map.insert("alt+t".to_string(), tabs_focus_command("next"));
+    map.insert("alt+plus".to_string(), tabs_resize_command("increase"));
+    map.insert("alt+=".to_string(), tabs_resize_command("increase"));
+    map.insert("alt+minus".to_string(), tabs_resize_command("decrease"));
     // Last-window toggle (ctrl+o). The windows plugin owns all tab
-    // navigation; this key binds to `last-window` (tmux's convention
+    // navigation; this key binds to `last-tab` (tmux's convention
     // for "jump back to the previous window").
     map.insert(
         "ctrl+o".to_string(),
-        "plugin:bmux.windows:last-window".to_string(),
+        "plugin:bmux.tabs:last-tab".to_string(),
     );
     // Window navigation via plugin (no-op if plugin not loaded)
     for i in 1..=9 {
-        map.insert(
-            format!("alt+{i}"),
-            format!("plugin:bmux.windows:goto-window {i}"),
-        );
+        map.insert(format!("alt+{i}"), format!("plugin:bmux.tabs:goto-tab {i}"));
     }
     map.insert(
         "alt+0".to_string(),
-        "plugin:bmux.windows:goto-window 10".to_string(),
+        "plugin:bmux.tabs:goto-tab 10".to_string(),
     );
     map.insert(
         "ctrl+h".to_string(),
-        "plugin:bmux.windows:prev-window".to_string(),
+        "plugin:bmux.tabs:prev-tab".to_string(),
     );
     map.insert(
         "ctrl+j".to_string(),
-        "plugin:bmux.windows:prev-window".to_string(),
+        "plugin:bmux.tabs:prev-tab".to_string(),
     );
     map.insert(
         "ctrl+left".to_string(),
-        "plugin:bmux.windows:prev-window".to_string(),
+        "plugin:bmux.tabs:prev-tab".to_string(),
     );
     map.insert(
         "ctrl+s".to_string(),
-        "plugin:bmux.windows:next-window".to_string(),
+        "plugin:bmux.tabs:next-tab".to_string(),
     );
     map.insert(
         "ctrl+right".to_string(),
-        "plugin:bmux.windows:next-window".to_string(),
+        "plugin:bmux.tabs:next-tab".to_string(),
     );
     map.insert(
         "ctrl+l".to_string(),
-        "plugin:bmux.windows:last-window".to_string(),
+        "plugin:bmux.tabs:last-tab".to_string(),
     );
     map.insert(
         "alt+l".to_string(),
@@ -192,63 +189,45 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
         ("d", RuntimeAction::Detach),
         ("q", RuntimeAction::Quit),
     ]);
-    map.insert("%".to_string(), windows_split_command("vertical"));
-    map.insert("\"".to_string(), windows_split_command("horizontal"));
+    map.insert("%".to_string(), tabs_split_command("vertical"));
+    map.insert("\"".to_string(), tabs_split_command("horizontal"));
     map.insert(
         "x".to_string(),
-        "plugin:bmux.windows:close-active-pane".to_string(),
+        "plugin:bmux.tabs:close-active-pane".to_string(),
     );
-    map.insert(
-        "r".to_string(),
-        "plugin:bmux.windows:restart-pane".to_string(),
-    );
-    map.insert("z".to_string(), "plugin:bmux.windows:zoom-pane".to_string());
-    map.insert("o".to_string(), windows_focus_command("next"));
-    map.insert("h".to_string(), windows_focus_command("left"));
-    map.insert("l".to_string(), windows_focus_command("right"));
-    map.insert("k".to_string(), windows_focus_command("up"));
-    map.insert("j".to_string(), windows_focus_command("down"));
-    map.insert("arrow_left".to_string(), windows_focus_command("left"));
-    map.insert("arrow_right".to_string(), windows_focus_command("right"));
-    map.insert("arrow_up".to_string(), windows_focus_command("up"));
-    map.insert("arrow_down".to_string(), windows_focus_command("down"));
-    map.insert("plus".to_string(), windows_resize_command("increase"));
-    map.insert("minus".to_string(), windows_resize_command("decrease"));
-    map.insert("shift+h".to_string(), windows_resize_command("left"));
-    map.insert("shift+l".to_string(), windows_resize_command("right"));
-    map.insert("shift+k".to_string(), windows_resize_command("up"));
-    map.insert("shift+j".to_string(), windows_resize_command("down"));
-    map.insert(
-        "shift+arrow_left".to_string(),
-        windows_resize_command("left"),
-    );
+    map.insert("r".to_string(), "plugin:bmux.tabs:restart-pane".to_string());
+    map.insert("z".to_string(), "plugin:bmux.tabs:zoom-pane".to_string());
+    map.insert("o".to_string(), tabs_focus_command("next"));
+    map.insert("h".to_string(), tabs_focus_command("left"));
+    map.insert("l".to_string(), tabs_focus_command("right"));
+    map.insert("k".to_string(), tabs_focus_command("up"));
+    map.insert("j".to_string(), tabs_focus_command("down"));
+    map.insert("arrow_left".to_string(), tabs_focus_command("left"));
+    map.insert("arrow_right".to_string(), tabs_focus_command("right"));
+    map.insert("arrow_up".to_string(), tabs_focus_command("up"));
+    map.insert("arrow_down".to_string(), tabs_focus_command("down"));
+    map.insert("plus".to_string(), tabs_resize_command("increase"));
+    map.insert("minus".to_string(), tabs_resize_command("decrease"));
+    map.insert("shift+h".to_string(), tabs_resize_command("left"));
+    map.insert("shift+l".to_string(), tabs_resize_command("right"));
+    map.insert("shift+k".to_string(), tabs_resize_command("up"));
+    map.insert("shift+j".to_string(), tabs_resize_command("down"));
+    map.insert("shift+arrow_left".to_string(), tabs_resize_command("left"));
     map.insert(
         "shift+arrow_right".to_string(),
-        windows_resize_command("right"),
+        tabs_resize_command("right"),
     );
-    map.insert("shift+arrow_up".to_string(), windows_resize_command("up"));
-    map.insert(
-        "shift+arrow_down".to_string(),
-        windows_resize_command("down"),
-    );
+    map.insert("shift+arrow_up".to_string(), tabs_resize_command("up"));
+    map.insert("shift+arrow_down".to_string(), tabs_resize_command("down"));
     // Window prev/next: (, ) bind via the windows plugin so the tab
     // bar and navigation stay in lockstep on whatever ordering the
     // plugin owns.
-    map.insert(
-        "(".to_string(),
-        "plugin:bmux.windows:prev-window".to_string(),
-    );
-    map.insert(
-        ")".to_string(),
-        "plugin:bmux.windows:next-window".to_string(),
-    );
+    map.insert("(".to_string(), "plugin:bmux.tabs:prev-tab".to_string());
+    map.insert(")".to_string(), "plugin:bmux.tabs:next-tab".to_string());
     // Plugin command: toggle last window (no-op if plugin not loaded)
-    map.insert(
-        "^".to_string(),
-        "plugin:bmux.windows:last-window".to_string(),
-    );
+    map.insert("^".to_string(), "plugin:bmux.tabs:last-tab".to_string());
     // New session via the sessions plugin. Creation/naming is owned
-    // by the plugin so windows-plugin's contexts-events subscriber
+    // by the plugin so tabs-plugin's contexts-events subscriber
     // observes the resulting Created event and maintains
     // `windows.order` in insertion order.
     map.insert(
@@ -299,16 +278,16 @@ fn action_bindings(pairs: &[(&str, RuntimeAction)]) -> BTreeMap<String, String> 
         .collect()
 }
 
-fn windows_focus_command(direction: &str) -> String {
-    format!("plugin:bmux.windows:focus-pane-in-direction --direction {direction}")
+fn tabs_focus_command(direction: &str) -> String {
+    format!("plugin:bmux.tabs:focus-pane-in-direction --direction {direction}")
 }
 
-fn windows_resize_command(direction: &str) -> String {
-    format!("plugin:bmux.windows:resize-pane --direction {direction}")
+fn tabs_resize_command(direction: &str) -> String {
+    format!("plugin:bmux.tabs:resize-pane --direction {direction}")
 }
 
-fn windows_split_command(direction: &str) -> String {
-    format!("plugin:bmux.windows:split-pane --direction {direction}")
+fn tabs_split_command(direction: &str) -> String {
+    format!("plugin:bmux.tabs:split-pane --direction {direction}")
 }
 
 impl KeyBindingConfig {
@@ -517,10 +496,7 @@ pub fn key_event_to_string(event: &KeyEvent) -> String {
 fn default_normal_bindings() -> BTreeMap<String, String> {
     let mut bindings = default_runtime_bindings();
     bindings.insert("i".to_string(), "enter_mode insert".to_string());
-    bindings.insert(
-        "c".to_string(),
-        "plugin:bmux.windows:new-window".to_string(),
-    );
+    bindings.insert("c".to_string(), "plugin:bmux.tabs:new-tab".to_string());
     bindings
 }
 

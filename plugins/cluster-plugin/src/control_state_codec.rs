@@ -1,9 +1,7 @@
 use crate::control_codec::{
     CodecError, Reader, Writer, decode_state_response, encode_state_response,
 };
-use bmux_cluster_plugin_api::cluster_types::{
-    ClusterMember, LogicalPaneRecord, LogicalWindowRecord,
-};
+use bmux_cluster_plugin_api::cluster_types::{ClusterMember, LogicalPaneRecord, LogicalTabRecord};
 
 use super::{
     CONTROL_CODEC_VERSION, CONTROL_SCHEMA_VERSION, ControlState, DedupKey, DedupRecord,
@@ -73,13 +71,13 @@ pub(super) fn encode_snapshot(state: &ControlState) -> Result<Vec<u8>, StateCode
         writer.encode_state_workspace(workspace);
     }
 
-    write_count(&mut writer, state.windows.len())?;
-    for (key, window) in &state.windows {
-        if key != &window.window_id.value {
-            return Err(StateCodecError::InvalidState("window map key mismatch"));
+    write_count(&mut writer, state.tabs.len())?;
+    for (key, tab) in &state.tabs {
+        if key != &tab.tab_id.value {
+            return Err(StateCodecError::InvalidState("tab map key mismatch"));
         }
         writer.uuid(*key);
-        writer.encode_state_window(window);
+        writer.encode_state_tab(tab);
     }
 
     write_count(&mut writer, state.panes.len())?;
@@ -202,13 +200,13 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
         }
         Ok((key, workspace))
     })?;
-    let windows = read_map(&mut reader, |reader| {
+    let tabs = read_map(&mut reader, |reader| {
         let key = reader.uuid()?;
-        let window = reader.decode_state_window()?;
-        if key != window.window_id.value {
-            return Err(StateCodecError::InvalidState("window map key mismatch"));
+        let tab = reader.decode_state_tab()?;
+        if key != tab.tab_id.value {
+            return Err(StateCodecError::InvalidState("tab map key mismatch"));
         }
-        Ok((key, window))
+        Ok((key, tab))
     })?;
     let panes = read_map(&mut reader, |reader| {
         let key = reader.uuid()?;
@@ -295,7 +293,7 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> Result<ControlState, StateCodecEr
         activated_features,
         members,
         workspaces,
-        windows,
+        tabs,
         panes,
         dedup,
         feature_dedup,
@@ -356,31 +354,27 @@ fn validate_references(state: &ControlState) -> Result<(), StateCodecError> {
             "control feature floors are inconsistent",
         ));
     }
-    for LogicalWindowRecord { workspace_id, .. } in state.windows.values() {
+    for LogicalTabRecord { workspace_id, .. } in state.tabs.values() {
         if !state.workspaces.contains_key(&workspace_id.value) {
             return Err(StateCodecError::InvalidState(
-                "window references missing workspace",
+                "tab references missing workspace",
             ));
         }
     }
     for LogicalPaneRecord {
         workspace_id,
-        window_id,
+        tab_id,
         execution,
         ..
     } in state.panes.values()
     {
-        let Some(window) = state.windows.get(&window_id.value) else {
-            return Err(StateCodecError::InvalidState(
-                "pane references missing window",
-            ));
+        let Some(tab) = state.tabs.get(&tab_id.value) else {
+            return Err(StateCodecError::InvalidState("pane references missing tab"));
         };
-        if window.workspace_id.value != workspace_id.value
+        if tab.workspace_id.value != workspace_id.value
             || !state.workspaces.contains_key(&workspace_id.value)
         {
-            return Err(StateCodecError::InvalidState(
-                "pane workspace/window mismatch",
-            ));
+            return Err(StateCodecError::InvalidState("pane workspace/tab mismatch"));
         }
         if execution
             .as_ref()

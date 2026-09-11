@@ -1,21 +1,21 @@
-// Public, typed contract of the windows plugin. Other plugins that
-// depend on `bmux_windows_plugin_api` import these interfaces rather
-// than the windows plugin implementation itself.
+// Public, typed contract of the tabs plugin. Other plugins that
+// depend on `bmux_tabs_plugin_api` import these interfaces rather
+// than the tabs plugin implementation itself.
 //
 // Four interfaces:
-// - `windows-state` — read-only queries about panes and windows.
-// - `windows-commands` — mutating operations on panes and windows.
-// - `windows-events` — event stream of window/pane lifecycle changes.
-// - `windows-list` — reactive state channel carrying the ordered
-//   window list for tab-bar rendering + positional navigation.
+// - `tabs-state` — read-only queries about panes and tabs.
+// - `tabs-commands` — mutating operations on panes and tabs.
+// - `tabs-events` — event stream of tab/pane lifecycle changes.
+// - `tabs-list` — reactive state channel carrying the ordered
+//   tab list for tab-bar rendering + positional navigation.
 
-plugin bmux.windows version 1;
+plugin bmux.tabs version 1;
 
-capability WINDOWS_READ = bmux.windows.read;
-capability WINDOWS_WRITE = bmux.windows.write;
+capability TABS_READ = bmux.tabs.read;
+capability TABS_WRITE = bmux.tabs.write;
 
-@capability(WINDOWS_READ)
-interface windows-state {
+@capability(TABS_READ)
+interface tabs-state {
     // A pane's current lifecycle status.
     variant pane-status {
         @default running,
@@ -32,7 +32,7 @@ interface windows-state {
         status: pane-status,
     }
 
-    // Snapshot of a floating pane surface exposed through the windows UX facade.
+    // Snapshot of a floating pane surface exposed through the tabs UX facade.
     record floating-pane-state {
         id: uuid,
         pane-id: uuid,
@@ -50,9 +50,9 @@ interface windows-state {
         visible: bool,
     }
 
-    // Snapshot of a window. Windows are a plugin-layered view over
+    // Snapshot of a tab. Tabs are a plugin-layered view over
     // sessions/contexts; the id is the underlying context id.
-    record window-entry {
+    record tab-entry {
         id: string,
         name: string,
         active: bool,
@@ -67,26 +67,26 @@ interface windows-state {
     query list-panes(session: uuid) -> list<pane-state>;
     query list-floating-panes(session: uuid?) -> list<floating-pane-state>;
 
-    record active-window-pane-set {
-        window-id: uuid,
+    record active-tab-pane-set {
+        tab-id: uuid,
         session-id: uuid,
         pane-ids: list<uuid>,
     }
 
-    variant active-window-pane-query-error {
-        no-active-window,
+    variant active-tab-pane-query-error {
+        no-active-tab,
         no-selected-session,
         failed { reason: string },
     }
 
-    // Window-level queries.
-    query list-windows(session: string?) -> list<window-entry>;
-    query active-window-panes()
-        -> result<active-window-pane-set, active-window-pane-query-error>;
+    // Tab-level queries.
+    query list-tabs(session: string?) -> list<tab-entry>;
+    query active-tab-panes()
+        -> result<active-tab-pane-set, active-tab-pane-query-error>;
 }
 
-@capability(WINDOWS_WRITE)
-interface windows-commands {
+@capability(TABS_WRITE)
+interface tabs-commands {
     // Errors a focus command can produce.
     variant focus-error {
         pane-not-found,
@@ -99,8 +99,8 @@ interface windows-commands {
         close-denied { reason: string },
     }
 
-    // Errors a window-level command can produce.
-    variant window-error {
+    // Errors a tab-level command can produce.
+    variant tab-error {
         not-found,
         denied { reason: string },
         failed { reason: string },
@@ -116,10 +116,10 @@ interface windows-commands {
         failed { reason: string },
     }
 
-    // Acknowledgement returned by mutating window commands. When a new
-    // window is created, `id` carries the new context id; other
+    // Acknowledgement returned by mutating tab commands. When a new
+    // tab is created, `id` carries the new context id; other
     // commands may leave it empty.
-    record window-ack {
+    record tab-ack {
         ok: bool,
         id: string?,
     }
@@ -170,8 +170,8 @@ interface windows-commands {
         down,
     }
 
-    // Placement for moving a window relative to another window.
-    enum window-move-placement {
+    // Placement for moving a tab relative to another tab.
+    enum tab-move-placement {
         @default before,
         after,
     }
@@ -205,7 +205,7 @@ interface windows-commands {
         -> result<pane-ack, pane-mutation-error>;
     // Focus the next/previous pane in the layout relative to the
     // currently-active pane. The direction is interpreted by the host
-    // today; once the windows plugin owns focus ordering internally,
+    // today; once the tabs plugin owns focus ordering internally,
     // this shifts to a plugin-local lookup.
     command focus-pane-in-direction(session: selector?, direction: pane-direction)
         -> result<pane-ack, pane-mutation-error>;
@@ -314,20 +314,20 @@ interface windows-commands {
         layer: string,
     ) -> result<pane-ack, pane-mutation-error>;
 
-    // Window-level commands.
-    command new-window(name: string?) -> result<window-ack, window-error>;
-    command rename-window(name: string) -> result<window-ack, window-error>;
-    // Rename a specific window by id, independent of which window is current.
-    command rename-window-by-id(id: uuid, name: string)
-        -> result<window-ack, window-error>;
-    command kill-window(target: string, force-local: bool) -> result<window-ack, window-error>;
-    command kill-all-windows(force-local: bool) -> result<window-ack, window-error>;
-    command switch-window(target: string) -> result<window-ack, window-error>;
-    command move-window(source: uuid, target: uuid, placement: window-move-placement)
-        -> result<window-ack, window-error>;
+    // Tab-level commands.
+    command new-tab(name: string?) -> result<tab-ack, tab-error>;
+    command rename-tab(name: string) -> result<tab-ack, tab-error>;
+    // Rename a specific tab by id, independent of which tab is current.
+    command rename-tab-by-id(id: uuid, name: string)
+        -> result<tab-ack, tab-error>;
+    command kill-tab(target: string, force-local: bool) -> result<tab-ack, tab-error>;
+    command kill-all-tabs(force-local: bool) -> result<tab-ack, tab-error>;
+    command switch-tab(target: string) -> result<tab-ack, tab-error>;
+    command move-tab(source: uuid, target: uuid, placement: tab-move-placement)
+        -> result<tab-ack, tab-error>;
 }
 
-interface windows-events {
+interface tabs-events {
     // A single event describing a pane-level state change.
     variant pane-event {
         // A pane gained focus.
@@ -349,45 +349,45 @@ interface windows-events {
     events pane-event;
 }
 
-// Reactive state channel carrying the ordered list of windows in the
+// Reactive state channel carrying the ordered list of tabs in the
 // order consumers should render them (and navigate through). The
-// windows plugin owns the authoritative window order (persisted in its
-// plugin-local storage under `windows.order`) and publishes a fresh
-// snapshot on every mutation: new-window, rename-window,
-// switch-window, move-window, kill-window, kill-all-windows,
-// goto-window, close-current-window, next/prev/last window.
+// tabs plugin owns the authoritative tab order (persisted in its
+// plugin-local storage under `tabs.order`) and publishes a fresh
+// snapshot on every mutation: new-tab, rename-tab,
+// switch-tab, move-tab, kill-tab, kill-all-tabs,
+// goto-tab, close-current-tab, next/prev/last tab.
 //
 // Subscribers (notably the attach tab bar) consume this via
-// `EventBus::subscribe_state::<WindowListSnapshot>` to observe the
+// `EventBus::subscribe_state::<TabListSnapshot>` to observe the
 // current ordered list synchronously plus a live-update receiver.
 // This lets the tab bar render the exact order the plugin maintains
 // and lets next/prev navigation walk the same order without a
 // round-trip query per frame.
 //
 // Payload semantics:
-// - `windows` is the ordered list of live windows; consumers render
+// - `tabs` is the ordered list of live tabs; consumers render
 //   positional indices (`1:`, `2:`, …) from this order.
-// - `active` on each entry is `true` for the current active window
+// - `active` on each entry is `true` for the current active tab
 //   (as resolved by the plugin's effective-current-context logic) and
 //   `false` otherwise.
 // - `revision` is a monotonic counter advancing on every publish;
 //   consumers can use it to deduplicate or order updates.
 // Client-local selection, published by attach rather than the shared catalog.
-interface windows-local-view {
-    record window-selection {
+interface tabs-local-view {
+    record tab-selection {
         context-id: uuid?,
     }
 
-    @state events window-selection;
+    @state events tab-selection;
 }
 
-interface windows-list {
-    record window-list-snapshot {
-        windows: list<window-list-entry>,
+interface tabs-list {
+    record tab-list-snapshot {
+        tabs: list<tab-list-entry>,
         revision: u64,
     }
 
-    record window-list-entry {
+    record tab-list-entry {
         id: uuid,
         name: string,
         active: bool,
@@ -395,5 +395,5 @@ interface windows-list {
         workspace-id: uuid,
     }
 
-    @state events window-list-snapshot;
+    @state events tab-list-snapshot;
 }

@@ -2646,8 +2646,8 @@ mod tests {
     async fn repeated_snapshot_compaction_bounds_files_and_preserves_pruned_dedup_semantics() {
         use bmux_cluster_plugin_api::cluster_types::{
             CommandId, ControlCommand, ControlCommandRequest, ControlWorkflowStatus,
-            ExecutionAssignment, ExecutionId, LogicalPaneId, LogicalPaneRecord, LogicalWindowId,
-            LogicalWindowRecord, PaneAvailability, PaneRestartPolicy, PlacementIntent,
+            ExecutionAssignment, ExecutionId, LogicalPaneId, LogicalPaneRecord, LogicalTabId,
+            LogicalTabRecord, PaneAvailability, PaneRestartPolicy, PlacementIntent,
             WorkerLaunchSpec, WorkspaceId,
         };
         use openraft::storage::RaftStateMachine;
@@ -2679,9 +2679,9 @@ mod tests {
         state_machine.control_state.apply(&command(
             10,
             10,
-            ControlCommandRequest::PutWindow {
-                window: LogicalWindowRecord {
-                    window_id: LogicalWindowId {
+            ControlCommandRequest::PutTab {
+                tab: LogicalTabRecord {
+                    tab_id: LogicalTabId {
                         value: uuid::Uuid::from_u128(20),
                     },
                     workspace_id: WorkspaceId {
@@ -2706,7 +2706,7 @@ mod tests {
                     workspace_id: WorkspaceId {
                         value: uuid::Uuid::from_u128(10),
                     },
-                    window_id: LogicalWindowId {
+                    tab_id: LogicalTabId {
                         value: uuid::Uuid::from_u128(20),
                     },
                     name: None,

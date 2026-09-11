@@ -687,18 +687,18 @@ mod tests {
     fn build_rebuild_target_selection_marks_selector_reason() {
         let options = RebuildOptions {
             profile: BuildProfile::Debug,
-            selectors: vec!["bmux_windows_plugin".to_string()],
+            selectors: vec!["bmux_tabs_plugin".to_string()],
             ..RebuildOptions::default()
         };
         let selected = build_rebuild_target_selection(
             &options,
             &[
-                "bmux_windows_plugin".to_string(),
+                "bmux_tabs_plugin".to_string(),
                 "bmux_permissions_plugin".to_string(),
             ],
         );
         assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0].crate_name, "bmux_windows_plugin");
+        assert_eq!(selected[0].crate_name, "bmux_tabs_plugin");
         assert_eq!(selected[1].crate_name, "bmux_permissions_plugin");
         assert_eq!(selected[0].reason, "selector");
         assert_eq!(selected[1].reason, "selector");
@@ -707,11 +707,11 @@ mod tests {
     #[test]
     fn resolve_selector_error_is_actionable_and_includes_next_step() {
         let bundled = vec![BundledPlugin {
-            plugin_id: "bmux.windows".to_string(),
-            short_name: "windows-plugin".to_string(),
-            crate_name: "bmux_windows_plugin".to_string(),
+            plugin_id: "bmux.tabs".to_string(),
+            short_name: "tabs-plugin".to_string(),
+            crate_name: "bmux_tabs_plugin".to_string(),
         }];
-        let workspace = vec!["bmux_windows_plugin".to_string()];
+        let workspace = vec!["bmux_tabs_plugin".to_string()];
         let selector_index = build_selector_index(&bundled, &workspace);
         let error = resolve_selector("windos", &selector_index).expect_err("selector should fail");
         assert!(error.contains("Problem:"));
@@ -722,26 +722,26 @@ mod tests {
     #[test]
     fn resolve_selector_accepts_plugin_id_short_name_and_crate_name() {
         let bundled = vec![BundledPlugin {
-            plugin_id: "bmux.windows".to_string(),
-            short_name: "windows-plugin".to_string(),
-            crate_name: "bmux_windows_plugin".to_string(),
+            plugin_id: "bmux.tabs".to_string(),
+            short_name: "tabs-plugin".to_string(),
+            crate_name: "bmux_tabs_plugin".to_string(),
         }];
-        let workspace = vec!["bmux_windows_plugin".to_string()];
+        let workspace = vec!["bmux_tabs_plugin".to_string()];
         let selector_index = build_selector_index(&bundled, &workspace);
 
         assert_eq!(
-            resolve_selector("bmux.windows", &selector_index).expect("id selector should work"),
-            "bmux_windows_plugin"
+            resolve_selector("bmux.tabs", &selector_index).expect("id selector should work"),
+            "bmux_tabs_plugin"
         );
         assert_eq!(
-            resolve_selector("windows-plugin", &selector_index)
+            resolve_selector("tabs-plugin", &selector_index)
                 .expect("short name selector should work"),
-            "bmux_windows_plugin"
+            "bmux_tabs_plugin"
         );
         assert_eq!(
-            resolve_selector("bmux_windows_plugin", &selector_index)
+            resolve_selector("bmux_tabs_plugin", &selector_index)
                 .expect("crate selector should work"),
-            "bmux_windows_plugin"
+            "bmux_tabs_plugin"
         );
     }
 }

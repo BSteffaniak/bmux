@@ -49,6 +49,7 @@ bmux_session_models = { workspace = true, features = ["serde"] }
 bmux_sessions_plugin_api = { workspace = true }
 bmux_slots = { workspace = true }
 bmux_snapshot_plugin_api = { workspace = true }
+bmux_tabs_plugin_api = { workspace = true }
 bmux_terminal_grid = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
 bmux_text_edit = { workspace = true }
@@ -66,7 +67,6 @@ bmux_tui_components = { workspace = true, features = [
     "text-view",
     "virtual-list",
 ] }
-bmux_windows_plugin_api = { workspace = true }
 sshenv_vault = { workspace = true }
 
 # Bundled plugins (optional, statically linked as rlib when enabled)
@@ -129,16 +129,16 @@ bmux_sidebar_plugin = { workspace = true, optional = true, features = [
 bmux_snapshot_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
-bmux_tab_strip_plugin = { workspace = true, optional = true, features = [
+bmux_tab_bar_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
+bmux_tabs_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
 bmux_theme_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
 bmux_visual_adapters_plugin_renderer = { workspace = true, optional = true }
-bmux_windows_plugin = { workspace = true, optional = true, features = [
-    "static-bundled",
-] }
 bmux_workspaces_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -247,11 +247,11 @@ fail-on-warnings = [
     "bmux_sessions_plugin?/fail-on-warnings",
     "bmux_snapshot_plugin?/fail-on-warnings",
     "bmux_sidebar_plugin?/fail-on-warnings",
-    "bmux_tab_strip_plugin?/fail-on-warnings",
+    "bmux_tab_bar_plugin?/fail-on-warnings",
     "bmux_theme_plugin?/fail-on-warnings",
     "bmux_terminal_grid/fail-on-warnings",
     "bmux_terminal_protocol/fail-on-warnings",
-    "bmux_windows_plugin?/fail-on-warnings",
+    "bmux_tabs_plugin?/fail-on-warnings",
     "bmux_workspaces_plugin?/fail-on-warnings",
     "bmux_decoration_plugin?/fail-on-warnings",
     "bmux_decoration_plugin_renderer?/fail-on-warnings",
@@ -285,7 +285,7 @@ bundled-plugins = [
     "bundled-plugin-sessions",
     "bundled-plugin-snapshot",
     "bundled-plugin-sidebar",
-    "bundled-plugin-tab-strip",
+    "bundled-plugin-tab-bar",
     "bundled-plugin-theme",
     "bundled-plugin-windows",
     "bundled-plugin-workspaces",
@@ -319,9 +319,9 @@ bundled-plugin-recording = ["dep:bmux_recording_plugin"]
 bundled-plugin-sessions = ["dep:bmux_sessions_plugin"]
 bundled-plugin-sidebar = ["dep:bmux_sidebar_plugin"]
 bundled-plugin-snapshot = ["dep:bmux_snapshot_plugin"]
-bundled-plugin-tab-strip = ["dep:bmux_tab_strip_plugin"]
+bundled-plugin-tab-bar = ["dep:bmux_tab_bar_plugin"]
 bundled-plugin-theme = ["dep:bmux_theme_plugin"]
-bundled-plugin-windows = ["dep:bmux_windows_plugin"]
+bundled-plugin-windows = ["dep:bmux_tabs_plugin"]
 bundled-plugin-workspaces = ["dep:bmux_workspaces_plugin"]
 bundled-visual-adapters = ["dep:bmux_visual_adapters_plugin_renderer"]
 

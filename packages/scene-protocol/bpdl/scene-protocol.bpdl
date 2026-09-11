@@ -276,7 +276,7 @@ interface scene-protocol {
         region-id: string,
         // Plugin id that receives mouse events intersecting this
         // region. Matches the `plugin.<id>` form used elsewhere in
-        // the manifest (`bmux.decoration`, `bmux.windows`, ...).
+        // the manifest (`bmux.decoration`, `bmux.tabs`, ...).
         owning-plugin-id: string,
     }
 

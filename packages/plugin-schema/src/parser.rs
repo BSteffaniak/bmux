@@ -468,7 +468,7 @@ impl Parser<'_> {
         }
     }
 
-    /// Parse a dotted identifier sequence (`bmux.windows`, `plugin.name`).
+    /// Parse a dotted identifier sequence (`bmux.tabs`, `plugin.name`).
     /// Requires at least one identifier; subsequent `.<ident>` segments
     /// are joined with `.` in the returned string.
     fn parse_dotted_ident(&mut self, message: &str) -> Result<String, Error> {
@@ -635,8 +635,8 @@ mod tests {
 
     #[test]
     fn parses_plugin_header_only() {
-        let schema = must_parse("plugin bmux.windows version 1;");
-        assert_eq!(schema.plugin.plugin_id, "bmux.windows");
+        let schema = must_parse("plugin bmux.tabs version 1;");
+        assert_eq!(schema.plugin.plugin_id, "bmux.tabs");
         assert_eq!(schema.plugin.version, 1);
         assert!(schema.interfaces.is_empty());
         assert!(schema.imports.is_empty());
@@ -791,12 +791,12 @@ mod tests {
     fn parses_import_directive() {
         let schema = must_parse(
             "plugin p version 1;\n\
-             import windows = bmux.windows;\n\
+             import windows = bmux.tabs;\n\
              interface i { record r { id: uuid } }",
         );
         assert_eq!(schema.imports.len(), 1);
         assert_eq!(schema.imports[0].alias, "windows");
-        assert_eq!(schema.imports[0].plugin_id, "bmux.windows");
+        assert_eq!(schema.imports[0].plugin_id, "bmux.tabs");
     }
 
     #[test]
@@ -833,7 +833,7 @@ mod tests {
     fn parses_qualified_type_reference() {
         let schema = must_parse(
             "plugin p version 1;\n\
-             import windows = bmux.windows;\n\
+             import windows = bmux.tabs;\n\
              interface i {\n\
                query q(id: uuid) -> windows.pane-state;\n\
              }",

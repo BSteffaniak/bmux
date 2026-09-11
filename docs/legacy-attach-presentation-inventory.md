@@ -6,7 +6,7 @@ This inventory records the production ownership that the plugin-owned presentati
 
 The premature cutover has now been repaired through the plugin-owned path:
 
-- `bmux.tab_strip` is enabled by default at the bottom and renders a full-width
+- `bmux.tab_bar` is enabled by default at the bottom and renders a full-width
   row containing width-packed tabs plus mode, role, follow, hints/messages, and
   optional session/context modules.
 - `bmux.sidebar` remains independently bundled and opt-in.
@@ -14,7 +14,7 @@ The premature cutover has now been repaired through the plugin-owned path:
   overflow, active alignment, and migration-era aliases are plugin-private.
 - Tab click, hover, drag reorder, wheel navigation, inline rename, and menu
   workflows remain plugin-owned and dispatch domain mutations through generated
-  `bmux.windows` clients.
+  `bmux.tabs` clients.
 - Attach-local mode/role/follow/hint/catalog labels flow through the neutral
   `AttachLocalPresentationSnapshot` protocol; no core status model was restored.
 - Generic attach companion lifecycle in `packages/plugin` now owns start/stop
@@ -27,7 +27,7 @@ The premature cutover has now been repaired through the plugin-owned path:
 - The release 64-window projection benchmark measured 15.098 µs average over
   20,000 iterations against the retained 35 µs projection budget.
 
-Remaining evidence tracked in `restore-full-tab-strip-parity-progress.md`
+Remaining evidence tracked in `restore-full-tab-bar-parity-progress.md`
 includes robust automated host-composited capture and the broader retained
 frame/output/latency performance budgets. Those evidence gaps do not restore or
 justify any legacy core presentation ownership.
@@ -36,10 +36,10 @@ justify any legacy core presentation ownership.
 
 | Concern | Production owners | Migration obligation |
 | --- | --- | --- |
-| `StatusBarConfig` | Removed from `packages/config`; `[status_bar]` is rejected with a diagnostic pointing to plugin settings. | Full legacy-equivalent settings now live privately in `bmux.tab_strip`; migration-era aliases remain accepted when canonical keys are absent. |
-| `StatusPosition` | Removed from `packages/config`; legacy `appearance.status_position` is rejected with a migration diagnostic. | Generic plugin layout is authoritative; `bmux.tab_strip.placement` defaults to `bottom`. |
-| Tab/status projection | `plugins/tab-strip-plugin` | Width-aware full-row projection, modules, styling, hitboxes, editor, menu, and interactions are plugin-owned. |
-| Windows state consumption | `packages/cli/src/runtime/attach/runtime.rs`, state, simulation, bootstrap, and playbook support import `bmux_windows_plugin_api`; runtime decodes `bmux.windows/windows-list` and projects it into `AttachTab` | Presentation consumption must move to the tab-strip companion using generated windows contracts. CLI bootstrap/runtime must stop interpreting window state for presentation. Other domain-owned plugin/mobile consumers are not part of this removal. |
+| `StatusBarConfig` | Removed from `packages/config`; `[status_bar]` is rejected with a diagnostic pointing to plugin settings. | Full legacy-equivalent settings now live privately in `bmux.tab_bar`; migration-era aliases remain accepted when canonical keys are absent. |
+| `StatusPosition` | Removed from `packages/config`; legacy `appearance.status_position` is rejected with a migration diagnostic. | Generic plugin layout is authoritative; `bmux.tab_bar.placement` defaults to `bottom`. |
+| Tab/status projection | `plugins/tab-bar-plugin` | Width-aware full-row projection, modules, styling, hitboxes, editor, menu, and interactions are plugin-owned. |
+| Windows state consumption | `packages/cli/src/runtime/attach/runtime.rs`, state, simulation, bootstrap, and playbook support import `bmux_tabs_plugin_api`; runtime decodes `bmux.tabs/tabs-list` and projects it into `AttachTab` | Presentation consumption must move to the tab-bar companion using generated windows contracts. CLI bootstrap/runtime must stop interpreting window state for presentation. Other domain-owned plugin/mobile consumers are not part of this removal. |
 
 The generic four-edge viewport migration already removed production
 `status_top_inset` and `status_bottom_inset` fields. Those names now occur only
@@ -51,10 +51,10 @@ pane-runtime attach contracts and implementation.
 
 | Concern | Production owners | Migration obligation |
 | --- | --- | --- |
-| Hover | `AttachViewState.hovered_tab_context_id`, attach mouse routing/simulation, and `packages/cli/src/status.rs` hover styling | Move semantic hover state and repaint publication into the tab-strip companion. |
+| Hover | `AttachViewState.hovered_tab_context_id`, attach mouse routing/simulation, and `packages/cli/src/status.rs` hover styling | Move semantic hover state and repaint publication into the tab-bar companion. |
 | Drag/reorder | `AttachMouseTabDrag`, runtime pointer handling, status hitboxes, simulation, and playbook coverage | Use generic committed-region input and pointer capture; invoke generated windows reorder commands. |
-| Rename | Attach prompt state/runtime actions, tab edit projection in `status.rs`, simulation, and playbooks | Move workflow ownership to the tab-strip plugin while retaining the existing prompt behavior or an equivalent plugin-owned editor. |
-| Tab menu | `AttachTabMenu`, `AttachTabMenuAction`, retained menu surface construction, runtime/state/simulation, and playbooks | Move menu model/actions/placement to the tab-strip plugin and target its resolved surface allocation. |
+| Rename | Attach prompt state/runtime actions, tab edit projection in `status.rs`, simulation, and playbooks | Move workflow ownership to the tab-bar plugin while retaining the existing prompt behavior or an equivalent plugin-owned editor. |
+| Tab menu | `AttachTabMenu`, `AttachTabMenuAction`, retained menu surface construction, runtime/state/simulation, and playbooks | Move menu model/actions/placement to the tab-bar plugin and target its resolved surface allocation. |
 | Click/hit testing | `AttachStatusTabHitbox` emitted by `status.rs`, then interpreted by attach runtime | Replace hardcoded status-row hitboxes with committed `PluginSurfaceRegion` routing. |
 
 ## Damage and rendering
@@ -85,12 +85,12 @@ turn those facts into generic core status state:
 | Transient messages | `AttachViewState.transient_status` with attach-local TTL, written by command, error, clipboard, follow, and workflow handlers | The attach workflow that performs an action owns its ephemeral result. Keep a neutral client-local notification stream/slot; do not make tab/sidebar or core server state authoritative. |
 | Session label/count | Cached typed sessions catalog | `bmux.sessions` is authoritative; consume generated session state/services. |
 | Context label | Cached typed contexts catalog and context/session bindings | `bmux.contexts` is authoritative; consume generated context state/services. |
-| Tab position/count | Derived from the ordered tab projection and active item | The tab-strip plugin derives this from authoritative `bmux.windows` ordered state. It is tab-strip presentation, not a generic status fact. |
+| Tab position/count | Derived from the ordered tab projection and active item | The tab-bar plugin derives this from authoritative `bmux.tabs` ordered state. It is tab-bar presentation, not a generic status fact. |
 
 Current support remains intentional during migration: mode, role, follow, hints,
 transient messages, optional session/context labels, and tab position/count all
 have existing configuration or runtime behavior. Final placement is split by
-ownership: tab position/count stays with the tab-strip plugin; window/pane live
+ownership: tab position/count stays with the tab-bar plugin; window/pane live
 facts go through Phase 10's typed domain producers; local mode/hints/messages
 belong in an attach-client presentation companion; sessions, contexts, clients,
 and permissions are consumed through their generated foundational contracts.

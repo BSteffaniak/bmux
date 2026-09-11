@@ -35,8 +35,8 @@ The initial command vocabulary is:
 - `set-member-state`: transition active/revoked/left state with expected credential serial.
 - `create-workspace`: create stable workspace identity/name.
 - `rename-workspace`: update display name using expected workspace revision.
-- `put-window`: create/update logical window and layout payload using expected workspace revision.
-- `remove-window`: remove an empty/logically removable window using expected revision.
+- `put-tab`: create/update logical window and layout payload using expected workspace revision.
+- `remove-tab`: remove an empty/logically removable window using expected revision.
 - `put-pane`: create/update logical pane metadata, restart policy, and placement intent using expected revision.
 - `remove-pane`: remove a logical pane using expected generation/revision.
 - `assign-execution`: atomically set node, execution ID, and strictly increasing generation using expected prior generation/revision.
@@ -65,7 +65,7 @@ All maps are ordered by canonical full ID bytes. No hash-map iteration, locale c
 
 Each logical pane contains:
 
-- `LogicalPaneId` and owning `WorkspaceId`/`LogicalWindowId`;
+- `LogicalPaneId` and owning `WorkspaceId`/`LogicalTabId`;
 - mutable name and opaque versioned layout reference;
 - restart policy (`manual`, `never`, `on-worker-loss`);
 - deterministic placement intent (explicit node and ordered required/preferred labels initially);

@@ -20,7 +20,7 @@ All durable federation identifiers are opaque, globally unique typed values. The
 - `ClusterId`: persistent cluster identity, created once at cluster initialization.
 - `NodeId`: persistent node identity bound to node credentials, never reused by a replacement installation.
 - `WorkspaceId`: durable logical workspace identity.
-- `LogicalWindowId`: durable logical window identity within a workspace.
+- `LogicalTabId`: durable logical window identity within a workspace.
 - `LogicalPaneId`: durable logical pane identity independent of placement.
 - `ExecutionId`: unique identity for one concrete worker execution.
 - `CommandId`: caller-generated identity for one logical mutation.

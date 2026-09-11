@@ -966,7 +966,7 @@ mod tests {
         // ref because the alias is declared; validate_with_imports would
         // further resolve the imported type.
         let src = "plugin p version 1;\n\
-                   import windows = bmux.windows;\n\
+                   import windows = bmux.tabs;\n\
                    capability I_READ = p.i.read;\n\
                    @capability(I_READ)\n\
                    interface i {\n\

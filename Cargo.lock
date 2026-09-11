@@ -1264,7 +1264,9 @@ dependencies = [
  "bmux_slots",
  "bmux_snapshot_plugin",
  "bmux_snapshot_plugin_api",
- "bmux_tab_strip_plugin",
+ "bmux_tab_bar_plugin",
+ "bmux_tabs_plugin",
+ "bmux_tabs_plugin_api",
  "bmux_terminal_grid",
  "bmux_terminal_protocol",
  "bmux_text_edit",
@@ -1272,8 +1274,6 @@ dependencies = [
  "bmux_tui",
  "bmux_tui_components",
  "bmux_visual_adapters_plugin_renderer",
- "bmux_windows_plugin",
- "bmux_windows_plugin_api",
  "bmux_workspaces_plugin",
  "clap",
  "crossterm",
@@ -1649,7 +1649,7 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_scene_protocol",
- "bmux_windows_plugin_api",
+ "bmux_tabs_plugin_api",
  "mlua",
  "serde",
  "serde_json",
@@ -1770,7 +1770,7 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
- "bmux_windows_plugin_api",
+ "bmux_tabs_plugin_api",
  "bmux_workspaces_plugin_api",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
@@ -1853,8 +1853,8 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_session_models",
  "bmux_sessions_plugin_api",
+ "bmux_tabs_plugin_api",
  "bmux_terminal_grid",
- "bmux_windows_plugin_api",
  "iroh",
  "rustls",
  "rustls-native-certs",
@@ -1904,9 +1904,9 @@ dependencies = [
  "bmux_session_state",
  "bmux_sessions_plugin_api",
  "bmux_snapshot_runtime",
+ "bmux_tabs_plugin_api",
  "bmux_terminal_grid",
  "bmux_terminal_protocol",
- "bmux_windows_plugin_api",
  "portable-pty",
  "serde",
  "serde_json",
@@ -2362,9 +2362,9 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
+ "bmux_tabs_plugin_api",
  "bmux_tui",
  "bmux_tui_components",
- "bmux_windows_plugin_api",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
@@ -2437,7 +2437,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bmux_tab_strip_plugin"
+name = "bmux_tab_bar_plugin"
 version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_attach_view_protocol",
@@ -2445,10 +2445,10 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
+ "bmux_tabs_plugin_api",
  "bmux_text_edit",
  "bmux_tui",
  "bmux_tui_components",
- "bmux_windows_plugin_api",
  "bmux_workspaces_plugin_api",
  "serde",
  "tokio",
@@ -2456,6 +2456,43 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_tabs_plugin"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_attach_view_protocol",
+ "bmux_client",
+ "bmux_clients_plugin_api",
+ "bmux_contexts_plugin",
+ "bmux_contexts_plugin_api",
+ "bmux_ipc",
+ "bmux_pane_runtime_plugin_api",
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "bmux_session_models",
+ "bmux_sessions_plugin_api",
+ "bmux_tab_bar_plugin",
+ "bmux_tabs_plugin_api",
+ "bmux_workspaces_plugin_api",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 1.1.4+spec-1.1.0",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_tabs_plugin_api"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -2588,43 +2625,6 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_plugin",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "bmux_windows_plugin"
-version = "0.0.1-alpha.1"
-dependencies = [
- "bmux_attach_view_protocol",
- "bmux_client",
- "bmux_clients_plugin_api",
- "bmux_contexts_plugin",
- "bmux_contexts_plugin_api",
- "bmux_ipc",
- "bmux_pane_runtime_plugin_api",
- "bmux_plugin",
- "bmux_plugin_sdk",
- "bmux_session_models",
- "bmux_sessions_plugin_api",
- "bmux_tab_strip_plugin",
- "bmux_windows_plugin_api",
- "bmux_workspaces_plugin_api",
- "serde",
- "serde_json",
- "tokio",
- "toml 1.1.4+spec-1.1.0",
- "uuid",
-]
-
-[[package]]
-name = "bmux_windows_plugin_api"
-version = "0.0.1-alpha.1"
-dependencies = [
- "bmux_ipc",
- "bmux_plugin_schema_macros",
- "bmux_plugin_sdk",
- "serde",
- "serde_json",
  "uuid",
 ]
 

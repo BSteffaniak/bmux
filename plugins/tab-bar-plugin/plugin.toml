@@ -1,17 +1,17 @@
 execution_class = "native_fast"
-id = "bmux.tab_strip"
+id = "bmux.tab_bar"
 name = "bmux Tab Strip"
-provided_capabilities = ["bmux.tab_strip.input"]
-provided_features = ["bmux.tab_strip"]
+provided_capabilities = ["bmux.tab_bar.input"]
+provided_features = ["bmux.tab_bar"]
 required_capabilities = [
-    "bmux.windows.read",
-    "bmux.windows.write",
+    "bmux.tabs.read",
+    "bmux.tabs.write",
     "bmux.workspaces.write",
 ]
 version = "0.0.1-alpha.0"
 
 [[dependencies]]
-plugin_id   = "bmux.windows"
+plugin_id   = "bmux.tabs"
 version_req = ">=0.0.1-alpha.0"
 
 [[dependencies]]
@@ -19,6 +19,6 @@ plugin_id   = "bmux.workspaces"
 version_req = ">=0.0.1-alpha.0"
 
 [[services]]
-capability   = "bmux.tab_strip.input"
+capability   = "bmux.tab_bar.input"
 interface_id = "presentation-input"
 kind         = "command"

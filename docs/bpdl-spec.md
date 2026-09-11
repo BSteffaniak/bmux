@@ -14,13 +14,13 @@ declaring the plugin identity, optional `import` directives referencing
 other plugins' schemas, followed by one or more interfaces.
 
 ```bpdl
-plugin bmux.windows version 1;
+plugin bmux.tabs version 1;
 
-interface windows-state {
+interface tabs-state {
     // items...
 }
 
-interface windows-events {
+interface tabs-events {
     // items...
 }
 ```
@@ -133,7 +133,7 @@ file with `import`:
 ```bpdl
 plugin bmux.decoration version 1;
 
-import windows = bmux.windows;
+import windows = bmux.tabs;
 
 interface decoration-state {
     command focus-imported-pane(source: windows.pane-state)
@@ -225,7 +225,7 @@ argument block:
 ```rust
 // Simple schema with no imports.
 bmux_plugin_schema_macros::schema! {
-    source: "bpdl/windows-plugin.bpdl",
+    source: "bpdl/tabs-plugin.bpdl",
 }
 
 // Schema that imports types from another plugin.
@@ -233,8 +233,8 @@ bmux_plugin_schema_macros::schema! {
     source: "bpdl/decoration-plugin.bpdl",
     imports: {
         windows: {
-            source: "../windows-plugin-api/bpdl/windows-plugin.bpdl",
-            crate_path: ::bmux_windows_plugin_api,
+            source: "../tabs-plugin-api/bpdl/tabs-plugin.bpdl",
+            crate_path: ::bmux_tabs_plugin_api,
         },
     },
 }
@@ -257,7 +257,7 @@ The macro expands to a module containing:
 
 Qualified type references are resolved against the `imports` table.
 For the example above, `windows.pane-state` emits as
-`::bmux_windows_plugin_api::windows_state::PaneState`.
+`::bmux_tabs_plugin_api::tabs_state::PaneState`.
 
 ### Inline schemas
 
@@ -313,7 +313,7 @@ the plugin host uses at load time:
 let mut reg = SchemaRegistry::new();
 reg.register(windows_schema_source)?;
 reg.register(decoration_schema_source)?;
-reg.check_compatibility("bmux.windows", "bmux.decoration", "windows-events")?;
+reg.check_compatibility("bmux.tabs", "bmux.decoration", "tabs-events")?;
 ```
 
 `check_compatibility` returns `Err(Vec<CompatError>)` listing every
@@ -331,6 +331,6 @@ The grammar is intentionally small. Planned additions, each additive:
 
 ## Example — windows plugin
 
-See `plugins/windows-plugin-api/bpdl/windows-plugin.bpdl` for the
+See `plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl` for the
 production schema defining the windows plugin's complete public API
 (three interfaces: state queries, commands, and a pane-event stream).

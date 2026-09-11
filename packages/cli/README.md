@@ -445,14 +445,14 @@ Top-level and grouped forms are exact aliases.
 
 ```bash
 # top-level
-bmux new-window --session dev --name editor
-bmux list-windows --session dev
-bmux list-windows --session dev --json
-bmux switch-window active --session dev
-bmux kill-window active --session dev
-bmux kill-window active --session dev --force-local
-bmux kill-all-windows --session dev
-bmux kill-all-windows --session dev --force-local
+bmux new-tab --session dev --name editor
+bmux list-tabs --session dev
+bmux list-tabs --session dev --json
+bmux switch-tab active --session dev
+bmux kill-tab active --session dev
+bmux kill-tab active --session dev --force-local
+bmux kill-all-tabs --session dev
+bmux kill-all-tabs --session dev --force-local
 
 # grouped aliases
 bmux window new --session dev --name editor
@@ -501,7 +501,7 @@ Use config opt-out when you want to disable specific bundled plugins:
 
 ```toml
 [plugins]
-disabled = ["bmux.windows", "bmux.permissions", "bmux.clipboard"]
+disabled = ["bmux.tabs", "bmux.permissions", "bmux.clipboard"]
 ```
 
 You can still explicitly enable additional non-bundled plugins:
@@ -564,7 +564,7 @@ Role policy:
 - `bmux session clients --json`
 - `bmux permissions --session <name|uuid> --json`
 - `bmux session permissions --session <name|uuid> --json`
-- `bmux list-windows --json`
+- `bmux list-tabs --json`
 - `bmux window list --json`
 
 Output format is a bare JSON array.

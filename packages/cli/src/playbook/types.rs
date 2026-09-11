@@ -251,7 +251,7 @@ pub enum Action {
         assertion: RenderAssertion,
     },
     /// Seed a deterministic attach simulation window list.
-    SeedWindowList { names: Vec<String>, active: String },
+    SeedTabList { names: Vec<String>, active: String },
     /// Seed deterministic attach simulation pane text.
     SeedPaneText {
         lines: Vec<String>,
@@ -676,7 +676,7 @@ impl Action {
             Self::Status => "status",
             Self::RenderMark { .. } => "render-mark",
             Self::AssertRender { .. } => "assert-render",
-            Self::SeedWindowList { .. } => "seed-window-list",
+            Self::SeedTabList { .. } => "seed-window-list",
             Self::SeedPaneText { .. } => "seed-pane-text",
             Self::SeedPaneLayout { .. } => "seed-pane-layout",
             Self::Render => "render",
@@ -843,7 +843,7 @@ impl Action {
                 append_render_assertion_dsl(&mut line, assertion);
                 line
             }
-            Self::SeedWindowList { names, active } => format!(
+            Self::SeedTabList { names, active } => format!(
                 "seed-window-list names='{}' active='{}'",
                 escape_single_quote(&names.join(",")),
                 escape_single_quote(active)

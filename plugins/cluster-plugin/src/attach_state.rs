@@ -314,7 +314,7 @@ where
     fn layout<'a>(
         &'a self,
         workspace_id: WorkspaceId,
-        window_id: Option<bmux_cluster_plugin_api::cluster_types::LogicalWindowId>,
+        tab_id: Option<bmux_cluster_plugin_api::cluster_types::LogicalTabId>,
         columns: u16,
         rows: u16,
     ) -> std::pin::Pin<
@@ -324,23 +324,21 @@ where
     > {
         Box::pin(async move {
             let view = bmux_cluster_plugin_api::cluster_control_state::ClusterControlStateService::read_linearizable(self.control.as_ref()).await?;
-            let windows = view
-                .windows
+            let tabs = view
+                .tabs
                 .iter()
-                .filter(|window| window.workspace_id == workspace_id)
+                .filter(|tab| tab.workspace_id == workspace_id)
                 .collect::<Vec<_>>();
-            let selected = select_layout_window(&windows, window_id.as_ref(), &workspace_id)?;
+            let selected = select_layout_tab(&tabs, tab_id.as_ref(), &workspace_id)?;
             let panes = view
                 .panes
                 .iter()
-                .filter(|pane| {
-                    pane.workspace_id == workspace_id && pane.window_id == selected.window_id
-                })
+                .filter(|pane| pane.workspace_id == workspace_id && pane.tab_id == selected.tab_id)
                 .cloned()
                 .collect::<Vec<_>>();
             if panes.is_empty() {
                 return Err(ControlServiceError::Internal {
-                    reason: "logical window has no panes".to_string(),
+                    reason: "logical tab has no panes".to_string(),
                 });
             }
             let mut rects = Vec::new();
@@ -373,7 +371,7 @@ where
             validate_projected_layout(&panes, &rects)?;
             Ok(AttachLayout {
                 workspace_id,
-                window_id: selected.window_id.clone(),
+                tab_id: selected.tab_id.clone(),
                 control_revision: view.revision,
                 panes,
                 rects,
@@ -445,17 +443,17 @@ struct LayoutRect {
 }
 
 fn decode_layout(
-    window: &bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord,
+    tab: &bmux_cluster_plugin_api::cluster_types::LogicalTabRecord,
 ) -> Result<bmux_attach_layout_protocol::PaneLayoutNode, ControlServiceError> {
-    if window.layout_schema_version != 1 {
+    if tab.layout_schema_version != 1 {
         return Err(ControlServiceError::Internal {
             reason: format!(
                 "unsupported logical layout schema {}",
-                window.layout_schema_version
+                tab.layout_schema_version
             ),
         });
     }
-    bmux_codec::from_bytes(&window.layout).map_err(|error| ControlServiceError::Internal {
+    bmux_codec::from_bytes(&tab.layout).map_err(|error| ControlServiceError::Internal {
         reason: format!("logical layout is malformed: {error}"),
     })
 }
@@ -550,28 +548,26 @@ fn project_layout(
     Ok(())
 }
 
-fn select_layout_window<'a>(
-    windows: &[&'a bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord],
-    requested: Option<&bmux_cluster_plugin_api::cluster_types::LogicalWindowId>,
+fn select_layout_tab<'a>(
+    tabs: &[&'a bmux_cluster_plugin_api::cluster_types::LogicalTabRecord],
+    requested: Option<&bmux_cluster_plugin_api::cluster_types::LogicalTabId>,
     workspace_id: &WorkspaceId,
-) -> Result<&'a bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord, ControlServiceError> {
+) -> Result<&'a bmux_cluster_plugin_api::cluster_types::LogicalTabRecord, ControlServiceError> {
     requested.map_or_else(
         || {
-            windows
-                .first()
+            tabs.first()
                 .copied()
                 .ok_or_else(|| ControlServiceError::Internal {
-                    reason: "logical workspace has no windows".to_string(),
+                    reason: "logical workspace has no tabs".to_string(),
                 })
         },
         |requested| {
-            windows
-                .iter()
+            tabs.iter()
                 .copied()
-                .find(|window| window.window_id == *requested)
+                .find(|tab| tab.tab_id == *requested)
                 .ok_or_else(|| ControlServiceError::Internal {
                     reason: format!(
-                        "requested logical window {} was not found in workspace {}",
+                        "requested logical tab {} was not found in workspace {}",
                         requested.value, workspace_id.value
                     ),
                 })
@@ -593,7 +589,7 @@ fn validate_projected_layout(
         .collect::<std::collections::BTreeSet<_>>();
     if rect_ids.len() != rects.len() || rect_ids != pane_ids {
         return Err(ControlServiceError::Internal {
-            reason: "logical layout must reference every selected-window pane exactly once"
+            reason: "logical layout must reference every selected-tab pane exactly once"
                 .to_string(),
         });
     }
@@ -661,12 +657,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_unknown_window_fails_instead_of_falling_back() {
+    fn explicit_unknown_tab_fails_instead_of_falling_back() {
         let workspace_id = WorkspaceId {
             value: uuid::Uuid::from_u128(1),
         };
-        let window = bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord {
-            window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
+        let tab = bmux_cluster_plugin_api::cluster_types::LogicalTabRecord {
+            tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId {
                 value: uuid::Uuid::from_u128(2),
             },
             workspace_id: workspace_id.clone(),
@@ -675,17 +671,17 @@ mod tests {
             layout: Vec::new(),
             revision: 1,
         };
-        let windows = [&window];
+        let tabs = [&tab];
         assert_eq!(
-            select_layout_window(&windows, None, &workspace_id)
+            select_layout_tab(&tabs, None, &workspace_id)
                 .unwrap()
-                .window_id,
-            window.window_id
+                .tab_id,
+            tab.tab_id
         );
         assert!(
-            select_layout_window(
-                &windows,
-                Some(&bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
+            select_layout_tab(
+                &tabs,
+                Some(&bmux_cluster_plugin_api::cluster_types::LogicalTabId {
                     value: uuid::Uuid::from_u128(3),
                 }),
                 &workspace_id,
@@ -703,7 +699,7 @@ mod tests {
             workspace_id: bmux_cluster_plugin_api::cluster_types::WorkspaceId {
                 value: uuid::Uuid::nil(),
             },
-            window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
+            tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId {
                 value: uuid::Uuid::nil(),
             },
             name: None,

@@ -403,7 +403,7 @@ pub fn parse_action_line(line: &str) -> Result<Action> {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>();
             let active = require_arg(&args, "active", "seed-window-list")?;
-            Ok(Action::SeedWindowList { names, active })
+            Ok(Action::SeedTabList { names, active })
         }
         "seed-pane-text" => {
             let lines = require_arg(&args, "lines", "seed-pane-text")?
@@ -793,9 +793,9 @@ snapshot id=final
 
     #[test]
     fn parse_plugin_config() {
-        let input = "@plugin enable=bmux.windows\n@plugin disable=bmux.permissions";
+        let input = "@plugin enable=bmux.tabs\n@plugin disable=bmux.permissions";
         let (playbook, _includes) = parse_dsl(input).unwrap();
-        assert_eq!(playbook.config.plugins.enable, vec!["bmux.windows"]);
+        assert_eq!(playbook.config.plugins.enable, vec!["bmux.tabs"]);
         assert_eq!(playbook.config.plugins.disable, vec!["bmux.permissions"]);
     }
 

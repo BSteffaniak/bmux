@@ -416,7 +416,7 @@ mod tests {
     }
 
     use bmux_cluster_plugin_api::cluster_types::{
-        LogicalWindowId, PaneAvailability, PaneRestartPolicy, WorkspaceId, WorkspaceRecord,
+        LogicalTabId, PaneAvailability, PaneRestartPolicy, WorkspaceId, WorkspaceRecord,
     };
 
     fn pane_state(assigned_generation: Option<u64>) -> crate::control_state::ControlState {
@@ -424,7 +424,7 @@ mod tests {
         let workspace_id = WorkspaceId {
             value: uuid::Uuid::from_u128(10),
         };
-        let window_id = LogicalWindowId {
+        let tab_id = LogicalTabId {
             value: uuid::Uuid::from_u128(20),
         };
         state.workspaces.insert(
@@ -435,10 +435,10 @@ mod tests {
                 revision: 1,
             },
         );
-        state.windows.insert(
-            window_id.value,
-            bmux_cluster_plugin_api::cluster_types::LogicalWindowRecord {
-                window_id: window_id.clone(),
+        state.tabs.insert(
+            tab_id.value,
+            bmux_cluster_plugin_api::cluster_types::LogicalTabRecord {
+                tab_id: tab_id.clone(),
                 workspace_id: workspace_id.clone(),
                 name: None,
                 layout_schema_version: 1,
@@ -453,7 +453,7 @@ mod tests {
                     value: uuid::Uuid::from_u128(30),
                 },
                 workspace_id,
-                window_id,
+                tab_id,
                 name: None,
                 restart_policy: PaneRestartPolicy::Manual,
                 placement: PlacementIntent {

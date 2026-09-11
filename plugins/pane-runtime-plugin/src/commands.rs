@@ -660,7 +660,7 @@ fn resolve_scope(
             if !context
                 .available_capabilities
                 .iter()
-                .any(|capability| capability == "bmux.windows.read")
+                .any(|capability| capability == "bmux.tabs.read")
             {
                 return Err(PluginCommandError::unavailable(
                     "current-window scope requires the windows plugin",
@@ -670,15 +670,15 @@ fn resolve_scope(
             if !window_context
                 .required_capabilities
                 .iter()
-                .any(|capability| capability == "bmux.windows.read")
+                .any(|capability| capability == "bmux.tabs.read")
             {
                 window_context
                     .required_capabilities
-                    .push("bmux.windows.read".to_string());
+                    .push("bmux.tabs.read".to_string());
             }
             let mut client = ServiceCallerDispatchClient::new(&window_context);
             let result = bmux_plugin::block_on_typed_dispatch(
-                bmux_windows_plugin_api::windows_state::client::active_window_panes(&mut client),
+                bmux_tabs_plugin_api::tabs_state::client::active_tab_panes(&mut client),
             )
             .map_err(|error| {
                 PluginCommandError::failed(format!("window target lookup failed: {error}"))
@@ -955,7 +955,7 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
     let windows_available = context
         .available_capabilities
         .iter()
-        .any(|capability| capability == "bmux.windows.read");
+        .any(|capability| capability == "bmux.tabs.read");
     let target_summary = format!(
         "Targets: 1 pane | Outer: {}x{} | Base: {}x{} | Content/PTY: {}x{} | Source: {}",
         current.outer_rect.w,

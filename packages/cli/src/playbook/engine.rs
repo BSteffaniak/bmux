@@ -32,7 +32,7 @@ use bmux_recording_plugin_api::{
 use bmux_recording_protocol::{DisplayActivityKind, RecordingSummary};
 use bmux_session_models::SessionSelector;
 use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
-use bmux_windows_plugin_api::windows_commands;
+use bmux_tabs_plugin_api::tabs_commands;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
@@ -92,14 +92,14 @@ fn ipc_to_session_selector(selector: SessionSelector) -> sessions_state::Session
 }
 
 #[must_use]
-fn ipc_to_windows_selector(selector: SessionSelector) -> windows_commands::Selector {
+fn ipc_to_windows_selector(selector: SessionSelector) -> tabs_commands::Selector {
     match selector {
-        SessionSelector::ById(id) => windows_commands::Selector {
+        SessionSelector::ById(id) => tabs_commands::Selector {
             id: Some(id),
             name: None,
             index: None,
         },
-        SessionSelector::ByName(name) => windows_commands::Selector {
+        SessionSelector::ByName(name) => tabs_commands::Selector {
             id: None,
             name: Some(name),
             index: None,
@@ -108,19 +108,19 @@ fn ipc_to_windows_selector(selector: SessionSelector) -> windows_commands::Selec
 }
 
 #[must_use]
-const fn pane_to_windows_selector(selector: &PaneSelector) -> windows_commands::Selector {
+const fn pane_to_windows_selector(selector: &PaneSelector) -> tabs_commands::Selector {
     match selector {
-        PaneSelector::ById(id) => windows_commands::Selector {
+        PaneSelector::ById(id) => tabs_commands::Selector {
             id: Some(*id),
             name: None,
             index: None,
         },
-        PaneSelector::ByIndex(index) => windows_commands::Selector {
+        PaneSelector::ByIndex(index) => tabs_commands::Selector {
             id: None,
             name: None,
             index: Some(*index),
         },
-        PaneSelector::Active => windows_commands::Selector {
+        PaneSelector::Active => tabs_commands::Selector {
             id: None,
             name: None,
             index: None,
@@ -131,10 +131,10 @@ const fn pane_to_windows_selector(selector: &PaneSelector) -> windows_commands::
 #[must_use]
 const fn ipc_split_to_windows_direction(
     direction: PaneSplitDirection,
-) -> windows_commands::PaneDirection {
+) -> tabs_commands::PaneDirection {
     match direction {
-        PaneSplitDirection::Vertical => windows_commands::PaneDirection::Vertical,
-        PaneSplitDirection::Horizontal => windows_commands::PaneDirection::Horizontal,
+        PaneSplitDirection::Vertical => tabs_commands::PaneDirection::Vertical,
+        PaneSplitDirection::Horizontal => tabs_commands::PaneDirection::Horizontal,
     }
 }
 
@@ -1600,7 +1600,7 @@ impl AttachInputRuntime {
     }
 }
 
-/// Invoke a `windows-commands` typed operation on a [`BmuxClient`] by
+/// Invoke a `tabs-commands` typed operation on a [`BmuxClient`] by
 /// routing through `Request::InvokeService`. Mirrors the pattern the
 /// attach runtime uses on its `StreamingBmuxClient` handle; separate
 /// helpers exist because the two client types share no trait.
@@ -1617,9 +1617,9 @@ where
         .map_err(|error| anyhow::anyhow!("encoding {operation}: {error}"))?;
     let response_bytes = client
         .invoke_service_raw(
-            windows_commands::client::FocusPaneEndpoint::CAPABILITY.as_str(),
+            tabs_commands::client::FocusPaneEndpoint::CAPABILITY.as_str(),
             bmux_ipc::InvokeServiceKind::Command,
-            windows_commands::INTERFACE_ID.as_str(),
+            tabs_commands::INTERFACE_ID.as_str(),
             operation,
             payload,
         )
@@ -1630,15 +1630,14 @@ where
 }
 
 async fn switch_window_by_id_playbook(client: &mut BmuxClient, id: Uuid) -> anyhow::Result<()> {
-    let _ack =
-        invoke_windows_command_bmux::<_, bmux_windows_plugin_api::windows_commands::WindowAck>(
-            client,
-            "switch-window",
-            &windows_commands::client::SwitchWindowRequest {
-                target: id.to_string(),
-            },
-        )
-        .await?;
+    let _ack = invoke_windows_command_bmux::<_, bmux_tabs_plugin_api::tabs_commands::TabAck>(
+        client,
+        "switch-tab",
+        &tabs_commands::client::SwitchTabRequest {
+            target: id.to_string(),
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -1726,11 +1725,11 @@ async fn goto_known_window_playbook(
     let total_started = Instant::now();
     let target_index = args
         .first()
-        .ok_or_else(|| anyhow::anyhow!("goto-window requires an index argument"))?
+        .ok_or_else(|| anyhow::anyhow!("goto-tab requires an index argument"))?
         .parse::<usize>()
-        .map_err(|error| anyhow::anyhow!("invalid goto-window index: {error}"))?
+        .map_err(|error| anyhow::anyhow!("invalid goto-tab index: {error}"))?
         .checked_sub(1)
-        .ok_or_else(|| anyhow::anyhow!("goto-window index must be at least 1"))?;
+        .ok_or_else(|| anyhow::anyhow!("goto-tab index must be at least 1"))?;
     let contexts = &runtime.state.window_context_ids;
     if contexts.is_empty() {
         return Err(anyhow::anyhow!("known window context list is empty"));
@@ -1738,7 +1737,7 @@ async fn goto_known_window_playbook(
     let resolve_started = Instant::now();
     let Some(target_id) = contexts.get(target_index).copied() else {
         return Err(anyhow::anyhow!(
-            "goto-window index {} is out of range for {} known windows",
+            "goto-tab index {} is out of range for {} known windows",
             target_index + 1,
             contexts.len()
         ));
@@ -1764,26 +1763,25 @@ async fn run_known_attach_plugin_command_playbook(
     command_name: &str,
     args: &[String],
 ) -> anyhow::Result<Option<PluginCliCommandResponse>> {
-    if plugin_id != "bmux.windows" {
+    if plugin_id != "bmux.tabs" {
         return Ok(None);
     }
     match command_name {
-        "new-window" => {
+        "new-tab" => {
             let name = args.first().cloned();
-            let _ack: bmux_windows_plugin_api::windows_commands::WindowAck =
-                invoke_windows_command_bmux(
-                    client,
-                    "new-window",
-                    &windows_commands::client::NewWindowRequest { name },
-                )
-                .await?;
+            let _ack: bmux_tabs_plugin_api::tabs_commands::TabAck = invoke_windows_command_bmux(
+                client,
+                "new-tab",
+                &tabs_commands::client::NewTabRequest { name },
+            )
+            .await?;
             Ok(Some(PluginCliCommandResponse::new(0)))
         }
-        "next-window" => {
+        "next-tab" => {
             cycle_window_playbook(client, false).await?;
             Ok(Some(PluginCliCommandResponse::new(0)))
         }
-        "prev-window" => {
+        "prev-tab" => {
             cycle_window_playbook(client, true).await?;
             Ok(Some(PluginCliCommandResponse::new(0)))
         }
@@ -2130,7 +2128,7 @@ fn execute_attach_sim_step(
     snapshots: &mut Vec<SnapshotCapture>,
 ) -> Result<Option<String>> {
     match &step.action {
-        Action::SeedWindowList { .. } => {
+        Action::SeedTabList { .. } => {
             bail!("seed-window-list is obsolete; window presentation is plugin-owned")
         }
         Action::SeedPaneText {
@@ -3680,19 +3678,18 @@ pub(super) async fn execute_step(
                 SplitDirection::Vertical => PaneSplitDirection::Vertical,
                 SplitDirection::Horizontal => PaneSplitDirection::Horizontal,
             };
-            let ack: bmux_windows_plugin_api::windows_commands::PaneAck =
-                invoke_windows_command_bmux(
-                    client,
-                    "split-pane",
-                    &windows_commands::client::SplitPaneRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
-                        target: None,
-                        direction: ipc_split_to_windows_direction(ipc_dir),
-                        ratio_pct: None,
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("split-pane failed: {e}"))?;
+            let ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command_bmux(
+                client,
+                "split-pane",
+                &tabs_commands::client::SplitPaneRequest {
+                    session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
+                    target: None,
+                    direction: ipc_split_to_windows_direction(ipc_dir),
+                    ratio_pct: None,
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("split-pane failed: {e}"))?;
             let pane_id = ack
                 .pane_id
                 .ok_or_else(|| anyhow::anyhow!("split-pane returned no pane id"))?;
@@ -3718,17 +3715,16 @@ pub(super) async fn execute_step(
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
             let selector = pane_to_windows_selector(&PaneSelector::ByIndex(*target));
-            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
-                invoke_windows_command_bmux(
-                    client,
-                    "focus-pane-by-selector",
-                    &windows_commands::client::FocusPaneBySelectorRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
-                        target: selector,
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("focus-pane failed: {e}"))?;
+            let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command_bmux(
+                client,
+                "focus-pane-by-selector",
+                &tabs_commands::client::FocusPaneBySelectorRequest {
+                    session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
+                    target: selector,
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("focus-pane failed: {e}"))?;
             runtime_vars.focused_pane = *target;
             Ok(None)
         }
@@ -3740,17 +3736,16 @@ pub(super) async fn execute_step(
                 || pane_to_windows_selector(&PaneSelector::Active),
                 |idx| pane_to_windows_selector(&PaneSelector::ByIndex(*idx)),
             );
-            let _ack: bmux_windows_plugin_api::windows_commands::PaneAck =
-                invoke_windows_command_bmux(
-                    client,
-                    "close-pane-by-selector",
-                    &windows_commands::client::ClosePaneBySelectorRequest {
-                        session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
-                        target: selector,
-                    },
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("close-pane failed: {e}"))?;
+            let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command_bmux(
+                client,
+                "close-pane-by-selector",
+                &tabs_commands::client::ClosePaneBySelectorRequest {
+                    session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
+                    target: selector,
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("close-pane failed: {e}"))?;
             runtime_vars.pane_count = runtime_vars.pane_count.saturating_sub(1);
             Ok(None)
         }
@@ -4350,7 +4345,7 @@ pub(super) async fn execute_step(
         Action::RenderMark { .. } | Action::AssertRender { .. } => {
             bail!("render trace actions are handled by the playbook runner")
         }
-        Action::SeedWindowList { .. }
+        Action::SeedTabList { .. }
         | Action::SeedPaneText { .. }
         | Action::SeedPaneLayout { .. }
         | Action::Render
@@ -4513,7 +4508,7 @@ async fn apply_attach_runtime_actions(
                 let total_started = Instant::now();
                 let before_session_id = runtime.state.attached_id;
                 let before_context_started = Instant::now();
-                let before_context_id = if plugin_id == "bmux.windows" {
+                let before_context_id = if plugin_id == "bmux.tabs" {
                     if runtime.state.attached_context_id.is_some() {
                         runtime.state.attached_context_id
                     } else {
@@ -4539,8 +4534,8 @@ async fn apply_attach_runtime_actions(
                 let use_production_pipeline =
                     PlaybookAttachCommandExecution::should_use_production_for(&command_name);
                 let response = if !use_production_pipeline
-                    && plugin_id == "bmux.windows"
-                    && command_name == "next-window"
+                    && plugin_id == "bmux.tabs"
+                    && command_name == "next-tab"
                 {
                     let (context_id, timing) =
                         cycle_known_window_playbook(client, runtime, false).await?;
@@ -4548,8 +4543,8 @@ async fn apply_attach_runtime_actions(
                     window_cycle_timing = Some(timing);
                     PluginCliCommandResponse::new(0)
                 } else if !use_production_pipeline
-                    && plugin_id == "bmux.windows"
-                    && command_name == "prev-window"
+                    && plugin_id == "bmux.tabs"
+                    && command_name == "prev-tab"
                 {
                     let (context_id, timing) =
                         cycle_known_window_playbook(client, runtime, true).await?;
@@ -4557,8 +4552,8 @@ async fn apply_attach_runtime_actions(
                     window_cycle_timing = Some(timing);
                     PluginCliCommandResponse::new(0)
                 } else if !use_production_pipeline
-                    && plugin_id == "bmux.windows"
-                    && command_name == "goto-window"
+                    && plugin_id == "bmux.tabs"
+                    && command_name == "goto-tab"
                 {
                     let (context_id, timing) =
                         goto_known_window_playbook(client, runtime, &args).await?;
@@ -4653,8 +4648,8 @@ async fn apply_attach_runtime_actions(
                     .await?;
                 }
                 let retarget_us = retarget_started.elapsed().as_micros();
-                if plugin_id == "bmux.windows"
-                    && command_name == "new-window"
+                if plugin_id == "bmux.tabs"
+                    && command_name == "new-tab"
                     && let Some(context_id) = runtime.state.attached_context_id
                     && !runtime.state.window_context_ids.contains(&context_id)
                 {
@@ -5396,8 +5391,8 @@ mod tests {
                 .processor
                 .process_terminal_event(key_event(CrosstermKeyCode::Char('c'), KeyModifiers::NONE)),
             vec![crate::input::RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "new-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "new-tab".to_string(),
                 args: Vec::new(),
             }]
         );
@@ -5415,8 +5410,8 @@ mod tests {
                 KeyModifiers::CONTROL
             )),
             vec![crate::input::RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "next-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "next-tab".to_string(),
                 args: Vec::new(),
             }]
         );

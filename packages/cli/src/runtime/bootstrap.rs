@@ -428,10 +428,10 @@ async fn run_server_start_inner(
                     >(kind)
                 }
                 (k, bmux_plugin_sdk::PluginEventDelivery::State)
-                    if k == bmux_windows_plugin_api::windows_list::STATE_KIND.as_str() =>
+                    if k == bmux_tabs_plugin_api::tabs_list::STATE_KIND.as_str() =>
                 {
                     server.spawn_plugin_bus_state_forwarder::<
-                        bmux_windows_plugin_api::windows_list::WindowListSnapshot,
+                        bmux_tabs_plugin_api::tabs_list::TabListSnapshot,
                     >(kind)
                 }
                 (k, bmux_plugin_sdk::PluginEventDelivery::State)

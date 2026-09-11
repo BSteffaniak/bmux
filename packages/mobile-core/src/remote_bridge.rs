@@ -1357,16 +1357,16 @@ async fn handle_session_mouse_event(
     if focus_before_forward && !in_focused_pane {
         #[derive(serde::Serialize)]
         struct FocusPaneBySelectorArgs {
-            session: bmux_windows_plugin_api::windows_commands::Selector,
-            target: bmux_windows_plugin_api::windows_commands::Selector,
+            session: bmux_tabs_plugin_api::tabs_commands::Selector,
+            target: bmux_tabs_plugin_api::tabs_commands::Selector,
         }
         let args = FocusPaneBySelectorArgs {
-            session: bmux_windows_plugin_api::windows_commands::Selector {
+            session: bmux_tabs_plugin_api::tabs_commands::Selector {
                 id: Some(session_id),
                 name: None,
                 index: None,
             },
-            target: bmux_windows_plugin_api::windows_commands::Selector {
+            target: bmux_tabs_plugin_api::tabs_commands::Selector {
                 id: Some(target_pane),
                 name: None,
                 index: None,
@@ -1379,9 +1379,9 @@ async fn handle_session_mouse_event(
         })?;
         let _response_bytes = client
             .invoke_service_raw(
-                bmux_windows_plugin_api::capabilities::WINDOWS_WRITE.as_str(),
+                bmux_tabs_plugin_api::capabilities::TABS_WRITE.as_str(),
                 bmux_ipc::InvokeServiceKind::Command,
-                bmux_windows_plugin_api::windows_commands::INTERFACE_ID.as_str(),
+                bmux_tabs_plugin_api::tabs_commands::INTERFACE_ID.as_str(),
                 "focus-pane-by-selector",
                 encoded,
             )

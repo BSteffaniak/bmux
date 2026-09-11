@@ -34,7 +34,7 @@ fn bundled_plugin_manifests_include_core_shipped_plugins() {
     assert!(
         manifests
             .iter()
-            .any(|manifest| manifest.id.as_str() == "bmux.windows")
+            .any(|manifest| manifest.id.as_str() == "bmux.tabs")
     );
     assert!(
         manifests
@@ -173,8 +173,8 @@ fn bundled_plugin_cli_manifest_does_not_proxy_recording_commands() {
 }
 
 #[test]
-fn bundled_windows_manifest_requires_generic_runtime_capabilities() {
-    let windows = bundled_manifest("bmux.windows");
+fn bundled_tabs_manifest_requires_generic_runtime_capabilities() {
+    let windows = bundled_manifest("bmux.tabs");
 
     let required = windows
         .required_capabilities
@@ -215,18 +215,18 @@ fn bundled_permissions_manifest_exposes_policy_service_interface() {
 }
 
 #[test]
-fn bundled_windows_manifest_exposes_window_command_service_interface() {
-    let windows = bundled_manifest("bmux.windows");
+fn bundled_tabs_manifest_exposes_tab_command_service_interface() {
+    let windows = bundled_manifest("bmux.tabs");
 
     assert!(windows.services.iter().any(|service| {
-        service.interface_id == "windows-commands"
+        service.interface_id == "tabs-commands"
             && service.kind == bmux_plugin_sdk::ServiceKind::Command
     }));
 }
 
 #[test]
-fn bundled_windows_manifest_matches_pragmatic_command_surface() {
-    let windows = bundled_manifest("bmux.windows");
+fn bundled_tabs_manifest_matches_pragmatic_command_surface() {
+    let windows = bundled_manifest("bmux.tabs");
     let commands = windows
         .commands
         .iter()
@@ -240,46 +240,22 @@ fn bundled_windows_manifest_matches_pragmatic_command_surface() {
         .collect::<Vec<_>>();
 
     let expected = [
+        ("new-tab", vec!["new-tab"], vec![vec!["tab", "new"]]),
+        ("list-tabs", vec!["list-tabs"], vec![vec!["tab", "list"]]),
+        ("kill-tab", vec!["kill-tab"], vec![vec!["tab", "kill"]]),
         (
-            "new-window",
-            vec!["new-window"],
-            vec![vec!["window", "new"], vec!["tab", "new"]],
+            "kill-all-tabs",
+            vec!["kill-all-tabs"],
+            vec![vec!["tab", "kill-all"]],
         ),
         (
-            "list-windows",
-            vec!["list-windows"],
-            vec![vec!["window", "list"], vec!["tab", "list"]],
+            "switch-tab",
+            vec!["switch-tab"],
+            vec![vec!["tab", "switch"]],
         ),
-        (
-            "kill-window",
-            vec!["kill-window"],
-            vec![vec!["window", "kill"], vec!["tab", "kill"]],
-        ),
-        (
-            "kill-all-windows",
-            vec!["kill-all-windows"],
-            vec![vec!["window", "kill-all"], vec!["tab", "kill-all"]],
-        ),
-        (
-            "switch-window",
-            vec!["switch-window"],
-            vec![vec!["window", "switch"], vec!["tab", "switch"]],
-        ),
-        (
-            "next-window",
-            vec!["next-window"],
-            vec![vec!["window", "next"], vec!["tab", "next"]],
-        ),
-        (
-            "prev-window",
-            vec!["prev-window"],
-            vec![vec!["window", "prev"], vec!["tab", "prev"]],
-        ),
-        (
-            "last-window",
-            vec!["last-window"],
-            vec![vec!["window", "last"], vec!["tab", "last"]],
-        ),
+        ("next-tab", vec!["next-tab"], vec![vec!["tab", "next"]]),
+        ("prev-tab", vec!["prev-tab"], vec![vec!["tab", "prev"]]),
+        ("last-tab", vec!["last-tab"], vec![vec!["tab", "last"]]),
     ];
 
     for (name, path, aliases) in expected {
@@ -304,19 +280,19 @@ fn bundled_windows_manifest_matches_pragmatic_command_surface() {
         .collect::<BTreeMap<_, _>>();
     assert_eq!(
         runtime_keybindings.get("c").copied(),
-        Some("plugin:bmux.windows:new-window")
+        Some("plugin:bmux.tabs:new-tab")
     );
     assert_eq!(
         runtime_keybindings.get("n").copied(),
-        Some("plugin:bmux.windows:next-window")
+        Some("plugin:bmux.tabs:next-tab")
     );
     assert_eq!(
         runtime_keybindings.get("p").copied(),
-        Some("plugin:bmux.windows:prev-window")
+        Some("plugin:bmux.tabs:prev-tab")
     );
     assert_eq!(
         runtime_keybindings.get("w").copied(),
-        Some("plugin:bmux.windows:last-window")
+        Some("plugin:bmux.tabs:last-tab")
     );
 }
 

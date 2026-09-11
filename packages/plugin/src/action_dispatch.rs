@@ -115,10 +115,10 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let _guard = register_host(tx);
 
-        dispatch("plugin:bmux.windows:goto-window 3").expect("dispatch should succeed");
+        dispatch("plugin:bmux.tabs:goto-tab 3").expect("dispatch should succeed");
 
         let request = rx.recv().await.expect("host should receive request");
-        assert_eq!(request.action, "plugin:bmux.windows:goto-window 3");
+        assert_eq!(request.action, "plugin:bmux.tabs:goto-tab 3");
     }
 
     #[tokio::test]

@@ -601,14 +601,14 @@ fn reject_removed_presentation_settings(value: &toml::Value, path: &str) -> Resu
         if key == "status_bar" && path.is_empty() {
             return Err(ConfigError::InvalidValue {
                 field: child_path,
-                value: "removed; configure plugins.settings.\"bmux.tab_strip\" or plugins.settings.\"bmux.sidebar\" instead"
+                value: "removed; configure plugins.settings.\"bmux.tab_bar\" or plugins.settings.\"bmux.sidebar\" instead"
                     .to_string(),
             });
         }
         if key == "status_position" && path.ends_with("appearance") {
             return Err(ConfigError::InvalidValue {
                 field: child_path,
-                value: "removed; configure plugins.settings.\"bmux.tab_strip\".placement instead"
+                value: "removed; configure plugins.settings.\"bmux.tab_bar\".placement instead"
                     .to_string(),
             });
         }
@@ -3893,12 +3893,12 @@ key_file = "/tmp/gateway-key.pem"
         let dir = path.parent().expect("temp dir").to_path_buf();
         std::fs::write(
             &path,
-            "[plugins]\nenabled = ['bmux.windows']\ndisabled = ['bmux.permissions']\n",
+            "[plugins]\nenabled = ['bmux.tabs']\ndisabled = ['bmux.permissions']\n",
         )
         .expect("failed writing config fixture");
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
-        assert_eq!(config.plugins.enabled, vec!["bmux.windows".to_string()]);
+        assert_eq!(config.plugins.enabled, vec!["bmux.tabs".to_string()]);
         assert_eq!(
             config.plugins.disabled,
             vec!["bmux.permissions".to_string()]
@@ -4108,7 +4108,7 @@ active_profile = "zellij_compat"
         );
         assert_eq!(
             insert_bindings.get("ctrl+t n"),
-            Some(&"plugin:bmux.windows:new-window".to_string())
+            Some(&"plugin:bmux.tabs:new-tab".to_string())
         );
         assert_eq!(
             insert_bindings.get("ctrl+n plus"),
@@ -5245,7 +5245,7 @@ timeout_profile = "missing"
         let error = BmuxConfig::load_from_path(&path).expect_err("removed setting must fail");
         let message = error.to_string();
         assert!(message.contains("appearance.status_position"));
-        assert!(message.contains("bmux.tab_strip"));
+        assert!(message.contains("bmux.tab_bar"));
         std::fs::remove_dir_all(path.parent().expect("config parent")).ok();
     }
 
@@ -5267,7 +5267,7 @@ timeout_profile = "missing"
         .expect_err("removed scoped setting must fail");
         let message = error.to_string();
         assert!(message.contains("status_position"));
-        assert!(message.contains("bmux.tab_strip"));
+        assert!(message.contains("bmux.tab_bar"));
         std::fs::remove_dir_all(path.parent().expect("config parent")).ok();
     }
 

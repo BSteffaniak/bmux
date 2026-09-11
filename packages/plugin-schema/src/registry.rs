@@ -309,10 +309,10 @@ fn format_type(ty: &crate::ast::TypeRef) -> String {
 mod tests {
     use super::*;
 
-    const WINDOWS_V1: &str = "plugin bmux.windows version 1;\n\
-        capability WINDOWS_READ = bmux.windows.read;\n\
-        @capability(WINDOWS_READ)\n\
-        interface windows-state {\n\
+    const WINDOWS_V1: &str = "plugin bmux.tabs version 1;\n\
+        capability TABS_READ = bmux.tabs.read;\n\
+        @capability(TABS_READ)\n\
+        interface tabs-state {\n\
           record pane-state { id: uuid }\n\
           query pane-state(id: uuid) -> pane-state?;\n\
         }";
@@ -321,9 +321,9 @@ mod tests {
     fn register_and_lookup_round_trips() {
         let mut reg = SchemaRegistry::new();
         let entry = reg.register(WINDOWS_V1).expect("register");
-        assert_eq!(entry.plugin_id, "bmux.windows");
+        assert_eq!(entry.plugin_id, "bmux.tabs");
         assert_eq!(entry.version, 1);
-        let fetched = reg.get("bmux.windows").expect("registered");
+        let fetched = reg.get("bmux.tabs").expect("registered");
         assert_eq!(fetched.version, 1);
     }
 
@@ -357,16 +357,16 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         reg.register(WINDOWS_V1).expect("provider");
         reg.register(
-            "plugin bmux.windows.consumer version 1;\n\
-             capability WINDOWS_READ = bmux.windows.read;\n\
-             @capability(WINDOWS_READ)\n\
-             interface windows-state {\n\
+            "plugin bmux.tabs.consumer version 1;\n\
+             capability TABS_READ = bmux.tabs.read;\n\
+             @capability(TABS_READ)\n\
+             interface tabs-state {\n\
                record pane-state { id: uuid }\n\
                query pane-state(id: uuid) -> pane-state?;\n\
               }",
         )
         .expect("consumer");
-        let r = reg.check_compatibility("bmux.windows", "bmux.windows.consumer", "windows-state");
+        let r = reg.check_compatibility("bmux.tabs", "bmux.tabs.consumer", "tabs-state");
         assert!(r.is_ok(), "expected compat, got {r:?}");
     }
 
@@ -376,16 +376,16 @@ mod tests {
         reg.register(WINDOWS_V1).expect("provider");
         reg.register(
             "plugin consumer version 1;\n\
-             capability WINDOWS_READ = bmux.windows.read;\n\
-             @capability(WINDOWS_READ)\n\
-             interface windows-state {\n\
+             capability TABS_READ = bmux.tabs.read;\n\
+             @capability(TABS_READ)\n\
+             interface tabs-state {\n\
                record pane-state { id: uuid }\n\
                query pane-state(id: uuid) -> pane-state;\n\
               }",
         )
         .expect("consumer");
         let err = reg
-            .check_compatibility("bmux.windows", "consumer", "windows-state")
+            .check_compatibility("bmux.tabs", "consumer", "tabs-state")
             .unwrap_err();
         assert!(
             err.iter()
@@ -406,7 +406,7 @@ mod tests {
         )
         .expect("consumer");
         let err = reg
-            .check_compatibility("bmux.windows", "consumer", "windows-state")
+            .check_compatibility("bmux.tabs", "consumer", "tabs-state")
             .unwrap_err();
         assert!(
             err.iter()
@@ -421,16 +421,16 @@ mod tests {
         reg.register(WINDOWS_V1).expect("provider");
         reg.register(
             "plugin consumer version 3;\n\
-             capability WINDOWS_READ = bmux.windows.read;\n\
-             @capability(WINDOWS_READ)\n\
-             interface windows-state {\n\
+             capability TABS_READ = bmux.tabs.read;\n\
+             @capability(TABS_READ)\n\
+             interface tabs-state {\n\
                record pane-state { id: uuid }\n\
                query pane-state(id: uuid) -> pane-state?;\n\
               }",
         )
         .expect("consumer");
         let err = reg
-            .check_compatibility("bmux.windows", "consumer", "windows-state")
+            .check_compatibility("bmux.tabs", "consumer", "tabs-state")
             .unwrap_err();
         assert!(
             err.iter()

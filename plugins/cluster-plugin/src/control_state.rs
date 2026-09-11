@@ -4,8 +4,8 @@ mod control_state_codec;
 use bmux_cluster_plugin_api::cluster_types::{
     ClusterMember, ClusterMemberState, ControlCommand, ControlCommandError, ControlCommandRequest,
     ControlCommandResult, ControlReadConsistency, ControlResourceKind, ControlResponse,
-    ControlStateView, ControlWorkflowStatus, LogicalPaneRecord, LogicalWindowRecord,
-    PaneAvailability, PendingWorkflow, WorkspaceId, WorkspaceRecord,
+    ControlStateView, ControlWorkflowStatus, LogicalPaneRecord, LogicalTabRecord, PaneAvailability,
+    PendingWorkflow, WorkspaceId, WorkspaceRecord,
 };
 use control_state_codec::{decode_snapshot, encode_snapshot};
 use sha2::Digest as _;
@@ -113,7 +113,7 @@ pub struct ControlState {
     pub activated_features: BTreeSet<String>,
     pub members: BTreeMap<String, ClusterMember>,
     pub workspaces: BTreeMap<uuid::Uuid, WorkspaceRecord>,
-    pub windows: BTreeMap<uuid::Uuid, LogicalWindowRecord>,
+    pub tabs: BTreeMap<uuid::Uuid, LogicalTabRecord>,
     pub panes: BTreeMap<uuid::Uuid, LogicalPaneRecord>,
     dedup: BTreeMap<DedupKey, DedupRecord>,
     feature_dedup: BTreeMap<DedupKey, FeatureDedupRecord>,
@@ -131,7 +131,7 @@ impl ControlState {
             activated_features: BTreeSet::new(),
             members: BTreeMap::new(),
             workspaces: BTreeMap::new(),
-            windows: BTreeMap::new(),
+            tabs: BTreeMap::new(),
             panes: BTreeMap::new(),
             dedup: BTreeMap::new(),
             feature_dedup: BTreeMap::new(),
@@ -146,7 +146,7 @@ impl ControlState {
             revision: self.revision,
             members: self.members.values().cloned().collect(),
             workspaces: self.workspaces.values().cloned().collect(),
-            windows: self.windows.values().cloned().collect(),
+            tabs: self.tabs.values().cloned().collect(),
             panes: self.panes.values().cloned().collect(),
             pending_workflows: self
                 .dedup
@@ -478,24 +478,25 @@ impl ControlState {
                 workspace.name.clone_from(name);
                 Ok(ApplyOutcome::complete(changed))
             }
-            ControlCommandRequest::PutWindow {
-                window,
+            ControlCommandRequest::PutTab {
+                tab,
                 expected_workspace_revision,
             } => {
-                let workspace = workspace_mut(self, &window.workspace_id)?;
+                let workspace = workspace_mut(self, &tab.workspace_id)?;
                 require_revision(*expected_workspace_revision, workspace.revision)?;
-                let changed = self.windows.get(&window.window_id.value) != Some(window);
-                self.windows.insert(window.window_id.value, window.clone());
+                let changed = self.tabs.get(&tab.tab_id.value) != Some(tab);
+                self.tabs.insert(tab.tab_id.value, tab.clone());
                 Ok(ApplyOutcome::complete(changed))
             }
-            ControlCommandRequest::RemoveWindow {
-                window_id,
+            ControlCommandRequest::RemoveTab {
+                tab_id,
                 expected_workspace_revision,
             } => {
-                let window = self.windows.get(&window_id.value).ok_or_else(|| {
-                    not_found(ControlResourceKind::Window, window_id.value.to_string())
-                })?;
-                let workspace_id = window.workspace_id.clone();
+                let tab = self
+                    .tabs
+                    .get(&tab_id.value)
+                    .ok_or_else(|| not_found(ControlResourceKind::Tab, tab_id.value.to_string()))?;
+                let workspace_id = tab.workspace_id.clone();
                 require_revision(
                     *expected_workspace_revision,
                     workspace(self, &workspace_id)?.revision,
@@ -503,11 +504,11 @@ impl ControlState {
                 if self
                     .panes
                     .values()
-                    .any(|pane| pane.window_id.value == window_id.value)
+                    .any(|pane| pane.tab_id.value == tab_id.value)
                 {
-                    return Err(invalid_transition("window still contains logical panes"));
+                    return Err(invalid_transition("tab still contains logical panes"));
                 }
-                self.windows.remove(&window_id.value);
+                self.tabs.remove(&tab_id.value);
                 Ok(ApplyOutcome::complete(true))
             }
             ControlCommandRequest::PutPane {
@@ -640,11 +641,11 @@ impl ControlState {
                     workspace.revision = revision;
                 }
             }
-            ControlCommandRequest::PutWindow { window, .. } => {
-                if let Some(stored) = self.windows.get_mut(&window.window_id.value) {
+            ControlCommandRequest::PutTab { tab, .. } => {
+                if let Some(stored) = self.tabs.get_mut(&tab.tab_id.value) {
                     stored.revision = revision;
                 }
-                if let Some(workspace) = self.workspaces.get_mut(&window.workspace_id.value) {
+                if let Some(workspace) = self.workspaces.get_mut(&tab.workspace_id.value) {
                     workspace.revision = revision;
                 }
             }
@@ -664,7 +665,7 @@ impl ControlState {
             }
             ControlCommandRequest::UpsertMember { .. }
             | ControlCommandRequest::SetMemberState { .. }
-            | ControlCommandRequest::RemoveWindow { .. }
+            | ControlCommandRequest::RemoveTab { .. }
             | ControlCommandRequest::RemovePane { .. }
             | ControlCommandRequest::CompleteWorkflow { .. }
             | ControlCommandRequest::PruneDedup { .. } => {}
@@ -743,13 +744,13 @@ fn require_pane_references(
     pane: &LogicalPaneRecord,
 ) -> Result<(), ControlCommandError> {
     workspace(state, &pane.workspace_id)?;
-    let window = state.windows.get(&pane.window_id.value).ok_or_else(|| {
+    let tab = state.tabs.get(&pane.tab_id.value).ok_or_else(|| {
         ControlCommandError::InvalidReference {
-            resource: ControlResourceKind::Window,
-            id: pane.window_id.value.to_string(),
+            resource: ControlResourceKind::Tab,
+            id: pane.tab_id.value.to_string(),
         }
     })?;
-    if window.workspace_id != pane.workspace_id {
+    if tab.workspace_id != pane.workspace_id {
         return Err(ControlCommandError::InvalidReference {
             resource: ControlResourceKind::Workspace,
             id: pane.workspace_id.value.to_string(),
@@ -825,8 +826,8 @@ fn invalid_transition(reason: &str) -> ControlCommandError {
 mod tests {
     use super::*;
     use bmux_cluster_plugin_api::cluster_types::{
-        CommandId, ExecutionAssignment, ExecutionId, LogicalPaneId, LogicalWindowId,
-        PaneAvailability, PaneRestartPolicy, PlacementIntent, WorkerLaunchSpec,
+        CommandId, ExecutionAssignment, ExecutionId, LogicalPaneId, LogicalTabId, PaneAvailability,
+        PaneRestartPolicy, PlacementIntent, WorkerLaunchSpec,
     };
 
     fn id(value: u128) -> uuid::Uuid {
@@ -867,9 +868,9 @@ mod tests {
         assert_accepted(&state.apply(&command(1, create_workspace(1))));
         assert_accepted(&state.apply(&command(
             2,
-            ControlCommandRequest::PutWindow {
-                window: LogicalWindowRecord {
-                    window_id: LogicalWindowId { value: id(20) },
+            ControlCommandRequest::PutTab {
+                tab: LogicalTabRecord {
+                    tab_id: LogicalTabId { value: id(20) },
                     workspace_id: WorkspaceId { value: id(10) },
                     name: None,
                     layout_schema_version: 1,
@@ -885,7 +886,7 @@ mod tests {
                 pane: LogicalPaneRecord {
                     pane_id: LogicalPaneId { value: id(30) },
                     workspace_id: WorkspaceId { value: id(10) },
-                    window_id: LogicalWindowId { value: id(20) },
+                    tab_id: LogicalTabId { value: id(20) },
                     name: None,
                     restart_policy: PaneRestartPolicy::Manual,
                     placement: PlacementIntent {
@@ -933,7 +934,7 @@ mod tests {
                 pane: LogicalPaneRecord {
                     pane_id: LogicalPaneId { value: id(30) },
                     workspace_id: WorkspaceId { value: id(10) },
-                    window_id: LogicalWindowId { value: id(20) },
+                    tab_id: LogicalTabId { value: id(20) },
                     name: None,
                     restart_policy: PaneRestartPolicy::Manual,
                     placement: PlacementIntent {
@@ -1020,8 +1021,8 @@ mod tests {
         assert_eq!(pane.availability, PaneAvailability::Unavailable);
         assert_eq!(pane.execution, current.execution);
         assert_eq!(pane.workspace_id.value, id(10));
-        assert_eq!(pane.window_id.value, id(20));
-        assert!(state.windows.contains_key(&id(20)));
+        assert_eq!(pane.tab_id.value, id(20));
+        assert!(state.tabs.contains_key(&id(20)));
         assert!(state.workspaces.contains_key(&id(10)));
 
         let rejected = state.apply(&command(

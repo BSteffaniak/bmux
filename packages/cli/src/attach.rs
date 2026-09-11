@@ -85,7 +85,7 @@ pub async fn request_prompt_with_events(
 /// Dispatch a runtime action string to the attach loop.
 ///
 /// The action string uses the same format as keybinding action values
-/// (e.g. `"focus_next_pane"`, `"plugin:bmux.windows:goto-window 1"`).
+/// (e.g. `"focus_next_pane"`, `"plugin:bmux.tabs:goto-tab 1"`).
 ///
 /// This is intended for async plugin code that has collected parameters
 /// (e.g. via prompts) and needs to execute an action with those values.

@@ -60,7 +60,7 @@ Read the [TUI framework guide](docs/tui-framework.md) for reusable APIs and owne
 
 - [CLI workflows and advanced examples](docs/cli-workflows.md)
 - [Concepts](docs/concepts.md) and [configuration profiles](docs/config-profiles.md)
-- [Plugins](docs/plugins.md) and [window presentation](docs/window-presentations.md)
+- [Plugins](docs/plugins.md) and [window presentation](docs/tab-presentations.md)
 - [Images and compression](docs/images.md)
 - [Operations](docs/operations.md) and [testing](TESTING.md)
 

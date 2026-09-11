@@ -1,16 +1,16 @@
-//! Typed public API of the bmux windows plugin.
+//! Typed public API of the bmux tabs plugin.
 //!
 //! This crate is the stable contract other plugins depend on. The
-//! [`windows_state`], [`windows_commands`], and [`windows_events`]
-//! modules are generated from `bpdl/windows-plugin.bpdl` at compile time
+//! [`tabs_state`], [`tabs_commands`], and [`tabs_events`]
+//! modules are generated from `bpdl/tabs-plugin.bpdl` at compile time
 //! via the [`bmux_plugin_schema_macros::schema!`] macro.
 //!
 //! Consumers pattern:
 //!
 //! ```ignore
-//! use bmux_windows_plugin_api::windows_state::WindowsStateService;
+//! use bmux_tabs_plugin_api::tabs_state::TabsStateService;
 //!
-//! fn somewhere(state: &dyn WindowsStateService, id: uuid::Uuid) {
+//! fn somewhere(state: &dyn TabsStateService, id: uuid::Uuid) {
 //!     let focused = state.focused_pane(id);
 //!     // ...
 //! }
@@ -24,5 +24,5 @@
 #![allow(clippy::too_many_arguments)]
 
 bmux_plugin_schema_macros::schema! {
-    source: "bpdl/windows-plugin.bpdl",
+    source: "bpdl/tabs-plugin.bpdl",
 }

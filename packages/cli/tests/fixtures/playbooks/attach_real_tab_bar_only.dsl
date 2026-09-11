@@ -1,13 +1,13 @@
 @driver real-attach
 @viewport cols=100 rows=30
 @shell sh
-@plugin enable=bmux.windows
+@plugin enable=bmux.tabs
 @plugin enable=bmux.pane_runtime
 @plugin enable=bmux.sessions
 @plugin enable=bmux.contexts
 @plugin enable=bmux.clients
 @plugin enable=bmux.permissions
-@plugin enable=bmux.tab_strip
+@plugin enable=bmux.tab_bar
 new-session
 send-keys keys='printf TAB_ONLY_OK\r'
 wait-for pattern='TAB_ONLY_OK'

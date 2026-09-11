@@ -139,7 +139,7 @@ macro_rules! declare_bundled_plugins {
 /// Register an optional client-side adapter owned by one bundled plugin.
 #[cfg(any(
     feature = "bundled-plugin-cluster",
-    feature = "bundled-plugin-tab-strip",
+    feature = "bundled-plugin-tab-bar",
     feature = "bundled-plugin-sidebar"
 ))]
 #[allow(unused_variables, clippy::missing_const_for_fn)]
@@ -148,18 +148,16 @@ fn install_bundled_client_adapter(plugin_id: &str, settings: Option<&toml::Value
     if plugin_id == "bmux.cluster" {
         bmux_cluster_plugin_client::install();
     }
-    #[cfg(feature = "bundled-plugin-tab-strip")]
-    if plugin_id == "bmux.tab_strip" {
+    #[cfg(feature = "bundled-plugin-tab-bar")]
+    if plugin_id == "bmux.tab_bar" {
         let settings = settings.cloned();
         bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::from_factory(
             plugin_id,
             std::sync::Arc::new(move |resources| {
-                Ok(Box::new(
-                    bmux_tab_strip_plugin::TabStripPresentation::install(
-                        settings.as_ref(),
-                        resources,
-                    )?,
-                ))
+                Ok(Box::new(bmux_tab_bar_plugin::TabBarPresentation::install(
+                    settings.as_ref(),
+                    resources,
+                )?))
             }),
         ));
     }
@@ -269,10 +267,10 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/sidebar-plugin/plugin.toml"),
     plugin_type = bmux_sidebar_plugin::SidebarPlugin;
 
-    feature = "bundled-plugin-tab-strip",
-    id = "bmux.tab_strip",
-    manifest = include_str!("../../../../plugins/tab-strip-plugin/plugin.toml"),
-    plugin_type = bmux_tab_strip_plugin::TabStripPlugin;
+    feature = "bundled-plugin-tab-bar",
+    id = "bmux.tab_bar",
+    manifest = include_str!("../../../../plugins/tab-bar-plugin/plugin.toml"),
+    plugin_type = bmux_tab_bar_plugin::TabBarPlugin;
 
     feature = "bundled-plugin-theme",
     id = "bmux.theme",
@@ -280,9 +278,9 @@ declare_bundled_plugins! {
     plugin_type = bmux_theme_plugin::ThemePlugin;
 
     feature = "bundled-plugin-windows",
-    id = "bmux.windows",
-    manifest = include_str!("../../../../plugins/windows-plugin/plugin.toml"),
-    plugin_type = bmux_windows_plugin::WindowsPlugin;
+    id = "bmux.tabs",
+    manifest = include_str!("../../../../plugins/tabs-plugin/plugin.toml"),
+    plugin_type = bmux_tabs_plugin::TabsPlugin;
 
     feature = "bundled-plugin-workspaces",
     id = "bmux.workspaces",
@@ -487,7 +485,7 @@ const fn static_bundled_workspace_plugin_dirs() -> &'static [&'static str] {
         #[cfg(feature = "bundled-plugin-theme")]
         "theme-plugin",
         #[cfg(feature = "bundled-plugin-windows")]
-        "windows-plugin",
+        "tabs-plugin",
         #[cfg(feature = "bundled-plugin-workspaces")]
         "workspaces-plugin",
         #[cfg(feature = "bundled-plugin-decoration")]
@@ -1380,7 +1378,7 @@ pub(super) fn typed_service_registry_snapshot() -> std::sync::Arc<
     TYPED_SERVICE_REGISTRY.with(|cell| std::sync::Arc::clone(&cell.borrow()))
 }
 
-/// Resolve the typed `windows-commands` service handle from the current
+/// Resolve the typed `tabs-commands` service handle from the current
 /// registry, if the windows plugin is loaded and registered typed
 /// services.
 ///
@@ -1392,43 +1390,38 @@ pub(super) fn typed_service_registry_snapshot() -> std::sync::Arc<
 #[must_use]
 #[allow(dead_code)] // Consumed by attach-flow routing changes landing in a follow-up.
 pub(super) fn resolve_windows_commands_service() -> Option<
-    std::sync::Arc<
-        dyn bmux_windows_plugin_api::windows_commands::WindowsCommandsService + Send + Sync,
-    >,
+    std::sync::Arc<dyn bmux_tabs_plugin_api::tabs_commands::TabsCommandsService + Send + Sync>,
 > {
-    let write_cap = bmux_plugin_sdk::HostScope::new("bmux.windows.write").ok()?;
+    let write_cap = bmux_plugin_sdk::HostScope::new("bmux.tabs.write").ok()?;
     let registry = typed_service_registry_snapshot();
     let handle = registry.get(&(
         write_cap,
         bmux_plugin_sdk::ServiceKind::Command,
-        bmux_windows_plugin_api::windows_commands::INTERFACE_ID,
+        bmux_tabs_plugin_api::tabs_commands::INTERFACE_ID,
     ))?;
     handle
         .provider_as_trait::<
-            dyn bmux_windows_plugin_api::windows_commands::WindowsCommandsService + Send + Sync,
+            dyn bmux_tabs_plugin_api::tabs_commands::TabsCommandsService + Send + Sync,
         >()
         .ok()
 }
 
-/// Resolve the typed `windows-state` service handle from the current
+/// Resolve the typed `tabs-state` service handle from the current
 /// registry. Mirrors [`resolve_windows_commands_service`] for the
 /// read-only query interface.
 #[must_use]
 #[allow(dead_code)] // Consumed by attach-flow routing changes landing in a follow-up.
-pub(super) fn resolve_windows_state_service() -> Option<
-    std::sync::Arc<dyn bmux_windows_plugin_api::windows_state::WindowsStateService + Send + Sync>,
-> {
-    let read_cap = bmux_plugin_sdk::HostScope::new("bmux.windows.read").ok()?;
+pub(super) fn resolve_windows_state_service()
+-> Option<std::sync::Arc<dyn bmux_tabs_plugin_api::tabs_state::TabsStateService + Send + Sync>> {
+    let read_cap = bmux_plugin_sdk::HostScope::new("bmux.tabs.read").ok()?;
     let registry = typed_service_registry_snapshot();
     let handle = registry.get(&(
         read_cap,
         bmux_plugin_sdk::ServiceKind::Query,
-        bmux_windows_plugin_api::windows_state::INTERFACE_ID,
+        bmux_tabs_plugin_api::tabs_state::INTERFACE_ID,
     ))?;
     handle
-        .provider_as_trait::<
-            dyn bmux_windows_plugin_api::windows_state::WindowsStateService + Send + Sync,
-        >()
+        .provider_as_trait::<dyn bmux_tabs_plugin_api::tabs_state::TabsStateService + Send + Sync>()
         .ok()
 }
 
@@ -2500,12 +2493,12 @@ enabled_by_default = false
     }
 
     #[test]
-    fn presentation_defaults_to_bottom_tab_strip_without_sidebar() {
+    fn presentation_defaults_to_bottom_tab_bar_without_sidebar() {
         let mut registry = PluginRegistry::new();
         register_static_bundled_plugins(&mut registry);
 
         let enabled = effective_enabled_plugins(&BmuxConfig::default(), &registry);
-        assert!(enabled.iter().any(|plugin| plugin == "bmux.tab_strip"));
+        assert!(enabled.iter().any(|plugin| plugin == "bmux.tab_bar"));
         assert!(!enabled.iter().any(|plugin| plugin == "bmux.sidebar"));
     }
 
@@ -2514,12 +2507,12 @@ enabled_by_default = false
         let mut registry = PluginRegistry::new();
         register_static_bundled_plugins(&mut registry);
         let combinations = [(true, true), (true, false), (false, true), (false, false)];
-        for (tab_strip, sidebar) in combinations {
+        for (tab_bar, sidebar) in combinations {
             let mut config = BmuxConfig::default();
-            if tab_strip {
-                config.plugins.enabled.push("bmux.tab_strip".to_string());
+            if tab_bar {
+                config.plugins.enabled.push("bmux.tab_bar".to_string());
             } else {
-                config.plugins.disabled.push("bmux.tab_strip".to_string());
+                config.plugins.disabled.push("bmux.tab_bar".to_string());
             }
             if sidebar {
                 config.plugins.enabled.push("bmux.sidebar".to_string());
@@ -2528,8 +2521,8 @@ enabled_by_default = false
             }
             let enabled = effective_enabled_plugins(&config, &registry);
             assert_eq!(
-                enabled.iter().any(|plugin| plugin == "bmux.tab_strip"),
-                tab_strip
+                enabled.iter().any(|plugin| plugin == "bmux.tab_bar"),
+                tab_bar
             );
             assert_eq!(
                 enabled.iter().any(|plugin| plugin == "bmux.sidebar"),
@@ -2550,29 +2543,27 @@ enabled_by_default = false
             .register_manifest_from_root(
                 &bundled_root,
                 &dir.join("plugin.toml"),
-                plugin_manifest("bmux.windows", "windows.dylib"),
+                plugin_manifest("bmux.tabs", "windows.dylib"),
             )
             .expect("bundled plugin should register");
 
         let config = BmuxConfig::default();
         let enabled = effective_enabled_plugins(&config, &registry);
-        assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+        assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.tabs"));
     }
 
     #[test]
     fn windows_manifest_marks_navigation_commands_repeat_safe() {
         let mut registry = PluginRegistry::new();
         registry
-            .register_bundled_manifest(include_str!(
-                "../../../../plugins/windows-plugin/plugin.toml"
-            ))
+            .register_bundled_manifest(include_str!("../../../../plugins/tabs-plugin/plugin.toml"))
             .expect("windows manifest should register");
 
-        assert!(registry.command_accepts_repeat("bmux.windows", "focus-pane-in-direction"));
-        assert!(registry.command_accepts_repeat("bmux.windows", "resize-pane"));
-        assert!(registry.command_accepts_repeat("bmux.windows", "next-window"));
-        assert!(registry.command_accepts_repeat("bmux.windows", "prev-window"));
-        assert!(!registry.command_accepts_repeat("bmux.windows", "close-active-pane"));
+        assert!(registry.command_accepts_repeat("bmux.tabs", "focus-pane-in-direction"));
+        assert!(registry.command_accepts_repeat("bmux.tabs", "resize-pane"));
+        assert!(registry.command_accepts_repeat("bmux.tabs", "next-tab"));
+        assert!(registry.command_accepts_repeat("bmux.tabs", "prev-tab"));
+        assert!(!registry.command_accepts_repeat("bmux.tabs", "close-active-pane"));
     }
 
     #[test]
@@ -2623,7 +2614,7 @@ enabled_by_default = false
             .register_manifest_from_root(
                 &bundled_root,
                 &dir.join("windows.toml"),
-                plugin_manifest("bmux.windows", "windows.dylib"),
+                plugin_manifest("bmux.tabs", "windows.dylib"),
             )
             .expect("windows plugin should register");
         registry
@@ -2636,7 +2627,7 @@ enabled_by_default = false
 
         let config = BmuxConfig::default();
         let enabled = effective_enabled_plugins(&config, &registry);
-        assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+        assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.tabs"));
         assert!(
             enabled
                 .iter()
@@ -2656,14 +2647,14 @@ enabled_by_default = false
             .register_manifest_from_root(
                 &bundled_root,
                 &dir.join("plugin.toml"),
-                plugin_manifest("bmux.windows", "windows.dylib"),
+                plugin_manifest("bmux.tabs", "windows.dylib"),
             )
             .expect("bundled plugin should register");
 
         let mut config = BmuxConfig::default();
-        config.plugins.disabled.push("bmux.windows".to_string());
+        config.plugins.disabled.push("bmux.tabs".to_string());
         let enabled = effective_enabled_plugins(&config, &registry);
-        assert!(!enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+        assert!(!enabled.iter().any(|plugin_id| plugin_id == "bmux.tabs"));
     }
 
     #[test]
@@ -2677,13 +2668,13 @@ enabled_by_default = false
             .register_manifest_from_root(
                 &bundled_root,
                 &dir.join("plugin.toml"),
-                plugin_manifest("bmux.windows", "windows.dylib"),
+                plugin_manifest("bmux.tabs", "windows.dylib"),
             )
             .expect("bundled plugin should register");
 
         let config = BmuxConfig::default();
         let enabled = effective_enabled_plugins(&config, &registry);
-        assert!(!enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+        assert!(!enabled.iter().any(|plugin_id| plugin_id == "bmux.tabs"));
     }
 
     #[test]
@@ -3012,15 +3003,15 @@ allow_hyphen_values=true
                     &bundled_root,
                     &dir.join("plugin.toml"),
                     plugin_manifest_with_commands(
-                        "bmux.windows",
+                        "bmux.tabs",
                         "windows.dylib",
-                        "owns_namespaces=['new-window']\n[[commands]]\nname='new-window'\npath=['new-window']\nsummary='new'\nexecution='provider_exec'\nexpose_in_cli=true\n",
+                        "owns_namespaces=['new-tab']\n[[commands]]\nname='new-tab'\npath=['new-tab']\nsummary='new'\nexecution='provider_exec'\nexpose_in_cli=true\n",
                     ),
                 )
                 .expect("plugin should register");
 
         let config = BmuxConfig::default();
-        let argv = vec![OsString::from("bmux"), OsString::from("new-window")];
+        let argv = vec![OsString::from("bmux"), OsString::from("new-tab")];
         let parsed = parse_runtime_cli_with_registry(
             &argv,
             &config,
@@ -3031,7 +3022,7 @@ allow_hyphen_values=true
         .expect("runtime CLI should parse bundled plugin command");
         match parsed {
             ParsedRuntimeCli::Plugin { plugin_id, .. } => {
-                assert_eq!(plugin_id, "bmux.windows");
+                assert_eq!(plugin_id, "bmux.tabs");
             }
             other => panic!("expected plugin runtime parse, got {other:?}"),
         }
@@ -3392,7 +3383,7 @@ allow_hyphen_values=true
         assert_eq!(runtime.get("o"), Some(&"quit".to_string()));
         assert_eq!(
             runtime.get("%"),
-            Some(&"plugin:bmux.windows:split-pane --direction vertical".to_string())
+            Some(&"plugin:bmux.tabs:split-pane --direction vertical".to_string())
         );
         assert_eq!(runtime.get("["), Some(&"enter_scroll_mode".to_string()));
     }
@@ -3475,8 +3466,8 @@ allow_hyphen_values=true
     #[test]
     fn format_plugin_command_run_error_adds_policy_hint_when_denied() {
         let error = anyhow::anyhow!("session policy denied for this operation");
-        let message = format_plugin_command_run_error("bmux.windows", "kill", &error);
-        assert!(message.contains("failed running plugin command 'bmux.windows:kill'"));
+        let message = format_plugin_command_run_error("bmux.tabs", "kill", &error);
+        assert!(message.contains("failed running plugin command 'bmux.tabs:kill'"));
         assert!(message.contains("operation denied by an active policy provider"));
         assert!(message.contains("authorized principal"));
     }
@@ -3501,10 +3492,10 @@ allow_hyphen_values=true
     fn format_plugin_not_found_message_lists_available_plugins() {
         let message = format_plugin_not_found_message(
             "missing.plugin",
-            &["bmux.windows".to_string(), "bmux.permissions".to_string()],
+            &["bmux.tabs".to_string(), "bmux.permissions".to_string()],
         );
         assert!(message.contains("plugin 'missing.plugin' was not found"));
-        assert!(message.contains("bmux.windows, bmux.permissions"));
+        assert!(message.contains("bmux.tabs, bmux.permissions"));
     }
 
     #[test]
@@ -3516,8 +3507,8 @@ allow_hyphen_values=true
 
     #[test]
     fn format_plugin_not_enabled_message_points_to_plugins_enabled() {
-        let message = format_plugin_not_enabled_message("bmux.windows");
-        assert!(message.contains("plugin 'bmux.windows' is not enabled"));
+        let message = format_plugin_not_enabled_message("bmux.tabs");
+        assert!(message.contains("plugin 'bmux.tabs' is not enabled"));
         assert!(message.contains("plugins.disabled"));
         assert!(message.contains("plugins.enabled"));
     }

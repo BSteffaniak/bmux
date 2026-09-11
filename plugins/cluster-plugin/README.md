@@ -66,7 +66,7 @@ Current scope:
 - Policy presets tune breaker/cooldown/probe defaults:
   - `balanced`: current defaults.
   - `aggressive`: faster failover and shorter cooldown.
-  - `conservative`: slower failover and longer stabilization windows.
+  - `conservative`: slower failover and longer stabilization tabs.
 - Candidate ordering in auto mode is stability-first (latency used as tie-break), with explicit skip reasons (`cooldown` / `breaker_open`) visible in status/explain and dry-run output.
 - Text output may truncate long candidate names for alignment only; JSON keeps full candidate values.
 

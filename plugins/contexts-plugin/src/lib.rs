@@ -1781,7 +1781,7 @@ mod tests {
         bmux_plugin_sdk::NativeServiceContext {
             plugin_id: "bmux.contexts".to_string(),
             request: bmux_plugin_sdk::ServiceRequest {
-                caller_plugin_id: "bmux.windows".to_string(),
+                caller_plugin_id: "bmux.tabs".to_string(),
                 service: bmux_plugin_sdk::RegisteredService {
                     capability: bmux_plugin_sdk::HostScope::new("bmux.contexts.write")
                         .expect("capability should parse"),

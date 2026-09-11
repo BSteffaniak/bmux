@@ -1,7 +1,7 @@
 # bmux_finder_plugin
 
 Standalone read-only finder for tabs across workspaces. It consumes retained
-windows/workspace state and delegates fuzzy matching to bmux's search-select
+tabs/workspace state and delegates fuzzy matching to bmux's search-select
 prompt.
 
 The finder prefers a 90-column modal, with content-driven height capped at 30

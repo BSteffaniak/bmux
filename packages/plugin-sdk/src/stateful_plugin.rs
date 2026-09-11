@@ -47,7 +47,7 @@ pub type StatefulPluginResult<T> = std::result::Result<T, StatefulPluginError>;
 /// A versioned, opaque snapshot payload produced by a [`StatefulPlugin`].
 ///
 /// `id` identifies the plugin surface being snapshotted — typically the
-/// plugin id string (e.g. `"bmux.windows"`) so the orchestration plugin
+/// plugin id string (e.g. `"bmux.tabs"`) so the orchestration plugin
 /// can route a payload back to the same plugin on restore. `version`
 /// lets the plugin evolve its internal format without breaking older
 /// snapshots: on restore the plugin can branch on `version` or reject

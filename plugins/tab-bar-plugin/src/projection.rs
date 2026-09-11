@@ -3,8 +3,7 @@ use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use super::{
-    ActiveAlignment, Density, HintPolicy, OverflowStyle, Preset, SeparatorSet, Settings,
-    windows_list,
+    ActiveAlignment, Density, HintPolicy, OverflowStyle, Preset, SeparatorSet, Settings, tabs_list,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +25,7 @@ pub enum SegmentKind {
 pub struct ProjectedSegment {
     pub(super) text: String,
     pub(super) kind: SegmentKind,
-    pub(super) window_id: Option<Uuid>,
+    pub(super) tab_id: Option<Uuid>,
     pub(super) edit_cursor_offset: Option<usize>,
 }
 
@@ -35,8 +34,8 @@ pub struct ProjectedBar {
     pub(super) segments: Vec<ProjectedSegment>,
 }
 
-pub struct ProjectedWindowRange {
-    pub(super) window_id: Uuid,
+pub struct ProjectedTabRange {
+    pub(super) tab_id: Uuid,
     pub(super) start: u16,
     pub(super) end: u16,
 }
@@ -49,18 +48,18 @@ pub enum DropSide {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedInsertion {
-    pub(super) window_id: Uuid,
+    pub(super) tab_id: Uuid,
     pub(super) side: DropSide,
     pub(super) marker_col: u16,
 }
 
 /// Interaction geometry is independent of segment text, decoration, and styling.
 /// Only visible tab bounds contribute insertion anchors; clipped tabs do not.
-pub struct TabStripGeometry {
-    pub(super) tabs: Vec<ProjectedWindowRange>,
+pub struct TabBarGeometry {
+    pub(super) tabs: Vec<ProjectedTabRange>,
 }
 
-impl TabStripGeometry {
+impl TabBarGeometry {
     pub fn resolve_insertion(&self, col: u16) -> Option<ResolvedInsertion> {
         // Compare cell centers to edge coordinates in half-cell units. Equal
         // distances favor the right anchor, including a single-cell separator.
@@ -71,12 +70,12 @@ impl TabStripGeometry {
             .flat_map(|tab| {
                 [
                     ResolvedInsertion {
-                        window_id: tab.window_id,
+                        tab_id: tab.tab_id,
                         side: DropSide::Before,
                         marker_col: tab.start,
                     },
                     ResolvedInsertion {
-                        window_id: tab.window_id,
+                        tab_id: tab.tab_id,
                         side: DropSide::After,
                         marker_col: tab.end,
                     },
@@ -92,26 +91,26 @@ impl TabStripGeometry {
 }
 
 impl ProjectedBar {
-    pub fn interaction_geometry(&self) -> TabStripGeometry {
-        TabStripGeometry {
-            tabs: self.window_ranges(),
+    pub fn interaction_geometry(&self) -> TabBarGeometry {
+        TabBarGeometry {
+            tabs: self.tab_ranges(),
         }
     }
-    pub fn window_ranges(&self) -> Vec<ProjectedWindowRange> {
-        let mut ranges: Vec<ProjectedWindowRange> = Vec::new();
+    pub fn tab_ranges(&self) -> Vec<ProjectedTabRange> {
+        let mut ranges: Vec<ProjectedTabRange> = Vec::new();
         let mut x = 0_u16;
         for segment in &self.segments {
             let width =
                 u16::try_from(UnicodeWidthStr::width(segment.text.as_str())).unwrap_or(u16::MAX);
-            if let Some(window_id) = segment.window_id {
+            if let Some(tab_id) = segment.tab_id {
                 if let Some(last) = ranges.last_mut()
-                    && last.window_id == window_id
+                    && last.tab_id == tab_id
                     && last.end == x
                 {
                     last.end = x.saturating_add(width);
                 } else {
-                    ranges.push(ProjectedWindowRange {
-                        window_id,
+                    ranges.push(ProjectedTabRange {
+                        tab_id,
                         start: x,
                         end: x.saturating_add(width),
                     });
@@ -127,12 +126,12 @@ impl ProjectedBar {
     }
 
     #[cfg(test)]
-    pub fn window_at_col(&self, col: u16) -> Option<Uuid> {
+    pub fn tab_at_col(&self, col: u16) -> Option<Uuid> {
         let mut x = 0_u16;
         for segment in &self.segments {
             let width = u16::try_from(UnicodeWidthStr::width(segment.text.as_str())).ok()?;
             if col >= x && col < x.saturating_add(width) {
-                return segment.window_id;
+                return segment.tab_id;
             }
             x = x.saturating_add(width);
         }
@@ -153,12 +152,12 @@ struct TabToken {
     width: usize,
     active: bool,
     hovered: bool,
-    window_id: Uuid,
+    tab_id: Uuid,
     edit_cursor_offset: Option<usize>,
     edit_selection: Option<(usize, usize)>,
 }
 
-struct TabWindow {
+struct TabTab {
     start: usize,
     end: usize,
 }
@@ -256,9 +255,9 @@ impl RenderStyle {
 #[derive(Default)]
 pub struct ProjectionInteraction<'a> {
     pub(super) scroll_anchor: Option<usize>,
-    pub(super) editing_window_id: Option<Uuid>,
+    pub(super) editing_tab_id: Option<Uuid>,
     pub(super) edit_selection: Option<(usize, usize)>,
-    pub(super) menu_window_id: Option<Uuid>,
+    pub(super) menu_tab_id: Option<Uuid>,
     pub(super) menu_selected: usize,
     pub(super) drag_marker_col: Option<u16>,
     pub(super) workspace_label: Option<&'a str>,
@@ -268,9 +267,9 @@ pub struct ProjectionInteraction<'a> {
 #[allow(clippy::too_many_lines)] // Projection is one ordered width-budgeting pass; splitting obscures shared constraints.
 pub fn project_bar(
     settings: &Settings,
-    windows: &[windows_list::WindowListEntry],
+    tabs: &[tabs_list::TabListEntry],
     local: &AttachLocalPresentationSnapshot,
-    hovered_window_id: Option<Uuid>,
+    hovered_tab_id: Option<Uuid>,
     interaction: &ProjectionInteraction<'_>,
 ) -> ProjectedBar {
     let style = RenderStyle::from_settings(settings);
@@ -286,7 +285,7 @@ pub fn project_bar(
     let inner_width = width
         .saturating_sub(settings.left_padding)
         .saturating_sub(settings.right_padding);
-    let tab_reserve = if windows.is_empty() {
+    let tab_reserve = if tabs.is_empty() {
         0
     } else {
         inner_width.min(2)
@@ -304,7 +303,7 @@ pub fn project_bar(
     let tail_width = segments_width(&tail);
     let workspace_name = interaction
         .workspace_label
-        .or_else(|| windows.first().map(|window| window.workspace.as_str()));
+        .or_else(|| tabs.first().map(|tab| tab.workspace.as_str()));
     let workspace_budget = width.saturating_sub(right_width + tail_width + 20).min(24);
     let workspace_label =
         workspace_name.map_or_else(String::new, |name| truncate_cells(name, workspace_budget));
@@ -317,19 +316,19 @@ pub fn project_bar(
         .saturating_sub(settings.left_padding)
         .saturating_sub(settings.right_padding)
         .saturating_sub(tail_width);
-    let tokens = windows
+    let tokens = tabs
         .iter()
         .enumerate()
-        .map(|(index, window)| {
-            let editing = interaction.editing_window_id == Some(window.id);
-            let label = render_tab_template(settings, window, index, local);
-            let text = style.tab(&label, window.active);
+        .map(|(index, tab)| {
+            let editing = interaction.editing_tab_id == Some(tab.id);
+            let label = render_tab_template(settings, tab, index, local);
+            let text = style.tab(&label, tab.active);
             TabToken {
                 width: UnicodeWidthStr::width(text.as_str()),
                 text,
-                active: window.active,
-                hovered: settings.hover_highlight && hovered_window_id == Some(window.id),
-                window_id: window.id,
+                active: tab.active,
+                hovered: settings.hover_highlight && hovered_tab_id == Some(tab.id),
+                tab_id: tab.id,
                 edit_cursor_offset: editing.then_some(0),
                 edit_selection: if editing {
                     interaction.edit_selection
@@ -339,7 +338,7 @@ pub fn project_bar(
             }
         })
         .collect::<Vec<_>>();
-    let window = visible_tabs_for_layout(
+    let tab = visible_tabs_for_layout(
         &tokens,
         settings,
         &style,
@@ -349,7 +348,7 @@ pub fn project_bar(
     let mut left = vec![ProjectedSegment {
         text: " ".repeat(settings.left_padding),
         kind: SegmentKind::Base,
-        window_id: None,
+        tab_id: None,
         edit_cursor_offset: None,
     }];
     left.push(ProjectedSegment {
@@ -359,14 +358,14 @@ pub fn project_bar(
         } else {
             SegmentKind::Workspace
         },
-        window_id: None,
+        tab_id: None,
         edit_cursor_offset: interaction.editing_workspace.then_some(0),
     });
     if show_workspace {
         left.push(ProjectedSegment {
             text: " │ ".to_string(),
             kind: SegmentKind::Base,
-            window_id: None,
+            tab_id: None,
             edit_cursor_offset: None,
         });
     }
@@ -374,11 +373,11 @@ pub fn project_bar(
         left.push(ProjectedSegment {
             text: "[no tabs]".to_string(),
             kind: SegmentKind::Base,
-            window_id: None,
+            tab_id: None,
             edit_cursor_offset: None,
         });
     } else {
-        append_tabs(&mut left, &tokens, &window, settings, &style, tab_budget);
+        append_tabs(&mut left, &tokens, &tab, settings, &style, tab_budget);
     }
     left.extend(tail);
 
@@ -398,7 +397,7 @@ pub fn project_bar(
         segments.push(ProjectedSegment {
             text: " ".repeat(spacer),
             kind: SegmentKind::Base,
-            window_id: None,
+            tab_id: None,
             edit_cursor_offset: None,
         });
     }
@@ -407,7 +406,7 @@ pub fn project_bar(
         segments.push(ProjectedSegment {
             text: " ".repeat(settings.right_padding),
             kind: SegmentKind::Base,
-            window_id: None,
+            tab_id: None,
             edit_cursor_offset: None,
         });
     }
@@ -418,7 +417,7 @@ pub fn project_bar(
         segments.push(ProjectedSegment {
             text: " ".repeat(width - current_width),
             kind: SegmentKind::Base,
-            window_id: None,
+            tab_id: None,
             edit_cursor_offset: None,
         });
     }
@@ -430,7 +429,7 @@ fn append_menu(
     interaction: &ProjectionInteraction<'_>,
     style: &RenderStyle,
 ) {
-    if interaction.menu_window_id.is_none() {
+    if interaction.menu_tab_id.is_none() {
         return;
     }
     segments.clear();
@@ -445,7 +444,7 @@ fn append_menu(
             } else {
                 SegmentKind::Module
             },
-            window_id: None,
+            tab_id: None,
             edit_cursor_offset: None,
         });
     }
@@ -454,13 +453,13 @@ fn append_menu(
 fn append_tabs(
     output: &mut Vec<ProjectedSegment>,
     tokens: &[TabToken],
-    window: &TabWindow,
+    tab: &TabTab,
     settings: &Settings,
     style: &RenderStyle,
     budget: usize,
 ) {
-    let hidden_left = window.start;
-    let hidden_right = tokens.len().saturating_sub(window.end);
+    let hidden_left = tab.start;
+    let hidden_right = tokens.len().saturating_sub(tab.end);
     // Chrome must not consume the anchor's entire budget on narrow resizes.
     // Keep the marker only when it leaves room for the first tab's label.
     let leading_width = UnicodeWidthStr::width(
@@ -469,17 +468,17 @@ fn append_tabs(
             .as_str(),
     )
     .saturating_add(UnicodeWidthStr::width(style.tab_separator.as_str()));
-    let anchor_width = tokens.get(window.start).map_or(0, |token| token.width);
+    let anchor_width = tokens.get(tab.start).map_or(0, |token| token.width);
     if hidden_left > 0 && leading_width.saturating_add(anchor_width) <= budget {
         output.push(ProjectedSegment {
             text: style.overflow(hidden_left, settings.overflow_style),
             kind: SegmentKind::Overflow,
-            window_id: None,
+            tab_id: None,
             edit_cursor_offset: None,
         });
         push_separator(output, &style.tab_separator);
     }
-    for (offset, token) in tokens[window.start..window.end].iter().enumerate() {
+    for (offset, token) in tokens[tab.start..tab.end].iter().enumerate() {
         if offset > 0 {
             push_separator(output, &style.tab_separator);
         }
@@ -495,7 +494,7 @@ fn append_tabs(
                     (false, false) => SegmentKind::InactiveTab,
                 }
             },
-            window_id: Some(token.window_id),
+            tab_id: Some(token.tab_id),
             edit_cursor_offset: token.edit_cursor_offset,
         });
     }
@@ -504,7 +503,7 @@ fn append_tabs(
         output.push(ProjectedSegment {
             text: style.overflow(hidden_right, settings.overflow_style),
             kind: SegmentKind::Overflow,
-            window_id: None,
+            tab_id: None,
             edit_cursor_offset: None,
         });
     }
@@ -565,7 +564,7 @@ fn right_segments(
         result.push(ProjectedSegment {
             text,
             kind,
-            window_id: None,
+            tab_id: None,
             edit_cursor_offset: None,
         });
     }
@@ -585,7 +584,7 @@ fn values_to_segments(
         result.push(ProjectedSegment {
             text,
             kind,
-            window_id: None,
+            tab_id: None,
             edit_cursor_offset: None,
         });
     }
@@ -596,7 +595,7 @@ fn push_separator(output: &mut Vec<ProjectedSegment>, separator: &str) {
     output.push(ProjectedSegment {
         text: separator.to_string(),
         kind: SegmentKind::Base,
-        window_id: None,
+        tab_id: None,
         edit_cursor_offset: None,
     });
 }
@@ -607,9 +606,9 @@ fn visible_tabs_for_layout(
     style: &RenderStyle,
     budget: usize,
     scroll_anchor: Option<usize>,
-) -> TabWindow {
+) -> TabTab {
     if tokens.is_empty() {
-        return TabWindow { start: 0, end: 0 };
+        return TabTab { start: 0, end: 0 };
     }
     let anchor = scroll_anchor
         .unwrap_or_else(|| tokens.iter().position(|token| token.active).unwrap_or(0))
@@ -637,12 +636,12 @@ fn visible_tabs_for_layout(
         let mut expanded = false;
         for candidate in candidates.into_iter().flatten() {
             let proposed = if candidate < start {
-                TabWindow {
+                TabTab {
                     start: candidate,
                     end,
                 }
             } else {
-                TabWindow {
+                TabTab {
                     start,
                     end: candidate + 1,
                 }
@@ -659,17 +658,17 @@ fn visible_tabs_for_layout(
         }
         extend_left = !extend_left;
     }
-    TabWindow { start, end }
+    TabTab { start, end }
 }
 
 fn tab_window_width(
     tokens: &[TabToken],
-    window: &TabWindow,
+    tab: &TabTab,
     style: &RenderStyle,
     overflow_style: OverflowStyle,
 ) -> usize {
-    let visible = window.end.saturating_sub(window.start);
-    let mut width = tokens[window.start..window.end]
+    let visible = tab.end.saturating_sub(tab.start);
+    let mut width = tokens[tab.start..tab.end]
         .iter()
         .map(|token| token.width)
         .sum::<usize>()
@@ -677,14 +676,14 @@ fn tab_window_width(
             UnicodeWidthStr::width(style.tab_separator.as_str())
                 .saturating_mul(visible.saturating_sub(1)),
         );
-    if window.start > 0 {
+    if tab.start > 0 {
         width = width
             .saturating_add(UnicodeWidthStr::width(
-                style.overflow(window.start, overflow_style).as_str(),
+                style.overflow(tab.start, overflow_style).as_str(),
             ))
             .saturating_add(UnicodeWidthStr::width(style.tab_separator.as_str()));
     }
-    let hidden_right = tokens.len().saturating_sub(window.end);
+    let hidden_right = tokens.len().saturating_sub(tab.end);
     if hidden_right > 0 {
         width = width
             .saturating_add(UnicodeWidthStr::width(
@@ -697,27 +696,27 @@ fn tab_window_width(
 
 fn render_tab_template(
     settings: &Settings,
-    window: &windows_list::WindowListEntry,
+    tab: &tabs_list::TabListEntry,
     index: usize,
     local: &AttachLocalPresentationSnapshot,
 ) -> String {
-    render_tab_template_ranges(settings, window, index, local).0
+    render_tab_template_ranges(settings, tab, index, local).0
 }
 
 pub fn name_ranges(
     settings: &Settings,
-    window: &windows_list::WindowListEntry,
+    tab: &tabs_list::TabListEntry,
     index: usize,
     local: &AttachLocalPresentationSnapshot,
 ) -> Vec<(usize, usize)> {
     let style = RenderStyle::from_settings(settings);
-    let prefix = if window.active {
+    let prefix = if tab.active {
         style.active_prefix
     } else {
         style.inactive_prefix
     };
     let offset = UnicodeWidthStr::width(prefix);
-    render_tab_template_ranges(settings, window, index, local)
+    render_tab_template_ranges(settings, tab, index, local)
         .1
         .into_iter()
         .map(|(start, width)| (start + offset, width))
@@ -726,12 +725,12 @@ pub fn name_ranges(
 
 fn render_tab_template_ranges(
     settings: &Settings,
-    window: &windows_list::WindowListEntry,
+    tab: &tabs_list::TabListEntry,
     index: usize,
     local: &AttachLocalPresentationSnapshot,
 ) -> (String, Vec<(usize, usize)>) {
     let mut ranges = Vec::new();
-    let name = truncate_cells(&window.name, usize::from(settings.maximum_label_width));
+    let name = truncate_cells(&tab.name, usize::from(settings.maximum_label_width));
     let session = local.session_label.as_deref().unwrap_or("");
     let mut output = String::with_capacity(settings.label_template.len());
     let mut chars = settings.label_template.chars().peekable();
@@ -760,9 +759,9 @@ fn render_tab_template_ranges(
                     "index" => Some(index.saturating_add(1).to_string()),
                     "index0" => Some(index.to_string()),
                     "session" => Some(session.to_string()),
-                    "marker" => Some(if window.active { "*" } else { "" }.to_string()),
-                    "id" => Some(window.id.to_string()),
-                    "active" => Some(if window.active { "active" } else { "idle" }.to_string()),
+                    "marker" => Some(if tab.active { "*" } else { "" }.to_string()),
+                    "id" => Some(tab.id.to_string()),
+                    "active" => Some(if tab.active { "active" } else { "idle" }.to_string()),
                     _ => None,
                 };
                 if terminated && let Some(value) = value {
@@ -831,8 +830,8 @@ fn segments_width(segments: &[ProjectedSegment]) -> usize {
 mod tests {
     use super::*;
 
-    fn window(index: u128, name: &str, active: bool) -> windows_list::WindowListEntry {
-        windows_list::WindowListEntry {
+    fn tab(index: u128, name: &str, active: bool) -> tabs_list::TabListEntry {
+        tabs_list::TabListEntry {
             id: Uuid::from_u128(index),
             name: name.to_string(),
             active,
@@ -850,11 +849,11 @@ mod tests {
 
     #[test]
     fn default_modules_leave_narrow_manual_anchor_interactive() {
-        let windows = [window(1, "first", true), window(2, "second", false)];
+        let tabs = [tab(1, "first", true), tab(2, "second", false)];
         for width in 3..40 {
             let projected = project_bar(
                 &Settings::default(),
-                &windows,
+                &tabs,
                 &local(width),
                 None,
                 &ProjectionInteraction {
@@ -863,11 +862,8 @@ mod tests {
                 },
             );
             assert_eq!(
-                projected
-                    .window_ranges()
-                    .first()
-                    .map(|range| range.window_id),
-                Some(windows[1].id),
+                projected.tab_ranges().first().map(|range| range.tab_id),
+                Some(tabs[1].id),
                 "width {width}: {}",
                 projected.plain_text()
             );
@@ -887,11 +883,11 @@ mod tests {
             show_hint: false,
             ..Settings::default()
         };
-        let windows = [window(1, "first", true), window(2, "second", false)];
+        let tabs = [tab(1, "first", true), tab(2, "second", false)];
         for width in 6..20 {
             let projected = project_bar(
                 &settings,
-                &windows,
+                &tabs,
                 &local(width),
                 None,
                 &ProjectionInteraction {
@@ -900,11 +896,8 @@ mod tests {
                 },
             );
             assert_eq!(
-                projected
-                    .window_ranges()
-                    .first()
-                    .map(|range| range.window_id),
-                Some(windows[1].id),
+                projected.tab_ranges().first().map(|range| range.tab_id),
+                Some(tabs[1].id),
                 "width {width}: {}",
                 projected.plain_text()
             );
@@ -918,7 +911,7 @@ mod tests {
     #[test]
     fn default_projection_omits_session_and_context_modules() {
         let settings = Settings::default();
-        let windows = [window(1, "main", true)];
+        let tabs = [tab(1, "main", true)];
         let local = AttachLocalPresentationSnapshot {
             session_label: Some("bcode".to_string()),
             session_count: 1,
@@ -928,7 +921,7 @@ mod tests {
         };
         let projected = project_bar(
             &settings,
-            &windows,
+            &tabs,
             &local,
             None,
             &ProjectionInteraction::default(),
@@ -943,7 +936,7 @@ mod tests {
     fn default_projection_is_full_width_and_includes_mode_and_role() {
         let projected = project_bar(
             &Settings::default(),
-            &[window(1, "main", true)],
+            &[tab(1, "main", true)],
             &local(40),
             None,
             &ProjectionInteraction::default(),
@@ -973,18 +966,18 @@ mod tests {
             projected
                 .segments
                 .iter()
-                .all(|segment| segment.window_id.is_none())
+                .all(|segment| segment.tab_id.is_none())
         );
     }
 
     #[test]
     fn narrow_projection_keeps_active_tab_and_uses_overflow() {
-        let windows = (0..8)
-            .map(|index| window(index + 1, &format!("window-{index}"), index == 7))
+        let tabs = (0..8)
+            .map(|index| tab(index + 1, &format!("tab-{index}"), index == 7))
             .collect::<Vec<_>>();
         let projected = project_bar(
             &Settings::default(),
-            &windows,
+            &tabs,
             &local(50),
             None,
             &ProjectionInteraction::default(),
@@ -992,19 +985,19 @@ mod tests {
         let text = projected.plain_text();
         assert_eq!(UnicodeWidthStr::width(text.as_str()), 50);
         assert!(text.contains("default"));
-        assert!(text.contains("window-7"));
+        assert!(text.contains("tab-7"));
         assert!(text.contains('◀'));
     }
 
     #[test]
     fn right_module_zone_survives_every_representative_width() {
-        let windows = (0..12)
-            .map(|index| window(index + 1, &format!("window-{index}"), index == 11))
+        let tabs = (0..12)
+            .map(|index| tab(index + 1, &format!("tab-{index}"), index == 11))
             .collect::<Vec<_>>();
         for width in [20, 40, 80, 120, 240] {
             let projected = project_bar(
                 &Settings::default(),
-                &windows,
+                &tabs,
                 &local(width),
                 None,
                 &ProjectionInteraction::default(),
@@ -1016,7 +1009,7 @@ mod tests {
                 assert!(text.contains("write"), "width {width}: {text:?}");
             }
             assert!(
-                !projected.window_ranges().is_empty(),
+                !projected.tab_ranges().is_empty(),
                 "width {width}: {text:?}"
             );
         }
@@ -1044,7 +1037,7 @@ mod tests {
         };
         let text = project_bar(
             &settings,
-            &[window(1, "main", true)],
+            &[tab(1, "main", true)],
             &local,
             None,
             &ProjectionInteraction::default(),
@@ -1066,20 +1059,20 @@ mod tests {
     #[test]
     fn drop_target_uses_tab_halves_and_exposes_insertion_column() {
         let settings = Settings::default();
-        let windows = [window(1, "one", true), window(2, "two", false)];
+        let tabs = [tab(1, "one", true), tab(2, "two", false)];
         let projected = project_bar(
             &settings,
-            &windows,
+            &tabs,
             &local(80),
             None,
             &ProjectionInteraction::default(),
         );
-        let ranges = projected.window_ranges();
+        let ranges = projected.tab_ranges();
         let second = &ranges[1];
         assert_eq!(
             projected.drop_target_at_col(second.start),
             Some(ResolvedInsertion {
-                window_id: second.window_id,
+                tab_id: second.tab_id,
                 side: DropSide::Before,
                 marker_col: second.start
             })
@@ -1087,7 +1080,7 @@ mod tests {
         assert_eq!(
             projected.drop_target_at_col(second.end.saturating_sub(1)),
             Some(ResolvedInsertion {
-                window_id: second.window_id,
+                tab_id: second.tab_id,
                 side: DropSide::After,
                 marker_col: second.end
             })
@@ -1096,20 +1089,20 @@ mod tests {
 
     #[test]
     fn insertion_geometry_resolves_gaps_ties_and_outer_edges() {
-        let geometry = TabStripGeometry {
+        let geometry = TabBarGeometry {
             tabs: vec![
-                ProjectedWindowRange {
-                    window_id: Uuid::from_u128(1),
+                ProjectedTabRange {
+                    tab_id: Uuid::from_u128(1),
                     start: 4,
                     end: 10,
                 },
-                ProjectedWindowRange {
-                    window_id: Uuid::from_u128(2),
+                ProjectedTabRange {
+                    tab_id: Uuid::from_u128(2),
                     start: 13,
                     end: 19,
                 },
-                ProjectedWindowRange {
-                    window_id: Uuid::from_u128(3),
+                ProjectedTabRange {
+                    tab_id: Uuid::from_u128(3),
                     start: 20,
                     end: 26,
                 },
@@ -1128,14 +1121,14 @@ mod tests {
             assert_eq!(
                 geometry.resolve_insertion(col),
                 Some(ResolvedInsertion {
-                    window_id: Uuid::from_u128(id),
+                    tab_id: Uuid::from_u128(id),
                     side,
                     marker_col,
                 }),
                 "column {col}"
             );
         }
-        assert_eq!(TabStripGeometry { tabs: vec![] }.resolve_insertion(0), None);
+        assert_eq!(TabBarGeometry { tabs: vec![] }.resolve_insertion(0), None);
     }
 
     #[test]
@@ -1146,37 +1139,37 @@ mod tests {
                     ProjectedSegment {
                         text: "界ab".into(),
                         kind: SegmentKind::ActiveTab,
-                        window_id: Some(Uuid::from_u128(1)),
+                        tab_id: Some(Uuid::from_u128(1)),
                         edit_cursor_offset: None,
                     },
                     ProjectedSegment {
                         text: separator.into(),
                         kind: SegmentKind::Base,
-                        window_id: None,
+                        tab_id: None,
                         edit_cursor_offset: None,
                     },
                     ProjectedSegment {
                         text: "next".into(),
                         kind: SegmentKind::InactiveTab,
-                        window_id: Some(Uuid::from_u128(2)),
+                        tab_id: Some(Uuid::from_u128(2)),
                         edit_cursor_offset: None,
                     },
                 ],
             };
-            let ranges = projected.window_ranges();
+            let ranges = projected.tab_ranges();
             assert_eq!(ranges[0].end, 4);
             for col in ranges[0].end..ranges[1].start {
                 let insertion = projected.drop_target_at_col(col).unwrap();
                 assert!(
                     insertion
                         == ResolvedInsertion {
-                            window_id: ranges[0].window_id,
+                            tab_id: ranges[0].tab_id,
                             side: DropSide::After,
                             marker_col: ranges[0].end
                         }
                         || insertion
                             == ResolvedInsertion {
-                                window_id: ranges[1].window_id,
+                                tab_id: ranges[1].tab_id,
                                 side: DropSide::Before,
                                 marker_col: ranges[1].start
                             }
@@ -1195,17 +1188,17 @@ mod tests {
                         label_template: "{index}: {name} ({name})".to_string(),
                         ..Settings::default()
                     };
-                    let windows = [window(1, "界hello", active), window(2, "other", !active)];
+                    let tabs = [tab(1, "界hello", active), tab(2, "other", !active)];
                     let normal = project_bar(
                         &settings,
-                        &windows,
+                        &tabs,
                         &local(width),
                         None,
                         &ProjectionInteraction::default(),
                     );
                     for interaction in [
                         ProjectionInteraction {
-                            editing_window_id: Some(windows[0].id),
+                            editing_tab_id: Some(tabs[0].id),
                             ..ProjectionInteraction::default()
                         },
                         ProjectionInteraction {
@@ -1214,21 +1207,21 @@ mod tests {
                         },
                     ] {
                         let edited =
-                            project_bar(&settings, &windows, &local(width), None, &interaction);
+                            project_bar(&settings, &tabs, &local(width), None, &interaction);
                         assert_eq!(normal.plain_text(), edited.plain_text());
                         let normal_ranges = normal
-                            .window_ranges()
+                            .tab_ranges()
                             .into_iter()
-                            .map(|r| (r.window_id, r.start, r.end))
+                            .map(|r| (r.tab_id, r.start, r.end))
                             .collect::<Vec<_>>();
                         let edited_ranges = edited
-                            .window_ranges()
+                            .tab_ranges()
                             .into_iter()
-                            .map(|r| (r.window_id, r.start, r.end))
+                            .map(|r| (r.tab_id, r.start, r.end))
                             .collect::<Vec<_>>();
                         assert_eq!(normal_ranges, edited_ranges);
                     }
-                    let ranges = name_ranges(&settings, &windows[0], 0, &local(width));
+                    let ranges = name_ranges(&settings, &tabs[0], 0, &local(width));
                     assert_eq!(ranges.len(), 2);
                     assert_eq!(ranges[0].1, 7);
                     assert!(ranges[1].0 > ranges[0].0);
@@ -1240,18 +1233,18 @@ mod tests {
     #[test]
     fn editing_and_menu_state_are_projected() {
         let mut interaction = ProjectionInteraction {
-            editing_window_id: Some(Uuid::from_u128(1)),
+            editing_tab_id: Some(Uuid::from_u128(1)),
             edit_selection: Some((0, 7)),
             ..ProjectionInteraction::default()
         };
         let settings = Settings::default();
-        let windows = [window(1, "main", true)];
-        let edited = project_bar(&settings, &windows, &local(80), None, &interaction);
+        let tabs = [tab(1, "main", true)];
+        let edited = project_bar(&settings, &tabs, &local(80), None, &interaction);
         assert_eq!(
             edited.plain_text(),
             project_bar(
                 &settings,
-                &windows,
+                &tabs,
                 &local(80),
                 None,
                 &ProjectionInteraction::default()
@@ -1262,9 +1255,9 @@ mod tests {
             segment.kind == SegmentKind::EditingTab && segment.edit_cursor_offset.is_some()
         }));
 
-        interaction.menu_window_id = Some(Uuid::from_u128(1));
+        interaction.menu_tab_id = Some(Uuid::from_u128(1));
         interaction.menu_selected = 1;
-        let menu = project_bar(&settings, &windows, &local(120), None, &interaction);
+        let menu = project_bar(&settings, &tabs, &local(120), None, &interaction);
         let text = menu.plain_text();
         assert!(text.contains("Switch"));
         assert!(text.contains("Rename"));
@@ -1283,7 +1276,7 @@ mod tests {
         );
         assert!(empty.plain_text().contains("[no tabs]"));
 
-        let unicode = [window(1, "界e\u{301}", true), window(2, "other", false)];
+        let unicode = [tab(1, "界e\u{301}", true), tab(2, "other", false)];
         let hovered = project_bar(
             &settings,
             &unicode,
@@ -1293,7 +1286,7 @@ mod tests {
         );
         assert!(hovered.plain_text().contains("界e\u{301}"));
         assert!(hovered.segments.iter().any(|segment| {
-            segment.window_id == Some(Uuid::from_u128(2))
+            segment.tab_id == Some(Uuid::from_u128(2))
                 && segment.kind == SegmentKind::HoveredInactiveTab
         }));
 
@@ -1326,13 +1319,13 @@ mod tests {
         use std::time::Instant;
 
         const ITERATIONS: u32 = 20_000;
-        let one_window = vec![window(1, "one", true)];
-        let windows = (0..64)
-            .map(|index| window(index + 1, &format!("window-{index}"), index == 32))
+        let one_tab = vec![tab(1, "one", true)];
+        let tabs = (0..64)
+            .map(|index| tab(index + 1, &format!("tab-{index}"), index == 32))
             .collect::<Vec<_>>();
         let settings = Settings::default();
         let local = local(240);
-        let measure = |windows: &[windows_list::WindowListEntry],
+        let measure = |tabs: &[tabs_list::TabListEntry],
                        hovered: Option<Uuid>,
                        interaction: &ProjectionInteraction<'_>,
                        local: &AttachLocalPresentationSnapshot| {
@@ -1341,7 +1334,7 @@ mod tests {
             for _ in 0..ITERATIONS {
                 let projected = project_bar(
                     black_box(&settings),
-                    black_box(windows),
+                    black_box(tabs),
                     black_box(local),
                     hovered,
                     interaction,
@@ -1352,23 +1345,23 @@ mod tests {
             (started.elapsed().as_nanos() / u128::from(ITERATIONS), bytes)
         };
         let default_interaction = ProjectionInteraction::default();
-        let (one_ns, one_bytes) = measure(&one_window, None, &default_interaction, &local);
-        let (many_ns, many_bytes) = measure(&windows, None, &default_interaction, &local);
-        let (idle_ns, idle_bytes) = measure(&windows, None, &default_interaction, &local);
+        let (one_ns, one_bytes) = measure(&one_tab, None, &default_interaction, &local);
+        let (many_ns, many_bytes) = measure(&tabs, None, &default_interaction, &local);
+        let (idle_ns, idle_bytes) = measure(&tabs, None, &default_interaction, &local);
         let (hover_ns, hover_bytes) = measure(
-            &windows,
+            &tabs,
             Some(Uuid::from_u128(41)),
             &default_interaction,
             &local,
         );
-        let mut reordered = windows.clone();
+        let mut reordered = tabs.clone();
         reordered.rotate_left(17);
         let (reorder_ns, reorder_bytes) = measure(&reordered, None, &default_interaction, &local);
         let editing = ProjectionInteraction {
-            editing_window_id: Some(Uuid::from_u128(33)),
+            editing_tab_id: Some(Uuid::from_u128(33)),
             ..ProjectionInteraction::default()
         };
-        let (rename_ns, rename_bytes) = measure(&windows, None, &editing, &local);
+        let (rename_ns, rename_bytes) = measure(&tabs, None, &editing, &local);
         let module_local = AttachLocalPresentationSnapshot {
             mode_label: "SCROLL".to_string(),
             role_label: "read-only".to_string(),
@@ -1377,8 +1370,7 @@ mod tests {
             viewport_cols: 240,
             ..AttachLocalPresentationSnapshot::initial()
         };
-        let (module_ns, module_bytes) =
-            measure(&windows, None, &default_interaction, &module_local);
+        let (module_ns, module_bytes) = measure(&tabs, None, &default_interaction, &module_local);
         println!(
             "projection iterations={ITERATIONS} one_ns={one_ns} one_bytes={one_bytes} many_ns={many_ns} many_bytes={many_bytes} idle_ns={idle_ns} idle_bytes={idle_bytes} hover_ns={hover_ns} hover_bytes={hover_bytes} reorder_ns={reorder_ns} reorder_bytes={reorder_bytes} rename_ns={rename_ns} rename_bytes={rename_bytes} module_ns={module_ns} module_bytes={module_bytes}"
         );
@@ -1406,7 +1398,7 @@ mod tests {
         };
         let projected = project_bar(
             &settings,
-            &[window(1, "main", true)],
+            &[tab(1, "main", true)],
             &local(80),
             None,
             &ProjectionInteraction::default(),

@@ -5,12 +5,27 @@ use super::{
     SeparatorSet, Settings, TabOrder, TabScope,
 };
 
-#[allow(clippy::too_many_lines)] // Parsing mirrors the intentionally rich legacy-compatible settings surface.
+#[allow(clippy::too_many_lines)] // Parsing mirrors the intentionally rich settings surface.
 pub fn parse_settings(value: Option<&toml::Value>) -> Result<Settings, PluginCommandError> {
     let mut settings = Settings::default();
     let Some(table) = value.and_then(toml::Value::as_table) else {
         return Ok(settings);
     };
+
+    for removed in [
+        "label_template",
+        "maximum_label_width",
+        "maximum_visible_tabs",
+        "show_index",
+        "show_compact_facts",
+    ] {
+        if table.contains_key(removed) {
+            return Err(invalid(
+                removed,
+                "is removed; use the canonical tab bar settings documented in docs/tab-presentations.md",
+            ));
+        }
+    }
 
     settings.placement = parse_enum(
         table,
@@ -65,31 +80,20 @@ pub fn parse_settings(value: Option<&toml::Value>) -> Result<Settings, PluginCom
     settings.height = parse_bounded_u16(table, "height", settings.height, 1, 4)?;
     settings.order = parse_i32(table, "order", settings.order)?;
 
-    if let Some(template) = table
-        .get("tab_template")
-        .or_else(|| table.get("label_template"))
-        .and_then(toml::Value::as_str)
-    {
+    if let Some(template) = table.get("tab_template").and_then(toml::Value::as_str) {
         settings.label_template = template.to_string();
-    } else if table.get("show_tab_index").and_then(toml::Value::as_bool) == Some(true)
-        || table.get("show_index").and_then(toml::Value::as_bool) == Some(true)
-    {
+    } else if table.get("show_tab_index").and_then(toml::Value::as_bool) == Some(true) {
         settings.label_template = "{index}:{name}".to_string();
     }
-    settings.maximum_label_width = parse_bounded_u16_alias(
+    settings.maximum_label_width = parse_bounded_u16(
         table,
         "tab_label_max_width",
-        "maximum_label_width",
         settings.maximum_label_width,
         1,
         u16::MAX,
     )?;
-    settings.maximum_visible_tabs = parse_optional_count_alias(
-        table,
-        "max_tabs",
-        "maximum_visible_tabs",
-        settings.maximum_visible_tabs,
-    )?;
+    settings.maximum_visible_tabs =
+        parse_optional_count(table, "max_tabs", settings.maximum_visible_tabs)?;
 
     for (key, target) in [
         ("show_session_name", &mut settings.show_session_name),
@@ -99,7 +103,7 @@ pub fn parse_settings(value: Option<&toml::Value>) -> Result<Settings, PluginCom
         ("show_follow", &mut settings.show_follow),
         ("show_hint", &mut settings.show_hint),
         ("hover_highlight", &mut settings.hover_highlight),
-        ("show_compact_facts", &mut settings.show_compact_facts),
+        ("show_facts", &mut settings.show_compact_facts),
     ] {
         if let Some(value) = table.get(key).and_then(toml::Value::as_bool) {
             *target = value;
@@ -271,31 +275,12 @@ fn parse_bounded_u16(
     .ok_or_else(|| invalid(key, &format!("must be between {minimum} and {maximum}")))
 }
 
-fn parse_bounded_u16_alias(
+fn parse_optional_count(
     table: &toml::map::Map<String, toml::Value>,
     canonical: &str,
-    alias: &str,
-    default: u16,
-    minimum: u16,
-    maximum: u16,
-) -> Result<u16, PluginCommandError> {
-    if table.contains_key(canonical) {
-        parse_bounded_u16(table, canonical, default, minimum, maximum)
-    } else {
-        parse_bounded_u16(table, alias, default, minimum, maximum)
-    }
-}
-
-fn parse_optional_count_alias(
-    table: &toml::map::Map<String, toml::Value>,
-    canonical: &str,
-    alias: &str,
     default: Option<usize>,
 ) -> Result<Option<usize>, PluginCommandError> {
-    let entry = table
-        .get(canonical)
-        .map(|value| (canonical, value))
-        .or_else(|| table.get(alias).map(|value| (alias, value)));
+    let entry = table.get(canonical).map(|value| (canonical, value));
     let Some((key, value)) = entry else {
         return Ok(default);
     };
@@ -316,5 +301,5 @@ fn valid_hex_color(value: &str) -> bool {
 }
 
 fn invalid(key: &str, reason: &str) -> PluginCommandError {
-    PluginCommandError::invalid_arguments(format!("bmux.tab_strip {key} {reason}"))
+    PluginCommandError::invalid_arguments(format!("bmux.tab_bar {key} {reason}"))
 }

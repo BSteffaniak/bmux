@@ -6,7 +6,7 @@ use crate::membership::{ClusterId, NodeId};
 use crate::worker_runtime::{WorkerLeaseVerifier, WorkerPaneRuntime, WorkerServiceHandle};
 use bmux_cluster_plugin_api::cluster_types::{
     ClusterConsensusRole, ClusterNodeCapabilities, ControlWorkflowStatus, LogicalPaneRecord,
-    LogicalWindowId, LogicalWindowRecord, PaneRestartPolicy, PlacementIntent, WorkerLaunchSpec,
+    LogicalTabId, LogicalTabRecord, PaneRestartPolicy, PlacementIntent, WorkerLaunchSpec,
 };
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -242,7 +242,7 @@ async fn leader_failover_recovers_committed_launch_without_duplicate_execution()
     let workspace_id = WorkspaceId {
         value: uuid::Uuid::from_u128(10),
     };
-    let window_id = LogicalWindowId {
+    let tab_id = LogicalTabId {
         value: uuid::Uuid::from_u128(20),
     };
     let pane_id = LogicalPaneId {
@@ -256,9 +256,9 @@ async fn leader_failover_recovers_committed_launch_without_duplicate_execution()
             workspace_id: workspace_id.clone(),
             name: None,
         },
-        ControlCommandRequest::PutWindow {
-            window: LogicalWindowRecord {
-                window_id: window_id.clone(),
+        ControlCommandRequest::PutTab {
+            tab: LogicalTabRecord {
+                tab_id: tab_id.clone(),
                 workspace_id: workspace_id.clone(),
                 name: None,
                 layout_schema_version: 1,
@@ -271,7 +271,7 @@ async fn leader_failover_recovers_committed_launch_without_duplicate_execution()
             pane: LogicalPaneRecord {
                 pane_id: pane_id.clone(),
                 workspace_id: workspace_id.clone(),
-                window_id: window_id.clone(),
+                tab_id: tab_id.clone(),
                 name: None,
                 restart_policy: PaneRestartPolicy::Manual,
                 placement: PlacementIntent {

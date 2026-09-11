@@ -290,7 +290,7 @@ interface decoration-state {
     }
 
     // Mirror of `windows.pane-status` used in `pane-activity`. Kept
-    // local to avoid an import cycle with `bmux.windows`.
+    // local to avoid an import cycle with `bmux.tabs`.
     enum pane-lifecycle {
         @default running,
         exited,
@@ -337,7 +337,7 @@ interface decoration-commands {
     // this plugin remains the sole interpreter of decoration theme data.
     command apply-theme-extension(toml: string, config-dir-candidates: list<string>) -> result<unit, decoration-state.validation-result>;
     // Notify the plugin of a pane-level event. Today the decoration
-    // plugin also subscribes to `bmux.windows/windows-events` via the
+    // plugin also subscribes to `bmux.tabs/tabs-events` via the
     // typed event bus; this typed command exists as an ordered
     // fallback path (e.g. for test harnesses without the event bus,
     // and for a future where the windows plugin uses typed-dispatch
@@ -347,7 +347,7 @@ interface decoration-commands {
 
 interface decoration-events {
     // Pane-level event mirror. Identical to `windows.pane-event` by
-    // design; kept local to avoid an import cycle with `bmux.windows`.
+    // design; kept local to avoid an import cycle with `bmux.tabs`.
     variant pane-event {
         focused { pane-id: uuid },
         unfocused { pane-id: uuid },

@@ -14,7 +14,7 @@ use crate::{PluginError, PluginEventKind, Result};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginEvent {
     /// Canonical identifier for the event stream this event belongs to
-    /// (for example `"bmux.windows/pane-event"`).
+    /// (for example `"bmux.tabs/pane-event"`).
     pub kind: PluginEventKind,
     /// Serialized event payload. Decoders interpret this according to
     /// the type the owning plugin declared for the stream.

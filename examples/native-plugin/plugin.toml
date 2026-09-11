@@ -9,8 +9,8 @@ required_capabilities = [
     "bmux.storage",
     "bmux.permissions.read",
     "bmux.permissions.write",
-    "bmux.windows.read",
-    "bmux.windows.write",
+    "bmux.tabs.read",
+    "bmux.tabs.write",
 ]
 runtime = "native"
 version = "0.0.1-alpha.0"
@@ -104,7 +104,7 @@ value_name = "CLIENT"
 
 [[commands]]
 expose_in_cli = true
-name          = "windows-list"
+name          = "tabs-list"
 summary       = "List session windows through bmux provider service"
 
 [[commands.arguments]]
@@ -179,12 +179,12 @@ summary    = "Storage key"
 value_name = "KEY"
 
 [[event_subscriptions]]
-kinds = ["bmux.core/server-started", "bmux.windows/pane-event"]
+kinds = ["bmux.core/server-started", "bmux.tabs/pane-event"]
 
 [[dependencies]]
 plugin_id   = "bmux.permissions"
 version_req = "=0.0.1-alpha.0"
 
 [[dependencies]]
-plugin_id   = "bmux.windows"
+plugin_id   = "bmux.tabs"
 version_req = "=0.0.1-alpha.0"

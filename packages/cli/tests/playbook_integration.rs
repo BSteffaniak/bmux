@@ -274,7 +274,7 @@ fn playbook_real_attach_finder_switches_sandbox_tabs() {
 fn playbook_real_attach_presentation_combinations_reach_shell_and_resize() {
     for fixture in [
         "attach_real_presentations_neither.dsl",
-        "attach_real_tab_strip_only.dsl",
+        "attach_real_tab_bar_only.dsl",
         "attach_real_sidebar_only.dsl",
         "attach_real_presentations_both.dsl",
     ] {

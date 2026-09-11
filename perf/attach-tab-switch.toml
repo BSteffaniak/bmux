@@ -9,7 +9,7 @@ windows = 4
 switches = 4
 previsit_windows = true
 previsit_rounds = 1
-scenario = "next-window"
+scenario = "next-tab"
 attach_command_execution = "production"
 attach_command_limit_ms = 8
 retarget_limit_ms = 8
@@ -206,19 +206,19 @@ tags = ["plugin"]
 allow_empty = true
 
 [[reports]]
-phase = "bmux.windows.typed_services"
+phase = "bmux.tabs.typed_services"
 field = "total_us"
 tags = ["plugin"]
 allow_empty = true
 
 [[reports]]
-phase = "bmux.windows.typed_services"
+phase = "bmux.tabs.typed_services"
 field = "subscriber_us"
 tags = ["plugin"]
 allow_empty = true
 
 [[reports]]
-phase = "bmux.windows.typed_services"
+phase = "bmux.tabs.typed_services"
 field = "snapshot_publish_us"
 tags = ["plugin"]
 allow_empty = true
@@ -246,7 +246,7 @@ phase = "plugin.command"
 field = "total_us"
 tags = ["plugin"]
 filters = [
-  { key = "plugin_id", value = "bmux.windows" },
+  { key = "plugin_id", value = "bmux.tabs" },
   { key = "command_name", value = "${command_name}" },
 ]
 
@@ -255,7 +255,7 @@ phase = "plugin.command.invoke"
 field = "total_us"
 tags = ["plugin"]
 filters = [
-  { key = "plugin_id", value = "bmux.windows" },
+  { key = "plugin_id", value = "bmux.tabs" },
   { key = "command_name", value = "${command_name}" },
 ]
 
@@ -264,7 +264,7 @@ phase = "plugin.command.invoke"
 field = "encode_us"
 tags = ["plugin"]
 filters = [
-  { key = "plugin_id", value = "bmux.windows" },
+  { key = "plugin_id", value = "bmux.tabs" },
   { key = "command_name", value = "${command_name}" },
 ]
 
@@ -273,7 +273,7 @@ phase = "plugin.command.invoke"
 field = "call_us"
 tags = ["plugin"]
 filters = [
-  { key = "plugin_id", value = "bmux.windows" },
+  { key = "plugin_id", value = "bmux.tabs" },
   { key = "command_name", value = "${command_name}" },
 ]
 
@@ -282,7 +282,7 @@ phase = "plugin.command.invoke"
 field = "outcome_us"
 tags = ["plugin"]
 filters = [
-  { key = "plugin_id", value = "bmux.windows" },
+  { key = "plugin_id", value = "bmux.tabs" },
   { key = "command_name", value = "${command_name}" },
 ]
 
@@ -297,7 +297,7 @@ phase = "plugin.command"
 field = "load_us"
 tags = ["plugin"]
 filters = [
-  { key = "plugin_id", value = "bmux.windows" },
+  { key = "plugin_id", value = "bmux.tabs" },
   { key = "command_name", value = "${command_name}" },
 ]
 
@@ -306,7 +306,7 @@ phase = "plugin.command"
 field = "run_us"
 tags = ["plugin"]
 filters = [
-  { key = "plugin_id", value = "bmux.windows" },
+  { key = "plugin_id", value = "bmux.tabs" },
   { key = "command_name", value = "${command_name}" },
 ]
 
@@ -485,25 +485,25 @@ phase = "storage.get"
 field = "total_us"
 limit = "attach_command"
 tags = ["storage"]
-filter = { key = "plugin_id", value = "bmux.windows" }
+filter = { key = "plugin_id", value = "bmux.tabs" }
 
 [[reports]]
 phase = "storage.set"
 field = "total_us"
 limit = "attach_command"
 tags = ["storage"]
-filter = { key = "plugin_id", value = "bmux.windows" }
+filter = { key = "plugin_id", value = "bmux.tabs" }
 
 [[reports]]
 phase = "volatile_state.get"
 field = "total_us"
 limit = "attach_command"
 tags = ["storage"]
-filter = { key = "plugin_id", value = "bmux.windows" }
+filter = { key = "plugin_id", value = "bmux.tabs" }
 
 [[reports]]
 phase = "volatile_state.set"
 field = "total_us"
 limit = "attach_command"
 tags = ["storage"]
-filter = { key = "plugin_id", value = "bmux.windows" }
+filter = { key = "plugin_id", value = "bmux.tabs" }

@@ -591,11 +591,11 @@ mod tests {
         let active = vec![ActiveKeybinding {
             scope: "normal".to_string(),
             chord: "Ctrl-A %".to_string(),
-            action: "plugin:bmux.windows:split-pane --direction vertical".to_string(),
+            action: "plugin:bmux.tabs:split-pane --direction vertical".to_string(),
         }];
 
         assert_eq!(
-            plugin_command_key_hint(&active, "bmux.windows", "split-pane"),
+            plugin_command_key_hint(&active, "bmux.tabs", "split-pane"),
             Some("Ctrl-A %".to_string())
         );
     }

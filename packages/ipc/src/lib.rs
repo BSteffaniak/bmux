@@ -58,7 +58,7 @@ impl IpcEndpoint {
 }
 
 /// Current IPC protocol version.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 3;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 4;
 
 /// Current wire-compatibility epoch for IPC framing.
 pub const CURRENT_WIRE_EPOCH: u16 = CURRENT_PROTOCOL_VERSION;
@@ -626,8 +626,8 @@ mod tests {
 
         let payload = bmux_codec::to_typed_vec(&TypedPayload {
             protocol_version: 1,
-            plugin_id: "bmux.windows".to_string(),
-            command_name: "next-window".to_string(),
+            plugin_id: "bmux.tabs".to_string(),
+            command_name: "next-tab".to_string(),
             arguments: Vec::new(),
         })
         .expect("typed payload should encode");
@@ -660,7 +660,7 @@ mod tests {
         assert_eq!(decoded_payload, &payload);
         let decoded_message: TypedPayload = bmux_codec::from_typed_bytes(decoded_payload)
             .expect("preserved payload should remain typed-decodable");
-        assert_eq!(decoded_message.command_name, "next-window");
+        assert_eq!(decoded_message.command_name, "next-tab");
     }
 
     #[test]

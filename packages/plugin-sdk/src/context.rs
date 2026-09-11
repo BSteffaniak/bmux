@@ -162,7 +162,7 @@ pub struct NativeLifecycleContext {
 pub struct NativeCommandContext {
     /// The plugin's own ID (e.g. `"bmux.clipboard"`).
     pub plugin_id: String,
-    /// The command name being invoked (e.g. `"hello"`, `"list-windows"`).
+    /// The command name being invoked (e.g. `"hello"`, `"list-tabs"`).
     pub command: String,
     /// Positional and flag arguments passed to the command.
     pub arguments: Vec<String>,
@@ -711,8 +711,8 @@ mod tests {
     #[test]
     fn plugin_cli_bridge_payload_round_trip_preserves_request() {
         let request = PluginCliCommandRequest::new(
-            "bmux.windows".to_string(),
-            "new-window".to_string(),
+            "bmux.tabs".to_string(),
+            "new-tab".to_string(),
             vec!["--name".to_string(), "work".to_string()],
         );
         let encoded = encode_host_kernel_bridge_plugin_command_payload(&request)
@@ -734,8 +734,8 @@ mod tests {
     #[test]
     fn plugin_cli_bridge_payload_rejects_unsupported_protocol_version() {
         let mut request = PluginCliCommandRequest::new(
-            "bmux.windows".to_string(),
-            "new-window".to_string(),
+            "bmux.tabs".to_string(),
+            "new-tab".to_string(),
             Vec::new(),
         );
         request.protocol_version = CORE_CLI_BRIDGE_PROTOCOL_V1 + 1;

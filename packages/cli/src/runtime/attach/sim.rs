@@ -1052,8 +1052,7 @@ mod tests {
             matches!(
                 effect,
                 AttachUiEffect::Resize {
-                    direction:
-                        bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right,
+                    direction: bmux_tabs_plugin_api::tabs_commands::PaneResizeDirection::Right,
                     cells: 3,
                     ..
                 }
@@ -1076,8 +1075,7 @@ mod tests {
             matches!(
                 effect,
                 AttachUiEffect::Resize {
-                    direction:
-                        bmux_windows_plugin_api::windows_commands::PaneResizeDirection::Right,
+                    direction: bmux_tabs_plugin_api::tabs_commands::PaneResizeDirection::Right,
                     cells: 3,
                     ..
                 }

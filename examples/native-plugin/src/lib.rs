@@ -35,7 +35,7 @@ impl RustPlugin for ExamplePlugin {
             "permissions-list" => Ok(run_permissions_list(&context)),
             "permissions-grant" => Ok(run_permissions_grant(&context)),
             "permissions-revoke" => Ok(run_permissions_revoke(&context)),
-            "windows-list" => Ok(run_windows_list(&context)),
+            "tabs-list" => Ok(run_windows_list(&context)),
             "windows-new" => Ok(run_windows_new(&context)),
             "settings-show" => Ok(run_settings_show(&context)),
             "storage-put" => Ok(run_storage_put(&context)),
@@ -231,15 +231,15 @@ fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
 
 fn run_windows_list(context: &NativeCommandContext) -> i32 {
     let Some(session) = context.arguments.first() else {
-        eprintln!("example.native windows-list requires a session name or UUID");
+        eprintln!("example.native tabs-list requires a session name or UUID");
         return EXIT_USAGE;
     };
 
-    let windows = match context.call_service::<ListWindowsRequest, Vec<WindowEntry>>(
-        "bmux.windows.read",
+    let windows = match context.call_service::<ListWindowsRequest, Vec<TabEntry>>(
+        "bmux.tabs.read",
         ServiceKind::Query,
-        "windows-state",
-        "list-windows",
+        "tabs-state",
+        "list-tabs",
         &ListWindowsRequest {
             session: Some(session.clone()),
         },
@@ -298,11 +298,11 @@ fn run_windows_new(context: &NativeCommandContext) -> i32 {
     }
 
     let _ = session; // No longer scoped per-session in the typed command.
-    let ack = match context.call_service::<NewWindowRequest, WindowAck>(
-        "bmux.windows.write",
+    let ack = match context.call_service::<NewWindowRequest, TabAck>(
+        "bmux.tabs.write",
         ServiceKind::Command,
-        "windows-commands",
-        "new-window",
+        "tabs-commands",
+        "new-tab",
         &NewWindowRequest { name },
     ) {
         Ok(response) => response,
@@ -614,14 +614,14 @@ struct NewWindowRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct WindowAck {
+struct TabAck {
     ok: bool,
     #[serde(default)]
     id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct WindowEntry {
+struct TabEntry {
     id: String,
     name: String,
     active: bool,

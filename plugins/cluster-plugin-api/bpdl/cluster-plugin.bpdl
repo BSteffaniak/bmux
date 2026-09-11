@@ -59,7 +59,7 @@ interface cluster-types {
         value: uuid,
     }
 
-    record logical-window-id {
+    record logical-tab-id {
         value: uuid,
     }
 
@@ -257,8 +257,8 @@ interface cluster-types {
         revision: u64,
     }
 
-    record logical-window-record {
-        window_id: logical-window-id,
+    record logical-tab-record {
+        tab_id: logical-tab-id,
         workspace_id: workspace-id,
         name: string?,
         layout_schema_version: u32,
@@ -276,7 +276,7 @@ interface cluster-types {
 
     record attach-layout {
         workspace_id: workspace-id,
-        window_id: logical-window-id,
+        tab_id: logical-tab-id,
         control_revision: u64,
         panes: list<logical-pane-record>,
         rects: list<attach-layout-rect>,
@@ -292,7 +292,7 @@ interface cluster-types {
     record logical-pane-record {
         pane_id: logical-pane-id,
         workspace_id: workspace-id,
-        window_id: logical-window-id,
+        tab_id: logical-tab-id,
         name: string?,
         restart_policy: pane-restart-policy,
         placement: placement-intent,
@@ -307,8 +307,8 @@ interface cluster-types {
         set-member-state { node_id: string, expected_credential_serial: string, state: cluster-member-state },
         create-workspace { workspace_id: workspace-id, name: string? },
         rename-workspace { workspace_id: workspace-id, expected_revision: u64, name: string? },
-        put-window { window: logical-window-record, expected_workspace_revision: u64 },
-        remove-window { window_id: logical-window-id, expected_workspace_revision: u64 },
+        put-tab { tab: logical-tab-record, expected_workspace_revision: u64 },
+        remove-tab { tab_id: logical-tab-id, expected_workspace_revision: u64 },
         put-pane { pane: logical-pane-record, expected_workspace_revision: u64 },
         remove-pane { pane_id: logical-pane-id, expected_revision: u64, expected_generation: u64? },
         assign-execution { pane_id: logical-pane-id, expected_revision: u64, expected_generation: u64, assignment: execution-assignment, launch_spec: worker-launch-spec? },
@@ -328,7 +328,7 @@ interface cluster-types {
     enum control-resource-kind {
         member,
         workspace,
-        window,
+        tab,
         pane,
         execution,
         workflow,
@@ -359,7 +359,7 @@ interface cluster-types {
         revision: u64,
         members: list<cluster-member>,
         workspaces: list<workspace-record>,
-        windows: list<logical-window-record>,
+        tabs: list<logical-tab-record>,
         panes: list<logical-pane-record>,
         pending_workflows: list<pending-workflow>,
         consistency: control-read-consistency,
@@ -703,7 +703,7 @@ interface cluster-attach-command {
 @capability(CLUSTER_READ)
 @interface-version(1)
 interface cluster-attach-state {
-    query layout(workspace_id: cluster-types.workspace-id, window_id: cluster-types.logical-window-id?, columns: u16, rows: u16) -> result<cluster-types.attach-layout, cluster-types.control-service-error>;
+    query layout(workspace_id: cluster-types.workspace-id, tab_id: cluster-types.logical-tab-id?, columns: u16, rows: u16) -> result<cluster-types.attach-layout, cluster-types.control-service-error>;
     query snapshot(workspace_id: cluster-types.workspace-id, execution_id: cluster-types.execution-id, generation: u64) -> result<cluster-types.worker-terminal-snapshot, cluster-types.worker-service-error>;
     query output(workspace_id: cluster-types.workspace-id, execution_id: cluster-types.execution-id, generation: u64, cursor: u64, max_bytes: u32) -> result<cluster-types.worker-output, cluster-types.worker-service-error>;
 }

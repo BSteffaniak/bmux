@@ -371,8 +371,8 @@ required    = true                # default: true
 
 ```toml
 [keybindings.runtime]
-c = "plugin:bmux.windows:new-window"
-"alt+w" = "plugin:bmux.windows:switch-window"
+c = "plugin:bmux.tabs:new-tab"
+"alt+w" = "plugin:bmux.tabs:switch-tab"
 
 [keybindings.scroll]
 y = "copy_scrollback"

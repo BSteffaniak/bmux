@@ -2,7 +2,7 @@
 
 use super::{
     BarStyles, CompanionHandle, CompanionState, LAYOUT_ID, OWNER, Placement, command_invocation,
-    input_endpoint, republish_companion, windows_commands,
+    input_endpoint, republish_companion, tabs_commands,
 };
 use bmux_plugin::layout::{PluginLayoutId, resolve_plugin_layout};
 use bmux_plugin::surface::{
@@ -40,8 +40,8 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
         .find(|region| {
             Some(region.local_id.as_str())
                 == companion
-                    .menu_window_id
-                    .map(|id| format!("window:{id}"))
+                    .menu_tab_id
+                    .map(|id| format!("tab:{id}"))
                     .as_deref()
         })?;
     let width = 12.min(viewport.w);
@@ -55,7 +55,7 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
 }
 
 pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface> {
-    if companion.menu_window_id.is_none() {
+    if companion.menu_tab_id.is_none() {
         return Vec::new();
     }
     let Some(rect) = popup_rect(companion) else {
@@ -147,30 +147,25 @@ fn transition(
 ) -> Option<AttachInputResult> {
     let pointer = event.event_kind == "pointer";
     let down = pointer && event.phase == "down";
-    if companion.menu_window_id.is_none() {
+    if companion.menu_tab_id.is_none() {
         if !down || event.button.as_deref() != Some("right") {
             return None;
         }
         let target = event
             .hook_id
-            .strip_prefix("bmux.tab_strip:strip:window:")
+            .strip_prefix("bmux.tab_bar:strip:tab:")
             .and_then(|id| Uuid::parse_str(id).ok())?;
-        if !companion
-            .snapshot
-            .windows
-            .iter()
-            .any(|window| window.id == target)
-        {
+        if !companion.snapshot.tabs.iter().any(|tab| tab.id == target) {
             return None;
         }
-        companion.menu_window_id = Some(target);
+        companion.menu_tab_id = Some(target);
         // Do not capture input unless there is a visible popup to interact with.
         if popup_rect(companion).is_none() {
-            companion.menu_window_id = None;
+            companion.menu_tab_id = None;
             return Some(AttachInputResult::default());
         }
         companion.menu_selected = 0;
-        companion.editing_window_id = None;
+        companion.editing_tab_id = None;
         companion.pointer_source = None;
         companion.drag_target = None;
         return Some(AttachInputResult {
@@ -188,7 +183,7 @@ fn transition(
     if pointer {
         let item = event
             .hook_id
-            .strip_prefix("bmux.tab_strip:menu:item:")
+            .strip_prefix("bmux.tab_bar:menu:item:")
             .and_then(|index| index.parse::<usize>().ok())
             .filter(|index| *index < LABELS.len());
         if let Some(item) = item {
@@ -198,7 +193,7 @@ fn transition(
             }
             activate = down && event.button.as_deref() == Some("left");
         } else if down {
-            companion.menu_window_id = None;
+            companion.menu_tab_id = None;
             result.release_capture = true;
             result.dirty = true;
         }
@@ -209,7 +204,7 @@ fn transition(
                 companion.menu_selected = (companion.menu_selected + 1).min(2);
             }
             "esc" => {
-                companion.menu_window_id = None;
+                companion.menu_tab_id = None;
                 result.release_capture = true;
             }
             "enter" => activate = true,
@@ -224,7 +219,7 @@ fn transition(
 }
 
 fn activate_selection(companion: &mut CompanionState, result: &mut AttachInputResult) {
-    let Some(target) = companion.menu_window_id.take() else {
+    let Some(target) = companion.menu_tab_id.take() else {
         return;
     };
     result.dirty = true;
@@ -232,25 +227,19 @@ fn activate_selection(companion: &mut CompanionState, result: &mut AttachInputRe
     result.service_invocation = match companion.menu_selected {
         0 => command_invocation(
             bmux_plugin::AttachInputEndpoint {
-                capability: windows_commands::client::SwitchWindowEndpoint::CAPABILITY.to_string(),
-                interface_id: windows_commands::client::SwitchWindowEndpoint::INTERFACE_ID
-                    .to_string(),
-                operation: windows_commands::client::SwitchWindowEndpoint::OPERATION.to_string(),
+                capability: tabs_commands::client::SwitchTabEndpoint::CAPABILITY.to_string(),
+                interface_id: tabs_commands::client::SwitchTabEndpoint::INTERFACE_ID.to_string(),
+                operation: tabs_commands::client::SwitchTabEndpoint::OPERATION.to_string(),
             },
-            &windows_commands::client::SwitchWindowRequest {
+            &tabs_commands::client::SwitchTabRequest {
                 target: target.to_string(),
             },
         ),
         1 => {
-            if let Some(window) = companion
-                .snapshot
-                .windows
-                .iter()
-                .find(|window| window.id == target)
-            {
-                companion.editing_window_id = Some(target);
+            if let Some(tab) = companion.snapshot.tabs.iter().find(|tab| tab.id == target) {
+                companion.editing_tab_id = Some(target);
                 companion.edit_buffer =
-                    bmux_text_edit::TextEditBuffer::from_text(window.name.clone()).into();
+                    bmux_text_edit::TextEditBuffer::from_text(tab.name.clone()).into();
                 companion.edit_buffer.select_all();
                 result.release_capture = false;
                 result.capture_keyboard = vec!["*".to_string()];
@@ -259,12 +248,11 @@ fn activate_selection(companion: &mut CompanionState, result: &mut AttachInputRe
         }
         _ => command_invocation(
             bmux_plugin::AttachInputEndpoint {
-                capability: windows_commands::client::KillWindowEndpoint::CAPABILITY.to_string(),
-                interface_id: windows_commands::client::KillWindowEndpoint::INTERFACE_ID
-                    .to_string(),
-                operation: windows_commands::client::KillWindowEndpoint::OPERATION.to_string(),
+                capability: tabs_commands::client::KillTabEndpoint::CAPABILITY.to_string(),
+                interface_id: tabs_commands::client::KillTabEndpoint::INTERFACE_ID.to_string(),
+                operation: tabs_commands::client::KillTabEndpoint::OPERATION.to_string(),
             },
-            &windows_commands::client::KillWindowRequest {
+            &tabs_commands::client::KillTabRequest {
                 target: target.to_string(),
                 force_local: false,
             },
@@ -275,15 +263,15 @@ fn activate_selection(companion: &mut CompanionState, result: &mut AttachInputRe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Settings, companion_surfaces, windows_list};
+    use crate::{Settings, companion_surfaces, tabs_list};
 
     fn companion() -> CompanionState {
         let mut companion = CompanionState::new(Settings::default());
         companion.local_presentation.viewport_cols = 80;
         companion.local_presentation.viewport_rows = 24;
-        companion.replace_windows(windows_list::WindowListSnapshot {
+        companion.replace_tabs(tabs_list::TabListSnapshot {
             revision: 1,
-            windows: vec![windows_list::WindowListEntry {
+            tabs: vec![tabs_list::TabListEntry {
                 id: Uuid::from_u128(7),
                 name: "test".to_string(),
                 active: true,
@@ -324,7 +312,7 @@ mod tests {
                 "down",
                 None,
                 Some("right"),
-                format!("bmux.tab_strip:strip:window:{}", Uuid::from_u128(7)),
+                format!("bmux.tab_bar:strip:tab:{}", Uuid::from_u128(7)),
             ),
         )
         .unwrap()
@@ -341,7 +329,7 @@ mod tests {
     fn popup_geometry_uses_the_companions_layout_registry() {
         let mut first = companion();
         first.layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4));
-        first.menu_window_id = Some(Uuid::from_u128(7));
+        first.menu_tab_id = Some(Uuid::from_u128(7));
         let mut second = first.clone();
         second.layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4));
         let baseline = popup_rect(&second).unwrap();
@@ -399,21 +387,21 @@ mod tests {
             open(&mut companion);
             companion.menu_selected = selection;
             let result = key(&mut companion, "enter").unwrap();
-            assert!(companion.menu_window_id.is_none());
+            assert!(companion.menu_tab_id.is_none());
             if selection == 1 {
                 assert!(!result.release_capture);
                 assert!(result.service_invocation.is_none());
-                assert_eq!(companion.editing_window_id, Some(Uuid::from_u128(7)));
+                assert_eq!(companion.editing_tab_id, Some(Uuid::from_u128(7)));
                 assert_eq!(companion.edit_buffer.text(), "test");
             } else {
                 assert!(result.release_capture);
                 let invocation = result.service_invocation.unwrap();
                 if selection == 0 {
-                    let request: windows_commands::client::SwitchWindowRequest =
+                    let request: tabs_commands::client::SwitchTabRequest =
                         bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
                     assert_eq!(request.target, Uuid::from_u128(7).to_string());
                 } else {
-                    let request: windows_commands::client::KillWindowRequest =
+                    let request: tabs_commands::client::KillTabRequest =
                         bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
                     assert_eq!(request.target, Uuid::from_u128(7).to_string());
                     assert!(!request.force_local);
@@ -433,7 +421,7 @@ mod tests {
                 "down",
                 None,
                 Some("left"),
-                "bmux.tab_strip:menu:item:2".to_string(),
+                "bmux.tab_bar:menu:item:2".to_string(),
             ),
         )
         .unwrap();
@@ -446,12 +434,12 @@ mod tests {
                 "down",
                 None,
                 Some("left"),
-                "bmux.tab_strip:menu-dismiss:dismiss".to_string(),
+                "bmux.tab_bar:menu-dismiss:dismiss".to_string(),
             ),
         )
         .unwrap();
         assert!(result.release_capture && result.service_invocation.is_none());
-        assert!(companion.menu_window_id.is_none());
+        assert!(companion.menu_tab_id.is_none());
     }
 
     #[test]
@@ -468,14 +456,14 @@ mod tests {
                 } else {
                     // Extremely narrow strips have no hittable tab to anchor to.
                     assert!(!opened.consumed);
-                    assert!(companion.menu_window_id.is_none());
+                    assert!(companion.menu_tab_id.is_none());
                 }
             }
         }
         let mut companion = companion();
         companion.local_presentation.viewport_rows = 0;
         assert!(!open(&mut companion).consumed);
-        assert!(companion.menu_window_id.is_none());
+        assert!(companion.menu_tab_id.is_none());
     }
 
     #[test]
@@ -483,12 +471,12 @@ mod tests {
         let mut first = companion();
         let second = companion();
         open(&mut first);
-        assert!(second.menu_window_id.is_none());
-        first.replace_windows(windows_list::WindowListSnapshot {
+        assert!(second.menu_tab_id.is_none());
+        first.replace_tabs(tabs_list::TabListSnapshot {
             revision: 2,
-            windows: Vec::new(),
+            tabs: Vec::new(),
         });
-        assert!(first.menu_window_id.is_none());
+        assert!(first.menu_tab_id.is_none());
         assert!(key(&mut first, "x").is_none());
     }
 }

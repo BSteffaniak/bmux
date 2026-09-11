@@ -498,7 +498,7 @@ timeout_ms = 15000
 record = true
 
 [playbook.plugins]
-enable = ["bmux.windows"]
+enable = ["bmux.tabs"]
 
 [[step]]
 action = "new-session"
@@ -530,7 +530,7 @@ contains = "hello"
         assert_eq!(playbook.config.shell.as_deref(), Some("/bin/bash"));
         assert_eq!(playbook.config.timeout, Duration::from_secs(15));
         assert!(playbook.config.record);
-        assert_eq!(playbook.config.plugins.enable, vec!["bmux.windows"]);
+        assert_eq!(playbook.config.plugins.enable, vec!["bmux.tabs"]);
         assert_eq!(playbook.steps.len(), 5);
     }
 

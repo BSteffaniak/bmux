@@ -203,10 +203,10 @@ Examples currently in tree:
   context state: list, create, select, close, current).
 - `plugins/clients-plugin-api` + `plugins/clients-plugin` (owns
   per-client identity, selected session, follow state).
-- `plugins/windows-plugin-api` + `plugins/windows-plugin` (owns pane /
+- `plugins/tabs-plugin-api` + `plugins/tabs-plugin` (owns pane /
   window / tab lifecycle; exposes state queries, commands, events).
 - `plugins/decoration-plugin-api` + `plugins/decoration-plugin` (owns
-  pane visual styling; depends on `windows-plugin-api`).
+  pane visual styling; depends on `tabs-plugin-api`).
 - `plugins/pane-runtime-plugin-api` + `plugins/pane-runtime-plugin`
   (owns pane/session runtime orchestration, attach lifecycle, and
   attach-view queries — see "Pane-runtime ownership" below).
@@ -653,7 +653,7 @@ alternate_screen_wheel = "ignore"
 selection_release = "select"
 
 [behavior.mouse.gesture_actions]
-click_left = "plugin:bmux.windows:new-window"
+click_left = "plugin:bmux.tabs:new-tab"
 hover_focus = "focus_next_pane"
 scroll_up = "scroll_up_line"
 scroll_down = "scroll_down_line"
@@ -691,9 +691,9 @@ contexts rather than forcing core windows types.
 
 Expected behavior:
 
-- `new-window` creates a context
-- `switch/next/prev/last-window` select contexts
-- `kill-window` closes a context
+- `new-tab` creates a context
+- `switch/next/prev/last-tab` select contexts
+- `kill-tab` closes a context
 - `ctrl-a c` immediately switches attach context to the newly created
   context
 

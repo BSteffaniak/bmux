@@ -275,7 +275,7 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
 
 /// Consume an identifier body. Identifiers use `[a-zA-Z_]` followed by
 /// `[a-zA-Z0-9_-]`. Note: `.` is NOT part of an identifier — it's a
-/// standalone [`TokenKind::Dot`] used for plugin ids (`bmux.windows`)
+/// standalone [`TokenKind::Dot`] used for plugin ids (`bmux.tabs`)
 /// and qualified type refs (`alias.type-name`). The parser re-joins
 /// identifier sequences across dots where the grammar requires it.
 fn consume_identifier(mut iter: std::iter::Peekable<std::str::Chars<'_>>) -> (String, usize) {
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn tokenizes_plugin_header() {
-        let toks = tokenize("plugin bmux.windows version 1;").expect("lex");
+        let toks = tokenize("plugin bmux.tabs version 1;").expect("lex");
         let kinds: Vec<_> = toks.into_iter().map(|t| t.kind).collect();
         assert_eq!(
             kinds,
@@ -322,7 +322,7 @@ mod tests {
                 TokenKind::Plugin,
                 TokenKind::Identifier("bmux".to_string()),
                 TokenKind::Dot,
-                TokenKind::Identifier("windows".to_string()),
+                TokenKind::Identifier("tabs".to_string()),
                 TokenKind::Version,
                 TokenKind::IntLiteral(1),
                 TokenKind::Semicolon,
@@ -354,17 +354,17 @@ mod tests {
 
     #[test]
     fn tokenizes_import_directive() {
-        let toks = tokenize("import windows = bmux.windows;").expect("lex");
+        let toks = tokenize("import tabs = bmux.tabs;").expect("lex");
         let kinds: Vec<_> = toks.into_iter().map(|t| t.kind).collect();
         assert_eq!(
             kinds,
             vec![
                 TokenKind::Import,
-                TokenKind::Identifier("windows".to_string()),
+                TokenKind::Identifier("tabs".to_string()),
                 TokenKind::Equals,
                 TokenKind::Identifier("bmux".to_string()),
                 TokenKind::Dot,
-                TokenKind::Identifier("windows".to_string()),
+                TokenKind::Identifier("tabs".to_string()),
                 TokenKind::Semicolon,
             ]
         );

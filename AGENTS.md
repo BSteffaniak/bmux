@@ -4,11 +4,11 @@ This file defines REQUIRED validation steps for coding agents working in this re
 
 ## Core Architecture Boundary (REQUIRED)
 
-BMUX core must remain domain-agnostic. Windows, sessions, contexts, clients, and permissions are all plugin domains, not core architecture. Core crates provide generic primitives; plugins own product-specific behavior.
+BMUX core must remain domain-agnostic. Tabs, sessions, contexts, clients, and permissions are all plugin domains, not core architecture. Core crates provide generic primitives; plugins own product-specific behavior.
 
 ### Hard Rules
 
-- Do not add or keep domain logic (windows, sessions, contexts, clients, panes, permissions) in core architecture layers.
+- Do not add or keep domain logic (tabs, sessions, contexts, clients, panes, permissions) in core architecture layers.
 - Core architecture includes at least:
   - `packages/server/**`
   - `packages/client/**`
@@ -22,7 +22,7 @@ BMUX core must remain domain-agnostic. Windows, sessions, contexts, clients, and
 - In core architecture, avoid domain-specific types/fields/events/APIs for any plugin domain.
 - Domain behavior must be implemented through plugins and generic plugin/service invoke paths (`Request::InvokeService` + typed plugin-api crates, or `ServiceCaller::execute_kernel_request` for kernel-level primitives).
 - Core defaults when plugins are missing:
-  - Missing windows plugin: baseline single terminal attach/session/pane flow still works.
+  - Missing tabs plugin: baseline single terminal attach/session/pane flow still works.
   - Missing permissions plugin: permissive single-user behavior.
   - Missing sessions/contexts/clients plugins: baseline server behavior still works (plugins provide typed-dispatch facades over core state).
 
@@ -31,7 +31,7 @@ BMUX core must remain domain-agnostic. Windows, sessions, contexts, clients, and
 - Plugins are first-class and may implement critical product behavior.
 - Prefer extending generic plugin APIs/capabilities over adding core-special-case code.
 - If a feature seems domain-specific, place it in a plugin unless there is a strong, documented reason it must be core-agnostic runtime plumbing.
-- When a plugin needs to reach core kernel state (sessions, contexts, panes), use `ServiceCaller::execute_kernel_request(bmux_ipc::Request::*)` directly. Foundational plugins (sessions, contexts, clients, windows) are allowed to call core IPC this way; other plugins must go through typed BPDL services exposed by the foundational plugins.
+- When a plugin needs to reach core kernel state (sessions, contexts, panes), use `ServiceCaller::execute_kernel_request(bmux_ipc::Request::*)` directly. Foundational plugins (sessions, contexts, clients, tabs) are allowed to call core IPC this way; other plugins must go through typed BPDL services exposed by the foundational plugins.
 
 ### Plugin API Crate Boundary (REQUIRED)
 
@@ -50,7 +50,7 @@ BMUX core must remain domain-agnostic. Windows, sessions, contexts, clients, and
 
 For any non-doc code change, verify no forbidden domain leakage was introduced in core architecture:
 
-- Run content checks (or equivalent) to confirm no new core references to windows/permissions/sessions/contexts/clients/panes domain concepts.
+- Run content checks (or equivalent) to confirm no new core references to tabs/permissions/sessions/contexts/clients/panes domain concepts.
 - `HostRuntimeApi` must remain domain-agnostic — only `core_cli_command_run_path`, `plugin_command_run`, `storage_get`, `storage_set`, `log_write`, `recording_write_event`.
 - Domain convenience helpers belong in plugins (as private modules) or are reached through typed BPDL services, not in `HostRuntimeApi` or any other core crate.
 - For plugin API changes, confirm no public `plugins/*-plugin-api/src/typed_client.rs`, no new concrete runtime state implementations in plugin API crates, and no public handwritten request/response envelopes where generated BPDL transport exists.

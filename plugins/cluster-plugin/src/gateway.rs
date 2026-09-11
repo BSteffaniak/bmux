@@ -3359,7 +3359,7 @@ fn build_gateway_doctor_findings(
                 reason_code: "breaker_open",
                 detail: "candidate is blocked by open breaker".to_string(),
                 recommended_action:
-                    "wait for half-open window or inspect recurring failures for this target"
+                    "wait for half-open tab or inspect recurring failures for this target"
                         .to_string(),
                 priority: 4,
                 confidence: 0.80,

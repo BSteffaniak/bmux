@@ -17,7 +17,7 @@ Common options:
   --warmup N
   --windows N
   --switches N
-  --scenario next-window|prev-window|goto-window|new-window
+  --scenario next-tab|prev-tab|goto-tab|new-tab
   --profile normal|diagnostic|ci|stress
   --bmux-bin PATH
   --artifact-json PATH

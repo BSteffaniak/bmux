@@ -7,7 +7,7 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     PromptOption, PromptRequest, PromptResponse, PromptSearchMatchMode, PromptValue,
 };
-use bmux_windows_plugin_api::windows_list::WindowListEntry;
+use bmux_tabs_plugin_api::tabs_list::TabListEntry;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -28,27 +28,22 @@ impl RustPlugin for FinderPlugin {
 
 // Commands may run outside the process owning the reactive catalog. Query
 // the provider so discovery also reflects the invoking client's selection.
-fn load_windows(
-    context: &NativeCommandContext,
-) -> Result<Vec<WindowListEntry>, PluginCommandError> {
+fn load_windows(context: &NativeCommandContext) -> Result<Vec<TabListEntry>, PluginCommandError> {
     let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
-    let windows = bmux_plugin::block_on_typed_dispatch(
-        bmux_windows_plugin_api::windows_state::client::list_windows(&mut client, None),
+    let tabs = bmux_plugin::block_on_typed_dispatch(
+        bmux_tabs_plugin_api::tabs_state::client::list_tabs(&mut client, None),
     )
-    .map_err(|error| {
-        PluginCommandError::unavailable(format!("window list unavailable: {error}"))
-    })?;
-    windows
-        .into_iter()
-        .map(|window| {
-            Ok(WindowListEntry {
-                id: Uuid::parse_str(&window.id).map_err(|error| {
-                    PluginCommandError::failed(format!("invalid window ID: {error}"))
+    .map_err(|error| PluginCommandError::unavailable(format!("tab list unavailable: {error}")))?;
+    tabs.into_iter()
+        .map(|tab| {
+            Ok(TabListEntry {
+                id: Uuid::parse_str(&tab.id).map_err(|error| {
+                    PluginCommandError::failed(format!("invalid tab ID: {error}"))
                 })?,
-                name: window.name,
-                active: window.active,
-                workspace: window.workspace,
-                workspace_id: window.workspace_id,
+                name: tab.name,
+                active: tab.active,
+                workspace: tab.workspace,
+                workspace_id: tab.workspace_id,
             })
         })
         .collect()
@@ -58,12 +53,12 @@ fn show_finder(context: &NativeCommandContext) -> Result<i32, PluginCommandError
     let _workspace_contract = bmux_workspaces_plugin_api::workspaces_state::INTERFACE_ID.as_str();
     let settings =
         FinderSettings::parse(context.settings.as_ref()).map_err(PluginCommandError::failed)?;
-    let windows = load_windows(context)?;
-    let active_workspace_id = windows
+    let tabs = load_windows(context)?;
+    let active_workspace_id = tabs
         .iter()
-        .find(|window| window.active)
-        .map(|window| window.workspace_id);
-    let entries = build_entries(&windows, &settings, active_workspace_id);
+        .find(|tab| tab.active)
+        .map(|tab| tab.workspace_id);
+    let entries = build_entries(&tabs, &settings, active_workspace_id);
     if entries.is_empty() {
         warn!("finder: no tabs available");
         return Ok(EXIT_OK);
@@ -213,30 +208,29 @@ struct FinderEntry {
 }
 
 fn build_entries(
-    windows: &[WindowListEntry],
+    tabs: &[TabListEntry],
     settings: &FinderSettings,
     active_workspace_id: Option<Uuid>,
 ) -> Vec<FinderEntry> {
-    windows
-        .iter()
-        .filter(|window| {
+    tabs.iter()
+        .filter(|tab| {
             settings.scope == FinderScope::AllWorkspaces
-                || active_workspace_id == Some(window.workspace_id)
+                || active_workspace_id == Some(tab.workspace_id)
         })
-        .map(|window| {
+        .map(|entry| {
             let label = settings
                 .entry_format
-                .replace("{workspace}", &window.workspace)
-                .replace("{tab}", &window.name);
+                .replace("{workspace}", &entry.workspace)
+                .replace("{tab}", &entry.name);
             let search_source = if settings.include_workspace_name {
-                format!("{} {}", window.workspace, window.name)
+                format!("{} {}", entry.workspace, entry.name)
             } else {
-                window.name.clone()
+                entry.name.clone()
             };
             FinderEntry {
-                context_id: window.id,
+                context_id: entry.id,
                 label,
-                detail: format!("workspace {} · tab {}", window.workspace, window.name),
+                detail: format!("workspace {} · tab {}", entry.workspace, entry.name),
                 search_text: search_source,
             }
         })
@@ -306,8 +300,8 @@ mod tests {
         workspace: &str,
         name: &str,
         active: bool,
-    ) -> WindowListEntry {
-        WindowListEntry {
+    ) -> TabListEntry {
+        TabListEntry {
             id: Uuid::from_u128(id),
             name: name.to_string(),
             active,

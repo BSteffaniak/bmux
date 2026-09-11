@@ -353,7 +353,7 @@ terminal-event kind=mouse phase=down button=left col='${one.center_col}' row='${
 terminal-event kind=mouse phase=move button=left col='${three.end_col}' row='${three.row}'
 terminal-event kind=mouse phase=up button=left col='${three.end_col}' row='${three.row}'
 
-assert-effect operation='move-window'
+assert-effect operation='move-tab'
 assert-state path='windows.names' equals='["two","three","one"]'
 ```
 
@@ -371,7 +371,7 @@ Supported attach-sim actions:
 | `terminal-event`   | Send normalized terminal input; currently mouse events are supported                                                                                                                                                          |
 | `send-attach`      | Send an attach key chord through the attach keybinding processor in simulation                                                                                                                                                |
 | `assert-rendered`  | Assert rendered output contains or matches text                                                                                                                                                                               |
-| `assert-effect`    | Assert an effect such as `move-window`, `resize-pane`, `focus-pane`, or `move-floating-pane` was emitted                                                                                                                      |
+| `assert-effect`    | Assert an effect such as `move-tab`, `resize-pane`, `focus-pane`, or `move-floating-pane` was emitted                                                                                                                      |
 | `assert-no-effect` | Assert an effect was not emitted                                                                                                                                                                                              |
 | `assert-state`     | Assert fake state; currently supports `windows.names`, `windows.active_name`, `scrollback.active`, `scrollback.cursor`, `selection.active`, `selection.text`, `help_overlay.open`, `help_overlay.scroll`, and `prompt.active` |
 
@@ -962,7 +962,7 @@ ______________________________________________________________________
 By default, all bundled plugins are available. Use `@plugin` to control this:
 
 ```
-@plugin disable=bmux.windows        # disable a specific plugin
+@plugin disable=bmux.tabs        # disable a specific plugin
 @plugin enable=bmux.permissions     # only enable specific plugins
 ```
 

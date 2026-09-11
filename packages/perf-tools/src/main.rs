@@ -880,24 +880,24 @@ struct AttachScenario {
 
 fn attach_scenario(name: &str) -> Result<AttachScenario, String> {
     match name {
-        "next-window" => Ok(AttachScenario {
-            command_name: "next-window",
-            service_operation: "switch-window",
+        "next-tab" => Ok(AttachScenario {
+            command_name: "next-tab",
+            service_operation: "switch-tab",
             prime_key: "ctrl+h",
         }),
-        "prev-window" => Ok(AttachScenario {
-            command_name: "prev-window",
-            service_operation: "switch-window",
+        "prev-tab" => Ok(AttachScenario {
+            command_name: "prev-tab",
+            service_operation: "switch-tab",
             prime_key: "ctrl+s",
         }),
-        "goto-window" => Ok(AttachScenario {
-            command_name: "goto-window",
-            service_operation: "switch-window",
+        "goto-tab" => Ok(AttachScenario {
+            command_name: "goto-tab",
+            service_operation: "switch-tab",
             prime_key: "ctrl+s",
         }),
-        "new-window" => Ok(AttachScenario {
-            command_name: "new-window",
-            service_operation: "new-window",
+        "new-tab" => Ok(AttachScenario {
+            command_name: "new-tab",
+            service_operation: "new-tab",
             prime_key: "",
         }),
         other => Err(format!("unknown attach scenario '{other}'")),
@@ -914,8 +914,8 @@ fn validate_attach_options(options: &BenchmarkResolvedOptions) -> Result<(), Str
     if options.previsit_windows && options.previsit_rounds == 0 {
         return Err("previsit_windows requires previsit_rounds greater than 0".to_string());
     }
-    if options.scenario == "goto-window" && options.windows < 3 {
-        return Err("goto-window scenario requires at least 3 windows".to_string());
+    if options.scenario == "goto-tab" && options.windows < 3 {
+        return Err("goto-tab scenario requires at least 3 windows".to_string());
     }
     Ok(())
 }
@@ -961,11 +961,11 @@ fn attach_scenario_key(
     index: usize,
 ) -> Result<&'static str, String> {
     match options.scenario.as_str() {
-        "next-window" => Ok("ctrl+s"),
-        "prev-window" => Ok("ctrl+h"),
-        "goto-window" if index.is_multiple_of(2) => Ok("alt+2"),
-        "goto-window" => Ok("alt+3"),
-        "new-window" => Ok("c"),
+        "next-tab" => Ok("ctrl+s"),
+        "prev-tab" => Ok("ctrl+h"),
+        "goto-tab" if index.is_multiple_of(2) => Ok("alt+2"),
+        "goto-tab" => Ok("alt+3"),
+        "new-tab" => Ok("c"),
         _ => Err(format!("unknown attach scenario '{}'", options.scenario)),
     }
 }
@@ -4187,15 +4187,15 @@ mod tests {
     #[test]
     fn annotate_attach_events_marks_cold_then_warm_switches() {
         let mut events = vec![
-            json!({"phase":"attach.plugin_command_pipeline","command_name":"next-window","total_us":10}),
-            json!({"phase":"attach.retarget_context","command_name":"next-window","total_us":1}),
-            json!({"phase":"attach.plugin_command","command_name":"next-window","total_us":11}),
-            json!({"phase":"attach.plugin_command_pipeline","command_name":"next-window","total_us":2}),
-            json!({"phase":"attach.retarget_context","command_name":"next-window","total_us":1}),
-            json!({"phase":"attach.plugin_command","command_name":"next-window","total_us":3}),
+            json!({"phase":"attach.plugin_command_pipeline","command_name":"next-tab","total_us":10}),
+            json!({"phase":"attach.retarget_context","command_name":"next-tab","total_us":1}),
+            json!({"phase":"attach.plugin_command","command_name":"next-tab","total_us":11}),
+            json!({"phase":"attach.plugin_command_pipeline","command_name":"next-tab","total_us":2}),
+            json!({"phase":"attach.retarget_context","command_name":"next-tab","total_us":1}),
+            json!({"phase":"attach.plugin_command","command_name":"next-tab","total_us":3}),
         ];
 
-        annotate_attach_tab_switch_events(&mut events, "next-window", 1);
+        annotate_attach_tab_switch_events(&mut events, "next-tab", 1);
 
         assert_eq!(events[0]["measurement_stage"], "cold");
         assert_eq!(events[2]["measurement_switch_index"], 1);

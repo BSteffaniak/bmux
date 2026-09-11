@@ -102,16 +102,16 @@ struct PendingChord {
     decoded: Vec<DecodedStroke>,
 }
 
-fn windows_focus_command(direction: &str) -> String {
-    format!("plugin:bmux.windows:focus-pane-in-direction --direction {direction}")
+fn tabs_focus_command(direction: &str) -> String {
+    format!("plugin:bmux.tabs:focus-pane-in-direction --direction {direction}")
 }
 
-fn windows_resize_command(direction: &str) -> String {
-    format!("plugin:bmux.windows:resize-pane --direction {direction}")
+fn tabs_resize_command(direction: &str) -> String {
+    format!("plugin:bmux.tabs:resize-pane --direction {direction}")
 }
 
-fn windows_split_command(direction: &str) -> String {
-    format!("plugin:bmux.windows:split-pane --direction {direction}")
+fn tabs_split_command(direction: &str) -> String {
+    format!("plugin:bmux.tabs:split-pane --direction {direction}")
 }
 
 // ============================================================================
@@ -138,44 +138,35 @@ impl Keymap {
         .into_iter()
         .map(|(key, action)| (key.to_string(), action_to_name(&action).to_string()))
         .chain([
-            ("%".to_string(), windows_split_command("vertical")),
-            ("\"".to_string(), windows_split_command("horizontal")),
+            ("%".to_string(), tabs_split_command("vertical")),
+            ("\"".to_string(), tabs_split_command("horizontal")),
             (
                 "x".to_string(),
-                "plugin:bmux.windows:close-active-pane".to_string(),
+                "plugin:bmux.tabs:close-active-pane".to_string(),
             ),
-            (
-                "r".to_string(),
-                "plugin:bmux.windows:restart-pane".to_string(),
-            ),
-            ("o".to_string(), windows_focus_command("next")),
-            ("h".to_string(), windows_focus_command("left")),
-            ("l".to_string(), windows_focus_command("right")),
-            ("k".to_string(), windows_focus_command("up")),
-            ("j".to_string(), windows_focus_command("down")),
-            ("arrow_left".to_string(), windows_focus_command("left")),
-            ("arrow_right".to_string(), windows_focus_command("right")),
-            ("arrow_up".to_string(), windows_focus_command("up")),
-            ("arrow_down".to_string(), windows_focus_command("down")),
-            ("plus".to_string(), windows_resize_command("increase")),
-            ("minus".to_string(), windows_resize_command("decrease")),
-            ("shift+h".to_string(), windows_resize_command("left")),
-            ("shift+l".to_string(), windows_resize_command("right")),
-            ("shift+k".to_string(), windows_resize_command("up")),
-            ("shift+j".to_string(), windows_resize_command("down")),
-            (
-                "shift+arrow_left".to_string(),
-                windows_resize_command("left"),
-            ),
+            ("r".to_string(), "plugin:bmux.tabs:restart-pane".to_string()),
+            ("o".to_string(), tabs_focus_command("next")),
+            ("h".to_string(), tabs_focus_command("left")),
+            ("l".to_string(), tabs_focus_command("right")),
+            ("k".to_string(), tabs_focus_command("up")),
+            ("j".to_string(), tabs_focus_command("down")),
+            ("arrow_left".to_string(), tabs_focus_command("left")),
+            ("arrow_right".to_string(), tabs_focus_command("right")),
+            ("arrow_up".to_string(), tabs_focus_command("up")),
+            ("arrow_down".to_string(), tabs_focus_command("down")),
+            ("plus".to_string(), tabs_resize_command("increase")),
+            ("minus".to_string(), tabs_resize_command("decrease")),
+            ("shift+h".to_string(), tabs_resize_command("left")),
+            ("shift+l".to_string(), tabs_resize_command("right")),
+            ("shift+k".to_string(), tabs_resize_command("up")),
+            ("shift+j".to_string(), tabs_resize_command("down")),
+            ("shift+arrow_left".to_string(), tabs_resize_command("left")),
             (
                 "shift+arrow_right".to_string(),
-                windows_resize_command("right"),
+                tabs_resize_command("right"),
             ),
-            ("shift+arrow_up".to_string(), windows_resize_command("up")),
-            (
-                "shift+arrow_down".to_string(),
-                windows_resize_command("down"),
-            ),
+            ("shift+arrow_up".to_string(), tabs_resize_command("up")),
+            ("shift+arrow_down".to_string(), tabs_resize_command("down")),
         ])
         .chain(std::iter::once((
             "shift+c".to_string(),
@@ -1238,7 +1229,7 @@ mod tests {
 
     fn focus_action(direction: &str) -> RuntimeAction {
         RuntimeAction::PluginCommand {
-            plugin_id: "bmux.windows".to_string(),
+            plugin_id: "bmux.tabs".to_string(),
             command_name: "focus-pane-in-direction".to_string(),
             args: vec!["--direction".to_string(), direction.to_string()],
         }
@@ -1246,7 +1237,7 @@ mod tests {
 
     fn resize_action(direction: &str) -> RuntimeAction {
         RuntimeAction::PluginCommand {
-            plugin_id: "bmux.windows".to_string(),
+            plugin_id: "bmux.tabs".to_string(),
             command_name: "resize-pane".to_string(),
             args: vec!["--direction".to_string(), direction.to_string()],
         }
@@ -1358,7 +1349,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "restart-pane".to_string(),
                 args: Vec::new(),
             }]
@@ -1877,7 +1868,7 @@ mod tests {
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('%'), KeyModifiers::SHIFT)),
             vec![RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "split-pane".to_string(),
                 args: vec!["--direction".to_string(), "vertical".to_string()],
             }]
@@ -1890,7 +1881,7 @@ mod tests {
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('"'), KeyModifiers::SHIFT)),
             vec![RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "split-pane".to_string(),
                 args: vec!["--direction".to_string(), "horizontal".to_string()],
             }]
@@ -1928,14 +1919,14 @@ mod tests {
 
     #[test]
     fn command_like_modified_char_does_not_match_plain_normal_mode_binding() {
-        let new_window = RuntimeAction::PluginCommand {
-            plugin_id: "bmux.windows".to_string(),
-            command_name: "new-window".to_string(),
+        let new_tab = RuntimeAction::PluginCommand {
+            plugin_id: "bmux.tabs".to_string(),
+            command_name: "new-tab".to_string(),
             args: vec![],
         };
         let modes = BTreeMap::from([(
             "normal".to_string(),
-            modal_mode("NORMAL", false, &[("c", new_window.clone())]),
+            modal_mode("NORMAL", false, &[("c", new_tab.clone())]),
         )]);
         let keymap = Keymap::from_modal_parts_with_scroll(
             Some(250),
@@ -1949,7 +1940,7 @@ mod tests {
 
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::NONE)),
-            vec![new_window]
+            vec![new_tab]
         );
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('c'), KeyModifiers::SUPER)),
@@ -2021,11 +2012,11 @@ mod tests {
     #[test]
     fn parse_runtime_action_name_accepts_plugin_command_action() {
         assert_eq!(
-            super::parse_runtime_action_name("plugin:bmux.windows:new-window")
+            super::parse_runtime_action_name("plugin:bmux.tabs:new-tab")
                 .expect("plugin action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "new-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "new-tab".to_string(),
                 args: vec![],
             }
         );

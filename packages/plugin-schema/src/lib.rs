@@ -24,9 +24,9 @@
 //! # Example schema
 //!
 //! ```bpdl
-//! plugin bmux.windows version 1;
+//! plugin bmux.tabs version 1;
 //!
-//! interface windows-state {
+//! interface tabs-state {
 //!     record pane-state {
 //!         id: uuid,
 //!         focused: bool,

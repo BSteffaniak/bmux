@@ -30,14 +30,14 @@ use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRole,
     global_presentation_fact_host_service,
 };
-use bmux_windows_plugin_api::{windows_commands, windows_list};
+use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
 use bmux_workspaces_plugin_api::{workspaces_commands, workspaces_state};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const OWNER: &str = "bmux.tab_strip";
+const OWNER: &str = "bmux.tab_bar";
 const LAYOUT_ID: &str = "strip";
 const SURFACE_ID: &str = "strip";
 const RETAINED_ID: Uuid = Uuid::from_u128(0x626d_7578_5f74_6162_5f73_7472_6970_0001);
@@ -208,8 +208,8 @@ struct CompanionState {
     layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
     settings: Settings,
     revision: u64,
-    snapshot: windows_list::WindowListSnapshot,
-    hovered_window_id: Option<Uuid>,
+    snapshot: tabs_list::TabListSnapshot,
+    hovered_tab_id: Option<Uuid>,
     scroll_offset: usize,
     manual_scroll: bool,
     pointer_source: Option<Uuid>,
@@ -218,12 +218,12 @@ struct CompanionState {
     pointer_moved: bool,
     drag_target: Option<projection::ResolvedInsertion>,
     last_left_click: Option<(Uuid, u16, u16, Instant)>,
-    editing_window_id: Option<Uuid>,
+    editing_tab_id: Option<Uuid>,
     edit_buffer: rename_input::RenameInput,
-    menu_window_id: Option<Uuid>,
+    menu_tab_id: Option<Uuid>,
     menu_selected: usize,
     local_presentation: AttachLocalPresentationSnapshot,
-    catalog: windows_list::WindowListSnapshot,
+    catalog: tabs_list::TabListSnapshot,
     selected_context_id: Option<Uuid>,
     workspace_label: Option<String>,
     workspace_id: Option<Uuid>,
@@ -238,11 +238,11 @@ impl CompanionState {
             layouts: bmux_plugin::layout::global_plugin_layout_registry_handle(),
             settings,
             revision: 0,
-            snapshot: windows_list::WindowListSnapshot {
-                windows: Vec::new(),
+            snapshot: tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
                 revision: 0,
             },
-            hovered_window_id: None,
+            hovered_tab_id: None,
             scroll_offset: 0,
             manual_scroll: false,
             pointer_source: None,
@@ -251,13 +251,13 @@ impl CompanionState {
             pointer_moved: false,
             drag_target: None,
             last_left_click: None,
-            editing_window_id: None,
+            editing_tab_id: None,
             edit_buffer: rename_input::RenameInput::default(),
-            menu_window_id: None,
+            menu_tab_id: None,
             menu_selected: 0,
             local_presentation: AttachLocalPresentationSnapshot::initial(),
-            catalog: windows_list::WindowListSnapshot {
-                windows: Vec::new(),
+            catalog: tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
                 revision: 0,
             },
             selected_context_id: None,
@@ -268,69 +268,61 @@ impl CompanionState {
         }
     }
 
-    fn replace_windows(&mut self, mut snapshot: windows_list::WindowListSnapshot) {
+    fn replace_tabs(&mut self, mut snapshot: tabs_list::TabListSnapshot) {
         self.catalog = snapshot.clone();
         let selected = self.selected_context_id;
         let workspace_id = snapshot
-            .windows
+            .tabs
             .iter()
-            .find(|window| selected.map_or(window.active, |id| window.id == id))
-            .map(|window| window.workspace_id)
+            .find(|tab| selected.map_or(tab.active, |id| tab.id == id))
+            .map(|tab| tab.workspace_id)
             .or_else(|| selected.is_none().then_some(Uuid::nil()));
         // A remembered label is not evidence of a live workspace identity.
         self.workspace_id = snapshot
-            .windows
+            .tabs
             .iter()
-            .find(|window| Some(window.workspace_id) == workspace_id)
-            .map(|window| window.workspace_id);
+            .find(|tab| Some(tab.workspace_id) == workspace_id)
+            .map(|tab| tab.workspace_id);
         if self.editing_workspace_id.is_some() && self.editing_workspace_id != self.workspace_id {
             self.editing_workspace_id = None;
             self.edit_buffer.clear();
         }
-        if let Some(window) = snapshot
-            .windows
+        if let Some(tab) = snapshot
+            .tabs
             .iter()
-            .find(|window| Some(window.workspace_id) == workspace_id)
+            .find(|tab| Some(tab.workspace_id) == workspace_id)
         {
-            self.workspace_label = Some(window.workspace.clone());
+            self.workspace_label = Some(tab.workspace.clone());
         }
         snapshot
-            .windows
-            .retain(|window| Some(window.workspace_id) == workspace_id);
+            .tabs
+            .retain(|tab| Some(tab.workspace_id) == workspace_id);
         if let Some(selected) = selected {
-            for window in &mut snapshot.windows {
-                window.active = window.id == selected;
+            for tab in &mut snapshot.tabs {
+                tab.active = tab.id == selected;
             }
         }
         if self.snapshot != snapshot {
-            let active_id = |windows: &[windows_list::WindowListEntry]| {
-                windows
-                    .iter()
-                    .find(|window| window.active)
-                    .map(|window| window.id)
+            let active_id = |tabs: &[tabs_list::TabListEntry]| {
+                tabs.iter().find(|tab| tab.active).map(|tab| tab.id)
             };
             let retained_anchor = (self.manual_scroll
-                && active_id(&self.snapshot.windows) == active_id(&snapshot.windows))
-            .then(|| {
-                self.snapshot
-                    .windows
-                    .get(self.scroll_offset)
-                    .map(|window| window.id)
-            })
+                && active_id(&self.snapshot.tabs) == active_id(&snapshot.tabs))
+            .then(|| self.snapshot.tabs.get(self.scroll_offset).map(|tab| tab.id))
             .flatten()
-            .and_then(|id| snapshot.windows.iter().position(|window| window.id == id));
+            .and_then(|id| snapshot.tabs.iter().position(|tab| tab.id == id));
             self.snapshot = snapshot;
             if self
-                .menu_window_id
-                .is_some_and(|id| !self.snapshot.windows.iter().any(|window| window.id == id))
+                .menu_tab_id
+                .is_some_and(|id| !self.snapshot.tabs.iter().any(|tab| tab.id == id))
             {
-                self.menu_window_id = None;
+                self.menu_tab_id = None;
             }
             if self
-                .editing_window_id
-                .is_some_and(|id| !self.snapshot.windows.iter().any(|window| window.id == id))
+                .editing_tab_id
+                .is_some_and(|id| !self.snapshot.tabs.iter().any(|tab| tab.id == id))
             {
-                self.editing_window_id = None;
+                self.editing_tab_id = None;
                 self.edit_buffer.clear();
             }
             self.manual_scroll = retained_anchor.is_some();
@@ -349,8 +341,8 @@ impl CompanionState {
     fn replace_local_presentation(&mut self, snapshot: AttachLocalPresentationSnapshot) {
         if self.local_presentation != snapshot {
             self.local_presentation = snapshot;
-            if self.menu_window_id.is_some() && menu::surfaces(self, self.revision).is_empty() {
-                self.menu_window_id = None;
+            if self.menu_tab_id.is_some() && menu::surfaces(self, self.revision).is_empty() {
+                self.menu_tab_id = None;
             }
             self.revision = self.revision.saturating_add(1).max(1);
         }
@@ -365,16 +357,16 @@ fn state() -> &'static CompanionHandle {
 }
 
 #[derive(Default)]
-pub struct TabStripPlugin;
+pub struct TabBarPlugin;
 
-impl RustPlugin for TabStripPlugin {
+impl RustPlugin for TabBarPlugin {
     type Contract = bmux_plugin_sdk::NoPluginContract;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         let settings = Settings::parse(context.settings.as_ref())?;
         *state()
             .lock()
-            .map_err(|_| PluginCommandError::failed("tab-strip state lock poisoned"))? =
+            .map_err(|_| PluginCommandError::failed("tab-bar state lock poisoned"))? =
             Some(CompanionState::new(settings));
         Ok(EXIT_OK)
     }
@@ -403,7 +395,7 @@ impl RustPlugin for TabStripPlugin {
 
 fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
     bmux_plugin::AttachInputEndpoint {
-        capability: "bmux.tab_strip.input".to_string(),
+        capability: "bmux.tab_bar.input".to_string(),
         interface_id: "presentation-input".to_string(),
         operation: "handle-input".to_string(),
     }
@@ -419,7 +411,7 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
     let request = layout_request(&settings);
     let mut guard = state()
         .lock()
-        .map_err(|_| "tab-strip state lock poisoned".to_string())?;
+        .map_err(|_| "tab-bar state lock poisoned".to_string())?;
     *guard = Some(CompanionState::new(settings));
     drop(guard);
 
@@ -433,7 +425,7 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
                 requests: vec![request],
             },
         )
-        .map_err(|error| format!("publishing tab-strip layout: {error:?}"))?;
+        .map_err(|error| format!("publishing tab-bar layout: {error:?}"))?;
     register_presentation_input(
         bmux_plugin::global_attach_presentation_input_registry(),
         state(),
@@ -473,8 +465,8 @@ fn register_presentation_input(
     );
 }
 
-/// One runtime-owned tab-strip installation and its subscriptions.
-pub struct TabStripPresentation {
+/// One runtime-owned tab-bar installation and its subscriptions.
+pub struct TabBarPresentation {
     owner: CompanionHandle,
     layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
     input: std::sync::Arc<bmux_plugin::AttachPresentationInputRegistry>,
@@ -482,7 +474,7 @@ pub struct TabStripPresentation {
     task: tokio::task::JoinHandle<()>,
 }
 
-impl TabStripPresentation {
+impl TabBarPresentation {
     /// Install and subscribe using the invoking runtime's resources.
     ///
     /// # Errors
@@ -494,9 +486,9 @@ impl TabStripPresentation {
         let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
         let request = layout_request(&settings);
         let handle = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
-        let (windows, mut windows_rx) = resources
+        let (tabs, mut tabs_rx) = resources
             .events
-            .subscribe_state::<windows_list::WindowListSnapshot>(&windows_list::STATE_KIND)
+            .subscribe_state::<tabs_list::TabListSnapshot>(&tabs_list::STATE_KIND)
             .map_err(|error| error.to_string())?;
         let (local, mut local_rx) = resources
             .events
@@ -506,15 +498,15 @@ impl TabStripPresentation {
             .map_err(|error| error.to_string())?;
         let (selection, mut selection_rx) = resources
             .events
-            .subscribe_state::<bmux_windows_plugin_api::windows_local_view::WindowSelection>(
-                &bmux_windows_plugin_api::windows_local_view::STATE_KIND,
+            .subscribe_state::<bmux_tabs_plugin_api::tabs_local_view::TabSelection>(
+                &bmux_tabs_plugin_api::tabs_local_view::STATE_KIND,
             )
             .map_err(|error| error.to_string())?;
         let mut companion = CompanionState::new(settings);
         companion.surfaces = resources.surfaces.clone();
         companion.layouts = resources.layouts.clone();
         companion.selected_context_id = selection.context_id;
-        companion.replace_windows(windows.as_ref().clone());
+        companion.replace_tabs(tabs.as_ref().clone());
         companion.replace_local_presentation(local.as_ref().clone());
         resources
             .layouts
@@ -525,7 +517,7 @@ impl TabStripPresentation {
                     requests: vec![request],
                 },
             )
-            .map_err(|error| format!("publishing tab-strip layout: {error:?}"))?;
+            .map_err(|error| format!("publishing tab-bar layout: {error:?}"))?;
         if let Err(error) = publish_companion(&mut companion) {
             resources.layouts.remove_owner(OWNER);
             return Err(error);
@@ -536,9 +528,9 @@ impl TabStripPresentation {
         let task = handle.spawn(async move {
             loop {
                 let update = tokio::select! {
-                    result = windows_rx.changed() => {
+                    result = tabs_rx.changed() => {
                         if result.is_err() { break; }
-                        PresentationUpdate::Windows(windows_rx.borrow_and_update().as_ref().clone())
+                        PresentationUpdate::Tabs(tabs_rx.borrow_and_update().as_ref().clone())
                     }
                     result = local_rx.changed() => {
                         if result.is_err() { break; }
@@ -553,7 +545,7 @@ impl TabStripPresentation {
                     break;
                 };
                 if let Err(error) = apply_presentation_update(&owner, update) {
-                    tracing::warn!(%error, "tab-strip publication failed");
+                    tracing::warn!(%error, "tab-bar publication failed");
                 }
             }
         });
@@ -567,7 +559,7 @@ impl TabStripPresentation {
     }
 }
 
-impl Drop for TabStripPresentation {
+impl Drop for TabBarPresentation {
     fn drop(&mut self) {
         self.task.abort();
         self.input.remove(&input_endpoint());
@@ -580,7 +572,7 @@ impl Drop for TabStripPresentation {
 }
 
 enum PresentationUpdate {
-    Windows(windows_list::WindowListSnapshot),
+    Tabs(tabs_list::TabListSnapshot),
     Local(Box<AttachLocalPresentationSnapshot>),
     Selection(Option<Uuid>),
 }
@@ -591,25 +583,25 @@ fn apply_presentation_update(
 ) -> Result<(), String> {
     let mut guard = owner
         .lock()
-        .map_err(|_| "tab-strip state lock poisoned".to_string())?;
+        .map_err(|_| "tab-bar state lock poisoned".to_string())?;
     let Some(companion) = guard.as_mut() else {
         return Ok(());
     };
     match update {
-        PresentationUpdate::Windows(snapshot) => companion.replace_windows(snapshot),
+        PresentationUpdate::Tabs(snapshot) => companion.replace_tabs(snapshot),
         PresentationUpdate::Local(snapshot) => companion.replace_local_presentation(*snapshot),
         PresentationUpdate::Selection(context_id) => {
             if companion.selected_context_id == context_id {
                 return Ok(());
             }
             companion.selected_context_id = context_id;
-            companion.hovered_window_id = None;
-            companion.editing_window_id = None;
-            companion.menu_window_id = None;
+            companion.hovered_tab_id = None;
+            companion.editing_tab_id = None;
+            companion.menu_tab_id = None;
             companion.pointer_source = None;
             companion.drag_target = None;
             companion.scroll_offset = 0;
-            companion.replace_windows(companion.catalog.clone());
+            companion.replace_tabs(companion.catalog.clone());
         }
     }
     let result = publish_companion(companion);
@@ -619,7 +611,7 @@ fn apply_presentation_update(
 
 static ATTACH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Subscribe the configured companion to authoritative window state.
+/// Subscribe the configured companion to authoritative tab state.
 ///
 /// # Errors
 ///
@@ -629,8 +621,8 @@ pub fn start() -> Result<(), String> {
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
     let (initial, mut receiver) = bmux_plugin::global_event_bus()
-        .subscribe_state::<windows_list::WindowListSnapshot>(&windows_list::STATE_KIND)
-        .map_err(|error| format!("subscribing to windows list: {error}"))?;
+        .subscribe_state::<tabs_list::TabListSnapshot>(&tabs_list::STATE_KIND)
+        .map_err(|error| format!("subscribing to tabs list: {error}"))?;
     let (initial_local_presentation, mut local_presentation_receiver) =
         bmux_plugin::global_event_bus()
             .subscribe_state::<AttachLocalPresentationSnapshot>(
@@ -638,22 +630,22 @@ pub fn start() -> Result<(), String> {
             )
             .map_err(|error| format!("subscribing to attach-local presentation: {error}"))?;
     let (initial_selection, mut selection_receiver) = bmux_plugin::global_event_bus()
-        .subscribe_state::<bmux_windows_plugin_api::windows_local_view::WindowSelection>(
-            &bmux_windows_plugin_api::windows_local_view::STATE_KIND,
+        .subscribe_state::<bmux_tabs_plugin_api::tabs_local_view::TabSelection>(
+            &bmux_tabs_plugin_api::tabs_local_view::STATE_KIND,
         )
         .map_err(|error| format!("subscribing to local selection: {error}"))?;
     publish_selection(initial_selection.context_id)?;
     publish(initial.as_ref().clone())?;
     publish_local_presentation(initial_local_presentation.as_ref().clone())?;
     let handle = tokio::runtime::Handle::try_current()
-        .map_err(|error| format!("tab-strip companion requires an async runtime: {error}"))?;
+        .map_err(|error| format!("tab-bar companion requires an async runtime: {error}"))?;
     handle.spawn(async move {
         while ATTACH_GENERATION.load(Ordering::Acquire) == generation
             && selection_receiver.changed().await.is_ok()
         {
             let selected = selection_receiver.borrow_and_update().context_id;
             if let Err(error) = publish_selection(selected) {
-                tracing::warn!(%error, "tab-strip selection publication failed");
+                tracing::warn!(%error, "tab-bar selection publication failed");
             }
         }
     });
@@ -663,7 +655,7 @@ pub fn start() -> Result<(), String> {
         {
             let snapshot = receiver.borrow_and_update().as_ref().clone();
             if let Err(error) = publish(snapshot) {
-                tracing::warn!(%error, "tab-strip publication failed");
+                tracing::warn!(%error, "tab-bar publication failed");
             }
         }
     });
@@ -676,7 +668,7 @@ pub fn start() -> Result<(), String> {
                 .as_ref()
                 .clone();
             if let Err(error) = publish_local_presentation(snapshot) {
-                tracing::warn!(%error, "tab-strip local presentation publication failed");
+                tracing::warn!(%error, "tab-bar local presentation publication failed");
             }
         }
     });
@@ -708,14 +700,14 @@ fn layout_request(settings: &Settings) -> PluginLayoutRequest {
 // The companion lock must cover registry publication so multiple retained-state
 // subscriber tasks cannot race the same owner revision.
 #[allow(clippy::significant_drop_tightening)]
-fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
+fn publish(snapshot: tabs_list::TabListSnapshot) -> Result<(), String> {
     let mut guard = state()
         .lock()
-        .map_err(|_| "tab-strip state lock poisoned".to_string())?;
+        .map_err(|_| "tab-bar state lock poisoned".to_string())?;
     let Some(companion) = guard.as_mut() else {
         return Ok(());
     };
-    companion.replace_windows(snapshot);
+    companion.replace_tabs(snapshot);
     publish_companion(companion)
 }
 
@@ -723,7 +715,7 @@ fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
 fn publish_local_presentation(snapshot: AttachLocalPresentationSnapshot) -> Result<(), String> {
     let mut guard = state()
         .lock()
-        .map_err(|_| "tab-strip state lock poisoned".to_string())?;
+        .map_err(|_| "tab-bar state lock poisoned".to_string())?;
     let Some(companion) = guard.as_mut() else {
         return Ok(());
     };
@@ -735,7 +727,7 @@ fn publish_local_presentation(snapshot: AttachLocalPresentationSnapshot) -> Resu
 fn publish_selection(context_id: Option<Uuid>) -> Result<(), String> {
     let mut guard = state()
         .lock()
-        .map_err(|_| "tab-strip state lock poisoned".to_string())?;
+        .map_err(|_| "tab-bar state lock poisoned".to_string())?;
     let Some(companion) = guard.as_mut() else {
         return Ok(());
     };
@@ -746,13 +738,13 @@ fn publish_selection(context_id: Option<Uuid>) -> Result<(), String> {
     companion.editing_workspace_id = None;
     companion.last_workspace_click = None;
     companion.edit_buffer.clear();
-    companion.hovered_window_id = None;
-    companion.editing_window_id = None;
-    companion.menu_window_id = None;
+    companion.hovered_tab_id = None;
+    companion.editing_tab_id = None;
+    companion.menu_tab_id = None;
     companion.pointer_source = None;
     companion.drag_target = None;
     companion.scroll_offset = 0;
-    companion.replace_windows(companion.catalog.clone());
+    companion.replace_tabs(companion.catalog.clone());
     publish_companion(companion)
 }
 
@@ -763,7 +755,7 @@ fn publish_surface(
 ) -> Result<u64, String> {
     registry
         .publish_advancing(OWNER, PluginSurfaceSnapshot { revision, surfaces })
-        .map_err(|error| format!("publishing tab-strip surface: {error:?}"))?;
+        .map_err(|error| format!("publishing tab-bar surface: {error:?}"))?;
     registry
         .owner_snapshot(OWNER)
         .map(|snapshot| snapshot.revision)
@@ -788,8 +780,8 @@ fn companion_surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSu
 }
 
 #[cfg(test)]
-fn compact_fact(window: &windows_list::WindowListEntry) -> Option<PresentationFact> {
-    let entity = PresentationEntityRef::new("bmux.windows", window.id.to_string());
+fn compact_fact(tab: &tabs_list::TabListEntry) -> Option<PresentationFact> {
+    let entity = PresentationEntityRef::new("bmux.tabs", tab.id.to_string());
     global_presentation_fact_host_service()
         .registry()
         .facts_for_entity(&entity)
@@ -850,7 +842,7 @@ fn truncate_to_width(value: &str, maximum: usize) -> String {
 }
 
 #[cfg(test)]
-fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index: usize) -> String {
+fn tab_label(settings: &Settings, tab: &tabs_list::TabListEntry, index: usize) -> String {
     const INDEX_TOKEN: &str = concat!("{", "index}");
     const INDEX0_TOKEN: &str = concat!("{", "index0}");
     const SESSION_TOKEN: &str = concat!("{", "session}");
@@ -858,11 +850,11 @@ fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index:
     const FACT_TOKEN: &str = concat!("{", "fact}");
     let display_index = index.saturating_add(1).to_string();
     let zero_index = index.to_string();
-    let marker = if window.active { "*" } else { "" };
+    let marker = if tab.active { "*" } else { "" };
     let session = "";
     let fact = settings
         .show_compact_facts
-        .then(|| compact_fact(window))
+        .then(|| compact_fact(tab))
         .flatten();
     let label = settings
         .label_template
@@ -870,11 +862,11 @@ fn tab_label(settings: &Settings, window: &windows_list::WindowListEntry, index:
         .replace("}}", "\u{1}")
         .replace(INDEX_TOKEN, &display_index)
         .replace(INDEX0_TOKEN, &zero_index)
-        .replace("{name}", &window.name)
+        .replace("{name}", &tab.name)
         .replace(SESSION_TOKEN, session)
         .replace(MARKER_TOKEN, marker)
-        .replace("{id}", &window.id.to_string())
-        .replace("{active}", if window.active { "active" } else { "idle" })
+        .replace("{id}", &tab.id.to_string())
+        .replace("{active}", if tab.active { "active" } else { "idle" })
         .replace(
             FACT_TOKEN,
             fact.as_ref().map_or("", |fact| fact.short_text.as_str()),
@@ -1008,12 +1000,12 @@ fn adjust_rgb(value: (u8, u8, u8), delta: i16) -> (u8, u8, u8) {
 fn projection_interaction(state: &CompanionState) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
         scroll_anchor: state.manual_scroll.then_some(state.scroll_offset),
-        editing_window_id: state.editing_window_id,
+        editing_tab_id: state.editing_tab_id,
         edit_selection: state
             .edit_buffer
             .selection()
             .map(|selection| (selection.start, selection.end)),
-        menu_window_id: state.menu_window_id,
+        menu_tab_id: state.menu_tab_id,
         menu_selected: state.menu_selected,
         workspace_label: state.workspace_label.as_deref(),
         drag_marker_col: state.drag_target.map(|target| target.marker_col),
@@ -1038,12 +1030,12 @@ fn build_surface_with_editor(
     let styles = BarStyles::resolve(&state.settings, &state.local_presentation);
     let mut interaction = projection_interaction(state);
     // The popup is a separate surface; retain the tabs and their focus identities.
-    interaction.menu_window_id = None;
+    interaction.menu_tab_id = None;
     let projected = projection::project_bar(
         &state.settings,
-        &state.snapshot.windows,
+        &state.snapshot.tabs,
         &state.local_presentation,
-        state.hovered_window_id,
+        state.hovered_tab_id,
         &interaction,
     );
     let rect = ExtensionRect::new(
@@ -1053,7 +1045,7 @@ fn build_surface_with_editor(
         state.settings.height,
     );
     let mut ops = vec![RenderOp::fill_rect(rect, ' ', styles.base)];
-    let mut regions = Vec::with_capacity(state.snapshot.windows.len());
+    let mut regions = Vec::with_capacity(state.snapshot.tabs.len());
     let mut x = 0_u16;
     for segment in projected.segments {
         let width = u16::try_from(unicode_width::UnicodeWidthStr::width(segment.text.as_str()))
@@ -1072,15 +1064,15 @@ fn build_surface_with_editor(
             ops.extend(paint);
             editor_viewport = viewport;
         } else if segment.kind == projection::SegmentKind::EditingTab
-            && let Some((index, window)) = state
+            && let Some((index, tab)) = state
                 .snapshot
-                .windows
+                .tabs
                 .iter()
                 .enumerate()
-                .find(|(_, window)| Some(window.id) == segment.window_id)
+                .find(|(_, tab)| Some(tab.id) == segment.tab_id)
         {
             for (start, length) in
-                projection::name_ranges(&state.settings, window, index, &state.local_presentation)
+                projection::name_ranges(&state.settings, tab, index, &state.local_presentation)
             {
                 let start = u16::try_from(start).unwrap_or(u16::MAX);
                 let length = u16::try_from(length)
@@ -1111,12 +1103,12 @@ fn build_surface_with_editor(
                 .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
             );
         }
-        if let Some(window_id) = segment.window_id
+        if let Some(tab_id) = segment.tab_id
             && segment.kind != projection::SegmentKind::EditingTab
         {
             regions.push(
                 PluginSurfaceRegion::new(
-                    format!("window:{window_id}"),
+                    format!("tab:{tab_id}"),
                     ExtensionRect::new(x, 0, width, state.settings.height),
                 )
                 .endpoint(input_endpoint())
@@ -1127,8 +1119,8 @@ fn build_surface_with_editor(
     }
     if let Some(viewport) = &editor_viewport {
         let id = state
-            .editing_window_id
-            .map(|id| format!("window:{id}"))
+            .editing_tab_id
+            .map(|id| format!("tab:{id}"))
             .or_else(|| {
                 state
                     .editing_workspace_id
@@ -1166,7 +1158,7 @@ fn build_surface_with_editor(
 fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let target = event
         .hook_id
-        .strip_prefix("bmux.tab_strip:strip:window:")
+        .strip_prefix("bmux.tab_bar:strip:tab:")
         .and_then(|target| Uuid::parse_str(target).ok());
     let hovered = match event.phase.as_str() {
         "enter" | "move" => target,
@@ -1179,10 +1171,10 @@ fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let Some(companion) = guard.as_mut() else {
         return false;
     };
-    if companion.hovered_window_id == hovered {
+    if companion.hovered_tab_id == hovered {
         return false;
     }
-    companion.hovered_window_id = hovered;
+    companion.hovered_tab_id = hovered;
     companion.revision = companion.revision.saturating_add(1).max(1);
     publish_companion(companion).is_ok()
 }
@@ -1197,13 +1189,13 @@ fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let Some(companion) = guard.as_mut() else {
         return false;
     };
-    let ranges = projected_bar(companion).window_ranges();
+    let ranges = projected_bar(companion).tab_ranges();
     let Some(first) = ranges.first().and_then(|range| {
         companion
             .snapshot
-            .windows
+            .tabs
             .iter()
-            .position(|window| window.id == range.window_id)
+            .position(|tab| tab.id == range.tab_id)
     }) else {
         return true;
     };
@@ -1212,14 +1204,14 @@ fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
         .and_then(|range| {
             companion
                 .snapshot
-                .windows
+                .tabs
                 .iter()
-                .position(|window| window.id == range.window_id)
+                .position(|tab| tab.id == range.tab_id)
         })
         .unwrap_or(first);
     let next = if event.wheel_delta > 0 {
         first.saturating_sub(1)
-    } else if last + 1 < companion.snapshot.windows.len() {
+    } else if last + 1 < companion.snapshot.tabs.len() {
         first + 1
     } else {
         first
@@ -1236,9 +1228,9 @@ fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
 fn projected_bar(state: &CompanionState) -> projection::ProjectedBar {
     projection::project_bar(
         &state.settings,
-        &state.snapshot.windows,
+        &state.snapshot.tabs,
         &state.local_presentation,
-        state.hovered_window_id,
+        state.hovered_tab_id,
         &projection_interaction_without_marker(state),
     )
 }
@@ -1248,12 +1240,12 @@ fn projection_interaction_without_marker(
 ) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
         scroll_anchor: state.manual_scroll.then_some(state.scroll_offset),
-        editing_window_id: state.editing_window_id,
+        editing_tab_id: state.editing_tab_id,
         edit_selection: state
             .edit_buffer
             .selection()
             .map(|selection| (selection.start, selection.end)),
-        menu_window_id: state.menu_window_id,
+        menu_tab_id: state.menu_tab_id,
         menu_selected: state.menu_selected,
         drag_marker_col: None,
         workspace_label: state.workspace_label.as_deref(),
@@ -1265,7 +1257,7 @@ fn command_invocation<Request: serde::Serialize>(
     endpoint: bmux_plugin::AttachInputEndpoint,
     request: &Request,
 ) -> Option<AttachInputServiceInvocation> {
-    // This local gesture owns the move_window interaction and emits the
+    // This local gesture owns the move_tab interaction and emits the
     // generated endpoint request for generic attach-side dispatch.
     Some(AttachInputServiceInvocation {
         endpoint,
@@ -1281,7 +1273,7 @@ fn update_drag_local(
 ) -> Option<AttachInputResult> {
     let source = event
         .hook_id
-        .strip_prefix("bmux.tab_strip:strip:window:")
+        .strip_prefix("bmux.tab_bar:strip:tab:")
         .and_then(|target| Uuid::parse_str(target).ok())?;
     let col = event.col.unwrap_or_default();
     let row = event.row.unwrap_or_default();
@@ -1291,16 +1283,16 @@ fn update_drag_local(
         "down" if event.button.as_deref() == Some("left") => {
             companion.last_workspace_click = None;
             companion.editing_workspace_id = None;
-            let double_click_window =
+            let double_click_tab =
                 Duration::from_millis(companion.local_presentation.double_click_ms);
-            let is_double = !double_click_window.is_zero()
+            let is_double = !double_click_tab.is_zero()
                 && companion
                     .last_left_click
                     .is_some_and(|(last, last_col, last_row, at)| {
                         last == source
                             && last_col == col
                             && last_row == row
-                            && Instant::now().saturating_duration_since(at) <= double_click_window
+                            && Instant::now().saturating_duration_since(at) <= double_click_tab
                     });
             companion.last_left_click = if is_double {
                 None
@@ -1308,17 +1300,17 @@ fn update_drag_local(
                 Some((source, col, row, Instant::now()))
             };
             if is_double {
-                let window = companion
+                let tab = companion
                     .snapshot
-                    .windows
+                    .tabs
                     .iter()
-                    .find(|window| window.id == source)?;
+                    .find(|tab| tab.id == source)?;
                 companion.pointer_source = None;
                 companion.pointer_moved = false;
                 companion.drag_target = None;
-                companion.editing_window_id = Some(source);
+                companion.editing_tab_id = Some(source);
                 companion.edit_buffer =
-                    bmux_text_edit::TextEditBuffer::from_text(window.name.clone()).into();
+                    bmux_text_edit::TextEditBuffer::from_text(tab.name.clone()).into();
                 companion.edit_buffer.select_all();
                 let dirty = republish_companion(companion);
                 return Some(AttachInputResult {
@@ -1348,7 +1340,7 @@ fn update_drag_local(
                     .abs_diff(companion.pointer_started_col)
                     .max(row.abs_diff(companion.pointer_started_row))
                     > 1
-                || target.is_some_and(|target| target.window_id != source);
+                || target.is_some_and(|target| target.tab_id != source);
             companion.pointer_moved = moved;
             companion.drag_target = moved.then_some(target).flatten();
             let dirty = republish_companion(companion);
@@ -1369,29 +1361,23 @@ fn update_drag_local(
             let dirty = republish_companion(companion);
             let service_invocation = if moved {
                 target
-                    .filter(|target| target.window_id != source)
+                    .filter(|target| target.tab_id != source)
                     .and_then(|insertion| {
-                        let target = insertion.window_id;
+                        let target = insertion.tab_id;
                         let placement = match insertion.side {
-                            projection::DropSide::Before => {
-                                windows_commands::WindowMovePlacement::Before
-                            }
-                            projection::DropSide::After => {
-                                windows_commands::WindowMovePlacement::After
-                            }
+                            projection::DropSide::Before => tabs_commands::TabMovePlacement::Before,
+                            projection::DropSide::After => tabs_commands::TabMovePlacement::After,
                         };
                         command_invocation(
                             bmux_plugin::AttachInputEndpoint {
-                                capability:
-                                    windows_commands::client::MoveWindowEndpoint::CAPABILITY
-                                        .to_string(),
-                                interface_id:
-                                    windows_commands::client::MoveWindowEndpoint::INTERFACE_ID
-                                        .to_string(),
-                                operation: windows_commands::client::MoveWindowEndpoint::OPERATION
+                                capability: tabs_commands::client::MoveTabEndpoint::CAPABILITY
+                                    .to_string(),
+                                interface_id: tabs_commands::client::MoveTabEndpoint::INTERFACE_ID
+                                    .to_string(),
+                                operation: tabs_commands::client::MoveTabEndpoint::OPERATION
                                     .to_string(),
                             },
-                            &windows_commands::client::MoveWindowRequest {
+                            &tabs_commands::client::MoveTabRequest {
                                 source,
                                 target,
                                 placement,
@@ -1401,14 +1387,13 @@ fn update_drag_local(
             } else {
                 command_invocation(
                     bmux_plugin::AttachInputEndpoint {
-                        capability: windows_commands::client::SwitchWindowEndpoint::CAPABILITY
+                        capability: tabs_commands::client::SwitchTabEndpoint::CAPABILITY
                             .to_string(),
-                        interface_id: windows_commands::client::SwitchWindowEndpoint::INTERFACE_ID
+                        interface_id: tabs_commands::client::SwitchTabEndpoint::INTERFACE_ID
                             .to_string(),
-                        operation: windows_commands::client::SwitchWindowEndpoint::OPERATION
-                            .to_string(),
+                        operation: tabs_commands::client::SwitchTabEndpoint::OPERATION.to_string(),
                     },
-                    &windows_commands::client::SwitchWindowRequest {
+                    &tabs_commands::client::SwitchTabRequest {
                         target: source.to_string(),
                     },
                 )
@@ -1439,7 +1424,7 @@ fn update_editor(
     }
     let mut guard = state().lock().ok()?;
     let companion = guard.as_mut()?;
-    let editing = companion.editing_window_id?;
+    let editing = companion.editing_tab_id?;
     let key = event.key.as_deref()?;
     match key {
         "esc" => {
@@ -1450,16 +1435,16 @@ fn update_editor(
             if name.is_empty() {
                 return Some(AttachInputResult {
                     consumed: true,
-                    status_message: Some("window name must not be empty".to_string()),
+                    status_message: Some("tab name must not be empty".to_string()),
                     ..AttachInputResult::default()
                 });
             }
-            companion.editing_window_id = None;
+            companion.editing_tab_id = None;
             companion.edit_buffer.clear();
             drop(guard);
             let mut client = ServiceCallerDispatchClient::new(context);
             return Some(
-                match block_on_typed_dispatch(windows_commands::client::rename_window_by_id(
+                match block_on_typed_dispatch(tabs_commands::client::rename_tab_by_id(
                     &mut client,
                     editing,
                     name,
@@ -1471,12 +1456,12 @@ fn update_editor(
                     },
                     Ok(Err(error)) => AttachInputResult {
                         consumed: true,
-                        status_message: Some(format!("window rename failed: {error:?}")),
+                        status_message: Some(format!("tab rename failed: {error:?}")),
                         ..AttachInputResult::default()
                     },
                     Err(error) => AttachInputResult {
                         consumed: true,
-                        status_message: Some(format!("window rename unavailable: {error}")),
+                        status_message: Some(format!("tab rename unavailable: {error}")),
                         ..AttachInputResult::default()
                     },
                 },
@@ -1501,7 +1486,7 @@ fn begin_rename(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     }
     let Some(target) = event
         .hook_id
-        .strip_prefix("bmux.tab_strip:strip:window:")
+        .strip_prefix("bmux.tab_bar:strip:tab:")
         .and_then(|target| Uuid::parse_str(target).ok())
     else {
         return false;
@@ -1512,32 +1497,23 @@ fn begin_rename(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let Some(companion) = guard.as_mut() else {
         return false;
     };
-    let Some(window) = companion
-        .snapshot
-        .windows
-        .iter()
-        .find(|window| window.id == target)
-    else {
+    let Some(tab) = companion.snapshot.tabs.iter().find(|tab| tab.id == target) else {
         return false;
     };
-    companion.editing_window_id = Some(target);
-    companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(window.name.clone()).into();
+    companion.editing_tab_id = Some(target);
+    companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(tab.name.clone()).into();
     companion.edit_buffer.select_all();
     republish_companion(companion)
 }
 
-fn rename_window_invocation(window_id: Uuid, name: String) -> Option<AttachInputServiceInvocation> {
+fn rename_tab_invocation(tab_id: Uuid, name: String) -> Option<AttachInputServiceInvocation> {
     command_invocation(
         bmux_plugin::AttachInputEndpoint {
-            capability: windows_commands::client::RenameWindowByIdEndpoint::CAPABILITY.to_string(),
-            interface_id: windows_commands::client::RenameWindowByIdEndpoint::INTERFACE_ID
-                .to_string(),
-            operation: windows_commands::client::RenameWindowByIdEndpoint::OPERATION.to_string(),
+            capability: tabs_commands::client::RenameTabByIdEndpoint::CAPABILITY.to_string(),
+            interface_id: tabs_commands::client::RenameTabByIdEndpoint::INTERFACE_ID.to_string(),
+            operation: tabs_commands::client::RenameTabByIdEndpoint::OPERATION.to_string(),
         },
-        &windows_commands::client::RenameWindowByIdRequest {
-            id: window_id,
-            name,
-        },
+        &tabs_commands::client::RenameTabByIdRequest { id: tab_id, name },
     )
 }
 
@@ -1552,7 +1528,7 @@ fn update_editor_local(
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     let editing = companion
-        .editing_window_id
+        .editing_tab_id
         .or(companion.editing_workspace_id)?;
     let workspace = companion.editing_workspace_id.is_some();
     let key = event.key.as_deref()?;
@@ -1570,7 +1546,7 @@ fn update_editor_local(
                     consumed: true,
                     status_message: Some(format!(
                         "{} name must not be empty",
-                        if workspace { "workspace" } else { "window" }
+                        if workspace { "workspace" } else { "tab" }
                     )),
                     ..AttachInputResult::default()
                 });
@@ -1578,9 +1554,9 @@ fn update_editor_local(
             service_invocation = if workspace {
                 workspace_rename::invocation(editing, name)
             } else {
-                rename_window_invocation(editing, name)
+                rename_tab_invocation(editing, name)
             };
-            companion.editing_window_id = None;
+            companion.editing_tab_id = None;
             companion.editing_workspace_id = None;
             companion.edit_buffer.clear();
             release_capture = true;
@@ -1603,8 +1579,8 @@ fn update_editor_local(
 }
 
 fn cancel_rename(companion: &mut CompanionState) -> bool {
-    let editing = companion.editing_window_id.take().is_some()
-        | companion.editing_workspace_id.take().is_some();
+    let editing =
+        companion.editing_tab_id.take().is_some() | companion.editing_workspace_id.take().is_some();
     if editing {
         companion.edit_buffer.clear();
         companion.last_left_click = None;
@@ -1635,14 +1611,14 @@ fn handle_editor_pointer(
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     let target = companion
-        .editing_window_id
-        .map(|id| format!("window:{id}"))
+        .editing_tab_id
+        .map(|id| format!("tab:{id}"))
         .or_else(|| {
             companion
                 .editing_workspace_id
                 .map(|id| format!("workspace:{id}"))
         })?;
-    if event.hook_id != format!("bmux.tab_strip:strip:{target}") {
+    if event.hook_id != format!("bmux.tab_bar:strip:{target}") {
         return None;
     }
     if event.phase == "down"
@@ -1680,7 +1656,7 @@ fn handle_editor_paste(owner: &CompanionHandle, _hook: &str, text: &str) -> Atta
     let Some(companion) = guard.as_mut() else {
         return AttachInputResult::default();
     };
-    if companion.editing_window_id.is_none() && companion.editing_workspace_id.is_none() {
+    if companion.editing_tab_id.is_none() && companion.editing_workspace_id.is_none() {
         return AttachInputResult::default();
     }
     if text.len() > 4096 || text.contains(['\n', '\r']) {
@@ -1767,16 +1743,16 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
     AttachInputResult::default()
 }
 
-bmux_plugin_sdk::export_plugin!(TabStripPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::export_plugin!(TabBarPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
     fn scoped_resources() -> bmux_plugin::AttachPresentationResources {
         let events = std::sync::Arc::new(bmux_plugin::EventBus::new());
         events.register_state_channel(
-            windows_list::STATE_KIND,
-            windows_list::WindowListSnapshot {
-                windows: Vec::new(),
+            tabs_list::STATE_KIND,
+            tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
                 revision: 0,
             },
         );
@@ -1785,8 +1761,8 @@ mod tests {
             AttachLocalPresentationSnapshot::initial(),
         );
         events.register_state_channel(
-            bmux_windows_plugin_api::windows_local_view::STATE_KIND,
-            bmux_windows_plugin_api::windows_local_view::WindowSelection { context_id: None },
+            bmux_tabs_plugin_api::tabs_local_view::STATE_KIND,
+            bmux_tabs_plugin_api::tabs_local_view::TabSelection { context_id: None },
         );
         bmux_plugin::AttachPresentationResources {
             layouts: std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(64)),
@@ -1802,9 +1778,9 @@ mod tests {
         let companion = guard.as_mut().unwrap();
         companion.local_presentation.viewport_cols = 80;
         companion.local_presentation.viewport_rows = 24;
-        companion.replace_windows(windows_list::WindowListSnapshot {
+        companion.replace_tabs(tabs_list::TabListSnapshot {
             revision: 1,
-            windows: vec![windows_list::WindowListEntry {
+            tabs: vec![tabs_list::TabListEntry {
                 id,
                 name: "original".to_string(),
                 active: true,
@@ -1815,11 +1791,11 @@ mod tests {
         drop(guard);
     }
 
-    fn seed_rename_owner(presentation: &TabStripPresentation, id: Uuid) {
+    fn seed_rename_owner(presentation: &TabBarPresentation, id: Uuid) {
         let mut guard = presentation.owner.lock().unwrap();
         let companion = guard.as_mut().unwrap();
-        companion.menu_window_id = None;
-        companion.editing_window_id = Some(id);
+        companion.menu_tab_id = None;
+        companion.editing_tab_id = Some(id);
         companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text("original").into();
         companion.edit_buffer.select_all();
         publish_companion(companion).unwrap();
@@ -1832,14 +1808,14 @@ mod tests {
     async fn scoped_input_keeps_menu_paste_and_focus_on_the_owner() {
         let first_resources = scoped_resources();
         let second_resources = scoped_resources();
-        let first = TabStripPresentation::install(None, &first_resources).unwrap();
-        let second = TabStripPresentation::install(None, &second_resources).unwrap();
+        let first = TabBarPresentation::install(None, &first_resources).unwrap();
+        let second = TabBarPresentation::install(None, &second_resources).unwrap();
         let id = Uuid::from_u128(7);
         for owner in [&first.owner, &second.owner] {
             seed_input_owner(owner, id);
         }
         let event = AttachInputEvent {
-            hook_id: format!("bmux.tab_strip:strip:window:{id}"),
+            hook_id: format!("bmux.tab_bar:strip:tab:{id}"),
             event_kind: "pointer".to_string(),
             phase: "down".to_string(),
             button: Some("right".to_string()),
@@ -1859,7 +1835,7 @@ mod tests {
                 .consumed
         );
         assert_eq!(
-            first.owner.lock().unwrap().as_ref().unwrap().menu_window_id,
+            first.owner.lock().unwrap().as_ref().unwrap().menu_tab_id,
             Some(id)
         );
         assert!(
@@ -1869,7 +1845,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .menu_window_id
+                .menu_tab_id
                 .is_none()
         );
         for presentation in [&first, &second] {
@@ -1916,7 +1892,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .editing_window_id
+                .editing_tab_id
                 .is_none()
         );
         assert_eq!(
@@ -1926,14 +1902,14 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .editing_window_id,
+                .editing_tab_id,
             Some(id)
         );
     }
 
     async fn remove_open_menu_target(
         first_resources: &bmux_plugin::AttachPresentationResources,
-        first: &TabStripPresentation,
+        first: &TabBarPresentation,
         event: &mut AttachInputEvent,
     ) {
         event.event_kind = "pointer".into();
@@ -1948,9 +1924,9 @@ mod tests {
         first_resources
             .events
             .publish_state(
-                &windows_list::STATE_KIND,
-                windows_list::WindowListSnapshot {
-                    windows: Vec::new(),
+                &tabs_list::STATE_KIND,
+                tabs_list::TabListSnapshot {
+                    tabs: Vec::new(),
                     revision: 2,
                 },
             )
@@ -1964,7 +1940,7 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .snapshot
-                    .windows
+                    .tabs
                     .is_empty()
                 {
                     break;
@@ -1984,7 +1960,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .menu_window_id
+                .menu_tab_id
                 .is_none()
         );
         assert!(
@@ -2005,10 +1981,10 @@ mod tests {
         resources
             .events
             .publish_state(
-                &windows_list::STATE_KIND,
-                windows_list::WindowListSnapshot {
-                    windows: (0..20)
-                        .map(|index| windows_list::WindowListEntry {
+                &tabs_list::STATE_KIND,
+                tabs_list::TabListSnapshot {
+                    tabs: (0..20)
+                        .map(|index| tabs_list::TabListEntry {
                             id: Uuid::from_u128(base + index),
                             name: format!("long-tab-{index}"),
                             active: index == 0,
@@ -2038,8 +2014,8 @@ mod tests {
     async fn populated_registries_isolate_scrolling_and_switch_requests() {
         let first_resources = populated_resources(100);
         let second_resources = populated_resources(200);
-        let first = TabStripPresentation::install(None, &first_resources).unwrap();
-        let second = TabStripPresentation::install(None, &second_resources).unwrap();
+        let first = TabBarPresentation::install(None, &first_resources).unwrap();
+        let second = TabBarPresentation::install(None, &second_resources).unwrap();
         let mut event = AttachInputEvent {
             hook_id: String::new(),
             event_kind: "pointer".into(),
@@ -2075,7 +2051,7 @@ mod tests {
             event.phase = "down".into();
             event.button = Some("right".into());
             event.wheel_delta = 0;
-            event.hook_id = format!("bmux.tab_strip:strip:window:{}", Uuid::from_u128(target));
+            event.hook_id = format!("bmux.tab_bar:strip:tab:{}", Uuid::from_u128(target));
             assert!(
                 resources
                     .input
@@ -2091,9 +2067,9 @@ mod tests {
             let invocation = result.service_invocation.unwrap();
             assert_eq!(
                 invocation.endpoint.operation,
-                windows_commands::client::SwitchWindowEndpoint::OPERATION.to_string()
+                tabs_commands::client::SwitchTabEndpoint::OPERATION.to_string()
             );
-            let request: windows_commands::client::SwitchWindowRequest =
+            let request: tabs_commands::client::SwitchTabRequest =
                 bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
             assert_eq!(request.target, Uuid::from_u128(target).to_string());
         }
@@ -2104,7 +2080,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .menu_window_id
+                .menu_tab_id
                 .is_none()
         );
         assert!(
@@ -2114,7 +2090,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .menu_window_id
+                .menu_tab_id
                 .is_none()
         );
     }
@@ -2140,9 +2116,9 @@ mod tests {
         first_resources
             .events
             .publish_state(
-                &windows_list::STATE_KIND,
-                windows_list::WindowListSnapshot {
-                    windows: vec![windows_list::WindowListEntry {
+                &tabs_list::STATE_KIND,
+                tabs_list::TabListSnapshot {
+                    tabs: vec![tabs_list::TabListEntry {
                         id: target,
                         name: "tab".into(),
                         active: true,
@@ -2153,10 +2129,10 @@ mod tests {
                 },
             )
             .unwrap();
-        let first = TabStripPresentation::install(None, &first_resources).unwrap();
-        let second = TabStripPresentation::install(None, &second_resources).unwrap();
+        let first = TabBarPresentation::install(None, &first_resources).unwrap();
+        let second = TabBarPresentation::install(None, &second_resources).unwrap();
         let mut event = AttachInputEvent {
-            hook_id: format!("bmux.tab_strip:strip:window:{target}"),
+            hook_id: format!("bmux.tab_bar:strip:tab:{target}"),
             event_kind: "pointer".into(),
             phase: "down".into(),
             button: Some("right".into()),
@@ -2183,7 +2159,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .menu_window_id
+                .menu_tab_id
                 .is_none()
         );
         event.event_kind = "key".into();
@@ -2201,7 +2177,7 @@ mod tests {
                 .unwrap()
                 .as_ref()
                 .unwrap()
-                .menu_window_id
+                .menu_tab_id
                 .is_none()
         );
         remove_open_menu_target(&first_resources, &first, &mut event).await;
@@ -2219,8 +2195,8 @@ mod tests {
     async fn scoped_installations_deliver_updates_and_stop_independently() {
         let first_resources = scoped_resources();
         let second_resources = scoped_resources();
-        let first = TabStripPresentation::install(None, &first_resources).unwrap();
-        let second = TabStripPresentation::install(None, &second_resources).unwrap();
+        let first = TabBarPresentation::install(None, &first_resources).unwrap();
+        let second = TabBarPresentation::install(None, &second_resources).unwrap();
         let update = |resources: &bmux_plugin::AttachPresentationResources, label: &str| {
             resources
                 .events
@@ -2288,7 +2264,7 @@ mod tests {
         .await
         .unwrap();
         assert!(stopped_owner.lock().unwrap().is_none());
-        let restarted = TabStripPresentation::install(None, &first_resources).unwrap();
+        let restarted = TabBarPresentation::install(None, &first_resources).unwrap();
         assert_eq!(
             restarted
                 .owner
@@ -2322,7 +2298,7 @@ mod tests {
             if workspace {
                 companion.editing_workspace_id = Some(id);
             } else {
-                companion.editing_window_id = Some(id);
+                companion.editing_tab_id = Some(id);
             }
             companion.edit_buffer =
                 bmux_text_edit::TextEditBuffer::from_text("uncommitted draft").into();
@@ -2330,7 +2306,7 @@ mod tests {
             companion.last_left_click = Some((id, 0, 0, Instant::now()));
             companion.last_workspace_click = companion.last_left_click;
             assert!(cancel_rename(&mut companion));
-            assert!(companion.editing_window_id.is_none());
+            assert!(companion.editing_tab_id.is_none());
             assert!(companion.editing_workspace_id.is_none());
             assert!(companion.edit_buffer.text().is_empty());
             assert!(companion.edit_buffer.selection().is_none());
@@ -2357,9 +2333,9 @@ mod tests {
     #[test]
     fn republish_advances_past_retained_owner_revision() {
         uninstall();
-        install(None).expect("install tab strip");
-        publish(windows_list::WindowListSnapshot {
-            windows: Vec::new(),
+        install(None).expect("install tab bar");
+        publish(tabs_list::TabListSnapshot {
+            tabs: Vec::new(),
             revision: 0,
         })
         .expect("initial publish");
@@ -2373,8 +2349,8 @@ mod tests {
             )
             .expect("seed higher owner revision");
 
-        publish(windows_list::WindowListSnapshot {
-            windows: Vec::new(),
+        publish(tabs_list::TabListSnapshot {
+            tabs: Vec::new(),
             revision: 1,
         })
         .expect("republish above retained revision");
@@ -2387,9 +2363,9 @@ mod tests {
         );
         // Exercise the registered local route, not just projection helpers.
         let id = Uuid::from_u128(7);
-        publish(windows_list::WindowListSnapshot {
+        publish(tabs_list::TabListSnapshot {
             revision: 2,
-            windows: vec![windows_list::WindowListEntry {
+            tabs: vec![tabs_list::TabListEntry {
                 id,
                 name: "original".to_string(),
                 active: true,
@@ -2405,7 +2381,7 @@ mod tests {
         })
         .unwrap();
         let mut event = AttachInputEvent {
-            hook_id: format!("bmux.tab_strip:strip:window:{id}"),
+            hook_id: format!("bmux.tab_bar:strip:tab:{id}"),
             event_kind: "pointer".to_string(),
             phase: "down".to_string(),
             button: Some("right".to_string()),
@@ -2430,7 +2406,7 @@ mod tests {
             3
         );
         event.button = Some("left".to_string());
-        event.hook_id = "bmux.tab_strip:menu:item:1".to_string();
+        event.hook_id = "bmux.tab_bar:menu:item:1".to_string();
         let rename = handle_local_input(state(), &event).unwrap();
         assert!(!rename.release_capture);
         event.event_kind = "key".to_string();
@@ -2451,7 +2427,7 @@ mod tests {
         event.event_kind = "pointer".to_string();
         event.phase = "down".to_string();
         event.button = Some("left".to_string());
-        event.hook_id = format!("bmux.tab_strip:strip:workspace:{}", Uuid::nil());
+        event.hook_id = format!("bmux.tab_bar:strip:workspace:{}", Uuid::nil());
         state()
             .lock()
             .unwrap()
@@ -2544,13 +2520,13 @@ mod tests {
     }
 
     #[test]
-    fn settings_validate_legacy_defaults_aliases_and_nested_values() {
+    fn settings_validate_canonical_defaults_and_nested_values() {
         let value: toml::Value = toml::from_str(
             r##"
 placement = "bottom"
 height = 2
-show_index = true
-maximum_visible_tabs = 8
+show_tab_index = true
+max_tabs = 8
 show_mode = false
 hint_policy = "always"
 
@@ -2592,7 +2568,7 @@ bar_bg = "#112233"
 
     #[test]
     fn tab_labels_expand_templates_and_truncate_by_display_width() {
-        let window = windows_list::WindowListEntry {
+        let tab = tabs_list::TabListEntry {
             id: Uuid::from_u128(8),
             name: "界界界".to_string(),
             active: true,
@@ -2604,7 +2580,7 @@ bar_bg = "#112233"
             maximum_label_width: 5,
             ..Settings::default()
         };
-        assert_eq!(tab_label(&settings, &window, 0), "1:界");
+        assert_eq!(tab_label(&settings, &tab, 0), "1:界");
     }
 
     #[test]
@@ -2681,16 +2657,16 @@ bar_bg = "#112233"
         let mut state = CompanionState::new(Settings::default());
         let first = Uuid::from_u128(11);
         let second = Uuid::from_u128(12);
-        let catalog = windows_list::WindowListSnapshot {
-            windows: vec![
-                windows_list::WindowListEntry {
+        let catalog = tabs_list::TabListSnapshot {
+            tabs: vec![
+                tabs_list::TabListEntry {
                     id: first,
                     name: "old-tab".to_string(),
                     active: true,
                     workspace: "old-workspace".to_string(),
                     workspace_id: Uuid::nil(),
                 },
-                windows_list::WindowListEntry {
+                tabs_list::TabListEntry {
                     id: second,
                     name: "new-tab".to_string(),
                     active: false,
@@ -2701,31 +2677,31 @@ bar_bg = "#112233"
             revision: 1,
         };
         state.selected_context_id = Some(second);
-        state.replace_windows(catalog.clone());
-        assert_eq!(state.snapshot.windows.len(), 1);
-        assert_eq!(state.snapshot.windows[0].id, second);
-        assert!(state.snapshot.windows[0].active);
+        state.replace_tabs(catalog.clone());
+        assert_eq!(state.snapshot.tabs.len(), 1);
+        assert_eq!(state.snapshot.tabs[0].id, second);
+        assert!(state.snapshot.tabs[0].active);
         state.selected_context_id = Some(first);
-        state.replace_windows(catalog);
-        assert_eq!(state.snapshot.windows.len(), 1);
-        assert_eq!(state.snapshot.windows[0].id, first);
+        state.replace_tabs(catalog);
+        assert_eq!(state.snapshot.tabs.len(), 1);
+        assert_eq!(state.snapshot.tabs[0].id, first);
     }
 
     #[test]
-    fn hover_style_changes_only_the_target_window_operation() {
+    fn hover_style_changes_only_the_target_tab_operation() {
         let mut state = CompanionState::new(Settings::default());
         let first = Uuid::from_u128(11);
         let second = Uuid::from_u128(12);
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: vec![
-                windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![
+                tabs_list::TabListEntry {
                     id: first,
                     name: "one".to_string(),
                     active: false,
                     workspace: "default".to_string(),
                     workspace_id: uuid::Uuid::nil(),
                 },
-                windows_list::WindowListEntry {
+                tabs_list::TabListEntry {
                     id: second,
                     name: "two".to_string(),
                     active: false,
@@ -2737,7 +2713,7 @@ bar_bg = "#112233"
         });
         state.local_presentation.viewport_cols = 80;
         let before = build_surface(&state, 1);
-        state.hovered_window_id = Some(second);
+        state.hovered_tab_id = Some(second);
         let after = build_surface(&state, 2);
         let before_second = before
             .ops
@@ -2765,11 +2741,11 @@ bar_bg = "#112233"
         let mut state = CompanionState::new(Settings::default());
         state.surfaces = std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64));
         state.local_presentation.viewport_cols = 80;
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: (0..20)
-                .map(|index| windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: (0..20)
+                .map(|index| tabs_list::TabListEntry {
                     id: Uuid::from_u128(index),
-                    name: format!("long-window-{index}"),
+                    name: format!("long-tab-{index}"),
                     active: index == 0,
                     workspace: "default".to_string(),
                     workspace_id: Uuid::nil(),
@@ -2797,7 +2773,7 @@ bar_bg = "#112233"
             let state = guard.as_ref().unwrap();
             assert_eq!(state.scroll_offset, 1);
             assert_eq!(
-                projected_bar(state).window_ranges()[0].window_id,
+                projected_bar(state).tab_ranges()[0].tab_id,
                 Uuid::from_u128(1)
             );
             drop(guard);
@@ -2808,7 +2784,7 @@ bar_bg = "#112233"
         let state = guard.as_ref().unwrap();
         assert_eq!(state.scroll_offset, 0);
         assert_eq!(
-            projected_bar(state).window_ranges()[0].window_id,
+            projected_bar(state).tab_ranges()[0].tab_id,
             Uuid::from_u128(0)
         );
         drop(guard);
@@ -2819,11 +2795,7 @@ bar_bg = "#112233"
         let mut guard = owner.lock().unwrap();
         let state = guard.as_mut().unwrap();
         assert_eq!(
-            projected_bar(state)
-                .window_ranges()
-                .last()
-                .unwrap()
-                .window_id,
+            projected_bar(state).tab_ranges().last().unwrap().tab_id,
             Uuid::from_u128(19)
         );
         let stopped_at = state.scroll_offset;
@@ -2843,17 +2815,17 @@ bar_bg = "#112233"
     }
 
     #[test]
-    fn overflow_window_keeps_active_tab_visible_and_bounded() {
+    fn overflow_tab_keeps_active_tab_visible_and_bounded() {
         let settings = Settings {
             maximum_visible_tabs: Some(2),
             ..Settings::default()
         };
         let mut state = CompanionState::new(settings);
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: (0..5)
-                .map(|index| windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: (0..5)
+                .map(|index| tabs_list::TabListEntry {
                     id: Uuid::from_u128(index),
-                    name: format!("window-{index}"),
+                    name: format!("tab-{index}"),
                     active: index == 4,
                     workspace: "default".to_string(),
                     workspace_id: uuid::Uuid::nil(),
@@ -2863,64 +2835,60 @@ bar_bg = "#112233"
         });
         assert!(!state.manual_scroll);
         assert_eq!(
-            projected_bar(&state)
-                .window_ranges()
-                .last()
-                .unwrap()
-                .window_id,
+            projected_bar(&state).tab_ranges().last().unwrap().tab_id,
             Uuid::from_u128(4)
         );
         state.manual_scroll = true;
         state.scroll_offset = 1;
         let mut updated = state.snapshot.clone();
         updated.revision += 1;
-        state.replace_windows(updated.clone());
+        state.replace_tabs(updated.clone());
         assert!(state.manual_scroll);
         assert_eq!(state.scroll_offset, 1);
-        updated.windows.swap(0, 1);
+        updated.tabs.swap(0, 1);
         updated.revision += 1;
-        state.replace_windows(updated.clone());
+        state.replace_tabs(updated.clone());
         assert!(state.manual_scroll);
         assert_eq!(state.scroll_offset, 0, "anchor follows stable tab identity");
-        updated.windows.swap(0, 1);
-        updated.windows[4].active = false;
-        updated.windows[0].active = true;
+        updated.tabs.swap(0, 1);
+        updated.tabs[4].active = false;
+        updated.tabs[0].active = true;
         updated.revision += 1;
-        state.replace_windows(updated.clone());
+        state.replace_tabs(updated.clone());
         assert!(
             !state.manual_scroll,
             "selection changes restore active reveal"
         );
-        updated.windows[0].active = false;
-        updated.windows[4].active = true;
+        updated.tabs[0].active = false;
+        updated.tabs[4].active = true;
         updated.revision += 1;
-        state.replace_windows(updated);
+        state.replace_tabs(updated);
         state.manual_scroll = true;
         state.scroll_offset = 0;
         let scrolled = build_surface(&state, 1);
-        let scrolled_windows: Vec<_> = scrolled
+        let scrolled_tabs: Vec<_> = scrolled
             .interactive_regions
             .iter()
-            .filter(|region| region.local_id.starts_with("window:"))
+            .filter(|region| region.local_id.starts_with("tab:"))
             .map(|region| region.local_id.as_str())
             .collect();
         assert_eq!(
-            scrolled_windows,
+            scrolled_tabs,
             vec![
-                format!("window:{}", Uuid::from_u128(0)),
-                format!("window:{}", Uuid::from_u128(1)),
+                format!("tab:{}", Uuid::from_u128(0)),
+                format!("tab:{}", Uuid::from_u128(1)),
             ]
         );
         state.manual_scroll = false;
         let surface = build_surface(&state, 1);
-        let windows: Vec<_> = surface
+        let tabs: Vec<_> = surface
             .interactive_regions
             .iter()
-            .filter(|region| region.local_id.starts_with("window:"))
+            .filter(|region| region.local_id.starts_with("tab:"))
             .map(|region| region.local_id.as_str())
             .collect();
-        assert_eq!(windows.len(), 2);
-        assert_eq!(windows[1], format!("window:{}", Uuid::from_u128(4)));
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[1], format!("tab:{}", Uuid::from_u128(4)));
         assert!(
             surface
                 .ops
@@ -2930,15 +2898,15 @@ bar_bg = "#112233"
     }
 
     #[test]
-    fn visible_window_lookup_accounts_for_overflow_marker() {
+    fn visible_tab_lookup_accounts_for_overflow_marker() {
         let settings = Settings {
             maximum_visible_tabs: Some(2),
             ..Settings::default()
         };
         let mut state = CompanionState::new(settings);
         state.scroll_offset = 1;
-        state.snapshot.windows = (0..4)
-            .map(|index| windows_list::WindowListEntry {
+        state.snapshot.tabs = (0..4)
+            .map(|index| tabs_list::TabListEntry {
                 id: Uuid::from_u128(index),
                 name: format!("w{index}"),
                 active: index == 2,
@@ -2950,10 +2918,10 @@ bar_bg = "#112233"
         let second_region = surface
             .interactive_regions
             .iter()
-            .find(|region| region.local_id == format!("window:{}", Uuid::from_u128(2)))
-            .expect("active window region");
+            .find(|region| region.local_id == format!("tab:{}", Uuid::from_u128(2)))
+            .expect("active tab region");
         assert_eq!(
-            projected_bar(&state).window_at_col(second_region.rect.x),
+            projected_bar(&state).tab_at_col(second_region.rect.x),
             Some(Uuid::from_u128(2))
         );
     }
@@ -2974,11 +2942,11 @@ bar_bg = "#112233"
     }
 
     #[test]
-    fn surface_uses_stable_window_regions() {
+    fn surface_uses_stable_tab_regions() {
         let mut state = CompanionState::new(Settings::default());
         let id = Uuid::from_u128(7);
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: vec![windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![tabs_list::TabListEntry {
                 id,
                 name: "main".to_string(),
                 active: true,
@@ -2992,10 +2960,7 @@ bar_bg = "#112233"
             surface.interactive_regions[0].local_id,
             format!("workspace:{}", Uuid::nil())
         );
-        assert_eq!(
-            surface.interactive_regions[1].local_id,
-            format!("window:{id}")
-        );
+        assert_eq!(surface.interactive_regions[1].local_id, format!("tab:{id}"));
         assert!(surface.accepts_input);
     }
 }

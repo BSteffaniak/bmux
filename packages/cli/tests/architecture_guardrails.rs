@@ -12,7 +12,7 @@ fn production_section(source: &str) -> &str {
 fn assert_no_domain_markers(source: &str, context: &str) {
     let denied = [
         "bmux.permissions",
-        "bmux.windows",
+        "bmux.tabs",
         "permission-query/v1",
         "permission-command/v1",
         "window-query/v1",
@@ -20,9 +20,9 @@ fn assert_no_domain_markers(source: &str, context: &str) {
         // Typed interface ids replacing the legacy `window-*/v1` strings.
         // Core and CLI-runtime code must stay domain-agnostic; only the
         // windows plugin references these.
-        "windows-state",
-        "windows-commands",
-        "windows-events",
+        "tabs-state",
+        "tabs-commands",
+        "tabs-events",
         "Request::NewWindow",
         "Request::ListWindows",
         "Request::KillWindow",
@@ -55,7 +55,7 @@ fn assert_no_cluster_domain_markers(source: &str, context: &str) {
         "ClusterId",
         "NodeId",
         "WorkspaceId",
-        "LogicalWindowId",
+        "LogicalTabId",
         "LogicalPaneId",
         "ExecutionGeneration",
         "ClusterGatewayMode",
@@ -232,8 +232,8 @@ fn core_packages_do_not_reference_domain_plugin_markers() {
 fn plugin_production_code_uses_generic_host_api_only() {
     let plugin_sources = [
         (
-            "plugins/windows-plugin/src/lib.rs",
-            include_str!("../../../plugins/windows-plugin/src/lib.rs"),
+            "plugins/tabs-plugin/src/lib.rs",
+            include_str!("../../../plugins/tabs-plugin/src/lib.rs"),
         ),
         (
             "plugins/permissions-plugin/src/lib.rs",
@@ -433,7 +433,7 @@ fn plugin_host_crate_does_not_import_plugin_api_crates() {
         "bmux_sessions_plugin_api",
         "bmux_contexts_plugin_api",
         "bmux_clients_plugin_api",
-        "bmux_windows_plugin_api",
+        "bmux_tabs_plugin_api",
         "bmux_permissions_plugin_api",
         "bmux_pane_runtime_plugin_api",
     ] {
@@ -1316,7 +1316,7 @@ fn bmux_client_is_pure_protocol() {
         "bmux_recording_plugin_api",
         "bmux_performance_plugin_api",
         "bmux_control_catalog_plugin_api",
-        "bmux_windows_plugin_api",
+        "bmux_tabs_plugin_api",
         "bmux_decoration_plugin_api",
         "bmux_pane_runtime_plugin_api",
     ];
@@ -3223,7 +3223,7 @@ fn host_runtime_api_remains_domain_neutral() {
         "fn client",
         "fn pane",
         "fn permission",
-        "bmux_windows_plugin_api",
+        "bmux_tabs_plugin_api",
     ] {
         assert!(
             !trait_body.contains(denied),
@@ -3260,11 +3260,11 @@ fn plugin_presentation_primitives_remain_domain_neutral() {
     ];
     let denied = [
         "AttachTab",
-        "tab_strip",
-        "tab-strip",
+        "tab_bar",
+        "tab-bar",
         "sidebar",
-        "windows-list",
-        "bmux.windows",
+        "tabs-list",
+        "bmux.tabs",
         "status_top_inset",
         "status_bottom_inset",
         "HitRole::Decoration",
@@ -3315,17 +3315,17 @@ fn removed_attach_status_architecture_stays_removed() {
 #[test]
 fn presentation_plugins_own_product_projection_and_interaction() {
     let repo = repo_root();
-    let tab = std::fs::read_to_string(repo.join("plugins/tab-strip-plugin/src/lib.rs"))
-        .expect("tab-strip plugin source");
+    let tab = std::fs::read_to_string(repo.join("plugins/tab-bar-plugin/src/lib.rs"))
+        .expect("tab-bar plugin source");
     let sidebar = std::fs::read_to_string(repo.join("plugins/sidebar-plugin/src/lib.rs"))
         .expect("sidebar plugin source");
     for required in [
         "label_template",
-        "move_window",
-        "rename_window_by_id",
+        "move_tab",
+        "rename_tab_by_id",
         "show_compact_facts",
     ] {
-        assert!(tab.contains(required), "tab-strip must own {required}");
+        assert!(tab.contains(required), "tab-bar must own {required}");
     }
     for required in [
         "title_template",
@@ -3352,8 +3352,8 @@ fn presentation_plugins_own_product_projection_and_interaction() {
         for denied in [
             "label_template",
             "title_template",
-            "rename_window_by_id",
-            "WindowMovePlacement",
+            "rename_tab_by_id",
+            "TabMovePlacement",
         ] {
             assert!(
                 !production_section(source).contains(denied),

@@ -20,7 +20,7 @@ use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRole,
     global_presentation_fact_host_service,
 };
-use bmux_windows_plugin_api::{windows_commands, windows_list};
+use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
@@ -62,7 +62,7 @@ impl Default for Settings {
             maximum_width: 60,
             order: 200,
             show_index: true,
-            heading: "Windows".to_string(),
+            heading: "Tabs".to_string(),
             title_template: "{marker} {index}{name}".to_string(),
             description_template: String::new(),
             status_template: String::new(),
@@ -182,8 +182,8 @@ struct CompanionState {
     allocation_publication_pending: bool,
     settings: Settings,
     revision: u64,
-    snapshot: windows_list::WindowListSnapshot,
-    hovered_window_id: Option<Uuid>,
+    snapshot: tabs_list::TabListSnapshot,
+    hovered_tab_id: Option<Uuid>,
     scroll: bmux_tui_components::scroll_view::ScrollViewState,
     measured_items: std::cell::RefCell<std::collections::BTreeMap<Uuid, MeasuredSidebarItem>>,
 }
@@ -208,11 +208,11 @@ impl CompanionState {
             allocation_publication_pending: false,
             settings,
             revision: 0,
-            snapshot: windows_list::WindowListSnapshot {
-                windows: Vec::new(),
+            snapshot: tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
                 revision: 0,
             },
-            hovered_window_id: None,
+            hovered_tab_id: None,
             scroll: bmux_tui_components::scroll_view::ScrollViewState::new(),
             measured_items: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
@@ -236,12 +236,7 @@ impl CompanionState {
             &mut self.scroll,
             0,
         );
-        if let Some(index) = self
-            .snapshot
-            .windows
-            .iter()
-            .position(|window| window.active)
-        {
+        if let Some(index) = self.snapshot.tabs.iter().position(|tab| tab.active) {
             self.reveal(index);
         }
         true
@@ -320,7 +315,7 @@ impl CompanionState {
             }
             let content = fields
                 .iter()
-                .fold(Column::new().id(format!("window:{id}")), |column, field| {
+                .fold(Column::new().id(format!("tab:{id}")), |column, field| {
                     column.child(field.clone())
                 });
             let layout = content.layout(
@@ -342,20 +337,20 @@ impl CompanionState {
         std::cell::Ref::map(self.measured_items.borrow(), |items| &items[&id])
     }
 
-    fn measured_window(&self, index: usize) -> std::cell::Ref<'_, MeasuredSidebarItem> {
-        let window = &self.snapshot.windows[index];
-        let fact = window_fact(window);
+    fn measured_tab(&self, index: usize) -> std::cell::Ref<'_, MeasuredSidebarItem> {
+        let tab = &self.snapshot.tabs[index];
+        let fact = tab_fact(tab);
         let render = |template: &str| {
             render_template(
                 template,
-                window,
+                tab,
                 index,
                 self.settings.show_index,
                 fact.as_ref(),
             )
         };
         self.measure_item(
-            window.id,
+            tab.id,
             render(&self.settings.title_template),
             render(&self.settings.description_template),
             render(&self.settings.status_template),
@@ -369,8 +364,8 @@ impl CompanionState {
             LayoutId::new("sidebar.items"),
             LogicalSize::new(u64::from(self.settings.width), 0),
         );
-        for index in 0..self.snapshot.windows.len() {
-            let item = self.measured_window(index);
+        for index in 0..self.snapshot.tabs.len() {
+            let item = self.measured_tab(index);
             let y = content.size.height;
             content.size.height = y.saturating_add(item.layout.size.height);
             content
@@ -408,24 +403,19 @@ impl CompanionState {
         );
     }
 
-    fn replace_windows(&mut self, snapshot: windows_list::WindowListSnapshot) {
+    fn replace_tabs(&mut self, snapshot: tabs_list::TabListSnapshot) {
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
             self.measured_items
                 .get_mut()
-                .retain(|id, _| self.snapshot.windows.iter().any(|window| window.id == *id));
+                .retain(|id, _| self.snapshot.tabs.iter().any(|tab| tab.id == *id));
             let layout = self.scroll_layout();
             bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
                 &layout,
                 &mut self.scroll,
                 0,
             );
-            if let Some(active) = self
-                .snapshot
-                .windows
-                .iter()
-                .position(|window| window.active)
-            {
+            if let Some(active) = self.snapshot.tabs.iter().position(|tab| tab.active) {
                 self.reveal(active);
             }
             self.revision = self.revision.saturating_add(1).max(1);
@@ -559,7 +549,7 @@ impl SidebarPresentation {
     ///
     /// # Errors
     /// Returns state-lock or surface-publication errors.
-    pub fn publish(&self, snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
+    pub fn publish(&self, snapshot: tabs_list::TabListSnapshot) -> Result<(), String> {
         publish_for_installation(&self.owner, snapshot)
     }
 }
@@ -675,7 +665,7 @@ fn register_input_callbacks(
     );
 }
 
-/// Subscribe the configured companion to authoritative window state.
+/// Subscribe the configured companion to authoritative tab state.
 ///
 /// # Errors
 ///
@@ -697,8 +687,8 @@ fn start_for_installation(
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("sidebar companion requires an async runtime: {error}"))?;
     let (initial, mut receiver) = bus
-        .subscribe_state::<windows_list::WindowListSnapshot>(&windows_list::STATE_KIND)
-        .map_err(|error| format!("subscribing to windows list: {error}"))?;
+        .subscribe_state::<tabs_list::TabListSnapshot>(&tabs_list::STATE_KIND)
+        .map_err(|error| format!("subscribing to tabs list: {error}"))?;
     publish_for_installation(owner, initial.as_ref().clone())?;
     let mut guard = owner
         .lock()
@@ -755,19 +745,19 @@ fn layout_request(settings: &Settings) -> PluginLayoutRequest {
 }
 
 #[cfg(test)]
-fn publish(snapshot: windows_list::WindowListSnapshot) -> Result<(), String> {
+fn publish(snapshot: tabs_list::TabListSnapshot) -> Result<(), String> {
     publish_for_installation(&state(), snapshot)
 }
 
 fn publish_for_installation(
     owner: &CompanionHandle,
-    snapshot: windows_list::WindowListSnapshot,
+    snapshot: tabs_list::TabListSnapshot,
 ) -> Result<(), String> {
     let mut guard = owner
         .lock()
         .map_err(|_| "sidebar state lock poisoned".to_string())?;
     if let Some(companion) = guard.as_mut() {
-        companion.replace_windows(snapshot);
+        companion.replace_tabs(snapshot);
         return publish_companion(companion);
     }
     drop(guard);
@@ -817,8 +807,8 @@ fn truncate_to_width(value: &str, maximum: usize) -> String {
     result
 }
 
-fn window_fact(window: &windows_list::WindowListEntry) -> Option<PresentationFact> {
-    let entity = PresentationEntityRef::new("bmux.windows", window.id.to_string());
+fn tab_fact(tab: &tabs_list::TabListEntry) -> Option<PresentationFact> {
+    let entity = PresentationEntityRef::new("bmux.tabs", tab.id.to_string());
     global_presentation_fact_host_service()
         .registry()
         .facts_for_entity(&entity)
@@ -861,7 +851,7 @@ const fn fact_style(role: PresentationFactRole, fallback: RenderStyle) -> Render
 
 fn render_template(
     template: &str,
-    window: &windows_list::WindowListEntry,
+    tab: &tabs_list::TabListEntry,
     index: usize,
     show_index: bool,
     fact: Option<&PresentationFact>,
@@ -869,7 +859,7 @@ fn render_template(
     const MARKER_TOKEN: &str = concat!("{", "marker}");
     const INDEX_TOKEN: &str = concat!("{", "index}");
     const FACT_TOKEN: &str = concat!("{", "fact}");
-    let marker = if window.active { "●" } else { "○" };
+    let marker = if tab.active { "●" } else { "○" };
     let index = if show_index {
         format!("{} ", index.saturating_add(1))
     } else {
@@ -880,9 +870,9 @@ fn render_template(
         .replace("}}", "\u{1}")
         .replace(MARKER_TOKEN, marker)
         .replace(INDEX_TOKEN, &index)
-        .replace("{name}", &window.name)
-        .replace("{id}", &window.id.to_string())
-        .replace("{active}", if window.active { "active" } else { "idle" })
+        .replace("{name}", &tab.name)
+        .replace("{id}", &tab.id.to_string())
+        .replace("{active}", if tab.active { "active" } else { "idle" })
         .replace(FACT_TOKEN, fact.map_or("", |fact| fact.short_text.as_str()))
         .replace(
             "{fact_detail}",
@@ -995,7 +985,7 @@ const fn sidebar_title_style(
 
 fn sidebar_region(id: Uuid, width: u16, row: u16, height: u16) -> PluginSurfaceRegion {
     PluginSurfaceRegion::new(
-        format!("window:{id}"),
+        format!("tab:{id}"),
         ExtensionRect::new(1, row, width.saturating_sub(2), height.max(1)),
     )
     .endpoint(input_endpoint())
@@ -1025,7 +1015,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         ),
         RenderOp::text_run(2, 0, format!(" {} ", state.settings.heading), active),
     ];
-    let mut regions = Vec::with_capacity(state.snapshot.windows.len());
+    let mut regions = Vec::with_capacity(state.snapshot.tabs.len());
     let layout = state.scroll_layout();
     let visible = state.scroll.vertical_offset()
         ..state
@@ -1033,7 +1023,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
             .vertical_offset()
             .saturating_add(layout.size.height);
     let mut row = 1_u16;
-    for (index, window) in state.snapshot.windows.iter().enumerate() {
+    for (index, tab) in state.snapshot.tabs.iter().enumerate() {
         let item = &layout.children[0].node.children[index];
         let item_end = item.y.saturating_add(item.node.size.height);
         let Some(projected) =
@@ -1041,31 +1031,31 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         else {
             continue;
         };
-        let fact = window_fact(window);
+        let fact = tab_fact(tab);
         let start_row = u16::try_from(projected.start + 1).unwrap_or(u16::MAX);
-        let measured = state.measured_window(index);
+        let measured = state.measured_tab(index);
         let item_style = fact.as_ref().map_or_else(
             || {
                 sidebar_title_style(
-                    window.active,
-                    state.hovered_window_id == Some(window.id),
+                    tab.active,
+                    state.hovered_tab_id == Some(tab.id),
                     active,
                     inactive,
                 )
             },
-            |fact| fact_style(fact.role, if window.active { active } else { inactive }),
+            |fact| fact_style(fact.role, if tab.active { active } else { inactive }),
         );
         for (field, child) in measured.fields.iter().zip(&measured.layout.children) {
             let style = match child.node.id.as_str() {
                 "title" => item_style,
-                "status" if window.active => active,
+                "status" if tab.active => active,
                 _ => inactive.dim(),
             };
             paint_sidebar_field(field, child, &(item.y, visible.clone()), style, &mut ops);
         }
         row = u16::try_from(projected.end + 1).unwrap_or(u16::MAX);
         regions.push(sidebar_region(
-            window.id,
+            tab.id,
             width,
             start_row,
             row.saturating_sub(start_row),
@@ -1092,7 +1082,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
 fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let target = event
         .hook_id
-        .strip_prefix("bmux.sidebar:sidebar:window:")
+        .strip_prefix("bmux.sidebar:sidebar:tab:")
         .and_then(|target| Uuid::parse_str(target).ok());
     let hovered = match event.phase.as_str() {
         "enter" | "move" => target,
@@ -1105,10 +1095,10 @@ fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let Some(companion) = guard.as_mut() else {
         return false;
     };
-    if companion.hovered_window_id == hovered {
+    if companion.hovered_tab_id == hovered {
         return false;
     }
-    companion.hovered_window_id = hovered;
+    companion.hovered_tab_id = hovered;
     companion.revision = companion.revision.saturating_add(1).max(1);
     publish_companion(companion).is_ok()
 }
@@ -1143,29 +1133,27 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
     }
     let target = event
         .hook_id
-        .strip_prefix("bmux.sidebar:sidebar:window:")
+        .strip_prefix("bmux.sidebar:sidebar:tab:")
         .and_then(|target| Uuid::parse_str(target).ok())?;
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     let index = companion
         .snapshot
-        .windows
+        .tabs
         .iter()
-        .position(|window| window.id == target)?;
+        .position(|tab| tab.id == target)?;
     match event.key.as_deref()? {
         "up" => {
             let next = index.saturating_sub(1);
             companion.reveal(next);
-            companion.hovered_window_id =
-                companion.snapshot.windows.get(next).map(|window| window.id);
+            companion.hovered_tab_id = companion.snapshot.tabs.get(next).map(|tab| tab.id);
         }
         "down" => {
             let next = index
                 .saturating_add(1)
-                .min(companion.snapshot.windows.len().saturating_sub(1));
+                .min(companion.snapshot.tabs.len().saturating_sub(1));
             companion.reveal(next);
-            companion.hovered_window_id =
-                companion.snapshot.windows.get(next).map(|window| window.id);
+            companion.hovered_tab_id = companion.snapshot.tabs.get(next).map(|tab| tab.id);
         }
         _ => return None,
     }
@@ -1218,11 +1206,11 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
     if !activate_key && !activate_pointer {
         return AttachInputResult::default();
     }
-    let Some(target) = event.hook_id.strip_prefix("bmux.sidebar:sidebar:window:") else {
+    let Some(target) = event.hook_id.strip_prefix("bmux.sidebar:sidebar:tab:") else {
         return AttachInputResult::default();
     };
     let mut client = ServiceCallerDispatchClient::new(context);
-    match block_on_typed_dispatch(windows_commands::client::switch_window(
+    match block_on_typed_dispatch(tabs_commands::client::switch_tab(
         &mut client,
         target.to_string(),
     )) {
@@ -1233,12 +1221,12 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
         },
         Ok(Err(error)) => AttachInputResult {
             consumed: true,
-            status_message: Some(format!("window switch failed: {error:?}")),
+            status_message: Some(format!("tab switch failed: {error:?}")),
             ..AttachInputResult::default()
         },
         Err(error) => AttachInputResult {
             consumed: true,
-            status_message: Some(format!("window switch unavailable: {error}")),
+            status_message: Some(format!("tab switch unavailable: {error}")),
             ..AttachInputResult::default()
         },
     }
@@ -1254,8 +1242,8 @@ mod tests {
     fn republish_advances_past_retained_owner_revision() {
         uninstall();
         install(None).expect("install sidebar");
-        publish(windows_list::WindowListSnapshot {
-            windows: Vec::new(),
+        publish(tabs_list::TabListSnapshot {
+            tabs: Vec::new(),
             revision: 0,
         })
         .expect("initial publish");
@@ -1269,8 +1257,8 @@ mod tests {
             )
             .expect("seed higher owner revision");
 
-        publish(windows_list::WindowListSnapshot {
-            windows: Vec::new(),
+        publish(tabs_list::TabListSnapshot {
+            tabs: Vec::new(),
             revision: 1,
         })
         .expect("republish above retained revision");
@@ -1284,8 +1272,8 @@ mod tests {
         let foreign_identity = std::sync::Arc::new(Mutex::new(None));
         publish_for_installation(
             &foreign_identity,
-            windows_list::WindowListSnapshot {
-                windows: Vec::new(),
+            tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
                 revision: 99,
             },
         )
@@ -1364,8 +1352,8 @@ mod tests {
     }
 
     #[test]
-    fn templates_escape_braces_and_expand_stable_window_fields() {
-        let window = windows_list::WindowListEntry {
+    fn templates_escape_braces_and_expand_stable_tab_fields() {
+        let tab = tabs_list::TabListEntry {
             id: Uuid::from_u128(10),
             name: "build".to_string(),
             active: true,
@@ -1373,14 +1361,14 @@ mod tests {
             workspace_id: uuid::Uuid::nil(),
         };
         assert_eq!(
-            render_template("{{literal}} {index}{name} {active}", &window, 1, true, None,),
+            render_template("{{literal}} {index}{name} {active}", &tab, 1, true, None,),
             "{literal} 2 build active"
         );
     }
 
     #[test]
     fn semantic_fact_populates_templates_and_style_role() {
-        let window = windows_list::WindowListEntry {
+        let tab = tabs_list::TabListEntry {
             id: Uuid::from_u128(20),
             name: "build".to_string(),
             active: false,
@@ -1388,7 +1376,7 @@ mod tests {
             workspace_id: uuid::Uuid::nil(),
         };
         let fact = PresentationFact {
-            entity: PresentationEntityRef::new("bmux.windows", window.id.to_string()),
+            entity: PresentationEntityRef::new("bmux.tabs", tab.id.to_string()),
             key: "activity".to_string(),
             role: PresentationFactRole::Warning,
             short_text: "waiting".to_string(),
@@ -1399,7 +1387,7 @@ mod tests {
         assert_eq!(
             render_template(
                 concat!("{name} ", "{", "fact}", " {fact_detail} {fact_icon}"),
-                &window,
+                &tab,
                 0,
                 true,
                 Some(&fact)
@@ -1427,16 +1415,16 @@ mod tests {
         let mut state = CompanionState::new(Settings::default());
         let first = Uuid::from_u128(11);
         let second = Uuid::from_u128(12);
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: vec![
-                windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![
+                tabs_list::TabListEntry {
                     id: first,
                     name: "one".to_string(),
                     active: false,
                     workspace: "default".to_string(),
                     workspace_id: uuid::Uuid::nil(),
                 },
-                windows_list::WindowListEntry {
+                tabs_list::TabListEntry {
                     id: second,
                     name: "two".to_string(),
                     active: false,
@@ -1447,7 +1435,7 @@ mod tests {
             revision: 1,
         });
         let before = build_surface(&state, 1);
-        state.hovered_window_id = Some(second);
+        state.hovered_tab_id = Some(second);
         let after = build_surface(&state, 2);
         assert_eq!(before.ops[3], after.ops[3]);
         assert_ne!(before.ops[4], after.ops[4]);
@@ -1456,11 +1444,11 @@ mod tests {
     #[tokio::test]
     async fn presentation_subscription_uses_local_bus_and_stops_on_drop() {
         let bus = bmux_plugin::EventBus::new();
-        let snapshot = |revision| windows_list::WindowListSnapshot {
-            windows: Vec::new(),
+        let snapshot = |revision| tabs_list::TabListSnapshot {
+            tabs: Vec::new(),
             revision,
         };
-        bus.register_state_channel(windows_list::STATE_KIND, snapshot(1));
+        bus.register_state_channel(tabs_list::STATE_KIND, snapshot(1));
         let presentation = SidebarPresentation::install(
             None,
             std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4)),
@@ -1481,7 +1469,7 @@ mod tests {
                 .revision,
             1
         );
-        bus.publish_state(&windows_list::STATE_KIND, snapshot(2))
+        bus.publish_state(&tabs_list::STATE_KIND, snapshot(2))
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -1504,7 +1492,7 @@ mod tests {
         .unwrap();
         let owner = presentation.owner.clone();
         drop(presentation);
-        bus.publish_state(&windows_list::STATE_KIND, snapshot(3))
+        bus.publish_state(&tabs_list::STATE_KIND, snapshot(3))
             .unwrap();
         tokio::task::yield_now().await;
         assert!(owner.lock().unwrap().is_none());
@@ -1640,11 +1628,11 @@ mod tests {
             description_template: "description".to_string(),
             ..Settings::default()
         });
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: (0..3)
-                .map(|index| windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: (0..3)
+                .map(|index| tabs_list::TabListEntry {
                     id: Uuid::from_u128(index),
-                    name: format!("window-{index}"),
+                    name: format!("tab-{index}"),
                     active: false,
                     workspace: "default".to_string(),
                     workspace_id: Uuid::nil(),
@@ -1693,17 +1681,17 @@ mod tests {
     }
 
     #[test]
-    fn virtual_window_realigns_to_active_and_bounds_projected_items() {
+    fn virtual_tab_realigns_to_active_and_bounds_projected_items() {
         let settings = Settings {
             maximum_visible_items: 2,
             ..Settings::default()
         };
         let mut state = CompanionState::new(settings);
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: (0..5)
-                .map(|index| windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: (0..5)
+                .map(|index| tabs_list::TabListEntry {
                     id: Uuid::from_u128(index),
-                    name: format!("window-{index}"),
+                    name: format!("tab-{index}"),
                     active: index == 4,
                     workspace: "default".to_string(),
                     workspace_id: uuid::Uuid::nil(),
@@ -1716,7 +1704,7 @@ mod tests {
         assert_eq!(surface.interactive_regions.len(), 2);
         assert_eq!(
             surface.interactive_regions[1].local_id,
-            format!("window:{}", Uuid::from_u128(4))
+            format!("tab:{}", Uuid::from_u128(4))
         );
     }
 
@@ -1726,16 +1714,16 @@ mod tests {
         let first = Uuid::from_u128(31);
         let second = Uuid::from_u128(32);
         let mut state = CompanionState::new(Settings::default());
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: vec![
-                windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![
+                tabs_list::TabListEntry {
                     id: first,
                     name: "one".to_string(),
                     active: false,
                     workspace: "default".to_string(),
                     workspace_id: uuid::Uuid::nil(),
                 },
-                windows_list::WindowListEntry {
+                tabs_list::TabListEntry {
                     id: second,
                     name: "two".to_string(),
                     active: false,
@@ -1753,7 +1741,7 @@ mod tests {
                 bmux_presentation_state::PresentationFactSnapshot {
                     revision: 1,
                     facts: vec![PresentationFact {
-                        entity: PresentationEntityRef::new("bmux.windows", second.to_string()),
+                        entity: PresentationEntityRef::new("bmux.tabs", second.to_string()),
                         key: "activity".to_string(),
                         role: PresentationFactRole::Warning,
                         short_text: "waiting".to_string(),
@@ -1784,11 +1772,11 @@ mod tests {
             ..Settings::default()
         };
         let mut state = CompanionState::new(settings);
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: (0..2_000)
-                .map(|index| windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: (0..2_000)
+                .map(|index| tabs_list::TabListEntry {
                     id: Uuid::from_u128(index),
-                    name: format!("window-{index}"),
+                    name: format!("tab-{index}"),
                     active: index == 1_999,
                     workspace: "default".to_string(),
                     workspace_id: uuid::Uuid::nil(),
@@ -1802,19 +1790,19 @@ mod tests {
             std::hint::black_box(build_surface(&state, u64::from(revision)));
         }
         let average_ns = started.elapsed().as_nanos() / u128::from(iterations);
-        eprintln!("sidebar 2,000-window/32-visible projection average: {average_ns} ns");
+        eprintln!("sidebar 2,000-tab/32-visible projection average: {average_ns} ns");
         assert!(average_ns < 70_000, "projection exceeded 70 us budget");
     }
 
     #[test]
-    fn single_and_large_window_lists_remain_bounded() {
+    fn single_and_large_tab_lists_remain_bounded() {
         let settings = Settings {
             maximum_visible_items: 32,
             ..Settings::default()
         };
         let mut state = CompanionState::new(settings);
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: vec![windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![tabs_list::TabListEntry {
                 id: Uuid::from_u128(50),
                 name: "single".to_string(),
                 active: true,
@@ -1825,11 +1813,11 @@ mod tests {
         });
         assert_eq!(build_surface(&state, 1).interactive_regions.len(), 1);
 
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: (0..2_000)
-                .map(|index| windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: (0..2_000)
+                .map(|index| tabs_list::TabListEntry {
                     id: Uuid::from_u128(index),
-                    name: format!("window-{index}"),
+                    name: format!("tab-{index}"),
                     active: index == 1_999,
                     workspace: "default".to_string(),
                     workspace_id: uuid::Uuid::nil(),
@@ -1848,8 +1836,8 @@ mod tests {
             content_height: true,
             ..Settings::default()
         });
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: vec![windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![tabs_list::TabListEntry {
                 id: Uuid::from_u128(40),
                 name: "one".to_string(),
                 active: true,
@@ -1869,11 +1857,11 @@ mod tests {
     }
 
     #[test]
-    fn surface_uses_one_stable_region_per_window() {
+    fn surface_uses_one_stable_region_per_tab() {
         let mut state = CompanionState::new(Settings::default());
         let id = Uuid::from_u128(9);
-        state.replace_windows(windows_list::WindowListSnapshot {
-            windows: vec![windows_list::WindowListEntry {
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![tabs_list::TabListEntry {
                 id,
                 name: "main".to_string(),
                 active: true,
@@ -1883,10 +1871,7 @@ mod tests {
             revision: 1,
         });
         let surface = build_surface(&state, 1);
-        assert_eq!(
-            surface.interactive_regions[0].local_id,
-            format!("window:{id}")
-        );
+        assert_eq!(surface.interactive_regions[0].local_id, format!("tab:{id}"));
         assert!(surface.accepts_input);
     }
 }

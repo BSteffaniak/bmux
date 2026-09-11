@@ -1,17 +1,17 @@
-[plugins.settings."bmux.tab_strip"]
+[plugins.settings."bmux.tab_bar"]
 tab_template = "<{name}>"
 
 [keybindings]
 initial_mode = "normal"
 
 [keybindings.global]
-"alt+1" = "plugin:bmux.windows:goto-window 1"
-"alt+2" = "plugin:bmux.windows:goto-window 2"
+"alt+1" = "plugin:bmux.tabs:goto-tab 1"
+"alt+2" = "plugin:bmux.tabs:goto-tab 2"
 "alt+c" = "plugin:bmux.sessions:new-session"
 "alt+f" = "plugin:bmux.finder:show"
-"alt+h" = "plugin:bmux.windows:prev-window"
-"alt+j" = "plugin:bmux.windows:next-window"
-"alt+k" = "plugin:bmux.windows:last-window"
+"alt+h" = "plugin:bmux.tabs:prev-tab"
+"alt+j" = "plugin:bmux.tabs:next-tab"
+"alt+k" = "plugin:bmux.tabs:last-tab"
 "alt+l" = "plugin:bmux.workspaces:last-workspace"
 "alt+w" = "plugin:bmux.workspaces:new-workspace"
 
@@ -20,9 +20,9 @@ label       = "NORMAL"
 passthrough = true
 
 [keybindings.modes.normal.bindings]
-"c"       = "plugin:bmux.windows:new-window"
-"g"       = "plugin:bmux.windows:goto-window 1"
-"l"       = "plugin:bmux.windows:last-window"
-"n"       = "plugin:bmux.windows:next-window"
-"p"       = "plugin:bmux.windows:prev-window"
-"shift+1" = "plugin:bmux.windows:goto-window 1"
+"c"       = "plugin:bmux.tabs:new-tab"
+"g"       = "plugin:bmux.tabs:goto-tab 1"
+"l"       = "plugin:bmux.tabs:last-tab"
+"n"       = "plugin:bmux.tabs:next-tab"
+"p"       = "plugin:bmux.tabs:prev-tab"
+"shift+1" = "plugin:bmux.tabs:goto-tab 1"

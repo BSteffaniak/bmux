@@ -27,12 +27,12 @@
 //! At the call site, plugin-api crates emit one `const` per identifier:
 //!
 //! ```ignore
-//! // Generated from BPDL for `plugin bmux.windows`:
-//! pub mod windows_events {
+//! // Generated from BPDL for `plugin bmux.tabs`:
+//! pub mod tabs_events {
 //!     pub const INTERFACE_ID: bmux_plugin_sdk::InterfaceId =
-//!         bmux_plugin_sdk::InterfaceId::from_static("windows-events");
+//!         bmux_plugin_sdk::InterfaceId::from_static("tabs-events");
 //!     pub const EVENT_KIND: bmux_plugin_sdk::PluginEventKind =
-//!         bmux_plugin_sdk::PluginEventKind::from_static("bmux.windows/windows-events");
+//!         bmux_plugin_sdk::PluginEventKind::from_static("bmux.tabs/tabs-events");
 //! }
 //! ```
 //!
@@ -53,7 +53,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// subscriber a compile-time-checked identifier without baking any
 /// domain knowledge into core. The underlying wire representation is a
 /// plain string of the form `"<namespace>/<stream-name>"`, for example
-/// `"bmux.windows/pane-event"`.
+/// `"bmux.tabs/pane-event"`.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct PluginEventKind(Cow<'static, str>);
 
@@ -321,7 +321,7 @@ impl<'de> Deserialize<'de> for OperationId {
 ///
 /// Capabilities gate access to host primitives (for example,
 /// `bmux.storage.read`) and to other plugins' typed services (for
-/// example, `bmux.windows.write`, which an unrelated plugin needs in
+/// example, `bmux.tabs.write`, which an unrelated plugin needs in
 /// order to invoke any mutating operation on the windows plugin's
 /// services). Plugin-api crates emit `CapabilityId` constants so
 /// consumers don't hand-type capability strings.
@@ -419,12 +419,12 @@ mod tests {
 
     #[test]
     fn interface_id_roundtrips_through_json() {
-        const ID: InterfaceId = InterfaceId::from_static("windows-events");
+        const ID: InterfaceId = InterfaceId::from_static("tabs-events");
         let json = serde_json::to_string(&ID).expect("serialize");
-        assert_eq!(json, "\"windows-events\"");
+        assert_eq!(json, "\"tabs-events\"");
         let decoded: InterfaceId = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, ID);
-        assert_eq!(decoded.as_str(), "windows-events");
+        assert_eq!(decoded.as_str(), "tabs-events");
     }
 
     #[test]

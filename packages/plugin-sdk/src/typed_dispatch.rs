@@ -1,6 +1,6 @@
 //! Typed interface dispatch for plugin-to-plugin calls.
 //!
-//! BPDL schemas generate typed service traits (e.g. `WindowsStateService`)
+//! BPDL schemas generate typed service traits (e.g. `TabsStateService`)
 //! that plugins implement and consume. This module provides the primitives
 //! that bridge those typed traits to the untyped [`crate::ServiceRequest`]
 //! / [`crate::ServiceResponse`] transport the plugin host already speaks.
@@ -8,7 +8,7 @@
 //! # Model
 //!
 //! - The **provider** plugin implements the BPDL-generated service trait
-//!   (e.g. `impl WindowsStateService for MyPlugin`). During plugin init
+//!   (e.g. `impl TabsStateService for MyPlugin`). During plugin init
 //!   the provider registers an `Arc<Self>` as a typed handle via
 //!   [`TypedServiceRegistry`].
 //! - The **consumer** plugin resolves a typed handle via

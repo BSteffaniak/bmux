@@ -780,7 +780,7 @@ id = "one.plugin"
 name = "One"
 version = "0.1.0"
 entry = "one.dylib"
-provided_capabilities = ["bmux.windows.read"]
+provided_capabilities = ["bmux.tabs.read"]
 
 [plugin_api]
 minimum = "1.0"
@@ -796,7 +796,7 @@ id = "two.plugin"
 name = "Two"
 version = "0.1.0"
 entry = "two.dylib"
-provided_capabilities = ["bmux.windows.read"]
+provided_capabilities = ["bmux.tabs.read"]
 
 [plugin_api]
 minimum = "1.0"
@@ -819,7 +819,7 @@ minimum = "1.0"
             .capability_providers_for(&["one.plugin".to_string(), "two.plugin".to_string()], &[])
             .expect("provider selection should succeed");
         let selected = providers
-            .get(&HostScope::new("bmux.windows.read").expect("scope should parse"))
+            .get(&HostScope::new("bmux.tabs.read").expect("scope should parse"))
             .expect("capability should be present");
         assert_eq!(selected.provider.to_string(), "one.plugin");
     }
@@ -870,12 +870,12 @@ name = "One"
 version = "0.1.0"
 entry = "one.dylib"
 provider_priority = 10
-provided_capabilities = ["bmux.windows.read"]
+provided_capabilities = ["bmux.tabs.read"]
 
 [[services]]
-capability = "bmux.windows.read"
+capability = "bmux.tabs.read"
 kind = "query"
-interface_id = "windows-state"
+interface_id = "tabs-state"
 
 [plugin_api]
 minimum = "1.0"
@@ -892,12 +892,12 @@ id = "two.plugin"
 name = "Two"
 version = "0.1.0"
 entry = "two.dylib"
-provided_capabilities = ["bmux.windows.read"]
+provided_capabilities = ["bmux.tabs.read"]
 
 [[services]]
-capability = "bmux.windows.read"
+capability = "bmux.tabs.read"
 kind = "query"
-interface_id = "windows-state"
+interface_id = "tabs-state"
 
 [plugin_api]
 minimum = "1.0"
@@ -920,9 +920,9 @@ minimum = "1.0"
             .service_providers_for(&["one.plugin".to_string(), "two.plugin".to_string()])
             .expect("service provider selection should succeed");
         let key = (
-            HostScope::new("bmux.windows.read").expect("scope should parse"),
+            HostScope::new("bmux.tabs.read").expect("scope should parse"),
             bmux_plugin_sdk::ServiceKind::Query,
-            "windows-state".to_string(),
+            "tabs-state".to_string(),
         );
         let selected = providers
             .get(&key)

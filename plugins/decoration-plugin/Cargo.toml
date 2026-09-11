@@ -21,7 +21,7 @@ bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin                  = { workspace = true }
 bmux_plugin_sdk              = { workspace = true }
 bmux_scene_protocol          = { workspace = true }
-bmux_windows_plugin_api      = { workspace = true }
+bmux_tabs_plugin_api         = { workspace = true }
 mlua                         = { workspace = true, optional = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true }

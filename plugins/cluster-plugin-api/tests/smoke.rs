@@ -13,9 +13,9 @@ use bmux_cluster_plugin_api::{
         ControlCommandRequest, ControlCommandResult, ControlReadConsistency, ControlResourceKind,
         ControlResponse, ControlServiceError, ControlStateView, ControlWorkflowStatus,
         EnrollmentTokenResult, ExecutionAssignment, ExecutionId, LogicalPaneId, LogicalPaneRecord,
-        LogicalWindowId, LogicalWindowRecord, PaneAvailability, PaneRestartPolicy,
-        PeerAuthChallenge, PeerAuthProof, PlacementIntent, PromotionId, RaftRpcRequest,
-        RaftRpcResponse, WorkerAdoptionSpec, WorkerAuthority, WorkerExecution, WorkerExecutionList,
+        LogicalTabId, LogicalTabRecord, PaneAvailability, PaneRestartPolicy, PeerAuthChallenge,
+        PeerAuthProof, PlacementIntent, PromotionId, RaftRpcRequest, RaftRpcResponse,
+        WorkerAdoptionSpec, WorkerAuthority, WorkerExecution, WorkerExecutionList,
         WorkerExecutionState, WorkerLaunchResult, WorkerLaunchSpec, WorkerMutationAck,
         WorkerOperationClass, WorkerOutput, WorkerQueryResult, WorkerServiceError, WorkerSignal,
         WorkerTerminalSnapshot, WorkspaceId, WorkspaceRecord,
@@ -31,7 +31,7 @@ fn generated_control_services_expose_consistency_and_structured_errors() {
         revision: 7,
         members: Vec::new(),
         workspaces: Vec::new(),
-        windows: Vec::new(),
+        tabs: Vec::new(),
         panes: Vec::new(),
         pending_workflows: Vec::new(),
         consistency: ControlReadConsistency::Linearizable,
@@ -112,7 +112,7 @@ fn control_state_contract_uses_typed_ids_and_tagged_commands() {
     let workspace_id = WorkspaceId {
         value: uuid::Uuid::new_v4(),
     };
-    let window_id = LogicalWindowId {
+    let tab_id = LogicalTabId {
         value: uuid::Uuid::new_v4(),
     };
     let pane_id = LogicalPaneId {
@@ -133,8 +133,8 @@ fn control_state_contract_uses_typed_ids_and_tagged_commands() {
         name: Some("ops".to_string()),
         revision: 1,
     };
-    let window = LogicalWindowRecord {
-        window_id: window_id.clone(),
+    let tab = LogicalTabRecord {
+        tab_id: tab_id.clone(),
         workspace_id: workspace_id.clone(),
         name: Some("main".to_string()),
         layout_schema_version: 1,
@@ -144,7 +144,7 @@ fn control_state_contract_uses_typed_ids_and_tagged_commands() {
     let pane = LogicalPaneRecord {
         pane_id: pane_id.clone(),
         workspace_id: workspace_id.clone(),
-        window_id,
+        tab_id,
         name: Some("shell".to_string()),
         restart_policy: PaneRestartPolicy::Manual,
         placement: PlacementIntent {
@@ -162,8 +162,8 @@ fn control_state_contract_uses_typed_ids_and_tagged_commands() {
             workspace_id: workspace.workspace_id,
             name: workspace.name,
         },
-        ControlCommandRequest::PutWindow {
-            window,
+        ControlCommandRequest::PutTab {
+            tab,
             expected_workspace_revision: 1,
         },
         ControlCommandRequest::PutPane {

@@ -7,7 +7,7 @@ pub fn invocation(id: Uuid, name: String) -> Option<super::AttachInputServiceInv
     command_invocation(
         // Keep typed result interpretation in the plugin, not generic attach dispatch.
         bmux_plugin::AttachInputEndpoint {
-            capability: "bmux.tab_strip.input".to_string(),
+            capability: "bmux.tab_bar.input".to_string(),
             interface_id: "presentation-input".to_string(),
             operation: "rename-workspace".to_string(),
         },
@@ -37,8 +37,8 @@ fn begin(companion: &mut CompanionState, id: Uuid, col: u16, row: u16) -> bool {
         Some((id, col, row, now))
     };
     if double {
-        companion.editing_window_id = None;
-        companion.menu_window_id = None;
+        companion.editing_tab_id = None;
+        companion.menu_tab_id = None;
         companion.pointer_source = None;
         companion.pointer_moved = false;
         companion.drag_target = None;
@@ -59,7 +59,7 @@ pub fn handle_pointer(
 ) -> Option<AttachInputResult> {
     let id = event
         .hook_id
-        .strip_prefix("bmux.tab_strip:strip:workspace:")
+        .strip_prefix("bmux.tab_bar:strip:workspace:")
         .and_then(|id| Uuid::parse_str(id).ok())?;
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;

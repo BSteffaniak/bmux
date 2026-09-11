@@ -112,7 +112,7 @@ name = "Example Native Plugin"
 version = "0.0.1-alpha.0"
 runtime = "native"
 entry = "${LIB_PATH}"
-required_capabilities = ["bmux.commands", "bmux.config.read", "bmux.events.subscribe", "bmux.storage", "bmux.permissions.read", "bmux.permissions.write", "bmux.windows.read", "bmux.windows.write"]
+required_capabilities = ["bmux.commands", "bmux.config.read", "bmux.events.subscribe", "bmux.storage", "bmux.permissions.read", "bmux.permissions.write", "bmux.tabs.read", "bmux.tabs.write"]
 provided_features = ["example.native"]
 
 [[dependencies]]
@@ -120,7 +120,7 @@ plugin_id = "bmux.permissions"
 version_req = "=0.0.1-alpha.0"
 
 [[dependencies]]
-plugin_id = "bmux.windows"
+plugin_id = "bmux.tabs"
 version_req = "=0.0.1-alpha.0"
 
 [[commands]]
@@ -210,7 +210,7 @@ summary = "Client UUID"
 value_name = "CLIENT"
 
 [[commands]]
-name = "windows-list"
+name = "tabs-list"
 summary = "List session windows through bmux provider service"
 execution = "provider_exec"
 expose_in_cli = true

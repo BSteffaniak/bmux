@@ -16,7 +16,7 @@ usage() {
 Usage: ./scripts/perf-attach-scenario-matrix.sh [options]
 
 Runs a closed-loop attach scenario matrix and writes one artifact per scenario.
-Scenarios cover next-window, prev-window, goto-window, and new-window across
+Scenarios cover next-tab, prev-tab, goto-tab, and new-tab across
 small and larger tab counts.
 
 Options:
@@ -119,12 +119,12 @@ run_case() {
 		--artifact-json "$artifact"
 }
 
-run_case next-window 2
-run_case next-window 4
-run_case next-window 20
-run_case prev-window 4
-run_case goto-window 4
-run_case goto-window 20
-run_case new-window 2
+run_case next-tab 2
+run_case next-tab 4
+run_case next-tab 20
+run_case prev-tab 4
+run_case goto-tab 4
+run_case goto-tab 20
+run_case new-tab 2
 
 echo "matrix_artifacts=$OUT_DIR"

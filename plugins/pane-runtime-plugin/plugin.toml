@@ -21,7 +21,7 @@ required_capabilities = [
 version = "0.0.1-alpha.0"
 
 [[dependencies]]
-plugin_id   = "bmux.windows"
+plugin_id   = "bmux.tabs"
 required    = false
 version_req = ">=0.0.1-alpha.0"
 

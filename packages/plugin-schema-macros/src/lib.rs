@@ -7,7 +7,7 @@
 //! ```ignore
 //! // Simple schema with no imports.
 //! bmux_plugin_schema_macros::schema! {
-//!     source: "bpdl/windows-plugin.bpdl",
+//!     source: "bpdl/tabs-plugin.bpdl",
 //! }
 //!
 //! // Schema that imports types from another plugin.
@@ -15,8 +15,8 @@
 //!     source: "bpdl/my-plugin.bpdl",
 //!     imports: {
 //!         windows: {
-//!             source: "../windows-plugin-api/bpdl/windows-plugin.bpdl",
-//!             crate_path: ::bmux_windows_plugin_api,
+//!             source: "../tabs-plugin-api/bpdl/tabs-plugin.bpdl",
+//!             crate_path: ::bmux_tabs_plugin_api,
 //!         },
 //!     },
 //! }

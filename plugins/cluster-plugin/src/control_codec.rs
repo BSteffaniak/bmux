@@ -2,8 +2,8 @@ use bmux_cluster_plugin_api::cluster_types::{
     ClusterConsensusRole, ClusterMember, ClusterMemberState, ClusterNegotiatedProtocol,
     ClusterNodeCapabilities, CommandId, ControlCommand, ControlCommandError, ControlCommandRequest,
     ControlCommandResult, ControlResourceKind, ControlResponse, ControlWorkflowStatus,
-    ExecutionAssignment, LogicalPaneRecord, LogicalWindowRecord, PaneAvailability,
-    PaneRestartPolicy, PlacementIntent, PlacementLabel, WorkspaceId, WorkspaceRecord,
+    ExecutionAssignment, LogicalPaneRecord, LogicalTabRecord, PaneAvailability, PaneRestartPolicy,
+    PlacementIntent, PlacementLabel, WorkspaceId, WorkspaceRecord,
 };
 use sha2::{Digest, Sha256};
 
@@ -286,8 +286,8 @@ fn validate_request(request: &ControlCommandRequest) -> Result<(), CodecError> {
         | ControlCommandRequest::RenameWorkspace { name, .. } => {
             validate_optional_string(name.as_deref())
         }
-        ControlCommandRequest::PutWindow { window, .. } => validate_window(window),
-        ControlCommandRequest::RemoveWindow { .. }
+        ControlCommandRequest::PutTab { tab, .. } => validate_tab(tab),
+        ControlCommandRequest::RemoveTab { .. }
         | ControlCommandRequest::RemovePane { .. }
         | ControlCommandRequest::PruneDedup { .. } => Ok(()),
         ControlCommandRequest::PutPane { pane, .. } => validate_pane(pane),
@@ -323,9 +323,9 @@ fn validate_request(request: &ControlCommandRequest) -> Result<(), CodecError> {
     }
 }
 
-fn validate_window(window: &LogicalWindowRecord) -> Result<(), CodecError> {
-    validate_optional_string(window.name.as_deref())?;
-    validate_bytes(&window.layout)
+fn validate_tab(tab: &LogicalTabRecord) -> Result<(), CodecError> {
+    validate_optional_string(tab.name.as_deref())?;
+    validate_bytes(&tab.layout)
 }
 
 fn validate_pane(pane: &LogicalPaneRecord) -> Result<(), CodecError> {
@@ -431,20 +431,20 @@ fn encode_request(writer: &mut Writer, request: &ControlCommandRequest) {
             writer.u64(*expected_revision);
             writer.optional_string(name.as_deref());
         }
-        ControlCommandRequest::PutWindow {
-            window,
+        ControlCommandRequest::PutTab {
+            tab,
             expected_workspace_revision,
         } => {
             writer.u16(5);
-            encode_window(writer, window);
+            encode_tab(writer, tab);
             writer.u64(*expected_workspace_revision);
         }
-        ControlCommandRequest::RemoveWindow {
-            window_id,
+        ControlCommandRequest::RemoveTab {
+            tab_id,
             expected_workspace_revision,
         } => {
             writer.u16(6);
-            writer.uuid(window_id.value);
+            writer.uuid(tab_id.value);
             writer.u64(*expected_workspace_revision);
         }
         ControlCommandRequest::PutPane {
@@ -529,12 +529,12 @@ fn decode_request(reader: &mut Reader<'_>) -> Result<ControlCommandRequest, Code
             expected_revision: reader.u64()?,
             name: reader.optional_string()?,
         },
-        5 => ControlCommandRequest::PutWindow {
-            window: decode_window(reader)?,
+        5 => ControlCommandRequest::PutTab {
+            tab: decode_tab(reader)?,
             expected_workspace_revision: reader.u64()?,
         },
-        6 => ControlCommandRequest::RemoveWindow {
-            window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
+        6 => ControlCommandRequest::RemoveTab {
+            tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId {
                 value: reader.uuid()?,
             },
             expected_workspace_revision: reader.u64()?,
@@ -596,18 +596,18 @@ fn decode_workspace_id(reader: &mut Reader<'_>) -> Result<WorkspaceId, CodecErro
     })
 }
 
-fn encode_window(writer: &mut Writer, window: &LogicalWindowRecord) {
-    writer.uuid(window.window_id.value);
-    encode_workspace_id(writer, &window.workspace_id);
-    writer.optional_string(window.name.as_deref());
-    writer.u32(window.layout_schema_version);
-    writer.bytes(&window.layout);
-    writer.u64(window.revision);
+fn encode_tab(writer: &mut Writer, tab: &LogicalTabRecord) {
+    writer.uuid(tab.tab_id.value);
+    encode_workspace_id(writer, &tab.workspace_id);
+    writer.optional_string(tab.name.as_deref());
+    writer.u32(tab.layout_schema_version);
+    writer.bytes(&tab.layout);
+    writer.u64(tab.revision);
 }
 
-fn decode_window(reader: &mut Reader<'_>) -> Result<LogicalWindowRecord, CodecError> {
-    Ok(LogicalWindowRecord {
-        window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
+fn decode_tab(reader: &mut Reader<'_>) -> Result<LogicalTabRecord, CodecError> {
+    Ok(LogicalTabRecord {
+        tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId {
             value: reader.uuid()?,
         },
         workspace_id: decode_workspace_id(reader)?,
@@ -621,7 +621,7 @@ fn decode_window(reader: &mut Reader<'_>) -> Result<LogicalWindowRecord, CodecEr
 fn encode_pane(writer: &mut Writer, pane: &LogicalPaneRecord) {
     writer.uuid(pane.pane_id.value);
     writer.uuid(pane.workspace_id.value);
-    writer.uuid(pane.window_id.value);
+    writer.uuid(pane.tab_id.value);
     writer.optional_string(pane.name.as_deref());
     encode_restart_policy(writer, pane.restart_policy);
     encode_placement(writer, &pane.placement);
@@ -643,7 +643,7 @@ fn decode_pane(reader: &mut Reader<'_>) -> Result<LogicalPaneRecord, CodecError>
             value: reader.uuid()?,
         },
         workspace_id: decode_workspace_id(reader)?,
-        window_id: bmux_cluster_plugin_api::cluster_types::LogicalWindowId {
+        tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId {
             value: reader.uuid()?,
         },
         name: reader.optional_string()?,
@@ -1029,7 +1029,7 @@ fn encode_resource_kind(writer: &mut Writer, kind: ControlResourceKind) {
     writer.u16(match kind {
         ControlResourceKind::Member => 1,
         ControlResourceKind::Workspace => 2,
-        ControlResourceKind::Window => 3,
+        ControlResourceKind::Tab => 3,
         ControlResourceKind::Pane => 4,
         ControlResourceKind::Execution => 5,
         ControlResourceKind::Workflow => 6,
@@ -1040,7 +1040,7 @@ fn decode_resource_kind(reader: &mut Reader<'_>) -> Result<ControlResourceKind, 
     match reader.u16()? {
         1 => Ok(ControlResourceKind::Member),
         2 => Ok(ControlResourceKind::Workspace),
-        3 => Ok(ControlResourceKind::Window),
+        3 => Ok(ControlResourceKind::Tab),
         4 => Ok(ControlResourceKind::Pane),
         5 => Ok(ControlResourceKind::Execution),
         6 => Ok(ControlResourceKind::Workflow),
@@ -1067,8 +1067,8 @@ impl Writer {
         encode_member(self, member);
     }
 
-    pub(crate) fn encode_state_window(&mut self, window: &LogicalWindowRecord) {
-        encode_window(self, window);
+    pub(crate) fn encode_state_tab(&mut self, tab: &LogicalTabRecord) {
+        encode_tab(self, tab);
     }
 
     pub(crate) fn encode_state_pane(&mut self, pane: &LogicalPaneRecord) {
@@ -1168,8 +1168,8 @@ impl<'a> Reader<'a> {
         decode_member(self)
     }
 
-    pub(crate) fn decode_state_window(&mut self) -> Result<LogicalWindowRecord, CodecError> {
-        decode_window(self)
+    pub(crate) fn decode_state_tab(&mut self) -> Result<LogicalTabRecord, CodecError> {
+        decode_tab(self)
     }
 
     pub(crate) fn decode_state_pane(&mut self) -> Result<LogicalPaneRecord, CodecError> {
@@ -1267,7 +1267,7 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use bmux_cluster_plugin_api::cluster_types::{
-        ControlCommandRequest, ExecutionId, LogicalPaneId, LogicalWindowId,
+        ControlCommandRequest, ExecutionId, LogicalPaneId, LogicalTabId,
     };
 
     fn id(value: u128) -> uuid::Uuid {
@@ -1296,7 +1296,7 @@ mod tests {
         LogicalPaneRecord {
             pane_id: LogicalPaneId { value: id(4) },
             workspace_id: WorkspaceId { value: id(2) },
-            window_id: LogicalWindowId { value: id(3) },
+            tab_id: LogicalTabId { value: id(3) },
             name: Some("shell".to_string()),
             restart_policy: PaneRestartPolicy::Manual,
             placement: PlacementIntent {
@@ -1364,8 +1364,8 @@ mod tests {
             updated_at_unix_ms: 1,
             state: ClusterMemberState::Active,
         };
-        let window = LogicalWindowRecord {
-            window_id: LogicalWindowId { value: id(3) },
+        let tab = LogicalTabRecord {
+            tab_id: LogicalTabId { value: id(3) },
             workspace_id: WorkspaceId { value: id(2) },
             name: Some("main".to_string()),
             layout_schema_version: 1,
@@ -1388,12 +1388,12 @@ mod tests {
                 expected_revision: 1,
                 name: None,
             },
-            ControlCommandRequest::PutWindow {
-                window,
+            ControlCommandRequest::PutTab {
+                tab,
                 expected_workspace_revision: 1,
             },
-            ControlCommandRequest::RemoveWindow {
-                window_id: LogicalWindowId { value: id(3) },
+            ControlCommandRequest::RemoveTab {
+                tab_id: LogicalTabId { value: id(3) },
                 expected_workspace_revision: 1,
             },
             ControlCommandRequest::PutPane {
@@ -1526,8 +1526,8 @@ mod tests {
                 current: 3,
             },
             ControlCommandError::InvalidReference {
-                resource: ControlResourceKind::Window,
-                id: "window".to_string(),
+                resource: ControlResourceKind::Tab,
+                id: "tab".to_string(),
             },
             ControlCommandError::InvalidTransition {
                 reason: "bad".to_string(),

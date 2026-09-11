@@ -26,7 +26,7 @@ use crate::ast::{
 
 /// Resolution table used by codegen to turn qualified BPDL type
 /// references (`windows.pane-state`) into Rust paths
-/// (`::bmux_windows_plugin_api::windows_state::PaneState`).
+/// (`::bmux_tabs_plugin_api::tabs_state::PaneState`).
 ///
 /// Keys are the import aliases declared in the schema's `import`
 /// directives; values are the [`ImportInfo`] describing the target crate.
@@ -39,7 +39,7 @@ type NonEqTypeSet = BTreeSet<String>;
 #[derive(Debug, Clone)]
 pub struct ImportInfo {
     /// Rust crate path the generated code should prefix onto imported
-    /// type references, e.g. `::bmux_windows_plugin_api`.
+    /// type references, e.g. `::bmux_tabs_plugin_api`.
     pub crate_path: String,
     /// The imported plugin's parsed schema. Used to find which
     /// interface a qualified type belongs to (so the emitted path
@@ -1108,21 +1108,21 @@ mod tests {
     #[test]
     fn emits_service_trait_with_queries_and_commands() {
         let src = "plugin p version 1;\n\
-                   capability WINDOWS_READ = bmux.windows.read;\n\
-                   capability WINDOWS_WRITE = bmux.windows.write;\n\
-                   @capability(WINDOWS_READ)\n\
-                   interface windows-state {\n\
+                   capability TABS_READ = bmux.tabs.read;\n\
+                   capability TABS_WRITE = bmux.tabs.write;\n\
+                   @capability(TABS_READ)\n\
+                   interface tabs-state {\n\
                       record pane-state { id: uuid }\n\
                       query pane-state(id: uuid) -> pane-state?;\n\
                    }\n\
-                   @capability(WINDOWS_WRITE)\n\
-                   interface windows-commands {\n\
+                   @capability(TABS_WRITE)\n\
+                   interface tabs-commands {\n\
                       command focus-pane(id: uuid) -> result<unit, string>;\n\
                    }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
-        assert!(rust.contains("pub trait WindowsStateService"));
-        assert!(rust.contains("pub trait WindowsCommandsService"));
+        assert!(rust.contains("pub trait TabsStateService"));
+        assert!(rust.contains("pub trait TabsCommandsService"));
         assert!(rust.contains("fn pane_state"));
         assert!(rust.contains("fn focus_pane"));
         assert!(rust.contains("Option<PaneState>"));
@@ -1134,20 +1134,20 @@ mod tests {
     #[test]
     fn emits_service_client_with_forwarders() {
         let src = "plugin p version 1;\n\
-                   capability WINDOWS_READ = bmux.windows.read;\n\
-                   @capability(WINDOWS_READ)\n\
-                   interface windows-state {\n\
+                   capability TABS_READ = bmux.tabs.read;\n\
+                   @capability(TABS_READ)\n\
+                   interface tabs-state {\n\
                       record pane-state { id: uuid }\n\
                       query pane-state(id: uuid) -> pane-state?;\n\
                    }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
         assert!(
-            rust.contains("pub struct WindowsStateClient"),
+            rust.contains("pub struct TabsStateClient"),
             "client wrapper not emitted; got: {rust}"
         );
         assert!(
-            rust.contains("inner: ::std::sync::Arc<dyn WindowsStateService + Send + Sync>"),
+            rust.contains("inner: ::std::sync::Arc<dyn TabsStateService + Send + Sync>"),
             "client wrapper should hold Arc<dyn Service + Send + Sync>; got: {rust}"
         );
         assert!(
@@ -1171,9 +1171,9 @@ mod tests {
     #[test]
     fn emits_transport_client_with_endpoint_metadata() {
         let src = "plugin p version 1;\n\
-                   capability WINDOWS_READ = bmux.windows.read;\n\
-                   @capability(WINDOWS_READ)\n\
-                   interface windows-state {\n\
+                   capability TABS_READ = bmux.tabs.read;\n\
+                   @capability(TABS_READ)\n\
+                   interface tabs-state {\n\
                      record pane-state { id: uuid }\n\
                      query pane-state(id: uuid) -> pane-state?;\n\
                    }";
@@ -1188,7 +1188,7 @@ mod tests {
             "endpoint marker should be emitted; got: {rust}"
         );
         assert!(
-            rust.contains("const CAPABILITY: ::bmux_plugin_sdk::CapabilityId = super::super::capabilities::WINDOWS_READ;"),
+            rust.contains("const CAPABILITY: ::bmux_plugin_sdk::CapabilityId = super::super::capabilities::TABS_READ;"),
             "endpoint should carry explicit capability; got: {rust}"
         );
         assert!(
@@ -1210,16 +1210,16 @@ mod tests {
     #[test]
     fn emits_interface_id_const() {
         let src = "plugin p version 1;\n\
-                   capability WINDOWS_READ = bmux.windows.read;\n\
-                   @capability(WINDOWS_READ)\n\
-                   interface windows-state {\n\
+                   capability TABS_READ = bmux.tabs.read;\n\
+                   @capability(TABS_READ)\n\
+                   interface tabs-state {\n\
                       query ping() -> bool;\n\
                    }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
         assert!(
             rust.contains(
-                "pub const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = ::bmux_plugin_sdk::InterfaceId::from_static(\"windows-state\");"
+                "pub const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = ::bmux_plugin_sdk::InterfaceId::from_static(\"tabs-state\");"
             ),
             "codegen must emit the canonical interface id as a typed const; got: {rust}"
         );
@@ -1251,14 +1251,14 @@ mod tests {
     #[test]
     fn emits_operation_id_constants() {
         let src = "plugin p version 1;\n\
-                   capability WINDOWS_READ = bmux.windows.read;\n\
-                   capability WINDOWS_WRITE = bmux.windows.write;\n\
-                   @capability(WINDOWS_READ)\n\
-                   interface windows-state {\n\
+                   capability TABS_READ = bmux.tabs.read;\n\
+                   capability TABS_WRITE = bmux.tabs.write;\n\
+                   @capability(TABS_READ)\n\
+                   interface tabs-state {\n\
                       query list-panes(session: uuid) -> unit;\n\
                    }\n\
-                   @capability(WINDOWS_WRITE)\n\
-                   interface windows-commands {\n\
+                   @capability(TABS_WRITE)\n\
+                   interface tabs-commands {\n\
                       command focus-pane(id: uuid) -> unit;\n\
                    }";
         let schema = compile(src).expect("valid");
@@ -1334,8 +1334,8 @@ mod tests {
 
     #[test]
     fn emits_event_bindings_for_events_declaration() {
-        let src = "plugin bmux.windows version 1;\n\
-                   interface windows-events {\n\
+        let src = "plugin bmux.tabs version 1;\n\
+                   interface tabs-events {\n\
                      variant pane-event { focused { pane_id: uuid }, closed { pane_id: uuid } }\n\
                      events pane-event;\n\
                    }";
@@ -1343,7 +1343,7 @@ mod tests {
         let rust = emit(&schema);
         assert!(
             rust.contains(
-                "pub const EVENT_KIND: ::bmux_plugin_sdk::PluginEventKind = ::bmux_plugin_sdk::PluginEventKind::from_static(\"bmux.windows/windows-events\");"
+                "pub const EVENT_KIND: ::bmux_plugin_sdk::PluginEventKind = ::bmux_plugin_sdk::PluginEventKind::from_static(\"bmux.tabs/tabs-events\");"
             ),
             "codegen must emit typed EVENT_KIND for interface with events; got: {rust}"
         );
@@ -1356,9 +1356,9 @@ mod tests {
     #[test]
     fn emits_no_event_bindings_without_events_declaration() {
         let src = "plugin p version 1;\n\
-                   capability WINDOWS_READ = bmux.windows.read;\n\
-                   @capability(WINDOWS_READ)\n\
-                   interface windows-state {\n\
+                   capability TABS_READ = bmux.tabs.read;\n\
+                   @capability(TABS_READ)\n\
+                   interface tabs-state {\n\
                       query ping() -> bool;\n\
                    }";
         let schema = compile(src).expect("valid");
@@ -1473,14 +1473,14 @@ mod tests {
     #[test]
     fn emits_qualified_type_via_import_crate_path() {
         let importer = "plugin importer version 1;\n\
-                        import windows = bmux.windows;\n\
+                        import windows = bmux.tabs;\n\
                         capability IMPORTER_READ = importer.read;\n\
                         @capability(IMPORTER_READ)\n\
                         interface my-iface {\n\
                           query pane-ref(id: uuid) -> windows.pane-state;\n\
                         }";
-        let imported_src = "plugin bmux.windows version 1;\n\
-                            interface windows-state {\n\
+        let imported_src = "plugin bmux.tabs version 1;\n\
+                            interface tabs-state {\n\
                               record pane-state { id: uuid }\n\
                             }";
         let schema = compile(importer).expect("valid");
@@ -1489,13 +1489,13 @@ mod tests {
         imports.insert(
             "windows".to_string(),
             ImportInfo {
-                crate_path: "::bmux_windows_plugin_api".to_string(),
+                crate_path: "::bmux_tabs_plugin_api".to_string(),
                 schema: imported_schema,
             },
         );
         let rust = emit_with_imports(&schema, &imports);
         assert!(
-            rust.contains("::bmux_windows_plugin_api::windows_state::PaneState"),
+            rust.contains("::bmux_tabs_plugin_api::tabs_state::PaneState"),
             "qualified type should resolve to imported crate path; got: {rust}"
         );
     }

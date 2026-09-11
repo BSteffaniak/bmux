@@ -385,22 +385,22 @@ kinds = ["bmux.core/server-started"]
     fn parses_manifest_keybinding_proposals() {
         let manifest = PluginManifest::from_toml_str(
             r#"
-id = "bmux.windows"
+id = "bmux.tabs"
 name = "Windows"
 version = "0.1.0"
 runtime = "native"
 entry = "libwindows.dylib"
 
 [keybindings.runtime]
-c = "plugin:bmux.windows:new-window"
-"alt+w" = "plugin:bmux.windows:switch-window"
+c = "plugin:bmux.tabs:new-tab"
+"alt+w" = "plugin:bmux.tabs:switch-tab"
 "#,
         )
         .expect("manifest should parse");
 
         assert_eq!(
             manifest.keybindings.runtime.get("c").map(String::as_str),
-            Some("plugin:bmux.windows:new-window")
+            Some("plugin:bmux.tabs:new-tab")
         );
     }
 

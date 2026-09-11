@@ -99,11 +99,11 @@ members = [
     "plugins/snapshot-plugin",
     "plugins/snapshot-plugin-api",
     "plugins/sidebar-plugin",
-    "plugins/tab-strip-plugin",
+    "plugins/tab-bar-plugin",
     "plugins/theme-plugin",
     "plugins/visual-adapters-plugin-renderer",
-    "plugins/windows-plugin",
-    "plugins/windows-plugin-api",
+    "plugins/tabs-plugin",
+    "plugins/tabs-plugin-api",
     "plugins/workspaces-plugin",
     "plugins/workspaces-plugin-api",
 ]
@@ -253,11 +253,11 @@ bmux_sessions_plugin_api             = { version = "0.0.1-alpha.1", default-feat
 bmux_sidebar_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/sidebar-plugin" }
 bmux_snapshot_plugin                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/snapshot-plugin" }
 bmux_snapshot_plugin_api             = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/snapshot-plugin-api" }
-bmux_tab_strip_plugin                = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tab-strip-plugin" }
+bmux_tab_bar_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tab-bar-plugin" }
+bmux_tabs_plugin                     = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tabs-plugin" }
+bmux_tabs_plugin_api                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tabs-plugin-api" }
 bmux_theme_plugin                    = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/theme-plugin" }
 bmux_visual_adapters_plugin_renderer = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/visual-adapters-plugin-renderer" }
-bmux_windows_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/windows-plugin" }
-bmux_windows_plugin_api              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/windows-plugin-api" }
 bmux_workspaces_plugin               = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/workspaces-plugin" }
 bmux_workspaces_plugin_api           = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/workspaces-plugin-api" }
 

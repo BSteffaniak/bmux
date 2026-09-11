@@ -1,6 +1,6 @@
 # bmux sidebar plugin
 
-Bundled vertical presentation of the authoritative ordered window list.
+Bundled vertical presentation of the authoritative ordered tab list.
 
 ```toml
 [plugins.settings."bmux.sidebar"]
@@ -10,7 +10,7 @@ minimum_width = 16
 maximum_width = 60
 order = 200
 show_index = true
-heading = "Windows"
+heading = "Tabs"
 title_template = "{marker} {index}{name}"
 description_template = ""
 status_template = ""
@@ -25,4 +25,4 @@ Descriptions wrap to two display-cell-safe lines; status renders on a separate
 line when configured.
 
 Enable it with `plugins.enabled = ["bmux.sidebar"]`. It composes through the
-generic layout resolver with the independent tab-strip plugin.
+generic layout resolver with the independent tab-bar plugin.

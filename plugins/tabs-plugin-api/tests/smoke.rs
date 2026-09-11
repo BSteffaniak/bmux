@@ -1,9 +1,9 @@
 //! Smoke test: the BPDL-generated bindings compile and their types can
 //! be constructed, serialized, and used via the trait signature.
 
-use bmux_windows_plugin_api::{
-    windows_events::{self, PaneEvent},
-    windows_state::{self, PaneState, PaneStatus},
+use bmux_tabs_plugin_api::{
+    tabs_events::{self, PaneEvent},
+    tabs_state::{self, PaneState, PaneStatus},
 };
 
 #[test]
@@ -43,15 +43,15 @@ fn pane_event_variant_is_tagged() {
 
 #[test]
 fn interface_ids_match_bpdl_source() {
-    assert_eq!(windows_state::INTERFACE_ID, "windows-state");
-    assert_eq!(windows_events::INTERFACE_ID, "windows-events");
+    assert_eq!(tabs_state::INTERFACE_ID, "tabs-state");
+    assert_eq!(tabs_events::INTERFACE_ID, "tabs-events");
 }
 
 #[test]
 fn event_kind_constant_is_namespaced_by_plugin_id() {
-    // `plugin bmux.windows` in the BPDL source means every interface's
-    // event stream is namespaced under `bmux.windows/<interface-name>`.
-    assert_eq!(windows_events::EVENT_KIND, "bmux.windows/windows-events");
+    // `plugin bmux.tabs` in the BPDL source means every interface's
+    // event stream is namespaced under `bmux.tabs/<interface-name>`.
+    assert_eq!(tabs_events::EVENT_KIND, "bmux.tabs/tabs-events");
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn event_payload_alias_matches_declared_type() {
     // The generated `EventPayload` alias must resolve to the same
     // `PaneEvent` variant the BPDL declared. Constructing one via the
     // alias round-trips through JSON identically to the direct type.
-    let via_alias: windows_events::EventPayload = windows_events::EventPayload::Focused {
+    let via_alias: tabs_events::EventPayload = tabs_events::EventPayload::Focused {
         pane_id: uuid::Uuid::nil(),
     };
     let via_type: PaneEvent = PaneEvent::Focused {

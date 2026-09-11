@@ -1,14 +1,14 @@
-# Window presentation plugins
+# Tab presentation plugins
 
-BMUX ships two independent window presentation plugins for normal `bmux attach`:
+BMUX ships two independent tab presentation plugins for normal `bmux attach`:
 
-- `bmux.tab_strip` is enabled by default and owns the full horizontal
+- `bmux.tab_bar` is enabled by default and owns the full horizontal
   status/tab row at the bottom.
 - `bmux.sidebar` is bundled but opt-in and reserves a bounded vertical region
   at the left or right.
 
-Both consume the authoritative ordered window state from `bmux.windows`;
-presentation enablement does not change window lifecycle or ordering.
+Both consume the authoritative ordered tab state from `bmux.tabs`;
+presentation enablement does not change tab lifecycle or ordering.
 
 ## Enablement combinations
 
@@ -24,19 +24,19 @@ enabled = ["bmux.sidebar"]
 # Sidebar only
 [plugins]
 enabled = ["bmux.sidebar"]
-disabled = ["bmux.tab_strip"]
+disabled = ["bmux.tab_bar"]
 ```
 
 ```toml
 # Neither presentation; baseline attach remains available
 [plugins]
-disabled = ["bmux.tab_strip", "bmux.sidebar"]
+disabled = ["bmux.tab_bar", "bmux.sidebar"]
 ```
 
 ## Full tab/status bar
 
 ```toml
-[plugins.settings."bmux.tab_strip"]
+[plugins.settings."bmux.tab_bar"]
 placement = "bottom"            # "top" or "bottom"
 height = 1                       # 1..=4 cells
 order = 100                      # lower layout order allocates first
@@ -52,7 +52,7 @@ show_hint = true
 hover_highlight = true
 hint_policy = "scroll_only"     # "always" or "never"
 
-[plugins.settings."bmux.tab_strip".layout]
+[plugins.settings."bmux.tab_bar".layout]
 density = "cozy"               # or "compact"
 left_padding = 1
 right_padding = 1
@@ -61,7 +61,7 @@ module_gap = 1
 overflow_style = "arrows"       # or "count"
 align_active = "keep_visible"   # or "focus_bias"
 
-[plugins.settings."bmux.tab_strip".style]
+[plugins.settings."bmux.tab_bar".style]
 separator_set = "angled_segments" # "plain" or "ascii"
 prefer_unicode = true
 force_ascii = false
@@ -76,15 +76,14 @@ left side after tabs. Templates support `{name}`, `{index}`, `{index0}`,
 `{session}`, `{marker}`, `{id}`, and `{active}` with Unicode-cell-safe width
 limits and literal double braces.
 
-Optional color keys under `[plugins.settings."bmux.tab_strip".colors]` cover
+Optional color keys under `[plugins.settings."bmux.tab_bar".colors]` cover
 the bar, active/inactive/hover tabs, modules, and overflow using `#RRGGBB`
-values. Migration-era aliases (`label_template`, `maximum_label_width`,
-`maximum_visible_tabs`, `show_index`, `show_compact_facts`) remain accepted
-when their canonical setting is absent.
+values. Use `tab_template`, `tab_label_max_width`, `max_tabs`, `show_tab_index`,
+and `show_facts`; former aliases are rejected with an explicit error.
 
 Interactions include click switching, hover, drag reorder, wheel navigation,
 middle-click inline rename, and a right-click Switch/Rename/Close menu. Domain
-mutations use generated `bmux.windows` service clients.
+mutations use generated `bmux.tabs` service clients.
 
 ## Sidebar
 
@@ -96,7 +95,7 @@ minimum_width = 16
 maximum_width = 60
 order = 200
 show_index = true
-heading = "Windows"
+heading = "Tabs"
 title_template = "{marker} {index}{name}"
 description_template = ""
 status_template = ""
@@ -114,4 +113,4 @@ composes it with the bar when enabled.
 
 Legacy `appearance.status_position` and `[status_bar]` are rejected with
 migration diagnostics. Move those values into
-`plugins.settings."bmux.tab_strip"` using the equivalent fields above.
+`plugins.settings."bmux.tab_bar"` using the equivalent fields above.

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// A request to dispatch a runtime action string to the attach loop.
 ///
 /// The `action` field uses the same string format as keybinding action values
-/// (e.g. `"focus_next_pane"`, `"plugin:bmux.windows:goto-window 1"`).  The
+/// (e.g. `"focus_next_pane"`, `"plugin:bmux.tabs:goto-tab 1"`).  The
 /// attach loop parses the string into a `RuntimeAction` and executes it
 /// through the normal dispatch path.
 ///

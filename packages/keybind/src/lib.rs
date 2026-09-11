@@ -320,7 +320,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Focus Next Pane",
         "keybind: focus_next_pane",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "focus-pane-in-direction",
             args: &["--direction", "next"],
         },
@@ -330,7 +330,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Focus Previous Pane",
         "keybind: focus_previous_pane",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "focus-pane-in-direction",
             args: &["--direction", "prev"],
         },
@@ -340,7 +340,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Focus Previous Pane",
         "keybind alias: focus_prev_pane",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "focus-pane-in-direction",
             args: &["--direction", "prev"],
         },
@@ -350,7 +350,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Focus Left Pane",
         "keybind: focus_left_pane",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "focus-pane-in-direction",
             args: &["--direction", "left"],
         },
@@ -360,7 +360,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Focus Right Pane",
         "keybind: focus_right_pane",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "focus-pane-in-direction",
             args: &["--direction", "right"],
         },
@@ -370,7 +370,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Focus Up Pane",
         "keybind: focus_up_pane",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "focus-pane-in-direction",
             args: &["--direction", "up"],
         },
@@ -380,7 +380,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Focus Down Pane",
         "keybind: focus_down_pane",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "focus-pane-in-direction",
             args: &["--direction", "down"],
         },
@@ -390,7 +390,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Split Focused Vertical",
         "keybind: split_focused_vertical",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "split-pane",
             args: &["--direction", "vertical"],
         },
@@ -400,7 +400,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Split Focused Horizontal",
         "keybind: split_focused_horizontal",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "split-pane",
             args: &["--direction", "horizontal"],
         },
@@ -410,7 +410,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Increase Split",
         "keybind: increase_split",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "resize-pane",
             args: &["--direction", "increase"],
         },
@@ -420,7 +420,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Decrease Split",
         "keybind: decrease_split",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "resize-pane",
             args: &["--direction", "decrease"],
         },
@@ -430,7 +430,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Resize Left",
         "keybind: resize_left",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "resize-pane",
             args: &["--direction", "left"],
         },
@@ -440,7 +440,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Resize Right",
         "keybind: resize_right",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "resize-pane",
             args: &["--direction", "right"],
         },
@@ -450,7 +450,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Resize Up",
         "keybind: resize_up",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "resize-pane",
             args: &["--direction", "up"],
         },
@@ -460,7 +460,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Resize Down",
         "keybind: resize_down",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "resize-pane",
             args: &["--direction", "down"],
         },
@@ -470,7 +470,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Restart Focused Pane",
         "keybind: restart_focused_pane",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "restart-pane",
             args: &[],
         },
@@ -480,7 +480,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Close Focused Pane",
         "keybind: close_focused_pane",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "close-active-pane",
             args: &[],
         },
@@ -490,7 +490,7 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Zoom Pane",
         "keybind: zoom_pane",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
+            plugin_id: "bmux.tabs",
             command_name: "zoom-pane",
             args: &[],
         },
@@ -500,8 +500,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Previous Window",
         "keybind: window_prev",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "prev-window",
+            plugin_id: "bmux.tabs",
+            command_name: "prev-tab",
             args: &[],
         },
     ),
@@ -510,18 +510,18 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Next Window",
         "keybind: window_next",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "next-window",
+            plugin_id: "bmux.tabs",
+            command_name: "next-tab",
             args: &[],
         },
     ),
     static_action(
-        "rename_window",
+        "rename_tab",
         "Rename Window",
-        "keybind: rename_window",
+        "keybind: rename_tab",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "rename-window",
+            plugin_id: "bmux.tabs",
+            command_name: "rename-tab",
             args: &[],
         },
     ),
@@ -530,8 +530,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Rename Window",
         "keybind alias: window_rename",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "rename-window",
+            plugin_id: "bmux.tabs",
+            command_name: "rename-tab",
             args: &[],
         },
     ),
@@ -540,8 +540,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Close Window",
         "keybind: window_close",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "close-current-window",
+            plugin_id: "bmux.tabs",
+            command_name: "close-current-tab",
             args: &[],
         },
     ),
@@ -550,8 +550,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Go To Window 1",
         "keybind: window_goto_1",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "goto-window",
+            plugin_id: "bmux.tabs",
+            command_name: "goto-tab",
             args: &["1"],
         },
     ),
@@ -560,8 +560,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Go To Window 2",
         "keybind: window_goto_2",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "goto-window",
+            plugin_id: "bmux.tabs",
+            command_name: "goto-tab",
             args: &["2"],
         },
     ),
@@ -570,8 +570,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Go To Window 3",
         "keybind: window_goto_3",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "goto-window",
+            plugin_id: "bmux.tabs",
+            command_name: "goto-tab",
             args: &["3"],
         },
     ),
@@ -580,8 +580,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Go To Window 4",
         "keybind: window_goto_4",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "goto-window",
+            plugin_id: "bmux.tabs",
+            command_name: "goto-tab",
             args: &["4"],
         },
     ),
@@ -590,8 +590,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Go To Window 5",
         "keybind: window_goto_5",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "goto-window",
+            plugin_id: "bmux.tabs",
+            command_name: "goto-tab",
             args: &["5"],
         },
     ),
@@ -600,8 +600,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Go To Window 6",
         "keybind: window_goto_6",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "goto-window",
+            plugin_id: "bmux.tabs",
+            command_name: "goto-tab",
             args: &["6"],
         },
     ),
@@ -610,8 +610,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Go To Window 7",
         "keybind: window_goto_7",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "goto-window",
+            plugin_id: "bmux.tabs",
+            command_name: "goto-tab",
             args: &["7"],
         },
     ),
@@ -620,8 +620,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Go To Window 8",
         "keybind: window_goto_8",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "goto-window",
+            plugin_id: "bmux.tabs",
+            command_name: "goto-tab",
             args: &["8"],
         },
     ),
@@ -630,8 +630,8 @@ const STATIC_BINDABLE_ACTIONS: &[StaticBindableAction] = &[
         "Go To Window 9",
         "keybind: window_goto_9",
         ActionTarget::Plugin {
-            plugin_id: "bmux.windows",
-            command_name: "goto-window",
+            plugin_id: "bmux.tabs",
+            command_name: "goto-tab",
             args: &["9"],
         },
     ),
@@ -890,13 +890,12 @@ mod tests {
 
     #[test]
     fn parse_action_accepts_plugin_command_action() {
-        let action =
-            parse_action("plugin:bmux.windows:new-window").expect("plugin action should parse");
+        let action = parse_action("plugin:bmux.tabs:new-tab").expect("plugin action should parse");
         assert_eq!(
             action,
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "new-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "new-tab".to_string(),
                 args: vec![],
             }
         );
@@ -904,13 +903,13 @@ mod tests {
 
     #[test]
     fn parse_action_accepts_plugin_command_with_args() {
-        let action = parse_action("plugin:bmux.windows:goto-window 1")
+        let action = parse_action("plugin:bmux.tabs:goto-tab 1")
             .expect("plugin action with args should parse");
         assert_eq!(
             action,
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "goto-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "goto-tab".to_string(),
                 args: vec!["1".to_string()],
             }
         );
@@ -921,32 +920,32 @@ mod tests {
         assert_eq!(
             parse_action("window_prev").expect("legacy previous-window action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "prev-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "prev-tab".to_string(),
                 args: Vec::new(),
             }
         );
         assert_eq!(
-            parse_action("window_goto_3").expect("legacy goto-window action should parse"),
+            parse_action("window_goto_3").expect("legacy goto-tab action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "goto-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "goto-tab".to_string(),
                 args: vec!["3".to_string()],
             }
         );
         assert_eq!(
             parse_action("window_close").expect("legacy close-window action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "close-current-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "close-current-tab".to_string(),
                 args: Vec::new(),
             }
         );
         assert_eq!(
-            parse_action("window_rename").expect("legacy rename-window action should parse"),
+            parse_action("window_rename").expect("legacy rename-tab action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "rename-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "rename-tab".to_string(),
                 args: Vec::new(),
             }
         );
@@ -957,7 +956,7 @@ mod tests {
         assert_eq!(
             parse_action("focus_prev_pane").expect("legacy focus previous action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "focus-pane-in-direction".to_string(),
                 args: vec!["--direction".to_string(), "prev".to_string()],
             }
@@ -965,7 +964,7 @@ mod tests {
         assert_eq!(
             parse_action("focus_left_pane").expect("legacy focus left action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "focus-pane-in-direction".to_string(),
                 args: vec!["--direction".to_string(), "left".to_string()],
             }
@@ -977,7 +976,7 @@ mod tests {
         assert_eq!(
             parse_action("increase_split").expect("legacy increase split action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "resize-pane".to_string(),
                 args: vec!["--direction".to_string(), "increase".to_string()],
             }
@@ -985,7 +984,7 @@ mod tests {
         assert_eq!(
             parse_action("resize_left").expect("legacy resize left action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "resize-pane".to_string(),
                 args: vec!["--direction".to_string(), "left".to_string()],
             }
@@ -998,7 +997,7 @@ mod tests {
             parse_action("split_focused_vertical")
                 .expect("legacy vertical split action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "split-pane".to_string(),
                 args: vec!["--direction".to_string(), "vertical".to_string()],
             }
@@ -1007,7 +1006,7 @@ mod tests {
             parse_action("split_focused_horizontal")
                 .expect("legacy horizontal split action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "split-pane".to_string(),
                 args: vec!["--direction".to_string(), "horizontal".to_string()],
             }
@@ -1015,7 +1014,7 @@ mod tests {
         assert_eq!(
             parse_action("zoom_pane").expect("legacy zoom action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "zoom-pane".to_string(),
                 args: Vec::new(),
             }
@@ -1027,7 +1026,7 @@ mod tests {
         assert_eq!(
             parse_action("restart_focused_pane").expect("legacy restart action should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "restart-pane".to_string(),
                 args: Vec::new(),
             }
@@ -1036,13 +1035,13 @@ mod tests {
 
     #[test]
     fn parse_action_accepts_plugin_command_with_multiple_args() {
-        let action = parse_action("plugin:bmux.windows:switch-window --session dev")
+        let action = parse_action("plugin:bmux.tabs:switch-tab --session dev")
             .expect("plugin action with multiple args should parse");
         assert_eq!(
             action,
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "switch-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "switch-tab".to_string(),
                 args: vec!["--session".to_string(), "dev".to_string()],
             }
         );
@@ -1078,26 +1077,23 @@ mod tests {
     #[test]
     fn action_to_config_name_serializes_plugin_command_action() {
         let action = RuntimeAction::PluginCommand {
-            plugin_id: "bmux.windows".to_string(),
-            command_name: "new-window".to_string(),
+            plugin_id: "bmux.tabs".to_string(),
+            command_name: "new-tab".to_string(),
             args: vec![],
         };
-        assert_eq!(
-            action_to_config_name(&action),
-            "plugin:bmux.windows:new-window"
-        );
+        assert_eq!(action_to_config_name(&action), "plugin:bmux.tabs:new-tab");
     }
 
     #[test]
     fn action_to_config_name_serializes_plugin_command_with_args() {
         let action = RuntimeAction::PluginCommand {
-            plugin_id: "bmux.windows".to_string(),
-            command_name: "goto-window".to_string(),
+            plugin_id: "bmux.tabs".to_string(),
+            command_name: "goto-tab".to_string(),
             args: vec!["1".to_string()],
         };
         assert_eq!(
             action_to_config_name(&action),
-            "plugin:bmux.windows:goto-window 1"
+            "plugin:bmux.tabs:goto-tab 1"
         );
     }
 
@@ -1121,13 +1117,12 @@ mod tests {
 
     #[test]
     fn parse_action_lowercases_plugin_id_and_command() {
-        let action =
-            parse_action("Plugin:Bmux.Windows:New-Window").expect("mixed case should parse");
+        let action = parse_action("Plugin:Bmux.Tabs:New-Tab").expect("mixed case should parse");
         assert_eq!(
             action,
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
-                command_name: "new-window".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
+                command_name: "new-tab".to_string(),
                 args: vec![],
             }
         );
@@ -1142,7 +1137,7 @@ mod tests {
         assert_eq!(
             parse_action("Focus_Next_Pane").expect("mixed case built-in should parse"),
             RuntimeAction::PluginCommand {
-                plugin_id: "bmux.windows".to_string(),
+                plugin_id: "bmux.tabs".to_string(),
                 command_name: "focus-pane-in-direction".to_string(),
                 args: vec!["--direction".to_string(), "next".to_string()],
             }

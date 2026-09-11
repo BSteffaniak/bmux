@@ -1,7 +1,7 @@
 @driver real-attach
 @viewport cols=100 rows=30
 @shell sh
-@plugin enable=bmux.windows
+@plugin enable=bmux.tabs
 @plugin enable=bmux.pane_runtime
 @plugin enable=bmux.sessions
 @plugin enable=bmux.contexts

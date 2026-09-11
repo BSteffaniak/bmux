@@ -10,7 +10,7 @@ navigation history is not another input-target authority.
 
 Global discovery activates an exact durable context ID. Workspace-local navigation
 continues to resolve names, indexes, next, and previous within the current
-workspace. Existing versioned `switch-window` semantics are unchanged.
+workspace. Existing versioned `switch-tab` semantics are unchanged.
 
 The workspaces implementation owns cross-workspace orchestration, exposed through
 an explicitly new generated BPDL interface. The finder supplies an ID and does not
@@ -21,9 +21,9 @@ orchestrate two commands. No domain types or special cases are added to core,
 
 Current paths do not yet satisfy this decision:
 
-* `finder-plugin::handle_response` invokes workspace-local `switch-window` for
+* `finder-plugin::handle_response` invokes workspace-local `switch-tab` for
   results drawn from all workspaces.
-* `windows-plugin::switch_window` filters contexts before resolving the ID.
+* `tabs-plugin::switch_tab` filters contexts before resolving the ID.
 * `contexts-plugin::select_context_local` mutates context selection before session
   selection. Its legacy recovery can allocate a replacement session.
 * `workspaces-plugin::switch_workspace_for_client` selects a context and then

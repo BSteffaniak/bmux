@@ -1,11 +1,11 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Typed public API of the bmux windows plugin (BPDL-generated bindings)"
+description = "Typed public API of the bmux tabs plugin (BPDL-generated bindings)"
 edition     = { workspace = true }
-keywords    = ["bmux", "plugin", "api", "windows"]
+keywords    = ["bmux", "plugin", "api", "tabs"]
 license     = { workspace = true }
-name        = "bmux_windows_plugin_api"
+name        = "bmux_tabs_plugin_api"
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }

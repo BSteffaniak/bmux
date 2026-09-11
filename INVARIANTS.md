@@ -8,17 +8,17 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 
 * **BMUX remains independently usable.** Integrations, remote services, and federation must not become prerequisites for local terminal operation.
 * **Plugins are first-class product owners.** Plugins may implement critical product behavior; extensibility is not limited to cosmetic or peripheral features.
-* **Baseline operation survives missing domain plugins.** Without windows, sessions, contexts, or clients plugins, baseline single-terminal attachment and execution remain available through neutral runtime mechanisms, not duplicate domain implementations in core.
+* **Baseline operation survives missing domain plugins.** Without tabs, sessions, contexts, or clients plugins, baseline single-terminal attachment and execution remain available through neutral runtime mechanisms, not duplicate domain implementations in core.
 * **The permissions fallback is local and single-user.** Absence of the permissions plugin preserves permissive single-user operation. It does not waive authentication or authorization required by remote or federated services.
-* **Presentation is optional.** Enabling, disabling, or replacing tab strips, sidebars, or decorations does not create, destroy, or reorder authoritative resources.
+* **Presentation is optional.** Enabling, disabling, or replacing tab bars, sidebars, or decorations does not create, destroy, or reorder authoritative resources.
 
 ## Core and domain ownership
 
-* **Core remains domain-agnostic.** Windows, tabs, workspaces, sessions, contexts, clients, panes, permissions, and federation are plugin domains. Core provides neutral execution, transport, storage, and dispatch mechanisms, not their product policy.
+* **Core remains domain-agnostic.** Tabs, workspaces, sessions, contexts, clients, panes, permissions, and federation are plugin domains. Core provides neutral execution, transport, storage, and dispatch mechanisms, not their product policy.
 * **Infrastructure obeys the same boundary.** Server, client, IPC, session, event, terminal, CLI runtime, plugin SDK, plugin host, and schema/code-generation layers must not acquire domain-specific types, fields, events, convenience APIs, or dispatch branches.
 * **Host APIs expose mechanisms, not domain helpers.** Plugins use generic storage, logging, recording, service invocation, and permitted kernel execution. Domain convenience helpers belong in plugins, not shared host infrastructure.
 * **`HostRuntimeApi` has a closed generic surface.** Its operations are `core_cli_command_run_path`, `plugin_command_run`, `storage_get`, `storage_set`, `log_write`, and `recording_write_event`. Domain convenience operations must not be added.
-* **Kernel access follows the foundational-plugin boundary.** Sessions, contexts, clients, and windows plugins may call kernel primitives through `ServiceCaller::execute_kernel_request`. Other plugins use the foundational plugins' typed BPDL services.
+* **Kernel access follows the foundational-plugin boundary.** Sessions, contexts, clients, and tabs plugins may call kernel primitives through `ServiceCaller::execute_kernel_request`. Other plugins use the foundational plugins' typed BPDL services.
 * **Core imports neutral primitives directly.** Domain plugin API dependencies, umbrella re-exports, and compatibility layers must not expose plugin domains through core. Moving a domain type into a shared or `*-state` crate does not make it neutral.
 
 ## Plugin contracts and composition
@@ -34,7 +34,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 * **Durable identity is independent of presentation and placement.** Names, labels, indexes, connection IDs, and rendered positions are not resource identity. Durable references identify their authority; federated references use logical resource IDs, not worker-local execution IDs.
 * **Personal arrangement is separate from resource lifetime.** Removing, hiding, or reordering a reference does not terminate shared work. Zero remaining references does not authorize termination; destruction is an explicit operation enforced by the resource authority.
 * **Independent views remain independent.** Changing one personal arrangement does not rearrange another. Attachments deliberately sharing an arrangement share its durable changes, not active selection, focus, or navigation history.
-* **Presentations consume one authoritative arrangement.** Tab strips, sidebars, pickers, and navigation do not establish competing ordering or ownership models. Temporary follow presentation does not silently rewrite a personal arrangement.
+* **Presentations consume one authoritative arrangement.** Tab bars, sidebars, pickers, and navigation do not establish competing ordering or ownership models. Temporary follow presentation does not silently rewrite a personal arrangement.
 * **Removed work remains discoverable.** Removing a personal reference does not remove an otherwise authorized running resource from discovery.
 * **Selection changes preserve input safety.** Removing or invalidating the selected reference must resolve or suspend the input target; input must not continue into an unintentionally hidden resource.
 
