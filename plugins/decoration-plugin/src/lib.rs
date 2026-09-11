@@ -5443,13 +5443,13 @@ exited = ""
     }
 
     #[test]
-    fn pulse_demo_theme_slice_installs_and_runs_bundled_script() {
+    fn pulse_border_theme_slice_installs_and_runs_bundled_script() {
         let plugin = DecorationPlugin::new();
         let pane = Uuid::from_u128(0xf001);
         seed_geometry(&plugin, pane, 20, 5);
         set_activity(&plugin, pane, true, false);
 
-        let theme = include_str!("../../theme-plugin/assets/themes/pulse-demo.toml");
+        let theme = include_str!("../../theme-plugin/assets/themes/pulse-border.toml");
         let extension = decoration_extension_from_theme(theme);
         install_extension_with_script(&plugin, extension);
 

@@ -1792,8 +1792,8 @@ const fn bundled_theme_presets() -> &'static [(&'static str, &'static str)] {
         ("cyberpunk", include_str!("../assets/themes/cyberpunk.toml")),
         ("minimal", include_str!("../assets/themes/minimal.toml")),
         (
-            "pulse-demo",
-            include_str!("../assets/themes/pulse-demo.toml"),
+            "pulse-border",
+            include_str!("../assets/themes/pulse-border.toml"),
         ),
         (
             "rainbow-snake",
@@ -1839,11 +1839,14 @@ fn prompt_options(
     declared_stack: &[String],
     active_name: &str,
 ) -> Vec<bmux_plugin_sdk::PromptOption> {
+    let active_name = theme_by_name(catalog, active_name).map_or(active_name, |theme| &theme.name);
     catalog
         .iter()
         .map(|entry| {
             let mut label = entry.name.clone();
-            if declared_stack.iter().any(|name| name == &entry.name) {
+            if declared_stack.iter().any(|name| {
+                theme_by_name(catalog, name).is_some_and(|theme| theme.name == entry.name)
+            }) {
                 label.push_str(" (declared)");
             }
             if entry.name == active_name {
@@ -1855,6 +1858,7 @@ fn prompt_options(
 }
 
 fn selected_index(catalog: &[ThemeCatalogEntry], active_name: &str) -> usize {
+    let active_name = theme_by_name(catalog, active_name).map_or(active_name, |theme| &theme.name);
     catalog
         .iter()
         .position(|entry| entry.name == active_name)
@@ -1862,9 +1866,16 @@ fn selected_index(catalog: &[ThemeCatalogEntry], active_name: &str) -> usize {
 }
 
 fn theme_by_name<'a>(catalog: &'a [ThemeCatalogEntry], name: &str) -> Option<&'a ThemeConfig> {
+    // Preserve explicitly named user themes; the deprecated bundled name is
+    // only a lookup fallback, never a second catalog/picker entry.
     catalog
         .iter()
         .find(|entry| entry.name == name)
+        .or_else(|| {
+            (name == "pulse-demo")
+                .then(|| catalog.iter().find(|entry| entry.name == "pulse-border"))
+                .flatten()
+        })
         .map(|entry| &entry.theme)
 }
 
@@ -1993,7 +2004,7 @@ mod tests {
         let context = service_context(Some(toml::Value::Table(toml::map::Map::from_iter([
             (
                 "theme".to_string(),
-                toml::Value::String("pulse-demo".to_string()),
+                toml::Value::String("pulse-border".to_string()),
             ),
             (
                 "persistence".to_string(),
@@ -2016,7 +2027,7 @@ mod tests {
         let context = service_context(Some(toml::Value::Table(toml::map::Map::from_iter([
             (
                 "theme".to_string(),
-                toml::Value::String("pulse-demo".to_string()),
+                toml::Value::String("pulse-border".to_string()),
             ),
             (
                 "persistence".to_string(),
@@ -2071,7 +2082,7 @@ mod tests {
         let context = service_context(Some(toml::Value::Table(toml::map::Map::from_iter([
             (
                 "theme".to_string(),
-                toml::Value::String("pulse-demo".to_string()),
+                toml::Value::String("pulse-border".to_string()),
             ),
             (
                 "persistence".to_string(),
@@ -2093,7 +2104,7 @@ mod tests {
         let context = lifecycle_context(Some(toml::Value::Table(toml::map::Map::from_iter([
             (
                 "theme".to_string(),
-                toml::Value::String("pulse-demo".to_string()),
+                toml::Value::String("pulse-border".to_string()),
             ),
             (
                 "persistence".to_string(),
@@ -2132,7 +2143,7 @@ mod tests {
         let context = lifecycle_context(Some(toml::Value::Table(toml::map::Map::from_iter([
             (
                 "theme".to_string(),
-                toml::Value::String("pulse-demo".to_string()),
+                toml::Value::String("pulse-border".to_string()),
             ),
             (
                 "persistence".to_string(),
@@ -2210,7 +2221,7 @@ mod tests {
         let context = lifecycle_context(Some(toml::Value::Table(toml::map::Map::from_iter([
             (
                 "theme".to_string(),
-                toml::Value::String("pulse-demo".to_string()),
+                toml::Value::String("pulse-border".to_string()),
             ),
             (
                 "persistence".to_string(),
@@ -2632,6 +2643,34 @@ mod tests {
     }
 
     #[test]
+    fn deprecated_pulse_demo_alias_resolves_without_duplicate_catalog_entry() {
+        let catalog = load_theme_catalog(&[]);
+        assert!(catalog.iter().any(|entry| entry.name == "pulse-border"));
+        assert!(!catalog.iter().any(|entry| entry.name == "pulse-demo"));
+        assert_eq!(
+            theme_by_name(&catalog, "pulse-demo").unwrap().name,
+            "pulse-border"
+        );
+        assert_eq!(
+            selected_index(&catalog, "pulse-demo"),
+            selected_index(&catalog, "pulse-border")
+        );
+        let legacy = resolve_theme_stack(&catalog, &["pulse-demo".to_string()]).unwrap();
+        let renamed = resolve_theme_stack(&catalog, &["pulse-border".to_string()]).unwrap();
+        assert_eq!(legacy.plugins, renamed.plugins);
+        let mut catalog = catalog;
+        upsert_theme_catalog_entry(
+            &mut catalog,
+            "pulse-demo".to_string(),
+            ThemeConfig::default(),
+        );
+        assert_eq!(
+            theme_by_name(&catalog, "pulse-demo").unwrap().name,
+            "pulse-demo"
+        );
+    }
+
+    #[test]
     fn performance_and_pulse_compose_without_competing_scripted_borders() {
         let catalog = vec![
             ThemeCatalogEntry {
@@ -2639,14 +2678,14 @@ mod tests {
                 theme: toml::from_str(include_str!("../assets/themes/performance.toml")).unwrap(),
             },
             ThemeCatalogEntry {
-                name: "pulse-demo".to_string(),
-                theme: toml::from_str(include_str!("../assets/themes/pulse-demo.toml")).unwrap(),
+                name: "pulse-border".to_string(),
+                theme: toml::from_str(include_str!("../assets/themes/pulse-border.toml")).unwrap(),
             },
         ];
         let settings: ThemePluginSettings = toml::from_str(
             r#"
             appearance_themes = ["performance"]
-            component_themes = ["performance", "pulse-demo"]
+            component_themes = ["performance", "pulse-border"]
             [components."performance.border"]
             enabled = false
             [components."pulse.border"]

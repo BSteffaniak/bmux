@@ -10,7 +10,7 @@ and adjust the decoration style.
 
 The plugin ships four built-in border styles (`none`, `ascii`, `single`,
 `double`) plus a handful of bundled themes under `assets/themes/`
-(`hacker`, `cyberpunk`, `minimal`, `pulse-demo`, `rainbow-snake`,
+(`hacker`, `cyberpunk`, `minimal`, `pulse-border`, `rainbow-snake`,
 `performance`). ASCII is the default, matching the characters the core renderer
 falls back to when no theme is active.
 
@@ -77,14 +77,19 @@ enabled = false
 
 ### Composing performance colors with pulse
 
+The bundled theme is named `pulse-border`. The old `pulse-demo` name remains a
+deprecated lookup alias, not a separate picker entry. Explicit user themes named
+`pulse-demo` still take precedence. The `pulse` script and `pulse.border`
+component IDs are unchanged.
+
 Both themes remain independent: `performance` paints steady CPU-colored borders
-and headers; `pulse-demo` pulses lime/cyan on the focused pane. To connect them,
+and headers; `pulse-border` pulses lime/cyan on the focused pane. To connect them,
 use this in your BMUX config (no combination theme file is needed):
 
 ```toml
 [plugins.settings."bmux.theme"]
 appearance_themes = ["performance"]
-component_themes = ["performance", "pulse-demo"]
+component_themes = ["performance", "pulse-border"]
 
 [plugins.settings."bmux.theme".components."performance.border"]
 enabled = false
@@ -288,7 +293,7 @@ CPU cost.
 
 ## Try it
 
-The `pulse-demo` bundled theme exercises the full scripting path.
+The `pulse-border` bundled theme exercises the full scripting path.
 Activate it through the `bmux.theme` plugin; no additional files are
 required.
 

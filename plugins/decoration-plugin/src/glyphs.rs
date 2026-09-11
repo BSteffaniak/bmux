@@ -14,7 +14,7 @@ use bmux_scene_protocol::scene_protocol::BorderGlyphs;
 /// Accepts `kebab-case`, `snake_case`, and mixed case; normalises to
 /// lowercase + `_` before matching. The `"double"` shorthand is
 /// accepted as an alias for `"double_line"` to match the preset name
-/// convention used in theme files (see `pulse-demo.toml`).
+/// convention used in theme files (see `pulse-border.toml`).
 #[must_use]
 pub fn parse_border_glyphs(name: &str) -> BorderGlyphs {
     let normalized = name.trim().to_ascii_lowercase().replace('-', "_");

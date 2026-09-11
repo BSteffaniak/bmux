@@ -1,11 +1,11 @@
-# Pulse-demo theme - showcases the decoration plugin's Lua scripting
-# surface. The focused pane's border breathes between lime-green and
+# Pulse-border theme - a composable animated border.
+# The focused pane's border breathes between lime-green and
 # cyan every two seconds; unfocused panes get a static dim border.
 
 background           = "#000000"
 cursor               = "#39ff14"
 foreground           = "#e6ffe6"
-name                 = "pulse-demo"
+name                 = "pulse-border"
 selection_background = "#003311"
 
 [border]
