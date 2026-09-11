@@ -13,16 +13,34 @@ const INVOCATION_ID_ALPHABET: [char; 64] = [
 ];
 const INVOCATION_ID_LEN: usize = 21;
 
+fn encode_invocation_id(bytes: [u8; INVOCATION_ID_LEN]) -> String {
+    // A power-of-two alphabet makes masking uniform without rejection sampling.
+    bytes
+        .into_iter()
+        .map(|byte| INVOCATION_ID_ALPHABET[usize::from(byte & 63)])
+        .collect()
+}
+
 /// Serializable identifier that correlates all frames for one plugin invocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PluginInvocationId(String);
 
 impl PluginInvocationId {
-    /// Create a new nanoid-backed invocation identifier.
+    /// Create a new 21-character invocation identifier using Switchy's secure randomness.
+    ///
+    /// Switchy's simulator feature substitutes deterministic randomness for replay.
+    /// Production builds must not enable that feature.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the random source fails; no weaker fallback is used.
     #[must_use]
     pub fn new() -> Self {
-        Self(nanoid::nanoid!(INVOCATION_ID_LEN, &INVOCATION_ID_ALPHABET))
+        let mut bytes = [0; INVOCATION_ID_LEN];
+        switchy::random::secure_fill_bytes(&mut bytes)
+            .expect("failed to generate plugin invocation ID randomness");
+        Self(encode_invocation_id(bytes))
     }
 
     /// Return the identifier as a string slice.
@@ -158,7 +176,28 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn invocation_ids_are_nanoid_shaped_and_unique() {
+    fn invocation_id_encoding_preserves_alphabet_and_masks_uniformly() {
+        for byte in 0..=u8::MAX {
+            let encoded = super::encode_invocation_id([byte; super::INVOCATION_ID_LEN]);
+            let expected = super::INVOCATION_ID_ALPHABET[usize::from(byte & 63)];
+            assert_eq!(
+                encoded,
+                expected.to_string().repeat(super::INVOCATION_ID_LEN)
+            );
+        }
+    }
+
+    #[test]
+    fn invocation_id_serialization_remains_a_string() {
+        let encoded = "0123456789abcdefghijk";
+        let json = format!("\"{encoded}\"");
+        let id: PluginInvocationId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id.as_str(), encoded);
+        assert_eq!(serde_json::to_string(&id).unwrap(), json);
+    }
+
+    #[test]
+    fn invocation_ids_preserve_shape_and_are_unique() {
         let first = PluginInvocationId::new();
         let second = PluginInvocationId::new();
         assert_eq!(first.as_str().len(), 21);
