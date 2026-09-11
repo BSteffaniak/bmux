@@ -1003,6 +1003,7 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
     projection::ProjectionInteraction {
         scroll_anchor: state.manual_scroll.then_some(state.scroll_offset),
         editing_tab_id: state.editing_tab_id,
+        edit_text: Some(state.edit_buffer.text()),
         edit_selection: state
             .edit_buffer
             .selection()
@@ -1073,8 +1074,9 @@ fn build_surface_with_editor(
                 .enumerate()
                 .find(|(_, tab)| Some(tab.id) == segment.tab_id)
         {
+            let draft = projection::editing_entry(tab, Some(state.edit_buffer.text()));
             for (start, length) in
-                projection::name_ranges(&state.settings, tab, index, &state.local_presentation)
+                projection::name_ranges(&state.settings, &draft, index, &state.local_presentation)
             {
                 let start = u16::try_from(start).unwrap_or(u16::MAX);
                 let length = u16::try_from(length)
@@ -1243,6 +1245,7 @@ fn projection_interaction_without_marker(
     projection::ProjectionInteraction {
         scroll_anchor: state.manual_scroll.then_some(state.scroll_offset),
         editing_tab_id: state.editing_tab_id,
+        edit_text: Some(state.edit_buffer.text()),
         edit_selection: state
             .edit_buffer
             .selection()
@@ -2315,6 +2318,51 @@ mod tests {
             assert!(companion.last_left_click.is_none());
             assert!(companion.last_workspace_click.is_none());
             assert!(!cancel_rename(&mut companion));
+        }
+    }
+
+    #[test]
+    fn canonical_editor_drafts_resize_only_after_geometry_commit() {
+        for workspace in [false, true] {
+            let mut companion = CompanionState::new(Settings::default());
+            companion.local_presentation.viewport_cols = 120;
+            companion.workspace_label = Some("saved".to_string());
+            companion.editing_workspace_id = workspace.then_some(Uuid::nil());
+            if !workspace {
+                // The normal fixture supplies a stable authoritative tab identity.
+                companion.snapshot.tabs = vec![tabs_list::TabListEntry {
+                    id: Uuid::nil(),
+                    name: "saved".to_string(),
+                    active: true,
+                    workspace: "default".to_string(),
+                    workspace_id: Uuid::nil(),
+                }];
+                companion.editing_tab_id = Some(Uuid::nil());
+            }
+            companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text("x").into();
+            let (_, viewport) = build_surface_with_editor(&companion, 1);
+            rename_input::stage(&mut companion.edit_buffer, 1, viewport);
+            rename_input::acknowledge(&mut companion.edit_buffer, 1);
+            let initial = companion.edit_buffer.visible_rect().unwrap();
+            companion.edit_buffer.select_all();
+            companion
+                .edit_buffer
+                .dispatch(&bmux_tui::event::Event::Paste("界界long".to_string()));
+            let (_, viewport) = build_surface_with_editor(&companion, 2);
+            assert!(viewport.as_ref().unwrap().visible_rect().width > initial.width);
+            rename_input::stage(&mut companion.edit_buffer, 2, viewport);
+            assert_eq!(companion.edit_buffer.visible_rect(), Some(initial));
+            rename_input::acknowledge(&mut companion.edit_buffer, 2);
+            companion.edit_buffer.select_all();
+            rename_input::key(
+                &mut companion.edit_buffer,
+                "backspace",
+                bmux_plugin::AttachInputModifiers::default(),
+            );
+            let (_, viewport) = build_surface_with_editor(&companion, 3);
+            assert_eq!(viewport.unwrap().visible_rect().width, 1);
+            assert!(cancel_rename(&mut companion));
+            assert_eq!(companion.workspace_label.as_deref(), Some("saved"));
         }
     }
 

@@ -11918,12 +11918,12 @@ fn update_plugin_surface_focus(
     }
 }
 
-fn clear_plugin_surface_focus(view_state: &mut AttachViewState) {
+fn clear_plugin_surface_focus(view_state: &mut AttachViewState) -> bool {
     let Some(target) = view_state.plugin_focus.clear() else {
-        return;
+        return false;
     };
     let Some(endpoint) = view_state.retained_compositor.endpoint_for_region(&target) else {
-        return;
+        return false;
     };
     let hook_id = format!(
         "{}:{}:{}",
@@ -11936,10 +11936,16 @@ fn clear_plugin_surface_focus(view_state: &mut AttachViewState) {
         view_state
             .dirty
             .mark_extension_dirty(AttachDirtySource::PluginCommand);
+        let _ = view_state.plugin_pointer_router.release_capture();
+        return true;
     }
+    false
 }
 
-fn dismiss_plugin_focus_on_pointer_down(view_state: &mut AttachViewState, mouse_event: MouseEvent) {
+fn dismiss_plugin_focus_on_pointer_down(
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+) -> bool {
     if matches!(mouse_event.kind, MouseEventKind::Down(_)) {
         let hit = view_state
             .retained_compositor
@@ -11951,9 +11957,10 @@ fn dismiss_plugin_focus_on_pointer_down(view_state: &mut AttachViewState, mouse_
             .and_then(|id| view_state.retained_compositor.endpoint_for_region(id))
             .is_some_and(|endpoint| view_state.presentation_input.observes_focus_loss(endpoint));
         if observes_loss && view_state.plugin_focus.focused() != target {
-            clear_plugin_surface_focus(view_state);
+            return clear_plugin_surface_focus(view_state);
         }
     }
+    false
 }
 
 async fn try_handle_plugin_surface_mouse(
@@ -11962,7 +11969,9 @@ async fn try_handle_plugin_surface_mouse(
     mouse_event: MouseEvent,
 ) -> std::result::Result<bool, ClientError> {
     // Dismiss the old control before the destination can acquire focus.
-    dismiss_plugin_focus_on_pointer_down(view_state, mouse_event);
+    if dismiss_plugin_focus_on_pointer_down(view_state, mouse_event) {
+        return Ok(true);
+    }
     let events = view_state
         .plugin_pointer_router
         .route_terminal_mouse(&view_state.retained_compositor, mouse_event);
@@ -15867,14 +15876,16 @@ mod tests {
             row: 3,
             modifiers: KeyModifiers::empty(),
         };
-        dismiss_plugin_focus_on_pointer_down(&mut view, event);
+        assert!(!dismiss_plugin_focus_on_pointer_down(&mut view, event));
         assert!(view.plugin_focus.focused().is_some());
         event.column = 40;
         event.kind = MouseEventKind::Moved;
-        dismiss_plugin_focus_on_pointer_down(&mut view, event);
+        assert!(!dismiss_plugin_focus_on_pointer_down(&mut view, event));
         assert!(view.plugin_focus.focused().is_some());
         event.kind = MouseEventKind::Down(MouseButton::Left);
-        dismiss_plugin_focus_on_pointer_down(&mut view, event);
+        view.plugin_pointer_router.capture(hit);
+        assert!(dismiss_plugin_focus_on_pointer_down(&mut view, event));
+        assert!(view.plugin_pointer_router.release_capture().is_none());
         assert!(view.plugin_focus.focused().is_none());
         assert_eq!(notified.load(std::sync::atomic::Ordering::SeqCst), 1);
         registry.remove(&endpoint);

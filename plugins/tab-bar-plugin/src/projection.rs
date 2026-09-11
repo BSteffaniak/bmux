@@ -256,6 +256,7 @@ impl RenderStyle {
 pub struct ProjectionInteraction<'a> {
     pub(super) scroll_anchor: Option<usize>,
     pub(super) editing_tab_id: Option<Uuid>,
+    pub(super) edit_text: Option<&'a str>,
     pub(super) edit_selection: Option<(usize, usize)>,
     pub(super) menu_tab_id: Option<Uuid>,
     pub(super) menu_selected: usize,
@@ -304,6 +305,12 @@ pub fn project_bar(
     let workspace_name = interaction
         .workspace_label
         .or_else(|| tabs.first().map(|tab| tab.workspace.as_str()));
+    let workspace_draft = interaction.edit_text.map(editor_label);
+    let workspace_name = if interaction.editing_workspace {
+        workspace_draft.as_deref().or(workspace_name)
+    } else {
+        workspace_name
+    };
     let workspace_budget = width.saturating_sub(right_width + tail_width + 20).min(24);
     let workspace_label =
         workspace_name.map_or_else(String::new, |name| truncate_cells(name, workspace_budget));
@@ -321,7 +328,8 @@ pub fn project_bar(
         .enumerate()
         .map(|(index, tab)| {
             let editing = interaction.editing_tab_id == Some(tab.id);
-            let label = render_tab_template(settings, tab, index, local);
+            let draft = editing.then(|| editing_entry(tab, interaction.edit_text));
+            let label = render_tab_template(settings, draft.as_ref().unwrap_or(tab), index, local);
             let text = style.tab(&label, tab.active);
             TabToken {
                 width: UnicodeWidthStr::width(text.as_str()),
@@ -692,6 +700,22 @@ fn tab_window_width(
             .saturating_add(UnicodeWidthStr::width(style.tab_separator.as_str()));
     }
     width
+}
+
+// Reserve a display cell for the end cursor without changing the caller-owned draft.
+fn editor_label(text: &str) -> String {
+    format!("{text} ")
+}
+
+pub fn editing_entry(
+    tab: &tabs_list::TabListEntry,
+    draft: Option<&str>,
+) -> tabs_list::TabListEntry {
+    let mut entry = tab.clone();
+    if let Some(draft) = draft {
+        entry.name = editor_label(draft);
+    }
+    entry
 }
 
 fn render_tab_template(
@@ -1228,6 +1252,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn live_drafts_resize_tabs_and_workspaces_with_bounded_cell_geometry() {
+        let settings = Settings::default();
+        let tabs = [tab(1, "saved", true), tab(2, "other", false)];
+        for workspace in [false, true] {
+            let mut widths = Vec::new();
+            for text in ["x", "界界long", "", "x"] {
+                let interaction = ProjectionInteraction {
+                    editing_tab_id: (!workspace).then_some(tabs[0].id),
+                    editing_workspace: workspace,
+                    edit_text: Some(text),
+                    ..ProjectionInteraction::default()
+                };
+                let projected = project_bar(&settings, &tabs, &local(120), None, &interaction);
+                let kind = if workspace {
+                    SegmentKind::EditingWorkspace
+                } else {
+                    SegmentKind::EditingTab
+                };
+                let segment = projected
+                    .segments
+                    .iter()
+                    .find(|segment| segment.kind == kind)
+                    .unwrap();
+                widths.push(UnicodeWidthStr::width(segment.text.as_str()));
+                for width in [1, 8, 25] {
+                    let narrow = project_bar(&settings, &tabs, &local(width), None, &interaction);
+                    assert!(
+                        UnicodeWidthStr::width(narrow.plain_text().as_str()) <= usize::from(width)
+                    );
+                }
+            }
+            assert!(widths[1] > widths[0]);
+            assert!(widths[2] < widths[0]);
+            assert_eq!(widths[0], widths[3]);
+            assert!(widths[2] >= 1);
+        }
+        assert_eq!(tabs[0].name, "saved");
     }
 
     #[test]
