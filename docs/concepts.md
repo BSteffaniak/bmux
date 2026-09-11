@@ -50,6 +50,8 @@ sort_order = "last_visited"
 filtered_sort_order = "inherit"
 # "hidden" (default), "last", or "in_order".
 current_tab = "hidden"
+# Wrap Up/Down (and Ctrl-P/Ctrl-N) through filtered results; false clamps at ends.
+wrap_selection = true
 ```
 
 `entry_format` supports the `{workspace}` and `{tab}` placeholders. Finder

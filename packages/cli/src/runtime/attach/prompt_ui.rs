@@ -498,6 +498,7 @@ impl AttachPromptState {
                     PromptField::SearchSelect {
                         options,
                         match_mode,
+                        wrap_selection,
                         live_preview,
                         ..
                     },
@@ -566,7 +567,10 @@ impl AttachPromptState {
                             if matches!(key.code, KeyCode::Up)
                                 || key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
-                            *selected = selected.saturating_sub(1);
+                            let len =
+                                filtered_option_indices(options, query.text(), *match_mode).len();
+                            *selected =
+                                step_search_selection(*selected, len, false, *wrap_selection);
                         }
                         KeyCode::Down | KeyCode::Char('n')
                             if matches!(key.code, KeyCode::Down)
@@ -574,7 +578,8 @@ impl AttachPromptState {
                         {
                             let len =
                                 filtered_option_indices(options, query.text(), *match_mode).len();
-                            *selected = selected.saturating_add(1).min(len.saturating_sub(1));
+                            *selected =
+                                step_search_selection(*selected, len, true, *wrap_selection);
                         }
                         KeyCode::Home => {
                             *selected = 0;
@@ -2902,6 +2907,25 @@ fn prompt_footer_text(request: &PromptRequest) -> String {
     }
 }
 
+fn step_search_selection(selected: usize, len: usize, forward: bool, wrap: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let last = len - 1;
+    let selected = selected.min(last);
+    if forward {
+        if wrap && selected == last {
+            0
+        } else {
+            selected.saturating_add(1).min(last)
+        }
+    } else if wrap && selected == 0 {
+        last
+    } else {
+        selected.saturating_sub(1)
+    }
+}
+
 fn filtered_option_indices(
     options: &[PromptOption],
     query: &str,
@@ -3110,7 +3134,7 @@ fn run_prompt_validation(
 mod tests {
     use super::{
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, PromptWidgetState,
-        filtered_option_indices, prompt_overlay_layout,
+        filtered_option_indices, prompt_overlay_layout, step_search_selection,
     };
     use crate::runtime::attach::input::TerminalGeometry;
     use crate::runtime::attach::tui_surface::{component_theme, parse_tui_color};
@@ -4361,6 +4385,37 @@ mod tests {
             );
             assert!(filtered_option_indices(&options, "missing", mode(matching, false)).is_empty());
         }
+    }
+
+    #[test]
+    fn search_selection_wraps_only_when_enabled() {
+        assert_eq!(step_search_selection(0, 3, false, true), 2);
+        assert_eq!(step_search_selection(2, 3, true, true), 0);
+        assert_eq!(step_search_selection(0, 3, false, false), 0);
+        assert_eq!(step_search_selection(2, 3, true, false), 2);
+        assert_eq!(step_search_selection(1, 3, true, true), 2);
+        assert_eq!(step_search_selection(1, 3, false, true), 0);
+        for len in [0, 1] {
+            for wrap in [false, true] {
+                for forward in [false, true] {
+                    assert_eq!(step_search_selection(0, len, forward, wrap), 0);
+                }
+            }
+        }
+        let options = vec![
+            PromptOption::new("a", "match"),
+            PromptOption::new("b", "other"),
+            PromptOption::new("c", "match"),
+        ];
+        let filtered = filtered_option_indices(&options, "match", PromptSearchMatchMode::Substring);
+        assert_eq!(
+            filtered[step_search_selection(0, filtered.len(), false, true)],
+            2
+        );
+        assert_eq!(
+            filtered[step_search_selection(1, filtered.len(), true, true)],
+            0
+        );
     }
 
     #[test]

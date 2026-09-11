@@ -94,6 +94,7 @@ fn show_finder(context: &NativeCommandContext) -> Result<i32, PluginCommandError
             },
             relevance: settings.filtered_sort_order == FilteredSortOrder::Relevance,
         })
+        .search_wrap_selection(settings.wrap_selection)
         .search_placeholder("Search workspace or tab");
     let response = prompt::submit(request).map_err(|error| {
         PluginCommandError::unavailable(format!("finder prompt unavailable: {error}"))
@@ -167,6 +168,7 @@ struct FinderSettings {
     sort_order: SortOrder,
     filtered_sort_order: FilteredSortOrder,
     current_tab: CurrentTab,
+    wrap_selection: bool,
 }
 
 impl Default for FinderSettings {
@@ -179,6 +181,7 @@ impl Default for FinderSettings {
             sort_order: SortOrder::LastVisited,
             filtered_sort_order: FilteredSortOrder::Inherit,
             current_tab: CurrentTab::Hidden,
+            wrap_selection: true,
         }
     }
 }
@@ -258,6 +261,11 @@ impl FinderSettings {
             sort_order,
             filtered_sort_order,
             current_tab,
+            wrap_selection: table.get("wrap_selection").map_or(Ok(true), |value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| "finder wrap_selection must be a boolean".to_string())
+            })?,
         })
     }
 
@@ -624,6 +632,22 @@ mod tests {
                 assert!(FinderSettings::parse(Some(&settings)).is_err());
             }
         }
+    }
+
+    #[test]
+    fn wrapping_defaults_on_and_requires_a_boolean() {
+        assert!(FinderSettings::parse(None).unwrap().wrap_selection);
+        for enabled in [true, false] {
+            let value = toml::Value::Table(
+                std::iter::once(("wrap_selection".into(), toml::Value::Boolean(enabled))).collect(),
+            );
+            assert_eq!(
+                FinderSettings::parse(Some(&value)).unwrap().wrap_selection,
+                enabled
+            );
+        }
+        let value: toml::Value = toml::toml! { wrap_selection = "true" }.into();
+        assert!(FinderSettings::parse(Some(&value)).is_err());
     }
 
     #[test]

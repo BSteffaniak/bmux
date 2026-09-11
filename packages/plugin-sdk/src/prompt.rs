@@ -222,6 +222,9 @@ pub enum PromptField {
         /// Matching strategy used by the host while filtering options.
         #[serde(default)]
         match_mode: PromptSearchMatchMode,
+        /// Wrap single-step navigation at the filtered list boundaries.
+        #[serde(default)]
+        wrap_selection: bool,
         /// Emit selection-change events while the user moves through the filtered list.
         /// Hosts can use this for live previews without waiting for submit.
         live_preview: bool,
@@ -500,6 +503,7 @@ impl PromptRequest {
                 default_index: 0,
                 placeholder: Some("Type to search".to_string()),
                 match_mode: PromptSearchMatchMode::Fuzzy,
+                wrap_selection: false,
                 live_preview: false,
             },
         }
@@ -713,6 +717,15 @@ impl PromptRequest {
     pub const fn search_match_mode(mut self, mode: PromptSearchMatchMode) -> Self {
         if let PromptField::SearchSelect { match_mode, .. } = &mut self.field {
             *match_mode = mode;
+        }
+        self
+    }
+
+    /// Configure wrapping for single-step searchable-list navigation.
+    #[must_use]
+    pub const fn search_wrap_selection(mut self, wrap: bool) -> Self {
+        if let PromptField::SearchSelect { wrap_selection, .. } = &mut self.field {
+            *wrap_selection = wrap;
         }
         self
     }
