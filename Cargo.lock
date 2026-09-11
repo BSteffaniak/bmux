@@ -620,13 +620,13 @@ dependencies = [
 
 [[package]]
 name = "argon2"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+checksum = "134c52ddac6d63c576bef8168db10c83c49c26444ecbc68060fef078925a901c"
 dependencies = [
  "base64ct",
  "blake2",
- "cpufeatures 0.2.17",
+ "cpufeatures 0.3.0",
  "password-hash",
 ]
 
@@ -1049,11 +1049,11 @@ dependencies = [
 
 [[package]]
 name = "blake2"
-version = "0.10.6"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+checksum = "5b5d4d889834ee8ecfc0f8426ad30faf7cdcb10f741a8e6d7224d95325479f6f"
 dependencies = [
- "digest 0.10.7",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -3850,27 +3850,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dirs"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
-dependencies = [
- "dirs-sys",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4782,26 +4761,24 @@ dependencies = [
 [[package]]
 name = "git_sshripped_ssh_identity"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "914a50f93a040cf5523308e71cbc20f9a140589681076f1cfb4a49303068b1e2"
+source = "git+https://github.com/BSteffaniak/git-sshripped?branch=master#a8ccb9c128f7947e671b009471039c55e63283c6"
 dependencies = [
  "age",
  "anyhow",
- "dirs",
  "git_sshripped_ssh_identity_models",
  "hex",
  "profiling",
  "rpassword",
  "ssh-agent-client-rs",
  "ssh-key",
+ "switchy_fs",
  "wait-timeout",
 ]
 
 [[package]]
 name = "git_sshripped_ssh_identity_models"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34620f056d78e4faa75c4a08384d4844366831d865f4bcd30472dbee5a3777fa"
+source = "git+https://github.com/BSteffaniak/git-sshripped?branch=master#a8ccb9c128f7947e671b009471039c55e63283c6"
 dependencies = [
  "serde",
 ]
@@ -6724,15 +6701,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
-name = "libredox"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c943259e342f1e06ff2da7a83eabdfe7f92ce10262688dbf1895ff0b3e6e4652"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "libsqlite3-sys"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8143,12 +8111,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "option-ext"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
-
-[[package]]
 name = "ordered-float"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8319,13 +8281,11 @@ dependencies = [
 
 [[package]]
 name = "password-hash"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
 dependencies = [
- "base64ct",
- "rand_core 0.6.4",
- "subtle",
+ "phc",
 ]
 
 [[package]]
@@ -8467,6 +8427,16 @@ checksum = "e9567389417feee6ce15dd6527a8a1ecac205ef62c2932bcf3d9f6fc5b78b414"
 dependencies = [
  "futures",
  "rustc_version",
+]
+
+[[package]]
+name = "phc"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
+dependencies = [
+ "base64ct",
+ "ctutils",
 ]
 
 [[package]]
@@ -9304,17 +9274,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags 2.13.0",
-]
-
-[[package]]
-name = "redox_users"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -10628,9 +10587,8 @@ dependencies = [
 
 [[package]]
 name = "sshenv_vault"
-version = "0.0.1-alpha.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "739e193f86571b12dd90f5b22394920d974bae3652f012d64119bde057d0b378"
+version = "0.0.1-alpha.4"
+source = "git+https://github.com/BSteffaniak/sshenv?branch=master#ae4ed2c81988d12b6086043985d3674077e278bd"
 dependencies = [
  "aes-siv",
  "age",
@@ -10639,11 +10597,10 @@ dependencies = [
  "base64 0.23.1",
  "core-foundation 0.10.1",
  "core-foundation-sys",
- "dirs",
+ "getrandom 0.4.3",
  "hex",
  "hkdf 0.13.0",
  "libc",
- "rand_core 0.6.4",
  "rpassword",
  "security-framework",
  "security-framework-sys",
@@ -10652,6 +10609,8 @@ dependencies = [
  "sha2 0.11.0",
  "ssh-key",
  "sshenv_vault_models",
+ "switchy_age",
+ "switchy_fs",
  "tempfile",
  "thiserror 2.0.20",
  "windows-sys 0.61.2",
@@ -10660,9 +10619,8 @@ dependencies = [
 
 [[package]]
 name = "sshenv_vault_models"
-version = "0.0.1-alpha.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0483576725c49269993b7a12cd637dd97e92dd2116be1fabbced23b160222dc6"
+version = "0.0.1-alpha.4"
+source = "git+https://github.com/BSteffaniak/sshenv?branch=master#ae4ed2c81988d12b6086043985d3674077e278bd"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -11268,6 +11226,15 @@ dependencies = [
  "switchy_web_server",
  "switchy_web_server_core",
  "tokio",
+]
+
+[[package]]
+name = "switchy_age"
+version = "0.4.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#5626b800db0d31deea3b4e1c16880bc2c4080cba"
+dependencies = [
+ "age",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
