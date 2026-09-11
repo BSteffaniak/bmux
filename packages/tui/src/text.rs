@@ -757,6 +757,30 @@ pub fn wrap_line_with_geometry(
     }
 }
 
+/// Wrap and clip styled text to explicit per-row viewport widths.
+///
+/// Unlike [`wrap_line_with_geometry`], every returned row fits its requested
+/// width, including zero-width viewports and graphemes wider than a row. Such
+/// graphemes are omitted without an ellipsis; their row reservation is retained.
+/// This is a presentation operation, not a source-provenance projection. Callers
+/// needing source ranges should use `TextBlock` projection and clip its geometry
+/// together with its text instead of reconstructing offsets from these rows.
+#[must_use]
+pub fn wrap_line_bounded(line: &Line, geometry: TextWrapGeometry, wrap: TextWrap) -> Vec<Line> {
+    wrap_line_with_geometry(line, geometry, wrap)
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let width = if index == 0 {
+                geometry.first_width
+            } else {
+                geometry.continuation_width
+            };
+            row.viewport(0, width)
+        })
+        .collect()
+}
+
 /// Wrap plain text using an explicit policy and per-row geometry.
 ///
 /// Returns one string per produced row. `TextWrap::None` returns `text`
@@ -1567,6 +1591,40 @@ mod tests {
             wrapped.iter().map(Line::plain_text).collect::<Vec<_>>(),
             ["alpha beta ", "gamma ", "delta"]
         );
+    }
+
+    #[test]
+    fn bounded_wrapping_respects_zero_and_one_cell_viewports() {
+        let line = Line::from_spans(vec![Span::raw("界👩‍💻"), Span::raw("abc")]);
+        for first_width in 0..=4 {
+            for continuation_width in 0..=4 {
+                for wrap in [TextWrap::None, TextWrap::Word, TextWrap::Character] {
+                    let rows = super::wrap_line_bounded(
+                        &line,
+                        TextWrapGeometry::with_continuation(first_width, continuation_width),
+                        wrap,
+                    );
+                    assert!(!rows.is_empty());
+                    for (index, row) in rows.iter().enumerate() {
+                        let width = if index == 0 {
+                            first_width
+                        } else {
+                            continuation_width
+                        };
+                        assert!(row.width() <= width);
+                        assert!(!row.plain_text().contains('…'));
+                    }
+                }
+            }
+        }
+        let rows = super::wrap_line_bounded(
+            &Line::raw("界a"),
+            TextWrapGeometry::uniform(1),
+            TextWrap::Character,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].plain_text(), "");
+        assert_eq!(rows[1].plain_text(), "a");
     }
 
     #[test]
