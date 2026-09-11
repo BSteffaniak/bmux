@@ -1,9 +1,13 @@
-execution_class       = "native_fast"
-id                    = "bmux.finder"
-name                  = "bmux Finder"
-owns_namespaces       = ["finder"]
-required_capabilities = ["bmux.tabs.read", "bmux.workspaces.read"]
-version               = "0.0.1-alpha.0"
+execution_class = "native_fast"
+id = "bmux.finder"
+name = "bmux Finder"
+owns_namespaces = ["finder"]
+required_capabilities = [
+    "bmux.tabs.read",
+    "bmux.workspaces.read",
+    "bmux.contexts.read",
+]
+version = "0.0.1-alpha.0"
 
 [[commands]]
 execution     = "caller_process"

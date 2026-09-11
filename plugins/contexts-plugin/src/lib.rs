@@ -30,6 +30,7 @@ use bmux_contexts_plugin_api::contexts_state::{
     self, ContextQueryError, ContextSelector as StateContextSelector, ContextSummary,
     ContextsStateService,
 };
+use bmux_contexts_plugin_api::contexts_visits_v1::{self, ContextsVisitsV1Service};
 use bmux_plugin::{
     HostRuntimeApi, ServiceCaller, TypedServiceCaller, global_event_bus,
     global_plugin_state_registry,
@@ -232,6 +233,7 @@ impl ContextStateWriter for ContextStateAdapter {
                 state.session_by_context = snapshot.session_by_context;
                 state.selected_by_client = snapshot.selected_by_client;
                 state.mru_contexts = snapshot.mru_contexts;
+                state.visited_by_client.clear();
             },
             (),
         );
@@ -421,6 +423,9 @@ impl RustPlugin for ContextsPlugin {
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
+            "contexts-visits-v1", "list-visits" => |_req: (), ctx| {
+                Ok(list_visits_local(ctx, ctx.caller_client_id))
+            },
             "contexts-state", "list-contexts" => |_req: (), ctx| {
                 list_contexts_local(ctx)
                     .map_err(|e| ServiceResponse::error("list_failed", e))
@@ -471,6 +476,9 @@ impl RustPlugin for ContextsPlugin {
     ) {
         let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
 
+        let visits: Arc<dyn ContextsVisitsV1Service + Send + Sync> =
+            Arc::new(ContextsStateHandle::new(Arc::clone(&caller)));
+        let _ = contexts_visits_v1::register_provider(registry, visits);
         let state: Arc<dyn ContextsStateService + Send + Sync> =
             Arc::new(ContextsStateHandle::new(Arc::clone(&caller)));
         let _ = contexts_state::register_provider(registry, state);
@@ -815,7 +823,7 @@ fn select_context_local(
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| SelectContextError::Denied { reason })?;
 
-    let (context, mut session_after_select) = mutate_state_select(client_id, &context_selector)?;
+    let (context, mut session_after_select) = resolve_selection_target(&context_selector)?;
 
     tracing::Span::current().record("context_id", tracing::field::display(context.id));
     if let Some(session_id) = session_after_select {
@@ -855,6 +863,15 @@ fn select_context_local(
         }
     }
 
+    {
+        let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
+        let mut guard = state.write().map_err(|_| SelectContextError::Denied {
+            reason: "context state lock poisoned".into(),
+        })?;
+        guard
+            .select_for_client(client_id, &PrimitiveContextSelector::ById(context.id))
+            .map_err(|_| SelectContextError::NotFound)?;
+    }
     let _ = global_event_bus().emit(
         &contexts_events::EVENT_KIND,
         ContextEvent::Selected {
@@ -881,20 +898,24 @@ fn select_context_local(
 }
 
 #[allow(clippy::significant_drop_tightening)]
-fn mutate_state_select(
-    client_id: ClientId,
+fn resolve_selection_target(
     context_selector: &PrimitiveContextSelector,
 ) -> Result<(PrimitiveContextSummary, Option<SessionId>), SelectContextError> {
     let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
-    let mut guard = state.write().map_err(|_| SelectContextError::Denied {
+    let guard = state.read().map_err(|_| SelectContextError::Denied {
         reason: "context state lock poisoned".to_string(),
     })?;
-    let context = guard
-        .select_for_client(client_id, context_selector)
+    let id = guard
+        .resolve_id(context_selector)
         .map_err(|reason| SelectContextError::Denied {
             reason: reason.to_string(),
         })?;
-    let session_id = guard.current_session_for_client(client_id);
+    let context = guard
+        .contexts
+        .get(&id)
+        .map(ContextState::to_summary)
+        .ok_or(SelectContextError::NotFound)?;
+    let session_id = guard.session_by_context.get(&id).copied();
     Ok((context, session_id))
 }
 
@@ -1307,6 +1328,27 @@ pub struct ContextsStateHandle {
 impl ContextsStateHandle {
     const fn new(caller: Arc<TypedServiceCaller>) -> Self {
         Self { caller }
+    }
+}
+
+fn list_visits_local(
+    caller: &(impl ServiceCaller + Sync),
+    caller_client_id: Option<Uuid>,
+) -> Result<Vec<Uuid>, String> {
+    let client = resolve_caller_client_id(caller, caller_client_id)?;
+    let state = local_state()?;
+    let guard = state.read().map_err(|_| "context state lock poisoned")?;
+    Ok(guard
+        .visited_by_client
+        .get(&client)
+        .map_or_else(Vec::new, |history| history.iter().copied().collect()))
+}
+
+impl ContextsVisitsV1Service for ContextsStateHandle {
+    fn list_visits<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Uuid>, String>> + Send + 'a>> {
+        Box::pin(async move { list_visits_local(self.caller.as_ref(), None) })
     }
 }
 

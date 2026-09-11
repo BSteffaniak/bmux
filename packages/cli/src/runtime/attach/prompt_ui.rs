@@ -2920,6 +2920,34 @@ fn filtered_option_indices(
         })
         .collect::<Vec<_>>();
     scored.sort_by(|left, right| {
+        if let PromptSearchMatchMode::OrderedV1 { relevance, .. } = match_mode {
+            let key = |index: usize| {
+                options[index].search_order.map_or((0, index), |order| {
+                    (
+                        order.group,
+                        if query.trim().is_empty() {
+                            order.initial
+                        } else {
+                            order.filtered
+                        },
+                    )
+                })
+            };
+            let left_key = key(left.0);
+            let right_key = key(right.0);
+            return left_key
+                .0
+                .cmp(&right_key.0)
+                .then_with(|| {
+                    if relevance && !query.trim().is_empty() {
+                        right.1.cmp(&left.1)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .then_with(|| left_key.1.cmp(&right_key.1))
+                .then_with(|| left.0.cmp(&right.0));
+        }
         right
             .1
             .cmp(&left.1)
@@ -2935,6 +2963,18 @@ fn search_score(query: &str, candidate: &str, match_mode: PromptSearchMatchMode)
         return Some(0);
     }
     match match_mode {
+        PromptSearchMatchMode::OrderedV1 { matching, .. } => {
+            use bmux_plugin_sdk::prompt::PromptOrderedMatchMode;
+            search_score(
+                query,
+                candidate,
+                match matching {
+                    PromptOrderedMatchMode::Fuzzy => PromptSearchMatchMode::Fuzzy,
+                    PromptOrderedMatchMode::Prefix => PromptSearchMatchMode::Prefix,
+                    PromptOrderedMatchMode::Substring => PromptSearchMatchMode::Substring,
+                },
+            )
+        }
         PromptSearchMatchMode::Fuzzy => fuzzy_score(query, candidate),
         PromptSearchMatchMode::Prefix => candidate
             .to_ascii_lowercase()
@@ -4278,6 +4318,49 @@ mod tests {
         assert!(text.contains("Stop"));
         assert!(!text.contains("[x]"));
         assert!(!text.contains("[ ]"));
+    }
+
+    #[test]
+    fn ordered_search_preserves_ranks_and_group_before_relevance() {
+        use bmux_plugin_sdk::prompt::{PromptOrderedMatchMode, PromptSearchOrder};
+        let mut options = vec![
+            PromptOption::new("recent", "e-x"),
+            PromptOption::new("exact", "ex"),
+            PromptOption::new("current", "example"),
+        ];
+        for (index, option) in options.iter_mut().enumerate() {
+            option.search_order = Some(PromptSearchOrder {
+                group: u8::from(index == 2),
+                initial: index,
+                filtered: index,
+            });
+        }
+        let mode = |matching, relevance| PromptSearchMatchMode::OrderedV1 {
+            matching,
+            relevance,
+        };
+        assert_eq!(
+            filtered_option_indices(&options, "", mode(PromptOrderedMatchMode::Fuzzy, false)),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            filtered_option_indices(&options, "ex", mode(PromptOrderedMatchMode::Fuzzy, false)),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            filtered_option_indices(&options, "ex", mode(PromptOrderedMatchMode::Fuzzy, true)),
+            vec![1, 0, 2]
+        );
+        for matching in [
+            PromptOrderedMatchMode::Prefix,
+            PromptOrderedMatchMode::Substring,
+        ] {
+            assert_eq!(
+                filtered_option_indices(&options, "e", mode(matching, false)),
+                vec![0, 1, 2]
+            );
+            assert!(filtered_option_indices(&options, "missing", mode(matching, false)).is_empty());
+        }
     }
 
     #[test]

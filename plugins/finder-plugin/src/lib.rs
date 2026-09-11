@@ -4,10 +4,12 @@
 
 use bmux_plugin::{action_dispatch, prompt};
 use bmux_plugin_sdk::prelude::*;
+use bmux_plugin_sdk::prompt::{PromptOrderedMatchMode, PromptSearchOrder};
 use bmux_plugin_sdk::{
     PromptOption, PromptRequest, PromptResponse, PromptSearchMatchMode, PromptValue,
 };
 use bmux_tabs_plugin_api::tabs_list::TabListEntry;
+use std::collections::HashMap;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -31,9 +33,10 @@ impl RustPlugin for FinderPlugin {
 fn load_windows(context: &NativeCommandContext) -> Result<Vec<TabListEntry>, PluginCommandError> {
     let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
     let tabs = bmux_plugin::block_on_typed_dispatch(
-        bmux_tabs_plugin_api::tabs_state::client::list_tabs(&mut client, None),
+        bmux_tabs_plugin_api::tabs_catalog_v1::client::list_tabs(&mut client),
     )
-    .map_err(|error| PluginCommandError::unavailable(format!("tab list unavailable: {error}")))?;
+    .map_err(|error| PluginCommandError::unavailable(format!("tab list unavailable: {error}")))?
+    .map_err(PluginCommandError::unavailable)?;
     tabs.into_iter()
         .map(|tab| {
             Ok(TabListEntry {
@@ -63,21 +66,34 @@ fn show_finder(context: &NativeCommandContext) -> Result<i32, PluginCommandError
         warn!("finder: no tabs available");
         return Ok(EXIT_OK);
     }
-    let options = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            PromptOption::new(index.to_string(), entry.label.clone())
-                .search_text(entry.search_text.clone())
-                .detail(entry.detail.clone())
-        })
-        .collect();
+    let visits = if settings.sort_order == SortOrder::LastVisited
+        || settings.filtered_sort_order == FilteredSortOrder::Order(SortOrder::LastVisited)
+    {
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+        bmux_plugin::block_on_typed_dispatch(
+            bmux_contexts_plugin_api::contexts_visits_v1::client::list_visits(&mut client),
+        )
+        .map_err(|error| {
+            PluginCommandError::unavailable(format!("visit history unavailable: {error}"))
+        })?
+        .map_err(PluginCommandError::unavailable)?
+    } else {
+        Vec::new()
+    };
+    let options = ordered_options(&entries, &tabs, &visits, &settings);
     let request = PromptRequest::search_select("Find Tab", options)
         .width_range(90, 90)
         .max_height(30)
         .message(settings.message())
         .submit_label("Switch")
-        .search_match_mode(settings.match_mode.into())
+        .search_match_mode(PromptSearchMatchMode::OrderedV1 {
+            matching: match settings.match_mode {
+                MatchMode::Fuzzy => PromptOrderedMatchMode::Fuzzy,
+                MatchMode::Prefix => PromptOrderedMatchMode::Prefix,
+                MatchMode::Substring => PromptOrderedMatchMode::Substring,
+            },
+            relevance: settings.filtered_sort_order == FilteredSortOrder::Relevance,
+        })
         .search_placeholder("Search workspace or tab");
     let response = prompt::submit(request).map_err(|error| {
         PluginCommandError::unavailable(format!("finder prompt unavailable: {error}"))
@@ -112,12 +128,45 @@ impl From<MatchMode> for PromptSearchMatchMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortOrder {
+    LastVisited,
+    WorkspaceTab,
+    Alphabetical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilteredSortOrder {
+    Inherit,
+    Relevance,
+    Order(SortOrder),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentTab {
+    Hidden,
+    Last,
+    InOrder,
+}
+
+fn parse_sort(value: &str) -> Result<SortOrder, String> {
+    match value {
+        "last_visited" => Ok(SortOrder::LastVisited),
+        "workspace_tab" => Ok(SortOrder::WorkspaceTab),
+        "alphabetical" => Ok(SortOrder::Alphabetical),
+        _ => Err(format!("invalid finder sort order '{value}'")),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FinderSettings {
     scope: FinderScope,
     include_workspace_name: bool,
     match_mode: MatchMode,
     entry_format: String,
+    sort_order: SortOrder,
+    filtered_sort_order: FilteredSortOrder,
+    current_tab: CurrentTab,
 }
 
 impl Default for FinderSettings {
@@ -127,6 +176,9 @@ impl Default for FinderSettings {
             include_workspace_name: true,
             match_mode: MatchMode::Fuzzy,
             entry_format: DEFAULT_ENTRY_FORMAT.to_string(),
+            sort_order: SortOrder::LastVisited,
+            filtered_sort_order: FilteredSortOrder::Inherit,
+            current_tab: CurrentTab::Hidden,
         }
     }
 }
@@ -175,11 +227,37 @@ impl FinderSettings {
             })?
             .to_string();
         validate_entry_format(&entry_format)?;
+        let text = |key: &str, default: &str| -> Result<String, String> {
+            table.get(key).map_or_else(
+                || Ok(default.to_string()),
+                |value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("finder {key} must be a string"))
+                },
+            )
+        };
+        let sort_order = parse_sort(&text("sort_order", "last_visited")?)?;
+        let filtered_sort_order = match text("filtered_sort_order", "inherit")?.as_str() {
+            "inherit" => FilteredSortOrder::Inherit,
+            "relevance" => FilteredSortOrder::Relevance,
+            other => FilteredSortOrder::Order(parse_sort(other)?),
+        };
+        let current_tab = match text("current_tab", "hidden")?.as_str() {
+            "hidden" => CurrentTab::Hidden,
+            "last" => CurrentTab::Last,
+            "in_order" => CurrentTab::InOrder,
+            other => return Err(format!("invalid finder current_tab '{other}'")),
+        };
         Ok(Self {
             scope,
             include_workspace_name,
             match_mode,
             entry_format,
+            sort_order,
+            filtered_sort_order,
+            current_tab,
         })
     }
 
@@ -189,6 +267,69 @@ impl FinderSettings {
             FinderScope::CurrentWorkspace => "Search tabs in the current workspace",
         }
     }
+}
+
+fn ordered_options(
+    entries: &[FinderEntry],
+    tabs: &[TabListEntry],
+    visits: &[Uuid],
+    settings: &FinderSettings,
+) -> Vec<PromptOption> {
+    let visit_ranks: HashMap<_, _> = visits
+        .iter()
+        .enumerate()
+        .map(|(rank, id)| (*id, rank))
+        .collect();
+    let ranks = |sort: SortOrder| {
+        let mut indices: Vec<_> = (0..entries.len()).collect();
+        indices.sort_by(|left, right| {
+            let a = &entries[*left];
+            let b = &entries[*right];
+            match sort {
+                SortOrder::LastVisited => visit_ranks
+                    .get(&a.context_id)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+                    .cmp(
+                        &visit_ranks
+                            .get(&b.context_id)
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                    ),
+                SortOrder::WorkspaceTab => std::cmp::Ordering::Equal,
+                SortOrder::Alphabetical => a.label.cmp(&b.label),
+            }
+            .then_with(|| left.cmp(right))
+        });
+        let mut result = vec![0; entries.len()];
+        for (rank, index) in indices.into_iter().enumerate() {
+            result[index] = rank;
+        }
+        result
+    };
+    let initial = ranks(settings.sort_order);
+    let filtered = ranks(match settings.filtered_sort_order {
+        FilteredSortOrder::Order(order) => order,
+        FilteredSortOrder::Inherit | FilteredSortOrder::Relevance => settings.sort_order,
+    });
+    let active = tabs.iter().find(|tab| tab.active).map(|tab| tab.id);
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let mut option = PromptOption::new(entry.context_id.to_string(), entry.label.clone())
+                .search_text(entry.search_text.clone())
+                .detail(entry.detail.clone());
+            option.search_order = Some(PromptSearchOrder {
+                group: u8::from(
+                    settings.current_tab == CurrentTab::Last && active == Some(entry.context_id),
+                ),
+                initial: initial[index],
+                filtered: filtered[index],
+            });
+            option
+        })
+        .collect()
 }
 
 fn validate_entry_format(format: &str) -> Result<(), String> {
@@ -213,6 +354,7 @@ fn build_entries(
     active_workspace_id: Option<Uuid>,
 ) -> Vec<FinderEntry> {
     tabs.iter()
+        .filter(|tab| settings.current_tab != CurrentTab::Hidden || !tab.active)
         .filter(|tab| {
             settings.scope == FinderScope::AllWorkspaces
                 || active_workspace_id == Some(tab.workspace_id)
@@ -248,10 +390,9 @@ async fn handle_response(
         )
         | Err(_) => return,
     };
-    let Some(entry) = selected
-        .parse::<usize>()
+    let Some(entry) = Uuid::parse_str(&selected)
         .ok()
-        .and_then(|index| entries.get(index))
+        .and_then(|id| entries.iter().find(|entry| entry.context_id == id))
     else {
         warn!(selected, "finder: invalid selection");
         return;
@@ -275,7 +416,9 @@ mod tests {
         let id = Uuid::from_u128(42);
         let (response, selection) = tokio::sync::oneshot::channel();
         response
-            .send(PromptResponse::Submitted(PromptValue::Single("0".into())))
+            .send(PromptResponse::Submitted(PromptValue::Single(
+                id.to_string(),
+            )))
             .unwrap();
         handle_response(
             vec![FinderEntry {
@@ -312,7 +455,10 @@ mod tests {
 
     #[test]
     fn entries_include_workspace_and_tab_names() {
-        let settings = FinderSettings::default();
+        let settings = FinderSettings {
+            current_tab: CurrentTab::InOrder,
+            ..FinderSettings::default()
+        };
         let entries = build_entries(
             &[window(1, 2, "project", "editor", true)],
             &settings,
@@ -354,6 +500,7 @@ mod tests {
     fn current_workspace_scope_filters_other_workspaces() {
         let settings = FinderSettings {
             scope: FinderScope::CurrentWorkspace,
+            current_tab: CurrentTab::InOrder,
             ..FinderSettings::default()
         };
         let entries = build_entries(
@@ -373,6 +520,7 @@ mod tests {
     fn workspace_name_can_be_excluded_from_search() {
         let settings = FinderSettings {
             include_workspace_name: false,
+            current_tab: CurrentTab::InOrder,
             ..FinderSettings::default()
         };
         let entries = build_entries(
@@ -398,6 +546,84 @@ mod tests {
             PromptSearchMatchMode::from(MatchMode::Substring),
             PromptSearchMatchMode::Substring
         );
+    }
+
+    #[test]
+    fn default_order_hides_current_and_ranks_visits_across_workspaces() {
+        let settings = FinderSettings::default();
+        assert_eq!(settings.sort_order, SortOrder::LastVisited);
+        assert_eq!(settings.filtered_sort_order, FilteredSortOrder::Inherit);
+        assert_eq!(settings.current_tab, CurrentTab::Hidden);
+        let tabs = vec![
+            window(1, 10, "a", "current", true),
+            window(2, 10, "a", "old", false),
+            window(3, 20, "b", "recent", false),
+            window(4, 20, "b", "unvisited", false),
+        ];
+        let entries = build_entries(&tabs, &settings, None);
+        let options = ordered_options(
+            &entries,
+            &tabs,
+            &[Uuid::from_u128(1), Uuid::from_u128(3), Uuid::from_u128(2)],
+            &settings,
+        );
+        assert_eq!(options.len(), 3);
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.search_order.unwrap().initial)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 2]
+        );
+        assert!(
+            options
+                .iter()
+                .all(|option| option.search_order.unwrap().initial
+                    == option.search_order.unwrap().filtered)
+        );
+    }
+
+    #[test]
+    fn current_placement_and_filtered_order_are_independent() {
+        let settings = FinderSettings {
+            sort_order: SortOrder::WorkspaceTab,
+            filtered_sort_order: FilteredSortOrder::Order(SortOrder::Alphabetical),
+            current_tab: CurrentTab::Last,
+            ..FinderSettings::default()
+        };
+        let tabs = vec![
+            window(1, 10, "w", "z", true),
+            window(2, 10, "w", "b", false),
+            window(3, 10, "w", "a", false),
+        ];
+        let entries = build_entries(&tabs, &settings, None);
+        let options = ordered_options(&entries, &tabs, &[], &settings);
+        assert_eq!(options[0].search_order.unwrap().group, 1);
+        assert_eq!(options[1].search_order.unwrap().group, 0);
+        assert_eq!(options[2].search_order.unwrap().initial, 2);
+        assert_eq!(options[2].search_order.unwrap().filtered, 0);
+        let settings = FinderSettings {
+            current_tab: CurrentTab::InOrder,
+            ..settings
+        };
+        assert_eq!(
+            ordered_options(&entries, &tabs, &[], &settings)[0]
+                .search_order
+                .unwrap()
+                .group,
+            0
+        );
+    }
+
+    #[test]
+    fn ordering_settings_reject_unknown_values_and_wrong_types() {
+        for key in ["sort_order", "filtered_sort_order", "current_tab"] {
+            for value in [toml::Value::String("bogus".into()), toml::Value::Integer(1)] {
+                let settings =
+                    toml::Value::Table(std::iter::once((key.to_string(), value)).collect());
+                assert!(FinderSettings::parse(Some(&settings)).is_err());
+            }
+        }
     }
 
     #[test]

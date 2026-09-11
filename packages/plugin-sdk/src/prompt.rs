@@ -55,6 +55,17 @@ pub struct PromptOption {
     /// Optional active keybinding or shortcut hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_hint: Option<String>,
+    /// Caller-owned ordering used only by the explicitly selected ordered-v1 search mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_order: Option<PromptSearchOrder>,
+}
+
+/// Generic ordering metadata; groups precede ranking (for example, pinned items).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptSearchOrder {
+    pub group: u8,
+    pub initial: usize,
+    pub filtered: usize,
 }
 
 impl PromptOption {
@@ -66,6 +77,7 @@ impl PromptOption {
             search_text: None,
             detail: None,
             key_hint: None,
+            search_order: None,
         }
     }
 
@@ -240,6 +252,20 @@ pub enum PromptField {
 #[serde(rename_all = "snake_case")]
 pub enum PromptSearchMatchMode {
     #[default]
+    Fuzzy,
+    Prefix,
+    Substring,
+    /// Explicit v1 ordered matching. Older readers reject this enum variant.
+    OrderedV1 {
+        matching: PromptOrderedMatchMode,
+        relevance: bool,
+    },
+}
+
+/// Matching independent from caller-provided order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptOrderedMatchMode {
     Fuzzy,
     Prefix,
     Substring,

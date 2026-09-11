@@ -20,6 +20,7 @@ use bmux_plugin_sdk::{
     VolatileStateSetRequest,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_phase_timing},
 };
+use bmux_tabs_plugin_api::tabs_catalog_v1::{self, TabsCatalogV1Service};
 use bmux_tabs_plugin_api::tabs_commands::{
     self, CloseError, FloatingPaneMoveDirection, FocusError, PaneAck, PaneDirection,
     PaneMutationError, PaneResizeDirection, PaneZoomAck, Selector, TabAck, TabError,
@@ -1175,6 +1176,9 @@ impl RustPlugin for TabsPlugin {
     #[allow(clippy::too_many_lines)] // route_service! covers every tabs-commands op; the block is naturally long.
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
+            "tabs-catalog-v1", "list-tabs" => |_req: (), ctx| {
+                Ok(list_catalog(ctx))
+            },
             "tabs-state", "list-tabs" => |req: ListTabsArgs, ctx| {
                 let tabs = list_tabs(ctx, &self.runtime_state, req.session.as_deref())
                     .map_err(|e| ServiceResponse::error("list_failed", e))?;
@@ -1375,6 +1379,9 @@ impl RustPlugin for TabsPlugin {
             Arc::new(TabsCommandsHandle::new(shared.clone()));
         let _ = tabs_commands::register_provider(registry, commands);
 
+        let catalog: Arc<dyn TabsCatalogV1Service + Send + Sync> =
+            Arc::new(TabsStateHandle::new(shared.clone()));
+        let _ = tabs_catalog_v1::register_provider(registry, catalog);
         let state: Arc<dyn TabsStateService + Send + Sync> =
             Arc::new(TabsStateHandle::new(shared.clone()));
         let _ = tabs_state::register_provider(registry, state);
@@ -3915,6 +3922,64 @@ fn zoomed_pane_id_for_session(session: Uuid) -> Option<Uuid> {
         )
         .ok()?;
     snapshot.entries.get(&session)?.zoomed_pane_id
+}
+
+fn list_catalog(caller: &(impl HostRuntimeApi + Sync)) -> Result<Vec<TabEntry>, String> {
+    let contexts = list_contexts(caller)?;
+    let active = current_context(caller)?.map(|context| context.id);
+    let mut client = dispatch_client(caller);
+    let workspaces = bmux_plugin::block_on_typed_dispatch(
+        bmux_workspaces_plugin_api::workspaces_state::client::list_workspaces(&mut client),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut remaining: BTreeMap<_, _> = contexts
+        .into_iter()
+        .map(|context| (context.id, context))
+        .collect();
+    let mut ordered = Vec::new();
+    for workspace in workspaces {
+        let candidates: Vec<_> = remaining
+            .values()
+            .filter(|context| context_workspace_id(context) == workspace.id)
+            .cloned()
+            .collect();
+        let ids = project_tab_order_ids(
+            get_stored_tab_order_ids_for_workspace(caller, workspace.id)?,
+            &candidates,
+        );
+        for id in ids {
+            if let Some(context) = remaining.remove(&id) {
+                ordered.push((context, workspace.name.clone()));
+            }
+        }
+    }
+    // Discovery must not lose live resources missing a workspace catalog entry.
+    ordered.extend(remaining.into_values().map(|context| {
+        let workspace = format!("unavailable-{}", context_workspace_id(&context));
+        (context, workspace)
+    }));
+    Ok(ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, (context, workspace))| {
+            let workspace_id = context_workspace_id(&context);
+            TabEntry {
+                id: context.id.to_string(),
+                name: context.name.unwrap_or_else(|| format!("tab-{}", index + 1)),
+                active: active == Some(context.id),
+                workspace,
+                workspace_id,
+            }
+        })
+        .collect())
+}
+
+impl TabsCatalogV1Service for TabsStateHandle {
+    fn list_tabs<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TabEntry>, String>> + Send + 'a>> {
+        Box::pin(async move { list_catalog(self.shared.caller.as_ref()) })
+    }
 }
 
 impl TabsStateService for TabsStateHandle {

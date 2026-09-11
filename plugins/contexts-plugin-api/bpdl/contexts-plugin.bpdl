@@ -14,6 +14,13 @@ plugin bmux.contexts version 1;
 capability CONTEXTS_READ = bmux.contexts.read;
 capability CONTEXTS_WRITE = bmux.contexts.write;
 
+// Caller-local transient visit history, newest first. Unsupported providers
+// reject this interface rather than silently substituting shared MRU order.
+@capability(CONTEXTS_READ)
+interface contexts-visits-v1 {
+    query list-visits() -> result<list<uuid>, string>;
+}
+
 @capability(CONTEXTS_READ)
 interface contexts-state {
     // Snapshot of a single context's public state.

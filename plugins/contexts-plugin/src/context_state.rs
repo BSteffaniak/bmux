@@ -30,6 +30,8 @@ pub struct ContextState {
     pub session_by_context: BTreeMap<Uuid, SessionId>,
     pub selected_by_client: BTreeMap<ClientId, Uuid>,
     pub mru_contexts: VecDeque<Uuid>,
+    /// Transient, caller-local navigation history; never persisted as arrangement state.
+    pub visited_by_client: BTreeMap<ClientId, VecDeque<Uuid>>,
 }
 
 impl ContextState {
@@ -67,6 +69,7 @@ impl ContextState {
         self.contexts.insert(id, context.clone());
         self.selected_by_client.insert(client_id, id);
         self.touch_mru(id);
+        self.record_visit(client_id, id);
         // Authoritative diagnostic signal: exactly one emission per
         // real context mutation. Count these in the log to answer
         // "how many contexts did this tap actually create?" without
@@ -142,6 +145,7 @@ impl ContextState {
         let id = self.resolve_id(selector)?;
         self.selected_by_client.insert(client_id, id);
         self.touch_mru(id);
+        self.record_visit(client_id, id);
         self.contexts
             .get(&id)
             .map(Self::to_summary)
@@ -252,10 +256,20 @@ impl ContextState {
         Ok(())
     }
 
+    /// Record a successful visit without letting repeated selection change history.
+    pub fn record_visit(&mut self, client_id: ClientId, id: Uuid) {
+        let history = self.visited_by_client.entry(client_id).or_default();
+        if history.front() != Some(&id) {
+            history.retain(|entry| *entry != id);
+            history.push_front(id);
+        }
+    }
+
     /// Forget the client's selected-context so subsequent lookups fall
     /// back to the MRU queue.
     pub fn disconnect_client(&mut self, client_id: ClientId) {
         self.selected_by_client.remove(&client_id);
+        self.visited_by_client.remove(&client_id);
     }
 
     /// Resolve a selector to a single context id.
@@ -310,6 +324,9 @@ impl ContextState {
         let removed = self.contexts.remove(&context_id)?;
         let removed_session = self.session_by_context.remove(&context_id);
         self.mru_contexts.retain(|entry| *entry != context_id);
+        for history in self.visited_by_client.values_mut() {
+            history.retain(|entry| *entry != context_id);
+        }
 
         let replacement = self
             .mru_contexts
@@ -348,5 +365,39 @@ impl ContextState {
             name: context.name.clone(),
             attributes: context.attributes.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod visit_tests {
+    use super::*;
+
+    #[test]
+    fn visits_are_personal_bounded_and_transient() {
+        let mut state = ContextState::default();
+        let a = ClientId(Uuid::from_u128(1));
+        let b = ClientId(Uuid::from_u128(2));
+        let first = state.create(a, None, BTreeMap::new()).id;
+        let second = state.create(a, None, BTreeMap::new()).id;
+        state
+            .select_for_client(b, &ContextSelector::ById(first))
+            .unwrap();
+        assert_eq!(state.visited_by_client[&a], [second, first]);
+        assert_eq!(state.visited_by_client[&b], [first]);
+        state
+            .select_for_client(a, &ContextSelector::ById(second))
+            .unwrap();
+        assert_eq!(state.visited_by_client[&a], [second, first]);
+        assert!(
+            state
+                .select_for_client(a, &ContextSelector::ById(Uuid::nil()))
+                .is_err()
+        );
+        assert_eq!(state.visited_by_client[&a], [second, first]);
+        state.remove_context_by_id(first, None);
+        assert_eq!(state.visited_by_client[&a], [second]);
+        assert!(state.visited_by_client[&b].is_empty());
+        state.disconnect_client(a);
+        assert!(!state.visited_by_client.contains_key(&a));
     }
 }

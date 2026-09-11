@@ -85,6 +85,13 @@ interface tabs-state {
         -> result<active-tab-pane-set, active-tab-pane-query-error>;
 }
 
+@capability(TABS_READ)
+interface tabs-catalog-v1 {
+    // Complete discovery in workspace order, then each workspace's tab arrangement.
+    // Reading this catalog never initializes or rewrites arrangement storage.
+    query list-tabs() -> result<list<tabs-state.tab-entry>, string>;
+}
+
 @capability(TABS_WRITE)
 interface tabs-commands {
     // Errors a focus command can produce.

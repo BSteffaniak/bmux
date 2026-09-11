@@ -44,10 +44,32 @@ include_workspace_name = true
 # "fuzzy" (default), "prefix", or "substring".
 match_mode = "fuzzy"
 entry_format = "{workspace}/{tab}"
+# Opening order: "last_visited" (default), "workspace_tab", "alphabetical".
+sort_order = "last_visited"
+# "inherit" (default), "relevance", or an explicit opening-order value.
+filtered_sort_order = "inherit"
+# "hidden" (default), "last", or "in_order".
+current_tab = "hidden"
 ```
 
 `entry_format` supports the `{workspace}` and `{tab}` placeholders. Finder
 matching uses the workspace name only when `include_workspace_name` is true.
+
+Finder defaults now hide the current tab and show other tabs across all workspaces
+in personal most-recently-visited order. Filtering preserves that order unless
+`filtered_sort_order` selects another policy. `relevance` ranks matches by score,
+using the opening order to break ties. `workspace_tab` follows workspace and tab
+arrangements; `alphabetical` sorts displayed labels. These projections never
+rearrange the tab bar. `current_tab = "last"` places the current tab after other
+matches regardless of ranking; `in_order` treats it like any other result.
+
+Visit history belongs to the invoking client, not other attachments. It is
+transient, cleared on disconnect, and not restored across server restarts.
+Unvisited tabs follow visited tabs in arrangement order. Opening or cancelling
+the finder does not record visits, and its ordering remains fixed while open.
+Older providers lacking the versioned catalog/history interfaces return explicit
+errors rather than silently substituting another order. To approximate the old
+finder ordering, use `alphabetical`, `relevance`, and `in_order` respectively.
 
 ## Architecture Boundary
 
