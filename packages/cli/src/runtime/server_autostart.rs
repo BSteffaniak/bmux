@@ -441,7 +441,8 @@ fn service_spec_with_executable(
             } else {
                 format!("dev.bmux.server.{runtime}")
             };
-            let home = dirs::home_dir().context("cannot resolve home directory")?;
+            let home =
+                switchy::fs::directories::home_dir().context("cannot resolve home directory")?;
             let path = home
                 .join("Library/LaunchAgents")
                 .join(format!("{id}.plist"));
@@ -456,7 +457,7 @@ fn service_spec_with_executable(
             let config_home = std::env::var_os("XDG_CONFIG_HOME")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
-                .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+                .or_else(|| switchy::fs::directories::home_dir().map(|home| home.join(".config")))
                 .context("cannot resolve XDG config directory")?;
             (id.clone(), Some(config_home.join("systemd/user").join(id)))
         }
@@ -492,7 +493,7 @@ fn service_spec_with_executable(
         declaration_path,
         executable,
         arguments,
-        user_home: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+        user_home: switchy::fs::directories::home_dir().unwrap_or_else(|| PathBuf::from("/")),
     })
 }
 

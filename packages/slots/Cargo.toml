@@ -11,8 +11,8 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-dirs      = { workspace = true }
 serde     = { workspace = true, features = ["derive"] }
+switchy   = { workspace = true, features = ["fs-native-directories"] }
 thiserror = { workspace = true }
 toml      = { workspace = true, features = ["parse"] }
 

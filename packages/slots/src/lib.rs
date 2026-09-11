@@ -555,9 +555,9 @@ pub fn default_manifest_path() -> PathBuf {
 /// can't depend on it.
 #[must_use]
 pub fn default_config_root() -> PathBuf {
-    dirs::config_dir().map_or_else(
+    switchy::fs::directories::config_dir().map_or_else(
         || {
-            dirs::home_dir().map_or_else(
+            switchy::fs::directories::home_dir().map_or_else(
                 || PathBuf::from(".bmux"),
                 |h| h.join(".config").join("bmux"),
             )
@@ -579,9 +579,9 @@ pub fn default_slots_root() -> PathBuf {
     if let Some(raw) = std::env::var_os(SLOTS_ROOT_ENV) {
         return PathBuf::from(raw);
     }
-    dirs::data_dir().map_or_else(
+    switchy::fs::directories::data_dir().map_or_else(
         || {
-            dirs::home_dir().map_or_else(
+            switchy::fs::directories::home_dir().map_or_else(
                 || PathBuf::from(".bmux").join("slots"),
                 |h| h.join(".local").join("share").join("bmux").join("slots"),
             )
@@ -604,7 +604,7 @@ fn default_runtime_root() -> PathBuf {
 fn default_state_root() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME").map_or_else(
         || {
-            dirs::home_dir().map_or_else(
+            switchy::fs::directories::home_dir().map_or_else(
                 || PathBuf::from(".bmux").join("state"),
                 |h| h.join(".local").join("state").join("bmux"),
             )
@@ -619,7 +619,7 @@ pub fn default_bin_dir() -> PathBuf {
     if let Some(raw) = std::env::var_os(SLOTS_BIN_DIR_ENV) {
         return PathBuf::from(raw);
     }
-    dirs::home_dir().map_or_else(
+    switchy::fs::directories::home_dir().map_or_else(
         || PathBuf::from(".bmux-bin"),
         |h| h.join(".local").join("bin"),
     )
@@ -933,13 +933,13 @@ fn is_valid_env_name(s: &str) -> bool {
 fn expand_tilde(raw: &str) -> String {
     if let Some(rest) = raw.strip_prefix('~') {
         if rest.is_empty() {
-            if let Some(home) = dirs::home_dir() {
+            if let Some(home) = switchy::fs::directories::home_dir() {
                 return home.to_string_lossy().into_owned();
             }
             return "~".to_string();
         }
         if let Some(rest) = rest.strip_prefix('/')
-            && let Some(home) = dirs::home_dir()
+            && let Some(home) = switchy::fs::directories::home_dir()
         {
             return home.join(rest).to_string_lossy().into_owned();
         }
@@ -1019,7 +1019,7 @@ mod tests {
     fn tilde_expansion() {
         let _g = env_lock().lock().unwrap();
         let out = expand_tilde("~/foo");
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = switchy::fs::directories::home_dir() {
             assert_eq!(out, home.join("foo").to_string_lossy());
         }
         assert_eq!(expand_tilde("noTilde"), "noTilde");

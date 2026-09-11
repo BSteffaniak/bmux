@@ -334,7 +334,7 @@ fn default_state_dir() -> PathBuf {
 
     #[cfg(target_os = "macos")]
     {
-        dirs::home_dir().map_or_else(
+        switchy::fs::directories::home_dir().map_or_else(
             || PathBuf::from(".").join("bmux").join("state"),
             |home| {
                 home.join("Library")
@@ -347,7 +347,7 @@ fn default_state_dir() -> PathBuf {
 
     #[cfg(target_os = "windows")]
     {
-        dirs::data_local_dir().map_or_else(
+        switchy::fs::directories::data_local_dir().map_or_else(
             || PathBuf::from(".").join("bmux").join("state"),
             |base| base.join("bmux").join("State"),
         )
@@ -357,7 +357,7 @@ fn default_state_dir() -> PathBuf {
     {
         std::env::var_os("XDG_STATE_HOME").map_or_else(
             || {
-                dirs::home_dir().map_or_else(
+                switchy::fs::directories::home_dir().map_or_else(
                     || PathBuf::from(".").join("bmux").join("state"),
                     |home| home.join(".local").join("state").join("bmux"),
                 )
@@ -378,7 +378,7 @@ fn default_log_dir() -> PathBuf {
 
     #[cfg(target_os = "macos")]
     {
-        dirs::home_dir().map_or_else(
+        switchy::fs::directories::home_dir().map_or_else(
             || PathBuf::from(".").join("bmux").join("logs"),
             |home| home.join("Library").join("Logs").join("bmux"),
         )
@@ -386,7 +386,7 @@ fn default_log_dir() -> PathBuf {
 
     #[cfg(target_os = "windows")]
     {
-        dirs::data_local_dir().map_or_else(
+        switchy::fs::directories::data_local_dir().map_or_else(
             || PathBuf::from(".").join("bmux").join("logs"),
             |base| base.join("bmux").join("Logs"),
         )
@@ -412,9 +412,9 @@ fn stable_fnv1a64(bytes: &[u8]) -> u64 {
 /// The primary (OS-native) directory is always first. On macOS, the XDG-style
 /// `~/.config/bmux` is appended as a fallback when it differs from the primary.
 fn build_config_dir_candidates() -> Vec<PathBuf> {
-    let primary = dirs::config_dir().map_or_else(
+    let primary = switchy::fs::directories::config_dir().map_or_else(
         || {
-            dirs::home_dir().map_or_else(
+            switchy::fs::directories::home_dir().map_or_else(
                 || PathBuf::from(".bmux"),
                 |d| d.join(".config").join("bmux"),
             )
@@ -425,7 +425,7 @@ fn build_config_dir_candidates() -> Vec<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let mut candidates = vec![primary];
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = switchy::fs::directories::home_dir() {
             let xdg = home.join(".config").join("bmux");
             if candidates[0] != xdg {
                 candidates.push(xdg);
@@ -470,9 +470,9 @@ impl ConfigPaths {
 
         let data_dir = data_dir_override.map_or_else(
             || {
-                dirs::data_dir().map_or_else(
+                switchy::fs::directories::data_dir().map_or_else(
                     || {
-                        dirs::home_dir().map_or_else(
+                        switchy::fs::directories::home_dir().map_or_else(
                             || PathBuf::from(".bmux"),
                             |d| d.join(".local").join("share").join("bmux"),
                         )
@@ -972,7 +972,10 @@ mod tests {
             candidates.len() >= 2,
             "macOS should have at least 2 candidates (native + XDG), got {candidates:?}"
         );
-        let xdg = dirs::home_dir().unwrap().join(".config").join("bmux");
+        let xdg = switchy::fs::directories::home_dir()
+            .unwrap()
+            .join(".config")
+            .join("bmux");
         assert!(
             candidates.contains(&xdg),
             "candidates should include XDG path {xdg:?}, got {candidates:?}"

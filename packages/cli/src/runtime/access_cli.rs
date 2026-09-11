@@ -385,7 +385,7 @@ fn prompt_select_candidates(candidates: &[KeyEntry]) -> Result<Vec<KeyEntry>> {
 
 fn read_public_key_file(path: &str) -> Result<String> {
     let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        dirs::home_dir()
+        switchy::fs::directories::home_dir()
             .map(|home| home.join(rest))
             .ok_or_else(|| anyhow::anyhow!("failed resolving home directory for path: {path}"))?
     } else {

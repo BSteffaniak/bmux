@@ -2732,7 +2732,7 @@ impl BmuxConfig {
         if !(rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\')) {
             return (input.to_string(), false);
         }
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = switchy::fs::directories::home_dir() else {
             return (input.to_string(), true);
         };
         let mut expanded = home.to_string_lossy().into_owned();
@@ -4314,7 +4314,7 @@ server_timeout = 1234
 
     #[test]
     fn load_expands_connection_target_path_fields() {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = switchy::fs::directories::home_dir() else {
             return;
         };
 
@@ -4347,7 +4347,7 @@ server_timeout = 1234
 
     #[test]
     fn load_expands_plugin_search_paths() {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = switchy::fs::directories::home_dir() else {
             return;
         };
 
@@ -4741,7 +4741,7 @@ timeout_profile = "missing"
 
     #[test]
     fn load_expands_recording_path_fields() {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = switchy::fs::directories::home_dir() else {
             return;
         };
 
