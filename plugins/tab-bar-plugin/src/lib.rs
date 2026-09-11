@@ -222,6 +222,7 @@ struct CompanionState {
     edit_buffer: rename_input::RenameInput,
     menu_tab_id: Option<Uuid>,
     menu_selected: usize,
+    menu_pressed: Option<usize>,
     local_presentation: AttachLocalPresentationSnapshot,
     catalog: tabs_list::TabListSnapshot,
     selected_context_id: Option<Uuid>,
@@ -255,6 +256,7 @@ impl CompanionState {
             edit_buffer: rename_input::RenameInput::default(),
             menu_tab_id: None,
             menu_selected: 0,
+            menu_pressed: None,
             local_presentation: AttachLocalPresentationSnapshot::initial(),
             catalog: tabs_list::TabListSnapshot {
                 tabs: Vec::new(),
@@ -2407,6 +2409,13 @@ mod tests {
         );
         event.button = Some("left".to_string());
         event.hook_id = "bmux.tab_bar:menu:item:1".to_string();
+        assert!(
+            handle_local_input(state(), &event)
+                .unwrap()
+                .service_invocation
+                .is_none()
+        );
+        event.phase = "up".to_string();
         let rename = handle_local_input(state(), &event).unwrap();
         assert!(!rename.release_capture);
         event.event_kind = "key".to_string();

@@ -2084,7 +2084,9 @@ impl FrameDamage {
     }
 
     pub fn mark_content_surface(&mut self, pane_id: Uuid) {
-        self.content_surface_rects.remove(&pane_id);
+        // Content invalidation permits row-cache diffing, but explicit rectangle
+        // damage repairs cells overwritten by another surface. Keep that repair
+        // even when terminal output invalidates the whole content concurrently.
         self.content_surfaces.insert(pane_id);
     }
 
@@ -2095,7 +2097,7 @@ impl FrameDamage {
         surface_size: (u16, u16),
         policy: DamageCoalescingPolicy,
     ) {
-        if self.full_frame || self.content_surfaces.contains(&pane_id) {
+        if self.full_frame {
             return;
         }
         if coalesce_surface_rect(
@@ -2105,6 +2107,10 @@ impl FrameDamage {
             policy,
         ) {
             self.mark_content_surface(pane_id);
+            self.content_surface_rects.insert(
+                pane_id,
+                vec![DamageRect::new(0, 0, surface_size.0, surface_size.1)],
+            );
         }
     }
 
@@ -2245,9 +2251,6 @@ impl FrameDamage {
             self.mark_content_surface(*pane_id);
         }
         for (pane_id, rects) in &other.content_surface_rects {
-            if self.content_surfaces.contains(pane_id) {
-                continue;
-            }
             self.content_surface_rects
                 .entry(*pane_id)
                 .or_default()
@@ -6951,7 +6954,10 @@ mod tests {
         damage.mark_content_surface_rect(pane_id, DamageRect::new(4, 0, 1, 1), (20, 10), policy);
 
         assert!(damage.content_surfaces().contains(&pane_id));
-        assert!(damage.content_surface_rects(pane_id).is_empty());
+        assert_eq!(
+            damage.content_surface_rects(pane_id),
+            &[DamageRect::new(0, 0, 20, 10)]
+        );
     }
 
     #[test]
@@ -9179,6 +9185,56 @@ mod tests {
                 .filter(|op| matches!(op, AttachRenderTraceOp::PaneRowCacheSkip { .. }))
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn merged_repair_damage_repaints_cached_rows() {
+        use super::{PaneContentRenderStage, queue_pane_content_for_surface};
+        let pane_id = Uuid::from_u128(1);
+        let mut buffer = PaneRenderBuffer::default();
+        feed_pane_buffer(&mut buffer, 3, 8, b"hello");
+        let mut buffers = BTreeMap::from([(pane_id, buffer)]);
+        let appearance = RuntimeAppearance::default();
+        let before_content_cells = BTreeMap::new();
+        let content = PaneRect {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 5,
+        };
+        let mut frame_damage = FrameDamage::default();
+        frame_damage.mark_content_surface(pane_id);
+        let mut repair = FrameDamage::default();
+        repair.mark_content_surface_rect(
+            pane_id,
+            DamageRect::new(0, 0, 8, 5),
+            (8, 5),
+            DamageCoalescingPolicy::default(),
+        );
+        frame_damage.merge_from(&repair);
+        let damage =
+            PaneContentDamagePlan::from_frame(pane_id, &frame_damage, Vec::new(), Vec::new());
+        let stage = PaneContentRenderStage {
+            pane_id,
+            surface_index: 0,
+            content,
+            focus: false,
+            sync_deferred: false,
+            scrollback: None,
+            runtime_appearance: &appearance,
+            before_content_cells: &before_content_cells,
+            content_damage: &damage,
+        };
+        queue_pane_content_for_surface(&mut Vec::new(), &mut buffers, &stage, &mut None, &mut None)
+            .unwrap();
+        let mut output = Vec::new();
+        queue_pane_content_for_surface(&mut output, &mut buffers, &stage, &mut None, &mut None)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("hello"),
+            "full content damage must repaint cached cells: {output:?}"
         );
     }
 

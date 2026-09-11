@@ -1,7 +1,7 @@
 //! Client-local tab context menu. Only completed actions cross the service boundary.
 
 use super::{
-    BarStyles, CompanionHandle, CompanionState, LAYOUT_ID, OWNER, Placement, command_invocation,
+    CompanionHandle, CompanionState, LAYOUT_ID, OWNER, Placement, command_invocation,
     input_endpoint, republish_companion, tabs_commands,
 };
 use bmux_plugin::layout::{PluginLayoutId, resolve_plugin_layout};
@@ -10,6 +10,13 @@ use bmux_plugin::surface::{
 };
 use bmux_plugin::{AttachInputEvent, AttachInputResult, ExtensionRect, RenderOp};
 use bmux_plugin_sdk::TypedServiceEndpoint;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::composition::TextBlock;
+use bmux_tui::geometry::{Insets, Point, Rect, Size};
+use bmux_tui::paint::PaintCx;
+use bmux_tui::prelude::{Buffer, Frame, Style};
+use bmux_tui_components::menu::{Menu, MenuItem, MenuOutcome, MenuPolicy, MenuState};
+use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSizing, ModalTheme};
 use uuid::Uuid;
 
 const LABELS: [&str; 3] = ["Switch", "Rename", "Close"];
@@ -54,6 +61,26 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
     Some(ExtensionRect::new(x, y, width, height))
 }
 
+fn items() -> [MenuItem; 3] {
+    LABELS.map(|label| MenuItem::new(label, label))
+}
+
+const fn policy() -> MenuPolicy {
+    let mut policy = MenuPolicy::interactive();
+    policy.list.keyboard.wrap = true;
+    policy
+}
+
+fn content_rect(rect: ExtensionRect) -> Rect {
+    let inset = u16::from(rect.w >= 4 && rect.h >= 5);
+    Rect::new(
+        inset,
+        inset,
+        rect.w.saturating_sub(inset * 2),
+        rect.h.saturating_sub(inset * 2),
+    )
+}
+
 pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface> {
     if companion.menu_tab_id.is_none() {
         return Vec::new();
@@ -67,7 +94,11 @@ pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface>
         companion.local_presentation.viewport_cols,
         companion.local_presentation.viewport_rows,
     );
-    let styles = BarStyles::resolve(&companion.settings, &companion.local_presentation);
+    let content = content_rect(rect);
+    let items = items();
+    let menu = Menu::new(&items).policy(policy());
+    let state = MenuState::new(Some(companion.menu_selected));
+    let ops = paint_menu(companion, rect, &menu, &state);
     let mut backdrop = PluginSurface::layout(
         PluginSurfaceId::new(
             OWNER,
@@ -82,11 +113,6 @@ pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface>
     .modal(true)
     .interactive_region(PluginSurfaceRegion::new("dismiss", viewport).endpoint(input_endpoint()));
     backdrop.target = PluginSurfaceTarget::Explicit(viewport);
-    let mut ops = vec![RenderOp::fill_rect(
-        ExtensionRect::new(0, 0, rect.w, rect.h),
-        ' ',
-        styles.base,
-    )];
     let mut popup = PluginSurface::layout(
         PluginSurfaceId::new(
             OWNER,
@@ -103,28 +129,90 @@ pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface>
     popup.target = PluginSurfaceTarget::Explicit(rect);
     // Keep item regions non-focusable: the originating tab remains the stable
     // keyboard target, including when Rename transfers into its inline editor.
-    for (index, label) in LABELS.iter().enumerate() {
-        let row = u16::try_from(index).unwrap_or(0) + u16::from(rect.h >= 5);
-        if row >= rect.h {
-            break;
-        }
-        let selected = companion.menu_selected == index;
-        ops.push(RenderOp::text_run(
-            0,
-            row,
-            format!(" {} {label}", if selected { "›" } else { " " }),
-            if selected { styles.mode } else { styles.base },
-        ));
+    for row in content.y..content.bottom() {
+        let Some(index) = menu.item_index_at(content, &state, Point::new(content.x, row)) else {
+            continue;
+        };
         popup = popup.interactive_region(
             PluginSurfaceRegion::new(
                 format!("item:{index}"),
-                ExtensionRect::new(0, row, rect.w, 1),
+                ExtensionRect::new(content.x, row, content.width, 1),
             )
             .endpoint(input_endpoint()),
         );
     }
     popup.ops = ops;
     vec![backdrop, popup]
+}
+
+fn paint_menu(
+    companion: &CompanionState,
+    rect: ExtensionRect,
+    menu: &Menu<'_>,
+    state: &MenuState,
+) -> Vec<RenderOp> {
+    let local = &companion.local_presentation;
+    let foreground = super::parse_hex_color(&local.foreground).unwrap_or((220, 220, 220));
+    let background = super::parse_hex_color(&local.background).unwrap_or((20, 20, 20));
+    let accent = super::parse_hex_color(&local.status_active).unwrap_or((110, 170, 240));
+    let base = bmux_plugin::RenderStyle::new()
+        .rgb_foreground(foreground.0, foreground.1, foreground.2)
+        .rgb_background(background.0, background.1, background.2);
+    let selected_style = bmux_plugin::RenderStyle::new()
+        .rgb_foreground(background.0, background.1, background.2)
+        .rgb_background(accent.0, accent.1, accent.2);
+    let border_style = base.rgb_foreground(accent.0, accent.1, accent.2);
+    let area = Rect::new(0, 0, rect.w, rect.h);
+    let content = content_rect(rect);
+    let mut buffer = Buffer::empty(area);
+    let mut frame = Frame::new(&mut buffer);
+    let mut cx = PaintCx::new(&mut frame);
+    let theme = ModalTheme::dark(bmux_tui::style::Color::Rgb(accent.0, accent.1, accent.2));
+    let modal = ModalFrame::new(
+        ModalSizing::fixed(Size::new(rect.w, rect.h), Insets::new(0, 0, 0, 0)),
+        theme,
+    )
+    .padding(Insets::new(0, 0, 0, 0));
+    let chrome = ModalFrameComponent::new("menu", modal, TextBlock::new("")).chrome(content.x > 0);
+    let layout = chrome.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    chrome.paint(&layout, &mut cx);
+    menu.paint(content, state, Style::new(), &mut cx);
+    let mut ops = Vec::new();
+    for y in 0..rect.h {
+        for x in 0..rect.w {
+            let Some(cell) = buffer.get(Point::new(x, y)) else {
+                continue;
+            };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+            let selected = menu.item_index_at(content, state, Point::new(x, y))
+                == Some(companion.menu_selected);
+            let border = content.x > 0 && (x == 0 || y == 0 || x + 1 == rect.w || y + 1 == rect.h);
+            let style = if selected {
+                selected_style
+            } else if border {
+                border_style
+            } else {
+                base
+            };
+            if let Some(RenderOp::TextRun {
+                x: start,
+                y: row,
+                text,
+                style: previous,
+            }) = ops.last_mut()
+                && *row == y
+                && *previous == style
+                && usize::from(*start) + text.chars().count() == usize::from(x)
+            {
+                text.push_str(&cell.symbol);
+            } else {
+                ops.push(RenderOp::text_run(x, y, cell.symbol.clone(), style));
+            }
+        }
+    }
+    ops
 }
 
 #[allow(clippy::significant_drop_tightening)] // Publish the surface under the same lock as its interaction state.
@@ -165,6 +253,7 @@ fn transition(
             return Some(AttachInputResult::default());
         }
         companion.menu_selected = 0;
+        companion.menu_pressed = None;
         companion.editing_tab_id = None;
         companion.pointer_source = None;
         companion.drag_target = None;
@@ -191,26 +280,49 @@ fn transition(
                 companion.menu_selected = item;
                 result.dirty = true;
             }
-            activate = down && event.button.as_deref() == Some("left");
+            if event.button.as_deref() == Some("left") {
+                if down {
+                    companion.menu_pressed = Some(item);
+                } else if event.phase == "up" {
+                    activate = companion.menu_pressed.take() == Some(item);
+                }
+            }
         } else if down {
+            companion.menu_pressed = None;
             companion.menu_tab_id = None;
             result.release_capture = true;
             result.dirty = true;
         }
     } else if event.event_kind == "key" && matches!(event.phase.as_str(), "press" | "repeat") {
-        match event.key.as_deref()? {
-            "up" | "left" => companion.menu_selected = companion.menu_selected.saturating_sub(1),
-            "down" | "right" | "tab" => {
-                companion.menu_selected = (companion.menu_selected + 1).min(2);
-            }
-            "esc" => {
+        let key = match event.key.as_deref()? {
+            "tab" if event.modifiers.shift => "up",
+            "tab" => "down",
+            key => key,
+        };
+        let Ok(stroke) = bmux_keyboard::parse_key_stroke(key) else {
+            return Some(result);
+        };
+        let items = items();
+        let menu = Menu::new(&items).policy(policy());
+        let mut state = MenuState::new(Some(companion.menu_selected));
+        let area = content_rect(popup_rect(companion)?);
+        match menu.handle_event(area, &mut state, &bmux_tui::event::Event::Key(stroke)) {
+            MenuOutcome::Cancelled => {
                 companion.menu_tab_id = None;
                 result.release_capture = true;
             }
-            "enter" => activate = true,
-            _ => return Some(result),
+            MenuOutcome::Activated { index, .. } => {
+                companion.menu_selected = index;
+                activate = true;
+            }
+            MenuOutcome::Focused(index) => companion.menu_selected = index,
+            MenuOutcome::Redraw => companion.menu_selected = state.focused().unwrap_or(0),
+            MenuOutcome::Ignored | MenuOutcome::Typeahead(_) => return Some(result),
         }
         result.dirty = true;
+    }
+    if pointer && event.phase == "up" {
+        companion.menu_pressed = None;
     }
     if activate {
         activate_selection(companion, &mut result);
@@ -425,6 +537,18 @@ mod tests {
             ),
         )
         .unwrap();
+        assert!(result.service_invocation.is_none());
+        let result = transition(
+            &mut companion,
+            &event(
+                "pointer",
+                "up",
+                None,
+                Some("left"),
+                "bmux.tab_bar:menu:item:2".to_string(),
+            ),
+        )
+        .unwrap();
         assert!(result.release_capture && result.service_invocation.is_some());
         open(&mut companion);
         let result = transition(
@@ -440,6 +564,53 @@ mod tests {
         .unwrap();
         assert!(result.release_capture && result.service_invocation.is_none());
         assert!(companion.menu_tab_id.is_none());
+    }
+
+    #[test]
+    fn keyboard_wraps_and_supports_reverse_tab_and_home_end() {
+        let mut companion = companion();
+        open(&mut companion);
+        for (key, shift, expected) in [
+            ("up", false, 2),
+            ("down", false, 0),
+            ("tab", true, 2),
+            ("home", false, 0),
+            ("end", false, 2),
+        ] {
+            let mut input = event("key", "press", Some(key), None, String::new());
+            input.modifiers.shift = shift;
+            assert!(transition(&mut companion, &input).unwrap().consumed);
+            assert_eq!(companion.menu_selected, expected);
+        }
+    }
+
+    #[test]
+    fn release_over_another_item_does_not_activate() {
+        let mut companion = companion();
+        open(&mut companion);
+        transition(
+            &mut companion,
+            &event(
+                "pointer",
+                "down",
+                None,
+                Some("left"),
+                "bmux.tab_bar:menu:item:0".to_string(),
+            ),
+        );
+        let result = transition(
+            &mut companion,
+            &event(
+                "pointer",
+                "up",
+                None,
+                Some("left"),
+                "bmux.tab_bar:menu:item:2".to_string(),
+            ),
+        )
+        .unwrap();
+        assert!(result.service_invocation.is_none());
+        assert!(companion.menu_tab_id.is_some());
     }
 
     #[test]
