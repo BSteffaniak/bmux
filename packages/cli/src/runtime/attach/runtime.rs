@@ -12816,6 +12816,13 @@ async fn handle_attach_mouse_event_at(
         None => {}
     }
 
+    // Focus dismissal must precede pane forwarding and resize acquisition:
+    // an outside click belongs to the focused control, not the destination.
+    // Existing pointer owners above still receive their drag continuation.
+    if dismiss_plugin_focus_on_pointer_down(view_state, mouse_event) {
+        return Ok(());
+    }
+
     // Terminal applications that explicitly enable mouse reporting own pointer
     // semantics inside their pane content. Forward those events after bmux
     // chrome hit-testing so status/tab clicks are never swallowed by pane mouse
@@ -15819,8 +15826,48 @@ mod tests {
         assert!(focus.focused().is_none());
     }
 
-    #[test]
-    fn opted_in_control_is_dismissed_only_by_outside_pointer_down() {
+    async fn disconnected_focus_test_client() -> StreamingBmuxClient {
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            use bmux_ipc::{Envelope, EnvelopeKind, Response, ResponsePayload};
+            let mut stream = bmux_ipc::transport::ErasedIpcStream::new(Box::new(server_stream));
+            let envelope = stream.recv_envelope().await.unwrap();
+            let bmux_ipc::Request::Hello { contract, .. } =
+                bmux_ipc::decode(&envelope.payload).unwrap()
+            else {
+                panic!("expected hello")
+            };
+            let response = Response::Ok(ResponsePayload::HelloNegotiated {
+                negotiated: bmux_ipc::NegotiatedProtocol {
+                    wire_epoch: contract.wire_epoch,
+                    revision: contract.revisions.max,
+                    capabilities: Vec::new(),
+                },
+            });
+            stream
+                .send_envelope(&Envelope::new(
+                    envelope.request_id,
+                    EnvelopeKind::Response,
+                    bmux_ipc::encode(&response).unwrap(),
+                ))
+                .await
+                .unwrap();
+        });
+        let client = bmux_client::BmuxClient::connect_with_bridge_stream(
+            bmux_ipc::transport::ErasedIpcStream::new(Box::new(client_stream)),
+            std::time::Duration::from_secs(2),
+            "focus-test",
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+        let client = StreamingBmuxClient::from_client(client).unwrap();
+        server.await.unwrap();
+        client
+    }
+
+    #[tokio::test]
+    async fn opted_in_control_is_dismissed_only_by_outside_pointer_down() {
         let endpoint = bmux_plugin::AttachInputEndpoint {
             capability: "example.blur".to_string(),
             interface_id: "input".to_string(),
@@ -15853,11 +15900,13 @@ mod tests {
                 .endpoint(endpoint.clone())
                 .focusable(bmux_plugin::surface::PluginSurfaceCursor::Text),
         );
-        let mut view = AttachViewState::new(AttachOpenInfo {
-            context_id: None,
-            session_id: Uuid::from_u128(1),
-            can_write: true,
-        });
+        let mut view = attach_view_state_with_scrollback_fixture();
+        view.mouse.config.enabled = true;
+        let pane_id = focused_attach_pane_id(&view).unwrap();
+        append_pane_output(
+            view.pane_buffers.get_mut(&pane_id).unwrap(),
+            b"\x1b[?1000h\x1b[?1006h",
+        );
         view.presentation_input = registry.clone();
         let _ = view.retained_compositor.replace_surfaces(
             retained_surfaces_from_plugin_surfaces(
@@ -15888,6 +15937,31 @@ mod tests {
         assert!(view.plugin_pointer_router.release_capture().is_none());
         assert!(view.plugin_focus.focused().is_none());
         assert_eq!(notified.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Exercise the full dispatcher with an application requesting mouse input.
+        // A closed peer makes accidental forwarding fail instead of hiding the bug.
+        let mut client = disconnected_focus_test_client().await;
+        let hit = view.retained_compositor.hit_test(3, 3).unwrap();
+        view.plugin_focus.focus_hit(&view.retained_compositor, &hit);
+        event.column = 1;
+        let target = attach_mouse_target_context(&view, event.column, event.row);
+        assert!(pane_mouse_protocol_reports_event(
+            &view,
+            target.focus_target,
+            event.kind
+        ));
+        handle_attach_mouse_event_at(
+            &mut client,
+            event,
+            &mut view,
+            None,
+            Instant::now(),
+            TerminalGeometry { cols: 80, rows: 24 },
+        )
+        .await
+        .unwrap();
+        assert!(view.plugin_focus.focused().is_none());
+        assert_eq!(notified.load(std::sync::atomic::Ordering::SeqCst), 2);
         registry.remove(&endpoint);
     }
 
