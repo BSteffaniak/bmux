@@ -272,9 +272,7 @@ impl RustPlugin for ClusterPlugin {
             return;
         };
         let nodes = consensus_network::global_consensus_nodes();
-        let raft_handle: Arc<
-            dyn bmux_cluster_plugin_api::cluster_raft_rpc::ClusterRaftRpcService + Send + Sync,
-        > = Arc::new(consensus_network::RaftRpcServiceHandle::new(
+        let raft_handle = Arc::new(consensus_network::RaftRpcServiceHandle::new(
             caller.clone(),
             *identity.node_id(),
             nodes.clone(),
@@ -362,6 +360,14 @@ impl RustPlugin for ClusterPlugin {
                 + Send
                 + Sync,
         > = worker;
+        let _ = bmux_cluster_plugin_api::cluster_raft_decoder::register_provider(
+            registry,
+            raft_handle.clone(),
+        );
+        let _ = bmux_cluster_plugin_api::cluster_raft_rpc_v2::register_provider(
+            registry,
+            raft_handle.clone(),
+        );
         let _ = bmux_cluster_plugin_api::cluster_raft_rpc::register_provider(registry, raft_handle);
         let _ = bmux_cluster_plugin_api::cluster_control_command::register_provider(
             registry,

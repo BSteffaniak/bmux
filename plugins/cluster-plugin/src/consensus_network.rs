@@ -25,6 +25,13 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 const RAFT_RPC_DOMAIN: &[u8] = b"bmux.cluster.raft-rpc.v1\0";
+const DECODER_PROBE_OPERATION: &str = "capability-publication-decoder-v1";
+
+fn decoder_proof_payload(request: &RaftRpcRequest) -> Result<Vec<u8>, String> {
+    let mut payload = b"bmux.cluster.raft-decoder-proof.v1\0".to_vec();
+    payload.extend(encode_service_message(request).map_err(|error| error.to_string())?);
+    Ok(payload)
+}
 
 fn signing_payload(
     operation: &str,
@@ -113,6 +120,37 @@ impl<C> EndpointRaftNetworkFactory<C> {
     }
 }
 
+pub(super) trait DecoderAdmission: Send + Sync {
+    fn verify<'a>(
+        &'a self,
+        target: NodeId,
+        endpoint: &'a str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+impl<C> DecoderAdmission for EndpointRaftNetworkFactory<C>
+where
+    C: ServiceCaller + Send + Sync + 'static,
+{
+    fn verify<'a>(
+        &'a self,
+        target: NodeId,
+        endpoint: &'a str,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            EndpointRaftNetwork {
+                caller: self.caller.clone(),
+                identity: self.identity.clone(),
+                target,
+                endpoint: endpoint.to_string(),
+            }
+            .require_publication_decoder()
+            .await
+            .map_err(|error| format!("{error:?}"))
+        })
+    }
+}
+
 pub struct EndpointRaftNetwork<C> {
     caller: Arc<C>,
     identity: NodeIdentity,
@@ -140,6 +178,37 @@ impl<C> EndpointRaftNetwork<C>
 where
     C: ServiceCaller + Send + Sync + 'static,
 {
+    async fn require_publication_decoder(&self) -> Result<(), PeerAuthenticationFailure> {
+        let proof = crate::endpoint::peer_authentication_proof(
+            self.caller.as_ref(),
+            &self.endpoint,
+            &self.identity.node_id().to_string(),
+            &self.target.to_string(),
+        )
+        .await?;
+        let request = authenticated_request(
+            DECODER_PROBE_OPERATION,
+            self.target,
+            &self.identity,
+            proof,
+            Vec::new(),
+        )
+        .map_err(PeerAuthenticationFailure::Local)?;
+        let signed = decoder_proof_payload(&request).map_err(PeerAuthenticationFailure::Local)?;
+        let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), &self.endpoint);
+        let proof =
+            bmux_cluster_plugin_api::cluster_raft_decoder::client::probe(&mut remote, request)
+                .await
+                .map_err(|error| {
+                    PeerAuthenticationFailure::Unreachable(format!(
+                        "decoder negotiation failed: {error}"
+                    ))
+                })?
+                .map_err(PeerAuthenticationFailure::Untrusted)?;
+        verify_node_signature(&self.target.to_string(), &signed, &proof.signature)
+            .map_err(PeerAuthenticationFailure::Untrusted)
+    }
+
     async fn invoke<Request, Response>(
         &self,
         operation: &str,
@@ -164,6 +233,20 @@ where
                 .map_err(PeerAuthenticationFailure::Local)?;
         let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), &self.endpoint);
         let response = match operation {
+            "append_entries_v2" => {
+                bmux_cluster_plugin_api::cluster_raft_rpc_v2::client::append_entries(
+                    &mut remote,
+                    envelope,
+                )
+                .await
+            }
+            "install_snapshot_v2" => {
+                bmux_cluster_plugin_api::cluster_raft_rpc_v2::client::install_snapshot(
+                    &mut remote,
+                    envelope,
+                )
+                .await
+            }
             "append_entries" => {
                 bmux_cluster_plugin_api::cluster_raft_rpc::client::append_entries(
                     &mut remote,
@@ -228,6 +311,12 @@ where
         rpc: AppendEntriesRequest<ControlRaftConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        if rpc.entries.iter().any(|entry| matches!(
+            &entry.payload, openraft::EntryPayload::Normal(request) if request.0.starts_with(b"BMCAP001")
+        )) {
+            self.require_publication_decoder().await.map_err(Self::rpc_error)?;
+            return self.invoke("append_entries_v2", &rpc).await.map_err(Self::rpc_error);
+        }
         self.invoke("append_entries", &rpc)
             .await
             .map_err(Self::rpc_error)
@@ -241,6 +330,26 @@ where
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
     > {
+        // This transport sends complete envelopes. Do not guess decoder support
+        // from a partial chunk or scan arbitrary bytes for a format marker.
+        if rpc.offset != 0 || !rpc.done {
+            return Err(Self::rpc_error(PeerAuthenticationFailure::Local(
+                "partial snapshot negotiation is unsupported".into(),
+            )));
+        }
+        let advanced = crate::consensus_storage::snapshot_requires_publication_decoder(&rpc.data)
+            .map_err(|error| {
+            Self::rpc_error(PeerAuthenticationFailure::Local(error.to_string()))
+        })?;
+        if advanced {
+            self.require_publication_decoder()
+                .await
+                .map_err(Self::rpc_error)?;
+            return self
+                .invoke("install_snapshot_v2", &rpc)
+                .await
+                .map_err(Self::rpc_error);
+        }
         self.invoke("install_snapshot", &rpc)
             .await
             .map_err(Self::rpc_error)
@@ -1051,6 +1160,92 @@ where
     }
 }
 
+impl<C> bmux_cluster_plugin_api::cluster_raft_decoder::ClusterRaftDecoderService
+    for RaftRpcServiceHandle<C>
+where
+    C: crate::ClusterRuntimeOps + Send + Sync + 'static,
+{
+    fn probe<'a>(
+        &'a self,
+        request: RaftRpcRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_types::RaftDecoderProof,
+                        String,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            // Authenticate before attesting; the request signature and fresh challenge
+            // bind this proof to one requester and target, not an endpoint cache.
+            let signed = decoder_proof_payload(&request)?;
+            let (_, payload) = authenticate_request(
+                self.caller.as_ref(),
+                DECODER_PROBE_OPERATION,
+                self.local_node_id,
+                request,
+            )?;
+            if !payload.is_empty() {
+                return Err("decoder probe payload must be empty".into());
+            }
+            let identity = crate::load_or_create_node_identity(self.caller.as_ref())?;
+            if *identity.node_id() != self.local_node_id {
+                return Err("decoder signer does not match service identity".into());
+            }
+            Ok(bmux_cluster_plugin_api::cluster_types::RaftDecoderProof {
+                signature: identity.sign(&signed),
+            })
+        })
+    }
+}
+
+impl<C> bmux_cluster_plugin_api::cluster_raft_rpc_v2::ClusterRaftRpcService
+    for RaftRpcServiceHandle<C>
+where
+    C: crate::ClusterRuntimeOps + Send + Sync + 'static,
+{
+    fn append_entries<'a>(
+        &'a self,
+        request: RaftRpcRequest,
+    ) -> std::pin::Pin<Box<dyn Future<Output = RaftRpcResponse> + Send + 'a>> {
+        Box::pin(
+            self.dispatch("append_entries_v2", request, |raft, request| {
+                Box::pin(async move {
+                    raft.append_entries(request)
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+            }),
+        )
+    }
+    fn install_snapshot<'a>(
+        &'a self,
+        request: RaftRpcRequest,
+    ) -> std::pin::Pin<Box<dyn Future<Output = RaftRpcResponse> + Send + 'a>> {
+        Box::pin(
+            self.dispatch("install_snapshot_v2", request, |raft, request| {
+                Box::pin(async move {
+                    raft.install_snapshot(request)
+                        .await
+                        .map_err(|error| error.to_string())
+                })
+            }),
+        )
+    }
+    fn vote<'a>(
+        &'a self,
+        request: RaftRpcRequest,
+    ) -> std::pin::Pin<Box<dyn Future<Output = RaftRpcResponse> + Send + 'a>> {
+        Box::pin(self.dispatch("vote_v2", request, |raft, request| {
+            Box::pin(async move { raft.vote(request).await.map_err(|error| error.to_string()) })
+        }))
+    }
+}
+
 impl<C> ClusterRaftRpcService for RaftRpcServiceHandle<C>
 where
     C: crate::ClusterRuntimeOps + Send + Sync + 'static,
@@ -1251,6 +1446,25 @@ mod tests {
         )
         .unwrap();
         identity.verify(&signed, &request.signature).unwrap();
+        let decoder_signed = decoder_proof_payload(&request).unwrap();
+        let decoder_signature = identity.sign(&decoder_signed);
+        identity
+            .verify(&decoder_signed, &decoder_signature)
+            .unwrap();
+        let mut replay = request.clone();
+        replay.proof.challenge.nonce.push('x');
+        assert!(
+            identity
+                .verify(&decoder_proof_payload(&replay).unwrap(), &decoder_signature)
+                .is_err()
+        );
+        replay = request.clone();
+        replay.target_node_id = identity.node_id().to_string();
+        assert!(
+            identity
+                .verify(&decoder_proof_payload(&replay).unwrap(), &decoder_signature)
+                .is_err()
+        );
         assert!(
             identity
                 .verify(

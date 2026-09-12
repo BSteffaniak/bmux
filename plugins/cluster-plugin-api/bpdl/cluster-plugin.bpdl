@@ -660,6 +660,10 @@ interface cluster-types {
         signature: bytes,
     }
 
+    record raft-decoder-proof {
+        signature: bytes,
+    }
+
     record raft-rpc-response {
         source_node_id: string,
         payload: bytes,
@@ -669,6 +673,13 @@ interface cluster-types {
     record cluster-connection-event-list {
         events: list<cluster-connection-event>,
     }
+}
+
+// This version attests support for retained capability-publication commands and snapshots.
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-raft-decoder {
+    command probe(request: cluster-types.raft-rpc-request) -> result<cluster-types.raft-decoder-proof, string>;
 }
 
 @capability(CLUSTER_READ)
@@ -806,6 +817,16 @@ interface cluster-peer-auth {
 
 @capability(CLUSTER_AUTH)
 @interface-version(1)
+interface cluster-raft-rpc {
+    command append_entries(request: cluster-types.raft-rpc-request) -> cluster-types.raft-rpc-response;
+    command install_snapshot(request: cluster-types.raft-rpc-request) -> cluster-types.raft-rpc-response;
+    command vote(request: cluster-types.raft-rpc-request) -> cluster-types.raft-rpc-response;
+}
+
+// V2 receivers support retained capability-publication commands and snapshots.
+// Senders must not fall back to v1 when this interface is unavailable.
+@capability(CLUSTER_AUTH)
+@interface-version(2)
 interface cluster-raft-rpc {
     command append_entries(request: cluster-types.raft-rpc-request) -> cluster-types.raft-rpc-response;
     command install_snapshot(request: cluster-types.raft-rpc-request) -> cluster-types.raft-rpc-response;

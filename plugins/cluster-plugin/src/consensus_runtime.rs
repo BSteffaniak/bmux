@@ -139,8 +139,18 @@ pub struct ConsensusNode {
     raft: openraft::Raft<ControlRaftConfig>,
     storage: ConsensusLogStore,
     membership_submission: std::sync::Arc<tokio::sync::Mutex<()>>,
+    decoder_admission: Option<Arc<dyn crate::consensus_network::DecoderAdmission>>,
     node_id: NodeId,
     cluster_id: String,
+}
+
+fn validate_admission_term(expected: u64, current: u64) -> Result<(), ConsensusWriteError> {
+    if expected != current {
+        return Err(ConsensusWriteError::Membership(
+            "leadership term changed during admission; retry compatibility checks".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl ConsensusNode {
@@ -175,6 +185,7 @@ impl ConsensusNode {
             raft,
             storage,
             membership_submission: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            decoder_admission: None,
             node_id,
             cluster_id: cluster_id.to_string(),
         })
@@ -195,13 +206,16 @@ impl ConsensusNode {
     where
         C: bmux_plugin::ServiceCaller + Send + Sync + 'static,
     {
-        Self::start(
+        let network = EndpointRaftNetworkFactory::new(caller.clone(), identity.clone());
+        let mut node = Self::start(
             state_dir,
             cluster_id,
             *identity.node_id(),
             EndpointRaftNetworkFactory::new(caller, identity),
         )
-        .await
+        .await?;
+        node.decoder_admission = Some(Arc::new(network));
+        Ok(node)
     }
 
     #[must_use]
@@ -309,6 +323,7 @@ impl ConsensusNode {
                 return Err(ConsensusWriteError::QuorumUnavailable(error.to_string()));
             }
         }
+        let admission_term = self.current_term();
         // Retained publication commands/snapshots require their decoder even
         // before activation advances the schema floor. Endpoint authentication
         // does not prove that a newly added learner can consume this history.
@@ -318,33 +333,41 @@ impl ConsensusNode {
             ))
         })?;
         if state.requires_publication_decoder() {
-            let existing = self.storage.state_machine().map_err(|error| {
-                ConsensusWriteError::Membership(format!(
-                    "cannot read committed membership: {error}"
-                ))
-            })?;
-            if authenticated.keys().any(|id| {
-                existing
-                    .committed_membership()
-                    .membership()
-                    .get_node(id)
-                    .is_none()
-            }) {
-                return Err(ConsensusWriteError::Membership(
-                    "new recipients require capability-publication decoder admission proof".into(),
-                ));
+            for (id, node) in &authenticated {
+                if *id == self.node_id {
+                    continue;
+                }
+                // Probe every remote recipient, including endpoint replacements.
+                // A previous membership entry is not evidence of the current decoder.
+                let verifier = self.decoder_admission.as_ref().ok_or_else(|| {
+                    ConsensusWriteError::Membership(
+                        "new recipients require capability-publication decoder admission proof"
+                            .into(),
+                    )
+                })?;
+                verifier
+                    .verify(*id, &node.addr)
+                    .await
+                    .map_err(ConsensusWriteError::Membership)?;
             }
+            // Network waits may span a leadership transition. Never start admission
+            // on the authority of the earlier read alone.
+            self.raft.ensure_linearizable().await.map_err(|error| {
+                ConsensusWriteError::Membership(format!("admission authority changed: {error}"))
+            })?;
         }
         let voter_ids = authenticated
             .keys()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
         for (node_id, node) in authenticated {
+            validate_admission_term(admission_term, self.current_term())?;
             self.raft
                 .add_learner(node_id, node, true)
                 .await
                 .map_err(client_write_error)?;
         }
+        validate_admission_term(admission_term, self.current_term())?;
         self.raft
             .change_membership(voter_ids, false)
             .await
@@ -1892,7 +1915,30 @@ pub(crate) mod tests {
         recovered.shutdown().await.unwrap();
     }
 
+    #[test]
+    fn admission_evidence_does_not_survive_a_leadership_term_change() {
+        assert!(validate_admission_term(7, 7).is_ok());
+        assert!(
+            matches!(validate_admission_term(7, 8), Err(ConsensusWriteError::Membership(reason)) if reason.contains("retry compatibility checks"))
+        );
+    }
+
     async fn assert_unqualified_admission_rejected(node: &ConsensusNode, id: NodeId) {
+        struct RejectDecoder;
+        impl crate::consensus_network::DecoderAdmission for RejectDecoder {
+            fn verify<'a>(
+                &'a self,
+                target: NodeId,
+                endpoint: &'a str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    assert_eq!(target, NodeId::from(97));
+                    assert_eq!(endpoint, "new-node");
+                    Err("unsupported remote decoder".into())
+                })
+            }
+        }
         let admission = node
             .change_voters(BTreeMap::from([
                 (id, BasicNode::new("node")),
@@ -1902,6 +1948,19 @@ pub(crate) mod tests {
         assert!(
             matches!(admission, Err(ConsensusWriteError::Membership(reason)) if reason.contains("decoder admission proof"))
         );
+        let mut guarded = node.clone();
+        guarded.decoder_admission = Some(Arc::new(RejectDecoder));
+        let before = node.committed_member_ids();
+        let admission = guarded
+            .change_voters(BTreeMap::from([
+                (id, BasicNode::new("node")),
+                (NodeId::from(97), BasicNode::new("new-node")),
+            ]))
+            .await;
+        assert!(
+            matches!(admission, Err(ConsensusWriteError::Membership(reason)) if reason == "unsupported remote decoder")
+        );
+        assert_eq!(node.committed_member_ids(), before);
     }
 
     #[tokio::test]

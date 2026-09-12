@@ -53,6 +53,16 @@ version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.server_clusters.auth"
+interface_id = "cluster-raft-rpc/v2"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.server_clusters.auth"
+interface_id = "cluster-raft-decoder/v1"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.server_clusters.auth"
 interface_id = "cluster-capability-publication/v1"
 kind         = "command"
 

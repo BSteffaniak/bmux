@@ -944,6 +944,15 @@ fn encode_snapshot_envelope(
     Ok(result)
 }
 
+pub(super) fn snapshot_requires_publication_decoder(
+    bytes: &[u8],
+) -> Result<bool, ConsensusStorageError> {
+    let envelope = decode_snapshot_envelope(bytes)?;
+    let state = ControlState::decode_snapshot(&envelope.control_bytes)
+        .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot control state"))?;
+    Ok(state.requires_publication_decoder())
+}
+
 fn decode_snapshot_envelope(bytes: &[u8]) -> Result<SnapshotEnvelope, ConsensusStorageError> {
     if bytes.len() > MAX_SNAPSHOT_FILE_BYTES {
         return Err(ConsensusStorageError::CorruptRecord("snapshot size"));
@@ -2381,6 +2390,23 @@ mod tests {
             ConsensusLogStore::open(root.path(), "cluster-a"),
             Err(ConsensusStorageError::ClusterIdMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn snapshot_decoder_selection_validates_the_envelope() {
+        let state = ControlState::new("cluster-a");
+        let meta = SnapshotMeta {
+            last_log_id: None,
+            last_membership: StoredMembership::default(),
+            snapshot_id: "decoder-test".into(),
+        };
+        let mut bytes =
+            encode_snapshot_envelope("cluster-a", &meta, &state.encode_snapshot().unwrap())
+                .unwrap();
+        assert!(!snapshot_requires_publication_decoder(&bytes).unwrap());
+        assert!(snapshot_requires_publication_decoder(&bytes[..bytes.len() / 2]).is_err());
+        bytes[12] ^= 1;
+        assert!(snapshot_requires_publication_decoder(&bytes).is_err());
     }
 
     #[test]
