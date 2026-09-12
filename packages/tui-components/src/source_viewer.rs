@@ -1,5 +1,6 @@
 //! Generic source-code card and gutter rendering.
 
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Color, Line, Span, Style};
@@ -85,91 +86,43 @@ pub fn register_source_viewer_selection(
     if !policy.enabled || area.is_empty() {
         return scope_outcome;
     }
-    let lines = input
-        .contents
-        .lines()
-        .take(input.max_lines)
-        .collect::<Vec<_>>();
-    let last_line = input
-        .start_line
-        .saturating_add(lines.len().saturating_sub(1));
-    let number_width = usize::from(input.line_numbers) * last_line.to_string().len().max(1);
-    let body_width = usize::from(area.width.saturating_sub(2))
-        .saturating_sub(source_card_chrome_width(number_width))
-        .max(1);
+    let projection = source_projection(input, area.width);
+    let number_width = projection.number_width;
+    let body_width = projection.body_width;
     let content_x = area
         .x
         .saturating_add(4)
         .saturating_add(u16::try_from(number_width).unwrap_or(u16::MAX))
         .saturating_add(u16::from(number_width > 0) * 3);
-    let mut source_offset = 0_usize;
     let mut screen_y = area.y.saturating_add(1);
     let mut fragments = 0_usize;
-    for (line_index, source) in lines.into_iter().enumerate() {
-        let mut chunk = String::new();
-        let mut chunk_width = 0_usize;
-        let mut chunk_offset = source_offset;
-        for grapheme in source.graphemes(true).chain(std::iter::once("")) {
-            let grapheme_width = UnicodeWidthStr::width(grapheme);
-            if !chunk.is_empty()
-                && (grapheme.is_empty() || chunk_width.saturating_add(grapheme_width) > body_width)
-            {
-                for fragment in bmux_tui::selection::plain_text_fragments(
-                    selection.scope_id.clone(),
-                    format!(
-                        "{}.line.{}",
-                        selection.scope_id.as_str(),
-                        input.start_line + line_index
-                    ),
-                    Rect::new(
-                        content_x,
-                        screen_y,
-                        u16::try_from(body_width).unwrap_or(u16::MAX),
-                        1,
-                    ),
-                    u64::try_from(line_index).unwrap_or(u64::MAX),
-                    &chunk,
-                    chunk_offset,
-                    selection.revision,
-                ) {
-                    cx.push_selection_fragment(fragment);
-                    fragments = fragments.saturating_add(1);
-                }
-                chunk_offset = chunk_offset.saturating_add(chunk.len());
-                chunk.clear();
-                chunk_width = 0;
-                screen_y = screen_y.saturating_add(1);
-            }
-            if !grapheme.is_empty() {
-                chunk.push_str(grapheme);
-                chunk_width = chunk_width.saturating_add(grapheme_width);
-            }
+    for row in &projection.rows {
+        if screen_y >= area.bottom() {
+            break;
         }
-        if source.is_empty() {
-            for fragment in bmux_tui::selection::plain_text_fragments(
-                selection.scope_id.clone(),
-                format!(
-                    "{}.line.{}",
-                    selection.scope_id.as_str(),
-                    input.start_line + line_index
-                ),
-                Rect::new(
-                    content_x,
-                    screen_y,
-                    u16::try_from(body_width).unwrap_or(u16::MAX),
-                    1,
-                ),
-                u64::try_from(line_index).unwrap_or(u64::MAX),
-                "",
-                source_offset,
-                selection.revision,
-            ) {
-                cx.push_selection_fragment(fragment);
-                fragments = fragments.saturating_add(1);
-            }
-            screen_y = screen_y.saturating_add(1);
+        let text = Line::from_spans(row.spans.clone()).plain_text();
+        for fragment in bmux_tui::selection::plain_text_fragments(
+            selection.scope_id.clone(),
+            format!(
+                "{}.line.{}",
+                selection.scope_id.as_str(),
+                input.start_line.saturating_add(row.line_index)
+            ),
+            Rect::new(
+                content_x,
+                screen_y,
+                u16::try_from(body_width).unwrap_or(u16::MAX),
+                1,
+            ),
+            u64::try_from(row.line_index).unwrap_or(u64::MAX),
+            &text,
+            row.source_offset,
+            selection.revision,
+        ) {
+            cx.push_selection_fragment(fragment);
+            fragments = fragments.saturating_add(1);
         }
-        source_offset = source_offset.saturating_add(source.len().saturating_add(1));
+        screen_y = screen_y.saturating_add(1);
     }
     if fragments == 0 {
         scope_outcome
@@ -186,11 +139,24 @@ pub fn source_viewer_rows(input: SourceViewerInput<'_>, width: u16) -> Vec<Line>
 
 /// Render source text with caller-supplied semantic card styles.
 #[must_use]
-pub fn source_viewer_rows_with_style(
-    input: SourceViewerInput<'_>,
-    width: u16,
-    style: SourceViewerStyle,
-) -> Vec<Line> {
+#[derive(Debug)]
+struct SourceRow {
+    spans: Vec<Span>,
+    line_index: usize,
+    source_offset: usize,
+    first: bool,
+}
+
+#[derive(Debug)]
+struct SourceProjection {
+    rows: Vec<SourceRow>,
+    card_width: u16,
+    body_width: usize,
+    number_width: usize,
+    truncated: bool,
+}
+
+fn source_projection(input: SourceViewerInput<'_>, width: u16) -> SourceProjection {
     let lines = input.contents.lines().collect::<Vec<_>>();
     let displayed = lines.len().min(input.max_lines);
     let last_line = input.start_line.saturating_add(displayed.saturating_sub(1));
@@ -209,42 +175,91 @@ pub fn source_viewer_rows_with_style(
     let body_width = usize::from(card_width)
         .saturating_sub(source_card_chrome_width(number_width))
         .max(1);
-    let highlighted = input.styled_lines.map_or_else(
-        || {
-            lines[..displayed]
-                .iter()
-                .map(|line| vec![Span::raw((*line).to_owned())])
-                .collect::<Vec<_>>()
-        },
-        |styled| {
-            styled
-                .iter()
-                .take(displayed)
-                .map(|line| line.spans.clone())
-                .collect::<Vec<_>>()
-        },
-    );
     let mut rows = Vec::new();
-    rows.push(card_border(card_width, "┌", "┐", style.border));
-    for (index, spans) in highlighted.into_iter().enumerate() {
-        let spans = spans
+    let mut source_offset = 0usize;
+    for (index, source) in lines[..displayed].iter().enumerate() {
+        // Syntax styles may annotate source, never replace it or omit lines.
+        let spans = input
+            .styled_lines
+            .and_then(|styled| styled.get(index))
+            .filter(|line| line.plain_text() == *source)
+            .map_or_else(|| vec![Span::raw(*source)], |line| line.spans.clone());
+        // Syntax boundaries cannot divide a source grapheme. Its first byte
+        // selects the style; wrapping remains owned by canonical TextBlock.
+        let mut annotations = spans.iter();
+        let mut annotation = annotations.next();
+        let mut end = annotation.map_or(0, |span| span.content.len());
+        let spans: Vec<Span> = source
+            .grapheme_indices(true)
+            .map(|(offset, grapheme)| {
+                while offset >= end && annotation.is_some() {
+                    annotation = annotations.next();
+                    end = end.saturating_add(annotation.map_or(0, |span| span.content.len()));
+                }
+                Span::styled(
+                    grapheme,
+                    annotation.map_or_else(Style::new, |span| span.style),
+                )
+            })
+            .collect();
+        let text = bmux_tui::composition::TextBlock::new(bmux_tui::text::Text::from_lines([
+            Line::from_spans(spans),
+        ]))
+        .wrap(bmux_tui::text::TextWrap::Character);
+        let layout = text.layout(
+            Constraints::for_width(body_width.try_into().unwrap_or(u64::MAX)),
+            &mut LayoutCx::new(),
+        );
+        for (chunk_index, row) in text.projection(&layout).into_iter().enumerate() {
+            rows.push(SourceRow {
+                spans: row.line.spans,
+                line_index: index,
+                source_offset: source_offset.saturating_add(row.source_range.start),
+                first: chunk_index == 0,
+            });
+        }
+        // Preserve actual CRLF/LF source boundaries rather than assuming one byte.
+        let remaining = &input.contents[source_offset..];
+        source_offset = source_offset
+            .saturating_add(remaining.find('\n').map_or(remaining.len(), |end| end + 1));
+    }
+    SourceProjection {
+        rows,
+        card_width,
+        body_width,
+        number_width,
+        truncated: lines.len() > displayed,
+    }
+}
+
+/// Render source text with caller-supplied semantic card styles.
+#[must_use]
+pub fn source_viewer_rows_with_style(
+    input: SourceViewerInput<'_>,
+    width: u16,
+    style: SourceViewerStyle,
+) -> Vec<Line> {
+    let projection = source_projection(input, width);
+    let card_width = projection.card_width;
+    let number_width = projection.number_width;
+    let mut rows = vec![card_border(card_width, "┌", "┐", style.border)];
+    for row in projection.rows {
+        let spans = row
+            .spans
             .into_iter()
             .map(|span| Span::styled(span.content, style.source.patch(span.style)))
             .collect();
-        let chunks = wrap_spans(spans, body_width);
-        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
-            let number = (chunk_index == 0 && input.line_numbers)
-                .then(|| input.start_line.saturating_add(index));
-            rows.push(source_card_row(
-                chunk,
-                number,
-                number_width,
-                card_width,
-                style,
-            ));
-        }
+        let number = (row.first && input.line_numbers)
+            .then(|| input.start_line.saturating_add(row.line_index));
+        rows.push(source_card_row(
+            spans,
+            number,
+            number_width,
+            card_width,
+            style,
+        ));
     }
-    if lines.len() > displayed {
+    if projection.truncated {
         rows.push(source_card_row(
             vec![Span::styled(input.truncated_message, style.truncated)],
             None,
@@ -324,25 +339,6 @@ fn card_border(width: u16, left: &str, right: &str, style: Style) -> Line {
         Span::styled("─".repeat(inner), style),
         Span::styled(right, style),
     ])
-}
-
-fn wrap_spans(spans: Vec<Span>, width: usize) -> Vec<Vec<Span>> {
-    let mut rows = vec![Vec::new()];
-    let mut used = 0usize;
-    for span in spans {
-        for grapheme in span.content.graphemes(true) {
-            let cell_width = UnicodeWidthStr::width(grapheme);
-            if used > 0 && used.saturating_add(cell_width) > width {
-                rows.push(Vec::new());
-                used = 0;
-            }
-            rows.last_mut()
-                .expect("source row")
-                .push(Span::styled(grapheme, span.style));
-            used = used.saturating_add(cell_width);
-        }
-    }
-    rows
 }
 
 pub(crate) fn pad_card_spans(spans: &mut Vec<Span>, target_width: usize, style: Style) {
@@ -432,7 +428,7 @@ mod tests {
         let token = rows
             .iter()
             .flat_map(|row| &row.spans)
-            .find(|span| span.content == "l")
+            .find(|span| span.content.starts_with('l'))
             .expect("token span");
 
         assert_eq!(token.style.fg, Some(Color::Red));
@@ -440,8 +436,63 @@ mod tests {
         assert!(
             rows.iter()
                 .flat_map(|row| &row.spans)
-                .any(|span| span.content == "v" && span.style.fg == Some(Color::Blue))
+                .any(|span| span.content.contains('v') && span.style.fg == Some(Color::Blue))
         );
+    }
+
+    #[test]
+    fn canonical_projection_keeps_graphemes_across_syntax_spans() {
+        let styled = [Line::from_spans(vec![
+            Span::styled("👩", Style::new().fg(Color::Red)),
+            Span::raw("\u{200d}💻x"),
+        ])];
+        let projection = super::source_projection(
+            SourceViewerInput {
+                label: "source",
+                styled_lines: Some(&styled),
+                contents: "👩\u{200d}💻x",
+                start_line: 1,
+                max_lines: 1,
+                truncated_message: "",
+                line_numbers: false,
+            },
+            8,
+        );
+        assert_eq!(projection.rows.len(), 2);
+        assert_eq!(
+            Line::from_spans(projection.rows[0].spans.clone()).plain_text(),
+            "👩\u{200d}💻"
+        );
+        assert_eq!(projection.rows[1].source_offset, "👩\u{200d}💻".len());
+    }
+
+    #[test]
+    fn projection_preserves_source_boundaries_and_falls_back_from_incomplete_styles() {
+        let styled = [Line::from("not the source")];
+        let input = SourceViewerInput {
+            styled_lines: Some(&styled),
+            label: "source",
+            contents: "a界\r\nsecond",
+            start_line: 1,
+            max_lines: 10,
+            truncated_message: "truncated",
+            line_numbers: false,
+        };
+        let projection = super::source_projection(input, 40);
+        assert_eq!(projection.rows.len(), 2);
+        assert_eq!(projection.rows[1].source_offset, "a界\r\n".len());
+        assert_eq!(
+            Line::from_spans(projection.rows[0].spans.clone()).plain_text(),
+            "a界"
+        );
+        let painted = source_viewer_rows(input, 40);
+        for (index, row) in projection.rows.iter().enumerate() {
+            assert!(
+                painted[index + 1]
+                    .plain_text()
+                    .contains(&Line::from_spans(row.spans.clone()).plain_text())
+            );
+        }
     }
 
     #[test]

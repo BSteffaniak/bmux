@@ -82,7 +82,8 @@ pub fn register_terminal_viewer_selection(
         chrome_capture: SelectionCapture::Disabled,
         auto_scroll: policy.auto_scroll,
     };
-    let content_start = terminal_viewer_chrome_row_count(&input, area.width);
+    let content_start =
+        u16::try_from(terminal_viewer_chrome_rows(&input, area.width).len()).unwrap_or(u16::MAX);
     let content_area = Rect::new(
         area.x,
         area.y.saturating_add(content_start),
@@ -160,27 +161,7 @@ pub struct TerminalViewerInput<'a> {
 /// Render terminal transcript rows using terminal-grid semantics.
 #[must_use]
 pub fn terminal_viewer_rows(input: TerminalViewerInput<'_>, width: u16) -> Vec<Line> {
-    let mut rows = Vec::new();
-    if input.show_status {
-        push_wrapped_styled_text(
-            &mut rows,
-            vec![Span::styled("  ", muted_style())],
-            &terminal_status(&input),
-            width,
-            terminal_status_style(&input),
-            muted_style(),
-        );
-    }
-    if input.output_truncated {
-        push_wrapped_styled_text(
-            &mut rows,
-            vec![Span::styled("  ", muted_style())],
-            &terminal_truncation_status(&input),
-            width,
-            muted_style(),
-            muted_style(),
-        );
-    }
+    let mut rows = terminal_viewer_chrome_rows(&input, width);
     for line in terminal_output_lines(&input, width.saturating_sub(4)) {
         rows.push(prefix_line(line, "    ", muted_style()));
     }
@@ -222,7 +203,7 @@ fn terminal_truncation_status(input: &TerminalViewerInput<'_>) -> String {
     }
 }
 
-fn terminal_viewer_chrome_row_count(input: &TerminalViewerInput<'_>, width: u16) -> u16 {
+fn terminal_viewer_chrome_rows(input: &TerminalViewerInput<'_>, width: u16) -> Vec<Line> {
     let mut rows = Vec::new();
     if input.show_status {
         push_wrapped_styled_text(
@@ -244,7 +225,7 @@ fn terminal_viewer_chrome_row_count(input: &TerminalViewerInput<'_>, width: u16)
             muted_style(),
         );
     }
-    u16::try_from(rows.len()).unwrap_or(u16::MAX)
+    rows
 }
 
 fn terminal_output_lines(input: &TerminalViewerInput<'_>, width: u16) -> Vec<Line> {

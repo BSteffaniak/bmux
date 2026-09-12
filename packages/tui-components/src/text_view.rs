@@ -588,13 +588,21 @@ impl Component for TextViewComponent<'_, '_> {
     }
 
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
-        let Some(area) = cx.find_rect(&layout.id) else {
-            return EventOutcome::Ignored;
-        };
-        if area.is_empty() {
+        if cx.find_visible_rect(&layout.id).is_none_or(Rect::is_empty)
+            && !self.state.get().dragging_scrollbar()
+        {
             return EventOutcome::Ignored;
         }
-        match self.handle_event(area, layout, event) {
+        let Some(event) = crate::common::local_control_event(
+            event,
+            cx,
+            layout,
+            self.state.get().dragging_scrollbar(),
+        ) else {
+            return EventOutcome::Ignored;
+        };
+        let area = local_area_of(layout.size);
+        match self.handle_event(area, layout, &event) {
             ScrollViewOutcome::Ignored => EventOutcome::Ignored,
             ScrollViewOutcome::Scrolled { .. } | ScrollViewOutcome::HorizontalScrolled { .. } => {
                 EventOutcome::Redraw
@@ -1099,6 +1107,55 @@ mod tests {
             wrapped_layout.children[0].node.children[0].node.size.width,
             3
         );
+    }
+
+    #[test]
+    fn clipped_translated_scrollbar_keeps_local_geometry_and_capture() {
+        let lines: Vec<Line> = (0..20)
+            .map(|index| Line::from(format!("{index}")))
+            .collect();
+        let state = Cell::new(ScrollViewState::new());
+        let view = TextViewComponent::new("text", &lines, &state).policy(
+            TextViewPolicy::scrollable().vertical_scrollbar(ScrollbarAxisLayoutMode::Gutter),
+        );
+        let layout = layout_at(&view, Rect::new(0, 0, 6, 5));
+        let clip = Rect::new(10, 12, 6, 3);
+        let mut cx = EventCx::with_clip(&layout, clip);
+        cx.with_transform(0, 0, 10, 10, clip, |cx| {
+            // Local y=2 is the middle of the full five-row scrollbar, not
+            // the top of the three visible rows.
+            assert_eq!(
+                view.event(
+                    &Event::Mouse(MouseEvent::new(
+                        MouseEventKind::Down(MouseButton::Left),
+                        Point::new(15, 12),
+                    )),
+                    &layout,
+                    cx
+                ),
+                EventOutcome::Redraw
+            );
+            assert!(state.get().dragging_scrollbar());
+            assert!(state.get().vertical_offset() > 0);
+            view.event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    Point::new(15, 30),
+                )),
+                &layout,
+                cx,
+            );
+            assert_eq!(state.get().vertical_offset(), 15);
+            view.event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Up(MouseButton::Left),
+                    Point::new(15, 30),
+                )),
+                &layout,
+                cx,
+            );
+            assert!(!state.get().dragging_scrollbar());
+        });
     }
 
     #[test]

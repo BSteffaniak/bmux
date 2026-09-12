@@ -1738,6 +1738,32 @@ mod tests {
                 .presentation_pending
                 .get()
         );
+        // A subsequent allocation failure uses the same input suspension path
+        // while retaining the host's new allocation and authoritative snapshot.
+        let rect = ExtensionRect::new(0, 0, 9, 3);
+        {
+            let mut guard = owner.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            assert!(
+                state
+                    .publish_allocation(rect, |_| Err("rejected".to_string()))
+                    .is_err()
+            );
+            assert_eq!(state.allocation, Some(rect));
+            assert_eq!(state.snapshot.revision, 42);
+            drop(guard);
+        }
+        let repaired = super::handle_local_input(&owner, &event).unwrap();
+        assert!(repaired.consumed && repaired.dirty);
+        assert!(
+            !owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .presentation_pending
+                .get()
+        );
     }
 
     #[test]
