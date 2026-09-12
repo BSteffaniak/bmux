@@ -8422,10 +8422,13 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
         .plugin_focus
         .reconcile(&view_state.retained_compositor)
         && let Some((endpoint, hook)) = old_focus
-    {
-        let _ = view_state
+        && view_state
             .presentation_input
-            .notify_focus_lost(&endpoint, &hook);
+            .notify_focus_lost(&endpoint, &hook)
+    {
+        view_state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::PluginCommand);
     }
     let _ = view_state
         .plugin_pointer_router
@@ -11980,7 +11983,21 @@ fn dismiss_plugin_focus_on_pointer_down(
             .focused()
             .and_then(|id| view_state.retained_compositor.endpoint_for_region(id))
             .is_some_and(|endpoint| view_state.presentation_input.observes_focus_loss(endpoint));
-        if observes_loss && view_state.plugin_focus.focused() != target {
+        let within_owned_modal = hit.as_ref().is_some_and(|hit| {
+            view_state
+                .retained_compositor
+                .surfaces()
+                .get(&hit.surface_id)
+                .is_some_and(|surface| surface.modal)
+                && view_state
+                    .plugin_focus
+                    .focused()
+                    .and_then(|id| view_state.retained_compositor.endpoint_for_region(id))
+                    .is_some_and(|endpoint| {
+                        view_state.retained_compositor.endpoint_for_hit(hit) == Some(endpoint)
+                    })
+        });
+        if observes_loss && !within_owned_modal && view_state.plugin_focus.focused() != target {
             return clear_plugin_surface_focus(view_state);
         }
     }
@@ -14871,6 +14888,13 @@ mod tests {
                 .find(|surface| surface.id.local_id == "menu")
                 .unwrap();
             assert_ne!(popup.ops, next_popup.ops);
+            // Redisplay the retained revision before the publication watcher is
+            // serviced. Repeated acknowledgements must not suspend input.
+            super::acknowledge_plugin_surface_output(state);
+            let mut down = mouse;
+            down.kind = MouseEventKind::Down(crossterm::event::MouseButton::Left);
+            assert!(!super::dismiss_plugin_focus_on_pointer_down(state, down));
+            assert!(state.plugin_focus.focused().is_some());
             let lowered = super::retained_plugin_surfaces(state, viewport);
             super::replace_retained_surfaces(
                 state,

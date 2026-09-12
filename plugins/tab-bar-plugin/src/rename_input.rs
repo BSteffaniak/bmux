@@ -1,5 +1,5 @@
 //! Caller-owned rename state mounted through the neutral component viewport.
-use bmux_plugin::component_viewport::ComponentViewport;
+use bmux_plugin::component_viewport::{CommittedComponentViewport, ComponentViewport};
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::{
     component::{ChildLayout, LayoutNode, LogicalSize},
@@ -15,15 +15,13 @@ use std::ops::{Deref, DerefMut};
 #[derive(Debug, Clone, Default)]
 pub struct RenameInput {
     state: TextInputState,
-    pending: std::collections::VecDeque<(u64, Option<ComponentViewport>)>,
-    viewport: Option<ComponentViewport>,
+    geometry: CommittedComponentViewport,
 }
 impl From<TextEditBuffer> for RenameInput {
     fn from(buffer: TextEditBuffer) -> Self {
         Self {
             state: TextInputState::new(buffer),
-            pending: std::collections::VecDeque::new(),
-            viewport: None,
+            geometry: CommittedComponentViewport::default(),
         }
     }
 }
@@ -48,7 +46,7 @@ const fn policy() -> TextInputPolicy {
 
 impl RenameInput {
     pub fn visible_rect(&self) -> Option<Rect> {
-        self.viewport.as_ref().map(ComponentViewport::visible_rect)
+        self.geometry.get().map(ComponentViewport::visible_rect)
     }
 
     pub fn clear(&mut self) {
@@ -56,7 +54,7 @@ impl RenameInput {
     }
 
     pub fn dispatch(&mut self, event: &Event) {
-        let Some(viewport) = &self.viewport else {
+        let Some(viewport) = self.geometry.get() else {
             return;
         };
         let state = RefCell::new(self.state.clone());
@@ -74,7 +72,7 @@ impl RenameInput {
     }
 
     pub fn pointer(&mut self, event: &bmux_plugin::AttachInputEvent) -> bool {
-        if self.viewport.is_none() {
+        if self.geometry.get().is_none() {
             return false;
         }
         let kind = match event.phase.as_str() {
@@ -212,25 +210,18 @@ pub fn hit_regions(
 }
 
 pub fn stage(input: &mut RenameInput, revision: u64, viewport: Option<ComponentViewport>) {
-    if input.pending.len() == 32 {
-        input.pending.pop_front();
-    }
-    input.pending.push_back((revision, viewport));
+    input.geometry.stage(revision, viewport);
 }
 
 pub fn acknowledge(input: &mut RenameInput, revision: u64) {
-    if let Some((_, viewport)) = input.pending.iter().find(|(id, _)| *id == revision) {
-        input.viewport = viewport.clone();
-    } else if input.pending.front().is_some_and(|(id, _)| revision < *id) {
-        // A superseded revision whose geometry was evicted is not safe to guess.
-        input.viewport = None;
-    }
-    input.pending.retain(|(id, _)| *id > revision);
+    input.geometry.acknowledge(revision);
 }
 
 #[cfg(test)]
 pub fn commit(input: &mut RenameInput, viewport: Option<ComponentViewport>) {
-    input.viewport = viewport;
+    input.geometry = CommittedComponentViewport::default();
+    input.geometry.stage(0, viewport);
+    input.geometry.acknowledge(0);
 }
 
 #[cfg(test)]
@@ -343,7 +334,7 @@ mod tests {
         input.dispatch(&Event::Paste("bad\nline".to_string()));
         assert_eq!(input.text(), "hello 界");
         input.clear();
-        assert!(input.viewport.is_none());
+        assert!(input.geometry.get().is_none());
         assert!(!input.state.mouse_selection_active());
     }
 }

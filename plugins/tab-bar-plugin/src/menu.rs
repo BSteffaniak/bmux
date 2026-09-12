@@ -611,6 +611,34 @@ mod tests {
     }
 
     #[test]
+    fn hover_remains_live_while_new_publication_is_pending() {
+        let mut companion = companion();
+        open(&mut companion);
+        let first = pointer_event(&companion, "move", "1");
+        assert!(transition(&mut companion, &first).unwrap().dirty);
+        let viewport = viewport(&companion);
+        companion.menu.geometry.stage(2, viewport);
+        companion.menu.geometry.acknowledge(1);
+        let next = pointer_event(&companion, "move", "2");
+        assert!(transition(&mut companion, &next).unwrap().dirty);
+        companion.menu.geometry.acknowledge(2);
+        assert!(!transition(&mut companion, &next).unwrap().dirty);
+    }
+
+    #[test]
+    fn focus_loss_removes_menu_and_republishes_without_an_editor() {
+        let mut companion = companion();
+        open(&mut companion);
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(companion)));
+        assert!(crate::handle_focus_lost(&owner, "origin"));
+        let companion = owner.lock().unwrap().take().unwrap();
+        assert!(companion.menu_tab_id.is_none());
+        assert!(companion.menu.geometry.get().is_none());
+        let published = companion.surfaces.owner_snapshot(OWNER).unwrap();
+        assert!(published.surfaces.iter().all(|surface| !surface.modal));
+    }
+
+    #[test]
     fn geometry_is_bounded_and_missing_viewport_never_captures() {
         for placement in [Placement::Top, Placement::Bottom] {
             for (cols, rows) in [(80, 24), (4, 2), (1, 1)] {

@@ -1609,7 +1609,12 @@ fn handle_focus_lost(owner: &CompanionHandle, _hook_id: &str) -> bool {
     let Some(companion) = guard.as_mut() else {
         return false;
     };
-    cancel_rename(companion) && republish_companion(companion)
+    let menu_open = companion.menu_tab_id.take().is_some();
+    let editing = cancel_rename(companion);
+    if menu_open {
+        companion.menu = menu::MenuInput::default();
+    }
+    (menu_open || editing) && republish_companion(companion)
 }
 
 #[allow(clippy::significant_drop_tightening)] // Editor event and retained publication are serialized.

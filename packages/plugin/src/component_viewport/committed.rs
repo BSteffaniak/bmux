@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 pub struct CommittedComponentViewport {
     pending: VecDeque<(u64, Option<ComponentViewport>)>,
     committed: Option<ComponentViewport>,
+    committed_revision: Option<u64>,
 }
 
 impl CommittedComponentViewport {
@@ -17,6 +18,15 @@ impl CommittedComponentViewport {
     }
 
     pub fn acknowledge(&mut self, revision: u64) {
+        // Every successful frame acknowledges retained surfaces, including old
+        // ones while a newer publication awaits reconciliation.
+        if self
+            .committed_revision
+            .is_some_and(|current| revision <= current)
+        {
+            return;
+        }
+        self.committed_revision = Some(revision);
         if let Some((_, viewport)) = self.pending.iter().find(|(id, _)| *id == revision) {
             self.committed = viewport.clone();
         } else if self.pending.front().is_some_and(|(id, _)| revision < *id) {
@@ -60,6 +70,23 @@ mod tests {
         state.stage(3, None);
         assert!(state.get().is_some());
         state.acknowledge(3);
+        assert!(state.get().is_none());
+    }
+
+    #[test]
+    fn repeated_and_stale_acknowledgements_preserve_displayed_geometry() {
+        let mut state = CommittedComponentViewport::default();
+        state.stage(10, viewport(2));
+        state.acknowledge(10);
+        state.stage(11, viewport(8));
+        state.acknowledge(10);
+        assert_eq!(state.get().unwrap().visible_rect().x, 2);
+        state.acknowledge(11);
+        state.stage(12, None);
+        state.acknowledge(10);
+        assert_eq!(state.get().unwrap().visible_rect().x, 8);
+        state.acknowledge(12);
+        state.acknowledge(11);
         assert!(state.get().is_none());
     }
 
