@@ -288,6 +288,11 @@ impl SelectableListState {
         self.interaction.focused = focused.is_some();
     }
 
+    /// Clear pointer hover without changing focus, selection, or a pending press.
+    pub const fn clear_hover(&mut self) {
+        self.hovered = None;
+    }
+
     /// Return vertical scroll offset in logical item rows.
     #[must_use]
     pub const fn vertical_scroll(self) -> u64 {

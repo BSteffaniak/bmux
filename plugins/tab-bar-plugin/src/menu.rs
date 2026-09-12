@@ -81,10 +81,7 @@ fn items() -> [MenuItem; 3] {
 }
 
 const fn policy() -> MenuPolicy {
-    let mut policy = MenuPolicy::interactive();
-    policy.list.keyboard.wrap = true;
-    policy.tab_navigation = true;
-    policy
+    MenuPolicy::context_menu()
 }
 
 fn component<'a>(
@@ -581,13 +578,33 @@ mod tests {
     fn hover_survives_committed_revisions_without_republishing_stationary_pointer() {
         let mut companion = companion();
         open(&mut companion);
-        for index in ["0", "1", "2", "1", "0"] {
+        for index in ["1", "2", "1", "0"] {
             let input = pointer_event(&companion, "move", index);
             let before = surfaces(&companion, 1).pop().unwrap().ops;
             assert!(transition(&mut companion, &input).unwrap().dirty);
             let after = surfaces(&companion, 2).pop().unwrap().ops;
-            if index != "0" {
-                assert_ne!(before, after);
+            assert_ne!(before, after);
+            let selected = index.parse::<usize>().unwrap();
+            assert_eq!(companion.menu.state.focused(), Some(selected));
+            assert_eq!(companion.menu.state.selected(), Some(selected));
+            for (row, label) in LABELS.iter().enumerate() {
+                let op = after
+                    .iter()
+                    .find(|op| matches!(op, RenderOp::TextRun { text, .. } if text.contains(label)))
+                    .unwrap();
+                let RenderOp::TextRun { text, style, .. } = op else {
+                    unreachable!()
+                };
+                assert_eq!(text.contains('>'), row == selected, "caret on {label}");
+                assert_eq!(
+                    style.bg,
+                    Some(if row == selected {
+                        bmux_plugin::RenderColor::Rgb { r: 0, g: 255, b: 0 }
+                    } else {
+                        bmux_plugin::RenderColor::Rgb { r: 0, g: 0, b: 0 }
+                    }),
+                    "highlight on {label}"
+                );
             }
             let viewport = viewport(&companion);
             companion.menu.geometry.stage(2, viewport);

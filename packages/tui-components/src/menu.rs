@@ -85,6 +85,15 @@ impl MenuItem {
 /// Visual styles for a selectable menu.
 pub type MenuStyles = SelectableListStyles;
 
+/// How input devices choose a menu action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuNavigation {
+    /// Selection, keyboard focus, and hover remain independent.
+    Independent,
+    /// Pointer and keyboard share one active action and selection marker.
+    ActiveItem,
+}
+
 /// Configurable selectable-menu behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MenuPolicy {
@@ -94,6 +103,8 @@ pub struct MenuPolicy {
     pub escape_cancels: bool,
     /// Whether printable character keys are reported as typeahead requests.
     pub typeahead: bool,
+    /// Navigation semantics for pointer, focus, and selection.
+    pub navigation: MenuNavigation,
     /// Whether Tab and Shift-Tab move within the menu rather than escaping it.
     pub tab_navigation: bool,
     /// Submenu affordance suffix.
@@ -101,6 +112,16 @@ pub struct MenuPolicy {
 }
 
 impl MenuPolicy {
+    /// Context-menu navigation has one active action, regardless of input device.
+    #[must_use]
+    pub const fn context_menu() -> Self {
+        let mut policy = Self::interactive();
+        policy.navigation = MenuNavigation::ActiveItem;
+        policy.tab_navigation = true;
+        policy.list.keyboard.wrap = true;
+        policy
+    }
+
     /// Common interactive menu behavior.
     #[must_use]
     pub const fn interactive() -> Self {
@@ -108,6 +129,7 @@ impl MenuPolicy {
             list: SelectableListPolicy::interactive(),
             escape_cancels: true,
             typeahead: false,
+            navigation: MenuNavigation::Independent,
             tab_navigation: false,
             submenu_indicator: "›",
         }
@@ -318,16 +340,54 @@ impl<'a> Menu<'a> {
         let list = SelectableList::new(&items)
             .policy(self.policy.list)
             .styles(self.styles);
+        let previous = *state;
+        // Lists report selection changes, whereas context menus activate an
+        // already-active action too. Clear only selection before dispatch;
+        // preserve the shared list's press/release validation.
+        if self.policy.navigation == MenuNavigation::ActiveItem {
+            state.list.set_selected(None);
+        }
         let outcome = if let Some(layout) = layout {
             list.handle_event_with_layout(layout, area, &mut state.list, event)
         } else {
             list.handle_event(area, &mut state.list, event)
         };
+        self.synchronize_active_item(area, state, event);
+        if self.policy.navigation == MenuNavigation::ActiveItem
+            && *state == previous
+            && matches!(
+                outcome,
+                SelectableListOutcome::Redraw | SelectableListOutcome::Ignored
+            )
+        {
+            return MenuOutcome::Ignored;
+        }
+        if outcome == SelectableListOutcome::Ignored && *state != previous {
+            return MenuOutcome::Redraw;
+        }
         match outcome {
             SelectableListOutcome::Ignored => MenuOutcome::Ignored,
             SelectableListOutcome::Redraw => MenuOutcome::Redraw,
             SelectableListOutcome::Focused(index) => MenuOutcome::Focused(index),
             SelectableListOutcome::Selected(index) => self.activate(index),
+        }
+    }
+
+    fn synchronize_active_item(&self, area: Rect, state: &mut MenuState, event: &Event) {
+        if self.policy.navigation == MenuNavigation::ActiveItem {
+            if let Event::Mouse(mouse) = event
+                && matches!(mouse.kind, bmux_tui::event::MouseEventKind::Move)
+                && self.policy.list.mouse.enabled
+                && self.policy.list.mouse.hover
+                && let Some(index) = self.item_index_at(area, state, mouse.position)
+                && self.items.get(index).is_some_and(Self::is_activatable_item)
+            {
+                state.list.set_focused(Some(index));
+            }
+            state.list.set_selected(state.focused());
+            // The active item supplies all emphasis; stale hover must not leave
+            // a second highlighted row after keyboard navigation.
+            state.list.clear_hover();
         }
     }
 
@@ -616,6 +676,40 @@ mod tests {
             };
             render_component(&component, area, frame);
         }
+    }
+
+    #[test]
+    fn context_menu_hover_keyboard_and_activation_share_one_active_item() {
+        let items = items();
+        let menu = Menu::new(&items).policy(MenuPolicy::context_menu());
+        let area = Rect::new(0, 0, 20, 3);
+        let mut state = MenuState::new(Some(0));
+        let moved = Event::Mouse(MouseEvent::new(MouseEventKind::Move, Point::new(2, 1)));
+        assert_eq!(
+            menu.handle_event(area, &mut state, &moved),
+            MenuOutcome::Redraw
+        );
+        assert_eq!(state.focused(), Some(1));
+        assert_eq!(state.selected(), Some(1));
+        assert_eq!(
+            menu.handle_event(area, &mut state, &moved),
+            MenuOutcome::Ignored
+        );
+        menu.handle_event(
+            area,
+            &mut state,
+            &Event::Key(KeyStroke::simple(KeyCode::Up)),
+        );
+        assert_eq!(state.focused(), Some(0));
+        assert_eq!(state.selected(), Some(0));
+        assert!(matches!(
+            menu.handle_event(
+                area,
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Enter))
+            ),
+            MenuOutcome::Activated { index: 0, .. }
+        ));
     }
 
     #[test]

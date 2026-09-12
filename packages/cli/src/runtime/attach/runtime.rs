@@ -14854,7 +14854,7 @@ mod tests {
         resources: &bmux_plugin::AttachPresentationResources,
     ) {
         let viewport = DamageRect::new(0, 0, 80, 24);
-        for item in ["item.1", "item.2", "item.1"] {
+        for item in ["item.1", "item.2", "item.1", "item.0"] {
             let before = resources.surfaces.owner_snapshot("bmux.tab_bar").unwrap();
             let popup = before
                 .surfaces
