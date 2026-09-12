@@ -101,6 +101,35 @@ impl Line {
         )
     }
 
+    /// Align style runs to logical graphemes before retained measurement and
+    /// projection. A grapheme takes the style at its first source byte.
+    /// This ingestion step keeps later row iteration lazy and source bytes intact.
+    pub(crate) fn normalize_grapheme_styles(&mut self) {
+        if self.spans.len() < 2 {
+            return;
+        }
+        let source = self.plain_text();
+        let mut annotations = self.spans.iter();
+        let mut annotation = annotations.next();
+        let mut end = annotation.map_or(0, |span| span.content.len());
+        let mut spans: Vec<Span> = Vec::new();
+        for (offset, grapheme) in source.grapheme_indices(true) {
+            while offset >= end && annotation.is_some() {
+                annotation = annotations.next();
+                end = end.saturating_add(annotation.map_or(0, |span| span.content.len()));
+            }
+            let style = annotation.map_or_else(Style::new, |span| span.style);
+            if let Some(last) = spans.last_mut()
+                && last.style == style
+            {
+                last.content.push_str(grapheme);
+            } else {
+                spans.push(Span::styled(grapheme, style));
+            }
+        }
+        self.spans = spans;
+    }
+
     /// Return the terminal display width of this line.
     #[must_use]
     pub fn width(&self) -> usize {

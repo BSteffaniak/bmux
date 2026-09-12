@@ -138,7 +138,10 @@ impl TextBlock {
     /// Create rich text content.
     #[must_use]
     pub fn new(text: impl Into<Text>) -> Self {
-        let text = text.into();
+        let mut text = text.into();
+        for line in &mut text.lines {
+            line.normalize_grapheme_styles();
+        }
         let intrinsic_width = text.width();
         let mut offset = 0usize;
         let source_line_offsets = text
@@ -1957,6 +1960,28 @@ mod tests {
     use crate::geometry::{Insets, Point, Rect};
     use crate::paint::PaintCx;
     use crate::style::{Color, Style};
+
+    #[test]
+    fn rich_text_ingestion_preserves_cross_span_graphemes_for_all_wrap_policies() {
+        use crate::text::{Line, Span, Text, TextWrap};
+        for wrap in [TextWrap::Character, TextWrap::Word, TextWrap::None] {
+            let text = TextBlock::new(Text::from_lines([Line::from_spans(vec![
+                Span::styled("👩", Style::new().fg(Color::Red)),
+                Span::raw("\u{200d}💻x"),
+            ])]))
+            .wrap(wrap);
+            let layout = text.layout(Constraints::for_width(2), &mut LayoutCx::new());
+            let rows = text.projection(&layout);
+            assert!(rows[0].line.plain_text().starts_with("👩\u{200d}💻"));
+            assert_eq!(rows[0].line.spans[0].style.fg, Some(Color::Red));
+            if wrap != TextWrap::None {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].source_range, 0..11);
+                assert_eq!(rows[1].source_range, 11..12);
+                assert_eq!(layout.size.height, 2);
+            }
+        }
+    }
 
     struct EventLeaf {
         id: &'static str,

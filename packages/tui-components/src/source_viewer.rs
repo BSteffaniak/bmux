@@ -9,7 +9,6 @@ use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
     paint_component_scope,
 };
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// Input used to render a source viewer card.
@@ -87,13 +86,8 @@ pub fn register_source_viewer_selection(
         return scope_outcome;
     }
     let projection = source_projection(input, area.width);
-    let number_width = projection.number_width;
     let body_width = projection.body_width;
-    let content_x = area
-        .x
-        .saturating_add(4)
-        .saturating_add(u16::try_from(number_width).unwrap_or(u16::MAX))
-        .saturating_add(u16::from(number_width > 0) * 3);
+    let content_x = area.x.saturating_add(projection.source_column());
     let mut screen_y = area.y.saturating_add(1);
     let mut fragments = 0_usize;
     for row in &projection.rows {
@@ -137,26 +131,50 @@ pub fn source_viewer_rows(input: SourceViewerInput<'_>, width: u16) -> Vec<Line>
     source_viewer_rows_with_style(input, width, SourceViewerStyle::default())
 }
 
-/// Render source text with caller-supplied semantic card styles.
+/// One source row before card chrome is applied.
+#[derive(Debug)]
+pub struct SourceRow {
+    /// Styled source graphemes, excluding gutters and padding.
+    pub spans: Vec<Span>,
+    /// Zero-based logical line index in the input.
+    pub line_index: usize,
+    /// Original UTF-8 source byte offset, including preceding line endings.
+    pub source_offset: usize,
+    /// Whether this is the first wrapped row of the logical line.
+    pub first: bool,
+}
+
+/// Derived source-card geometry shared by paint and producer-owned selection.
+#[derive(Debug)]
+pub struct SourceProjection {
+    /// Source rows in paint order, beginning one row below the top border.
+    pub rows: Vec<SourceRow>,
+    /// Card width, excluding its two-cell outer indentation.
+    pub card_width: u16,
+    /// Source text width inside the card.
+    pub body_width: usize,
+    /// Width reserved for line numbers, or zero when disabled.
+    pub number_width: usize,
+    /// Whether an omission message follows the source rows.
+    pub truncated: bool,
+}
+
+impl SourceProjection {
+    /// Source column relative to the outer card allocation, excluding chrome.
+    #[must_use]
+    pub fn source_column(&self) -> u16 {
+        4_u16
+            .saturating_add(u16::try_from(self.number_width).unwrap_or(u16::MAX))
+            .saturating_add(u16::from(self.number_width > 0) * 3)
+    }
+}
+
+/// Project source and syntax annotations using canonical text geometry.
+///
+/// Producers can export selection provenance from these rows without parsing
+/// rendered borders or reconstructing wrapping. Source remains caller-owned.
 #[must_use]
-#[derive(Debug)]
-struct SourceRow {
-    spans: Vec<Span>,
-    line_index: usize,
-    source_offset: usize,
-    first: bool,
-}
-
-#[derive(Debug)]
-struct SourceProjection {
-    rows: Vec<SourceRow>,
-    card_width: u16,
-    body_width: usize,
-    number_width: usize,
-    truncated: bool,
-}
-
-fn source_projection(input: SourceViewerInput<'_>, width: u16) -> SourceProjection {
+pub fn source_projection(input: SourceViewerInput<'_>, width: u16) -> SourceProjection {
     let lines = input.contents.lines().collect::<Vec<_>>();
     let displayed = lines.len().min(input.max_lines);
     let last_line = input.start_line.saturating_add(displayed.saturating_sub(1));
@@ -184,24 +202,6 @@ fn source_projection(input: SourceViewerInput<'_>, width: u16) -> SourceProjecti
             .and_then(|styled| styled.get(index))
             .filter(|line| line.plain_text() == *source)
             .map_or_else(|| vec![Span::raw(*source)], |line| line.spans.clone());
-        // Syntax boundaries cannot divide a source grapheme. Its first byte
-        // selects the style; wrapping remains owned by canonical TextBlock.
-        let mut annotations = spans.iter();
-        let mut annotation = annotations.next();
-        let mut end = annotation.map_or(0, |span| span.content.len());
-        let spans: Vec<Span> = source
-            .grapheme_indices(true)
-            .map(|(offset, grapheme)| {
-                while offset >= end && annotation.is_some() {
-                    annotation = annotations.next();
-                    end = end.saturating_add(annotation.map_or(0, |span| span.content.len()));
-                }
-                Span::styled(
-                    grapheme,
-                    annotation.map_or_else(Style::new, |span| span.style),
-                )
-            })
-            .collect();
         let text = bmux_tui::composition::TextBlock::new(bmux_tui::text::Text::from_lines([
             Line::from_spans(spans),
         ]))
@@ -239,37 +239,49 @@ pub fn source_viewer_rows_with_style(
     width: u16,
     style: SourceViewerStyle,
 ) -> Vec<Line> {
-    let projection = source_projection(input, width);
-    let card_width = projection.card_width;
-    let number_width = projection.number_width;
-    let mut rows = vec![card_border(card_width, "┌", "┐", style.border)];
-    for row in projection.rows {
-        let spans = row
-            .spans
-            .into_iter()
-            .map(|span| Span::styled(span.content, style.source.patch(span.style)))
-            .collect();
-        let number = (row.first && input.line_numbers)
-            .then(|| input.start_line.saturating_add(row.line_index));
-        rows.push(source_card_row(
-            spans,
-            number,
-            number_width,
-            card_width,
-            style,
-        ));
+    source_projection(input, width).render_rows(input.start_line, input.truncated_message, style)
+}
+
+impl SourceProjection {
+    /// Paint-ready rows from this exact projection, preserving its source geometry.
+    #[must_use]
+    pub fn render_rows(
+        &self,
+        start_line: usize,
+        truncated_message: &str,
+        style: SourceViewerStyle,
+    ) -> Vec<Line> {
+        let card_width = self.card_width;
+        let number_width = self.number_width;
+        let mut rows = vec![card_border(card_width, "┌", "┐", style.border)];
+        for row in &self.rows {
+            let spans = row
+                .spans
+                .iter()
+                .map(|span| Span::styled(span.content.clone(), style.source.patch(span.style)))
+                .collect();
+            let number =
+                (row.first && number_width > 0).then(|| start_line.saturating_add(row.line_index));
+            rows.push(source_card_row(
+                spans,
+                number,
+                number_width,
+                card_width,
+                style,
+            ));
+        }
+        if self.truncated {
+            rows.push(source_card_row(
+                vec![Span::styled(truncated_message, style.truncated)],
+                None,
+                number_width,
+                card_width,
+                style,
+            ));
+        }
+        rows.push(card_border(card_width, "└", "┘", style.border));
+        rows
     }
-    if projection.truncated {
-        rows.push(source_card_row(
-            vec![Span::styled(input.truncated_message, style.truncated)],
-            None,
-            number_width,
-            card_width,
-            style,
-        ));
-    }
-    rows.push(card_border(card_width, "└", "┘", style.border));
-    rows
 }
 
 const fn source_card_chrome_width(number_width: usize) -> usize {
