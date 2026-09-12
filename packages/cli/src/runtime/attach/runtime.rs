@@ -8806,6 +8806,19 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         )?;
     } else {
         let force_cursor_move = std::mem::take(&mut view_state.force_cursor_move_next_frame);
+        let cursor_state = cursor_state.map(|mut cursor| {
+            cursor.visible &= layout_state
+                .scene
+                .surfaces
+                .iter()
+                .filter(|surface| surface.cursor_owner)
+                .any(|surface| {
+                    view_state
+                        .retained_compositor
+                        .point_visible_from(surface.id, cursor.x, cursor.y)
+                });
+            cursor
+        });
         apply_attach_cursor_state(
             &mut frame_bytes,
             cursor_state,
@@ -12864,6 +12877,17 @@ async fn handle_attach_mouse_event_at(
         return Ok(());
     }
 
+    // Resolve retained ownership before interpreting an application's mouse
+    // protocol. Ignored input inside a modal must not leak to the background.
+    let retained_owns_input = view_state
+        .retained_compositor
+        .blocks_background_input(mouse_event.column, mouse_event.row);
+    if try_handle_plugin_surface_mouse(client, view_state, mouse_event).await?
+        || retained_owns_input
+    {
+        return Ok(());
+    }
+
     // Terminal applications that explicitly enable mouse reporting own pointer
     // semantics inside their pane content. Forward those events after bmux
     // chrome hit-testing so status/tab clicks are never swallowed by pane mouse
@@ -12915,10 +12939,6 @@ async fn handle_attach_mouse_event_at(
             .await?;
             return Ok(());
         }
-    }
-
-    if try_handle_plugin_surface_mouse(client, view_state, mouse_event).await? {
-        return Ok(());
     }
 
     if try_handle_uncaptured_attach_input_hook_mouse(client, view_state, mouse_event, now).await? {
@@ -14875,11 +14895,16 @@ mod tests {
                 row: rect.y + hit.rect.y,
                 modifiers: KeyModifiers::NONE,
             };
-            assert!(
-                super::try_handle_plugin_surface_mouse(client, state, mouse)
-                    .await
-                    .unwrap()
-            );
+            handle_attach_mouse_event_at(
+                client,
+                mouse,
+                state,
+                None,
+                Instant::now(),
+                TerminalGeometry { cols: 80, rows: 24 },
+            )
+            .await
+            .unwrap();
             let after = resources.surfaces.owner_snapshot("bmux.tab_bar").unwrap();
             assert!(after.revision > before.revision);
             let next_popup = after
@@ -14995,11 +15020,13 @@ mod tests {
         .await
         .unwrap();
         let mut client = bmux_client::StreamingBmuxClient::from_client(client).unwrap();
-        let mut state = super::AttachViewState::new(bmux_client::AttachOpenInfo {
-            context_id: None,
-            session_id: uuid::Uuid::new_v4(),
-            can_write: true,
-        });
+        let mut state = attach_view_state_with_scrollback_fixture();
+        state.mouse.config.enabled = true;
+        let pane_id = focused_attach_pane_id(&state).unwrap();
+        append_pane_output(
+            state.pane_buffers.get_mut(&pane_id).unwrap(),
+            b"\x1b[?1049h\x1b[?1003h\x1b[?1006h",
+        );
         let (installation, resources) = installed_menu_action(&mut state);
         let mut survivor = super::AttachViewState::new(bmux_client::AttachOpenInfo {
             context_id: None,

@@ -904,7 +904,11 @@ impl RetainedCompositor {
         let ordered = self.ordered_surfaces();
         let mut modal_floor = None;
         for (index, surface) in ordered.iter().enumerate() {
-            if surface.modal && rect_contains_point(surface.paint_rect()?, x, y) {
+            if surface.modal
+                && surface
+                    .paint_rect()
+                    .is_some_and(|rect| rect_contains_point(rect, x, y))
+            {
                 modal_floor = Some(index);
             }
         }
@@ -935,6 +939,38 @@ impl RetainedCompositor {
                         surface_x: x.saturating_sub(surface.rect.x),
                         surface_y: y.saturating_sub(surface.rect.y),
                     })
+            })
+    }
+
+    /// Whether an unhandled event is still owned by the retained scene.
+    /// Modal allocations block fallthrough even in non-interactive padding.
+    #[must_use]
+    pub fn blocks_background_input(&self, x: u16, y: u16) -> bool {
+        self.surfaces.values().any(|surface| {
+            surface.modal
+                && surface
+                    .paint_rect()
+                    .is_some_and(|rect| rect_contains_point(rect, x, y))
+        }) || self
+            .hit_test(x, y)
+            .is_some_and(|hit| self.endpoint_for_hit(&hit).is_some())
+    }
+
+    /// Resolve a source-owned cursor against the same clipping and ordering as paint.
+    #[must_use]
+    pub fn point_visible_from(&self, source: Uuid, x: u16, y: u16) -> bool {
+        let Some(source) = self.surfaces.get(&source) else {
+            return false;
+        };
+        source
+            .paint_rect()
+            .is_some_and(|rect| rect_contains_point(rect, x, y))
+            && !self.surfaces.values().any(|surface| {
+                surface.z_key() > source.z_key()
+                    && surface.opaque
+                    && surface
+                        .paint_rect()
+                        .is_some_and(|rect| rect_contains_point(rect, x, y))
             })
     }
 
@@ -2340,6 +2376,42 @@ mod tests {
             Uuid::from_u128(600)
         );
         assert_eq!(compositor.hit_test(30, 20), None);
+    }
+
+    #[test]
+    fn modal_padding_blocks_input_and_opaque_coverage_hides_source_cursor() {
+        let source = Uuid::from_u128(1);
+        let overlay = Uuid::from_u128(2);
+        let base = RetainedSurface::new(
+            source,
+            DamageRect::new(0, 0, 80, 24),
+            0,
+            0,
+            true,
+            Vec::new(),
+        );
+        let popup = RetainedSurface::builder(overlay, DamageRect::new(2, 2, 8, 4))
+            .layer(100)
+            .opaque()
+            .modal(true)
+            .build();
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            [base.clone(), popup],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(compositor.blocks_background_input(3, 3));
+        assert!(compositor.hit_test(3, 3).is_none());
+        assert!(!compositor.point_visible_from(source, 3, 3));
+        assert!(compositor.point_visible_from(source, 20, 3));
+        compositor.replace_surfaces(
+            [base],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(!compositor.blocks_background_input(3, 3));
+        assert!(compositor.point_visible_from(source, 3, 3));
     }
 
     #[test]
