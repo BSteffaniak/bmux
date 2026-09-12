@@ -8256,26 +8256,6 @@ fn build_retained_frame_plan(
     let prompt_surface = prompt_overlay_render
         .as_ref()
         .map(retained_prompt_overlay_surface);
-    let opaque_overlay_rects = [help_surface.as_ref(), prompt_surface.as_ref()]
-        .into_iter()
-        .flatten()
-        .map(|surface| {
-            ExtensionRect::new(
-                surface.rect.x,
-                surface.rect.y,
-                surface.rect.w,
-                surface.rect.h,
-            )
-        })
-        .collect::<Vec<_>>();
-    // Pane terminal graphics only need re-planning when opaque overlay
-    // coverage changes. Prompt text edits commonly change retained graph
-    // content while preserving these bounds; globally querying extensions for
-    // those edits makes each keystroke regenerate every decorated pane.
-    if opaque_overlay_rects != view_state.opaque_overlay_rects {
-        frame_damage.mark_extension_query();
-        view_state.opaque_overlay_rects = opaque_overlay_rects;
-    }
     let frame_retained_damage = retained_frame_damage_from_frame_damage(
         &layout_state.scene,
         frame_damage,
@@ -8317,6 +8297,16 @@ fn build_retained_frame_plan(
         viewport,
         damage_policy,
     );
+    let opaque_overlay_rects = view_state
+        .retained_compositor
+        .content_occluders()
+        .into_iter()
+        .map(|rect| ExtensionRect::new(rect.x, rect.y, rect.w, rect.h))
+        .collect::<Vec<_>>();
+    if opaque_overlay_rects != view_state.opaque_overlay_rects {
+        frame_damage.mark_extension_query();
+        view_state.opaque_overlay_rects = opaque_overlay_rects;
+    }
     let merged_damage = merge_retained_damages(
         [
             frame_retained_damage.clone(),
@@ -8565,21 +8555,12 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     } else {
         view_state.active_mode_id.as_str()
     };
-    let opaque_overlay_rects = [
-        frame_plan.retained.help_surface.as_ref(),
-        frame_plan.retained.prompt_surface.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|surface| {
-        ExtensionRect::new(
-            surface.rect.x,
-            surface.rect.y,
-            surface.rect.w,
-            surface.rect.h,
-        )
-    })
-    .collect::<Vec<_>>();
+    let opaque_overlay_rects = view_state
+        .retained_compositor
+        .content_occluders()
+        .into_iter()
+        .map(|rect| ExtensionRect::new(rect.x, rect.y, rect.w, rect.h))
+        .collect::<Vec<_>>();
     let active_runtime_appearance = runtime_appearance.for_mode(appearance_mode_id);
     let mut scene_render_stats = AttachSceneRenderStats::default();
     let cursor_state = if frame_plan.render_scene {
@@ -11997,18 +11978,11 @@ fn dismiss_plugin_focus_on_pointer_down(
             .and_then(|id| view_state.retained_compositor.endpoint_for_region(id))
             .is_some_and(|endpoint| view_state.presentation_input.observes_focus_loss(endpoint));
         let within_owned_modal = hit.as_ref().is_some_and(|hit| {
-            view_state
-                .retained_compositor
-                .surfaces()
-                .get(&hit.surface_id)
-                .is_some_and(|surface| surface.modal)
-                && view_state
-                    .plugin_focus
-                    .focused()
-                    .and_then(|id| view_state.retained_compositor.endpoint_for_region(id))
-                    .is_some_and(|endpoint| {
-                        view_state.retained_compositor.endpoint_for_hit(hit) == Some(endpoint)
-                    })
+            view_state.plugin_focus.focused().is_some_and(|target| {
+                view_state
+                    .retained_compositor
+                    .hit_in_focus_scope(target, hit)
+            })
         });
         if observes_loss && !within_owned_modal && view_state.plugin_focus.focused() != target {
             return clear_plugin_surface_focus(view_state);
@@ -12056,6 +12030,9 @@ fn try_handle_plugin_surface_paste(view_state: &mut AttachViewState, text: &str)
     let Some(target) = view_state.plugin_focus.focused() else {
         return false;
     };
+    if !view_state.retained_compositor.focus_allowed(target) {
+        return true;
+    }
     let Some(endpoint) = view_state.retained_compositor.endpoint_for_region(target) else {
         return false;
     };
@@ -12092,6 +12069,9 @@ async fn try_handle_plugin_surface_key(
     let Some(target) = view_state.plugin_focus.focused().cloned() else {
         return Ok(false);
     };
+    if !view_state.retained_compositor.focus_allowed(&target) {
+        return Ok(true);
+    }
     let Some(endpoint) = view_state
         .retained_compositor
         .endpoint_for_region(&target)

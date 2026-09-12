@@ -974,6 +974,71 @@ impl RetainedCompositor {
             })
     }
 
+    /// Clipped opaque overlays above runtime content, in paint order. This is
+    /// shared by graphics lowering and overlay-coverage invalidation.
+    #[must_use]
+    pub fn content_occluders(&self) -> Vec<DamageRect> {
+        let content = self
+            .surfaces
+            .values()
+            .filter(|surface| matches!(surface.payload, RetainedSurfacePayload::Content { .. }))
+            .collect::<Vec<_>>();
+        self.ordered_surfaces()
+            .into_iter()
+            .filter(|surface| {
+                surface.opaque
+                    && !matches!(surface.payload, RetainedSurfacePayload::Content { .. })
+                    && content.iter().any(|source| {
+                        surface.z_key() > source.z_key()
+                            && intersect_rects(surface.rect, source.rect).is_some()
+                    })
+            })
+            .filter_map(RetainedSurface::paint_rect)
+            .collect()
+    }
+
+    /// A modal may keep its originating control focused only within the same
+    /// owner and declared input endpoint. Unrelated modal scopes exclude it.
+    #[must_use]
+    pub fn focus_allowed(&self, target: &PluginSurfaceRegionId) -> bool {
+        let Some(endpoint) = self.endpoint_for_region(target) else {
+            return false;
+        };
+        let top_modal = self
+            .ordered_surfaces()
+            .into_iter()
+            .rev()
+            .find(|surface| surface.modal && surface.paint_rect().is_some());
+        top_modal.is_none_or(|surface| {
+            surface.interactive_regions.iter().any(|region| {
+                region
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| id.owner_plugin_id == target.owner_plugin_id)
+                    && region.endpoint.as_ref() == Some(endpoint)
+            })
+        })
+    }
+
+    /// Whether a pointer hit belongs to the focused control's modal scope.
+    #[must_use]
+    pub fn hit_in_focus_scope(
+        &self,
+        target: &PluginSurfaceRegionId,
+        hit: &RetainedSurfaceHit,
+    ) -> bool {
+        hit.region_id
+            .as_ref()
+            .is_some_and(|id| id.owner_plugin_id == target.owner_plugin_id)
+            && self
+                .surfaces
+                .get(&hit.surface_id)
+                .is_some_and(|surface| surface.modal)
+            && self
+                .endpoint_for_region(target)
+                .is_some_and(|endpoint| self.endpoint_for_hit(hit) == Some(endpoint))
+    }
+
     #[must_use]
     pub fn endpoint_for_region(
         &self,
@@ -2412,6 +2477,77 @@ mod tests {
         );
         assert!(!compositor.blocks_background_input(3, 3));
         assert!(compositor.point_visible_from(source, 3, 3));
+    }
+
+    #[test]
+    fn content_occluders_include_clipped_plugin_surfaces_not_underlays() {
+        let source = RetainedSurface::with_payload(
+            Uuid::from_u128(1),
+            DamageRect::new(0, 0, 80, 24),
+            10,
+            0,
+            RetainedOpacity::Opaque,
+            RetainedSurfacePayload::Content {
+                content_id: Uuid::from_u128(1),
+            },
+        );
+        let overlay = RetainedSurface::builder(Uuid::from_u128(2), DamageRect::new(2, 2, 8, 4))
+            .layer(100)
+            .opaque()
+            .build();
+        let underlay = RetainedSurface::builder(Uuid::from_u128(3), DamageRect::new(0, 0, 80, 24))
+            .opaque()
+            .build();
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            [source, overlay, underlay],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        assert_eq!(
+            compositor.content_occluders(),
+            vec![DamageRect::new(2, 2, 8, 4)]
+        );
+    }
+
+    #[test]
+    fn unrelated_modal_suspends_focus_without_destroying_it() {
+        let target = PluginSurfaceRegionId {
+            owner_plugin_id: "owner".into(),
+            surface_local_id: "control".into(),
+            region_local_id: "field".into(),
+        };
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "input".into(),
+            interface_id: "input/v1".into(),
+            operation: "event".into(),
+        };
+        let mut source =
+            RetainedSurface::builder(Uuid::from_u128(1), DamageRect::new(0, 0, 8, 4)).build();
+        source.interactive_regions.push(RetainedInteractiveRegion {
+            id: Some(target.clone()),
+            rect: source.rect,
+            focusable: true,
+            cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+            endpoint: Some(endpoint),
+        });
+        let overlay = RetainedSurface::builder(Uuid::from_u128(2), DamageRect::new(0, 0, 80, 24))
+            .layer(100)
+            .modal(true)
+            .build();
+        let mut compositor = RetainedCompositor::new();
+        compositor.replace_surfaces(
+            [source.clone(), overlay],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(!compositor.focus_allowed(&target));
+        compositor.replace_surfaces(
+            [source],
+            DamageRect::new(0, 0, 80, 24),
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(compositor.focus_allowed(&target));
     }
 
     #[test]
