@@ -612,6 +612,16 @@ impl<'a> EventCx<'a> {
         self.clip.map_or(rect, |clip| clip.intersection(rect))
     }
 
+    /// Map a terminal point to local logical coordinates, including captured
+    /// pointer positions outside the current clip.
+    #[must_use]
+    pub fn local_point(&self, point: crate::geometry::Point) -> (i64, i64) {
+        (
+            i64::from(point.x) - i64::from(self.translation_x),
+            i64::from(point.y).saturating_sub(self.translation_y),
+        )
+    }
+
     /// Look up translated, clipped terminal geometry by stable identity.
     #[must_use]
     pub fn find_visible_rect(&self, id: &LayoutId) -> Option<Rect> {

@@ -175,6 +175,17 @@ fn run_playbook_fixture(name: &str) -> (serde_json::Value, bool) {
     });
 
     let pass = json["pass"].as_bool().unwrap_or(false);
+    if !pass {
+        // Preserve bounded subprocess diagnostics when assertions print only JSON.
+        let start = stderr.len().saturating_sub(16_384);
+        let start = (start..=stderr.len())
+            .find(|&index| stderr.is_char_boundary(index))
+            .unwrap_or(stderr.len());
+        eprintln!(
+            "playbook fixture {name} stderr (tail):\n{}",
+            &stderr[start..]
+        );
+    }
     (json, pass)
 }
 

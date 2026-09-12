@@ -64,7 +64,11 @@ impl RenameInput {
         let component = TextInputComponent::new("rename", &state, &policy).focused(true);
         viewport.event(&component, event);
         let next = state.into_inner();
-        if next.buffer().text().len() <= 4096 && !next.buffer().text().contains(['\n', '\r']) {
+        // Permit navigation and repair of existing oversized names, but never
+        // let an edit grow them beyond the normal input bound.
+        if next.buffer().text().len() <= self.state.buffer().text().len().max(4096)
+            && !next.buffer().text().contains(['\n', '\r'])
+        {
             self.state = next;
         }
     }
@@ -123,18 +127,15 @@ pub fn paint(
         return (Vec::new(), None);
     }
     let content_width =
-        u16::try_from(unicode_width::UnicodeWidthStr::width(input.text()).saturating_add(1))
-            .unwrap_or(u16::MAX)
-            .max(width);
+        u64::try_from(unicode_width::UnicodeWidthStr::width(input.text()).saturating_add(1))
+            .unwrap_or(u64::MAX)
+            .max(u64::from(width));
     let selected_all = input
         .selection()
         .is_some_and(|range| range.start == 0 && range.end == input.text().len());
     let cursor_col =
         unicode_width::UnicodeWidthStr::width(&input.text()[..input.cursor_byte_index()]);
-    let content = LayoutNode::leaf(
-        "rename".into(),
-        LogicalSize::new(u64::from(content_width), 1),
-    );
+    let content = LayoutNode::leaf("rename".into(), LogicalSize::new(content_width, 1));
     let layout = LayoutNode::with_children(
         "rename.viewport".into(),
         LogicalSize::new(u64::from(width), 1),
@@ -154,13 +155,11 @@ pub fn paint(
         }
         boundary = next;
     }
-    let viewport = ComponentViewport::new(
-        LayoutNode::leaf(
-            "rename".into(),
-            LogicalSize::new(u64::from(content_width), 1),
-        ),
+    let viewport = ComponentViewport::with_logical_offset(
+        LayoutNode::leaf("rename".into(), LogicalSize::new(content_width, 1)),
         Rect::new(x, 0, width, 1),
-        Point::new(u16::try_from(offset).unwrap_or(u16::MAX), 0),
+        u64::try_from(offset).unwrap_or(u64::MAX),
+        0,
     );
     let Some(viewport) = viewport else {
         return (Vec::new(), None);
@@ -251,6 +250,48 @@ mod tests {
     fn mouse(input: &mut RenameInput, kind: MouseEventKind, col: u16) {
         input.dispatch(&Event::Mouse(MouseEvent::new(kind, Point::new(col, 0))));
         refresh(input);
+    }
+
+    #[test]
+    fn long_input_reveals_and_targets_committed_suffix() {
+        let mut input: RenameInput =
+            TextEditBuffer::from_text(format!("{}end", "x".repeat(70_000))).into();
+        let (_, viewport) = paint(&input, 4, 7, bmux_plugin::RenderStyle::default());
+        let viewport = viewport.unwrap();
+        let state = RefCell::new(input.state.clone());
+        let policy = policy();
+        let component = TextInputComponent::new("rename", &state, &policy).focused(true);
+        let painted = viewport.paint(&component);
+        let row: String = painted
+            .buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert_eq!(row, "end ");
+        assert_eq!(painted.cursor.unwrap().position.x, 10);
+        assert_eq!(painted.hits.len(), 1);
+        commit(&mut input, Some(viewport));
+        input.dispatch(&Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(8, 0),
+        )));
+        assert_eq!(input.cursor_byte_index(), 70_001);
+        let (_, next) = paint(&input, 4, 30, bmux_plugin::RenderStyle::default());
+        stage(&mut input, 10, next);
+        // Publication alone must not move a captured drag to the new allocation.
+        input.dispatch(&Event::Mouse(MouseEvent::new(
+            MouseEventKind::Drag(MouseButton::Left),
+            Point::new(10, 0),
+        )));
+        assert_eq!(input.selected_text().as_deref(), Some("nd"));
+        acknowledge(&mut input, 10);
+        input.dispatch(&Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            Point::new(33, 0),
+        )));
+        assert!(!input.state.mouse_selection_active());
+        assert_eq!(input.visible_rect(), Some(Rect::new(30, 0, 4, 1)));
     }
 
     #[test]

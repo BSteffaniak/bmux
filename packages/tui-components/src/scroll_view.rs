@@ -292,7 +292,7 @@ impl<'a> ScrollViewComponent<'a> {
         self
     }
 
-    fn effective_state(&self, layout: &LayoutNode) -> ScrollViewState {
+    pub(crate) fn effective_state(&self, layout: &LayoutNode) -> ScrollViewState {
         let mut state = self
             .retained_state
             .map_or_else(ScrollViewState::new, std::cell::Cell::get);

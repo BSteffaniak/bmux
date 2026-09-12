@@ -1108,9 +1108,14 @@ fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     if companion.hovered_tab_id == hovered {
         return false;
     }
+    let previous = companion.hovered_tab_id;
     companion.hovered_tab_id = hovered;
     companion.revision = companion.revision.saturating_add(1).max(1);
-    publish_companion(companion).is_ok()
+    if publish_companion(companion).is_err() {
+        companion.hovered_tab_id = previous;
+        return false;
+    }
+    true
 }
 
 fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
@@ -1123,6 +1128,7 @@ fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let Some(companion) = guard.as_mut() else {
         return false;
     };
+    let previous_scroll = companion.scroll;
     let previous = companion.scroll.vertical_offset();
     let layout = companion.scroll_layout();
     bmux_tui_components::scroll_view::ScrollView::scroll_vertical_by(
@@ -1134,7 +1140,11 @@ fn update_scroll(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
         return true;
     }
     companion.revision = companion.revision.saturating_add(1).max(1);
-    publish_companion(companion).is_ok()
+    if publish_companion(companion).is_err() {
+        companion.scroll = previous_scroll;
+        return false;
+    }
+    true
 }
 
 fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<AttachInputResult> {
@@ -1152,6 +1162,8 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
         .tabs
         .iter()
         .position(|tab| tab.id == target)?;
+    let previous_scroll = companion.scroll;
+    let previous_hover = companion.hovered_tab_id;
     match event.key.as_deref()? {
         "up" => {
             let next = index.saturating_sub(1);
@@ -1169,7 +1181,13 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
     }
     let dirty = {
         companion.revision = companion.revision.saturating_add(1).max(1);
-        publish_companion(companion).is_ok()
+        if publish_companion(companion).is_ok() {
+            true
+        } else {
+            companion.scroll = previous_scroll;
+            companion.hovered_tab_id = previous_hover;
+            false
+        }
     };
     drop(guard);
     Some(AttachInputResult {
@@ -1647,6 +1665,80 @@ mod tests {
                 panic!("unchanged successful allocation republished")
             })
             .unwrap();
+    }
+
+    #[test]
+    fn rejected_interaction_publication_restores_scroll_and_hover() {
+        let mut state = CompanionState::new(Settings {
+            maximum_visible_items: 1,
+            ..Settings::default()
+        });
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: (1..=3)
+                .map(|index| tabs_list::TabListEntry {
+                    id: Uuid::from_u128(index),
+                    name: format!("tab-{index}"),
+                    active: false,
+                    workspace: "default".to_string(),
+                    workspace_id: Uuid::nil(),
+                })
+                .collect(),
+            revision: 1,
+        });
+        // Reject all surface publications without changing the production publisher.
+        state.surfaces = Some(std::sync::Arc::new(
+            bmux_plugin::surface::PluginSurfaceRegistry::new(0),
+        ));
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(state)));
+        let mut event = AttachInputEvent {
+            hook_id: format!("bmux.sidebar:sidebar:tab:{}", Uuid::from_u128(1)),
+            event_kind: "pointer".to_string(),
+            phase: "enter".to_string(),
+            button: None,
+            key: None,
+            col: None,
+            row: None,
+            wheel_delta: 0,
+            modifiers: bmux_plugin::render::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        assert!(!update_hover(&owner, &event));
+        assert_eq!(owner.lock().unwrap().as_ref().unwrap().hovered_tab_id, None);
+        event.phase = "wheel".to_string();
+        event.wheel_delta = -1;
+        assert!(!update_scroll(&owner, &event));
+        assert_eq!(
+            owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .scroll
+                .vertical_offset(),
+            0
+        );
+        event.event_kind = "key".to_string();
+        event.phase = "press".to_string();
+        event.key = Some("down".to_string());
+        assert!(!update_keyboard(&owner, &event).unwrap().dirty);
+        {
+            let mut guard = owner.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            assert_eq!(state.scroll.vertical_offset(), 0);
+            assert_eq!(state.hovered_tab_id, None);
+            state.surfaces = Some(std::sync::Arc::new(
+                bmux_plugin::surface::PluginSurfaceRegistry::new(1),
+            ));
+            drop(guard);
+        }
+        // A retry must apply exactly one navigation, not accumulate failed moves.
+        assert!(update_keyboard(&owner, &event).unwrap().dirty);
+        let guard = owner.lock().unwrap();
+        let state = guard.as_ref().unwrap();
+        assert_eq!(state.hovered_tab_id, Some(Uuid::from_u128(2)));
+        assert!(state.scroll.vertical_offset() > 0);
+        drop(guard);
     }
 
     #[test]

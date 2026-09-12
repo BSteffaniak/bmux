@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use bmux_keyboard::{KeyCode, KeyStroke};
 use bmux_tui::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutMetadata,
-    LayoutNode, LogicalSize,
+    LayoutNode,
 };
 use bmux_tui::event::{Event, EventOutcome};
 use bmux_tui::geometry::Rect;
@@ -244,8 +244,31 @@ impl<'a> Menu<'a> {
 
     /// Handle one input event.
     pub fn handle_event(&self, area: Rect, state: &mut MenuState, event: &Event) -> MenuOutcome {
+        self.handle_event_with_layout(area, state, event, None)
+    }
+
+    fn handle_event_with_layout(
+        &self,
+        area: Rect,
+        state: &mut MenuState,
+        event: &Event,
+        layout: Option<&LayoutNode>,
+    ) -> MenuOutcome {
         if state.list.interaction.disabled {
             return MenuOutcome::Ignored;
+        }
+        if let Some(layout) = layout
+            && !SelectableList::new(&self.list_items()).layout_matches_items(layout)
+        {
+            // Use list rejection to cancel any press against the old rows,
+            // including when a menu-specific key bypasses normal list input.
+            let _ = SelectableList::new(&self.list_items()).handle_event_with_layout(
+                layout,
+                area,
+                &mut state.list,
+                event,
+            );
+            return MenuOutcome::Redraw;
         }
         if self.policy.tab_navigation
             && let Event::Key(stroke) = event
@@ -261,7 +284,12 @@ impl<'a> Menu<'a> {
             } else {
                 KeyCode::Down
             };
-            return self.handle_event(area, state, &Event::Key(KeyStroke::simple(key)));
+            return self.handle_event_with_layout(
+                area,
+                state,
+                &Event::Key(KeyStroke::simple(key)),
+                layout,
+            );
         }
         let keyboard_event = matches!(event, Event::Key(_));
         if keyboard_event && matches!(event, Event::Key(stroke) if self.is_cancel_key(*stroke)) {
@@ -287,11 +315,15 @@ impl<'a> Menu<'a> {
             return MenuOutcome::Typeahead(ch);
         }
         let items = self.list_items();
-        match SelectableList::new(&items)
+        let list = SelectableList::new(&items)
             .policy(self.policy.list)
-            .styles(self.styles)
-            .handle_event(area, &mut state.list, event)
-        {
+            .styles(self.styles);
+        let outcome = if let Some(layout) = layout {
+            list.handle_event_with_layout(layout, area, &mut state.list, event)
+        } else {
+            list.handle_event(area, &mut state.list, event)
+        };
+        match outcome {
             SelectableListOutcome::Ignored => MenuOutcome::Ignored,
             SelectableListOutcome::Redraw => MenuOutcome::Redraw,
             SelectableListOutcome::Focused(index) => MenuOutcome::Focused(index),
@@ -370,11 +402,19 @@ impl<'a, 'state> MenuComponent<'a, 'state> {
         layout: &LayoutNode,
         cx: &mut EventCx<'_>,
     ) -> MenuOutcome {
-        let Some(area) = cx.find_rect(&layout.id) else {
+        let Some(event) = crate::common::local_control_event(
+            event,
+            cx,
+            layout,
+            self.state.get().list.scroll.dragging_scrollbar(),
+        ) else {
             return MenuOutcome::Ignored;
         };
+        let area = crate::common::local_area_of(layout.size);
         let mut state = self.state.get();
-        let outcome = self.menu.handle_event(area, &mut state, event);
+        let outcome = self
+            .menu
+            .handle_event_with_layout(area, &mut state, &event, Some(layout));
         self.state.set(state);
         outcome
     }
@@ -460,21 +500,12 @@ impl Component for MenuComponent<'_, '_> {
 
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         cx.record_measurement();
-        let (width, _) = self.menu.size();
-        let height = self
-            .menu
-            .items
-            .iter()
-            .map(|item| item.lines.len().max(1))
-            .sum::<usize>();
-        LayoutNode::leaf(
-            self.id.clone(),
-            constraints.constrain(LogicalSize::new(
-                width.into(),
-                height.try_into().unwrap_or(u64::MAX),
-            )),
-        )
-        .with_metadata(LayoutMetadata::new().semantic("menu"))
+        let items = self.menu.list_items();
+        SelectableList::new(&items)
+            .policy(self.menu.policy.list)
+            .styles(self.menu.styles)
+            .layout_with(&self.id, constraints)
+            .with_metadata(LayoutMetadata::new().semantic("menu"))
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
@@ -501,7 +532,7 @@ impl Component for MenuComponent<'_, '_> {
         let list = SelectableList::new(&items)
             .policy(self.menu.policy.list)
             .styles(self.menu.styles);
-        for region in list.visible_semantic_regions(area, &state.list) {
+        for region in list.visible_semantic_regions_with_layout(layout, area, &state.list) {
             let item_id = format!("{}.{}", self.id.as_str(), region.key);
             let disabled = self
                 .menu
@@ -520,7 +551,7 @@ impl Component for MenuComponent<'_, '_> {
             );
             cx.push_semantic(SemanticRegion::new(item_id, region.rect, "menu-item"));
         }
-        list.paint(area, &state.list, self.fallback, cx);
+        list.paint_layout(layout, area, &state.list, self.fallback, cx);
         cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "menu"));
         cx.push_damage(LocalRect::new(0, 0, area.width, area.height));
     }
@@ -884,6 +915,163 @@ mod tests {
         policy.list.highlight.symbol = "";
         policy.list.highlight.repeat_spacing = false;
         assert_eq!(Menu::new(&items).policy(policy).size(), (6, 1));
+    }
+
+    #[test]
+    fn clipped_top_does_not_shift_menu_pointer_row() {
+        let items = [MenuItem::new("a", "A"), MenuItem::new("b", "B")];
+        let state = Cell::new(MenuState::new(None));
+        let menu = MenuComponent::new("menu", &items, &state);
+        let layout = menu.layout(
+            Constraints::tight(Rect::new(0, 0, 8, 2).size()),
+            &mut LayoutCx::new(),
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 6));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(3, 2, LocalRect::new(0, 1, 8, 1), |cx| {
+            menu.paint(&layout, cx);
+        });
+        let hit = frame
+            .hits()
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == "menu.b")
+            .unwrap();
+        assert_eq!(hit.area, Rect::new(3, 3, 8, 1));
+        assert!(
+            !frame
+                .hits()
+                .regions()
+                .iter()
+                .any(|hit| hit.id.as_str() == "menu.a")
+        );
+        assert!(frame.buffer().row_symbols(3).unwrap().contains('B'));
+        let clip = Rect::new(3, 3, 8, 1);
+        let mut root = EventCx::with_clip(&layout, clip);
+        root.with_transform(0, 0, 3, 2, clip, |cx| {
+            let point = Point::new(5, 3);
+            let _ = menu.handle_event(
+                &Event::Mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    point,
+                )),
+                &layout,
+                cx,
+            );
+            assert_eq!(
+                menu.handle_event(
+                    &Event::Mouse(MouseEvent::new(
+                        MouseEventKind::Up(MouseButton::Left),
+                        point
+                    )),
+                    &layout,
+                    cx
+                ),
+                MenuOutcome::Activated {
+                    index: 1,
+                    id: "b".into()
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn stale_menu_activation_cancels_press_before_relayout() {
+        let items = [MenuItem::new("a", "A"), MenuItem::new("b", "B")];
+        let area = Rect::new(0, 0, 8, 2);
+        let cell = Cell::new(MenuState::new(Some(0)));
+        let layout = MenuComponent::new("menu", &items, &cell)
+            .layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let mut state = cell.get();
+        let down = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            Point::new(2, 0),
+        ));
+        let _ = Menu::new(&items).handle_event_with_layout(area, &mut state, &down, Some(&layout));
+        let reordered = [items[1].clone(), items[0].clone()];
+        let menu = Menu::new(&reordered);
+        assert_eq!(
+            menu.handle_event_with_layout(
+                area,
+                &mut state,
+                &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+                Some(&layout)
+            ),
+            MenuOutcome::Redraw
+        );
+        let fresh = MenuComponent::new("menu", &reordered, &cell)
+            .layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let up = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Up(MouseButton::Left),
+            Point::new(2, 0),
+        ));
+        assert!(!matches!(
+            menu.handle_event_with_layout(area, &mut state, &up, Some(&fresh)),
+            MenuOutcome::Activated { .. }
+        ));
+    }
+
+    #[test]
+    fn tab_navigation_rejects_stale_layout_before_changing_focus() {
+        let items = [MenuItem::new("a", "A"), MenuItem::new("b", "B")];
+        let area = Rect::new(0, 0, 8, 2);
+        let cell = Cell::new(MenuState::new(Some(0)));
+        let layout = MenuComponent::new("menu", &items, &cell)
+            .layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        let policy = MenuPolicy {
+            tab_navigation: true,
+            ..MenuPolicy::default()
+        };
+        let mut state = cell.get();
+        let tab = Event::Key(KeyStroke::simple(KeyCode::Tab));
+        assert_eq!(
+            Menu::new(&items).policy(policy).handle_event_with_layout(
+                area,
+                &mut state,
+                &tab,
+                Some(&layout)
+            ),
+            MenuOutcome::Focused(1)
+        );
+        let reordered = [items[1].clone(), items[0].clone()];
+        assert_eq!(
+            Menu::new(&reordered)
+                .policy(policy)
+                .handle_event_with_layout(area, &mut state, &tab, Some(&layout)),
+            MenuOutcome::Redraw
+        );
+        assert_eq!(state.focused(), Some(1));
+    }
+
+    #[test]
+    fn menu_retains_viewport_for_scrolled_paint_and_hits() {
+        let items = [MenuItem::new("one", "One"), MenuItem::new("two", "Two")];
+        let mut initial = MenuState::new(None);
+        initial.list.set_vertical_scroll(100);
+        let state = Cell::new(initial);
+        let menu = MenuComponent::new("menu", &items, &state);
+        let area = Rect::new(0, 0, 8, 1);
+        let layout = menu.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+        assert_eq!(layout.children[0].node.size.height, 1);
+        assert_eq!(layout.children[0].node.children[0].node.size.height, 2);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        menu.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert!(frame.buffer().row_symbols(0).unwrap().contains("Two"));
+        assert!(
+            frame
+                .hits()
+                .regions()
+                .iter()
+                .any(|hit| hit.id.as_str() == "menu.two")
+        );
+        assert!(
+            !frame
+                .hits()
+                .regions()
+                .iter()
+                .any(|hit| hit.id.as_str() == "menu.one")
+        );
     }
 
     #[test]

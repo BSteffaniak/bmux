@@ -30,9 +30,12 @@ const DEFAULT_MULTI_CLICK_DISTANCE: u16 = 2;
 pub struct TextInputState {
     buffer: TextEditBuffer,
     content_area: Rect,
+    logical_width: u64,
+    viewport_height: u64,
+    pointer_offset: (usize, usize),
     scroll: ScrollViewState,
     mouse_selection: MouseSelectionState,
-    wrapped: RefCell<Option<(u16, usize, bmux_text_edit::WrapLayout)>>,
+    wrapped: RefCell<Option<(u64, usize, bmux_text_edit::WrapLayout)>>,
 }
 
 // Derived measurement state must not change the meaning of editor equality.
@@ -40,6 +43,9 @@ impl PartialEq for TextInputState {
     fn eq(&self, other: &Self) -> bool {
         self.buffer == other.buffer
             && self.content_area == other.content_area
+            && self.viewport_height == other.viewport_height
+            && self.logical_width == other.logical_width
+            && self.pointer_offset == other.pointer_offset
             && self.scroll == other.scroll
             && self.mouse_selection == other.mouse_selection
     }
@@ -60,13 +66,16 @@ impl TextInputState {
         Self {
             buffer,
             content_area: Rect::new(0, 0, 1, 1),
+            logical_width: 1,
+            viewport_height: 1,
+            pointer_offset: (0, 0),
             scroll: ScrollViewState::new(),
             mouse_selection: MouseSelectionState::default(),
             wrapped: RefCell::new(None),
         }
     }
 
-    fn wrapped_layout(&self, width: u16) -> std::cell::Ref<'_, bmux_text_edit::WrapLayout> {
+    fn wrapped_layout(&self, width: u64) -> std::cell::Ref<'_, bmux_text_edit::WrapLayout> {
         let stale = self
             .wrapped
             .borrow()
@@ -76,7 +85,8 @@ impl TextInputState {
             *self.wrapped.borrow_mut() = Some((
                 width,
                 self.buffer.cursor_byte_index(),
-                self.buffer.wrapped_layout(usize::from(width.max(1))),
+                self.buffer
+                    .wrapped_layout(usize::try_from(width.max(1)).unwrap_or(usize::MAX)),
             ));
         } else if let Some((_, cursor, layout)) = self.wrapped.borrow_mut().as_mut()
             && *cursor != self.buffer.cursor_byte_index()
@@ -115,14 +125,31 @@ impl TextInputState {
 
     /// Store the latest content area.
     pub fn set_content_area(&mut self, area: Rect, policy: &TextInputPolicy) {
-        if self.content_area.width.max(1) != area.width.max(1) {
+        self.viewport_height = u64::from(area.height);
+        self.set_geometry(area, u64::from(area.width), (0, 0), policy);
+    }
+
+    fn set_geometry(
+        &mut self,
+        area: Rect,
+        width: u64,
+        offset: (usize, usize),
+        policy: &TextInputPolicy,
+    ) {
+        if self.logical_width.max(1) != width.max(1) {
             self.buffer.reset_preferred_visual_column();
         }
         self.content_area = area;
+        self.logical_width = width;
+        self.pointer_offset = offset;
         self.sync_scroll_to_cursor(policy);
-        let rows = self.wrapped_layout(area.width).lines.len();
-        let viewport = editor_viewport(area, rows);
+        let rows = self.wrapped_layout(self.logical_width).lines.len();
+        let viewport = editor_viewport(self.scroll_area(), rows);
         ScrollView::scroll_vertical_by(&viewport, &mut self.scroll, 0);
+    }
+
+    const fn scroll_area(&self) -> LogicalSize {
+        LogicalSize::new(self.logical_width, self.viewport_height)
     }
 
     /// Synchronize vertical scroll so the cursor is visible if policy allows.
@@ -136,12 +163,12 @@ impl TextInputState {
     /// Return the scroll offset that keeps the cursor visible.
     #[must_use]
     pub fn cursor_scroll_offset(&self, policy: &TextInputPolicy) -> Option<u64> {
-        if !policy.viewport.auto_scroll_to_cursor || self.content_area.height == 0 {
+        if !policy.viewport.auto_scroll_to_cursor || self.viewport_height == 0 {
             return None;
         }
-        let layout = self.wrapped_layout(self.content_area.width);
+        let layout = self.wrapped_layout(self.logical_width);
         let viewport = editor_viewport(
-            self.content_area,
+            self.scroll_area(),
             layout.lines.len().max(layout.cursor.row.saturating_add(1)),
         );
         // Preserve the editor's cursor-at-bottom policy while sharing reveal/clamping.
@@ -292,8 +319,9 @@ impl Component for TextInputComponent<'_, '_> {
             height,
         );
         let mut state = self.state.borrow_mut();
-        state.set_content_area(area, self.policy);
-        let wrapped = state.wrapped_layout(area.width);
+        state.viewport_height = layout.size.height;
+        state.set_geometry(area, layout.size.width, (0, 0), self.policy);
+        let wrapped = state.wrapped_layout(state.logical_width);
         let mut input = TextInput::new(state.buffer())
             .wrapped_layout(&wrapped)
             .id(self.id.clone())
@@ -306,14 +334,26 @@ impl Component for TextInputComponent<'_, '_> {
             input = input.placeholder(placeholder);
         }
         input.paint(layout, cx);
-        cx.push_hit(
-            HitRegion::new(self.id.as_str(), area)
-                .role(HitRole::TextInput)
-                .hoverable(true)
-                .focusable(true)
-                .enabled(!self.disabled),
+        let clip = cx.area();
+        cx.with_child(
+            clip.x,
+            clip.y,
+            LocalRect::new(0, 0, clip.width, clip.height),
+            |cx| {
+                cx.push_hit(
+                    HitRegion::new(self.id.as_str(), Rect::new(0, 0, clip.width, clip.height))
+                        .role(HitRole::TextInput)
+                        .hoverable(true)
+                        .focusable(true)
+                        .enabled(!self.disabled),
+                );
+                cx.push_semantic(SemanticRegion::new(
+                    self.id.as_str(),
+                    Rect::new(0, 0, clip.width, clip.height),
+                    "text-input",
+                ));
+            },
         );
-        cx.push_semantic(SemanticRegion::new(self.id.as_str(), area, "text-input"));
         cx.push_damage(local);
     }
 
@@ -325,7 +365,17 @@ impl Component for TextInputComponent<'_, '_> {
             return EventOutcome::Ignored;
         };
         let mut state = self.state.borrow_mut();
-        state.set_content_area(area, self.policy);
+        state.viewport_height = layout.size.height;
+        let (x, y) = cx.local_point(bmux_tui::geometry::Point::new(area.x, area.y));
+        state.set_geometry(
+            area,
+            layout.size.width,
+            (
+                usize::try_from(x.max(0)).unwrap_or(usize::MAX),
+                usize::try_from(y.max(0)).unwrap_or(usize::MAX),
+            ),
+            self.policy,
+        );
         match TextInputControl::new(self.policy).handle_event(&mut state, event) {
             TextInputOutcome::Ignored => EventOutcome::Ignored,
             TextInputOutcome::Edited
@@ -359,7 +409,7 @@ impl<'policy> TextInputControl<'policy> {
     /// Return visible content rows for a terminal width.
     #[must_use]
     pub fn visible_rows_for_width(&self, state: &TextInputState, width: u16) -> u16 {
-        let wrapped_rows = state.wrapped_layout(width).lines.len().max(1);
+        let wrapped_rows = state.wrapped_layout(u64::from(width)).lines.len().max(1);
         usize_to_u16_saturating(wrapped_rows)
             .max(self.policy.viewport.min_rows.max(1))
             .min(self.policy.viewport.max_rows.unwrap_or(u16::MAX))
@@ -484,7 +534,7 @@ impl<'policy> TextInputControl<'policy> {
         if !stroke.modifiers.is_empty() {
             return None;
         }
-        let layout = state.wrapped_layout(state.content_area.width);
+        let layout = state.wrapped_layout(state.logical_width);
         match stroke.key {
             KeyCode::Up if layout.cursor.row == 0 && self.policy.edge.up_at_first_row => {
                 Some(TextInputOutcome::EdgeUp)
@@ -530,7 +580,7 @@ impl<'policy> TextInputControl<'policy> {
             SelectionGranularity::Disabled
         };
         let byte_index = state
-            .wrapped_layout(state.content_area.width)
+            .wrapped_layout(state.logical_width)
             .byte_index_for_position(row, col);
         apply_selection_granularity(&mut state.buffer, byte_index, granularity);
         state.sync_scroll_to_cursor(self.policy);
@@ -546,7 +596,7 @@ impl<'policy> TextInputControl<'policy> {
             return TextInputOutcome::Ignored;
         };
         let byte_index = state
-            .wrapped_layout(state.content_area.width)
+            .wrapped_layout(state.logical_width)
             .byte_index_for_position(position.row, position.col);
         extend_selection_to_granularity(
             &mut state.buffer,
@@ -947,10 +997,16 @@ fn extend_visual_selection(state: &mut TextInputState, delta: isize) {
 }
 
 fn move_visual_cursor(state: &mut TextInputState, delta: isize, selection: SelectionMode) {
-    drop(state.wrapped_layout(state.content_area.width));
+    drop(state.wrapped_layout(state.logical_width));
     let cached = state.wrapped.borrow();
     let layout = &cached.as_ref().expect("measured projection").2;
     state.buffer.move_cursor_in_layout(layout, delta, selection);
+}
+
+fn pointer_source_row(state: &TextInputState, visible_row: usize) -> usize {
+    visible_row
+        .saturating_add(state.pointer_offset.1)
+        .saturating_add(usize::try_from(state.vertical_scroll()).unwrap_or(usize::MAX))
 }
 
 fn mouse_wrapped_position(state: &TextInputState, mouse: MouseEvent) -> Option<(usize, usize)> {
@@ -962,9 +1018,8 @@ fn mouse_wrapped_position(state: &TextInputState, mouse: MouseEvent) -> Option<(
         return None;
     }
     Some((
-        usize::from(mouse.position.y.saturating_sub(area.y))
-            .saturating_add(usize::try_from(state.vertical_scroll()).unwrap_or(usize::MAX)),
-        usize::from(mouse.position.x.saturating_sub(area.x)),
+        pointer_source_row(state, usize::from(mouse.position.y.saturating_sub(area.y))),
+        usize::from(mouse.position.x.saturating_sub(area.x)).saturating_add(state.pointer_offset.0),
     ))
 }
 
@@ -984,16 +1039,19 @@ fn drag_wrapped_position(
     if area.is_empty() {
         return None;
     }
-    let col = clamped_mouse_col(area, mouse.position.x);
+    let col = clamped_mouse_col(area, mouse.position.x).saturating_add(state.pointer_offset.0);
     if mouse.position.y < area.y {
         if !edge_scroll {
             return None;
         }
         let previous = state.vertical_scroll();
-        let viewport = editor_viewport(area, state.wrapped_layout(area.width).lines.len());
+        let viewport = editor_viewport(
+            state.scroll_area(),
+            state.wrapped_layout(state.logical_width).lines.len(),
+        );
         ScrollView::scroll_vertical_by(&viewport, &mut state.scroll, -1);
         return Some(DragPosition {
-            row: usize::try_from(state.vertical_scroll()).unwrap_or(usize::MAX),
+            row: pointer_source_row(state, 0),
             col,
             scrolled: state.vertical_scroll() != previous,
         });
@@ -1003,19 +1061,19 @@ fn drag_wrapped_position(
             return None;
         }
         let previous = state.vertical_scroll();
-        let viewport = editor_viewport(area, state.wrapped_layout(area.width).lines.len());
+        let viewport = editor_viewport(
+            state.scroll_area(),
+            state.wrapped_layout(state.logical_width).lines.len(),
+        );
         ScrollView::scroll_vertical_by(&viewport, &mut state.scroll, 1);
         return Some(DragPosition {
-            row: usize::try_from(state.vertical_scroll())
-                .unwrap_or(usize::MAX)
-                .saturating_add(usize::from(area.height).saturating_sub(1)),
+            row: pointer_source_row(state, usize::from(area.height).saturating_sub(1)),
             col,
             scrolled: state.vertical_scroll() != previous,
         });
     }
     Some(DragPosition {
-        row: usize::from(mouse.position.y.saturating_sub(area.y))
-            .saturating_add(usize::try_from(state.vertical_scroll()).unwrap_or(usize::MAX)),
+        row: pointer_source_row(state, usize::from(mouse.position.y.saturating_sub(area.y))),
         col,
         scrolled: false,
     })
@@ -1031,16 +1089,13 @@ fn clamped_mouse_col(area: Rect, x: u16) -> usize {
     }
 }
 
-fn editor_viewport(area: Rect, rows: usize) -> LayoutNode {
+fn editor_viewport(area: LogicalSize, rows: usize) -> LayoutNode {
     ScrollViewComponent::viewport_layout(
         LayoutId::new("text-input.viewport"),
-        LogicalSize::new(
-            area.width.into(),
-            u64::try_from(usize::from(area.height)).unwrap_or(u64::MAX),
-        ),
+        area,
         LayoutNode::leaf(
             LayoutId::new("text-input.content"),
-            LogicalSize::new(area.width.into(), rows.try_into().unwrap_or(u64::MAX)),
+            LogicalSize::new(area.width, rows.try_into().unwrap_or(u64::MAX)),
         ),
     )
 }
@@ -1164,6 +1219,104 @@ mod tests {
     }
 
     #[test]
+    fn deep_editor_paint_and_click_share_logical_height() {
+        let policy = TextInputPolicy::chat_composer();
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text(format!(
+            "{}end",
+            "x\n".repeat(70_000)
+        ))));
+        let component = TextInputComponent::new("deep", &state, &policy).focused(true);
+        let layout = LayoutNode::leaf("deep".into(), LogicalSize::new(8, 70_001));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame)
+            .with_child_size(0, -70_000, layout.size, |cx| component.paint(&layout, cx));
+        assert_eq!(frame.cursor().unwrap().position, Point::new(3, 0));
+        assert_eq!(state.borrow().vertical_scroll(), 0);
+        let row: String = buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert_eq!(row.trim_end(), "end");
+        EventCx::new(&layout).with_transform(0, 0, 0, -70_000, Rect::new(0, 0, 8, 1), |cx| {
+            component.event(
+                &Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0)),
+                &layout,
+                cx,
+            );
+        });
+        assert_eq!(state.borrow().buffer().cursor_byte_index(), 140_001);
+    }
+
+    #[test]
+    fn outer_clip_does_not_change_auto_reveal_between_paint_and_input() {
+        let policy = TextInputPolicy::chat_composer();
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text(
+            "zero\none\ntwo\nthree\nfour",
+        )));
+        let component = TextInputComponent::new("editor", &state, &policy);
+        let layout = LayoutNode::leaf("editor".into(), LogicalSize::new(8, 5));
+        let mut buffer = Buffer::empty(Rect::new(3, 4, 8, 2));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame)
+            .with_child_size(3, 2, layout.size, |cx| component.paint(&layout, cx));
+        assert_eq!(state.borrow().vertical_scroll(), 0);
+        let event = Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 4));
+        EventCx::new(&layout).with_transform(0, 0, 3, 2, Rect::new(3, 4, 8, 2), |cx| {
+            component.event(&event, &layout, cx);
+        });
+        assert_eq!(state.borrow().vertical_scroll(), 0);
+        assert_eq!(state.borrow().buffer().cursor_byte_index(), 9);
+        let row: String = buffer.cells()[..8]
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert_eq!(row.trim_end(), "two");
+    }
+
+    #[test]
+    fn vertically_transformed_component_click_targets_visible_source_row() {
+        let mut policy = TextInputPolicy::chat_composer();
+        policy.viewport.auto_scroll_to_cursor = false;
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text(
+            "zero\none\ntwo\nthree\nfour",
+        )));
+        let component = TextInputComponent::new("editor", &state, &policy);
+        let layout = LayoutNode::leaf("editor".into(), LogicalSize::new(8, 5));
+        let event = Event::Mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 4));
+        EventCx::new(&layout).with_transform(0, 0, 3, 2, Rect::new(3, 4, 8, 2), |cx| {
+            assert_eq!(component.event(&event, &layout, cx), EventOutcome::Redraw);
+        });
+        assert_eq!(state.borrow().buffer().cursor_byte_index(), 9);
+    }
+
+    #[test]
+    fn outer_vertical_offset_is_shared_by_click_and_drag_rows() {
+        let mut policy = TextInputPolicy::chat_composer();
+        policy.viewport.auto_scroll_to_cursor = false;
+        let mut state = TextInputState::new(TextEditBuffer::from_text("0\n1\n2\n3\n4\n5\n6\n7\n8"));
+        state.set_geometry(Rect::new(3, 4, 4, 2), 4, (0, 3), &policy);
+        state.scroll.set_vertical_offset(1);
+        let point = mouse(MouseEventKind::Down(MouseButton::Left), 3, 4);
+        assert_eq!(mouse_wrapped_position(&state, point), Some((4, 0)));
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 3, 5);
+        assert_eq!(
+            drag_wrapped_position(&mut state, drag, true).unwrap().row,
+            5
+        );
+        let below = mouse(MouseEventKind::Drag(MouseButton::Left), 3, 6);
+        let position = drag_wrapped_position(&mut state, below, true).unwrap();
+        assert!(position.scrolled);
+        assert_eq!(position.row, 6);
+        let above = mouse(MouseEventKind::Drag(MouseButton::Left), 3, 3);
+        assert_eq!(
+            drag_wrapped_position(&mut state, above, true).unwrap().row,
+            4
+        );
+    }
+
+    #[test]
     fn paste_reveals_cursor_instead_of_document_bottom() {
         let policy = TextInputPolicy::chat_composer();
         let mut state =
@@ -1259,7 +1412,7 @@ mod tests {
                 Some(&state.buffer().text()[9..expected])
             );
             assert!(
-                u64::try_from(state.wrapped_layout(width).cursor.row).unwrap()
+                u64::try_from(state.wrapped_layout(u64::from(width)).cursor.row).unwrap()
                     < state.vertical_scroll() + 3
             );
         }
@@ -1288,7 +1441,7 @@ mod tests {
     #[test]
     fn visual_movement_and_selection_share_wrapped_geometry() {
         let mut state = TextInputState::new(TextEditBuffer::from_text("abcdefghi"));
-        state.content_area = Rect::new(0, 0, 3, 3);
+        state.set_content_area(Rect::new(0, 0, 3, 3), &TextInputPolicy::chat_composer());
         state.buffer_mut().move_cursor(TextMotion::Absolute(1));
         move_visual_cursor(&mut state, 1, SelectionMode::Move);
         assert_eq!(state.buffer().cursor_byte_index(), 4);

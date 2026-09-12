@@ -458,6 +458,8 @@ impl<'a> SelectableList<'a> {
         let Some(viewport) = resolved_viewport(layout) else {
             return;
         };
+        let mut state = *state;
+        self.scroll_view().reconcile(viewport, &mut state.scroll);
         let local = Rect::new(0, 0, area.width, area.height);
         let content_area = self.content_area(local);
         cx.with_child(
@@ -482,7 +484,7 @@ impl<'a> SelectableList<'a> {
                             ItemRows {
                                 list: self,
                                 id: content_id_of(viewport),
-                                state: *state,
+                                state,
                                 fallback,
                                 offset: state.scroll.vertical_offset(),
                                 viewport_height: viewport.size.height,
@@ -508,7 +510,25 @@ impl<'a> SelectableList<'a> {
         area: Rect,
         state: &SelectableListState,
     ) -> Vec<HitRegion<&'a str>> {
-        self.visible_hit_regions(self.content_area(area), state)
+        let layout = self.layout(&LayoutId::new("list"), area);
+        self.visible_semantic_regions_with_layout(&layout, area, state)
+    }
+
+    pub(crate) fn visible_semantic_regions_with_layout(
+        &self,
+        layout: &LayoutNode,
+        area: Rect,
+        state: &SelectableListState,
+    ) -> Vec<HitRegion<&'a str>> {
+        let mut state = *state;
+        let Some(viewport) = resolved_viewport(layout) else {
+            return Vec::new();
+        };
+        self.scroll_view().reconcile(viewport, &mut state.scroll);
+        let Some(content) = viewport.children.first() else {
+            return Vec::new();
+        };
+        self.visible_hit_regions(&content.node, self.content_area(area), &state)
             .into_iter()
             .filter_map(|region| {
                 self.items
@@ -542,7 +562,7 @@ impl<'a> SelectableList<'a> {
         self.handle_event_with_layout(&layout, area, state, event)
     }
 
-    fn handle_event_with_layout(
+    pub(crate) fn handle_event_with_layout(
         &self,
         layout: &LayoutNode,
         area: Rect,
@@ -560,6 +580,11 @@ impl<'a> SelectableList<'a> {
                 SelectableListOutcome::Ignored
             };
         }
+        if !self.layout_matches_items(layout) {
+            state.pressed = None;
+            state.hovered = None;
+            return SelectableListOutcome::Redraw;
+        }
         let pointer_state = (state.pressed, state.hovered);
         self.normalize_state(state);
         let pointer_changed = pointer_state != (state.pressed, state.hovered);
@@ -574,6 +599,7 @@ impl<'a> SelectableList<'a> {
         let Some(viewport) = resolved_viewport(layout) else {
             return fallback;
         };
+        self.scroll_view().reconcile(viewport, &mut state.scroll);
         let outcome = match event {
             Event::Key(stroke) => self.handle_key(viewport, state, *stroke),
             Event::Mouse(mouse) => self.handle_mouse(viewport, area, state, *mouse),
@@ -652,7 +678,24 @@ impl<'a> SelectableList<'a> {
 
     /// Exact stacked item content at one content width.
     fn content_layout(&self, id: LayoutId, width: u16) -> LayoutNode {
-        LayoutNode::leaf(id, LogicalSize::new(width.into(), self.total_height()))
+        let mut y = 0u64;
+        let children = self
+            .items
+            .iter()
+            .map(|item| {
+                let child = ChildLayout::new(
+                    0,
+                    y,
+                    LayoutNode::leaf(
+                        LayoutId::new(format!("{}.{}", id.as_str(), item.id)),
+                        LogicalSize::new(width.into(), item.height()),
+                    ),
+                );
+                y = y.saturating_add(item.height());
+                child
+            })
+            .collect();
+        LayoutNode::with_children(id, LogicalSize::new(width.into(), y), children)
     }
 
     fn line(
@@ -806,7 +849,10 @@ impl<'a> SelectableList<'a> {
                 &event,
             ));
         }
-        let hit = self.hit_index(content_area, state, mouse);
+        let hit = viewport
+            .children
+            .first()
+            .and_then(|content| self.hit_index(&content.node, content_area, state, mouse));
         match mouse.kind {
             MouseEventKind::Move if self.policy.mouse.hover => Self::hover(state, hit),
             MouseEventKind::Down(MouseButton::Left) if self.policy.mouse.click => {
@@ -1018,11 +1064,12 @@ impl<'a> SelectableList<'a> {
 
     fn hit_index(
         &self,
+        content: &LayoutNode,
         area: Rect,
         state: &SelectableListState,
         mouse: MouseEvent,
     ) -> Option<usize> {
-        let regions = self.visible_hit_regions(area, state);
+        let regions = self.visible_hit_regions(content, area, state);
         let index = hit_region_at(&regions, mouse.position)?.key;
         if self.is_enabled_item(index) {
             Some(index)
@@ -1034,19 +1081,40 @@ impl<'a> SelectableList<'a> {
     /// Visible item rectangles inside the content viewport `area` after
     /// applying the logical scroll offset. Rows above the offset are skipped
     /// exactly and the final visible item is clipped to the viewport bottom.
+    pub(crate) fn layout_matches_items(&self, layout: &LayoutNode) -> bool {
+        resolved_viewport(layout)
+            .and_then(|viewport| viewport.children.first())
+            .is_some_and(|content| self.content_matches_items(&content.node))
+    }
+
+    fn content_matches_items(&self, content: &LayoutNode) -> bool {
+        content.children.len() == self.items.len()
+            && content
+                .children
+                .iter()
+                .zip(self.items)
+                .all(|(child, item)| {
+                    child.node.id.as_str() == format!("{}.{}", content.id.as_str(), item.id)
+                        && child.node.size.height == item.height()
+                })
+    }
+
     fn visible_hit_regions(
         &self,
+        content: &LayoutNode,
         area: Rect,
         state: &SelectableListState,
     ) -> Vec<HitRegion<usize>> {
+        if !self.content_matches_items(content) {
+            return Vec::new();
+        }
         let offset = state.scroll.vertical_offset();
         let viewport_end = offset.saturating_add(u64::from(area.height));
-        let mut start = 0u64;
         let mut regions = Vec::new();
-        for (index, item) in self.items.iter().enumerate() {
-            let end = start.saturating_add(item.height());
+        for (index, child) in content.children.iter().enumerate() {
+            let start = child.y;
+            let end = start.saturating_add(child.node.size.height);
             if end <= offset {
-                start = end;
                 continue;
             }
             if start >= viewport_end {
@@ -1067,7 +1135,6 @@ impl<'a> SelectableList<'a> {
                     ),
                 ));
             }
-            start = end;
         }
         regions
     }
@@ -1133,32 +1200,42 @@ impl Component for ItemRows<'_, '_> {
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        // A retained layout from another item revision must not reinterpret
+        // positional indexes as different stable rows. The caller must relayout.
+        if !self.list.content_matches_items(layout) {
+            return;
+        }
         let width = layout.size.width;
         let end = self.offset.saturating_add(self.viewport_height);
-        let mut row = 0u64;
-        for (index, item) in self.list.items.iter().enumerate() {
-            if row >= end {
+        for (index, child) in layout.children.iter().enumerate() {
+            let Some(item) = self.list.items.get(index) else {
+                continue;
+            };
+            if child.y >= end {
                 break;
             }
-            for line_index in 0..item.height() {
-                if row >= self.offset && row < end {
-                    cx.write_line_with_fallback_style(
-                        LocalRect::new(
-                            0,
-                            i64::try_from(row).unwrap_or(i64::MAX),
-                            width.try_into().unwrap_or(u16::MAX),
-                            1,
-                        ),
-                        &self.list.line(
-                            index,
-                            item,
-                            usize::try_from(line_index).unwrap_or(usize::MAX),
-                            self.state,
-                        ),
-                        self.fallback,
-                    );
-                }
-                row = row.saturating_add(1);
+            let first_line = self
+                .offset
+                .saturating_sub(child.y)
+                .min(child.node.size.height);
+            let last_line = end.saturating_sub(child.y).min(child.node.size.height);
+            for line_index in first_line..last_line {
+                let row = child.y.saturating_add(line_index);
+                cx.write_line_with_fallback_style(
+                    LocalRect::new(
+                        0,
+                        i64::try_from(row).unwrap_or(i64::MAX),
+                        width.try_into().unwrap_or(u16::MAX),
+                        1,
+                    ),
+                    &self.list.line(
+                        index,
+                        item,
+                        usize::try_from(line_index).unwrap_or(usize::MAX),
+                        self.state,
+                    ),
+                    self.fallback,
+                );
             }
         }
     }
@@ -1186,13 +1263,19 @@ impl<'a, 'state> SelectableListComponent<'a, 'state> {
         layout: &LayoutNode,
         cx: &mut EventCx<'_>,
     ) -> SelectableListOutcome {
-        let Some(area) = cx.find_rect(&layout.id) else {
+        let Some(event) = crate::common::local_control_event(
+            event,
+            cx,
+            layout,
+            self.state.get().scroll.dragging_scrollbar(),
+        ) else {
             return SelectableListOutcome::Ignored;
         };
+        let area = local_area_of(layout.size);
         let mut state = self.state.get();
         let outcome = self
             .list
-            .handle_event_with_layout(layout, area, &mut state, event);
+            .handle_event_with_layout(layout, area, &mut state, &event);
         self.state.set(state);
         outcome
     }
@@ -1297,7 +1380,20 @@ impl Component for SelectableListComponent<'_, '_> {
                 .enabled(!state.interaction.disabled),
         );
         let content_area = self.list.content_area(area);
-        for region in self.list.visible_hit_regions(content_area, &state) {
+        let Some(viewport) = resolved_viewport(layout) else {
+            return;
+        };
+        let Some(content) = viewport.children.first() else {
+            return;
+        };
+        let mut state = state;
+        self.list
+            .scroll_view()
+            .reconcile(viewport, &mut state.scroll);
+        for region in self
+            .list
+            .visible_hit_regions(&content.node, content_area, &state)
+        {
             let Some(item) = self.list.items.get(region.key) else {
                 continue;
             };
@@ -1782,6 +1878,89 @@ mod tests {
     }
 
     #[test]
+    fn retained_rows_do_not_reinterpret_reordered_items() {
+        use bmux_tui::component::LayoutId;
+        let items = [
+            SelectableListItem::new("a", "A"),
+            SelectableListItem::new("b", "B"),
+        ];
+        let list = SelectableList::new(&items);
+        let area = Rect::new(0, 0, 6, 2);
+        let layout = list.layout(&LayoutId::new("list"), area);
+        let reordered = [items[1].clone(), items[0].clone()];
+        let next = SelectableList::new(&reordered);
+        let state = SelectableListState::new(None);
+        assert!(
+            next.visible_semantic_regions_with_layout(&layout, area, &state)
+                .is_empty()
+        );
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        next.paint_layout(
+            &layout,
+            area,
+            &state,
+            Style::new(),
+            &mut PaintCx::new(&mut frame),
+        );
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("      "));
+        let mut input_state = SelectableListState::new(Some(0));
+        assert_eq!(
+            next.handle_event_with_layout(
+                &layout,
+                area,
+                &mut input_state,
+                &Event::Key(KeyStroke::simple(KeyCode::Enter)),
+            ),
+            SelectableListOutcome::Redraw
+        );
+        assert_eq!(input_state.selected(), Some(0));
+        let fresh = next.layout(&LayoutId::new("list"), area);
+        let regions = next.visible_semantic_regions_with_layout(&fresh, area, &state);
+        assert_eq!(regions[0].key, "b");
+        assert_eq!(regions[1].key, "a");
+    }
+
+    #[test]
+    fn stale_offset_uses_same_rows_for_paint_and_semantic_hits() {
+        let items = [
+            SelectableListItem::new("one", "One"),
+            SelectableListItem::new("two", "Two"),
+        ];
+        let list = SelectableList::new(&items);
+        let mut state = SelectableListState::new(None);
+        state.set_vertical_scroll(100);
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        list.render(area, &state, &mut frame);
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("  Two "));
+        assert_eq!(
+            list.semantic_id_at(area, &state, Point::new(2, 0)),
+            Some("two")
+        );
+        // Resolving derived geometry must not mutate caller-owned state.
+        assert_eq!(state.vertical_scroll(), 100);
+        let _ = list.handle_event(
+            area,
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(2, 0),
+            )),
+        );
+        let _ = list.handle_event(
+            area,
+            &mut state,
+            &Event::Mouse(MouseEvent::new(
+                MouseEventKind::Up(MouseButton::Left),
+                Point::new(2, 0),
+            )),
+        );
+        assert_eq!(state.selected(), Some(1));
+    }
+
+    #[test]
     fn renders_integrated_scrollbar() {
         let items = [
             SelectableListItem::new("one", "One"),
@@ -1798,6 +1977,36 @@ mod tests {
         list.render(Rect::new(0, 0, 6, 2), &state, &mut frame);
 
         assert_eq!(frame.buffer().row_symbols(1).as_deref(), Some("  Thr█"));
+    }
+
+    #[test]
+    fn translated_scrollbar_capture_drags_outside_and_releases() {
+        let items = (0..10)
+            .map(|i| SelectableListItem::new(i.to_string(), i.to_string()))
+            .collect::<Vec<_>>();
+        let state = Cell::new(SelectableListState::new(None));
+        let component = SelectableListComponent::new("list", &items, &state)
+            .policy(SelectableListPolicy::interactive().scrollbar(ScrollbarAxisLayoutMode::Gutter));
+        let layout = component.layout(
+            Constraints::tight(Rect::new(0, 0, 6, 4).size()),
+            &mut LayoutCx::new(),
+        );
+        let clip = Rect::new(3, 2, 6, 4);
+        let mut root = EventCx::with_clip(&layout, clip);
+        root.with_transform(0, 0, 3, 2, clip, |cx| {
+            let mut send = |kind, point| {
+                component.handle_event(&Event::Mouse(MouseEvent::new(kind, point)), &layout, cx)
+            };
+            let _ = send(MouseEventKind::Down(MouseButton::Left), Point::new(8, 2));
+            assert!(state.get().scroll.dragging_scrollbar());
+            let _ = send(MouseEventKind::Drag(MouseButton::Left), Point::new(8, 12));
+            assert_eq!(state.get().vertical_scroll(), 6);
+            let _ = send(MouseEventKind::Drag(MouseButton::Left), Point::new(8, 0));
+            assert_eq!(state.get().vertical_scroll(), 0);
+            let _ = send(MouseEventKind::Up(MouseButton::Left), Point::new(8, 0));
+            assert!(!state.get().scroll.dragging_scrollbar());
+            assert_eq!(state.get().selected(), None);
+        });
     }
 
     #[test]

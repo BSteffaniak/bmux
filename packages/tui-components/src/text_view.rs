@@ -370,7 +370,11 @@ impl<'a, 'state> TextViewComponent<'a, 'state> {
         let Some((viewport, content)) = resolved_viewport(layout) else {
             return scope_outcome;
         };
-        let state = self.state.get();
+        // Selection may be registered before paint reconciles caller state.
+        // Resolve the same clamping/follow policy as the painted viewport.
+        let state = self
+            .viewport_component(viewport.size)
+            .effective_state(viewport);
         let before = cx.selection().fragments().len();
         let content_id = content_id.into();
         cx.with_child(
@@ -1174,6 +1178,39 @@ mod tests {
         );
         assert!(fragments.iter().all(|fragment| fragment.area.right() <= 3));
         assert_eq!(frame.selection().scopes().len(), 1);
+    }
+
+    #[test]
+    fn selection_before_paint_resolves_stale_scroll_offsets() {
+        let lines = [Line::from("abc")];
+        let mut initial = ScrollViewState::new();
+        initial.set_vertical_offset(100);
+        initial.set_horizontal_offset(100);
+        let state = Cell::new(initial);
+        let view = TextViewComponent::new("text", &lines, &state).policy(TextViewPolicy::bare());
+        let area = Rect::new(0, 0, 3, 1);
+        let layout = layout_at(&view, area);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_child(0, 0, LocalRect::new(0, 0, 3, 1), |cx| {
+            assert_eq!(
+                view.register_selection(
+                    &layout,
+                    &ComponentSelectionState::new("text"),
+                    &ComponentSelectionPolicy::content(),
+                    "document",
+                    cx,
+                ),
+                ComponentSelectionOutcome::ContentRegistered { fragments: 3 }
+            );
+            view.paint(&layout, cx);
+        });
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("abc"));
+        let fragments = frame.selection().fragments();
+        assert_eq!(fragments[0].source_range.start, 0);
+        assert_eq!(fragments[0].area.x, 0);
+        assert_eq!(fragments[2].source_range.end, 3);
+        assert_eq!(fragments[2].area.x, 2);
     }
 
     #[test]

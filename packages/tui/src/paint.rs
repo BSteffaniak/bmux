@@ -259,8 +259,15 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
     /// allowed because terminal cursors may occupy the insertion position just
     /// beyond the final painted cell.
     pub fn set_cursor_local(&mut self, x: u16, y: u16, visible: bool) {
-        let x = i64::from(self.origin_x).saturating_add(i64::from(x));
-        let y = self.origin_y.saturating_add(i64::from(y));
+        self.set_cursor_logical(u64::from(x), u64::from(y), visible);
+    }
+
+    /// Request a logical cursor, clipping before conversion to terminal coordinates.
+    pub fn set_cursor_logical(&mut self, x: u64, y: u64, visible: bool) {
+        let Ok(x) = i64::try_from(x) else { return };
+        let Ok(y) = i64::try_from(y) else { return };
+        let x = i64::from(self.origin_x).saturating_add(x);
+        let y = self.origin_y.saturating_add(y);
         if x < i64::from(self.clip.x)
             || x > i64::from(self.clip.right())
             || y < i64::from(self.clip.y)

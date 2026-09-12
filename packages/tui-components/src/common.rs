@@ -4,6 +4,41 @@ use bmux_tui::component::LogicalSize;
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::style::Style;
 
+/// Translate pointer input without treating a clipped edge as the control origin.
+/// Outside-clip releases still reach controls to cancel pointer capture.
+pub(crate) fn local_control_event(
+    event: &bmux_tui::event::Event,
+    cx: &bmux_tui::component::EventCx<'_>,
+    layout: &bmux_tui::component::LayoutNode,
+    scrollbar_captured: bool,
+) -> Option<bmux_tui::event::Event> {
+    use bmux_tui::event::{Event, MouseEventKind};
+    let Event::Mouse(mouse) = event else {
+        return Some(event.clone());
+    };
+    if scrollbar_captured && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
+        let (x, y) = cx.local_point(mouse.position);
+        let mut local = *mouse;
+        local.position = Point::new(
+            u16::try_from(x.max(0)).unwrap_or(u16::MAX),
+            u16::try_from(y.max(0)).unwrap_or(u16::MAX),
+        );
+        return Some(Event::Mouse(local));
+    }
+    let visible = cx.find_visible_rect(&layout.id)?;
+    if !visible.contains(mouse.position) {
+        return matches!(mouse.kind, MouseEventKind::Up(_) | MouseEventKind::Move).then(|| {
+            let mut outside = *mouse;
+            outside.position = Point::new(u16::MAX, u16::MAX);
+            Event::Mouse(outside)
+        });
+    }
+    let (x, y) = cx.local_point(mouse.position);
+    let mut local = *mouse;
+    local.position = Point::new(u16::try_from(x).ok()?, u16::try_from(y).ok()?);
+    Some(Event::Mouse(local))
+}
+
 /// Runtime interaction flags common to interactive controls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[allow(clippy::struct_excessive_bools)]
@@ -290,6 +325,27 @@ mod tests {
         ComponentHitRegion, HitRegionId, InteractionState, InteractionStyles, ResizeBounds,
         hit_region_at,
     };
+
+    #[test]
+    fn captured_scrollbar_motion_survives_parent_clip() {
+        use bmux_tui::component::{EventCx, LayoutId, LayoutNode, LogicalSize};
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        let layout = LayoutNode::leaf(LayoutId::new("control"), LogicalSize::new(8, 4));
+        let clip = Rect::new(3, 3, 8, 2);
+        let mut root = EventCx::with_clip(&layout, clip);
+        root.with_transform(0, 0, 3, 2, clip, |cx| {
+            let drag = Event::Mouse(MouseEvent::new(
+                MouseEventKind::Drag(MouseButton::Left),
+                Point::new(10, 8),
+            ));
+            assert!(super::local_control_event(&drag, cx, &layout, false).is_none());
+            let Some(Event::Mouse(local)) = super::local_control_event(&drag, cx, &layout, true)
+            else {
+                panic!("captured drag dropped");
+            };
+            assert_eq!(local.position, Point::new(7, 6));
+        });
+    }
 
     #[test]
     fn hit_region_at_returns_first_containing_region() {

@@ -2,7 +2,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use bmux_text_edit::{TextEditBuffer, TextSelection, VisualCursor};
+use bmux_text_edit::{TextEditBuffer, TextSelection};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::component::{
@@ -12,13 +12,6 @@ use crate::geometry::Point;
 use crate::paint::{LocalRect, PaintCx};
 use crate::style::Style;
 use crate::text::Line;
-
-/// Internal rendered text-input projection shared by measurement-aware paint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RenderedInputRows {
-    lines: Vec<String>,
-    cursor: VisualCursor,
-}
 
 /// A multiline text input widget backed by [`TextEditBuffer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,36 +100,36 @@ impl<'buffer> TextInput<'buffer> {
         self
     }
 
-    fn project_with_layout(
-        layout: &bmux_text_edit::WrapLayout,
-        vertical_scroll: usize,
-        height: u16,
-    ) -> RenderedInputRows {
-        let lines = layout
-            .lines
-            .iter()
-            .skip(vertical_scroll)
-            .take(usize::from(height))
-            .cloned()
-            .collect();
-        RenderedInputRows {
-            lines,
-            cursor: VisualCursor {
-                row: layout.cursor.row.saturating_sub(vertical_scroll),
-                col: layout.cursor.col,
-            },
-        }
-    }
-    fn paint_scoped(&self, area: LocalRect, cx: &mut PaintCx<'_, '_>) {
+    fn paint_scoped(&self, size: LogicalSize, cx: &mut PaintCx<'_, '_>) {
+        let clip = cx.area();
+        let left = u64::try_from(clip.x.max(0)).unwrap_or(0).min(size.width);
+        let right = u64::try_from(i64::from(clip.x) + i64::from(clip.width))
+            .unwrap_or(0)
+            .min(size.width);
+        let top = u64::try_from(clip.y.max(0)).unwrap_or(0).min(size.height);
+        let bottom = u64::try_from(clip.y.saturating_add(i64::from(clip.height)))
+            .unwrap_or(0)
+            .min(size.height);
+        let area = LocalRect::new(
+            i32::try_from(left).unwrap_or(i32::MAX),
+            i64::try_from(top).unwrap_or(i64::MAX),
+            u16::try_from(right.saturating_sub(left)).unwrap_or(0),
+            u16::try_from(bottom.saturating_sub(top)).unwrap_or(0),
+        );
         if area.width == 0 || area.height == 0 {
             return;
         }
 
         if self.buffer.is_empty() {
             if let Some(placeholder) = &self.placeholder {
-                let styled = placeholder.with_fallback_style(self.placeholder_style);
+                let styled = placeholder
+                    .with_fallback_style(self.placeholder_style)
+                    .viewport(
+                        usize::try_from(left).unwrap_or(usize::MAX),
+                        usize::from(area.width),
+                    );
                 cx.write_line_with_fallback_style(
-                    LocalRect::new(area.x, area.y, area.width, 1),
+                    LocalRect::new(area.x, 0, area.width, 1),
                     &styled,
                     self.placeholder_style,
                 );
@@ -147,49 +140,52 @@ impl<'buffer> TextInput<'buffer> {
             return;
         }
 
-        let measured = self
-            .wrapped
-            .is_none()
-            .then(|| self.buffer.wrapped_layout(usize::from(area.width.max(1))));
+        let measured = self.wrapped.is_none().then(|| {
+            self.buffer
+                .wrapped_layout(usize::try_from(size.width.max(1)).unwrap_or(usize::MAX))
+        });
         let layout = self
             .wrapped
             .or(measured.as_ref())
             .expect("wrapped projection");
         let vertical_scroll = if self.vertical_scroll == usize::MAX {
-            scroll_offset_for_cursor_row(layout.cursor.row, area.height)
+            scroll_offset_for_cursor_row(layout.cursor.row, size.height)
         } else {
             self.vertical_scroll
         };
-        let projection = Self::project_with_layout(layout, vertical_scroll, area.height);
+        let source_start =
+            vertical_scroll.saturating_add(usize::try_from(top).unwrap_or(usize::MAX));
         let rendered_lines = selected_wrapped_lines(
             self.buffer.text(),
             layout,
+            source_start..source_start.saturating_add(usize::from(area.height)),
             self.buffer.selection(),
             self.style,
             self.selection_style,
         );
-        for (row, line) in rendered_lines
-            .into_iter()
-            .skip(vertical_scroll)
-            .take(usize::from(area.height))
-            .enumerate()
-        {
+        for (row, line) in rendered_lines.into_iter().enumerate() {
             let Ok(row) = i64::try_from(row) else {
                 return;
             };
             cx.write_line_with_fallback_style(
                 LocalRect::new(area.x, area.y.saturating_add(row), area.width, 1),
-                &line,
+                &line.viewport(
+                    usize::try_from(left).unwrap_or(usize::MAX),
+                    usize::from(area.width),
+                ),
                 self.style,
             );
         }
 
-        if self.cursor_visible && projection.cursor.row < usize::from(area.height) {
-            let cursor_col = u16::try_from(projection.cursor.col)
-                .unwrap_or(u16::MAX)
-                .min(area.width);
-            let cursor_row = u16::try_from(projection.cursor.row).unwrap_or(u16::MAX);
-            cx.set_cursor_local(cursor_col, cursor_row, true);
+        if self.cursor_visible
+            && let Some(row) = layout.cursor.row.checked_sub(vertical_scroll)
+            && u64::try_from(row).unwrap_or(u64::MAX) < size.height
+        {
+            cx.set_cursor_logical(
+                u64::try_from(layout.cursor.col).unwrap_or(u64::MAX),
+                u64::try_from(row).unwrap_or(u64::MAX),
+                true,
+            );
         }
     }
 
@@ -246,27 +242,20 @@ impl Component for TextInput<'_> {
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        self.paint_scoped(
-            LocalRect::new(
-                0,
-                0,
-                u16::try_from(layout.size.width).unwrap_or(u16::MAX),
-                u16::try_from(layout.size.height).unwrap_or(u16::MAX),
-            ),
-            cx,
-        );
+        self.paint_scoped(layout.size, cx);
     }
 }
 
-fn scroll_offset_for_cursor_row(cursor_row: usize, height: u16) -> usize {
+fn scroll_offset_for_cursor_row(cursor_row: usize, height: u64) -> usize {
     cursor_row
         .saturating_add(1)
-        .saturating_sub(usize::from(height))
+        .saturating_sub(usize::try_from(height).unwrap_or(usize::MAX))
 }
 
 fn selected_wrapped_lines(
     text: &str,
     layout: &bmux_text_edit::WrapLayout,
+    rows: std::ops::Range<usize>,
     selection: Option<TextSelection>,
     base_style: Style,
     selection_style: Style,
@@ -274,6 +263,8 @@ fn selected_wrapped_lines(
     layout
         .line_ranges
         .iter()
+        .skip(rows.start)
+        .take(rows.end.saturating_sub(rows.start))
         .map(|range| {
             let mut line = Line::new();
             for (offset, grapheme) in text[range.clone()].grapheme_indices(true) {
@@ -329,6 +320,25 @@ mod tests {
         }
     }
     use bmux_text_edit::TextEditBuffer;
+
+    #[test]
+    fn logical_width_preserves_long_line_and_cursor() {
+        let edit = TextEditBuffer::from_text(format!("{}end", "x".repeat(70_000)));
+        let input = TextInput::new(&edit);
+        let layout = input.layout(Constraints::for_width(70_004), &mut LayoutCx::new());
+        assert_eq!(layout.size.height, 1);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame)
+            .with_child_size(-70_000, 0, layout.size, |cx| input.paint(&layout, cx));
+        assert_eq!(frame.cursor().unwrap().position.x, 3);
+        let row: String = buffer
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert_eq!(row, "end ");
+    }
 
     #[test]
     fn component_paint_clips_text_and_cursor_to_the_scoped_viewport() {

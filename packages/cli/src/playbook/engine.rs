@@ -654,6 +654,7 @@ impl RealAttachPlaybookRuntime {
     }
 
     async fn send_chord(&self, chord: &str) -> Result<()> {
+        self.wait_until_ready().await?;
         let strokes = crate::input::parse_key_chord(chord)
             .map_err(|error| anyhow::anyhow!("invalid attach key chord '{chord}': {error}"))?;
         for stroke in strokes {
@@ -662,6 +663,21 @@ impl RealAttachPlaybookRuntime {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
         Ok(())
+    }
+
+    async fn wait_until_ready(&self) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.terminal.attached_session_id().is_none() {
+                ensure!(
+                    !self.task.is_finished(),
+                    "real attachment exited before becoming ready"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("real attachment readiness timed out")?
     }
 
     async fn wait_for_retarget(&self, before_session_id: Option<Uuid>) {
@@ -3585,6 +3601,12 @@ pub(super) async fn execute_step(
     _step_position: usize,
     _total_steps: usize,
 ) -> Result<Option<String>> {
+    if let Some(runtime) = real_attach_runtime
+        && let Some(observed) = runtime.terminal.attached_session_id()
+        && Some(observed) != *session_id
+    {
+        reconcile_real_attach_target(observed, client, session_id, runtime_vars).await?;
+    }
     visual_checkpoint_during_step(
         visual_interactive,
         client,
@@ -4360,6 +4382,30 @@ pub(super) async fn execute_step(
     }
 }
 
+async fn reconcile_real_attach_target(
+    observed: Uuid,
+    client: &mut BmuxClient,
+    session_id: &mut Option<Uuid>,
+    runtime_vars: &mut RuntimeVars,
+) -> Result<()> {
+    if Some(observed) == *session_id {
+        return Ok(());
+    }
+    let grant = client
+        .attach_grant(SessionSelector::ById(observed))
+        .await
+        .context("playbook retarget grant failed")?;
+    client
+        .open_attach_stream_info(&grant)
+        .await
+        .context("playbook retarget open failed")?;
+    // Publish the local target only after the control stream has opened.
+    debug!(previous_target = ?session_id, target = %observed, "playbook control target reconciled");
+    *session_id = Some(observed);
+    runtime_vars.session_id = Some(observed);
+    Ok(())
+}
+
 async fn execute_real_attach_chord(
     chord: &str,
     real_attach: &RealAttachPlaybookRuntime,
@@ -4369,21 +4415,23 @@ async fn execute_real_attach_chord(
     runtime_vars: &mut RuntimeVars,
 ) -> Result<()> {
     require_session(*session_id)?;
+    // Establish the initial attachment before sending input: None -> initial
+    // target is startup, not completion of a retarget requested by this chord.
+    real_attach.wait_until_ready().await?;
     let before_session_id = real_attach.terminal.attached_session_id();
     real_attach.send_chord(chord).await?;
+    let before_control_target = *session_id;
+    let wait_started = Instant::now();
     real_attach.wait_for_retarget(before_session_id).await;
+    debug!(
+        before_target = ?before_session_id,
+        control_target = ?before_control_target,
+        observed_target = ?real_attach.terminal.attached_session_id(),
+        elapsed_ms = wait_started.elapsed().as_millis(),
+        "playbook retarget wait completed"
+    );
     if let Some(attached_session_id) = real_attach.terminal.attached_session_id() {
-        if Some(attached_session_id) != *session_id {
-            let grant = client
-                .attach_grant(SessionSelector::ById(attached_session_id))
-                .await
-                .map_err(|error| anyhow::anyhow!("playbook retarget grant failed: {error}"))?;
-            client
-                .open_attach_stream_info(&grant)
-                .await
-                .map_err(|error| anyhow::anyhow!("playbook retarget open failed: {error}"))?;
-        }
-        *session_id = Some(attached_session_id);
+        reconcile_real_attach_target(attached_session_id, client, session_id, runtime_vars).await?;
     }
     let sid = require_session(*session_id)?;
     let snapshot = inspector.refresh(client, sid).await?;
@@ -4976,6 +5024,40 @@ fn session_plugin_bus_event_matches(kind: &str, payload: &[u8], name: &str) -> b
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn chord_submission_waits_for_initial_attachment() {
+        use crate::runtime::attach::runtime::AttachTerminal;
+        let (mut terminal, handle) = HeadlessAttachTerminal::new(10, 3);
+        let task = tokio::spawn(std::future::pending());
+        let runtime = RealAttachPlaybookRuntime {
+            terminal: handle,
+            task,
+        };
+        let target = Uuid::new_v4();
+        let send = runtime.send_chord("a");
+        tokio::pin!(send);
+        // Poll submission while readiness is absent, independently of wall-clock timing.
+        assert!(matches!(
+            futures_util::poll!(&mut send),
+            std::task::Poll::Pending
+        ));
+        {
+            let receive = terminal.next_event();
+            tokio::pin!(receive);
+            assert!(matches!(
+                futures_util::poll!(&mut receive),
+                std::task::Poll::Pending
+            ));
+        }
+        terminal.set_attached_session_id(target);
+        send.await.unwrap();
+        assert!(matches!(
+            terminal.next_event().await.unwrap(),
+            Some(CrosstermEvent::Key(_))
+        ));
+        runtime.task.abort();
+    }
+
     #[test]
     fn headless_screen_preserves_output_resize_order() {
         let (mut first, first_handle) = HeadlessAttachTerminal::new(10, 3);
@@ -5007,6 +5089,52 @@ mod tests {
                 .output_screen_text(20, 3)
                 .contains("ABCDEFGHIJK!")
         );
+    }
+
+    #[tokio::test]
+    async fn control_retarget_commits_only_after_successful_open() {
+        let executable = std::env::current_exe().unwrap();
+        let binary = executable.parent().unwrap().parent().unwrap().join("bmux");
+        let sandbox = SandboxServer::start(super::super::sandbox::SandboxStartOptions {
+            shell: Some("sh"),
+            plugin_config: &super::super::types::PluginConfig::default(),
+            startup_timeout: Duration::from_secs(15),
+            env: &BTreeMap::new(),
+            env_mode: super::super::types::SandboxEnvMode::Clean,
+            binary: Some(&binary),
+            sandbox_config_file: None,
+            bundled_plugin_ids: &[],
+        })
+        .await
+        .unwrap();
+        let result = async {
+            let mut client = sandbox.connect("retarget-control").await?;
+            let first = typed_new_session_playbook(&mut client, None).await?;
+            let second = typed_new_session_playbook(&mut client, None).await?;
+            let mut current = None;
+            let mut vars = RuntimeVars::new(BTreeMap::new());
+            reconcile_real_attach_target(first, &mut client, &mut current, &mut vars).await?;
+            assert_eq!(current, Some(first));
+            // Model an observed target arriving after the preceding chord wait.
+            reconcile_real_attach_target(second, &mut client, &mut current, &mut vars).await?;
+            assert_eq!(current, Some(second));
+            assert_eq!(vars.session_id, Some(second));
+            let missing = Uuid::new_v4();
+            assert!(
+                reconcile_real_attach_target(missing, &mut client, &mut current, &mut vars)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(current, Some(second));
+            assert_eq!(vars.session_id, Some(second));
+            client
+                .attach_input(second, b"printf RETARGET_OK\\r".to_vec())
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        sandbox.shutdown(false).await.unwrap();
+        result.unwrap();
     }
 
     #[tokio::test]
