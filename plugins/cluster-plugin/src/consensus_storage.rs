@@ -616,8 +616,9 @@ impl ConsensusStateMachine {
                 &SnapshotMeta {
                     last_log_id: envelope.last_log_id,
                     last_membership: envelope.last_membership,
-                    snapshot_id: envelope.snapshot_id,
+                    snapshot_id: envelope.snapshot_id.clone(),
                 },
+                &envelope.snapshot_id,
                 &self.cluster_id,
                 &canonical_control,
             )?;
@@ -630,19 +631,21 @@ impl ConsensusStateMachine {
         database: &Database,
         snapshot_dir: &Path,
         meta: &SnapshotMeta<NodeId, BasicNode>,
+        snapshot_id: &str,
         cluster_id: &str,
         control_bytes: &[u8],
     ) -> Result<Vec<u8>, ConsensusStorageError> {
-        validate_snapshot_id(&meta.snapshot_id)?;
-        let envelope = encode_snapshot_envelope(cluster_id, meta, control_bytes)?;
+        validate_snapshot_id(snapshot_id)?;
+        let envelope =
+            encode_snapshot_envelope_with_id(cluster_id, meta, snapshot_id, control_bytes)?;
         fs::create_dir_all(snapshot_dir)?;
-        let final_path = snapshot_path(snapshot_dir, &meta.snapshot_id)?;
-        let tmp_path = snapshot_dir.join(format!("{}.tmp", meta.snapshot_id));
+        let final_path = snapshot_path(snapshot_dir, snapshot_id)?;
+        let tmp_path = snapshot_dir.join(format!("{snapshot_id}.tmp"));
         let directory = snapshot_dir
             .parent()
             .ok_or(ConsensusStorageError::CorruptRecord("snapshot directory"))?;
         let manifest = SnapshotInstallManifest {
-            snapshot_id: meta.snapshot_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
             checksum: snapshot_checksum(&envelope),
         };
         write_snapshot_manifest(directory, &manifest)?;
@@ -655,7 +658,7 @@ impl ConsensusStateMachine {
         let checksum = snapshot_checksum(&envelope);
         immediate_write(database, |transaction| {
             let mut table = transaction.open_table(META_TABLE)?;
-            table.insert(META_ACTIVE_SNAPSHOT_ID, meta.snapshot_id.as_bytes())?;
+            table.insert(META_ACTIVE_SNAPSHOT_ID, snapshot_id.as_bytes())?;
             table.insert(META_ACTIVE_SNAPSHOT_CHECKSUM, checksum.as_slice())?;
             Ok(())
         })?;
@@ -822,9 +825,16 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
         let database = next.database.clone();
         let meta = meta.clone();
         run_storage_blocking(move || {
-            Self::publish_snapshot(&database, &snapshot_dir, &meta, &cluster_id, &control_bytes)
-                .map(|_| ())
-                .map_err(storage_write_error)
+            Self::publish_snapshot(
+                &database,
+                &snapshot_dir,
+                &meta,
+                &meta.snapshot_id,
+                &cluster_id,
+                &control_bytes,
+            )
+            .map(|_| ())
+            .map_err(storage_write_error)
         })
         .await?;
         *self = next;
@@ -885,8 +895,15 @@ impl RaftSnapshotBuilder<ControlRaftConfig> for ConsensusStateMachine {
         let database = self.database.clone();
         let publish_meta = meta.clone();
         let bytes = run_storage_blocking(move || {
-            Self::publish_snapshot(&database, &snapshot_dir, &publish_meta, &cluster_id, &bytes)
-                .map_err(storage_write_error)
+            Self::publish_snapshot(
+                &database,
+                &snapshot_dir,
+                &publish_meta,
+                &publish_meta.snapshot_id,
+                &cluster_id,
+                &bytes,
+            )
+            .map_err(storage_write_error)
         })
         .await?;
         Ok(Snapshot {
@@ -918,9 +935,19 @@ fn snapshot_checksum(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+#[cfg(test)]
 fn encode_snapshot_envelope(
     cluster_id: &str,
     meta: &SnapshotMeta<NodeId, BasicNode>,
+    control_bytes: &[u8],
+) -> Result<Vec<u8>, ConsensusStorageError> {
+    encode_snapshot_envelope_with_id(cluster_id, meta, &meta.snapshot_id, control_bytes)
+}
+
+fn encode_snapshot_envelope_with_id(
+    cluster_id: &str,
+    meta: &SnapshotMeta<NodeId, BasicNode>,
+    snapshot_id: &str,
     control_bytes: &[u8],
 ) -> Result<Vec<u8>, ConsensusStorageError> {
     if control_bytes.len() > MAX_SNAPSHOT_FILE_BYTES {
@@ -929,7 +956,7 @@ fn encode_snapshot_envelope(
     let mut writer = DurableWriter::new(*b"BMSNP001");
     writer.u16(SNAPSHOT_FORMAT_VERSION);
     writer.bytes(cluster_id.as_bytes())?;
-    writer.bytes(meta.snapshot_id.as_bytes())?;
+    writer.bytes(snapshot_id.as_bytes())?;
     writer.boolean(meta.last_log_id.is_some());
     if let Some(log_id) = &meta.last_log_id {
         encode_log_id_fields(&mut writer, log_id);
@@ -2400,9 +2427,17 @@ mod tests {
             last_membership: StoredMembership::default(),
             snapshot_id: "decoder-test".into(),
         };
-        let mut bytes =
-            encode_snapshot_envelope("cluster-a", &meta, &state.encode_snapshot().unwrap())
+        let control = state.encode_snapshot().unwrap();
+        let mut bytes = encode_snapshot_envelope("cluster-a", &meta, &control).unwrap();
+        let explicit =
+            encode_snapshot_envelope_with_id("cluster-a", &meta, "decoder-test", &control).unwrap();
+        assert_eq!(bytes, explicit);
+        let independent =
+            encode_snapshot_envelope_with_id("cluster-a", &meta, "storage-owned-id", &control)
                 .unwrap();
+        let decoded = decode_snapshot_envelope(&independent).unwrap();
+        assert_eq!(decoded.snapshot_id, "storage-owned-id");
+        assert_eq!(decoded.control_bytes, control);
         assert!(!snapshot_requires_publication_decoder(&bytes).unwrap());
         assert!(snapshot_requires_publication_decoder(&bytes[..bytes.len() / 2]).is_err());
         bytes[12] ^= 1;
