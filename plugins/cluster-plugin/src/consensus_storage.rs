@@ -670,6 +670,65 @@ impl ConsensusStateMachine {
     }
 }
 
+impl ConsensusStateMachine {
+    // Apply only to the adapter's private candidate state. Persistence and reply
+    // delivery remain the adapter's responsibility, in that order.
+    fn apply_control_request(
+        &mut self,
+        request: &ControlRequest,
+    ) -> Result<ControlReply, StorageError<NodeId>> {
+        let response = if crate::principal_bootstrap::is_bootstrap_command(&request.0) {
+            let command = crate::principal_bootstrap::BootstrapCommand::decode(&request.0)
+                .map_err(|error| storage_write_error(std::io::Error::other(error)))?;
+            self.control_state
+                .apply_bootstrap_command(&command, &self.last_membership)
+        } else if request.0.starts_with(b"BMCAP001") {
+            use bmux_cluster_plugin_api::cluster_types::{
+                ControlCommandError, ControlCommandResult, ControlResponse, ControlWorkflowStatus,
+            };
+            let command = crate::capability_publication::PublicationCommand::decode(&request.0)
+                .map_err(|error| storage_write_error(std::io::Error::other(error)))?;
+            let outcome = self
+                .control_state
+                .apply_publication(&command, &self.last_membership);
+            let (control_revision, result) = match outcome {
+                Ok(revision) => (
+                    revision,
+                    ControlCommandResult::Accepted {
+                        payload: Vec::new(),
+                    },
+                ),
+                Err(reason) => (
+                    self.control_state.revision,
+                    ControlCommandResult::Rejected {
+                        error: ControlCommandError::InvalidTransition { reason },
+                    },
+                ),
+            };
+            ControlResponse {
+                schema_version: 1,
+                command_id: command.reports[0].command_id.clone(),
+                control_revision,
+                workflow_status: ControlWorkflowStatus::Complete,
+                result,
+            }
+        } else if crate::control_codec::is_protocol_refresh(&request.0) {
+            let command = crate::control_codec::ProtocolRefreshCommand::decode(&request.0)
+                .map_err(storage_write_error)?;
+            self.control_state.apply_refresh_command(&command)
+        } else if crate::control_codec::is_feature_activation(&request.0) {
+            let command = crate::control_codec::decode_feature_activation(&request.0)
+                .map_err(storage_write_error)?;
+            self.control_state
+                .apply_feature_activation_with_membership(&command, Some(&self.last_membership))
+        } else {
+            let command = decode_control_command(&request.0).map_err(storage_write_error)?;
+            self.control_state.apply(&command)
+        };
+        Ok(ControlReply(encode_control_response(&response)))
+    }
+}
+
 impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
     type SnapshotBuilder = Self;
 
@@ -696,65 +755,7 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
                     replies.push(ControlReply(Vec::new()));
                 }
                 EntryPayload::Normal(request) => {
-                    let response = if crate::principal_bootstrap::is_bootstrap_command(&request.0) {
-                        let command =
-                            crate::principal_bootstrap::BootstrapCommand::decode(&request.0)
-                                .map_err(|error| {
-                                    storage_write_error(std::io::Error::other(error))
-                                })?;
-                        next.control_state
-                            .apply_bootstrap_command(&command, &next.last_membership)
-                    } else if request.0.starts_with(b"BMCAP001") {
-                        use bmux_cluster_plugin_api::cluster_types::{
-                            ControlCommandError, ControlCommandResult, ControlResponse,
-                            ControlWorkflowStatus,
-                        };
-                        let command = crate::capability_publication::PublicationCommand::decode(
-                            &request.0,
-                        )
-                        .map_err(|error| storage_write_error(std::io::Error::other(error)))?;
-                        let outcome = next
-                            .control_state
-                            .apply_publication(&command, &next.last_membership);
-                        let (control_revision, result) = match outcome {
-                            Ok(revision) => (
-                                revision,
-                                ControlCommandResult::Accepted {
-                                    payload: Vec::new(),
-                                },
-                            ),
-                            Err(reason) => (
-                                next.control_state.revision,
-                                ControlCommandResult::Rejected {
-                                    error: ControlCommandError::InvalidTransition { reason },
-                                },
-                            ),
-                        };
-                        ControlResponse {
-                            schema_version: 1,
-                            command_id: command.reports[0].command_id.clone(),
-                            control_revision,
-                            workflow_status: ControlWorkflowStatus::Complete,
-                            result,
-                        }
-                    } else if crate::control_codec::is_protocol_refresh(&request.0) {
-                        let command =
-                            crate::control_codec::ProtocolRefreshCommand::decode(&request.0)
-                                .map_err(storage_write_error)?;
-                        next.control_state.apply_refresh_command(&command)
-                    } else if crate::control_codec::is_feature_activation(&request.0) {
-                        let command = crate::control_codec::decode_feature_activation(&request.0)
-                            .map_err(storage_write_error)?;
-                        next.control_state.apply_feature_activation_with_membership(
-                            &command,
-                            Some(&next.last_membership),
-                        )
-                    } else {
-                        let command =
-                            decode_control_command(&request.0).map_err(storage_write_error)?;
-                        next.control_state.apply(&command)
-                    };
-                    replies.push(ControlReply(encode_control_response(&response)));
+                    replies.push(next.apply_control_request(&request)?);
                 }
             }
         }
