@@ -786,19 +786,21 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let received = snapshot.into_inner();
-        let control_bytes = match decode_snapshot_envelope(&received) {
-            Ok(envelope) => {
-                if envelope.snapshot_id != meta.snapshot_id
-                    || envelope.last_log_id != meta.last_log_id
-                    || envelope.last_membership != meta.last_membership
-                {
-                    return Err(storage_write_error(ConsensusStorageError::CorruptRecord(
-                        "snapshot metadata mismatch",
-                    )));
-                }
-                envelope.control_bytes
+        // Legacy raw control snapshots have their own versioned magic. Do not
+        // reinterpret a corrupt or unsupported envelope as legacy control state.
+        let control_bytes = if received.starts_with(b"BMSTA") {
+            received
+        } else {
+            let envelope = decode_snapshot_envelope(&received).map_err(storage_write_error)?;
+            if envelope.snapshot_id != meta.snapshot_id
+                || envelope.last_log_id != meta.last_log_id
+                || envelope.last_membership != meta.last_membership
+            {
+                return Err(storage_write_error(ConsensusStorageError::CorruptRecord(
+                    "snapshot metadata mismatch",
+                )));
             }
-            Err(_) => received,
+            envelope.control_bytes
         };
         let control_state =
             ControlState::decode_snapshot(&control_bytes).map_err(storage_write_error)?;
