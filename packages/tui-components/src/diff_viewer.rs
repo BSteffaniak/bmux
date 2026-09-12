@@ -124,13 +124,19 @@ pub fn register_diff_viewer_selection(
     if layout == DiffViewerLayout::SideBySide {
         return scope_outcome;
     }
-    let card_width = card_width(&preview, area.width.saturating_sub(2));
-    let body_width = usize::from(card_width)
-        .saturating_sub(INLINE_DIFF_BODY_CHROME_WIDTH)
-        .max(1);
+    let gutter = if input.line_numbers_known {
+        DiffGutter::for_preview(&preview)
+    } else {
+        DiffGutter { number_width: 4 }
+    };
+    let card_width = card_width_with_gutter(&preview, area.width.saturating_sub(2), gutter);
+    let body_width = usize::from(card_width).saturating_sub(gutter.unified_chrome());
+    if body_width == 0 {
+        return scope_outcome;
+    }
     let content_x = area
         .x
-        .saturating_add(u16::try_from(INLINE_DIFF_BODY_CHROME_WIDTH).unwrap_or(u16::MAX));
+        .saturating_add(u16::try_from(gutter.unified_chrome()).unwrap_or(u16::MAX));
     let mut screen_y = area
         .y
         .saturating_add(u16::try_from(diff_viewer_header_rows(&input)).unwrap_or(u16::MAX))
@@ -690,8 +696,36 @@ mod diff_tests {
 const MAX_INLINE_DIFF_ROWS: usize = 24;
 const MAX_INLINE_DIFF_RENDER_ROWS: usize = 15;
 const INLINE_DIFF_CARD_MIN_WIDTH: usize = 24;
-const INLINE_DIFF_CARD_CHROME_WIDTH: usize = 14;
-const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
+
+/// One gutter geometry shared by measurement, rows, and selection. Four cells
+/// retain the compact viewer's existing spacing; larger numbers grow it.
+#[derive(Clone, Copy)]
+struct DiffGutter {
+    number_width: usize,
+}
+
+impl DiffGutter {
+    fn for_preview(preview: &[PreviewRow<'_>]) -> Self {
+        let number_width = preview
+            .iter()
+            .filter_map(|row| preview_line(row))
+            .flat_map(|line| [line.old_line, line.new_line])
+            .flatten()
+            .map(|number| number.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max(4);
+        Self { number_width }
+    }
+
+    const fn unified_chrome(self) -> usize {
+        self.number_width + 10
+    }
+
+    const fn split_chrome(self) -> usize {
+        self.number_width + 5
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum PreviewRow<'a> {
@@ -1028,16 +1062,44 @@ pub fn diff_viewer_document_layout_with_style(
 
     let preview = inline_preview(&visible_lines, MAX_INLINE_DIFF_ROWS);
     let resolved_layout = resolved_layout(input.layout, width, diff.added, diff.removed);
-    let card_width = if resolved_layout == DiffViewerLayout::SideBySide {
-        side_by_side_card_width(&preview, width.saturating_sub(2))
+    layout_diff_preview(rows, source_lines, &preview, resolved_layout, width, style)
+}
+
+fn layout_diff_preview(
+    mut rows: Vec<Line>,
+    source_lines: Vec<DiffLine>,
+    preview: &[PreviewRow<'_>],
+    resolved_layout: DiffViewerLayout,
+    width: u16,
+    style: DiffViewerStyle,
+) -> DiffViewerProjection {
+    let available_card_width = width.saturating_sub(2);
+    let gutter = DiffGutter::for_preview(preview);
+    let minimum_width = if resolved_layout == DiffViewerLayout::SideBySide {
+        (gutter.split_chrome() + 1) * 2 + 3
     } else {
-        card_width(&preview, width.saturating_sub(2))
+        gutter.unified_chrome() + 1
+    };
+    // Never display a partial number as though it were a different source line.
+    // When the full gutter and one content cell cannot fit, show bounded chrome
+    // only, with no source mappings or selectable source content.
+    if usize::from(available_card_width) < minimum_width {
+        rows.push(Line::from("  …").viewport(0, usize::from(width)));
+        return DiffViewerProjection {
+            rows,
+            source_lines: Vec::new(),
+        };
+    }
+    let card_width = if resolved_layout == DiffViewerLayout::SideBySide {
+        side_by_side_card_width(preview, width.saturating_sub(2))
+    } else {
+        card_width(preview, width.saturating_sub(2))
     };
     rows.push(card_border('┌', '─', '┐', card_width, style.muted));
     finish_diff_projection(
         rows,
         source_lines,
-        &preview,
+        preview,
         resolved_layout,
         card_width,
         style,
@@ -1106,11 +1168,12 @@ fn render_preview_rows_mapped(
     if layout == DiffViewerLayout::SideBySide {
         return render_side_by_side_preview_mapped(preview, source, card_width, style, mappings);
     }
+    let gutter = DiffGutter::for_preview(preview);
     let mut rows = Vec::new();
     let mut rendered_rows = 0_usize;
     for (index, row) in preview.iter().enumerate() {
         let rendered = match row {
-            PreviewRow::Line(line) => render_diff_line_with_style(line, card_width, style),
+            PreviewRow::Line(line) => render_diff_line_with_style(line, card_width, gutter, style),
             PreviewRow::Hidden { count, .. } => {
                 vec![hidden_row_with_style(*count, card_width, style)]
             }
@@ -1257,9 +1320,6 @@ fn inline_preview(lines: &[DiffLine], max_rows: usize) -> Vec<PreviewRow<'_>> {
         .collect()
 }
 
-const SPLIT_CELL_CHROME_WIDTH: usize = 9;
-const SPLIT_CELL_MIN_WIDTH: usize = SPLIT_CELL_CHROME_WIDTH + 1;
-
 fn side_by_side_content_widths(preview: &[PreviewRow<'_>]) -> (usize, usize) {
     preview.iter().fold((0, 0), |(old, new), row| match row {
         PreviewRow::Line(line) => {
@@ -1281,7 +1341,7 @@ fn side_by_side_card_width(preview: &[PreviewRow<'_>], available_width: u16) -> 
     let (old, new) = side_by_side_content_widths(preview);
     let desired = old
         .saturating_add(new)
-        .saturating_add(SPLIT_CELL_CHROME_WIDTH.saturating_mul(2))
+        .saturating_add(DiffGutter::for_preview(preview).split_chrome() * 2)
         .saturating_add(3);
     u16::try_from(desired.clamp(INLINE_DIFF_CARD_MIN_WIDTH.min(available), available))
         .unwrap_or(u16::MAX)
@@ -1290,17 +1350,22 @@ fn side_by_side_card_width(preview: &[PreviewRow<'_>], available_width: u16) -> 
 fn side_by_side_column_widths(preview: &[PreviewRow<'_>], width: u16) -> (usize, usize) {
     let cells_width = usize::from(width).saturating_sub(3);
     let (old_content, new_content) = side_by_side_content_widths(preview);
-    let old_desired = old_content.saturating_add(SPLIT_CELL_CHROME_WIDTH);
-    let new_desired = new_content.saturating_add(SPLIT_CELL_CHROME_WIDTH);
+    let chrome = DiffGutter::for_preview(preview).split_chrome();
+    let minimum = chrome + 1;
+    let old_desired = old_content.saturating_add(chrome);
+    let new_desired = new_content.saturating_add(chrome);
     let desired_total = old_desired.saturating_add(new_desired);
     if desired_total <= cells_width {
         return (old_desired, cells_width.saturating_sub(old_desired));
     }
+    if cells_width < minimum * 2 {
+        return (cells_width / 2, cells_width - cells_width / 2);
+    }
 
-    let distributable = cells_width.saturating_sub(SPLIT_CELL_MIN_WIDTH.saturating_mul(2));
+    let distributable = cells_width.saturating_sub(minimum * 2);
     let content_total = old_content.saturating_add(new_content).max(1);
     let old_extra = distributable.saturating_mul(old_content) / content_total;
-    let old_width = SPLIT_CELL_MIN_WIDTH.saturating_add(old_extra);
+    let old_width = minimum.saturating_add(old_extra);
     (old_width, cells_width.saturating_sub(old_width))
 }
 
@@ -1327,6 +1392,7 @@ fn render_side_by_side_preview_mapped(
 ) -> Vec<Line> {
     let mut rows = Vec::new();
     let (left_width, right_width) = side_by_side_column_widths(preview, width);
+    let gutter = DiffGutter::for_preview(preview);
     let mut index = 0;
     while index < preview.len() {
         match preview[index] {
@@ -1382,6 +1448,7 @@ fn render_side_by_side_preview_mapped(
                         new,
                         left_width,
                         right_width,
+                        gutter,
                         style,
                     ));
                 }
@@ -1395,6 +1462,7 @@ fn render_side_by_side_preview_mapped(
                     Some(line),
                     left_width,
                     right_width,
+                    gutter,
                     style,
                 ));
                 index += 1;
@@ -1408,6 +1476,7 @@ fn render_side_by_side_preview_mapped(
                     Some(line),
                     left_width,
                     right_width,
+                    gutter,
                     style,
                 ));
                 index += 1;
@@ -1510,10 +1579,11 @@ fn render_split_row_with_style(
     new: Option<&DiffLine>,
     old_width: usize,
     new_width: usize,
+    gutter: DiffGutter,
     style: DiffViewerStyle,
 ) -> Vec<Line> {
-    let old_chunks = split_cell_chunks_with_style(old, old_width, style);
-    let new_chunks = split_cell_chunks_with_style(new, new_width, style);
+    let old_chunks = split_cell_chunks_with_style(old, old_width, gutter, style);
+    let new_chunks = split_cell_chunks_with_style(new, new_width, gutter, style);
     let height = old_chunks.len().max(new_chunks.len());
     (0..height)
         .map(|row| {
@@ -1526,6 +1596,7 @@ fn render_split_row_with_style(
                 old_chunks.get(row),
                 row,
                 old_width,
+                gutter,
                 style,
             ));
             spans.push(Span::styled("│", style.muted));
@@ -1534,6 +1605,7 @@ fn render_split_row_with_style(
                 new_chunks.get(row),
                 row,
                 new_width,
+                gutter,
                 style,
             ));
             spans.push(Span::styled("│", style.muted));
@@ -1545,12 +1617,16 @@ fn render_split_row_with_style(
 fn split_cell_chunks_with_style(
     line: Option<&DiffLine>,
     width: usize,
+    gutter: DiffGutter,
     style: DiffViewerStyle,
 ) -> Vec<Vec<Span>> {
     let Some(line) = line else {
         return vec![Vec::new()];
     };
-    let body_width = width.saturating_sub(9).max(1);
+    if width <= gutter.split_chrome() {
+        return vec![Vec::new()];
+    }
+    let body_width = width - gutter.split_chrome();
     let (_, _, body_style) = style.line(line.kind);
     let chunks = wrap_spans(
         content_spans(line, style.row(line.kind).patch(body_style)),
@@ -1570,6 +1646,7 @@ fn split_cell_row_with_style(
     chunk: Option<&Vec<Span>>,
     row: usize,
     width: usize,
+    gutter: DiffGutter,
     style: DiffViewerStyle,
 ) -> Vec<Span> {
     let Some(line) = line else {
@@ -1595,28 +1672,45 @@ fn split_cell_row_with_style(
             if row == 0 { sign } else { " " },
             background.patch(sign_style.add_modifier(Modifier::BOLD)),
         ),
-        Span::styled(format!("{number:>4}"), gutter_style),
+        Span::styled(
+            format!(
+                "{number:>number_width$}",
+                number_width = gutter.number_width
+            ),
+            gutter_style,
+        ),
         Span::styled(" │ ", gutter_style),
     ];
     if let Some(chunk) = chunk {
         spans.extend(chunk.iter().cloned());
     }
+    spans = Line::from_spans(spans).viewport(0, width).spans;
     pad_card_spans(&mut spans, width, background.patch(body_style));
     spans
 }
 
 #[cfg(test)]
 fn render_diff_line(line: &DiffLine, width: u16) -> Vec<Line> {
-    render_diff_line_with_style(line, width, DiffViewerStyle::default())
+    render_diff_line_with_style(
+        line,
+        width,
+        DiffGutter::for_preview(&[PreviewRow::Line(line)]),
+        DiffViewerStyle::default(),
+    )
 }
 
-fn render_diff_line_with_style(line: &DiffLine, width: u16, style: DiffViewerStyle) -> Vec<Line> {
+fn render_diff_line_with_style(
+    line: &DiffLine,
+    width: u16,
+    gutter: DiffGutter,
+    style: DiffViewerStyle,
+) -> Vec<Line> {
     let (sign, sign_style, body_style) = style.line(line.kind);
     let row_style = style.row(line.kind);
     let emphasis_style = style.emphasis(line.kind);
     let gutter_style = row_style.patch(style.muted);
     let body_width = usize::from(width)
-        .saturating_sub(INLINE_DIFF_BODY_CHROME_WIDTH)
+        .saturating_sub(gutter.unified_chrome())
         .max(1);
     let chunks = wrap_spans(
         content_spans(line, row_style.patch(body_style)),
@@ -1645,13 +1739,23 @@ fn render_diff_line_with_style(line: &DiffLine, width: u16, style: DiffViewerSty
                         sign,
                         row_style.patch(sign_style.add_modifier(Modifier::BOLD)),
                     ),
-                    Span::styled(format!("{:>4}", line_number(line)), gutter_style),
+                    Span::styled(
+                        format!(
+                            "{:>number_width$}",
+                            line_number(line),
+                            number_width = gutter.number_width
+                        ),
+                        gutter_style,
+                    ),
                     Span::styled(" │ ", gutter_style),
                 ]
             } else {
-                continuation_prefix(gutter_style, style.muted)
+                continuation_prefix(gutter_style, style.muted, gutter.number_width)
             };
             card_spans.extend(chunk);
+            card_spans = Line::from_spans(card_spans)
+                .viewport(0, usize::from(width).saturating_sub(2))
+                .spans;
             pad_card_spans(
                 &mut card_spans,
                 usize::from(width).saturating_sub(2),
@@ -1664,12 +1768,12 @@ fn render_diff_line_with_style(line: &DiffLine, width: u16, style: DiffViewerSty
         .collect()
 }
 
-fn continuation_prefix(gutter_style: Style, border_style: Style) -> Vec<Span> {
+fn continuation_prefix(gutter_style: Style, border_style: Style, number_width: usize) -> Vec<Span> {
     vec![
         Span::styled("│ ", border_style),
         Span::styled("  ", gutter_style),
         Span::styled(" ", gutter_style),
-        Span::styled("    ", gutter_style),
+        Span::styled(" ".repeat(number_width), gutter_style),
         Span::styled(" │ ", gutter_style),
     ]
 }
@@ -1728,6 +1832,14 @@ const fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usi
 }
 
 fn card_width(preview: &[PreviewRow<'_>], available_width: u16) -> u16 {
+    card_width_with_gutter(preview, available_width, DiffGutter::for_preview(preview))
+}
+
+fn card_width_with_gutter(
+    preview: &[PreviewRow<'_>],
+    available_width: u16,
+    gutter: DiffGutter,
+) -> u16 {
     let available = usize::from(available_width.max(1));
     let content_width = preview
         .iter()
@@ -1741,7 +1853,7 @@ fn card_width(preview: &[PreviewRow<'_>], available_width: u16) -> u16 {
         .unwrap_or(0);
     u16::try_from(
         content_width
-            .saturating_add(INLINE_DIFF_CARD_CHROME_WIDTH)
+            .saturating_add(gutter.unified_chrome())
             .clamp(INLINE_DIFF_CARD_MIN_WIDTH.min(available), available),
     )
     .unwrap_or(u16::MAX)
@@ -2243,8 +2355,10 @@ mod tests {
     fn fitting_diff_lines_do_not_wrap() {
         let content = "01234567890123456789012345678901234567890123456789";
         let line = DiffLine::new(DiffLineKind::Added, None, Some(1), content);
-        let card_width = u16::try_from(content.len() + INLINE_DIFF_BODY_CHROME_WIDTH)
-            .expect("card width fits u16");
+        let card_width = u16::try_from(
+            content.len() + DiffGutter::for_preview(&[PreviewRow::Line(&line)]).unified_chrome(),
+        )
+        .expect("card width fits u16");
 
         let rows = render_diff_line(&line, card_width);
 
@@ -2341,6 +2455,140 @@ mod tests {
         for width in card_widths {
             assert_eq!(width, first_width);
             assert!(width <= usize::from(available_width));
+        }
+    }
+
+    #[test]
+    fn large_line_numbers_keep_borders_and_wrapped_gutters_aligned() {
+        for number in [9_999, 10_000, 10741, 999_999, u32::MAX - 1] {
+            for layout in [DiffViewerLayout::Unified, DiffViewerLayout::SideBySide] {
+                for width in [48, 80, 240] {
+                    let input = DiffViewerInput {
+                        label: "src/lib.rs",
+                        old_text: "old 界👩‍💻e\u{301} content that wraps across several columns\ncontext\n",
+                        new_text: "new 界👩‍💻e\u{301} content that wraps across several columns\ncontext\n",
+                        old_start_line: number,
+                        new_start_line: number,
+                        line_numbers_known: true,
+                        title: "Diff",
+                        subtitle: None,
+                        argument_bytes: None,
+                        truncated: false,
+                        layout,
+                    };
+                    let rows = diff_viewer_rows(input, width);
+                    let card = rows
+                        .iter()
+                        .filter(|row| is_card_row(row))
+                        .collect::<Vec<_>>();
+                    let expected = card[0].width();
+                    assert!(expected <= usize::from(width));
+                    for row in &card {
+                        assert_eq!(
+                            row.width(),
+                            expected,
+                            "number={number}, layout={layout:?}, width={width}: {row:?}"
+                        );
+                    }
+                    let text = rows
+                        .iter()
+                        .map(|row| {
+                            row.spans
+                                .iter()
+                                .map(|span| span.content.as_str())
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    assert!(text.contains(&number.to_string()));
+                    assert!(text.contains(&(number + 1).to_string()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_gutters_degrade_without_partial_numbers_or_source_mappings() {
+        for layout in [DiffViewerLayout::Unified, DiffViewerLayout::SideBySide] {
+            for width in 0..23 {
+                let input = DiffViewerInput {
+                    label: "src/lib.rs",
+                    old_text: "old\n",
+                    new_text: "new\n",
+                    old_start_line: u32::MAX,
+                    new_start_line: u32::MAX,
+                    line_numbers_known: true,
+                    title: "Diff",
+                    subtitle: None,
+                    argument_bytes: None,
+                    truncated: false,
+                    layout,
+                };
+                let diff = diff_from_text_at_lines(
+                    input.label,
+                    input.old_text,
+                    input.new_text,
+                    input.old_start_line,
+                    input.new_start_line,
+                );
+                let projection = diff_viewer_document_layout_with_style(
+                    input,
+                    diff,
+                    width,
+                    DiffViewerStyle::default(),
+                );
+                assert!(projection.source_lines.is_empty());
+                assert!(projection.rows.last().unwrap().width() <= usize::from(width));
+                assert!(!projection.rows.iter().any(is_card_row));
+            }
+        }
+    }
+
+    #[test]
+    fn large_gutter_selection_starts_at_painted_content() {
+        for known in [true, false] {
+            let input = DiffViewerInput {
+                label: "src/lib.rs",
+                old_text: "old\n",
+                new_text: "new\n",
+                old_start_line: u32::MAX,
+                new_start_line: u32::MAX,
+                line_numbers_known: known,
+                title: "Diff",
+                subtitle: None,
+                argument_bytes: None,
+                truncated: false,
+                layout: DiffViewerLayout::Unified,
+            };
+            let rows = diff_viewer_rows(input, 80);
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
+            let mut frame = Frame::new(&mut buffer);
+            register_diff_viewer_selection(
+                input,
+                Rect::new(0, 0, 80, 20),
+                &ComponentSelectionState::new("large"),
+                &ComponentSelectionPolicy::content(),
+                &mut PaintCx::new(&mut frame),
+            );
+            let fragments = frame.selection().fragments();
+            assert!(!fragments.is_empty());
+            for fragment in fragments {
+                let painted = rows[usize::from(fragment.area.y)].viewport(
+                    usize::from(fragment.area.x),
+                    usize::from(fragment.area.width),
+                );
+                let text = painted
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>();
+                let source = if fragment.content_id.as_str().contains(".old.") {
+                    input.old_text
+                } else {
+                    input.new_text
+                };
+                assert_eq!(text, source[fragment.source_range.clone()]);
+            }
         }
     }
 
