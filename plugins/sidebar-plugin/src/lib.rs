@@ -180,6 +180,7 @@ struct CompanionState {
     subscription: Option<tokio::task::JoinHandle<()>>,
     allocation: Option<ExtensionRect>,
     allocation_publication_pending: bool,
+    presentation_pending: std::cell::Cell<bool>,
     settings: Settings,
     revision: u64,
     snapshot: tabs_list::TabListSnapshot,
@@ -206,6 +207,7 @@ impl CompanionState {
             subscription: None,
             allocation: None,
             allocation_publication_pending: false,
+            presentation_pending: std::cell::Cell::new(false),
             settings,
             revision: 0,
             snapshot: tabs_list::TabListSnapshot {
@@ -252,7 +254,9 @@ impl CompanionState {
             return Ok(());
         }
         self.allocation_publication_pending = true;
+        self.presentation_pending.set(true);
         publish(self)?;
+        self.presentation_pending.set(false);
         self.allocation_publication_pending = false;
         Ok(())
     }
@@ -758,6 +762,7 @@ fn publish_for_installation(
         .map_err(|_| "sidebar state lock poisoned".to_string())?;
     if let Some(companion) = guard.as_mut() {
         companion.replace_tabs(snapshot);
+        companion.presentation_pending.set(true);
         return publish_companion(companion);
     }
     drop(guard);
@@ -788,7 +793,9 @@ fn publish_companion(companion: &CompanionState) -> Result<(), String> {
         .surfaces
         .as_deref()
         .unwrap_or_else(|| global_plugin_surface_registry());
-    publish_surface(registry, revision, &surface)
+    publish_surface(registry, revision, &surface)?;
+    companion.presentation_pending.set(false);
+    Ok(())
 }
 
 fn truncate_to_width(value: &str, maximum: usize) -> String {
@@ -1201,6 +1208,20 @@ fn handle_local_input(
     owner: &CompanionHandle,
     event: &AttachInputEvent,
 ) -> Option<AttachInputResult> {
+    // A failed allocation/model publication leaves authoritative data intact,
+    // but old hooks must not navigate or activate against its unpublished geometry.
+    // Retry the complete snapshot and consume this event even after repair: it
+    // originated from the previous presentation.
+    if let Ok(guard) = owner.lock()
+        && let Some(companion) = guard.as_ref()
+        && companion.presentation_pending.get()
+    {
+        return Some(AttachInputResult {
+            consumed: true,
+            dirty: publish_companion(companion).is_ok(),
+            ..AttachInputResult::default()
+        });
+    }
     if let Some(result) = update_keyboard(owner, event) {
         return Some(result);
     }
@@ -1665,6 +1686,58 @@ mod tests {
                 panic!("unchanged successful allocation republished")
             })
             .unwrap();
+    }
+
+    #[test]
+    fn unpublished_snapshot_consumes_input_until_repaired() {
+        let mut state = CompanionState::new(Settings::default());
+        state.surfaces = Some(std::sync::Arc::new(
+            bmux_plugin::surface::PluginSurfaceRegistry::new(0),
+        ));
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(state)));
+        let snapshot = tabs_list::TabListSnapshot {
+            tabs: vec![],
+            revision: 42,
+        };
+        assert!(super::publish_for_installation(&owner, snapshot).is_err());
+        let event = AttachInputEvent {
+            hook_id: format!("bmux.sidebar:sidebar:tab:{}", Uuid::from_u128(1)),
+            event_kind: "key".to_string(),
+            phase: "press".to_string(),
+            key: Some("enter".to_string()),
+            button: None,
+            col: None,
+            row: None,
+            wheel_delta: 0,
+            modifiers: bmux_plugin::render::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        let rejected = super::handle_local_input(&owner, &event).unwrap();
+        assert!(rejected.consumed);
+        assert!(!rejected.dirty);
+        {
+            let mut guard = owner.lock().unwrap();
+            let state = guard.as_mut().unwrap();
+            assert_eq!(state.snapshot.revision, 42);
+            assert!(state.presentation_pending.get());
+            state.surfaces = Some(std::sync::Arc::new(
+                bmux_plugin::surface::PluginSurfaceRegistry::new(1),
+            ));
+            drop(guard);
+        }
+        let repaired = super::handle_local_input(&owner, &event).unwrap();
+        assert!(repaired.consumed);
+        assert!(repaired.dirty);
+        assert!(
+            !owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .presentation_pending
+                .get()
+        );
     }
 
     #[test]
