@@ -12028,7 +12028,7 @@ async fn try_handle_plugin_surface_mouse(
 
 fn try_handle_plugin_surface_paste(view_state: &mut AttachViewState, text: &str) -> bool {
     let Some(target) = view_state.plugin_focus.focused() else {
-        return false;
+        return view_state.retained_compositor.has_modal_scope();
     };
     if !view_state.retained_compositor.focus_allowed(target) {
         return true;
@@ -12067,7 +12067,7 @@ async fn try_handle_plugin_surface_key(
         return Ok(false);
     };
     let Some(target) = view_state.plugin_focus.focused().cloned() else {
-        return Ok(false);
+        return Ok(view_state.retained_compositor.has_modal_scope());
     };
     if !view_state.retained_compositor.focus_allowed(&target) {
         return Ok(true);

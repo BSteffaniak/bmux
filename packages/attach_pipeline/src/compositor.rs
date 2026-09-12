@@ -828,6 +828,7 @@ fn retarget_hit(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RetainedFocusState {
     focused: Option<PluginSurfaceRegionId>,
+    suspended: Vec<PluginSurfaceRegionId>,
 }
 
 impl RetainedFocusState {
@@ -856,21 +857,56 @@ impl RetainedFocusState {
     }
 
     pub fn reconcile(&mut self, compositor: &RetainedCompositor) -> bool {
-        let Some(focused) = self.focused.as_ref() else {
-            return false;
+        let present = |target: &PluginSurfaceRegionId| {
+            compositor.surfaces().values().any(|surface| {
+                surface.paint_rect().is_some()
+                    && surface
+                        .interactive_regions
+                        .iter()
+                        .any(|region| region.focusable && region.id.as_ref() == Some(target))
+            })
         };
-        let present = compositor.surfaces().values().any(|surface| {
-            surface
-                .interactive_regions
-                .iter()
-                .any(|region| region.focusable && region.id.as_ref() == Some(focused))
-        });
-        if present {
-            false
-        } else {
+        self.suspended.retain(&present);
+        let previous = self.focused.clone();
+        let removed = previous.as_ref().is_some_and(|target| !present(target));
+        if removed {
             self.focused = None;
-            true
         }
+        if let Some(target) = self.focused.as_ref()
+            && compositor.focus_allowed(target)
+        {
+            return removed;
+        }
+        if let Some(target) = self.focused.take() {
+            // Bound nested scope history; focus is attachment-local state.
+            if self.suspended.len() == 32 {
+                self.suspended.remove(0);
+            }
+            if !self.suspended.contains(&target) {
+                self.suspended.push(target);
+            }
+        }
+        if let Some(index) = self
+            .suspended
+            .iter()
+            .rposition(|target| compositor.focus_allowed(target))
+        {
+            self.focused = Some(self.suspended.remove(index));
+        } else {
+            self.focused = compositor
+                .ordered_surfaces()
+                .into_iter()
+                .rev()
+                .filter(|surface| surface.modal)
+                .flat_map(|surface| &surface.interactive_regions)
+                .filter(|region| region.focusable)
+                .filter_map(|region| region.id.as_ref())
+                .find(|target| compositor.focus_allowed(target))
+                .cloned();
+        }
+        // Suspension is not blur: notifying the old owner would destroy the
+        // control that must be restored when the child modal disappears.
+        removed
     }
 }
 
@@ -995,6 +1031,14 @@ impl RetainedCompositor {
             })
             .filter_map(RetainedSurface::paint_rect)
             .collect()
+    }
+
+    /// A visible modal without a focusable child still excludes background keys.
+    #[must_use]
+    pub fn has_modal_scope(&self) -> bool {
+        self.surfaces
+            .values()
+            .any(|surface| surface.modal && surface.paint_rect().is_some())
     }
 
     /// A modal may keep its originating control focused only within the same
@@ -1898,6 +1942,7 @@ mod tests {
         };
         let focus = RetainedFocusState {
             focused: Some(target),
+            suspended: Vec::new(),
         };
         let mut queue = RetainedInputQueue::new(1);
         assert!(queue.push_key(&focus, "first", true));
@@ -2511,6 +2556,72 @@ mod tests {
     }
 
     #[test]
+    fn nested_modal_focus_transfers_and_restores_only_present_targets() {
+        fn surface(id: u128, layer: i16) -> RetainedSurface {
+            let mut surface =
+                RetainedSurface::builder(Uuid::from_u128(id), DamageRect::new(0, 0, 10, 5))
+                    .layer(layer)
+                    .modal(layer > 0)
+                    .build();
+            surface.interactive_regions.push(RetainedInteractiveRegion {
+                id: Some(PluginSurfaceRegionId {
+                    owner_plugin_id: format!("owner-{id}"),
+                    surface_local_id: "control".into(),
+                    region_local_id: "field".into(),
+                }),
+                rect: surface.rect,
+                focusable: true,
+                cursor: bmux_plugin::surface::PluginSurfaceCursor::Default,
+                endpoint: Some(bmux_plugin::AttachInputEndpoint {
+                    capability: format!("input-{id}"),
+                    interface_id: "input/v1".into(),
+                    operation: "event".into(),
+                }),
+            });
+            surface
+        }
+        let base = surface(1, 0);
+        let parent = surface(2, 10);
+        let child = surface(3, 20);
+        let base_id = base.interactive_regions[0].id.clone();
+        let parent_id = parent.interactive_regions[0].id.clone();
+        let child_id = child.interactive_regions[0].id.clone();
+        let mut compositor = RetainedCompositor::new();
+        let mut focus = RetainedFocusState {
+            focused: base_id.clone(),
+            suspended: Vec::new(),
+        };
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        compositor.replace_surfaces(
+            [base.clone(), parent.clone()],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(!focus.reconcile(&compositor));
+        assert_eq!(focus.focused, parent_id);
+        compositor.replace_surfaces(
+            [base.clone(), parent.clone(), child],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(!focus.reconcile(&compositor));
+        assert_eq!(focus.focused, child_id);
+        compositor.replace_surfaces(
+            [base.clone(), parent],
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        assert!(focus.reconcile(&compositor));
+        assert_eq!(focus.focused, parent_id);
+        compositor.replace_surfaces([base], viewport, DamageCoalescingPolicy::default());
+        assert!(focus.reconcile(&compositor));
+        assert_eq!(focus.focused, base_id);
+        compositor.replace_surfaces([], viewport, DamageCoalescingPolicy::default());
+        focus.reconcile(&compositor);
+        assert!(focus.focused().is_none());
+    }
+
+    #[test]
     fn unrelated_modal_suspends_focus_without_destroying_it() {
         let target = PluginSurfaceRegionId {
             owner_plugin_id: "owner".into(),
@@ -2541,6 +2652,12 @@ mod tests {
             DamageRect::new(0, 0, 80, 24),
             DamageCoalescingPolicy::default(),
         );
+        let mut focus = RetainedFocusState {
+            focused: Some(target.clone()),
+            suspended: Vec::new(),
+        };
+        assert!(!focus.reconcile(&compositor));
+        assert!(focus.focused().is_none());
         assert!(!compositor.focus_allowed(&target));
         compositor.replace_surfaces(
             [source],
@@ -2548,6 +2665,8 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
         assert!(compositor.focus_allowed(&target));
+        assert!(!focus.reconcile(&compositor));
+        assert_eq!(focus.focused(), Some(&target));
     }
 
     #[test]
