@@ -5,6 +5,7 @@
 //! terminal coordinates, clips to pane boundaries, and emits the
 //! appropriate protocol-specific escape sequences.
 
+mod clipping;
 use std::io::Write;
 
 #[cfg(feature = "iterm2")]
@@ -36,6 +37,27 @@ pub struct KittyHostState {
 }
 
 impl KittyHostState {
+    /// Delete compositor-owned persistent Kitty images before a repair frame.
+    /// The caller must commit this state only after output succeeds.
+    pub fn clear_placements(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        #[cfg(feature = "kitty")]
+        for host_id in self.transmitted.values() {
+            out.write_all(b"\x1b_")?;
+            out.write_all(&crate::codec::kitty::encode_delete_image(*host_id))?;
+            out.write_all(b"\x1b\\")?;
+        }
+        #[cfg(not(feature = "kitty"))]
+        let _ = out;
+        self.transmitted.clear();
+        Ok(())
+    }
+
+    fn next_fragment_id(&self) -> u32 {
+        u32::try_from(self.transmitted.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+    }
+
     /// Get or allocate a host-side kitty image ID for a bmux image.
     #[cfg(feature = "kitty")]
     fn get_or_allocate(&mut self, bmux_image_id: u64) -> (u32, bool) {
@@ -103,6 +125,56 @@ pub fn render_pane_images(
         }
     }
 
+    Ok(())
+}
+
+/// Render only visible decoded fragments. Raw payloads are accepted only when
+/// no clipping is required; unsafe passthrough is rejected explicitly.
+pub fn render_pane_images_clipped(
+    out: &mut impl Write,
+    images: &[PaneImage],
+    pane: PaneRect,
+    covers: &[bmux_tui::geometry::Rect],
+    caps: &HostImageCapabilities,
+    state: &mut KittyHostState,
+) -> std::io::Result<()> {
+    use bmux_tui::geometry::Rect;
+    for image in images {
+        let destination = Rect::new(
+            pane.x.saturating_add(image.position.col),
+            pane.y.saturating_add(image.position.row),
+            image.cell_size.cols,
+            image.cell_size.rows,
+        );
+        let mut fragments =
+            vec![destination.intersection(Rect::new(pane.x, pane.y, pane.w, pane.h))];
+        for cover in covers {
+            fragments = fragments
+                .into_iter()
+                .flat_map(|rect| clipping::subtract(rect, *cover))
+                .collect();
+            if fragments.len() > 256 {
+                return Err(std::io::Error::other(
+                    "image occlusion fragment budget exceeded",
+                ));
+            }
+        }
+        for visible in fragments.into_iter().filter(|rect| !rect.is_empty()) {
+            let mut fragment = image.clone();
+            if visible != destination {
+                fragment.payload.pixels = Some(clipping::decoded(image)?);
+                fragment.pixel_size =
+                    crate::tui::crop_to_visible(&mut fragment.payload, destination, visible);
+                fragment.payload.raw = None;
+            }
+            fragment.cell_size.cols = visible.width;
+            fragment.cell_size.rows = visible.height;
+            // Each fragment has a distinct transmission; callers clear old
+            // placements before repair and commit the state after flush.
+            fragment.id = u64::from(state.next_fragment_id());
+            emit_from_pixels(out, &fragment, visible.x, visible.y, caps, state)?;
+        }
+    }
     Ok(())
 }
 

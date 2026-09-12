@@ -246,7 +246,7 @@ fn clipped_destination(
     Some(visible)
 }
 
-fn crop_to_visible(
+pub(crate) fn crop_to_visible(
     payload: &mut ImagePayload,
     destination: bmux_tui::geometry::Rect,
     visible: bmux_tui::geometry::Rect,

@@ -337,6 +337,12 @@ pub struct AttachViewState {
         feature = "image-iterm2"
     ))]
     pub kitty_host_state: bmux_image::compositor::KittyHostState,
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    pub pane_images_presented: bool,
     /// Cached image decode mode from config (read once at attach time).
     #[cfg(any(
         feature = "image-sixel",
@@ -663,6 +669,12 @@ impl AttachViewState {
                 feature = "image-iterm2"
             ))]
             kitty_host_state: bmux_image::compositor::KittyHostState::default(),
+            #[cfg(any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            ))]
+            pane_images_presented: false,
             #[cfg(any(
                 feature = "image-sixel",
                 feature = "image-kitty",

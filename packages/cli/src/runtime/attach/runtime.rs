@@ -8479,6 +8479,22 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     };
     let current_prompt_overlay_surface = view_state.prompt.overlay_surface(geometry);
     let mut frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    if view_state.pane_images_presented
+        || view_state
+            .pane_images
+            .values()
+            .any(|images| !images.is_empty())
+    {
+        // Non-persistent raster protocols require cell repair before replacing
+        // or removing a prior image. Use an explicit full repair until damage
+        // can retain protocol-specific raster footprints.
+        frame_damage.mark_full_frame();
+    }
 
     let (top_inset, bottom_inset) = (0, 0);
     let terminal_size = (geometry.cols, geometry.rows);
@@ -8519,6 +8535,19 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     let retained_repaint_by_id = frame_plan.retained.repaint_by_id();
 
     let mut frame_bytes = Vec::new();
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    let mut pending_kitty_state = view_state.kitty_host_state.clone();
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    pending_kitty_state.clear_placements(&mut frame_bytes)?;
+
     // Reconciliation describes encoded output, not yet-presented resources.
     // Keep the committed cache intact until the terminal accepts the frame.
     let mut pending_graphics_cache = view_state.terminal_graphics_cache.clone();
@@ -8626,15 +8655,19 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
                     w: surface.content_rect.w,
                     h: surface.content_rect.h,
                 };
-                let decode_mode = view_state.image_decode_mode;
-                let _ = bmux_image::compositor::render_pane_images(
+                let covers = opaque_overlay_rects
+                    .iter()
+                    .map(|rect| bmux_tui::geometry::Rect::new(rect.x, rect.y, rect.w, rect.h))
+                    .collect::<Vec<_>>();
+                bmux_image::compositor::render_pane_images_clipped(
                     &mut frame_bytes,
                     &pane_images,
                     pane_rect,
+                    &covers,
                     &view_state.host_image_caps,
-                    decode_mode,
-                    &mut view_state.kitty_host_state,
-                );
+                    &mut pending_kitty_state,
+                )
+                .context("failed composing pane images")?;
             }
         }
     }
@@ -8836,6 +8869,19 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     let terminal_write_ms = duration_millis_u64(terminal_write_started_at.elapsed());
     view_state.last_cursor_state = pending_cursor_state;
     view_state.terminal_graphics_cache = pending_graphics_cache;
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    {
+        view_state.kitty_host_state = pending_kitty_state;
+        view_state.pane_images_presented = view_state
+            .pane_images
+            .values()
+            .any(|images| !images.is_empty());
+    }
+
     // Capture only frames that were successfully written and flushed.
     display_capture.record_frame(
         &frame_bytes,
