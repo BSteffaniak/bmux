@@ -49,10 +49,26 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
             Some(region.local_id.as_str())
                 == companion
                     .menu_tab_id
-                    .map(|id| format!("tab:{id}"))
+                    .map(|id| {
+                        format!(
+                            "{}:{id}",
+                            if companion.menu.workspace {
+                                "workspace"
+                            } else {
+                                "tab"
+                            }
+                        )
+                    })
                     .as_deref()
         })?;
-    let width = 12.min(viewport.w);
+    let width = (if companion.menu.confirming {
+        48
+    } else if companion.menu.workspace {
+        22
+    } else {
+        12
+    })
+    .min(viewport.w);
     let height = 5.min(viewport.h);
     let x = strip.x.saturating_add(tab.rect.x).min(viewport.w - width);
     let y = match companion.settings.placement {
@@ -64,20 +80,35 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
 
 #[derive(Debug, Clone)]
 pub struct MenuInput {
+    pub workspace: bool,
+    pub confirming: bool,
     pub state: MenuState,
     pub geometry: CommittedComponentViewport,
 }
 impl Default for MenuInput {
     fn default() -> Self {
         Self {
+            workspace: false,
+            confirming: false,
             state: MenuState::new(Some(0)),
             geometry: CommittedComponentViewport::default(),
         }
     }
 }
 
-fn items() -> [MenuItem; 3] {
-    std::array::from_fn(|index| MenuItem::new(index.to_string(), LABELS[index]))
+fn items(companion: &CompanionState) -> Vec<MenuItem> {
+    let labels: &[&str] = if companion.menu.confirming {
+        &["Cancel", "Close workspace (move tabs to fallback)"]
+    } else if companion.menu.workspace {
+        &["Rename", "Close workspace…"]
+    } else {
+        &LABELS
+    };
+    labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| MenuItem::new(index.to_string(), *label))
+        .collect()
 }
 
 const fn policy() -> MenuPolicy {
@@ -127,7 +158,7 @@ fn component<'a>(
 pub fn viewport(companion: &CompanionState) -> Option<ComponentViewport> {
     companion.menu_tab_id?;
     let rect = popup_rect(companion)?;
-    let items = items();
+    let items = items(companion);
     let state = Cell::new(companion.menu.state);
     let outcome = Cell::new(MenuOutcome::Ignored);
     let component = component(companion, rect, &items, &state, &outcome);
@@ -147,7 +178,7 @@ pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface>
         return Vec::new();
     };
     let rect = viewport.visible_rect();
-    let items = items();
+    let items = items(companion);
     let state = Cell::new(companion.menu.state);
     let outcome = Cell::new(MenuOutcome::Ignored);
     let rect = ExtensionRect::new(rect.x, rect.y, rect.width, rect.height);
@@ -220,20 +251,32 @@ fn transition(
         if !down || event.button.as_deref() != Some("right") {
             return None;
         }
-        let target = event
-            .hook_id
-            .strip_prefix("bmux.tab_bar:strip:tab:")
-            .and_then(|id| Uuid::parse_str(id).ok())?;
-        if !companion.snapshot.tabs.iter().any(|tab| tab.id == target) {
+        let (workspace, selector) =
+            if let Some(id) = event.hook_id.strip_prefix("bmux.tab_bar:strip:workspace:") {
+                (true, id)
+            } else {
+                (
+                    false,
+                    event.hook_id.strip_prefix("bmux.tab_bar:strip:tab:")?,
+                )
+            };
+        let target = Uuid::parse_str(selector).ok()?;
+        if if workspace {
+            companion.workspace_id != Some(target)
+        } else {
+            !companion.snapshot.tabs.iter().any(|tab| tab.id == target)
+        } {
             return None;
         }
+        companion.menu = MenuInput {
+            workspace,
+            ..Default::default()
+        };
         companion.menu_tab_id = Some(target);
-        // Do not capture input unless there is a visible popup to interact with.
         if popup_rect(companion).is_none() {
             companion.menu_tab_id = None;
             return Some(AttachInputResult::default());
         }
-        companion.menu = MenuInput::default();
         companion.editing_tab_id = None;
         companion.pointer_source = None;
         companion.drag_target = None;
@@ -270,7 +313,7 @@ fn transition(
     };
     let rect = viewport.visible_rect();
     let rect = ExtensionRect::new(rect.x, rect.y, rect.width, rect.height);
-    let items = items();
+    let items = items(companion);
     let state = Cell::new(companion.menu.state);
     let outcome = Cell::new(MenuOutcome::Ignored);
     viewport.event_local(
@@ -301,6 +344,39 @@ fn activate_selection(
     };
     result.dirty = true;
     result.release_capture = true;
+    if companion.menu.workspace {
+        if companion.workspace_id != Some(target) {
+            return;
+        }
+        if companion.menu.confirming {
+            if index == 1 {
+                result.service_invocation = command_invocation(
+                    bmux_plugin::AttachInputEndpoint {
+                        capability: "bmux.tab_bar.input".into(),
+                        interface_id: "presentation-input".into(),
+                        operation: "close-workspace".into(),
+                    },
+                    &super::workspaces_commands::client::KillWorkspaceRequest {
+                        selector: super::workspaces_state::WorkspaceSelector {
+                            id: Some(target),
+                            name: None,
+                        },
+                    },
+                );
+            }
+        } else if index == 0 {
+            super::workspace_rename::start_editor(companion, target);
+            result.release_capture = false;
+            result.capture_keyboard = vec!["*".into()];
+        } else {
+            companion.menu_tab_id = Some(target);
+            companion.menu.confirming = true;
+            companion.menu.state = MenuState::new(Some(0));
+            result.release_capture = false;
+            result.capture_keyboard = vec!["*".into()];
+        }
+        return;
+    }
     result.service_invocation = match index {
         0 => command_invocation(
             bmux_plugin::AttachInputEndpoint {
@@ -653,6 +729,63 @@ mod tests {
         assert!(companion.menu.geometry.get().is_none());
         let published = companion.surfaces.owner_snapshot(OWNER).unwrap();
         assert!(published.surfaces.iter().all(|surface| !surface.modal));
+    }
+
+    #[test]
+    fn workspace_menu_renames_and_requires_confirmation_to_close() {
+        let mut companion = companion();
+        let id = companion.workspace_id.unwrap();
+        let input = event(
+            "pointer",
+            "down",
+            None,
+            Some("right"),
+            format!("bmux.tab_bar:strip:workspace:{id}"),
+        );
+        assert!(transition(&mut companion, &input).unwrap().consumed);
+        assert_eq!(items(&companion).len(), 2);
+        let mut result = AttachInputResult::default();
+        activate_selection(&mut companion, &mut result, 0);
+        assert_eq!(companion.editing_workspace_id, Some(id));
+        assert!(companion.menu_tab_id.is_none());
+        assert!(transition(&mut companion, &input).unwrap().consumed);
+        activate_selection(&mut companion, &mut result, 1);
+        assert!(companion.menu.confirming);
+        assert!(result.service_invocation.is_none());
+        assert_eq!(companion.menu.state.selected(), Some(0));
+        activate_selection(&mut companion, &mut result, 0);
+        assert!(companion.menu_tab_id.is_none());
+        assert!(result.service_invocation.is_none());
+        transition(&mut companion, &input);
+        activate_selection(&mut companion, &mut result, 1);
+        activate_selection(&mut companion, &mut result, 1);
+        let invocation = result.service_invocation.unwrap();
+        assert_eq!(invocation.endpoint.operation, "close-workspace");
+        let request: crate::workspaces_commands::client::KillWorkspaceRequest =
+            bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
+        assert_eq!(request.selector.id, Some(id));
+        assert!(request.selector.name.is_none());
+    }
+
+    #[test]
+    fn workspace_menu_does_not_retarget_when_workspace_changes() {
+        let mut companion = companion();
+        let id = companion.workspace_id.unwrap();
+        transition(
+            &mut companion,
+            &event(
+                "pointer",
+                "down",
+                None,
+                Some("right"),
+                format!("bmux.tab_bar:strip:workspace:{id}"),
+            ),
+        );
+        companion.workspace_id = Some(Uuid::from_u128(99));
+        let mut result = AttachInputResult::default();
+        activate_selection(&mut companion, &mut result, 1);
+        assert!(result.service_invocation.is_none());
+        assert!(companion.menu_tab_id.is_none());
     }
 
     #[test]

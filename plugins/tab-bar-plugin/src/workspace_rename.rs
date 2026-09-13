@@ -37,19 +37,23 @@ fn begin(companion: &mut CompanionState, id: Uuid, col: u16, row: u16) -> bool {
         Some((id, col, row, now))
     };
     if double {
-        companion.editing_tab_id = None;
-        companion.menu_tab_id = None;
-        companion.pointer_source = None;
-        companion.pointer_moved = false;
-        companion.drag_target = None;
-        companion.editing_workspace_id = Some(id);
-        companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(
-            companion.workspace_label.clone().unwrap_or_default(),
-        )
-        .into();
-        companion.edit_buffer.select_all();
+        start_editor(companion, id);
     }
     double
+}
+
+pub fn start_editor(companion: &mut CompanionState, id: Uuid) {
+    companion.editing_tab_id = None;
+    companion.menu_tab_id = None;
+    companion.pointer_source = None;
+    companion.pointer_moved = false;
+    companion.drag_target = None;
+    companion.editing_workspace_id = Some(id);
+    companion.edit_buffer = bmux_text_edit::TextEditBuffer::from_text(
+        companion.workspace_label.clone().unwrap_or_default(),
+    )
+    .into();
+    companion.edit_buffer.select_all();
 }
 
 #[allow(clippy::significant_drop_tightening)] // Serialize the gesture and its retained publication.

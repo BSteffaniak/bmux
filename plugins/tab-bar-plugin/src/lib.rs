@@ -302,6 +302,9 @@ impl CompanionState {
             .iter()
             .find(|tab| Some(tab.workspace_id) == workspace_id)
             .map(|tab| tab.workspace_id);
+        if self.menu.workspace && self.menu_tab_id != self.workspace_id {
+            self.menu_tab_id = None;
+        }
         if self.editing_workspace_id.is_some() && self.editing_workspace_id != self.workspace_id {
             self.editing_workspace_id = None;
             self.edit_buffer.clear();
@@ -330,10 +333,13 @@ impl CompanionState {
                     && snapshot.tabs.iter().any(|window| window.id == *id)
             });
             self.snapshot = snapshot;
-            if self
-                .menu_tab_id
-                .is_some_and(|id| !self.snapshot.tabs.iter().any(|tab| tab.id == id))
-            {
+            if self.menu_tab_id.is_some_and(|id| {
+                if self.menu.workspace {
+                    self.workspace_id != Some(id)
+                } else {
+                    !self.snapshot.tabs.iter().any(|tab| tab.id == id)
+                }
+            }) {
                 self.menu_tab_id = None;
             }
             if self
@@ -395,6 +401,12 @@ impl RustPlugin for TabBarPlugin {
                 ))
                 .map_err(|error| ServiceResponse::error("rename_unavailable", error.to_string()))?
                 .map_err(|error| ServiceResponse::error("rename_failed", format!("{error:?}")))
+            },
+            "presentation-input", "close-workspace" => |req: workspaces_commands::client::KillWorkspaceRequest, ctx| {
+                let mut client = ServiceCallerDispatchClient::new(ctx);
+                block_on_typed_dispatch(workspaces_commands::client::kill_workspace(&mut client, req.selector))
+                    .map_err(|error| ServiceResponse::error("close_unavailable", error.to_string()))?
+                    .map_err(|error| ServiceResponse::error("close_failed", format!("{error:?}")))
             },
             "presentation-input", "handle-input" => |event: AttachInputEvent, ctx| {
                 Ok::<_, ServiceResponse>(handle_input(ctx, &event))
@@ -1027,7 +1039,7 @@ fn projection_interaction(state: &CompanionState) -> projection::ProjectionInter
             .edit_buffer
             .selection()
             .map(|selection| (selection.start, selection.end)),
-        menu_tab_id: state.menu_tab_id,
+        menu_tab_id: state.menu_tab_id.filter(|_| !state.menu.workspace),
         menu_selected: state.menu.state.focused().unwrap_or(0),
         workspace_label: state.workspace_label.as_deref(),
         drag_marker_col: state.drag_target.map(|target| target.marker_col),
@@ -1254,7 +1266,7 @@ fn projection_interaction_without_marker(
             .edit_buffer
             .selection()
             .map(|selection| (selection.start, selection.end)),
-        menu_tab_id: state.menu_tab_id,
+        menu_tab_id: state.menu_tab_id.filter(|_| !state.menu.workspace),
         menu_selected: state.menu.state.focused().unwrap_or(0),
         drag_marker_col: None,
         workspace_label: state.workspace_label.as_deref(),
