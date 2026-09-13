@@ -235,6 +235,9 @@ pub struct AttachInputServiceInvocation {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AttachInputResult {
     pub consumed: bool,
+    /// Consume a gesture without changing its existing keyboard focus target.
+    #[serde(default)]
+    pub preserve_focus: bool,
     pub capture_pointer: bool,
     pub capture_keyboard: Vec<String>,
     pub release_capture: bool,

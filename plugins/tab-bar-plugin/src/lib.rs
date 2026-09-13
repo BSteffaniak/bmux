@@ -223,6 +223,8 @@ struct CompanionState {
     last_left_click: Option<(Uuid, u16, u16, Instant)>,
     editing_tab_id: Option<Uuid>,
     edit_buffer: rename_input::RenameInput,
+    multi_selection: std::collections::BTreeSet<Uuid>,
+    workspace_choices: Vec<workspaces_state::WorkspaceSummary>,
     menu_tab_id: Option<Uuid>,
     menu: menu::MenuInput,
     local_presentation: AttachLocalPresentationSnapshot,
@@ -272,6 +274,8 @@ impl CompanionState {
             last_left_click: None,
             editing_tab_id: None,
             edit_buffer: rename_input::RenameInput::default(),
+            multi_selection: std::collections::BTreeSet::new(),
+            workspace_choices: Vec::new(),
             menu_tab_id: None,
             menu: menu::MenuInput::default(),
             local_presentation: AttachLocalPresentationSnapshot::initial(),
@@ -288,6 +292,7 @@ impl CompanionState {
     }
 
     fn replace_tabs(&mut self, mut snapshot: tabs_list::TabListSnapshot) {
+        let previous_workspace = self.workspace_id;
         self.catalog = snapshot.clone();
         let selected = self.selected_context_id;
         let workspace_id = snapshot
@@ -302,6 +307,15 @@ impl CompanionState {
             .iter()
             .find(|tab| Some(tab.workspace_id) == workspace_id)
             .map(|tab| tab.workspace_id);
+        if previous_workspace != self.workspace_id {
+            self.multi_selection.clear();
+        }
+        self.multi_selection.retain(|id| {
+            snapshot
+                .tabs
+                .iter()
+                .any(|tab| tab.id == *id && Some(tab.workspace_id) == self.workspace_id)
+        });
         if self.menu.workspace && self.menu_tab_id != self.workspace_id {
             self.menu_tab_id = None;
         }
@@ -407,6 +421,19 @@ impl RustPlugin for TabBarPlugin {
                 block_on_typed_dispatch(workspaces_commands::client::kill_workspace(&mut client, req.selector))
                     .map_err(|error| ServiceResponse::error("close_unavailable", error.to_string()))?
                     .map_err(|error| ServiceResponse::error("close_failed", format!("{error:?}")))
+            },
+            "presentation-input", "move-selection" => |req: menu::MoveSelectionRequest, ctx| {
+                let mut client = ServiceCallerDispatchClient::new(ctx);
+                if req.tabs.is_empty() || req.tabs.len() > 4096 { return Err(ServiceResponse::error("invalid_selection", "selection must contain 1–4096 tabs")); }
+                let mut moved = 0;
+                let mut failed = Vec::new();
+                for id in req.tabs {
+                    match block_on_typed_dispatch(workspaces_commands::client::move_tab_to_workspace(&mut client, id, workspaces_state::WorkspaceSelector { id: Some(req.workspace), name: None })) {
+                        Ok(Ok(_)) => moved += 1,
+                        error => failed.push(format!("{id}: {error:?}")),
+                    }
+                }
+                if failed.is_empty() { Ok::<_, ServiceResponse>(()) } else { Err(ServiceResponse::error("partial_move", format!("Moved {moved}; failed {}: {}", failed.len(), failed.join("; ")))) }
             },
             "presentation-input", "handle-input" => |event: AttachInputEvent, ctx| {
                 Ok::<_, ServiceResponse>(handle_input(ctx, &event))
@@ -526,7 +553,17 @@ impl TabBarPresentation {
                 &bmux_tabs_plugin_api::tabs_local_view::STATE_KIND,
             )
             .map_err(|error| error.to_string())?;
+        let workspace_subscription = resources
+            .events
+            .subscribe_state::<bmux_workspaces_plugin_api::workspaces_list::WorkspaceListSnapshot>(
+                &bmux_workspaces_plugin_api::workspaces_list::STATE_KIND,
+            )
+            .ok();
         let mut companion = CompanionState::new(settings);
+        let mut workspaces_rx = workspace_subscription.map(|(snapshot, rx)| {
+            companion.workspace_choices.clone_from(&snapshot.workspaces);
+            rx
+        });
         companion.surfaces = resources.surfaces.clone();
         companion.layouts = resources.layouts.clone();
         companion.selected_context_id = selection.context_id;
@@ -552,6 +589,16 @@ impl TabBarPresentation {
         let task = handle.spawn(async move {
             loop {
                 let update = tokio::select! {
+                    result = async {
+                        match &mut workspaces_rx {
+                            Some(rx) => rx.changed().await.ok().map(|()| rx.borrow_and_update().workspaces.clone()),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let Some(workspaces) = result else { workspaces_rx = None; continue; };
+                        PresentationUpdate::Workspaces(workspaces)
+                    }
+
                     result = tabs_rx.changed() => {
                         if result.is_err() { break; }
                         PresentationUpdate::Tabs(tabs_rx.borrow_and_update().as_ref().clone())
@@ -596,6 +643,7 @@ impl Drop for TabBarPresentation {
 }
 
 enum PresentationUpdate {
+    Workspaces(Vec<workspaces_state::WorkspaceSummary>),
     Tabs(tabs_list::TabListSnapshot),
     Local(Box<AttachLocalPresentationSnapshot>),
     Selection(Option<Uuid>),
@@ -612,6 +660,7 @@ fn apply_presentation_update(
         return Ok(());
     };
     match update {
+        PresentationUpdate::Workspaces(workspaces) => companion.workspace_choices = workspaces,
         PresentationUpdate::Tabs(snapshot) => companion.replace_tabs(snapshot),
         PresentationUpdate::Local(snapshot) => companion.replace_local_presentation(*snapshot),
         PresentationUpdate::Selection(context_id) => {
@@ -1087,7 +1136,14 @@ fn build_surface_with_editor(
                 x,
                 0,
                 segment.text.clone(),
-                styles.for_kind(segment.kind),
+                if segment
+                    .tab_id
+                    .is_some_and(|id| state.multi_selection.contains(&id))
+                {
+                    styles.for_kind(segment.kind).underline().bold()
+                } else {
+                    styles.for_kind(segment.kind)
+                },
             ));
         }
         if segment.kind == projection::SegmentKind::EditingWorkspace {
@@ -1302,6 +1358,20 @@ fn update_drag_local(
     let companion = guard.as_mut()?;
     match event.phase.as_str() {
         "down" if event.button.as_deref() == Some("left") => {
+            if event.modifiers.control {
+                if !companion.multi_selection.remove(&source) {
+                    companion.multi_selection.insert(source);
+                }
+                companion.last_left_click = None;
+                companion.pointer_source = None;
+                return Some(AttachInputResult {
+                    consumed: true,
+                    preserve_focus: true,
+                    dirty: republish_companion(companion),
+                    ..Default::default()
+                });
+            }
+            companion.multi_selection.clear();
             companion.last_workspace_click = None;
             companion.editing_workspace_id = None;
             let double_click_tab =

@@ -852,6 +852,7 @@ mod lua_backend {
             return Ok(None);
         }
         Ok(Some(AttachInputResult {
+            preserve_focus: false,
             consumed,
             capture_pointer,
             capture_keyboard,

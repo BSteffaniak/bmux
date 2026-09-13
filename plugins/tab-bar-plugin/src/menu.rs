@@ -61,7 +61,7 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
                     })
                     .as_deref()
         })?;
-    let width = (if companion.menu.confirming {
+    let width = (if !companion.menu.group.is_empty() || companion.menu.confirming {
         48
     } else if companion.menu.workspace {
         22
@@ -69,7 +69,9 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
         12
     })
     .min(viewport.w);
-    let height = 5.min(viewport.h);
+    let height = u16::try_from(items(companion).len().saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(viewport.h);
     let x = strip.x.saturating_add(tab.rect.x).min(viewport.w - width);
     let y = match companion.settings.placement {
         Placement::Top => strip.y.saturating_add(strip.h).min(viewport.h - height),
@@ -80,6 +82,8 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
 
 #[derive(Debug, Clone)]
 pub struct MenuInput {
+    pub group: Vec<Uuid>,
+    pub destinations: Option<Vec<(Uuid, String)>>,
     pub workspace: bool,
     pub confirming: bool,
     pub state: MenuState,
@@ -88,6 +92,8 @@ pub struct MenuInput {
 impl Default for MenuInput {
     fn default() -> Self {
         Self {
+            group: Vec::new(),
+            destinations: None,
             workspace: false,
             confirming: false,
             state: MenuState::new(Some(0)),
@@ -96,7 +102,32 @@ impl Default for MenuInput {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct MoveSelectionRequest {
+    pub tabs: Vec<Uuid>,
+    pub workspace: Uuid,
+}
+
 fn items(companion: &CompanionState) -> Vec<MenuItem> {
+    if let Some(destinations) = &companion.menu.destinations {
+        return std::iter::once(MenuItem::new("cancel", "Cancel"))
+            .chain(
+                destinations
+                    .iter()
+                    .map(|(id, name)| MenuItem::new(id.to_string(), name)),
+            )
+            .collect();
+    }
+    if !companion.menu.group.is_empty() {
+        return vec![MenuItem::new(
+            "move",
+            format!(
+                "Move {} selected tabs to workspace…",
+                companion.menu.group.len()
+            ),
+        )];
+    }
+
     let labels: &[&str] = if companion.menu.confirming {
         &["Cancel", "Close workspace (move tabs to fallback)"]
     } else if companion.menu.workspace {
@@ -272,6 +303,15 @@ fn transition(
             workspace,
             ..Default::default()
         };
+        if !workspace && companion.multi_selection.contains(&target) {
+            companion.menu.group = companion
+                .snapshot
+                .tabs
+                .iter()
+                .filter(|tab| companion.multi_selection.contains(&tab.id))
+                .map(|tab| tab.id)
+                .collect();
+        }
         companion.menu_tab_id = Some(target);
         if popup_rect(companion).is_none() {
             companion.menu_tab_id = None;
@@ -334,6 +374,46 @@ fn transition(
     Some(result)
 }
 
+fn activate_group(
+    companion: &mut CompanionState,
+    result: &mut AttachInputResult,
+    index: usize,
+    target: Uuid,
+) {
+    if !companion.menu.group.is_empty() {
+        if let Some(destinations) = &companion.menu.destinations {
+            if let Some((workspace, _)) = index
+                .checked_sub(1)
+                .and_then(|index| destinations.get(index))
+            {
+                result.service_invocation = command_invocation(
+                    bmux_plugin::AttachInputEndpoint {
+                        capability: "bmux.tab_bar.input".into(),
+                        interface_id: "presentation-input".into(),
+                        operation: "move-selection".into(),
+                    },
+                    &MoveSelectionRequest {
+                        tabs: companion.menu.group.clone(),
+                        workspace: *workspace,
+                    },
+                );
+            }
+        } else {
+            companion.menu.destinations = Some(
+                companion
+                    .workspace_choices
+                    .iter()
+                    .filter(|workspace| Some(workspace.id) != companion.workspace_id)
+                    .map(|workspace| (workspace.id, workspace.name.clone()))
+                    .collect(),
+            );
+            companion.menu.state = MenuState::new(Some(0));
+            companion.menu_tab_id = Some(target);
+            result.release_capture = false;
+        }
+    }
+}
+
 fn activate_selection(
     companion: &mut CompanionState,
     result: &mut AttachInputResult,
@@ -344,6 +424,10 @@ fn activate_selection(
     };
     result.dirty = true;
     result.release_capture = true;
+    if !companion.menu.group.is_empty() {
+        activate_group(companion, result, index, target);
+        return;
+    }
     if companion.menu.workspace {
         if companion.workspace_id != Some(target) {
             return;
@@ -729,6 +813,49 @@ mod tests {
         assert!(companion.menu.geometry.get().is_none());
         let published = companion.surfaces.owner_snapshot(OWNER).unwrap();
         assert!(published.surfaces.iter().all(|surface| !surface.modal));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_without_switching_and_group_move_captures_ids() {
+        let mut companion = companion();
+        let id = Uuid::from_u128(7);
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(companion.clone())));
+        let mut input = event(
+            "pointer",
+            "down",
+            None,
+            Some("left"),
+            format!("bmux.tab_bar:strip:tab:{id}"),
+        );
+        input.modifiers.control = true;
+        let result = crate::handle_local_input(&owner, &input).unwrap();
+        assert!(result.consumed && result.preserve_focus);
+        assert!(result.service_invocation.is_none());
+        companion = owner.lock().unwrap().as_ref().unwrap().clone();
+        assert!(companion.multi_selection.contains(&id));
+        assert!(companion.pointer_source.is_none());
+        companion
+            .workspace_choices
+            .push(crate::workspaces_state::WorkspaceSummary {
+                id: Uuid::from_u128(99),
+                name: "destination".into(),
+                tab_ids: Vec::new(),
+                active: false,
+            });
+        input.modifiers.control = false;
+        input.button = Some("right".into());
+        transition(&mut companion, &input);
+        assert_eq!(companion.menu.group, vec![id]);
+        let mut result = AttachInputResult::default();
+        activate_selection(&mut companion, &mut result, 0);
+        assert!(result.service_invocation.is_none());
+        companion.multi_selection.clear();
+        activate_selection(&mut companion, &mut result, 1);
+        let invocation = result.service_invocation.unwrap();
+        let request: MoveSelectionRequest =
+            bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
+        assert_eq!(request.tabs, vec![id]);
+        assert_eq!(request.workspace, Uuid::from_u128(99));
     }
 
     #[test]

@@ -11878,6 +11878,7 @@ async fn invoke_plugin_surface_pointer_event(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     event: bmux_attach_pipeline::RetainedPointerEvent,
+    modifiers: KeyModifiers,
 ) -> std::result::Result<bool, ClientError> {
     let Some(endpoint) = view_state
         .retained_compositor
@@ -11916,7 +11917,12 @@ async fn invoke_plugin_surface_pointer_event(
         col: Some(event.hit.surface_x),
         row: Some(event.hit.surface_y),
         wheel_delta: event.wheel_delta,
-        modifiers: AttachInputModifiers::default(),
+        modifiers: AttachInputModifiers {
+            control: modifiers.contains(KeyModifiers::CONTROL),
+            shift: modifiers.contains(KeyModifiers::SHIFT),
+            alt: modifiers.contains(KeyModifiers::ALT),
+            ..Default::default()
+        },
         focused_pane: None,
         hovered_pane: None,
     };
@@ -11945,6 +11951,14 @@ async fn invoke_plugin_surface_pointer_event(
             },
         )?
     };
+    if result.consumed && !result.preserve_focus {
+        update_plugin_surface_focus(
+            &mut view_state.plugin_focus,
+            &view_state.retained_compositor,
+            &event,
+            true,
+        );
+    }
     if result.capture_pointer {
         view_state.plugin_pointer_router.capture(event.hit.clone());
         view_state
@@ -12052,13 +12066,8 @@ async fn try_handle_plugin_surface_mouse(
     let mut consumed = false;
     for event in events {
         let event_consumed =
-            invoke_plugin_surface_pointer_event(client, view_state, event.clone()).await?;
-        update_plugin_surface_focus(
-            &mut view_state.plugin_focus,
-            &view_state.retained_compositor,
-            &event,
-            event_consumed,
-        );
+            invoke_plugin_surface_pointer_event(client, view_state, event, mouse_event.modifiers)
+                .await?;
         consumed |= event_consumed;
     }
     if matches!(mouse_event.kind, MouseEventKind::Up(_)) {
