@@ -1915,6 +1915,24 @@ bmux_plugin_sdk::export_plugin!(TabBarPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manifest_declares_workspace_query_and_mutation_capabilities() {
+        let manifest: toml::Value = toml::from_str(include_str!("../plugin.toml")).unwrap();
+        let required = manifest["required_capabilities"].as_array().unwrap();
+        for capability in [
+            workspaces_state::client::ListWorkspacesEndpoint::CAPABILITY,
+            workspaces_state::client::GetWorkspaceEndpoint::CAPABILITY,
+            workspaces_commands::client::MoveTabToWorkspaceEndpoint::CAPABILITY,
+        ] {
+            assert!(
+                required
+                    .iter()
+                    .any(|value| value.as_str() == Some(capability.as_str())),
+                "missing required capability {capability}"
+            );
+        }
+    }
+
     fn scoped_resources() -> bmux_plugin::AttachPresentationResources {
         let events = std::sync::Arc::new(bmux_plugin::EventBus::new());
         events.register_state_channel(
