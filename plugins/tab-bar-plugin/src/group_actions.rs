@@ -92,7 +92,7 @@ pub fn execute(
             };
             match outcome {
                 Ok(Ok(())) => completed += 1,
-                error => errors.push(format!("{id}: {error:?}")),
+                error => errors.push(format!("{error:?} (tab {id})")),
             }
         }
     }
@@ -100,8 +100,7 @@ pub fn execute(
         Ok(())
     } else {
         Err(fail(format!(
-            "Completed {completed}; destination {}; failures: {}",
-            destination,
+            "{}; completed {completed}; destination {destination}",
             errors.join("; ")
         )))
     }

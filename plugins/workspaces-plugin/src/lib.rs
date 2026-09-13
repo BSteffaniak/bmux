@@ -1242,6 +1242,20 @@ bmux_plugin_sdk::export_plugin!(WorkspacesPlugin, include_str!("../plugin.toml")
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manifest_declares_tab_placement_capability() {
+        use bmux_plugin_sdk::TypedServiceEndpoint;
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        let capability =
+            bmux_tabs_plugin_api::tabs_placement_v1::client::PlaceTabEndpoint::CAPABILITY;
+        assert!(
+            manifest
+                .required_capabilities
+                .iter()
+                .any(|value| value.as_str() == capability.as_str())
+        );
+    }
     use super::*;
     use bmux_clients_plugin_api::clients_state::{ClientQueryError, ClientSummary};
     use bmux_contexts_plugin_api::contexts_commands::{ContextAck, SetContextAttributesError};
