@@ -1,7 +1,9 @@
 # ADR-0009: OpenRaft for the Federated Control Plane
 
-- **Status:** Accepted
+- **Status:** Superseded by [ADR-0015](adr-0015-bmux-owned-consensus.md)
 - **Date:** 2026-07-24
+
+ADR-0015 replaces this implementation selection with BMUX-owned established Raft. The decision below is retained as historical rationale and describes the current OpenRaft runtime until replacement qualification and explicit migration are complete; it is not the target architecture.
 
 ## Context
 

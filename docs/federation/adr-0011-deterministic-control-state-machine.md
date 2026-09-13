@@ -2,6 +2,9 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-24
+- **Amended by:** [ADR-0015](adr-0015-bmux-owned-consensus.md)
+
+ADR-0015 preserves this deterministic application contract. OpenRaft references below describe the current integration; the replacement supplies trusted apply context and committed voting configuration through its owned consensus adapter. Application member records still do not themselves grant voting authority.
 
 ## Context
 

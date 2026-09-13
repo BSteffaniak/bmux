@@ -11,14 +11,14 @@ Pane processes and terminal streams must remain available independently from con
 
 ## Decision
 
-Use a vetted Raft-family consensus implementation to order durable cluster control mutations. Do not implement a custom consensus algorithm.
+Use established Raft to order durable cluster control mutations. [ADR-0015](adr-0015-bmux-owned-consensus.md) explicitly permits a BMUX-owned implementation and supersedes ADR-0009's library selection. This amends the original vetted-library restriction, not the quorum, durability, lease, or fencing requirements. Do not invent a new consensus algorithm. Production replacement remains subject to ADR-0015's qualification and migration gates.
 
 ### Roles
 
 - **Voter:** stores the consensus log/state and participates in election and quorum.
 - **Worker:** hosts pane executions; it may also be a voter.
 - **Ingress:** accepts clients and forwards authoritative operations; it may also be a voter and/or worker.
-- **Observer/edge:** receives cluster information and may serve ingress traffic without voting, subject to the selected consensus library's supported learner model.
+- **Observer/edge:** receives cluster information and may serve ingress traffic without voting, subject to the consensus implementation's supported learner model.
 
 A production high-availability cluster requires at least three voters. One-voter mode may be supported for development or personal use with an explicit non-HA warning. Two voters provide no single-voter-failure write availability and must also warn.
 

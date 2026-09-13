@@ -2,6 +2,9 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-24
+- **Amended by:** [ADR-0015](adr-0015-bmux-owned-consensus.md)
+
+ADR-0015 preserves this storage decision and its durability guarantees for the BMUX-owned replacement. OpenRaft API references below describe the existing adapter; their persistence-ordering obligations also bind the replacement. Existing durable representations are not implicitly reinterpreted or declared compatible.
 
 ## Context
 
