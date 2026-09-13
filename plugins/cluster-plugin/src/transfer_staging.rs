@@ -333,6 +333,15 @@ impl TransferStaging {
     /// # Errors
     /// Rejects incomplete or corrupt objects; flush failure poisons the object.
     pub fn finish(&mut self, key: TransferKey) -> io::Result<()> {
+        self.finish_validated(key, |_, _| Ok(()))
+    }
+
+    /// Seal only after the caller validates canonical bytes and header identity.
+    pub(crate) fn finish_validated(
+        &mut self,
+        key: TransferKey,
+        validate: impl FnOnce(&mut File, u64) -> io::Result<()>,
+    ) -> io::Result<()> {
         let transfer = self
             .transfers
             .get_mut(&key)
@@ -345,6 +354,8 @@ impl TransferStaging {
         }
         transfer.failed = true;
         transfer.file.flush()?;
+        transfer.file.seek(SeekFrom::Start(0))?;
+        validate(&mut transfer.file, transfer.total)?;
         transfer.sealed = true;
         transfer.failed = false;
         Ok(())
@@ -450,6 +461,47 @@ mod tests {
             std::fs::read(root.path().join(OWNER_FILE)).unwrap(),
             b"corrupt"
         );
+    }
+
+    #[test]
+    fn canonical_validation_failure_never_seals_or_allows_reads() {
+        let root = private_root();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = recover_directory(root.path()).unwrap();
+        let mut staging = TransferStaging::new(8, 16).unwrap();
+        let key = TransferKey {
+            peer: [1; 32],
+            incarnation: Uuid::nil(),
+            sequence: 1,
+        };
+        let now = Instant::now();
+        staging
+            .begin(
+                &directory,
+                key,
+                [0; 32],
+                4,
+                Sha256::digest(b"bad!").into(),
+                now,
+            )
+            .unwrap();
+        staging.chunk(key, 0, b"bad!", now).unwrap();
+        assert!(
+            staging
+                .finish_validated(key, |file, total| {
+                    crate::consensus_storage::decode_owned_entry_reader(
+                        file,
+                        usize::try_from(total).unwrap(),
+                    )
+                    .map(|_| ())
+                    .map_err(io::Error::other)
+                })
+                .is_err()
+        );
+        assert!(!staging.transfers[&key].sealed);
+        assert!(staging.read(key, 0, &mut [0; 4]).is_err());
+        assert!(staging.finish(key).is_err());
+        staging.abort(key).unwrap();
     }
 
     #[test]

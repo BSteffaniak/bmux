@@ -1772,8 +1772,15 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry<ControlRaftConfig>, ConsensusStora
 pub(crate) fn decode_owned_entry(
     bytes: &[u8],
 ) -> Result<crate::consensus_model::Entry, ConsensusStorageError> {
+    decode_owned_entry_reader(bytes, bytes.len())
+}
+
+pub(crate) fn decode_owned_entry_reader(
+    input: impl std::io::Read,
+    length: usize,
+) -> Result<crate::consensus_model::Entry, ConsensusStorageError> {
     use crate::consensus_model::{Entry, EntryPayload};
-    let mut reader = DurableReader::new(bytes, *b"BMENT001", "log entry")?;
+    let mut reader = DurableReader::from_reader(input, length, *b"BMENT001", "log entry")?;
     let identity = decode_owned_log_identity(&mut reader)?;
     let payload = match reader.u8()? {
         0 => EntryPayload::NoOp,
@@ -1879,8 +1886,8 @@ impl DurableWriter {
 }
 
 struct DurableReader<'a> {
-    bytes: &'a [u8],
-    position: usize,
+    input: Box<dyn std::io::Read + 'a>,
+    remaining: usize,
     record: &'static str,
 }
 
@@ -1890,26 +1897,42 @@ impl<'a> DurableReader<'a> {
         magic: [u8; 8],
         record: &'static str,
     ) -> Result<Self, ConsensusStorageError> {
-        if !bytes.starts_with(&magic) {
-            return Err(ConsensusStorageError::CorruptRecord(record));
-        }
-        Ok(Self {
-            bytes,
-            position: magic.len(),
-            record,
-        })
+        Self::from_reader(bytes, bytes.len(), magic, record)
     }
 
-    fn take(&mut self, count: usize) -> Result<&'a [u8], ConsensusStorageError> {
-        let end = self
-            .position
-            .checked_add(count)
-            .ok_or(ConsensusStorageError::CorruptRecord(self.record))?;
-        let bytes = self
-            .bytes
-            .get(self.position..end)
-            .ok_or(ConsensusStorageError::CorruptRecord(self.record))?;
-        self.position = end;
+    fn from_reader(
+        input: impl std::io::Read + 'a,
+        length: usize,
+        magic: [u8; 8],
+        record: &'static str,
+    ) -> Result<Self, ConsensusStorageError> {
+        let mut reader = Self {
+            input: Box::new(input),
+            remaining: length,
+            record,
+        };
+        if reader.take(8)? != magic {
+            return Err(ConsensusStorageError::CorruptRecord(record));
+        }
+        Ok(reader)
+    }
+
+    fn take(&mut self, count: usize) -> Result<Vec<u8>, ConsensusStorageError> {
+        if count > self.remaining {
+            return Err(ConsensusStorageError::CorruptRecord(self.record));
+        }
+        let mut bytes = Vec::new();
+        // Bound individual reads and grow only after bytes actually arrive.
+        // A forged length on a truncated file cannot preallocate its claim.
+        let mut chunk = [0; 8192];
+        while bytes.len() < count {
+            let size = (count - bytes.len()).min(chunk.len());
+            self.input
+                .read_exact(&mut chunk[..size])
+                .map_err(|_| ConsensusStorageError::CorruptRecord(self.record))?;
+            bytes.extend_from_slice(&chunk[..size]);
+        }
+        self.remaining -= count;
         Ok(bytes)
     }
 
@@ -1963,11 +1986,18 @@ impl<'a> DurableReader<'a> {
 
     fn bytes(&mut self) -> Result<Vec<u8>, ConsensusStorageError> {
         let count = self.count()?;
-        Ok(self.take(count)?.to_vec())
+        self.take(count)
     }
 
-    const fn finish(self) -> Result<(), ConsensusStorageError> {
-        if self.position == self.bytes.len() {
+    fn finish(mut self) -> Result<(), ConsensusStorageError> {
+        let mut extra = [0];
+        if self.remaining == 0
+            && self
+                .input
+                .read(&mut extra)
+                .map_err(|_| ConsensusStorageError::CorruptRecord(self.record))?
+                == 0
+        {
             Ok(())
         } else {
             Err(ConsensusStorageError::CorruptRecord(self.record))

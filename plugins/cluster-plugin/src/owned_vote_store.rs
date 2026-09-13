@@ -878,7 +878,15 @@ impl VoteExecutor {
                         now,
                     ),
                     "chunk" => staging.chunk(key, request.offset, &request.data, now),
-                    "finish" => staging.finish(key).map(|()| request.header.total_bytes),
+                    "finish" => staging
+                        .finish_validated(key, |file, total| {
+                            crate::consensus_network::validate_staged_object(
+                                file,
+                                total,
+                                &request.header,
+                            )
+                        })
+                        .map(|()| request.header.total_bytes),
                     "abort" => staging.abort(key).map(|()| 0),
                     _ => return Err("unknown transfer operation".into()),
                 };

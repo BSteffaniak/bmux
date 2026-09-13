@@ -123,6 +123,85 @@ fn transfer_position(
     })
 }
 
+pub(crate) fn validate_staged_object(
+    file: &mut std::fs::File,
+    total: u64,
+    header: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferHeader,
+) -> std::io::Result<()> {
+    use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose;
+    use std::io::{Error, Read};
+    let length = usize::try_from(total).map_err(Error::other)?;
+    match &header.purpose {
+        TransferPurpose::Entry { value } => {
+            if total > 64 * 1024 * 1024 {
+                return Err(Error::other("entry exceeds owned storage bound"));
+            }
+            let entry = crate::consensus_storage::decode_owned_entry_reader(file, length)
+                .map_err(Error::other)?;
+            if entry.identity != transfer_position(&value.identity).map_err(Error::other)? {
+                return Err(Error::other("staged entry identity mismatch"));
+            }
+        }
+        TransferPurpose::Snapshot { value } => {
+            if total > 300 * 1024 * 1024 {
+                return Err(Error::other("snapshot exceeds owned storage bound"));
+            }
+            // The existing snapshot codec validates control state as well as the
+            // envelope. Retain its finite storage bound until streaming control
+            // decoding replaces this complete decoded-object allocation.
+            let mut bytes = Vec::new();
+            file.take(total + 1).read_to_end(&mut bytes)?;
+            let (descriptor, _) =
+                crate::consensus_storage::decode_owned_snapshot(&bytes).map_err(Error::other)?;
+            let membership = value
+                .membership
+                .as_ref()
+                .map(|m| {
+                    let configurations = m
+                        .configurations
+                        .iter()
+                        .map(|c| {
+                            c.voters
+                                .iter()
+                                .map(|v| transfer_node(v))
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let nodes = m
+                        .nodes
+                        .iter()
+                        .map(|n| Ok((transfer_node(&n.node)?, n.endpoint.clone())))
+                        .collect::<Result<Vec<_>, String>>()?;
+                    Ok::<_, String>(crate::consensus_model::StoredMembership {
+                        introduced_at: Some(transfer_position(&m.introduced_at)?),
+                        membership: crate::consensus_model::Membership::new(configurations, nodes)
+                            .map_err(|e| format!("invalid membership: {e:?}"))?,
+                    })
+                })
+                .transpose()
+                .map_err(Error::other)?;
+            if descriptor.format_version != value.format_version
+                || descriptor.cluster_id != header.cluster_id
+                || descriptor.cluster_id != value.cluster_id
+                || descriptor.snapshot_id != value.snapshot_id
+                || descriptor.last_included
+                    != value
+                        .last_included
+                        .as_ref()
+                        .map(transfer_position)
+                        .transpose()
+                        .map_err(Error::other)?
+                || descriptor.membership != membership
+                || descriptor.total_bytes != total
+                || descriptor.checksum.as_slice() != value.checksum.as_slice()
+            {
+                return Err(Error::other("staged snapshot descriptor mismatch"));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_transfer_descriptor(
     header: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferHeader,
 ) -> Result<(), String> {
