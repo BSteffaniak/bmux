@@ -12113,6 +12113,36 @@ fn try_handle_plugin_surface_paste(view_state: &mut AttachViewState, text: &str)
     result.consumed
 }
 
+fn dispatch_presentation_escape(view_state: &mut AttachViewState, key_name: &str) -> bool {
+    if key_name == "esc"
+        && !view_state.retained_compositor.has_modal_scope()
+        && view_state.plugin_focus.focused().is_none()
+    {
+        let input = AttachInputEvent {
+            hook_id: String::new(),
+            event_kind: "shortcut".into(),
+            phase: "press".into(),
+            key: Some(key_name.to_string()),
+            button: None,
+            col: None,
+            row: None,
+            wheel_delta: 0,
+            modifiers: AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        if let Some(result) = view_state.presentation_input.shortcut(&input) {
+            if result.dirty {
+                view_state
+                    .dirty
+                    .mark_retained_surfaces_dirty(AttachDirtySource::PluginCommand);
+            }
+            return true;
+        }
+    }
+    false
+}
+
 async fn try_handle_plugin_surface_key(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -12121,6 +12151,9 @@ async fn try_handle_plugin_surface_key(
     let Some(key_name) = attach_input_key_name(key) else {
         return Ok(false);
     };
+    if dispatch_presentation_escape(view_state, &key_name) {
+        return Ok(true);
+    }
     let Some(target) = view_state.plugin_focus.focused().cloned() else {
         return Ok(view_state.retained_compositor.has_modal_scope());
     };
@@ -12224,6 +12257,18 @@ async fn execute_surface_action(
             invocation.payload.clone(),
         )
         .await;
+    if let (Ok(payload), Some(endpoint)) = (&outcome, &invocation.response_endpoint)
+        && let Some(result) = view_state.presentation_input.response(endpoint, payload)
+    {
+        if result.dirty {
+            view_state
+                .dirty
+                .mark_retained_surfaces_dirty(AttachDirtySource::PluginCommand);
+        }
+        if let Some(message) = result.status_message {
+            view_state.set_transient_status(message, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
+        }
+    }
     finish_surface_action(view_state, consumed, outcome)
 }
 

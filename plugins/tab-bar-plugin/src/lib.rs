@@ -3,6 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
+mod group_actions;
 mod menu;
 mod projection;
 mod rename_input;
@@ -423,17 +424,12 @@ impl RustPlugin for TabBarPlugin {
                     .map_err(|error| ServiceResponse::error("close_failed", format!("{error:?}")))
             },
             "presentation-input", "move-selection" => |req: menu::MoveSelectionRequest, ctx| {
+                group_actions::execute(req, ctx)
+            },
+            "presentation-input", "list-destinations" => |(): (), ctx| {
                 let mut client = ServiceCallerDispatchClient::new(ctx);
-                if req.tabs.is_empty() || req.tabs.len() > 4096 { return Err(ServiceResponse::error("invalid_selection", "selection must contain 1–4096 tabs")); }
-                let mut moved = 0;
-                let mut failed = Vec::new();
-                for id in req.tabs {
-                    match block_on_typed_dispatch(workspaces_commands::client::move_tab_to_workspace(&mut client, id, workspaces_state::WorkspaceSelector { id: Some(req.workspace), name: None })) {
-                        Ok(Ok(_)) => moved += 1,
-                        error => failed.push(format!("{id}: {error:?}")),
-                    }
-                }
-                if failed.is_empty() { Ok::<_, ServiceResponse>(()) } else { Err(ServiceResponse::error("partial_move", format!("Moved {moved}; failed {}: {}", failed.len(), failed.join("; ")))) }
+                block_on_typed_dispatch(workspaces_state::client::list_workspaces(&mut client))
+                    .map_err(|error| ServiceResponse::error("workspaces_unavailable", error.to_string()))
             },
             "presentation-input", "handle-input" => |event: AttachInputEvent, ctx| {
                 Ok::<_, ServiceResponse>(handle_input(ctx, &event))
@@ -486,6 +482,43 @@ fn register_presentation_input(
     registry: &bmux_plugin::AttachPresentationInputRegistry,
     owner: &CompanionHandle,
 ) {
+    registry.register_shortcut(input_endpoint(), {
+        let owner = owner.clone();
+        std::sync::Arc::new(move |event| handle_local_input(&owner, event))
+    });
+    registry.register_response(input_endpoint(), {
+        let owner = owner.clone();
+        std::sync::Arc::new(move |payload| {
+            let Ok(workspaces) = bmux_plugin_sdk::decode_service_message::<
+                Vec<workspaces_state::WorkspaceSummary>,
+            >(payload) else {
+                return AttachInputResult {
+                    status_message: Some("Invalid workspace list response".into()),
+                    ..Default::default()
+                };
+            };
+            let Ok(mut guard) = owner.lock() else {
+                return AttachInputResult::default();
+            };
+            let Some(companion) = guard.as_mut() else {
+                return AttachInputResult::default();
+            };
+            if companion.menu_tab_id.is_none() || companion.menu.group.is_empty() {
+                return AttachInputResult::default();
+            }
+            companion.menu.destinations = Some(
+                workspaces
+                    .into_iter()
+                    .filter(|workspace| Some(workspace.id) != companion.workspace_id)
+                    .map(|workspace| (workspace.id, workspace.name))
+                    .collect(),
+            );
+            AttachInputResult {
+                dirty: republish_companion(companion),
+                ..Default::default()
+            }
+        })
+    });
     let input_owner = owner.clone();
     registry.register(
         input_endpoint(),
@@ -1145,6 +1178,19 @@ fn build_surface_with_editor(
                     styles.for_kind(segment.kind)
                 },
             ));
+            let selected = segment
+                .tab_id
+                .is_some_and(|id| state.multi_selection.contains(&id));
+            if selected && width >= 2 {
+                let edge = styles.editing.bold();
+                ops.push(RenderOp::text_run(x, 0, "▏", edge));
+                ops.push(RenderOp::text_run(
+                    x.saturating_add(width - 1),
+                    0,
+                    "▕",
+                    edge,
+                ));
+            }
         }
         if segment.kind == projection::SegmentKind::EditingWorkspace {
             let (paint, viewport) =
@@ -1337,6 +1383,7 @@ fn command_invocation<Request: serde::Serialize>(
     // This local gesture owns the move_tab interaction and emits the
     // generated endpoint request for generic attach-side dispatch.
     Some(AttachInputServiceInvocation {
+        response_endpoint: None,
         endpoint,
         payload: bmux_plugin_sdk::encode_service_message(request).ok()?,
     })
@@ -1775,10 +1822,32 @@ fn handle_editor_paste(owner: &CompanionHandle, _hook: &str, text: &str) -> Atta
     }
 }
 
+#[allow(clippy::significant_drop_tightening)] // Selection mutation and publication remain under one lock.
 fn handle_local_input(
     owner: &CompanionHandle,
     event: &AttachInputEvent,
 ) -> Option<AttachInputResult> {
+    if event.event_kind == "shortcut"
+        || (event.event_kind == "key" && event.key.as_deref() == Some("esc"))
+    {
+        let mut guard = owner.lock().ok()?;
+        let companion = guard.as_mut()?;
+        if companion.menu_tab_id.is_none()
+            && companion.editing_tab_id.is_none()
+            && companion.editing_workspace_id.is_none()
+            && !companion.multi_selection.is_empty()
+        {
+            companion.multi_selection.clear();
+            return Some(AttachInputResult {
+                consumed: true,
+                dirty: republish_companion(companion),
+                ..Default::default()
+            });
+        }
+        if event.event_kind == "shortcut" {
+            return None;
+        }
+    }
     if let Some(result) = handle_editor_pointer(owner, event) {
         return Some(result);
     }

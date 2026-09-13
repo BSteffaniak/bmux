@@ -104,28 +104,42 @@ impl Default for MenuInput {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct MoveSelectionRequest {
+    pub action: String,
     pub tabs: Vec<Uuid>,
     pub workspace: Uuid,
 }
 
 fn items(companion: &CompanionState) -> Vec<MenuItem> {
     if let Some(destinations) = &companion.menu.destinations {
-        return std::iter::once(MenuItem::new("cancel", "Cancel"))
-            .chain(
-                destinations
-                    .iter()
-                    .map(|(id, name)| MenuItem::new(id.to_string(), name)),
-            )
-            .collect();
+        return [
+            MenuItem::new("cancel", "Cancel"),
+            MenuItem::new("new", "New workspace"),
+        ]
+        .into_iter()
+        .chain(
+            destinations
+                .iter()
+                .map(|(id, name)| MenuItem::new(id.to_string(), name)),
+        )
+        .collect();
     }
     if !companion.menu.group.is_empty() {
-        return vec![MenuItem::new(
-            "move",
-            format!(
-                "Move {} selected tabs to workspace…",
-                companion.menu.group.len()
-            ),
-        )];
+        let labels: &[&str] = if companion.menu.confirming {
+            &["Cancel", "Close selected tabs (terminate processes)"]
+        } else {
+            &[
+                "Move to workspace…",
+                "Move left",
+                "Move right",
+                "Close selected tabs…",
+                "Clear selection",
+            ]
+        };
+        return labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| MenuItem::new(index.to_string(), *label))
+            .collect();
     }
 
     let labels: &[&str] = if companion.menu.confirming {
@@ -381,9 +395,60 @@ fn activate_group(
     target: Uuid,
 ) {
     if !companion.menu.group.is_empty() {
+        if companion.menu.confirming || (companion.menu.destinations.is_none() && index != 0) {
+            if companion.menu.confirming && index == 0 {
+                return;
+            }
+            if !companion.menu.confirming && index == 4 {
+                companion.multi_selection.clear();
+                return;
+            }
+            if !companion.menu.confirming && index == 3 {
+                companion.menu.confirming = true;
+                companion.menu.state = MenuState::new(Some(0));
+                companion.menu_tab_id = Some(target);
+                result.release_capture = false;
+                return;
+            }
+            let action = if companion.menu.confirming {
+                "close"
+            } else if index == 1 {
+                "left"
+            } else {
+                "right"
+            };
+            result.service_invocation = command_invocation(
+                bmux_plugin::AttachInputEndpoint {
+                    capability: "bmux.tab_bar.input".into(),
+                    interface_id: "presentation-input".into(),
+                    operation: "move-selection".into(),
+                },
+                &MoveSelectionRequest {
+                    action: action.into(),
+                    tabs: companion.menu.group.clone(),
+                    workspace: companion.workspace_id.unwrap_or_default(),
+                },
+            );
+            return;
+        }
         if let Some(destinations) = &companion.menu.destinations {
+            if index == 1 {
+                result.service_invocation = command_invocation(
+                    bmux_plugin::AttachInputEndpoint {
+                        capability: "bmux.tab_bar.input".into(),
+                        interface_id: "presentation-input".into(),
+                        operation: "move-selection".into(),
+                    },
+                    &MoveSelectionRequest {
+                        action: "new".into(),
+                        tabs: companion.menu.group.clone(),
+                        workspace: Uuid::nil(),
+                    },
+                );
+                return;
+            }
             if let Some((workspace, _)) = index
-                .checked_sub(1)
+                .checked_sub(2)
                 .and_then(|index| destinations.get(index))
             {
                 result.service_invocation = command_invocation(
@@ -393,12 +458,24 @@ fn activate_group(
                         operation: "move-selection".into(),
                     },
                     &MoveSelectionRequest {
+                        action: "move".into(),
                         tabs: companion.menu.group.clone(),
                         workspace: *workspace,
                     },
                 );
             }
         } else {
+            result.service_invocation = command_invocation(
+                bmux_plugin::AttachInputEndpoint {
+                    capability: "bmux.tab_bar.input".into(),
+                    interface_id: "presentation-input".into(),
+                    operation: "list-destinations".into(),
+                },
+                &(),
+            );
+            if let Some(invocation) = &mut result.service_invocation {
+                invocation.response_endpoint = Some(Box::new(input_endpoint()));
+            }
             companion.menu.destinations = Some(
                 companion
                     .workspace_choices
@@ -848,14 +925,65 @@ mod tests {
         assert_eq!(companion.menu.group, vec![id]);
         let mut result = AttachInputResult::default();
         activate_selection(&mut companion, &mut result, 0);
-        assert!(result.service_invocation.is_none());
+        assert_eq!(
+            result
+                .service_invocation
+                .as_ref()
+                .unwrap()
+                .endpoint
+                .operation,
+            "list-destinations"
+        );
         companion.multi_selection.clear();
-        activate_selection(&mut companion, &mut result, 1);
+        activate_selection(&mut companion, &mut result, 2);
         let invocation = result.service_invocation.unwrap();
         let request: MoveSelectionRequest =
             bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
         assert_eq!(request.tabs, vec![id]);
         assert_eq!(request.workspace, Uuid::from_u128(99));
+    }
+
+    #[test]
+    fn escape_clears_selection_without_sending_an_action() {
+        let mut companion = companion();
+        companion.multi_selection.insert(Uuid::from_u128(7));
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(companion)));
+        let input = event("shortcut", "press", Some("esc"), None, String::new());
+        let result = crate::handle_local_input(&owner, &input).unwrap();
+        assert!(result.consumed && result.dirty);
+        assert!(result.service_invocation.is_none());
+        assert!(
+            owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .multi_selection
+                .is_empty()
+        );
+        assert!(crate::handle_local_input(&owner, &input).is_none());
+    }
+
+    #[test]
+    fn group_close_defaults_to_cancel_and_new_destination_is_explicit() {
+        let mut companion = companion();
+        open(&mut companion);
+        companion.menu.group = vec![Uuid::from_u128(7)];
+        let mut result = AttachInputResult::default();
+        activate_selection(&mut companion, &mut result, 3);
+        assert!(companion.menu.confirming);
+        assert_eq!(companion.menu.state.selected(), Some(0));
+        activate_selection(&mut companion, &mut result, 0);
+        assert!(result.service_invocation.is_none());
+        open(&mut companion);
+        companion.menu.group = vec![Uuid::from_u128(7)];
+        companion.menu.destinations = Some(Vec::new());
+        assert_eq!(items(&companion).len(), 2);
+        activate_selection(&mut companion, &mut result, 1);
+        let request: MoveSelectionRequest =
+            bmux_plugin_sdk::decode_service_message(&result.service_invocation.unwrap().payload)
+                .unwrap();
+        assert_eq!(request.action, "new");
     }
 
     #[test]

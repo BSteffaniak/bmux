@@ -19,8 +19,12 @@ pub type AttachPresentationPasteHandler =
 /// Opt-in notification for a successfully flushed retained surface revision.
 pub type AttachPresentationCommittedHandler = Arc<dyn Fn(u64) + Send + Sync>;
 
+pub type AttachPresentationResponseHandler = Arc<dyn Fn(&[u8]) -> AttachInputResult + Send + Sync>;
+
 #[derive(Default)]
 pub struct AttachPresentationInputRegistry {
+    shortcuts: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationInputHandler>>,
+    responses: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationResponseHandler>>,
     committed: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationCommittedHandler>>,
     paste: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationPasteHandler>>,
     handlers: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationInputHandler>>,
@@ -31,6 +35,49 @@ impl AttachPresentationInputRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn register_shortcut(
+        &self,
+        endpoint: AttachInputEndpoint,
+        handler: AttachPresentationInputHandler,
+    ) {
+        if let Ok(mut handlers) = self.shortcuts.write() {
+            handlers.insert(endpoint, handler);
+        }
+    }
+
+    #[allow(clippy::needless_collect)] // Release registry lock before invoking callbacks that may unregister themselves.
+    pub fn shortcut(&self, event: &AttachInputEvent) -> Option<AttachInputResult> {
+        let handlers = self
+            .shortcuts
+            .read()
+            .ok()?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        handlers
+            .into_iter()
+            .find_map(|handler| handler(event).filter(|result| result.consumed))
+    }
+
+    pub fn register_response(
+        &self,
+        endpoint: AttachInputEndpoint,
+        handler: AttachPresentationResponseHandler,
+    ) {
+        if let Ok(mut handlers) = self.responses.write() {
+            handlers.insert(endpoint, handler);
+        }
+    }
+
+    pub fn response(
+        &self,
+        endpoint: &AttachInputEndpoint,
+        payload: &[u8],
+    ) -> Option<AttachInputResult> {
+        let handler = self.responses.read().ok()?.get(endpoint)?.clone();
+        Some(handler(payload))
     }
 
     pub fn register(&self, endpoint: AttachInputEndpoint, handler: AttachPresentationInputHandler) {
@@ -126,6 +173,12 @@ impl AttachPresentationInputRegistry {
     }
 
     pub fn remove(&self, endpoint: &AttachInputEndpoint) {
+        if let Ok(mut handlers) = self.shortcuts.write() {
+            handlers.remove(endpoint);
+        }
+        if let Ok(mut handlers) = self.responses.write() {
+            handlers.remove(endpoint);
+        }
         if let Ok(mut handlers) = self.committed.write() {
             handlers.remove(endpoint);
         }

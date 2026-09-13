@@ -228,6 +228,9 @@ pub struct AttachInputEvent {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AttachInputServiceInvocation {
     pub endpoint: AttachInputEndpoint,
+    /// Optional local continuation for the opaque service response.
+    #[serde(default)]
+    pub response_endpoint: Option<Box<AttachInputEndpoint>>,
     pub payload: Vec<u8>,
 }
 
