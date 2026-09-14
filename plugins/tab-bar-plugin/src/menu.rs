@@ -987,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_click_adds_inclusive_active_range_without_switching() {
+    fn alt_click_adds_inclusive_active_range_without_switching() {
         let mut companion = companion();
         let mut snapshot = companion.snapshot.clone();
         snapshot.tabs = (1..=6)
@@ -1013,7 +1013,7 @@ mod tests {
                 Some("left"),
                 format!("bmux.tab_bar:strip:tab:{}", Uuid::from_u128(clicked)),
             );
-            input.modifiers.shift = true;
+            input.modifiers.alt = true;
             let result = crate::handle_local_input(&owner, &input).unwrap();
             assert!(result.consumed && result.preserve_focus);
             assert!(result.service_invocation.is_none());

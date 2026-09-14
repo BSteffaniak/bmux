@@ -1405,13 +1405,13 @@ fn update_drag_local(
     let companion = guard.as_mut()?;
     match event.phase.as_str() {
         "down" if event.button.as_deref() == Some("left") => {
-            if event.modifiers.shift || event.modifiers.control {
+            if event.modifiers.alt || event.modifiers.control {
                 let clicked = companion
                     .snapshot
                     .tabs
                     .iter()
                     .position(|tab| tab.id == source)?;
-                if event.modifiers.shift {
+                if event.modifiers.alt {
                     if let Some(active) = companion.snapshot.tabs.iter().position(|tab| tab.active)
                     {
                         companion.multi_selection.extend(
