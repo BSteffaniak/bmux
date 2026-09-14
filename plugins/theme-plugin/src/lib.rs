@@ -22,21 +22,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use tracing::{info, warn};
 
+mod control_contract {
+    bmux_plugin_schema_macros::schema! { source: "bpdl/theme-plugin.bpdl" }
+}
+
 const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
 // Picker values are namespaced separately from catalog names.
 const CONFIGURED_SELECTION: &str = "configured:";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ThemeSelection {
-    Configured,
-    Preset(String),
-}
+use control_contract::theme_control_v1::Selection as ThemeSelection;
 
 impl ThemeSelection {
     fn picker_value(&self) -> String {
         match self {
             Self::Configured => CONFIGURED_SELECTION.to_string(),
-            Self::Preset(name) => format!("preset:{name}"),
+            Self::Preset { name } => format!("preset:{name}"),
         }
     }
 
@@ -44,9 +44,9 @@ impl ThemeSelection {
         if value == CONFIGURED_SELECTION {
             Some(Self::Configured)
         } else {
-            value
-                .strip_prefix("preset:")
-                .map(|name| Self::Preset(name.to_string()))
+            value.strip_prefix("preset:").map(|name| Self::Preset {
+                name: name.to_string(),
+            })
         }
     }
 }
@@ -648,7 +648,10 @@ fn picker_active_name(stack: &[String]) -> String {
 
 fn picker_selection_name(active: &ActiveThemeStack) -> String {
     if active.source == ActiveThemeSource::Persisted {
-        ThemeSelection::Preset(picker_active_name(&active.stack)).picker_value()
+        ThemeSelection::Preset {
+            name: picker_active_name(&active.stack),
+        }
+        .picker_value()
     } else {
         CONFIGURED_SELECTION.to_string()
     }
@@ -1434,7 +1437,7 @@ fn resolve_picker_value(
         ThemeSelection::Configured => {
             resolve_theme_stack_with_settings(catalog, &declared_theme_stack(settings), settings)
         }
-        ThemeSelection::Preset(name) => resolve_theme_picker_selection(catalog, &name, settings),
+        ThemeSelection::Preset { name } => resolve_theme_picker_selection(catalog, &name, settings),
     }
 }
 
@@ -1825,7 +1828,7 @@ fn persist_theme_name(context: &impl ThemeHostContext, name: &str) -> Result<(),
             version: 1,
             preset: match selection {
                 ThemeSelection::Configured => None,
-                ThemeSelection::Preset(name) => Some(name),
+                ThemeSelection::Preset { name } => Some(name),
             },
         })
         .expect("theme selection contains only JSON-serializable fields"),
@@ -1986,7 +1989,10 @@ fn prompt_options(
                 label.push_str(" (active)");
             }
             bmux_plugin_sdk::PromptOption::new(
-                ThemeSelection::Preset(entry.name.clone()).picker_value(),
+                ThemeSelection::Preset {
+                    name: entry.name.clone(),
+                }
+                .picker_value(),
                 label,
             )
         })
@@ -2122,7 +2128,9 @@ mod tests {
     #[test]
     fn picker_identity_does_not_collide_with_theme_names() {
         for name in ["configured:", "preset:hacker", "hacker"] {
-            let selection = ThemeSelection::Preset(name.to_string());
+            let selection = ThemeSelection::Preset {
+                name: name.to_string(),
+            };
             assert_eq!(
                 ThemeSelection::from_picker_value(&selection.picker_value()),
                 Some(selection)

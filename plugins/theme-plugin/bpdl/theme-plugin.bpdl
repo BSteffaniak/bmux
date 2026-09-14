@@ -1,0 +1,10 @@
+// Theme selection identity is independent of catalog labels. This contract is
+// shared by the picker and the versioned control protocol as it is introduced.
+plugin bmux.theme version 1;
+
+interface theme-control-v1 {
+    variant selection {
+        @default configured,
+        preset { name: string },
+    }
+}

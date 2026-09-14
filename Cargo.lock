@@ -2537,6 +2537,7 @@ dependencies = [
  "bmux_config",
  "bmux_ipc",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
