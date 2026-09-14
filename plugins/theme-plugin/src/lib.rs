@@ -529,7 +529,11 @@ fn configured_theme_with_settings(
         "theme settings parsed",
     );
     let active = active_theme_stack(context, settings, &catalog);
-    let theme = resolve_theme_stack_with_settings(&catalog, &active.stack, settings)?;
+    let theme = if active.source == ActiveThemeSource::Persisted {
+        resolve_theme_picker_selection(&catalog, active.requested_name.as_deref()?, settings)?
+    } else {
+        resolve_theme_stack_with_settings(&catalog, &active.stack, settings)?
+    };
     Some(ActiveThemeResolution {
         stack: active.stack,
         source: active.source,
@@ -1226,15 +1230,6 @@ fn active_theme_stack(
     settings: &ThemePluginSettings,
     catalog: &[ThemeCatalogEntry],
 ) -> ActiveThemeStack {
-    if !settings.themes.is_empty() {
-        let requested = declared_theme_stack(settings);
-        return active_stack_from_requested(
-            catalog,
-            requested,
-            ActiveThemeSource::DeclaredStack,
-            settings.themes.first().cloned(),
-        );
-    }
     if matches!(
         settings.persistence,
         ThemePersistence::PersistBetweenConnects
@@ -1254,7 +1249,11 @@ fn active_theme_stack(
     active_stack_from_requested(
         catalog,
         declared_theme_stack(settings),
-        ActiveThemeSource::Declared,
+        if settings.themes.is_empty() {
+            ActiveThemeSource::Declared
+        } else {
+            ActiveThemeSource::DeclaredStack
+        },
         settings.theme.clone(),
     )
 }
@@ -2057,7 +2056,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_theme_stack_ignores_persisted_theme() {
+    fn explicit_theme_stack_allows_persisted_preset_override() {
         let _router = install_persisted_theme_router(Some("hacker"));
         let context = service_context(Some(toml::Value::Table(toml::map::Map::from_iter([
             (
@@ -2072,8 +2071,31 @@ mod tests {
 
         let active = configured_theme(&context).expect("active theme should resolve");
 
-        assert_eq!(active.source, ActiveThemeSource::DeclaredStack);
-        assert_eq!(active.theme.appearance.background, "#050510");
+        assert_eq!(active.source, ActiveThemeSource::Persisted);
+        assert_eq!(active.theme.appearance.foreground, "#39ff14");
+    }
+
+    #[test]
+    fn persisted_preset_overrides_split_stacks() {
+        let _router = install_persisted_theme_router(Some("hacker"));
+        let settings = toml::from_str::<toml::Value>(
+            r#"
+            appearance_themes = ["performance", "mode-aware"]
+            component_themes = ["performance", "pulse-border"]
+            persistence = "persist_between_connects"
+            "#,
+        )
+        .expect("valid settings");
+        let context = service_context(Some(settings));
+        let active = configured_theme(&context).expect("persisted preset should resolve");
+        assert_eq!(active.source, ActiveThemeSource::Persisted);
+        assert_eq!(active.theme.appearance.foreground, "#39ff14");
+        let decoration = active
+            .theme
+            .plugins
+            .get("bmux.decoration")
+            .expect("decoration");
+        assert!(decoration.get("components").is_none());
     }
 
     #[test]

@@ -1,16 +1,22 @@
 # bmux Theme Plugin
 
-Owns runtime theme selection for bmux. Core configuration still declares the
-startup theme with `[appearance].theme`; this plugin handles live selection,
+Owns runtime theme selection for bmux. Declare the startup theme in
+`[plugins.settings."bmux.theme"]`; this plugin handles live selection,
 preview, persistence, additive theme stacks, and generic theme-extension
 fanout.
+
+With `persistence = "persist_between_connects"`, a saved picker preset takes
+precedence over both `themes` and split `appearance_themes` / `component_themes`
+stacks on reconnect. The preset resolves the same way as a live picker selection;
+declared component overrides and targets still apply. With the default
+`declared_on_connect` policy, reconnect uses the configured composition instead.
 
 ## Theme Stacks
 
 BMUX accepts either a single theme or an ordered stack:
 
 ```toml
-[appearance]
+[plugins.settings."bmux.theme"]
 theme = "cyberpunk"
 themes = ["cyberpunk", "mode-aware"]
 ```
