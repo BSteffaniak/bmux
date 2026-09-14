@@ -987,6 +987,60 @@ mod tests {
     }
 
     #[test]
+    fn shift_click_adds_inclusive_active_range_without_switching() {
+        let mut companion = companion();
+        let mut snapshot = companion.snapshot.clone();
+        snapshot.tabs = (1..=6)
+            .map(|id| {
+                let mut tab = snapshot.tabs[0].clone();
+                tab.id = Uuid::from_u128(id);
+                tab.active = id == 3;
+                tab
+            })
+            .collect();
+        companion.replace_tabs(snapshot);
+        companion.multi_selection.insert(Uuid::from_u128(6));
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(companion)));
+        for (clicked, expected) in [
+            (5, vec![3, 4, 5, 6]),
+            (1, vec![1, 2, 3, 4, 5, 6]),
+            (3, vec![1, 2, 3, 4, 5, 6]),
+        ] {
+            let mut input = event(
+                "pointer",
+                "down",
+                None,
+                Some("left"),
+                format!("bmux.tab_bar:strip:tab:{}", Uuid::from_u128(clicked)),
+            );
+            input.modifiers.shift = true;
+            let result = crate::handle_local_input(&owner, &input).unwrap();
+            assert!(result.consumed && result.preserve_focus);
+            assert!(result.service_invocation.is_none());
+            let state = owner.lock().unwrap().as_ref().unwrap().clone();
+            assert_eq!(
+                state
+                    .multi_selection
+                    .iter()
+                    .map(Uuid::as_u128)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                state
+                    .snapshot
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.active)
+                    .unwrap()
+                    .id,
+                Uuid::from_u128(3)
+            );
+            assert!(state.pointer_source.is_none());
+        }
+    }
+
+    #[test]
     fn workspace_menu_renames_and_requires_confirmation_to_close() {
         let mut companion = companion();
         let id = companion.workspace_id.unwrap();

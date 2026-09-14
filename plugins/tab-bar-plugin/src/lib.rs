@@ -1405,8 +1405,22 @@ fn update_drag_local(
     let companion = guard.as_mut()?;
     match event.phase.as_str() {
         "down" if event.button.as_deref() == Some("left") => {
-            if event.modifiers.control {
-                if !companion.multi_selection.remove(&source) {
+            if event.modifiers.shift || event.modifiers.control {
+                let clicked = companion
+                    .snapshot
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.id == source)?;
+                if event.modifiers.shift {
+                    if let Some(active) = companion.snapshot.tabs.iter().position(|tab| tab.active)
+                    {
+                        companion.multi_selection.extend(
+                            companion.snapshot.tabs[active.min(clicked)..=active.max(clicked)]
+                                .iter()
+                                .map(|tab| tab.id),
+                        );
+                    }
+                } else if !companion.multi_selection.remove(&source) {
                     companion.multi_selection.insert(source);
                 }
                 companion.last_left_click = None;
