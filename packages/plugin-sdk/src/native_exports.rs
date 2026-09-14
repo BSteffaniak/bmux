@@ -1,3 +1,4 @@
+mod service_read;
 use crate::{
     NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
     NativeStreamingServiceContext, PluginEvent, PluginService, ServiceEnvelopeKind,
@@ -908,10 +909,7 @@ pub fn invoke_service_export<P: RustPlugin>(
     let interface_id = context.request.service.interface_id.clone();
     let operation = context.request.operation.clone();
     let lock_started = Instant::now();
-    let response = {
-        let Ok(plugin) = instance.read() else {
-            return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
-        };
+    let Ok(response) = service_read::with_service_read(instance, |plugin| {
         let lock_wait = lock_started.elapsed();
         if lock_wait > PLUGIN_LOCK_LATENCY_BUDGET {
             tracing::warn!(
@@ -938,6 +936,8 @@ pub fn invoke_service_export<P: RustPlugin>(
             );
         }
         response
+    }) else {
+        return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
     };
 
     let Ok(encoded) = encode_service_envelope_with_invocation_id(
@@ -989,11 +989,10 @@ pub fn invoke_streaming_service_export<P: RustPlugin>(
         service,
         events: crate::ServiceEventSinkHandle::noop(),
     };
-    let response = {
-        let Ok(plugin) = instance.read() else {
-            return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
-        };
+    let Ok(response) = service_read::with_service_read(instance, |plugin| {
         plugin.invoke_streaming_service(context)
+    }) else {
+        return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
     };
 
     let Ok(encoded) = encode_service_envelope_with_invocation_id(

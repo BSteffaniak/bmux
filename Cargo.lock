@@ -1275,6 +1275,7 @@ dependencies = [
  "bmux_tui_components",
  "bmux_visual_adapters_plugin_renderer",
  "bmux_workspaces_plugin",
+ "bmux_workspaces_plugin_api",
  "clap",
  "crossterm",
  "futures-util",

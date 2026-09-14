@@ -146,6 +146,12 @@ impl ServerEnv {
         wait_for_exit(&mut child, SERVER_STOP_TIMEOUT, self.root());
     }
 
+    #[must_use]
+    #[allow(dead_code)] // Used by hang diagnostics, not every consumer of this shared fixture.
+    pub fn server_pid(&self) -> Option<u32> {
+        self.server_child.as_ref().map(Child::id)
+    }
+
     pub fn kill(&mut self) {
         if let Some(mut child) = self.server_child.take() {
             child.kill().expect("kill isolated server");
