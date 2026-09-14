@@ -26,6 +26,31 @@ const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
 // Picker values are namespaced separately from catalog names.
 const CONFIGURED_SELECTION: &str = "configured:";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThemeSelection {
+    Configured,
+    Preset(String),
+}
+
+impl ThemeSelection {
+    fn picker_value(&self) -> String {
+        match self {
+            Self::Configured => CONFIGURED_SELECTION.to_string(),
+            Self::Preset(name) => format!("preset:{name}"),
+        }
+    }
+
+    fn from_picker_value(value: &str) -> Option<Self> {
+        if value == CONFIGURED_SELECTION {
+            Some(Self::Configured)
+        } else {
+            value
+                .strip_prefix("preset:")
+                .map(|name| Self::Preset(name.to_string()))
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedThemeSelection {
@@ -623,7 +648,7 @@ fn picker_active_name(stack: &[String]) -> String {
 
 fn picker_selection_name(active: &ActiveThemeStack) -> String {
     if active.source == ActiveThemeSource::Persisted {
-        picker_active_name(&active.stack)
+        ThemeSelection::Preset(picker_active_name(&active.stack)).picker_value()
     } else {
         CONFIGURED_SELECTION.to_string()
     }
@@ -653,8 +678,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     };
     let active_name = picker_selection_name(&active_stack);
-    let Some(original_theme) = resolve_theme_picker_selection(&catalog, &active_name, &settings)
-    else {
+    let Some(original_theme) = resolve_picker_value(&catalog, &active_name, &settings) else {
         return;
     };
     let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
@@ -686,7 +710,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
                     continue;
                 };
                 if let PromptEvent::SelectionChanged { value, .. } = event
-                    && let Some(theme) = resolve_theme_picker_selection(&catalog, &value, &settings)
+                    && let Some(theme) = resolve_picker_value(&catalog, &value, &settings)
                 {
                     previewed = true;
                     publish_runtime_appearance_to_host(&context, &theme);
@@ -702,7 +726,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
     };
 
     if let Some(name) = selected_name
-        && let Some(theme) = resolve_theme_picker_selection(&catalog, &name, &settings)
+        && let Some(theme) = resolve_picker_value(&catalog, &name, &settings)
     {
         publish_runtime_appearance_to_host(&context, &theme);
         apply_theme_extensions(
@@ -716,6 +740,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
             ThemePersistence::PersistBetweenConnects
         ) {
             if persist_theme_name(&context, &name).is_err() {
+                restore_picker_theme(&context, &original_theme, &all_plugin_ids);
                 return;
             }
         } else {
@@ -734,14 +759,22 @@ async fn run_theme_picker(context: NativeCommandContext) {
     }
 
     if previewed {
-        publish_runtime_appearance_to_host(&context, &original_theme);
-        apply_theme_extensions(
-            &context,
-            &original_theme,
-            &all_plugin_ids,
-            &context.connection.config_dir_candidates,
-        );
+        restore_picker_theme(&context, &original_theme, &all_plugin_ids);
     }
+}
+
+fn restore_picker_theme(
+    context: &NativeCommandContext,
+    theme: &ResolvedTheme,
+    plugin_ids: &[String],
+) {
+    publish_runtime_appearance_to_host(context, theme);
+    apply_theme_extensions(
+        context,
+        theme,
+        plugin_ids,
+        &context.connection.config_dir_candidates,
+    );
 }
 
 async fn configure_theme_settings_providers(
@@ -1392,16 +1425,25 @@ fn resolve_theme_stack_with_settings(
     Some(theme)
 }
 
+fn resolve_picker_value(
+    catalog: &[ThemeCatalogEntry],
+    value: &str,
+    settings: &ThemePluginSettings,
+) -> Option<ResolvedTheme> {
+    match ThemeSelection::from_picker_value(value)? {
+        ThemeSelection::Configured => {
+            resolve_theme_stack_with_settings(catalog, &declared_theme_stack(settings), settings)
+        }
+        ThemeSelection::Preset(name) => resolve_theme_picker_selection(catalog, &name, settings),
+    }
+}
+
 fn resolve_theme_picker_selection(
     catalog: &[ThemeCatalogEntry],
     name: &str,
     settings: &ThemePluginSettings,
 ) -> Option<ResolvedTheme> {
-    let mut theme = if name == CONFIGURED_SELECTION {
-        resolve_theme_stack_with_settings(catalog, &declared_theme_stack(settings), settings)?
-    } else {
-        resolve_theme_stack(catalog, &base_theme_stack(name))?
-    };
+    let mut theme = resolve_theme_stack(catalog, &base_theme_stack(name))?;
     apply_theme_settings_component_overrides(&mut theme, &settings.theme_settings);
     apply_settings_component_overrides(&mut theme, &settings.components);
     apply_settings_component_target_overrides(&mut theme, &settings.component_targets);
@@ -1776,11 +1818,15 @@ fn read_persisted_theme_name(
 }
 
 fn persist_theme_name(context: &impl ThemeHostContext, name: &str) -> Result<(), String> {
+    let selection = ThemeSelection::from_picker_value(name).ok_or("invalid picker selection")?;
     let result = context.storage_set(&StorageSetRequest::new(
         bmux_plugin_sdk::storage_key!("selected_theme"),
         serde_json::to_vec(&PersistedThemeSelection {
             version: 1,
-            preset: (name != CONFIGURED_SELECTION).then(|| name.to_string()),
+            preset: match selection {
+                ThemeSelection::Configured => None,
+                ThemeSelection::Preset(name) => Some(name),
+            },
         })
         .expect("theme selection contains only JSON-serializable fields"),
     ));
@@ -1930,7 +1976,8 @@ fn prompt_options(
     catalog: &[ThemeCatalogEntry],
     active_name: &str,
 ) -> Vec<bmux_plugin_sdk::PromptOption> {
-    let active_name = theme_by_name(catalog, active_name).map_or(active_name, |theme| &theme.name);
+    let preset = active_name.strip_prefix("preset:").unwrap_or(active_name);
+    let active_name = theme_by_name(catalog, preset).map_or(preset, |theme| &theme.name);
     catalog
         .iter()
         .map(|entry| {
@@ -1938,12 +1985,19 @@ fn prompt_options(
             if entry.name == active_name {
                 label.push_str(" (active)");
             }
-            bmux_plugin_sdk::PromptOption::new(entry.name.as_str(), label)
+            bmux_plugin_sdk::PromptOption::new(
+                ThemeSelection::Preset(entry.name.clone()).picker_value(),
+                label,
+            )
         })
         .collect()
 }
 
 fn selected_index(catalog: &[ThemeCatalogEntry], active_name: &str) -> usize {
+    if active_name == CONFIGURED_SELECTION {
+        return 0;
+    }
+    let active_name = active_name.strip_prefix("preset:").unwrap_or(active_name);
     let active_name = theme_by_name(catalog, active_name).map_or(active_name, |theme| &theme.name);
     catalog
         .iter()
@@ -2066,6 +2120,22 @@ mod tests {
     }
 
     #[test]
+    fn picker_identity_does_not_collide_with_theme_names() {
+        for name in ["configured:", "preset:hacker", "hacker"] {
+            let selection = ThemeSelection::Preset(name.to_string());
+            assert_eq!(
+                ThemeSelection::from_picker_value(&selection.picker_value()),
+                Some(selection)
+            );
+        }
+        assert_eq!(
+            ThemeSelection::from_picker_value(CONFIGURED_SELECTION),
+            Some(ThemeSelection::Configured)
+        );
+        assert!(ThemeSelection::from_picker_value("unqualified").is_none());
+    }
+
+    #[test]
     fn selection_records_decode_legacy_configured_and_reject_unknown_versions() {
         assert_eq!(
             decode_theme_selection(b"hacker").expect("legacy"),
@@ -2090,8 +2160,8 @@ mod tests {
         )
         .expect("settings");
         let catalog = load_theme_catalog(&[]);
-        let configured = resolve_theme_picker_selection(&catalog, CONFIGURED_SELECTION, &settings)
-            .expect("configured");
+        let configured =
+            resolve_picker_value(&catalog, CONFIGURED_SELECTION, &settings).expect("configured");
         let expected = resolve_theme_stack_with_settings(
             &catalog,
             &declared_theme_stack(&settings),
@@ -2157,6 +2227,56 @@ mod tests {
         .await
         .expect("picker must finish without spinning");
         assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    async fn picker_storage_failure_restores_previous_extension() {
+        let applied = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = applied.clone();
+        let router: TestServiceRouter =
+            Arc::new(move |_, _, capability, _, _, operation, payload| {
+                match (capability, operation) {
+                    ("bmux.storage", "get") => encode_service_message(&StorageGetResponse {
+                        value: Some(b"hacker".to_vec()),
+                    }),
+                    ("bmux.storage", "set") => Err(bmux_plugin_sdk::PluginError::InvalidPluginId {
+                        id: "injected storage failure".into(),
+                    }),
+                    ("bmux.decoration.write", "apply") => {
+                        let request: ApplyThemeExtensionArgs =
+                            decode_service_message(&payload).expect("extension");
+                        observed.lock().expect("applied").push(request.toml);
+                        encode_service_message(&())
+                    }
+                    _ => encode_service_message(&()),
+                }
+            });
+        let _router = install_test_service_router(router);
+        let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let _host = prompt::register_host(sender);
+        let mut context = picker_context();
+        context.settings =
+            Some(toml::from_str("persistence = 'persist_between_connects'").expect("settings"));
+        let host = async {
+            let request = requests.recv().await.expect("prompt");
+            request
+                .response_tx
+                .send(PromptResponse::Submitted(PromptValue::Single(
+                    "preset:minimal".into(),
+                )))
+                .expect("response");
+        };
+        tokio::join!(run_theme_picker(context), host);
+        let applied = applied.lock().expect("applied");
+        assert_eq!(applied.len(), 2);
+        let catalog = load_theme_catalog(&[]);
+        let original =
+            resolve_theme_picker_selection(&catalog, "hacker", &ThemePluginSettings::default())
+                .expect("original");
+        let restored: toml::Value = toml::from_str(&applied[1]).expect("restored");
+        drop(applied);
+        assert_eq!(&restored, &original.plugins["bmux.decoration"]);
     }
 
     #[test]
