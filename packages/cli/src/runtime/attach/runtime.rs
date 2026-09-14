@@ -11967,7 +11967,11 @@ async fn invoke_plugin_surface_pointer_event(
     }
     if result.release_capture {
         let _ = view_state.plugin_pointer_router.release_capture();
-        let _ = view_state.plugin_focus.clear();
+        // A gesture may release pointer ownership while handing keyboard input
+        // to an editor on the same retained target. Do not erase that handoff.
+        if result.capture_keyboard.is_empty() {
+            let _ = view_state.plugin_focus.clear();
+        }
     }
     if result.dirty {
         view_state
@@ -15163,8 +15167,6 @@ mod tests {
                 focused_pane: None,
                 hovered_pane: None,
             };
-            resources.input.invoke(&endpoint, &event).unwrap();
-            resources.input.invoke(&endpoint, &event).unwrap();
             let viewport = DamageRect::new(0, 0, 80, 24);
             let surfaces = super::retained_plugin_surfaces(&state, viewport);
             super::replace_retained_surfaces(
@@ -15182,10 +15184,7 @@ mod tests {
                         .is_some_and(|id| id.region_local_id == target)
                 })
                 .expect("rename field");
-            state
-                .plugin_focus
-                .focus_hit(&state.retained_compositor, &hit);
-            super::acknowledge_plugin_surface_output(&state);
+            begin_rename_through_pointer_router(&mut state, &hit, viewport).await;
             event.event_kind = "key".into();
             event.phase = "press".into();
             event.key = Some("backspace".into());
@@ -15209,6 +15208,57 @@ mod tests {
                     .any(|bytes| bytes == "界 renamed".as_bytes())
             );
         }
+    }
+
+    #[cfg(feature = "bundled-plugin-tab-bar")]
+    async fn begin_rename_through_pointer_router(
+        state: &mut AttachViewState,
+        hit: &bmux_attach_pipeline::RetainedSurfaceHit,
+        viewport: DamageRect,
+    ) {
+        let mut client = disconnected_focus_test_client().await;
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: hit.absolute_x,
+            row: hit.absolute_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Start the first gesture without releasing it into a remote switch.
+        // The second Down must hand pointer capture to keyboard ownership.
+        for _ in 0..2 {
+            assert!(
+                try_handle_plugin_surface_mouse(&mut client, state, down)
+                    .await
+                    .unwrap()
+            );
+        }
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            ..down
+        };
+        assert!(
+            try_handle_plugin_surface_mouse(&mut client, state, up)
+                .await
+                .unwrap()
+        );
+        let surfaces = super::retained_plugin_surfaces(state, viewport);
+        super::replace_retained_surfaces(
+            state,
+            surfaces,
+            viewport,
+            DamageCoalescingPolicy::default(),
+        );
+        super::acknowledge_plugin_surface_output(state);
+        assert!(state.plugin_focus.focused().is_some());
+        let backspace = super::super::input::TerminalKeyEvent::from(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        ));
+        assert!(
+            try_handle_plugin_surface_key(&mut client, state, &backspace)
+                .await
+                .unwrap()
+        );
     }
 
     struct FailingWriter {
