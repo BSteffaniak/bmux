@@ -2436,8 +2436,9 @@ mod tests {
             Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
         )
         .unwrap();
-        let executor =
-            owned_vote_store::VoteExecutor::new(owned_vote_store::DurableVoteGate::new(1, store));
+        let executor = std::sync::Arc::new(owned_vote_store::VoteExecutor::new(
+            owned_vote_store::DurableVoteGate::new(1, store),
+        ));
         let position = LogIdentity {
             term: Term(0),
             leader: node,
@@ -2635,15 +2636,25 @@ mod tests {
             };
             append.proof.signature =
                 identity.sign(&consensus_network::owned_append_signing_payload(&append).unwrap());
-            let decision = executor
-                .append_authenticated(caller.clone(), node, append)
+            let request_id = append.request_id;
+            let provider = consensus_network::OwnedAppendService {
+                caller: caller.clone(),
+                local: node,
+                executor: executor.clone(),
+            };
+            let response =
+                bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService::append(
+                    &provider, append,
+                )
                 .await
                 .unwrap();
-            assert!(matches!(
-                decision.outcome,
-                Ok(crate::consensus_model::AppendOutcome::Reconciled(
-                    crate::consensus_model::AppendReconciliation::Matched { .. }
-                ))
+            assert_eq!(response.request_id, request_id);
+            assert_eq!(response.source, node.as_bytes());
+            assert_eq!(response.term, 0);
+            assert!(matches!(response.outcome,
+                bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendOutcome::Durable {
+                    matched: Some(ref matched)
+                } if matched.index == 2 && matched.term == 0 && matched.leader == node.as_bytes()
             ));
         }
         executor.shutdown().await.unwrap();
