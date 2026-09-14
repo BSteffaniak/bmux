@@ -33,6 +33,14 @@ storage. Shared live-state authority, exact cancellation restoration, and an
 explicit file-refresh command are not yet implemented. Saving configuration or
 Lua files does not automatically reload them.
 
+## Theme File Precedence
+
+User `themes/*.toml` files override bundled presets with the same filename stem.
+The first host configuration-directory candidate has priority over fallback
+candidates. A malformed overriding file is reported with its path and excludes
+that preset from the catalog rather than silently substituting the bundled
+version. Other valid presets remain available.
+
 ## Theme Stacks
 
 BMUX accepts either a single theme or an ordered stack:

@@ -733,13 +733,9 @@ async fn run_theme_picker(context: NativeCommandContext) {
                     && let Some(theme) = resolve_picker_value(&catalog, &value, &settings)
                 {
                     previewed = true;
-                    publish_runtime_appearance_to_host(&context, &theme);
-                    apply_theme_extensions(
-                        &context,
-                        &theme,
-                        &all_plugin_ids,
-                        &context.connection.config_dir_candidates,
-                    );
+                    if !apply_picker_theme(&context, &theme, &all_plugin_ids) {
+                        break None;
+                    }
                 }
             }
         }
@@ -748,13 +744,10 @@ async fn run_theme_picker(context: NativeCommandContext) {
     if let Some(name) = selected_name
         && let Some(theme) = resolve_picker_value(&catalog, &name, &settings)
     {
-        publish_runtime_appearance_to_host(&context, &theme);
-        apply_theme_extensions(
-            &context,
-            &theme,
-            &all_plugin_ids,
-            &context.connection.config_dir_candidates,
-        );
+        if !apply_picker_theme(&context, &theme, &all_plugin_ids) {
+            restore_picker_theme(&context, &original_theme, &all_plugin_ids);
+            return;
+        }
         if matches!(
             settings.persistence,
             ThemePersistence::PersistBetweenConnects
@@ -788,13 +781,27 @@ fn restore_picker_theme(
     theme: &ResolvedTheme,
     plugin_ids: &[String],
 ) {
-    publish_runtime_appearance_to_host(context, theme);
-    apply_theme_extensions(
+    if !apply_picker_theme(context, theme, plugin_ids) {
+        warn!("theme restoration failed; presentation requires recovery");
+    }
+}
+
+fn apply_picker_theme(
+    context: &NativeCommandContext,
+    theme: &ResolvedTheme,
+    plugin_ids: &[String],
+) -> bool {
+    if let Err(error) = try_apply_theme_extensions(
         context,
         theme,
         plugin_ids,
         &context.connection.config_dir_candidates,
-    );
+    ) {
+        warn!(%error, "theme selection application failed");
+        return false;
+    }
+    publish_runtime_appearance_to_host(context, theme);
+    true
 }
 
 async fn configure_theme_settings_providers(
@@ -1876,7 +1883,15 @@ fn load_theme_catalog(config_dir_candidates: &[std::path::PathBuf]) -> Vec<Theme
         theme: ThemeConfig::default(),
     }];
 
-    for dir in config_dir_candidates {
+    for (name, text) in bundled_theme_presets() {
+        if let Ok(theme) = toml::from_str::<ThemeConfig>(text) {
+            upsert_theme_catalog_entry(&mut entries, (*name).to_string(), theme);
+        }
+    }
+
+    // Candidate directories are highest priority first. Apply them in reverse
+    // so the first candidate overrides fallback directories and bundled defaults.
+    for dir in config_dir_candidates.iter().rev() {
         let themes_dir = dir.join("themes");
         let Ok(read_dir) = std::fs::read_dir(themes_dir) else {
             continue;
@@ -1889,12 +1904,6 @@ fn load_theme_catalog(config_dir_candidates: &[std::path::PathBuf]) -> Vec<Theme
         }
     }
 
-    for (name, text) in bundled_theme_presets() {
-        if let Ok(theme) = toml::from_str::<ThemeConfig>(text) {
-            upsert_theme_catalog_entry(&mut entries, (*name).to_string(), theme);
-        }
-    }
-
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
 }
@@ -1903,10 +1912,21 @@ fn load_theme_file(path: &Path, entries: &mut Vec<ThemeCatalogEntry>) {
     let Some(name) = path.file_stem().and_then(std::ffi::OsStr::to_str) else {
         return;
     };
-    if let Ok(text) = std::fs::read_to_string(path)
-        && let Ok(theme) = toml::from_str::<ThemeConfig>(&text)
-    {
-        upsert_theme_catalog_entry(entries, name.to_string(), theme);
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            warn!(path = %path.display(), %error, "failed reading theme file");
+            entries.retain(|entry| entry.name != name);
+            return;
+        }
+    };
+    match toml::from_str::<ThemeConfig>(&text) {
+        Ok(theme) => upsert_theme_catalog_entry(entries, name.to_string(), theme),
+        Err(error) => {
+            warn!(path = %path.display(), %error, "invalid theme file");
+            // Do not silently substitute a lower-priority preset with the same name.
+            entries.retain(|entry| entry.name != name);
+        }
     }
 }
 
@@ -2048,21 +2068,33 @@ fn apply_theme_extensions(
     plugin_ids: &[String],
     config_dir_candidates: &[String],
 ) {
+    if let Err(error) =
+        try_apply_theme_extensions(context, theme, plugin_ids, config_dir_candidates)
+    {
+        warn!(%error, "theme extension application failed");
+    }
+}
+
+fn try_apply_theme_extensions(
+    context: &(impl ServiceCaller + Sync),
+    theme: &ResolvedTheme,
+    plugin_ids: &[String],
+    config_dir_candidates: &[String],
+) -> Result<(), String> {
     for plugin_id in plugin_ids {
-        let toml = theme
-            .plugins
-            .get(plugin_id)
-            .and_then(|extension| toml::to_string(extension).ok())
-            .unwrap_or_default();
+        let toml = match theme.plugins.get(plugin_id) {
+            Some(extension) => {
+                toml::to_string(extension).map_err(|error| format!("{plugin_id}: {error}"))?
+            }
+            None => String::new(),
+        };
         let request = ApplyThemeExtensionArgs {
             toml,
             config_dir_candidates: config_dir_candidates.to_vec(),
         };
         let has_extension = !request.toml.trim().is_empty();
-        let Ok(payload) = bmux_plugin_sdk::encode_service_message(&request) else {
-            warn!(plugin_id = %plugin_id, "failed encoding theme extension apply request");
-            continue;
-        };
+        let payload = bmux_plugin_sdk::encode_service_message(&request)
+            .map_err(|error| format!("{plugin_id}: {error}"))?;
         let capability = format!("{plugin_id}.write");
         info!(
             plugin_id = %plugin_id,
@@ -2079,15 +2111,16 @@ fn apply_theme_extensions(
                 operation = "apply",
                 "theme extension apply failed",
             );
-        } else {
-            info!(
-                plugin_id = %plugin_id,
-                capability = %capability,
-                has_extension,
-                "theme extension apply completed",
-            );
+            return Err(format!("{plugin_id}: {error}"));
         }
+        info!(
+            plugin_id = %plugin_id,
+            capability = %capability,
+            has_extension,
+            "theme extension apply completed",
+        );
     }
+    Ok(())
 }
 
 fn execute_theme_extension_apply(
@@ -2355,6 +2388,82 @@ mod tests {
             execute_theme_extension_apply(&picker_context(), "bmux.decoration.write", payload)
                 .expect_err("validation must propagate");
         assert!(error.contains("invalid Lua"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    async fn rejected_decoration_is_not_persisted_by_picker() {
+        let writes = Arc::new(Mutex::new(0));
+        let observed = writes.clone();
+        let router: TestServiceRouter = Arc::new(
+            move |_, _, capability, _, _, operation, _| match (capability, operation) {
+                ("bmux.storage", "get") => encode_service_message(&StorageGetResponse {
+                    value: Some(b"hacker".to_vec()),
+                }),
+                ("bmux.storage", "set") => {
+                    *observed.lock().expect("writes") += 1;
+                    encode_service_message(&())
+                }
+                ("bmux.decoration.write", "apply-theme-extension") => {
+                    encode_service_message(&Err::<(), _>(
+                        bmux_decoration_plugin_api::decoration_state::ValidationResult::Errors {
+                            errors: Vec::new(),
+                        },
+                    ))
+                }
+                _ => encode_service_message(&()),
+            },
+        );
+        let _router = install_test_service_router(router);
+        let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let _host = prompt::register_host(sender);
+        let mut context = picker_context();
+        context.settings =
+            Some(toml::from_str("persistence = 'persist_between_connects'").expect("settings"));
+        let host = async {
+            let request = requests.recv().await.expect("prompt");
+            request
+                .response_tx
+                .send(PromptResponse::Submitted(PromptValue::Single(
+                    "preset:minimal".into(),
+                )))
+                .expect("response");
+        };
+        tokio::join!(run_theme_picker(context), host);
+        assert_eq!(*writes.lock().expect("writes"), 0);
+    }
+
+    #[test]
+    fn catalog_user_files_override_bundled_and_fallback_presets() {
+        let primary = temp_theme_dir("catalog-primary");
+        let fallback = temp_theme_dir("catalog-fallback");
+        for (dir, color) in [(&primary, "#112233"), (&fallback, "#445566")] {
+            std::fs::create_dir_all(dir.join("themes")).expect("themes directory");
+            std::fs::write(
+                dir.join("themes/hacker.toml"),
+                format!("foreground = '{color}'"),
+            )
+            .expect("theme");
+        }
+        let catalog = load_theme_catalog(&[primary.clone(), fallback]);
+        assert_eq!(
+            theme_by_name(&catalog, "hacker")
+                .expect("theme")
+                .foreground
+                .as_deref(),
+            Some("#112233")
+        );
+        assert_eq!(
+            catalog
+                .iter()
+                .filter(|entry| entry.name == "hacker")
+                .count(),
+            1
+        );
+        std::fs::write(primary.join("themes/hacker.toml"), "invalid = [").expect("invalid theme");
+        let catalog = load_theme_catalog(&[primary]);
+        assert!(theme_by_name(&catalog, "hacker").is_none());
+        assert!(theme_by_name(&catalog, "minimal").is_some());
     }
 
     #[test]
