@@ -16,6 +16,32 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+/// Classified failures at the unpublished authenticated append boundary.
+#[derive(Debug)]
+pub enum AuthenticatedAppendError {
+    Unauthorized,
+    TermMismatch,
+    MissingTransfer {
+        reference: Box<bmux_cluster_plugin_api::cluster_consensus_rpc_types::SealedEntryReference>,
+        term: Term,
+    },
+    Executor(VoteGateError),
+    Storage(io::Error),
+    Invalid(String),
+}
+
+impl From<String> for AuthenticatedAppendError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for AuthenticatedAppendError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.to_owned())
+    }
+}
+
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_authority");
 const EMPTY_POSITIONS: [&str; 5] = [
     "commit",
@@ -990,6 +1016,223 @@ impl VoteExecutor {
         .map_err(|error| format!("owned transfer admission failed: {error:?}"))?
     }
 
+    /// Authenticate and consume append entries under the single durable owner.
+    ///
+    /// Missing staging is an error, never a replication acknowledgment. This
+    /// unpublished path does not yet resolve staged retries from the durable log.
+    /// # Errors
+    /// Rejects stale authority, invalid objects, missing staging and storage failure.
+    #[allow(clippy::too_many_lines)] // Keep authority observation and mutation in one serialized closure.
+    pub async fn append_authenticated<C: crate::ClusterRuntimeOps + Send + Sync + 'static>(
+        &self,
+        caller: std::sync::Arc<C>,
+        local: NodeId,
+        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    ) -> Result<AppendDecision, AuthenticatedAppendError> {
+        crate::consensus_network::owned_append_signing_payload(&request)?;
+        self.run(move |gate| {
+            use bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendEntry;
+            use bmux_cluster_plugin_api::cluster_consensus_transfer_types::{
+                EntryPurpose, TransferHeader, TransferPurpose,
+            };
+            let store = &mut gate.store;
+            if store.failed || store.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                return Err(VoteGateError::Stopped);
+            }
+            store.failed = true;
+            let authority = (|| -> io::Result<_> {
+                let tx = store.database.begin_read().map_err(io::Error::other)?;
+                let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+                let control = meta
+                    .get("control")
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| invalid("missing control authority"))?;
+                let state = crate::control_state::ControlState::decode_snapshot(control.value())
+                    .map_err(io::Error::other)?;
+                let cluster = meta
+                    .get("cluster")
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| invalid("missing cluster authority"))?;
+                let membership = meta
+                    .get("membership")
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| invalid("missing membership authority"))?;
+                let membership = if membership.value().is_empty() {
+                    None
+                } else {
+                    let entry = crate::consensus_storage::decode_owned_entry(membership.value())
+                        .map_err(io::Error::other)?;
+                    let EntryPayload::Membership(membership) = entry.payload else {
+                        return Err(invalid("invalid membership authority"));
+                    };
+                    Some(membership)
+                };
+                Ok((state, cluster.value().to_vec(), membership))
+            })()
+            .map_err(|_| VoteGateError::StorageFailure)?;
+            store.failed = false;
+            Ok((|| -> Result<_, AuthenticatedAppendError> {
+                if request.cluster_id.as_bytes() != authority.1 {
+                    return Err(AuthenticatedAppendError::Unauthorized);
+                }
+                if request.term != store.state.term.0 {
+                    return Err(AuthenticatedAppendError::TermMismatch);
+                }
+                let members = authority.0.members.into_values().collect::<Vec<_>>();
+                let source = crate::consensus_network::authenticate_owned_append(
+                    caller.as_ref(),
+                    local,
+                    &members,
+                    &request,
+                )
+                .map_err(|_| AuthenticatedAppendError::Unauthorized)?;
+                if !authority.2.as_ref().is_some_and(|membership| {
+                    membership.nodes().contains_key(&local)
+                        && membership
+                            .configurations()
+                            .iter()
+                            .any(|set| set.contains(&source))
+                }) {
+                    return Err(AuthenticatedAppendError::Unauthorized);
+                }
+                let mut previous = request.previous.clone();
+                let mut entries = Vec::with_capacity(request.entries.len());
+                let mut remaining = 32 * 1024 * 1024usize;
+                for entry in &request.entries {
+                    let retained = if let AppendEntry::Staged { reference } = entry {
+                        store
+                            .retained_transfer_entry(reference, remaining)
+                            .map_err(|error| {
+                                if store.failed {
+                                    AuthenticatedAppendError::Storage(error)
+                                } else {
+                                    AuthenticatedAppendError::Invalid(error.to_string())
+                                }
+                            })?
+                    } else {
+                        None
+                    };
+                    let canonical = if let Some(bytes) = retained {
+                        bytes
+                    } else {
+                        match entry {
+                            AppendEntry::Inline { canonical } => canonical.clone(),
+                            AppendEntry::Staged { reference } => {
+                                let length = usize::try_from(reference.total_bytes)
+                                    .map_err(|_| "entry length overflow")?;
+                                if length > remaining {
+                                    return Err("append canonical byte budget exceeded".into());
+                                }
+                                let header = TransferHeader {
+                                    cluster_id: request.cluster_id.clone(),
+                                    sender: request.sender.clone(),
+                                    recipient: request.recipient.clone(),
+                                    leader_term: request.term,
+                                    sender_incarnation: reference.sender_incarnation,
+                                    sequence: reference.sequence,
+                                    purpose: TransferPurpose::Entry {
+                                        value: EntryPurpose {
+                                            identity: reference.identity.clone(),
+                                            previous: previous.clone(),
+                                        },
+                                    },
+                                    total_bytes: reference.total_bytes,
+                                    checksum: reference.checksum.clone(),
+                                };
+                                let binding = Sha256::digest(
+                                    bmux_plugin_sdk::encode_service_message(&header)
+                                        .map_err(|error| error.to_string())?,
+                                )
+                                .into();
+                                let key = crate::transfer_staging::TransferKey {
+                                    peer: *source.as_bytes(),
+                                    incarnation: reference.sender_incarnation,
+                                    sequence: reference.sequence,
+                                };
+                                let (_, staging) =
+                                    gate.staging.as_mut().ok_or("staging is not configured")?;
+                                staging
+                                    .expire(std::time::Instant::now())
+                                    .map_err(AuthenticatedAppendError::Storage)?;
+                                staging.validate_binding(key, binding).map_err(
+                                    |error| match error.kind() {
+                                        io::ErrorKind::NotFound => {
+                                            AuthenticatedAppendError::MissingTransfer {
+                                                reference: Box::new(reference.clone()),
+                                                term: store.state.term,
+                                            }
+                                        }
+                                        io::ErrorKind::InvalidInput => {
+                                            AuthenticatedAppendError::Invalid(error.to_string())
+                                        }
+                                        _ => AuthenticatedAppendError::Storage(error),
+                                    },
+                                )?;
+                                let mut bytes = vec![0; length];
+                                let mut offset = 0;
+                                while offset < length {
+                                    if store.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                                        return Err(AuthenticatedAppendError::Executor(
+                                            VoteGateError::Stopped,
+                                        ));
+                                    }
+                                    let end = length.min(offset + 64 * 1024);
+                                    let read = staging
+                                        .read(key, offset as u64, &mut bytes[offset..end])
+                                        .map_err(AuthenticatedAppendError::Storage)?;
+                                    if read == 0 {
+                                        return Err("incomplete staged entry".into());
+                                    }
+                                    offset += read;
+                                }
+                                bytes
+                            }
+                        }
+                    };
+                    remaining = remaining
+                        .checked_sub(canonical.len())
+                        .ok_or("append canonical byte budget exceeded")?;
+                    let decoded = crate::consensus_storage::decode_owned_entry(&canonical)
+                        .map_err(|error| error.to_string())?;
+                    if let AppendEntry::Staged { reference } = entry
+                        && decoded.identity
+                            != crate::consensus_network::transfer_position(&reference.identity)?
+                    {
+                        return Err("staged entry identity mismatch".into());
+                    }
+                    previous = Some(
+                        bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
+                            term: decoded.identity.term.0,
+                            leader: decoded.identity.leader.as_bytes().to_vec(),
+                            index: decoded.identity.index.0,
+                        },
+                    );
+                    entries.push(decoded);
+                }
+                let decoded = AppendRequest {
+                    term: Term(request.term),
+                    leader: source,
+                    previous: request
+                        .previous
+                        .as_ref()
+                        .map(crate::consensus_network::transfer_position)
+                        .transpose()?,
+                    entries,
+                    leader_commit: request
+                        .leader_commit
+                        .as_ref()
+                        .map(crate::consensus_network::transfer_position)
+                        .transpose()?,
+                };
+                store
+                    .append(&decoded, (64, 32 * 1024 * 1024))
+                    .map_err(AuthenticatedAppendError::Storage)
+            })())
+        })
+        .await
+        .map_err(AuthenticatedAppendError::Executor)?
+    }
+
     /// Serialize authenticated append with voting and shutdown.
     /// # Errors
     /// Busy admission is explicit; storage errors suppress dependent replies.
@@ -1576,6 +1819,44 @@ impl OwnedVoteStore {
                 .map_err(|_| VoteGateError::StorageFailure)?;
         }
         Ok(decision.response)
+    }
+
+    // Resolve an already persisted transfer without relying on disposable staging.
+    // A match supplies bytes only: append must still reconcile the predecessor.
+    fn retained_transfer_entry(
+        &mut self,
+        reference: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::SealedEntryReference,
+        budget: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Err(io::Error::other("owned authority stopped"));
+        }
+        let identity = crate::consensus_network::transfer_position(&reference.identity)
+            .map_err(|error| invalid(&error))?;
+        if reference.total_bytes > budget as u64 || reference.checksum.len() != 32 {
+            return Err(invalid("invalid retained transfer bounds"));
+        }
+        self.failed = true;
+        let result = (|| -> io::Result<_> {
+            let tx = self.database.begin_read().map_err(io::Error::other)?;
+            let log = tx.open_table(LOG).map_err(io::Error::other)?;
+            let Some(bytes) = log.get(identity.index.0).map_err(io::Error::other)? else {
+                return Ok(None);
+            };
+            let bytes = bytes.value();
+            if bytes.len() as u64 != reference.total_bytes
+                || Sha256::digest(bytes).as_slice() != reference.checksum
+            {
+                return Ok(None);
+            }
+            let entry =
+                crate::consensus_storage::decode_owned_entry(bytes).map_err(io::Error::other)?;
+            Ok((entry.identity == identity).then(|| bytes.to_vec()))
+        })();
+        if result.is_ok() {
+            self.failed = false;
+        }
+        result
     }
 
     /// Persist an authenticated append under the same owner as votes. The caller
@@ -2452,6 +2733,87 @@ mod tests {
         );
         assert!(meta.get("membership").unwrap().unwrap().value().is_empty());
     }
+    #[test]
+    fn retained_transfer_retry_survives_reopen_without_staging() {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::SealedEntryReference;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority.redb");
+        let leader = *crate::membership::NodeIdentity::new_for_test(1).node_id();
+        let identity = LogIdentity {
+            term: Term(1),
+            leader,
+            index: crate::consensus_model::LogIndex(0),
+        };
+        let entry = Entry {
+            identity,
+            payload: EntryPayload::NoOp,
+        };
+        let mut store = OwnedVoteStore::create(&path, "cluster").unwrap();
+        let request = AppendRequest {
+            term: Term(1),
+            leader,
+            previous: None,
+            entries: vec![entry],
+            leader_commit: None,
+        };
+        assert!(store.append(&request, (16, 4096)).unwrap().outcome.is_ok());
+        let bytes = {
+            let tx = store.database.begin_read().unwrap();
+            tx.open_table(LOG)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .unwrap()
+                .value()
+                .to_vec()
+        };
+        store.close().unwrap();
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        let reference = SealedEntryReference {
+            sender_incarnation: uuid::Uuid::from_u128(1),
+            sequence: 1,
+            identity: bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
+                term: 1,
+                leader: leader.as_bytes().to_vec(),
+                index: 0,
+            },
+            total_bytes: bytes.len() as u64,
+            checksum: Sha256::digest(&bytes).to_vec(),
+        };
+        assert_eq!(
+            store.retained_transfer_entry(&reference, 4096).unwrap(),
+            Some(bytes)
+        );
+        let mut conflicting = reference.clone();
+        conflicting.checksum[0] ^= 1;
+        assert!(
+            store
+                .retained_transfer_entry(&conflicting, 4096)
+                .unwrap()
+                .is_none()
+        );
+        conflicting = reference.clone();
+        conflicting.identity.term = 2;
+        assert!(
+            store
+                .retained_transfer_entry(&conflicting, 4096)
+                .unwrap()
+                .is_none()
+        );
+        conflicting = reference.clone();
+        conflicting.total_bytes += 1;
+        assert!(
+            store
+                .retained_transfer_entry(&conflicting, 4096)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.retained_transfer_entry(&reference, 0).is_err());
+        assert!(!store.failed);
+        assert!(store.append(&request, (16, 4096)).unwrap().outcome.is_ok());
+        store.close().unwrap();
+    }
+
     #[test]
     fn committed_vote_survives_aborted_update_and_reopen() {
         let root = tempfile::tempdir().unwrap();

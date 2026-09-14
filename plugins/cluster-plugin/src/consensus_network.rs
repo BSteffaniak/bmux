@@ -209,7 +209,7 @@ fn transfer_node(bytes: &[u8]) -> Result<NodeId, String> {
     Ok(node)
 }
 
-fn transfer_position(
+pub(crate) fn transfer_position(
     value: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity,
 ) -> Result<crate::consensus_model::LogIdentity, String> {
     Ok(crate::consensus_model::LogIdentity {
@@ -1814,6 +1814,109 @@ where
         Box::pin(self.dispatch("vote_v2", request, |raft, request| {
             Box::pin(async move { raft.vote(request).await.map_err(|error| error.to_string()) })
         }))
+    }
+}
+
+/// Unregistered owned append provider. Construction does not advertise capability
+/// or initialize another authority; the lifecycle owner supplies its executor.
+pub struct OwnedAppendService<C> {
+    pub caller: Arc<C>,
+    pub local: NodeId,
+    pub executor: Arc<crate::owned_vote_store::VoteExecutor>,
+}
+
+impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
+    bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
+    for OwnedAppendService<C>
+{
+    fn append<'a>(
+        &'a self,
+        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendResponse,
+                        bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            use crate::consensus_model::{AppendOutcome as DecisionOutcome, AppendReconciliation};
+            use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
+                AppendOutcome, AppendResponse, RpcError,
+            };
+            let request_id = request.request_id;
+            let next_index = request
+                .previous
+                .as_ref()
+                .map_or(0, |position| position.index);
+            let result = self
+                .executor
+                .append_authenticated(self.caller.clone(), self.local, request)
+                .await;
+            let result = match result {
+                Err(crate::owned_vote_store::AuthenticatedAppendError::MissingTransfer {
+                    reference,
+                    term,
+                }) => {
+                    return Ok(AppendResponse {
+                        request_id,
+                        source: self.local.as_bytes().to_vec(),
+                        term: term.0,
+                        outcome: AppendOutcome::MissingTransfer {
+                            reference: *reference,
+                        },
+                    });
+                }
+                other => other,
+            };
+            let decision = result.map_err(|error| match error {
+                crate::owned_vote_store::AuthenticatedAppendError::Unauthorized => {
+                    RpcError::Unauthorized
+                }
+                crate::owned_vote_store::AuthenticatedAppendError::Invalid(_) => {
+                    RpcError::InvalidRequest
+                }
+                crate::owned_vote_store::AuthenticatedAppendError::Storage(_) => {
+                    RpcError::StorageFailure
+                }
+                crate::owned_vote_store::AuthenticatedAppendError::Executor(
+                    crate::consensus_model::VoteGateError::Stopped,
+                ) => RpcError::Stopped,
+                crate::owned_vote_store::AuthenticatedAppendError::MissingTransfer { .. }
+                | crate::owned_vote_store::AuthenticatedAppendError::TermMismatch
+                | crate::owned_vote_store::AuthenticatedAppendError::Executor(_) => {
+                    RpcError::ExecutionFailed
+                }
+            })?;
+            let outcome = match decision.outcome {
+                Ok(DecisionOutcome::StaleTerm) => return Err(RpcError::StaleTerm),
+                Ok(DecisionOutcome::Reconciled(AppendReconciliation::PreviousMismatch)) => {
+                    AppendOutcome::Conflict { next_index }
+                }
+                Ok(DecisionOutcome::Reconciled(AppendReconciliation::Matched {
+                    through, ..
+                })) => AppendOutcome::Durable {
+                    matched: through.map(|identity| {
+                        bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
+                            term: identity.term.0,
+                            leader: identity.leader.as_bytes().to_vec(),
+                            index: identity.index.0,
+                        }
+                    }),
+                },
+                Err(_) => return Err(RpcError::ExecutionFailed),
+            };
+            Ok(AppendResponse {
+                request_id,
+                source: self.local.as_bytes().to_vec(),
+                term: decision.term.0,
+                outcome,
+            })
+        })
     }
 }
 

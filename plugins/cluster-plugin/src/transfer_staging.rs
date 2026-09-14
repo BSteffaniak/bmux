@@ -232,12 +232,15 @@ impl TransferStaging {
     /// # Errors
     /// Rejects unknown identities and attempts to retarget existing bytes.
     pub fn validate_binding(&self, key: TransferKey, binding: [u8; 32]) -> io::Result<()> {
-        if self
+        let transfer = self
             .transfers
             .get(&key)
-            .is_none_or(|transfer| transfer.binding != binding)
-        {
-            return Err(io::Error::other("unknown or conflicting transfer binding"));
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown transfer binding"))?;
+        if transfer.binding != binding {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "conflicting transfer binding",
+            ));
         }
         Ok(())
     }

@@ -2490,7 +2490,10 @@ mod tests {
             .await
             .unwrap();
         let bytes = crate::consensus_storage::encode_owned_entry(&Entry {
-            identity: position,
+            identity: LogIdentity {
+                index: LogIndex(2),
+                ..position
+            },
             payload: EntryPayload::NoOp,
         })
         .unwrap();
@@ -2507,13 +2510,13 @@ mod tests {
                         bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
                             term: 0,
                             leader: node.as_bytes().to_vec(),
-                            index: 1,
+                            index: 2,
                         },
                     previous: Some(
                         bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
                             term: 0,
                             leader: node.as_bytes().to_vec(),
-                            index: 0,
+                            index: 1,
                         },
                     ),
                 },
@@ -2567,6 +2570,81 @@ mod tests {
                         .contains("already consumed")
                 );
             }
+        }
+        for remove_staging in [false, true] {
+            use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
+                AppendEntry, AppendRequest, SealedEntryReference,
+            };
+            if remove_staging {
+                let challenge = create_peer_auth_challenge(
+                    caller.as_ref(),
+                    &ClusterPeerChallengeRequest {
+                        claimant_node_id: node.to_string(),
+                    },
+                )
+                .unwrap();
+                let mut abort = ChunkRequest {
+                    header: header.clone(),
+                    offset: 0,
+                    data: Vec::new(),
+                    proof: TransferProof {
+                        credential_serial: member.credential_serial.clone(),
+                        signature: Vec::new(),
+                        peer: create_peer_auth_proof(caller.as_ref(), challenge).unwrap(),
+                    },
+                };
+                abort.proof.signature = identity
+                    .sign(&consensus_network::transfer_signing_payload("abort", &abort).unwrap());
+                executor
+                    .transfer(caller.clone(), node, "abort".into(), abort)
+                    .await
+                    .unwrap();
+            }
+            let challenge = create_peer_auth_challenge(
+                caller.as_ref(),
+                &ClusterPeerChallengeRequest {
+                    claimant_node_id: node.to_string(),
+                },
+            )
+            .unwrap();
+            let TransferPurpose::Entry { value } = &header.purpose else {
+                unreachable!()
+            };
+            let mut append = AppendRequest {
+                cluster_id: header.cluster_id.clone(),
+                sender: header.sender.clone(),
+                recipient: header.recipient.clone(),
+                request_id: uuid::Uuid::new_v4(),
+                term: 0,
+                previous: value.previous.clone(),
+                leader_commit: None,
+                entries: vec![AppendEntry::Staged {
+                    reference: SealedEntryReference {
+                        sender_incarnation: header.sender_incarnation,
+                        sequence: header.sequence,
+                        identity: value.identity.clone(),
+                        total_bytes: header.total_bytes,
+                        checksum: header.checksum.clone(),
+                    },
+                }],
+                proof: TransferProof {
+                    credential_serial: member.credential_serial.clone(),
+                    signature: Vec::new(),
+                    peer: create_peer_auth_proof(caller.as_ref(), challenge).unwrap(),
+                },
+            };
+            append.proof.signature =
+                identity.sign(&consensus_network::owned_append_signing_payload(&append).unwrap());
+            let decision = executor
+                .append_authenticated(caller.clone(), node, append)
+                .await
+                .unwrap();
+            assert!(matches!(
+                decision.outcome,
+                Ok(crate::consensus_model::AppendOutcome::Reconciled(
+                    crate::consensus_model::AppendReconciliation::Matched { .. }
+                ))
+            ));
         }
         executor.shutdown().await.unwrap();
     }

@@ -999,6 +999,8 @@ interface cluster-consensus-rpc-types {
         capacity-unavailable,
         storage-failure,
         stopped,
+        // Unclassified executor rejection; never implies a durable acknowledgment.
+        execution-failed,
     }
 }
 
