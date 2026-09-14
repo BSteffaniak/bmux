@@ -1825,6 +1825,31 @@ pub struct OwnedAppendService<C> {
     pub executor: Arc<crate::owned_vote_store::VoteExecutor>,
 }
 
+impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static> OwnedAppendService<C> {
+    /// Register generated dispatch against an executor supplied by its lifecycle owner.
+    ///
+    /// This neither opens storage nor advertises negotiation support. The owner
+    /// must stop admission and shut down the same executor when removing service.
+    /// # Errors
+    /// Returns generated descriptor registration failures.
+    pub fn register(
+        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
+        caller: Arc<C>,
+        local: NodeId,
+        executor: Arc<crate::owned_vote_store::VoteExecutor>,
+    ) -> Result<(), Box<bmux_plugin_sdk::PluginError>> {
+        bmux_cluster_plugin_api::cluster_consensus_rpc::register_provider(
+            registry,
+            Arc::new(Self {
+                caller,
+                local,
+                executor,
+            }),
+        )
+        .map_err(Box::new)
+    }
+}
+
 impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
     bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
     for OwnedAppendService<C>
