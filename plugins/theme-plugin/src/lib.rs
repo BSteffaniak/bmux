@@ -44,9 +44,12 @@ impl ThemeSelection {
         if value == CONFIGURED_SELECTION {
             Some(Self::Configured)
         } else {
-            value.strip_prefix("preset:").map(|name| Self::Preset {
-                name: name.to_string(),
-            })
+            value
+                .strip_prefix("preset:")
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| Self::Preset {
+                    name: name.to_string(),
+                })
         }
     }
 }
@@ -55,7 +58,14 @@ impl ThemeSelection {
 #[serde(deny_unknown_fields)]
 struct PersistedThemeSelection {
     version: u32,
+    #[serde(deserialize_with = "required_preset")]
     preset: Option<String>,
+}
+
+fn required_preset<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
 }
 
 fn decode_theme_selection(bytes: &[u8]) -> Result<Option<String>, String> {
@@ -68,6 +78,13 @@ fn decode_theme_selection(bytes: &[u8]) -> Result<Option<String>, String> {
                 "unsupported theme selection version {}",
                 record.version
             ));
+        }
+        if record
+            .preset
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err("empty persisted preset name".to_string());
         }
         return Ok(record.preset);
     }
@@ -889,7 +906,7 @@ async fn configure_theme_settings_provider(
 }
 
 fn apply_configured_theme_settings(
-    context: &impl ServiceCaller,
+    context: &(impl ServiceCaller + Sync),
     theme: &ResolvedTheme,
     settings: &ThemePluginSettings,
 ) {
@@ -1201,7 +1218,7 @@ fn json_settings_to_toml(value: &serde_json::Value) -> toml::Value {
 }
 
 fn apply_builtin_component_theme_settings(
-    context: &impl ServiceCaller,
+    context: &(impl ServiceCaller + Sync),
     theme: &ResolvedTheme,
     provider_id: &str,
     payload: &ThemeSettingsPayload,
@@ -2026,7 +2043,7 @@ fn theme_by_name<'a>(catalog: &'a [ThemeCatalogEntry], name: &str) -> Option<&'a
 }
 
 fn apply_theme_extensions(
-    context: &impl ServiceCaller,
+    context: &(impl ServiceCaller + Sync),
     theme: &ResolvedTheme,
     plugin_ids: &[String],
     config_dir_candidates: &[String],
@@ -2074,10 +2091,24 @@ fn apply_theme_extensions(
 }
 
 fn execute_theme_extension_apply(
-    context: &impl ServiceCaller,
+    context: &(impl ServiceCaller + Sync),
     capability: &str,
     payload: Vec<u8>,
 ) -> std::result::Result<(), String> {
+    if capability == "bmux.decoration.write" {
+        let request: ApplyThemeExtensionArgs =
+            bmux_plugin_sdk::decode_service_message(&payload).map_err(|error| error.to_string())?;
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+        return bmux_plugin::block_on_typed_dispatch(
+            bmux_decoration_plugin_api::decoration_commands::client::apply_theme_extension(
+                &mut client,
+                request.toml,
+                request.config_dir_candidates,
+            ),
+        )
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("decoration rejected theme: {error:?}"));
+    }
     context
         .call_service_raw(
             capability,
@@ -2141,6 +2172,8 @@ mod tests {
             Some(ThemeSelection::Configured)
         );
         assert!(ThemeSelection::from_picker_value("unqualified").is_none());
+        assert!(ThemeSelection::from_picker_value("preset:").is_none());
+        assert!(ThemeSelection::from_picker_value("preset:  ").is_none());
     }
 
     #[test]
@@ -2154,6 +2187,10 @@ mod tests {
             None
         );
         assert!(decode_theme_selection(br#"{"version":2,"preset":null}"#).is_err());
+        assert!(decode_theme_selection(br#"{"version":1}"#).is_err());
+        assert!(decode_theme_selection(br#"{"version":1,"preset":" "}"#).is_err());
+        assert!(decode_theme_selection(br#"{"version":1,"preset":null,"extra":true}"#).is_err());
+        assert!(decode_theme_selection(br#"{"version":1,"version":1,"preset":null}"#).is_err());
         assert!(decode_theme_selection(b"{broken").is_err());
         assert!(decode_theme_selection(b"").is_err());
     }
@@ -2251,11 +2288,14 @@ mod tests {
                     ("bmux.storage", "set") => Err(bmux_plugin_sdk::PluginError::InvalidPluginId {
                         id: "injected storage failure".into(),
                     }),
-                    ("bmux.decoration.write", "apply") => {
+                    ("bmux.decoration.write", "apply-theme-extension") => {
                         let request: ApplyThemeExtensionArgs =
                             decode_service_message(&payload).expect("extension");
                         observed.lock().expect("applied").push(request.toml);
-                        encode_service_message(&())
+                        encode_service_message(&Ok::<
+                            (),
+                            bmux_decoration_plugin_api::decoration_state::ValidationResult,
+                        >(()))
                     }
                     _ => encode_service_message(&()),
                 }
@@ -2288,6 +2328,36 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn typed_decoration_apply_surfaces_validation_failure() {
+        let router: TestServiceRouter = Arc::new(|_, _, capability, _, interface, operation, _| {
+            assert_eq!(capability, "bmux.decoration.write");
+            assert_eq!(interface, "decoration-commands");
+            assert_eq!(operation, "apply-theme-extension");
+            encode_service_message(&Err::<(), _>(
+                bmux_decoration_plugin_api::decoration_state::ValidationResult::Errors {
+                    errors: vec![
+                        bmux_decoration_plugin_api::decoration_state::ValidationError {
+                            path: "script".into(),
+                            message: "invalid Lua".into(),
+                        },
+                    ],
+                },
+            ))
+        });
+        let _router = install_test_service_router(router);
+        let payload = encode_service_message(&ApplyThemeExtensionArgs {
+            toml: String::new(),
+            config_dir_candidates: Vec::new(),
+        })
+        .expect("encode");
+        let error =
+            execute_theme_extension_apply(&picker_context(), "bmux.decoration.write", payload)
+                .expect_err("validation must propagate");
+        assert!(error.contains("invalid Lua"));
+    }
+
+    #[test]
     fn active_appearance_service_uses_declared_theme() {
         let plugin = ThemePlugin::default();
         let context = service_context(Some(toml::Value::Table(toml::map::Map::from_iter([(
@@ -2303,6 +2373,40 @@ mod tests {
         assert_eq!(appearance.background, "#050510");
         assert_eq!(appearance.border.active, "#ffffff");
         assert!(appearance.modes.contains_key("normal"));
+    }
+
+    #[test]
+    fn malformed_stored_selection_does_not_resolve_configured_appearance() {
+        let _router = install_persisted_theme_router(Some(r#"{"version":1}"#));
+        let context = service_context(Some(
+            toml::from_str("persistence = 'persist_between_connects'").expect("settings"),
+        ));
+        assert!(configured_theme(&context).is_none());
+        let response = ThemePlugin::default().invoke_service(context);
+        assert!(response.error.is_some());
+    }
+
+    #[test]
+    fn configured_record_restores_declared_split_stacks() {
+        let _router = install_persisted_theme_router(Some(r#"{"version":1,"preset":null}"#));
+        let context = service_context(Some(
+            toml::from_str(
+                r#"
+            persistence = "persist_between_connects"
+            appearance_themes = ["performance", "mode-aware"]
+            component_themes = ["performance", "pulse-border"]
+        "#,
+            )
+            .expect("settings"),
+        ));
+        let active = configured_theme(&context).expect("configured selection");
+        assert_ne!(active.source, ActiveThemeSource::Persisted);
+        let settings = parse_settings(context.settings.as_ref());
+        let expected =
+            resolve_picker_value(&load_theme_catalog(&[]), CONFIGURED_SELECTION, &settings)
+                .expect("configured");
+        assert_eq!(active.theme.plugins, expected.plugins);
+        assert_eq!(active.theme.appearance, expected.appearance);
     }
 
     #[test]
@@ -3569,14 +3673,22 @@ mod tests {
                             value: selected.map(|value| value.as_bytes().to_vec()),
                         })
                     }
-                    ("bmux.decoration.write", ServiceKind::Command, "theme-extension", "apply") => {
+                    (
+                        "bmux.decoration.write",
+                        ServiceKind::Command,
+                        "decoration-commands",
+                        "apply-theme-extension",
+                    ) => {
                         let request: ApplyThemeExtensionArgs = decode_service_message(&payload)
                             .expect("theme extension payload should decode");
                         applied
                             .lock()
                             .expect("applied extensions lock should hold")
                             .push(request);
-                        encode_service_message(&())
+                        encode_service_message(&Ok::<
+                            (),
+                            bmux_decoration_plugin_api::decoration_state::ValidationResult,
+                        >(()))
                     }
                     other => panic!("unexpected service call: {other:?}"),
                 }

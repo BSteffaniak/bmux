@@ -11,6 +11,28 @@ stacks on reconnect. The preset resolves the same way as a live picker selection
 declared component overrides and targets still apply. With the default
 `declared_on_connect` policy, reconnect uses the configured composition instead.
 
+## Configured Selection and Stored Preferences
+
+The picker includes **Use configured theme**, summarizing the appearance and
+component stacks. It resolves the complete configured composition and bypasses
+saved interactive provider settings without deleting them. Preset selections
+remain distinct from this option, including presets with names resembling picker
+control values.
+
+Selection writes store a version-1 JSON record at `selected_theme`, with an
+explicit nullable `preset` field: `null` selects the configuration; a string
+selects that preset. Existing UTF-8 preset-name records remain readable and are
+replaced only on a subsequent confirmed, persisted selection. Reading does not
+rewrite configuration or storage. Unsupported versions, missing fields, and
+malformed records are errors rather than configured-mode defaults. Older BMUX
+versions do not understand these records; downgrade requires restoring a legacy
+preference from a backup rather than treating the new record as a preset name.
+
+The picker currently reconstructs its initial selection from configuration and
+storage. Shared live-state authority, exact cancellation restoration, and an
+explicit file-refresh command are not yet implemented. Saving configuration or
+Lua files does not automatically reload them.
+
 ## Theme Stacks
 
 BMUX accepts either a single theme or an ordered stack:
