@@ -1272,6 +1272,15 @@ impl VoteExecutor {
         })
     }
 
+    /// Begin an eligible local campaign using authoritative log and membership.
+    /// The returned request may be sent only after the self-vote has committed.
+    /// This does not establish leadership; the caller must collect a current quorum.
+    /// # Errors
+    /// Busy, stopped, exhausted terms, and uncertain persistence suppress requests.
+    pub async fn campaign(&self, local: NodeId) -> Result<Option<RequestVote>, VoteGateError> {
+        self.run(move |gate| gate.store.campaign(local)).await
+    }
+
     /// Apply at most 64 committed entries under the same single-flight owner.
     /// # Errors
     /// Any decode or persistence failure stops the owner; replies follow commit.
@@ -1761,7 +1770,9 @@ impl OwnedVoteStore {
         Ok(replies)
     }
 
-    fn vote(&mut self, local: NodeId, request: RequestVote) -> Result<VoteResponse, VoteGateError> {
+    fn election_context(
+        &mut self,
+    ) -> Result<(Option<LogIdentity>, Option<Membership>), VoteGateError> {
         if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             return Err(VoteGateError::Stopped);
         }
@@ -1806,6 +1817,38 @@ impl OwnedVoteStore {
         })()
         .map_err(|_| VoteGateError::StorageFailure)?;
         self.failed = false;
+        Ok(context)
+    }
+
+    fn campaign(&mut self, local: NodeId) -> Result<Option<RequestVote>, VoteGateError> {
+        let (last_log, membership) = self.election_context()?;
+        if !membership.is_some_and(|membership| {
+            membership
+                .configurations()
+                .iter()
+                .any(|voters| voters.contains(&local))
+        }) {
+            return Ok(None);
+        }
+        let term = self
+            .state
+            .term
+            .successor()
+            .map_err(|_| VoteGateError::EffectExhausted)?;
+        self.persist(HardState {
+            term,
+            voted_for: Some(local),
+        })
+        .map_err(|_| VoteGateError::StorageFailure)?;
+        Ok(Some(RequestVote {
+            term,
+            candidate: local,
+            last_log,
+        }))
+    }
+
+    fn vote(&mut self, local: NodeId, request: RequestVote) -> Result<VoteResponse, VoteGateError> {
+        let context = self.election_context()?;
         let Some(membership) = context.1 else {
             // An uninitialized node cannot vote; bootstrap must establish durable
             // membership explicitly before election admission.
@@ -2577,6 +2620,41 @@ mod tests {
             OwnedVoteStore::open(&path, "cluster").unwrap().state().term,
             Term(1)
         );
+    }
+
+    #[tokio::test]
+    async fn campaign_persists_self_vote_and_uses_recovered_log() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority.redb");
+        let local = NodeId::from(1);
+        let membership = Membership::new(vec![vec![local]], vec![(local, String::new())]).unwrap();
+        OwnedVoteStore::bootstrap(&path, "cluster", local, membership)
+            .unwrap()
+            .close()
+            .unwrap();
+        let executor = VoteExecutor::recover(path.clone(), "cluster".into(), 1)
+            .await
+            .unwrap();
+        assert!(executor.campaign(NodeId::from(2)).await.unwrap().is_none());
+        let request = executor.campaign(local).await.unwrap().unwrap();
+        assert_eq!(request.term, Term(1));
+        assert_eq!(request.candidate, local);
+        assert_eq!(request.last_log.unwrap().index.0, 0);
+        executor.shutdown().await.unwrap();
+        assert!(matches!(
+            executor.campaign(local).await,
+            Err(VoteGateError::Stopped)
+        ));
+        drop(executor);
+        let recovered = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(
+            recovered.state(),
+            HardState {
+                term: Term(1),
+                voted_for: Some(local)
+            }
+        );
+        recovered.close().unwrap();
     }
 
     #[tokio::test]

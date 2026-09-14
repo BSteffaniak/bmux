@@ -2572,10 +2572,12 @@ mod tests {
                 );
             }
         }
-        for remove_staging in [false, true] {
+        for attempt in 0..3 {
             use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
                 AppendEntry, AppendRequest, SealedEntryReference,
             };
+            let remove_staging = attempt == 1;
+            let missing_transfer = attempt == 2;
             if remove_staging {
                 let challenge = create_peer_auth_challenge(
                     caller.as_ref(),
@@ -2616,14 +2618,20 @@ mod tests {
                 sender: header.sender.clone(),
                 recipient: header.recipient.clone(),
                 request_id: uuid::Uuid::new_v4(),
-                term: u64::from(remove_staging),
+                term: attempt,
                 previous: value.previous.clone(),
                 leader_commit: None,
                 entries: vec![AppendEntry::Staged {
                     reference: SealedEntryReference {
                         sender_incarnation: header.sender_incarnation,
                         sequence: header.sequence,
-                        identity: value.identity.clone(),
+                        identity: if missing_transfer {
+                            let mut identity = value.identity.clone();
+                            identity.index += 1;
+                            identity
+                        } else {
+                            value.identity.clone()
+                        },
                         total_bytes: header.total_bytes,
                         checksum: header.checksum.clone(),
                     },
@@ -2650,7 +2658,13 @@ mod tests {
                 .unwrap();
             assert_eq!(response.request_id, request_id);
             assert_eq!(response.source, node.as_bytes());
-            assert_eq!(response.term, u64::from(remove_staging));
+            assert_eq!(response.term, attempt);
+            if missing_transfer {
+                assert!(matches!(response.outcome,
+                    bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendOutcome::MissingTransfer { .. }
+                ));
+                continue;
+            }
             assert!(matches!(response.outcome,
                 bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendOutcome::Durable {
                     matched: Some(ref matched)
@@ -2658,6 +2672,15 @@ mod tests {
             ));
         }
         executor.shutdown().await.unwrap();
+        drop(executor);
+        let recovered = owned_vote_store::OwnedVoteStore::open(
+            &root.path().join("authority.redb"),
+            &header.cluster_id,
+        )
+        .unwrap();
+        assert_eq!(recovered.state().term, Term(2));
+        assert_eq!(recovered.state().voted_for, None);
+        recovered.close().unwrap();
     }
 
     #[test]
