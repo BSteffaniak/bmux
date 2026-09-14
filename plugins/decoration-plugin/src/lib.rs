@@ -1841,6 +1841,7 @@ fn apply_theme_extension_toml_direct(
             "script could not be compiled",
         ));
     }
+    reuse_script_components(state, &mut prepared, &extension, &script_host_access);
     state.script_components = prepared.script_components;
     state.current_theme = Some(extension);
     clear_visual_projection_state(state);
@@ -3097,6 +3098,61 @@ struct ApplyThemeExtensionArgs {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct NotifyPaneEventArgs {
     event: PaneEvent,
+}
+
+// Reuse whole instance groups only: retaining half a shared instance would split
+// its Lua authority between an old backend and a freshly compiled backend.
+fn reuse_script_components(
+    state: &mut State,
+    prepared: &mut State,
+    extension: &DecorationThemeExtension,
+    host_access: &ScriptHostAccess,
+) {
+    if !host_access.service_grants.is_empty()
+        || state
+            .current_theme
+            .as_ref()
+            .and_then(|theme| theme.script_access.as_ref())
+            != extension.script_access.as_ref()
+    {
+        return;
+    }
+    let mut reusable: BTreeSet<String> = prepared
+        .script_components
+        .values()
+        .map(|runtime| runtime.instance_id.clone())
+        .collect();
+    for runtime in prepared.script_components.values() {
+        let unchanged = state
+            .script_components
+            .get(&runtime.id)
+            .is_some_and(|previous| {
+                previous.instance_id == runtime.instance_id
+                    && previous.spec == runtime.spec
+                    && previous.script_path == runtime.script_path
+                    && previous.script_source_hash == runtime.script_source_hash
+                    && previous.backend.is_some()
+            });
+        if !unchanged {
+            reusable.remove(&runtime.instance_id);
+        }
+    }
+    for previous in state.script_components.values() {
+        if prepared
+            .script_components
+            .get(&previous.id)
+            .is_none_or(|next| next.instance_id != previous.instance_id)
+        {
+            reusable.remove(&previous.instance_id);
+        }
+    }
+    for (id, candidate) in &mut prepared.script_components {
+        if reusable.contains(&candidate.instance_id)
+            && let Some(previous) = state.script_components.remove(id)
+        {
+            *candidate = previous;
+        }
+    }
 }
 
 fn install_script_components(
@@ -5534,6 +5590,100 @@ exited = ""
                 assert_eq!(state.scene_revision, revision);
                 assert!(state.current_theme.is_none());
             }
+        });
+    }
+
+    #[test]
+    fn identical_component_reapply_preserves_backend_and_interaction_state() {
+        let plugin = DecorationPlugin::new();
+        let shared = plugin.state.clone();
+        plugin.state.with_state(move |state| {
+            let extension = decoration_extension_from_theme(include_str!(
+                "../../theme-plugin/assets/themes/rainbow-snake.toml"
+            ));
+            let text = toml::to_string(&extension).expect("serialize extension");
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("initial apply");
+            let (id, runtime) = state
+                .script_components
+                .iter_mut()
+                .next()
+                .expect("component");
+            let id = id.clone();
+            runtime.script_frame = 41;
+            let backend = runtime.backend.clone().expect("backend");
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("reapply");
+            let runtime = state
+                .script_components
+                .get(&id)
+                .expect("retained component");
+            // Applying publishes a scene and renders one frame on the retained backend.
+            assert_eq!(runtime.script_frame, 42);
+            assert!(Arc::ptr_eq(
+                &backend,
+                runtime.backend.as_ref().expect("backend")
+            ));
+        });
+    }
+
+    #[test]
+    fn changed_shared_component_replaces_entire_instance_group() {
+        let plugin = DecorationPlugin::new();
+        let shared = plugin.state.clone();
+        plugin.state.with_state(move |state| {
+            let mut extension = decoration_extension_from_theme(include_str!(
+                "../../theme-plugin/assets/themes/rainbow-snake.toml"
+            ));
+            let components = extension.components.as_mut().expect("components");
+            let mut spec = components.values().next().expect("component").clone();
+            spec.script_instance = Some("shared".to_string());
+            components.clear();
+            components.insert("first".to_string(), spec.clone());
+            components.insert("second".to_string(), spec);
+            let text = toml::to_string(&extension).expect("serialize");
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("initial apply");
+            let original = state.script_components["first"]
+                .backend
+                .clone()
+                .expect("backend");
+            let components = extension.components.as_mut().expect("components");
+            components.get_mut("second").expect("second").script = Some("pulse".to_string());
+            let text = toml::to_string(&extension).expect("serialize");
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("changed apply");
+            assert!(!Arc::ptr_eq(
+                &original,
+                state.script_components["first"]
+                    .backend
+                    .as_ref()
+                    .expect("backend")
+            ));
         });
     }
 

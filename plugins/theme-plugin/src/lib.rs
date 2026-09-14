@@ -582,6 +582,14 @@ fn publish_runtime_appearance_to_host(context: &impl ServiceCaller, theme: &Reso
     }
 }
 
+fn picker_active_name(stack: &[String]) -> String {
+    stack
+        .iter()
+        .find(|name| name.as_str() != "mode-aware")
+        .cloned()
+        .unwrap_or_else(|| "default".to_string())
+}
+
 async fn run_theme_picker(context: NativeCommandContext) {
     let settings = parse_settings(context.settings.as_ref());
     let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
@@ -591,25 +599,13 @@ async fn run_theme_picker(context: NativeCommandContext) {
     }
 
     let active_stack = active_theme_stack(&context, &settings, &catalog);
-    let active_name = active_stack
-        .stack
-        .iter()
-        .find(|name| name.as_str() != "mode-aware")
-        .cloned()
-        .unwrap_or_else(|| "default".to_string());
+    let active_name = picker_active_name(&active_stack.stack);
     let Some(original_theme) =
         resolve_theme_stack_with_settings(&catalog, &active_stack.stack, &settings)
     else {
         return;
     };
     let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
-    publish_runtime_appearance_to_host(&context, &original_theme);
-    apply_theme_extensions(
-        &context,
-        &original_theme,
-        &all_plugin_ids,
-        &context.connection.config_dir_candidates,
-    );
 
     let request = bmux_plugin_sdk::PromptRequest::single_select(
         "Select Theme",
@@ -626,18 +622,26 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     };
 
+    let mut previewed = false;
+    let mut events_open = true;
     let selected_name = loop {
         tokio::select! {
+            biased;
             response = &mut response_rx => {
                 break match response {
                     Ok(PromptResponse::Submitted(PromptValue::Single(name))) => Some(name),
                     Ok(PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_)) | Err(_) => None,
                 };
             }
-            event = event_rx.recv() => {
-                if let Some(PromptEvent::SelectionChanged { value, .. }) = event
+            event = event_rx.recv(), if events_open => {
+                let Some(event) = event else {
+                    events_open = false;
+                    continue;
+                };
+                if let PromptEvent::SelectionChanged { value, .. } = event
                     && let Some(theme) = resolve_theme_picker_selection(&catalog, &value, &settings)
                 {
+                    previewed = true;
                     publish_runtime_appearance_to_host(&context, &theme);
                     apply_theme_extensions(
                         &context,
@@ -678,13 +682,15 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     }
 
-    publish_runtime_appearance_to_host(&context, &original_theme);
-    apply_theme_extensions(
-        &context,
-        &original_theme,
-        &all_plugin_ids,
-        &context.connection.config_dir_candidates,
-    );
+    if previewed {
+        publish_runtime_appearance_to_host(&context, &original_theme);
+        apply_theme_extensions(
+            &context,
+            &original_theme,
+            &all_plugin_ids,
+            &context.connection.config_dir_candidates,
+        );
+    }
 }
 
 async fn configure_theme_settings_providers(
@@ -1976,6 +1982,60 @@ mod tests {
         let dir = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&dir).expect("create temp theme dir");
         dir
+    }
+
+    fn picker_context() -> NativeCommandContext {
+        let lifecycle = lifecycle_context(None);
+        NativeCommandContext {
+            plugin_id: lifecycle.plugin_id,
+            command: "pick-theme".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: lifecycle.required_capabilities,
+            provided_capabilities: lifecycle.provided_capabilities,
+            services: lifecycle.services,
+            available_capabilities: lifecycle.available_capabilities,
+            enabled_plugins: lifecycle.enabled_plugins,
+            plugin_search_roots: Vec::new(),
+            registered_plugins: Vec::new(),
+            active_keybindings: Vec::new(),
+            host: lifecycle.host,
+            connection: lifecycle.connection,
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            caller_client_id: None,
+            invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
+            host_kernel_bridge: None,
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    async fn picker_rejection_and_closed_events_do_not_apply_themes() {
+        let calls = Arc::new(Mutex::new(0_usize));
+        let observed = calls.clone();
+        let router: TestServiceRouter = Arc::new(move |_, _, _, _, _, _, _| {
+            *observed.lock().expect("calls") += 1;
+            Ok(Vec::new())
+        });
+        let _router = install_test_service_router(router);
+        let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let _host = prompt::register_host(sender);
+        let host = async {
+            let request = requests.recv().await.expect("prompt");
+            drop(request.event_tx);
+            // Yield with a closed event stream before delivering the response.
+            tokio::task::yield_now().await;
+            request
+                .response_tx
+                .send(PromptResponse::RejectedBusy)
+                .expect("response");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(run_theme_picker(picker_context()), host);
+        })
+        .await
+        .expect("picker must finish without spinning");
+        assert_eq!(*calls.lock().expect("calls"), 0);
     }
 
     #[test]
