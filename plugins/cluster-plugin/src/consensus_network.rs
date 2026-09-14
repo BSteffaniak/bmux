@@ -1911,8 +1911,10 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
                 crate::owned_vote_store::AuthenticatedAppendError::Executor(
                     crate::consensus_model::VoteGateError::Stopped,
                 ) => RpcError::Stopped,
+                crate::owned_vote_store::AuthenticatedAppendError::TermMismatch => {
+                    RpcError::StaleTerm
+                }
                 crate::owned_vote_store::AuthenticatedAppendError::MissingTransfer { .. }
-                | crate::owned_vote_store::AuthenticatedAppendError::TermMismatch
                 | crate::owned_vote_store::AuthenticatedAppendError::Executor(_) => {
                     RpcError::ExecutionFailed
                 }

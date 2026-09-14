@@ -1075,9 +1075,6 @@ impl VoteExecutor {
                 if request.cluster_id.as_bytes() != authority.1 {
                     return Err(AuthenticatedAppendError::Unauthorized);
                 }
-                if request.term != store.state.term.0 {
-                    return Err(AuthenticatedAppendError::TermMismatch);
-                }
                 let members = authority.0.members.into_values().collect::<Vec<_>>();
                 let source = crate::consensus_network::authenticate_owned_append(
                     caller.as_ref(),
@@ -1094,6 +1091,19 @@ impl VoteExecutor {
                             .any(|set| set.contains(&source))
                 }) {
                     return Err(AuthenticatedAppendError::Unauthorized);
+                }
+                if request.term < store.state.term.0 {
+                    return Err(AuthenticatedAppendError::TermMismatch);
+                }
+                if request.term > store.state.term.0 {
+                    // Authentication and voter eligibility precede authority changes.
+                    // Persist even if subsequent staging or predecessor lookup fails.
+                    store
+                        .persist(HardState {
+                            term: Term(request.term),
+                            voted_for: None,
+                        })
+                        .map_err(AuthenticatedAppendError::Storage)?;
                 }
                 let mut previous = request.previous.clone();
                 let mut entries = Vec::with_capacity(request.entries.len());

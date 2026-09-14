@@ -2616,7 +2616,7 @@ mod tests {
                 sender: header.sender.clone(),
                 recipient: header.recipient.clone(),
                 request_id: uuid::Uuid::new_v4(),
-                term: 0,
+                term: u64::from(remove_staging),
                 previous: value.previous.clone(),
                 leader_commit: None,
                 entries: vec![AppendEntry::Staged {
@@ -2650,7 +2650,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.request_id, request_id);
             assert_eq!(response.source, node.as_bytes());
-            assert_eq!(response.term, 0);
+            assert_eq!(response.term, u64::from(remove_staging));
             assert!(matches!(response.outcome,
                 bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendOutcome::Durable {
                     matched: Some(ref matched)
