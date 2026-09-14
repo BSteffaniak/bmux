@@ -1754,6 +1754,15 @@ fn apply_theme_extension_toml(
     })
 }
 
+fn script_replacement_error(path: &str, message: &str) -> ValidationResult {
+    ValidationResult::Errors {
+        errors: vec![ValidationError {
+            path: path.to_string(),
+            message: message.to_string(),
+        }],
+    }
+}
+
 fn apply_theme_extension_toml_direct(
     shared: &SharedState,
     state: &mut State,
@@ -1793,17 +1802,66 @@ fn apply_theme_extension_toml_direct(
     let script_access = extension.script_access.clone();
     let mut script_host_access = script_host_access.clone();
     script_host_access.service_grants = script_service_grants(script_access.as_ref());
+    // Prepare every replacement away from the active state. A missing or invalid
+    // script must not discard working components or advance scene authority.
+    let mut prepared = State::default();
+    if extension.script.is_some() && script.is_none() {
+        return Err(script_replacement_error(
+            "script",
+            "script could not be loaded",
+        ));
+    }
     install_script_components(
-        state,
+        &mut prepared,
         &extension,
         config_dir_candidates,
         &script_host_access,
     );
+    if let Some(components) = extension.components.as_ref() {
+        for (id, spec) in components {
+            if component_enabled(spec)
+                && spec.script.is_some()
+                && prepared
+                    .script_components
+                    .get(id)
+                    .is_none_or(|runtime| runtime.backend.is_none())
+            {
+                return Err(script_replacement_error(
+                    &format!("components.{id}.script"),
+                    "script could not be loaded or compiled",
+                ));
+            }
+        }
+    }
+    let has_script = script.is_some();
+    install_script_backend(&mut prepared, script, script_host_access.clone());
+    if has_script && prepared.script_backend.is_none() {
+        return Err(script_replacement_error(
+            "script",
+            "script could not be compiled",
+        ));
+    }
+    state.script_components = prepared.script_components;
     state.current_theme = Some(extension);
     clear_visual_projection_state(state);
     state.animation_hz = animation_hz;
     state.animation_generation = state.animation_generation.saturating_add(1);
-    install_script_backend(state, script, script_host_access.clone());
+    let preserve_script = state.script_backend.is_some()
+        && state.script_path == prepared.script_path
+        && state.script_source_hash == prepared.script_source_hash
+        && script_host_access.service_grants.is_empty();
+    if !preserve_script {
+        state.script_backend = prepared.script_backend;
+        state.script_path = prepared.script_path;
+        state.script_source_hash = prepared.script_source_hash;
+        state.script_started_at = prepared.script_started_at;
+        state.script_frame = 0;
+        state.script_perf = prepared.script_perf;
+        state.script_events.clear();
+        state.script_event_subscriptions.clear();
+        state.script_first_invoke_logged = false;
+    }
+    state.script_subscription_generation = state.script_subscription_generation.saturating_add(1);
     let subscription_generation = state.script_subscription_generation;
     publish_scene_if_changed(state);
     install_script_event_subscriptions(shared, state, script_access, subscription_generation);
@@ -5437,6 +5495,93 @@ exited = ""
             script_visual_bytes_payload(&state)["pong.content-presence"].as_ref(),
             &[0, 1, 2, 3]
         );
+    }
+
+    #[test]
+    fn failed_script_replacement_preserves_active_state() {
+        let plugin = DecorationPlugin::new();
+        let shared = plugin.state.clone();
+        plugin.state.with_state(move |state| {
+            state.animation_generation = 17;
+            state.script_subscription_generation = 23;
+            state.script_frame = 41;
+            let revision = state.scene_revision;
+            for text in [
+                "script = '/nonexistent-bmux-script.lua'",
+                "[components.broken]\nscript = '/nonexistent-bmux-script.lua'",
+            ] {
+                let base = decoration_extension_from_theme(include_str!(
+                    "../../theme-plugin/assets/themes/pulse-border.toml"
+                ));
+                let mut value = toml::Value::try_from(base).expect("serialize extension");
+                let patch: toml::Value = toml::from_str(text).expect("parse patch");
+                value
+                    .as_table_mut()
+                    .expect("table")
+                    .extend(patch.as_table().expect("patch table").clone());
+                let text = toml::to_string(&value).expect("serialize patched extension");
+                let result = apply_theme_extension_toml_direct(
+                    &shared,
+                    state,
+                    &text,
+                    &[],
+                    &ScriptHostAccess::default(),
+                );
+                assert!(result.is_err());
+                assert_eq!(state.animation_generation, 17);
+                assert_eq!(state.script_subscription_generation, 23);
+                assert_eq!(state.script_frame, 41);
+                assert_eq!(state.scene_revision, revision);
+                assert!(state.current_theme.is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn invalid_lua_replacement_keeps_working_backend() {
+        let plugin = DecorationPlugin::new();
+        let shared = plugin.state.clone();
+        let dir = std::env::temp_dir().join(format!("bmux-script-replace-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create script directory");
+        let path = dir.join("test.lua");
+        std::fs::write(&path, "function decorate(message) return {} end").expect("write script");
+        plugin.state.with_state(move |state| {
+            let mut value = toml::Value::try_from(decoration_extension_from_theme(include_str!(
+                "../../theme-plugin/assets/themes/pulse-border.toml"
+            )))
+            .expect("serialize extension");
+            value
+                .as_table_mut()
+                .expect("table")
+                .insert("script".into(), "test.lua".into());
+            let extension = toml::to_string(&value).expect("serialize extension");
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &extension,
+                std::slice::from_ref(&dir),
+                &ScriptHostAccess::default(),
+            )
+            .expect("install working script");
+            state.script_frame = 41;
+            let source_hash = state.script_source_hash;
+            let generation = state.script_subscription_generation;
+            std::fs::write(&path, "function !!! invalid lua").expect("write invalid script");
+            assert!(
+                apply_theme_extension_toml_direct(
+                    &shared,
+                    state,
+                    &extension,
+                    std::slice::from_ref(&dir),
+                    &ScriptHostAccess::default(),
+                )
+                .is_err()
+            );
+            assert!(state.script_backend.is_some());
+            assert_eq!(state.script_source_hash, source_hash);
+            assert_eq!(state.script_frame, 41);
+            assert_eq!(state.script_subscription_generation, generation);
+        });
     }
 
     #[test]
