@@ -2671,6 +2671,62 @@ mod tests {
                 } if matched.index == 2 && matched.term == 0 && matched.leader == node.as_bytes()
             ));
         }
+        let challenge = create_peer_auth_challenge(
+            caller.as_ref(),
+            &ClusterPeerChallengeRequest {
+                claimant_node_id: node.to_string(),
+            },
+        )
+        .unwrap();
+        let mut vote = bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest {
+            cluster_id: header.cluster_id.clone(),
+            sender: node.as_bytes().to_vec(),
+            recipient: node.as_bytes().to_vec(),
+            request_id: uuid::Uuid::new_v4(),
+            term: 3,
+            last_log: Some(
+                bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
+                    term: 0,
+                    leader: node.as_bytes().to_vec(),
+                    index: 2,
+                },
+            ),
+            proof: TransferProof {
+                credential_serial: member.credential_serial.clone(),
+                signature: Vec::new(),
+                peer: create_peer_auth_proof(caller.as_ref(), challenge).unwrap(),
+            },
+        };
+        vote.proof.signature =
+            identity.sign(&consensus_network::owned_vote_signing_payload(&vote).unwrap());
+        let provider = consensus_network::OwnedAppendService {
+            caller: caller.clone(),
+            local: node,
+            executor: executor.clone(),
+        };
+        let response =
+            bmux_cluster_plugin_api::cluster_consensus_vote::ClusterConsensusVoteService::vote(
+                &provider,
+                vote.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(response.granted);
+        assert_eq!(response.term, 3);
+        membership::verify_node_signature(
+            &node.to_string(),
+            &consensus_network::owned_vote_response_signing_payload(&vote, &response).unwrap(),
+            &response.signature,
+        )
+        .unwrap();
+        assert!(matches!(
+            bmux_cluster_plugin_api::cluster_consensus_vote::ClusterConsensusVoteService::vote(
+                &provider, vote
+            )
+            .await,
+            Err(bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError::Unauthorized)
+        ));
+        drop(provider);
         executor.shutdown().await.unwrap();
         drop(executor);
         let recovered = owned_vote_store::OwnedVoteStore::open(
@@ -2678,8 +2734,8 @@ mod tests {
             &header.cluster_id,
         )
         .unwrap();
-        assert_eq!(recovered.state().term, Term(2));
-        assert_eq!(recovered.state().voted_for, None);
+        assert_eq!(recovered.state().term, Term(3));
+        assert_eq!(recovered.state().voted_for, Some(node));
         recovered.close().unwrap();
     }
 

@@ -24,6 +24,35 @@ use bmux_cluster_plugin_api::{
 };
 
 #[test]
+fn owned_vote_contract_is_distinct_from_legacy_raft() {
+    use bmux_cluster_plugin_api::{
+        cluster_consensus_vote, cluster_consensus_vote_types::VoteResponse,
+    };
+    assert_eq!(
+        cluster_consensus_vote::INTERFACE_ID,
+        "cluster-consensus-vote/v1"
+    );
+    assert_ne!(
+        cluster_consensus_vote::INTERFACE_ID,
+        cluster_raft_rpc::INTERFACE_ID
+    );
+    let response = VoteResponse {
+        request_id: uuid::Uuid::new_v4(),
+        source: vec![1; 32],
+        term: 9,
+        granted: false,
+        signature: vec![2; 64],
+    };
+    let decoded: VoteResponse =
+        bmux_codec::from_bytes(&bmux_codec::to_vec(&response).unwrap()).unwrap();
+    assert_eq!(decoded.request_id, response.request_id);
+    assert_eq!(decoded.source, response.source);
+    assert_eq!(decoded.term, response.term);
+    assert_eq!(decoded.granted, response.granted);
+    assert_eq!(decoded.signature, response.signature);
+}
+
+#[test]
 fn generated_control_services_expose_consistency_and_structured_errors() {
     let view = ControlStateView {
         membership_epoch: None,

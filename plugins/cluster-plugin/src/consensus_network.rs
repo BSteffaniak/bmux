@@ -103,6 +103,104 @@ pub fn transfer_signing_payload(
     Ok(signed)
 }
 
+/// Bounded, domain-separated signing input for owned votes.
+/// # Errors
+/// Rejects oversized proof fields and malformed resource identities before cloning.
+pub fn owned_vote_signing_payload(
+    request: &bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest,
+) -> Result<Vec<u8>, String> {
+    let proof = &request.proof;
+    let challenge = &proof.peer.challenge;
+    let mut remaining = 16 * 1024usize;
+    for field in [
+        &request.cluster_id,
+        &proof.credential_serial,
+        &proof.peer.claimant_node_id,
+        &proof.peer.claimant_credential_serial,
+        &proof.peer.claimant_signature,
+        &challenge.cluster_id,
+        &challenge.verifier_node_id,
+        &challenge.verifier_credential_serial,
+        &challenge.audience_node_id,
+        &challenge.nonce,
+        &challenge.signature,
+    ] {
+        remaining = remaining
+            .checked_sub(field.len())
+            .ok_or("vote proof exceeds budget")?;
+    }
+    if proof.signature.len() > 64 {
+        return Err("invalid vote signature length".into());
+    }
+    transfer_node(&request.sender)?;
+    transfer_node(&request.recipient)?;
+    if let Some(last) = &request.last_log {
+        transfer_node(&last.leader)?;
+        if last.term > request.term {
+            return Err("vote log term exceeds candidate term".into());
+        }
+    }
+    let mut unsigned = request.clone();
+    unsigned.proof.signature.clear();
+    let mut signed = b"bmux.cluster.consensus-vote.v1\0request\0".to_vec();
+    signed.extend(encode_service_message(&unsigned).map_err(|error| error.to_string())?);
+    Ok(signed)
+}
+
+/// Bind a signed vote response to the complete request and intended responder.
+/// # Errors
+/// Rejects malformed, oversized, or mismatched request/response pairs.
+pub fn owned_vote_response_signing_payload(
+    request: &bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest,
+    response: &bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteResponse,
+) -> Result<Vec<u8>, String> {
+    let request_bytes = owned_vote_signing_payload(request)?;
+    if response.source != request.recipient {
+        return Err("vote responder mismatch".into());
+    }
+    if response.request_id != request.request_id || response.signature.len() > 64 {
+        return Err("vote response binding mismatch".into());
+    }
+    let mut unsigned = response.clone();
+    unsigned.signature.clear();
+    let mut signed = b"bmux.cluster.consensus-vote.v1\0response\0".to_vec();
+    signed.extend(
+        encode_service_message(&(request_bytes, &request.proof.signature, unsigned))
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(signed)
+}
+
+/// Authenticate a vote against the durable members supplied by its executor.
+/// # Errors
+/// Rejects invalid signatures, identity bindings, and revoked or replayed proofs.
+pub fn authenticate_owned_vote(
+    caller: &impl crate::ClusterRuntimeOps,
+    local: NodeId,
+    members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
+    request: &bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest,
+) -> Result<NodeId, String> {
+    let signed = owned_vote_signing_payload(request)?;
+    let source = request.proof.peer.claimant_node_id.parse::<NodeId>()?;
+    if request.recipient.as_slice() != local.as_bytes()
+        || request.sender.as_slice() != source.as_bytes()
+        || request.cluster_id != request.proof.peer.challenge.cluster_id
+        || request.proof.credential_serial != request.proof.peer.claimant_credential_serial
+        || request.proof.signature.len() != 64
+    {
+        return Err("invalid vote identity or proof binding".into());
+    }
+    verify_node_signature(&source.to_string(), &signed, &request.proof.signature)?;
+    crate::membership::authenticate_peer_for_members(
+        caller,
+        &crate::ClusterPeerAuthenticateRequest {
+            proof: request.proof.peer.clone(),
+        },
+        members,
+    )?;
+    Ok(source)
+}
+
 /// Authenticate unpublished owned append against membership supplied by its owner.
 ///
 /// The owner must serialize membership/term checks and durable mutation; this
@@ -1847,6 +1945,53 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static> OwnedAppendService<C> 
             }),
         )
         .map_err(Box::new)
+    }
+}
+
+impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
+    bmux_cluster_plugin_api::cluster_consensus_vote::ClusterConsensusVoteService
+    for OwnedAppendService<C>
+{
+    fn vote<'a>(
+        &'a self,
+        request: bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteResponse,
+                        bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
+            owned_vote_signing_payload(&request).map_err(|_| RpcError::InvalidRequest)?;
+            let identity = crate::load_or_create_node_identity(self.caller.as_ref())
+                .map_err(|_| RpcError::Unauthorized)?;
+            if *identity.node_id() != self.local {
+                return Err(RpcError::Unauthorized);
+            }
+            let decision = self
+                .executor
+                .vote_authenticated(self.caller.clone(), self.local, request.clone())
+                .await?;
+            let mut response =
+                bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteResponse {
+                    request_id: request.request_id,
+                    source: self.local.as_bytes().to_vec(),
+                    term: decision.term.0,
+                    granted: decision.granted,
+                    signature: Vec::new(),
+                };
+            response.signature = identity.sign(
+                &owned_vote_response_signing_payload(&request, &response)
+                    .map_err(|_| RpcError::InvalidRequest)?,
+            );
+            Ok(response)
+        })
     }
 }
 

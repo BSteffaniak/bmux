@@ -1011,6 +1011,35 @@ interface cluster-consensus-rpc {
     command append(request: cluster-consensus-rpc-types.append-request) -> result<cluster-consensus-rpc-types.append-response, cluster-consensus-rpc-types.rpc-error>;
 }
 
+interface cluster-consensus-vote-types {
+    // Sender is the candidate. The request signature binds all fields except
+    // itself, with a vote-specific operation/version domain separator.
+    record vote-request {
+        cluster-id: string,
+        sender: bytes,
+        recipient: bytes,
+        request-id: uuid,
+        term: u64,
+        last-log: cluster-consensus-transfer-types.log-identity?,
+        proof: cluster-consensus-transfer-types.transfer-proof,
+    }
+    // The responder signs the complete request binding and all response fields
+    // except signature. A grant is published only after durable vote commit.
+    record vote-response {
+        request-id: uuid,
+        source: bytes,
+        term: u64,
+        granted: bool,
+        signature: bytes,
+    }
+}
+
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-consensus-vote {
+    command vote(request: cluster-consensus-vote-types.vote-request) -> result<cluster-consensus-vote-types.vote-response, cluster-consensus-rpc-types.rpc-error>;
+}
+
 @capability(CLUSTER_AUTH)
 @interface-version(1)
 interface cluster-peer-auth {
