@@ -38,6 +38,8 @@ pub struct ProjectedSegment {
 pub struct ProjectedBar {
     pub(super) segments: Vec<ProjectedSegment>,
     layout: LayoutNode,
+    continuation: Vec<Self>,
+    pub(super) height: u16,
     previous_anchor: Option<Uuid>,
     next_anchor: Option<Uuid>,
 }
@@ -46,6 +48,7 @@ pub struct ProjectedTabRange {
     pub(super) tab_id: Uuid,
     pub(super) start: u16,
     pub(super) end: u16,
+    pub(super) row: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +62,7 @@ pub struct ResolvedInsertion {
     pub(super) tab_id: Uuid,
     pub(super) side: DropSide,
     pub(super) marker_col: u16,
+    pub(super) marker_row: u16,
 }
 
 /// Interaction geometry is independent of segment text, decoration, and styling.
@@ -68,24 +72,26 @@ pub struct TabBarGeometry {
 }
 
 impl TabBarGeometry {
-    pub fn resolve_insertion(&self, col: u16) -> Option<ResolvedInsertion> {
+    pub fn resolve_insertion(&self, col: u16, row: u16) -> Option<ResolvedInsertion> {
         // Compare cell centers to edge coordinates in half-cell units. Equal
         // distances favor the right anchor, including a single-cell separator.
         let pointer = u32::from(col) * 2 + 1;
         self.tabs
             .iter()
-            .filter(|tab| tab.start < tab.end)
+            .filter(|tab| tab.start < tab.end && tab.row == row)
             .flat_map(|tab| {
                 [
                     ResolvedInsertion {
                         tab_id: tab.tab_id,
                         side: DropSide::Before,
                         marker_col: tab.start,
+                        marker_row: tab.row,
                     },
                     ResolvedInsertion {
                         tab_id: tab.tab_id,
                         side: DropSide::After,
                         marker_col: tab.end,
+                        marker_row: tab.row,
                     },
                 ]
             })
@@ -99,6 +105,11 @@ impl TabBarGeometry {
 }
 
 impl ProjectedBar {
+    pub fn empty() -> Self {
+        let mut bar = Self::new(Vec::new());
+        bar.height = 0;
+        bar
+    }
     pub fn interaction_geometry(&self) -> TabBarGeometry {
         TabBarGeometry {
             tabs: self.tab_ranges(),
@@ -117,6 +128,8 @@ impl ProjectedBar {
         Self {
             segments,
             layout,
+            continuation: Vec::new(),
+            height: 1,
             previous_anchor: None,
             next_anchor: None,
         }
@@ -141,13 +154,25 @@ impl ProjectedBar {
             })
     }
 
+    pub fn positioned_rows(&self) -> impl Iterator<Item = (&ProjectedSegment, u16, u16, u16)> {
+        std::iter::once(self)
+            .chain(self.continuation.iter())
+            .enumerate()
+            .flat_map(|(row, bar)| {
+                bar.positioned_segments().map(move |(segment, x, width)| {
+                    (segment, x, u16::try_from(row).unwrap_or(u16::MAX), width)
+                })
+            })
+    }
+
     pub fn tab_ranges(&self) -> Vec<ProjectedTabRange> {
         let mut ranges: Vec<ProjectedTabRange> = Vec::new();
-        for (segment, x, width) in self.positioned_segments() {
+        for (segment, x, row, width) in self.positioned_rows() {
             if let Some(tab_id) = segment.tab_id {
                 if let Some(last) = ranges.last_mut()
                     && last.tab_id == tab_id
                     && last.end == x
+                    && last.row == row
                 {
                     last.end = x.saturating_add(width);
                 } else {
@@ -155,6 +180,7 @@ impl ProjectedBar {
                         tab_id,
                         start: x,
                         end: x.saturating_add(width),
+                        row,
                     });
                 }
             }
@@ -162,8 +188,13 @@ impl ProjectedBar {
         ranges
     }
 
+    pub fn drop_target_at(&self, col: u16, row: u16) -> Option<ResolvedInsertion> {
+        self.interaction_geometry().resolve_insertion(col, row)
+    }
+
+    #[cfg(test)]
     pub fn drop_target_at_col(&self, col: u16) -> Option<ResolvedInsertion> {
-        self.interaction_geometry().resolve_insertion(col)
+        self.drop_target_at(col, 0)
     }
 
     #[cfg(test)]
@@ -407,13 +438,39 @@ pub fn project_bar(
         .collect::<Vec<_>>();
     let fallback_measurements = ProjectionMeasurements::default();
     let measurements = interaction.measurements.unwrap_or(&fallback_measurements);
-    let tab = visible_tabs_for_layout(
-        &tokens,
-        settings,
-        &style,
-        tab_budget,
-        interaction.scroll_anchor,
-        &mut measurements.0.borrow_mut(),
+    let row_limit = if settings.wrap {
+        settings
+            .max_rows
+            .min(local.viewport_rows.saturating_sub(1).max(1))
+    } else {
+        1
+    };
+    let wrapped = (row_limit > 1).then(|| {
+        wrapped_ranges(
+            &tokens,
+            settings,
+            tab_budget,
+            inner_width,
+            &style,
+            interaction.scroll_anchor,
+            row_limit,
+        )
+    });
+    let tab = wrapped.as_ref().map_or_else(
+        || {
+            visible_tabs_for_layout(
+                &tokens,
+                settings,
+                &style,
+                tab_budget,
+                interaction.scroll_anchor,
+                &mut measurements.0.borrow_mut(),
+            )
+        },
+        |ranges| TabTab {
+            start: ranges[0].start,
+            end: ranges[0].end,
+        },
     );
     let mut left = vec![ProjectedSegment {
         text: " ".repeat(settings.left_padding),
@@ -446,6 +503,17 @@ pub fn project_bar(
             tab_id: None,
             edit_cursor_offset: None,
         });
+    } else if let Some(ranges) = &wrapped {
+        append_wrapped_row(
+            &mut left,
+            &tokens,
+            &tab,
+            settings,
+            &style,
+            tab_budget,
+            true,
+            ranges.len() == 1,
+        );
     } else {
         append_tabs(&mut left, &tokens, &tab, settings, &style, tab_budget);
     }
@@ -497,7 +565,146 @@ pub fn project_bar(
         projected.previous_anchor = measurements.step_anchor(first.tab_id, last.tab_id, false);
         projected.next_anchor = measurements.step_anchor(first.tab_id, last.tab_id, true);
     }
+    if let Some(rows) = wrapped {
+        for (index, range) in rows.iter().enumerate().skip(1) {
+            let mut segments = vec![base_segment(" ".repeat(settings.left_padding.min(width)))];
+            append_wrapped_row(
+                &mut segments,
+                &tokens,
+                range,
+                settings,
+                &style,
+                inner_width,
+                false,
+                index + 1 == rows.len(),
+            );
+            truncate_segments(&mut segments, width.saturating_sub(settings.right_padding));
+            let padding = width.saturating_sub(segments_width(&segments));
+            segments.push(base_segment(" ".repeat(padding)));
+            projected.continuation.push(ProjectedBar::new(segments));
+        }
+        let first = rows[0].start;
+        let end = rows.last().unwrap().end;
+        projected.previous_anchor = first.checked_sub(1).map(|index| tokens[index].tab_id);
+        projected.next_anchor = (end < tokens.len()).then(|| tokens[first + 1].tab_id);
+    }
+    projected.height = if settings.wrap {
+        u16::try_from(projected.continuation.len() + 1)
+            .unwrap_or(row_limit)
+            .max(settings.min_rows.min(row_limit))
+    } else {
+        settings.height
+    };
     projected
+}
+
+const fn base_segment(text: String) -> ProjectedSegment {
+    ProjectedSegment {
+        text,
+        kind: SegmentKind::Base,
+        tab_id: None,
+        edit_cursor_offset: None,
+    }
+}
+
+// Two bounded linear passes: try canonical order, then reveal the requested anchor
+// if it does not fit. Neither pass changes authoritative order or selection.
+fn wrapped_ranges(
+    tokens: &[TabToken],
+    settings: &Settings,
+    first_budget: usize,
+    budget: usize,
+    style: &RenderStyle,
+    anchor: Option<Uuid>,
+    rows: u16,
+) -> Vec<TabTab> {
+    let explicit_anchor = anchor.and_then(|id| tokens.iter().position(|token| token.tab_id == id));
+    let anchor = anchor
+        .and_then(|id| tokens.iter().position(|token| token.tab_id == id))
+        .or_else(|| tokens.iter().position(|token| token.active))
+        .unwrap_or(0);
+    let pack = |start: usize| {
+        let mut output = Vec::new();
+        let mut next = start;
+        let maximum = start
+            .saturating_add(settings.maximum_visible_tabs.unwrap_or(usize::MAX))
+            .min(tokens.len());
+        for row in 0..rows {
+            let row_start = next;
+            let available = if row == 0 { first_budget } else { budget };
+            // Leave room for boundary overflow chrome, but never sacrifice the anchor.
+            let chrome = UnicodeWidthStr::width(
+                style
+                    .overflow(tokens.len(), settings.overflow_style)
+                    .as_str(),
+            ) + UnicodeWidthStr::width(style.tab_separator.as_str());
+            let available = if (row == 0 && start > 0) || row + 1 == rows {
+                available.saturating_sub(chrome).max(1)
+            } else {
+                available
+            };
+            let mut used = 0_usize;
+            while next < maximum {
+                let gap = if next == row_start {
+                    0
+                } else {
+                    UnicodeWidthStr::width(style.tab_separator.as_str())
+                };
+                let size = tokens[next].width.min(available);
+                if next > row_start && used.saturating_add(gap).saturating_add(size) > available {
+                    break;
+                }
+                used = used.saturating_add(gap).saturating_add(size);
+                next += 1;
+            }
+            output.push(TabTab {
+                start: row_start,
+                end: next,
+            });
+            if next == maximum {
+                break;
+            }
+        }
+        output
+    };
+    if let Some(start) = explicit_anchor {
+        return pack(start);
+    }
+    let initial = pack(0);
+    if initial.last().is_some_and(|range| anchor >= range.end) && !tokens.is_empty() {
+        pack(anchor)
+    } else {
+        initial
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Row boundary flags control chrome without duplicating token rendering.
+fn append_wrapped_row(
+    output: &mut Vec<ProjectedSegment>,
+    tokens: &[TabToken],
+    range: &TabTab,
+    settings: &Settings,
+    style: &RenderStyle,
+    budget: usize,
+    first: bool,
+    last: bool,
+) {
+    let start = if first { 0 } else { range.start };
+    let end = if last { tokens.len() } else { range.end };
+    let mut row = Vec::new();
+    append_tabs(
+        &mut row,
+        &tokens[start..end],
+        &TabTab {
+            start: range.start - start,
+            end: range.end - start,
+        },
+        settings,
+        style,
+        budget,
+    );
+    truncate_segments(&mut row, budget);
+    output.extend(row);
 }
 
 fn append_menu(
@@ -909,12 +1116,12 @@ fn render_tab_template_ranges(
 fn truncate_cells(value: &str, maximum: usize) -> String {
     let mut output = String::new();
     let mut width = 0_usize;
-    for character in value.chars() {
-        let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(value, true) {
+        let character_width = UnicodeWidthStr::width(grapheme);
         if width.saturating_add(character_width) > maximum {
             break;
         }
-        output.push(character);
+        output.push_str(grapheme);
         width = width.saturating_add(character_width);
     }
     output
@@ -1192,6 +1399,135 @@ mod tests {
     }
 
     #[test]
+    fn wrapping_grows_shrinks_and_routes_rows_without_reordering() {
+        let settings = Settings {
+            show_mode: false,
+            show_role: false,
+            show_hint: false,
+            ..Settings::default()
+        };
+        let tabs: Vec<_> = (1..=8)
+            .map(|id| tab(id, "long-tab-name", id == 1))
+            .collect();
+        let mut local = local(45);
+        local.viewport_rows = 24;
+        let project = |local: &AttachLocalPresentationSnapshot| {
+            project_bar(
+                &settings,
+                &tabs,
+                local,
+                None,
+                &ProjectionInteraction::default(),
+            )
+        };
+        let narrow = project(&local);
+        assert_eq!(narrow.height, 3);
+        let ranges = narrow.tab_ranges();
+        assert!(ranges.iter().any(|range| range.row == 2));
+        assert!(
+            ranges
+                .windows(2)
+                .all(|pair| pair[0].tab_id < pair[1].tab_id)
+        );
+        for range in &ranges {
+            assert!(range.end <= local.viewport_cols);
+            let insertion = narrow.drop_target_at(range.start, range.row).unwrap();
+            assert_eq!(insertion.tab_id, range.tab_id);
+            assert_eq!(insertion.marker_row, range.row);
+        }
+        assert!(narrow.drop_target_at(0, 3).is_none());
+        local.viewport_cols = 240;
+        assert_eq!(project(&local).height, 1);
+        local.viewport_cols = 45;
+        local.viewport_rows = 2;
+        assert_eq!(project(&local).height, 1);
+    }
+
+    #[test]
+    fn row_bounds_preserve_graphemes_and_minimum_height() {
+        let settings = Settings {
+            min_rows: 2,
+            max_rows: 3,
+            ..Settings::default()
+        };
+        let mut local = local(35);
+        local.viewport_rows = 24;
+        for placement in [
+            super::super::Placement::Top,
+            super::super::Placement::Bottom,
+        ] {
+            let settings = Settings {
+                placement,
+                ..settings.clone()
+            };
+            let empty = project_bar(
+                &settings,
+                &[],
+                &local,
+                None,
+                &ProjectionInteraction::default(),
+            );
+            assert_eq!(empty.height, 2);
+            let tabs = [tab(1, &"👩‍💻".repeat(100), true), tab(2, "next", false)];
+            let bar = project_bar(
+                &settings,
+                &tabs,
+                &local,
+                None,
+                &ProjectionInteraction::default(),
+            );
+            assert!(bar.height <= 3);
+            assert!(
+                bar.tab_ranges()
+                    .iter()
+                    .any(|range| range.tab_id == tabs[1].id && range.row > 0)
+            );
+            for (segment, x, row, width) in bar.positioned_rows() {
+                assert!(x.saturating_add(width) <= local.viewport_cols);
+                assert!(row < bar.height);
+                assert!(!segment.text.ends_with('\u{200d}'));
+            }
+        }
+        assert_eq!(truncate_cells("👩‍💻x", 2), "👩‍💻");
+    }
+
+    #[test]
+    fn wrapping_reveals_active_and_manual_anchors_at_the_ceiling() {
+        let settings = Settings::default();
+        let tabs: Vec<_> = (1..=20)
+            .map(|id| tab(id, "界界-long-title", id == 20))
+            .collect();
+        let mut local = local(40);
+        local.viewport_rows = 24;
+        let active = project_bar(
+            &settings,
+            &tabs,
+            &local,
+            None,
+            &ProjectionInteraction::default(),
+        );
+        assert!(
+            active
+                .tab_ranges()
+                .iter()
+                .any(|range| range.tab_id == tabs[19].id)
+        );
+        let manual = project_bar(
+            &settings,
+            &tabs,
+            &local,
+            None,
+            &ProjectionInteraction {
+                scroll_anchor: Some(tabs[4].id),
+                ..ProjectionInteraction::default()
+            },
+        );
+        assert_eq!(manual.tab_ranges()[0].tab_id, tabs[4].id);
+        assert!(manual.scroll_target(false).is_some());
+        assert!(manual.scroll_target(true).is_some());
+    }
+
+    #[test]
     fn empty_workspace_keeps_noninteractive_label() {
         let projected = project_bar(
             &Settings::default(),
@@ -1317,7 +1653,8 @@ mod tests {
             Some(ResolvedInsertion {
                 tab_id: second.tab_id,
                 side: DropSide::Before,
-                marker_col: second.start
+                marker_col: second.start,
+                marker_row: second.row,
             })
         );
         assert_eq!(
@@ -1325,7 +1662,8 @@ mod tests {
             Some(ResolvedInsertion {
                 tab_id: second.tab_id,
                 side: DropSide::After,
-                marker_col: second.end
+                marker_col: second.end,
+                marker_row: second.row,
             })
         );
     }
@@ -1338,16 +1676,19 @@ mod tests {
                     tab_id: Uuid::from_u128(1),
                     start: 4,
                     end: 10,
+                    row: 0,
                 },
                 ProjectedTabRange {
                     tab_id: Uuid::from_u128(2),
                     start: 13,
                     end: 19,
+                    row: 0,
                 },
                 ProjectedTabRange {
                     tab_id: Uuid::from_u128(3),
                     start: 20,
                     end: 26,
+                    row: 0,
                 },
             ],
         };
@@ -1362,16 +1703,20 @@ mod tests {
             (u16::MAX, 3, DropSide::After, 26),
         ] {
             assert_eq!(
-                geometry.resolve_insertion(col),
+                geometry.resolve_insertion(col, 0),
                 Some(ResolvedInsertion {
                     tab_id: Uuid::from_u128(id),
                     side,
                     marker_col,
+                    marker_row: 0,
                 }),
                 "column {col}"
             );
         }
-        assert_eq!(TabBarGeometry { tabs: vec![] }.resolve_insertion(0), None);
+        assert_eq!(
+            TabBarGeometry { tabs: vec![] }.resolve_insertion(0, 0),
+            None
+        );
     }
 
     #[test]
@@ -1406,13 +1751,15 @@ mod tests {
                         == ResolvedInsertion {
                             tab_id: ranges[0].tab_id,
                             side: DropSide::After,
-                            marker_col: ranges[0].end
+                            marker_col: ranges[0].end,
+                            marker_row: 0,
                         }
                         || insertion
                             == ResolvedInsertion {
                                 tab_id: ranges[1].tab_id,
                                 side: DropSide::Before,
-                                marker_col: ranges[1].start
+                                marker_col: ranges[1].start,
+                                marker_row: 0,
                             }
                 );
             }

@@ -119,6 +119,7 @@ pub fn paint(
     input: &RenameInput,
     width: u16,
     x: u16,
+    y: u16,
     style: bmux_plugin::RenderStyle,
 ) -> (Vec<bmux_plugin::RenderOp>, Option<ComponentViewport>) {
     if width == 0 {
@@ -155,7 +156,7 @@ pub fn paint(
     }
     let viewport = ComponentViewport::with_logical_offset(
         LayoutNode::leaf("rename".into(), LogicalSize::new(content_width, 1)),
-        Rect::new(x, 0, width, 1),
+        Rect::new(x, y, width, 1),
         u64::try_from(offset).unwrap_or(u64::MAX),
         0,
     );
@@ -235,7 +236,7 @@ mod tests {
         input
     }
     fn refresh(input: &mut RenameInput) {
-        let (_, viewport) = paint(input, 20, 7, bmux_plugin::RenderStyle::default());
+        let (_, viewport) = paint(input, 20, 7, 0, bmux_plugin::RenderStyle::default());
         commit(input, viewport);
     }
     fn mouse(input: &mut RenameInput, kind: MouseEventKind, col: u16) {
@@ -247,7 +248,7 @@ mod tests {
     fn long_input_reveals_and_targets_committed_suffix() {
         let mut input: RenameInput =
             TextEditBuffer::from_text(format!("{}end", "x".repeat(70_000))).into();
-        let (_, viewport) = paint(&input, 4, 7, bmux_plugin::RenderStyle::default());
+        let (_, viewport) = paint(&input, 4, 7, 0, bmux_plugin::RenderStyle::default());
         let viewport = viewport.unwrap();
         let state = RefCell::new(input.state.clone());
         let policy = policy();
@@ -268,7 +269,7 @@ mod tests {
             Point::new(8, 0),
         )));
         assert_eq!(input.cursor_byte_index(), 70_001);
-        let (_, next) = paint(&input, 4, 30, bmux_plugin::RenderStyle::default());
+        let (_, next) = paint(&input, 4, 30, 0, bmux_plugin::RenderStyle::default());
         stage(&mut input, 10, next);
         // Publication alone must not move a captured drag to the new allocation.
         input.dispatch(&Event::Mouse(MouseEvent::new(
@@ -289,7 +290,7 @@ mod tests {
     fn publication_does_not_commit_editor_geometry() {
         let mut input = mounted("hello world");
         let old = input.visible_rect();
-        let (_, next) = paint(&input, 5, 30, bmux_plugin::RenderStyle::default());
+        let (_, next) = paint(&input, 5, 30, 0, bmux_plugin::RenderStyle::default());
         stage(&mut input, 10, next);
         assert_eq!(input.visible_rect(), old);
         acknowledge(&mut input, 9);

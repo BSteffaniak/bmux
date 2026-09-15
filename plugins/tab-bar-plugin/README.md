@@ -8,7 +8,7 @@ at the bottom unless configured otherwise.
 ```toml
 [plugins.settings."bmux.tab_bar"]
 placement = "bottom" # or "top"
-height = 1
+# height = 1 # legacy fixed-height single-row mode; do not combine with row settings
 order = 100
 preset = "tab_rail" # "minimal" or "classic"
 tab_label_max_width = "unlimited" # default; or 1..=65535 terminal cells
@@ -23,6 +23,9 @@ hover_highlight = true
 hint_policy = "scroll_only" # "always" or "never"
 
 [plugins.settings."bmux.tab_bar".layout]
+wrap = true
+min_rows = 1
+max_rows = 3
 density = "cozy" # or "compact"
 left_padding = 1
 right_padding = 1
@@ -50,6 +53,13 @@ Templates support `{name}`, `{index}`, `{index0}`, `{session}`, `{marker}`,
 `{id}`, and `{active}`. Double braces render literal braces. Unknown or
 unterminated placeholders remain visible. Tabs pack to the terminal width,
 retain the active item, and expose bounded interactive regions.
+
+Tabs wrap into 1–3 rows by default, growing only as needed. Configure
+`layout.min_rows` and `layout.max_rows` within 1–16, or set `layout.wrap = false`
+for one row. Labels do not split across rows; oversized labels clip, and overflow
+navigation remains available at the row ceiling. Status modules appear once.
+Explicit legacy `height` preserves fixed-height single-row behavior and cannot
+be combined with the new row settings. See `docs/tab-presentations.md`.
 
 Interactions include click switching, hover feedback, drag reorder, wheel
 navigation, middle-click inline rename, and a right-click Switch/Rename/Close

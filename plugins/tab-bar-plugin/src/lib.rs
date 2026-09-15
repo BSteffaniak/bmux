@@ -126,6 +126,9 @@ struct ColorSettings {
 struct Settings {
     placement: Placement,
     height: u16,
+    wrap: bool,
+    min_rows: u16,
+    max_rows: u16,
     order: i32,
     preset: Preset,
     density: Density,
@@ -163,6 +166,9 @@ impl Default for Settings {
         Self {
             placement: Placement::Bottom,
             height: 1,
+            wrap: true,
+            min_rows: 1,
+            max_rows: 3,
             order: 100,
             preset: Preset::TabRail,
             density: Density::Cozy,
@@ -871,6 +877,26 @@ fn publish_surface(
 fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
     let revision = companion.revision.max(1);
     let (surface, viewport, projection) = build_surface_with_editor(companion, revision);
+    let mut settings = companion.settings.clone();
+    settings.height = projection.height;
+    let layout_revision = companion
+        .layouts
+        .owner_revision(OWNER)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let request = layout_request(&settings);
+    if !companion.layouts.requests().contains(&request) {
+        companion
+            .layouts
+            .publish(
+                OWNER,
+                PluginLayoutSnapshot {
+                    revision: layout_revision,
+                    requests: vec![request],
+                },
+            )
+            .map_err(|error| format!("publishing tab-bar layout: {error:?}"))?;
+    }
     let mut surfaces = vec![surface];
     surfaces.extend(menu::surfaces(companion, revision));
     let revision = publish_surface(&companion.surfaces, revision, surfaces)?;
@@ -1151,26 +1177,64 @@ fn build_surface_with_editor(
     let mut interaction = projection_interaction(state);
     // The popup is a separate surface; retain the tabs and their focus identities.
     interaction.menu_tab_id = None;
-    let projected = projection::project_bar(
+    let mut projected = projection::project_bar(
         &state.settings,
         &state.snapshot.tabs,
         &state.local_presentation,
         state.hovered_tab_id,
         &interaction,
     );
+    // Resolve through the same neutral allocator as the compositor. Other owners
+    // can constrain our allocation; clipped rows must not remain input targets.
+    let mut settings = state.settings.clone();
+    settings.height = projected.height;
+    let mut requests = state.layouts.requests();
+    requests.retain(|request| request.id.owner_plugin_id != OWNER);
+    requests.push(layout_request(&settings));
+    if state.local_presentation.viewport_rows > 0
+        && let Ok(layout) = bmux_plugin::layout::resolve_plugin_layout(
+            ExtensionRect::new(
+                0,
+                0,
+                state.local_presentation.viewport_cols,
+                state.local_presentation.viewport_rows,
+            ),
+            (1, 1),
+            &requests,
+        )
+        && let Some(allocation) = layout
+            .allocations
+            .iter()
+            .find(|allocation| allocation.id == PluginLayoutId::new(OWNER, LAYOUT_ID))
+    {
+        let mut local = state.local_presentation.clone();
+        local.viewport_cols = allocation.rect.w;
+        local.viewport_rows = allocation.rect.h.saturating_add(1);
+        settings.height = settings.height.min(allocation.rect.h);
+        projected = projection::project_bar(
+            &settings,
+            &state.snapshot.tabs,
+            &local,
+            state.hovered_tab_id,
+            &interaction,
+        );
+        if allocation.rect.w == 0 || allocation.rect.h == 0 {
+            projected = projection::ProjectedBar::empty();
+        }
+    }
     let rect = ExtensionRect::new(
         0,
         0,
         state.local_presentation.viewport_cols,
-        state.settings.height,
+        projected.height,
     );
     let mut ops = vec![RenderOp::fill_rect(rect, ' ', styles.base)];
     let mut regions = Vec::with_capacity(state.snapshot.tabs.len());
-    for (segment, x, width) in projected.positioned_segments() {
+    for (segment, x, row, width) in projected.positioned_rows() {
         if !segment.text.is_empty() {
             ops.push(RenderOp::text_run(
                 x,
-                0,
+                row,
                 segment.text.clone(),
                 if segment
                     .tab_id
@@ -1186,10 +1250,10 @@ fn build_surface_with_editor(
                 .is_some_and(|id| state.multi_selection.contains(&id));
             if selected && width >= 2 {
                 let edge = styles.editing.bold();
-                ops.push(RenderOp::text_run(x, 0, "▏", edge));
+                ops.push(RenderOp::text_run(x, row, "▏", edge));
                 ops.push(RenderOp::text_run(
                     x.saturating_add(width - 1),
-                    0,
+                    row,
                     "▕",
                     edge,
                 ));
@@ -1197,7 +1261,7 @@ fn build_surface_with_editor(
         }
         if segment.kind == projection::SegmentKind::EditingWorkspace {
             let (paint, viewport) =
-                rename_input::paint(&state.edit_buffer, width, x, styles.editing);
+                rename_input::paint(&state.edit_buffer, width, x, row, styles.editing);
             ops.extend(paint);
             editor_viewport = viewport;
         } else if segment.kind == projection::SegmentKind::EditingTab
@@ -1220,6 +1284,7 @@ fn build_surface_with_editor(
                     &state.edit_buffer,
                     length,
                     x.saturating_add(start),
+                    row,
                     styles.editing,
                 );
                 ops.extend(paint);
@@ -1235,7 +1300,16 @@ fn build_surface_with_editor(
             regions.push(
                 PluginSurfaceRegion::new(
                     format!("workspace:{id}"),
-                    ExtensionRect::new(x, 0, width, state.settings.height),
+                    ExtensionRect::new(
+                        x,
+                        row,
+                        width,
+                        if state.settings.wrap {
+                            1
+                        } else {
+                            state.settings.height
+                        },
+                    ),
                 )
                 .endpoint(input_endpoint())
                 .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
@@ -1247,7 +1321,16 @@ fn build_surface_with_editor(
             regions.push(
                 PluginSurfaceRegion::new(
                     format!("tab:{tab_id}"),
-                    ExtensionRect::new(x, 0, width, state.settings.height),
+                    ExtensionRect::new(
+                        x,
+                        row,
+                        width,
+                        if state.settings.wrap {
+                            1
+                        } else {
+                            state.settings.height
+                        },
+                    ),
                 )
                 .endpoint(input_endpoint())
                 .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
@@ -1274,7 +1357,7 @@ fn build_surface_with_editor(
     if let Some(marker_col) = projection_interaction(state).drag_marker_col {
         ops.push(RenderOp::text_run(
             marker_col.min(rect.w.saturating_sub(1)),
-            0,
+            state.drag_target.map_or(0, |target| target.marker_row),
             "│",
             styles.mode,
         ));
@@ -1492,7 +1575,7 @@ fn update_drag_local(
             let target = companion
                 .committed_projection
                 .as_ref()
-                .and_then(|projection| projection.drop_target_at_col(col));
+                .and_then(|projection| projection.drop_target_at(col, row));
             let moved = companion.pointer_moved
                 || col
                     .abs_diff(companion.pointer_started_col)
@@ -2869,6 +2952,78 @@ bar_bg = "#112233"
             ..Settings::default()
         };
         assert_eq!(tab_label(&settings, &tab, 0), "1:界");
+    }
+
+    #[test]
+    fn wrapped_surface_editor_and_committed_targets_follow_rows() {
+        let mut state = CompanionState::new(Settings::default());
+        state.local_presentation.viewport_cols = 45;
+        state.local_presentation.viewport_rows = 24;
+        state.snapshot.tabs = (1..=8)
+            .map(|id| tabs_list::TabListEntry {
+                id: Uuid::from_u128(id),
+                name: "a-long-tab-name".into(),
+                active: id == 1,
+                workspace: "default".into(),
+                workspace_id: Uuid::nil(),
+            })
+            .collect();
+        let (_, _, projection) = build_surface_with_editor(&state, 1);
+        let target = projection
+            .tab_ranges()
+            .into_iter()
+            .find(|range| range.row > 0)
+            .unwrap();
+        state.editing_tab_id = Some(target.tab_id);
+        state.edit_buffer = bmux_text_edit::TextEditBuffer::from_text("a-long-renamed-tab").into();
+        let (surface, editor, pending) = build_surface_with_editor(&state, 2);
+        assert!(editor.unwrap().visible_rect().y > 0);
+        assert!(
+            surface
+                .interactive_regions
+                .iter()
+                .any(|region| region.rect.y > 0)
+        );
+        state.pending_projection.push_back((2, pending));
+        assert!(state.committed_projection.is_none());
+        state.acknowledge_projection(2);
+        assert!(
+            state
+                .committed_projection
+                .as_ref()
+                .unwrap()
+                .tab_ranges()
+                .iter()
+                .any(|range| range.row > 0)
+        );
+    }
+
+    #[test]
+    fn adaptive_row_settings_validate_and_preserve_legacy_height() {
+        let defaults = Settings::parse(None).unwrap();
+        assert!(defaults.wrap);
+        assert_eq!((defaults.min_rows, defaults.max_rows), (1, 3));
+        for (config, wrap, height) in [
+            ("height = 3", false, 3),
+            ("[layout]\nwrap = false", false, 1),
+            ("[layout]\nmin_rows = 2\nmax_rows = 5", true, 1),
+        ] {
+            let value = toml::from_str(config).unwrap();
+            let settings = Settings::parse(Some(&value)).unwrap();
+            assert_eq!(settings.wrap, wrap);
+            assert_eq!(settings.height, height);
+        }
+        for config in [
+            "height = 2\n[layout]\nwrap = true",
+            "height = 2\n[layout]\nmax_rows = 3",
+            "[layout]\nmin_rows = 4\nmax_rows = 3",
+            "[layout]\nmax_rows = 17",
+            "[layout]\nmin_rows = 0",
+            "[layout]\nwrap = 1",
+        ] {
+            let value = toml::from_str(config).unwrap();
+            assert!(Settings::parse(Some(&value)).is_err(), "{config}");
+        }
     }
 
     #[test]

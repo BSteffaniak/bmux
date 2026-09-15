@@ -78,6 +78,35 @@ pub fn parse_settings(value: Option<&toml::Value>) -> Result<Settings, PluginCom
         )?;
 
     settings.height = parse_bounded_u16(table, "height", settings.height, 1, 4)?;
+    let layout = table.get("layout").and_then(toml::Value::as_table);
+    if table.contains_key("height") {
+        if layout.is_some_and(|layout| {
+            ["wrap", "min_rows", "max_rows"]
+                .iter()
+                .any(|key| layout.contains_key(*key))
+        }) {
+            return Err(invalid(
+                "height",
+                "cannot be combined with layout.wrap/min_rows/max_rows; remove height to use adaptive rows",
+            ));
+        }
+        settings.wrap = false;
+    }
+    if let Some(layout) = layout {
+        if let Some(value) = layout.get("wrap") {
+            settings.wrap = value
+                .as_bool()
+                .ok_or_else(|| invalid("layout.wrap", "must be a boolean"))?;
+        }
+        settings.min_rows = parse_bounded_u16(layout, "min_rows", 1, 1, 16)?;
+        settings.max_rows = parse_bounded_u16(layout, "max_rows", 3, 1, 16)?;
+        if settings.min_rows > settings.max_rows {
+            return Err(invalid(
+                "layout.min_rows",
+                "must not exceed layout.max_rows",
+            ));
+        }
+    }
     settings.order = parse_i32(table, "order", settings.order)?;
 
     if let Some(template) = table.get("tab_template").and_then(toml::Value::as_str) {

@@ -35,7 +35,11 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
     let mut requests = companion.layouts.requests();
     // Use this companion's layout intent even before its first publication.
     requests.retain(|request| request.id.owner_plugin_id != OWNER);
-    requests.push(super::layout_request(&companion.settings));
+    let mut settings = companion.settings.clone();
+    settings.height = super::build_surface_with_editor(companion, companion.revision)
+        .2
+        .height;
+    requests.push(super::layout_request(&settings));
     let layout = resolve_plugin_layout(viewport, (1, 1), &requests).ok()?;
     let strip = layout
         .allocations

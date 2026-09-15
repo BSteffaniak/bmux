@@ -38,7 +38,7 @@ disabled = ["bmux.tab_bar", "bmux.sidebar"]
 ```toml
 [plugins.settings."bmux.tab_bar"]
 placement = "bottom"            # "top" or "bottom"
-height = 1                       # 1..=4 cells
+# height = 1                    # legacy fixed-height single-row mode
 order = 100                      # lower layout order allocates first
 preset = "tab_rail"             # "minimal" or "classic"
 tab_label_max_width = "unlimited" # default; or 1..=65535 terminal cells
@@ -53,6 +53,9 @@ hover_highlight = true
 hint_policy = "scroll_only"     # "always" or "never"
 
 [plugins.settings."bmux.tab_bar".layout]
+wrap = true
+min_rows = 1
+max_rows = 3
 density = "cozy"               # or "compact"
 left_padding = 1
 right_padding = 1
@@ -69,6 +72,16 @@ dim_inactive = true
 bold_active = true
 underline_active = false
 ```
+
+Tabs wrap between labels in authoritative order, left-to-right then top-to-bottom,
+for either placement. The bar grows and shrinks from `layout.min_rows` to
+`layout.max_rows` (defaults 1 and 3; valid range `1 <= min_rows <= max_rows <= 16`).
+Workspace and status modules appear only on the first row. Oversized labels clip
+to one row; overflow navigation remains available at the ceiling and selection
+reveals the active tab. Terminal allocation can reduce the visible row count.
+Set `layout.wrap = false` for one row. An explicit legacy `height` retains its
+fixed-height, single-text-row behavior; combining it with `wrap`, `min_rows`, or
+`max_rows` is rejected. Remove `height` when migrating to adaptive rows.
 
 The bar composes width-packed tabs with right-aligned mode, role, follow, and
 conditional hint/message modules. Optional session/context modules occupy the
