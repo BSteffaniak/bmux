@@ -48,6 +48,41 @@ mod pipeline {
     }
 
     #[test]
+    fn alternate_screen_registry_restores_normal_images() {
+        let mut registry = ImageRegistry::default();
+        let event = ImageEvent::SixelImage {
+            data: b"#1;2;100;0;0~".to_vec(),
+            position: ImagePosition { row: 2, col: 3 },
+            pixel_size: ImagePixelSize {
+                width: 1,
+                height: 6,
+            },
+            filtered_byte_offset: 0,
+        };
+        registry.handle_event(event.clone(), 8, 16);
+        let main_id = registry.images()[0].id;
+        let before = registry.sequence();
+        registry.set_alternate_screen(true);
+        assert!(registry.images().is_empty());
+        assert!(registry.delta_since(before).removed.contains(&main_id));
+        registry.handle_event(event, 8, 16);
+        let alternate_id = registry.images()[0].id;
+        assert_ne!(main_id, alternate_id);
+        let before_exit = registry.sequence();
+        registry.set_alternate_screen(false);
+        assert_eq!(registry.images().len(), 1);
+        assert_eq!(registry.images()[0].id, main_id);
+        let delta = registry.delta_since(before_exit);
+        assert!(delta.removed.contains(&alternate_id));
+        assert!(delta.added.iter().any(|image| image.id == main_id));
+        registry.set_alternate_screen(true);
+        assert!(registry.images().is_empty());
+        registry.clear();
+        registry.set_alternate_screen(false);
+        assert_eq!(registry.images()[0].id, main_id);
+    }
+
+    #[test]
     fn split_sixel_offsets_are_relative_to_each_read() {
         let mut interceptor = ImageInterceptor::new();
         let first = interceptor.process(b"label\r\n\x1bPq\"1;1;2;6#1;2;100;0;0");

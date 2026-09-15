@@ -32,6 +32,8 @@ struct KittyChunkAccumulator {
 #[allow(dead_code)] // Fields used when image features are enabled; dead in minimal feature combos
 pub struct ImageRegistry {
     images: Vec<PaneImage>,
+    /// Hidden normal-screen state while an alternate screen is active.
+    normal_screen: Option<Box<ImageRegistry>>,
     next_id: u64,
     /// Monotonic sequence counter; incremented on every mutation.
     sequence: u64,
@@ -59,6 +61,7 @@ impl ImageRegistry {
     pub fn new(max_images: usize, max_bytes: usize) -> Self {
         Self {
             images: Vec::new(),
+            normal_screen: None,
             next_id: 1,
             sequence: 0,
             max_images,
@@ -72,6 +75,41 @@ impl ImageRegistry {
             #[cfg(feature = "kitty")]
             kitty_pending_chunks: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Switch screen-local image state, preserving the hidden normal screen.
+    /// Placement IDs and change sequence remain monotonic across switches.
+    pub fn set_alternate_screen(&mut self, alternate: bool) {
+        if alternate == self.normal_screen.is_some() {
+            return;
+        }
+        let old_ids = self.images.iter().map(|image| image.id).collect::<Vec<_>>();
+        let sequence = self.sequence;
+        let next_id = self.next_id;
+        let log = std::mem::take(&mut self.change_log);
+        if alternate {
+            let empty = Self::new(self.max_images, self.max_bytes);
+            let normal = std::mem::replace(self, empty);
+            self.normal_screen = Some(Box::new(normal));
+        } else if let Some(normal) = self.normal_screen.take() {
+            *self = *normal;
+        }
+        self.next_id = next_id;
+        self.sequence = sequence + 1;
+        self.change_log = log;
+        for image_id in old_ids {
+            self.change_log.push(ChangeLogEntry::Removed {
+                sequence: self.sequence,
+                image_id,
+            });
+        }
+        for image in &self.images {
+            self.change_log.push(ChangeLogEntry::Added {
+                sequence: self.sequence,
+                image: image.clone(),
+            });
+        }
+        self.compact_change_log();
     }
 
     /// Handle an image event produced by the interceptor.

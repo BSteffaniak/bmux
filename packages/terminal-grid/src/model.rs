@@ -615,6 +615,8 @@ pub struct TerminalGrid {
     palette: StylePalette,
     revision: u64,
     content_revision: u64,
+    /// Monotonic invalidation counter for full display erasures.
+    display_erase_revision: u64,
     total_scrolled_rows: u64,
     autowrap: bool,
     pending_wrap: bool,
@@ -718,6 +720,7 @@ impl TerminalGrid {
             palette: StylePalette::default(),
             revision: 0,
             content_revision: 0,
+            display_erase_revision: 0,
             total_scrolled_rows: 0,
             autowrap: true,
             pending_wrap: false,
@@ -812,6 +815,7 @@ impl TerminalGrid {
             palette,
             revision: snapshot.revision,
             content_revision: snapshot.content_revision,
+            display_erase_revision: 0,
             total_scrolled_rows: snapshot
                 .total_scrolled_rows
                 .unwrap_or(u64::from(snapshot.scrollback_rows)),
@@ -1162,6 +1166,12 @@ impl TerminalGrid {
         self.bump_content_revision();
     }
 
+    /// Local invalidation token for consumers retaining non-cell content.
+    #[must_use]
+    pub const fn display_erase_revision(&self) -> u64 {
+        self.display_erase_revision
+    }
+
     pub(crate) fn erase_display(&mut self, mode: usize) {
         let fill = self.erase_style();
         match mode {
@@ -1178,6 +1188,7 @@ impl TerminalGrid {
                 self.erase_line(1);
             }
             2 | 3 => {
+                self.display_erase_revision = self.display_erase_revision.wrapping_add(1);
                 for row in 0..self.height {
                     self.fill_viewport_row(row, fill);
                 }
@@ -2364,6 +2375,7 @@ impl TerminalGrid {
             palette: StylePalette::from_styles(styles),
             revision: self.revision,
             content_revision: self.content_revision,
+            display_erase_revision: self.display_erase_revision,
             total_scrolled_rows: self.total_scrolled_rows,
             autowrap: self.autowrap,
             pending_wrap: self.pending_wrap,

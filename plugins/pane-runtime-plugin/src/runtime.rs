@@ -1185,18 +1185,112 @@ fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> Recording
 /// Check if a chunk contains a screen-clearing CSI sequence.
 /// Looks for `\e[2J` (erase display) or `\e[3J` (erase scrollback + display).
 #[cfg(feature = "image-registry")]
-fn chunk_contains_screen_clear(chunk: &[u8]) -> bool {
-    // Fast scan for the byte patterns.
-    for window in chunk.windows(4) {
-        if window[0] == 0x1b
-            && window[1] == b'['
-            && window[3] == b'J'
-            && (window[2] == b'2' || window[2] == b'3')
-        {
-            return true;
+#[cfg(feature = "image-registry")]
+fn ordered_image_output(
+    tracker: &mut PaneCursorTracker,
+    protocol: &mut TerminalProtocolEngine,
+    registry: &mut bmux_image::ImageRegistry,
+    output: &mut bmux_image::intercept::InterceptResult,
+    cell_pixels: (u16, u16),
+    replies: &mut Vec<u8>,
+) {
+    let mut fed = 0;
+    for event in &mut output.events {
+        let offset = event.filtered_byte_offset();
+        image_terminal_bytes(
+            tracker,
+            protocol,
+            registry,
+            &output.filtered[fed..offset],
+            replies,
+        );
+        fed = offset;
+        let (row, col) = tracker.cursor_position();
+        event.set_position(bmux_image::ImagePosition { row, col });
+        registry.handle_event(event.clone(), cell_pixels.0, cell_pixels.1);
+    }
+    image_terminal_bytes(
+        tracker,
+        protocol,
+        registry,
+        &output.filtered[fed..],
+        replies,
+    );
+}
+
+#[cfg(feature = "image-registry")]
+fn image_terminal_bytes(
+    tracker: &mut PaneCursorTracker,
+    protocol: &mut TerminalProtocolEngine,
+    registry: &mut bmux_image::ImageRegistry,
+    bytes: &[u8],
+    replies: &mut Vec<u8>,
+) {
+    for byte in bytes {
+        let erase = tracker.terminal_grid.grid().display_erase_revision();
+        replies.extend(protocol_reply_for_chunk(
+            protocol,
+            tracker,
+            std::slice::from_ref(byte),
+        ));
+        registry.set_alternate_screen(
+            tracker.terminal_grid.grid().mode() == bmux_terminal_grid::GridMode::Alternate,
+        );
+        if erase != tracker.terminal_grid.grid().display_erase_revision() {
+            registry.clear();
+        }
+        let scrolled = tracker.drain_scroll_delta();
+        if scrolled > 0 {
+            registry.scroll_up(scrolled);
         }
     }
-    false
+}
+
+#[cfg(all(test, feature = "image-registry"))]
+mod image_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn screen_switches_and_erases_preserve_stream_order_at_every_split() {
+        let image = b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\";
+        let mut bytes = image.to_vec();
+        bytes.extend_from_slice(b"\x1b[?1049h\x1b[2J");
+        bytes.extend_from_slice(image);
+        bytes.extend_from_slice(b"\x1b[?1049l");
+        for split in 0..=bytes.len() {
+            let mut tracker = PaneCursorTracker::new(24, 80);
+            let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+            let mut registry = bmux_image::ImageRegistry::default();
+            let mut interceptor = bmux_image::ImageInterceptor::new();
+            for chunk in [&bytes[..split], &bytes[split..]] {
+                let mut output = interceptor.process(chunk);
+                ordered_image_output(
+                    &mut tracker,
+                    &mut protocol,
+                    &mut registry,
+                    &mut output,
+                    (8, 16),
+                    &mut Vec::new(),
+                );
+            }
+            assert_eq!(registry.images().len(), 1, "split {split}");
+            assert_eq!(
+                registry.images()[0].id,
+                1,
+                "normal screen restored at split {split}"
+            );
+            let mut output = interceptor.process(b"\x1b[2J");
+            ordered_image_output(
+                &mut tracker,
+                &mut protocol,
+                &mut registry,
+                &mut output,
+                (8, 16),
+                &mut Vec::new(),
+            );
+            assert!(registry.images().is_empty());
+        }
+    }
 }
 
 fn protocol_reply_for_chunk(
@@ -4431,42 +4525,32 @@ impl SessionRuntimeManager {
                                 // The filtered bytes (images stripped) are what gets
                                 // pushed to the structured grid cursor tracker.
                                 #[cfg(feature = "image-registry")]
+                                let mut image_protocol_reply = Vec::new();
+                                #[cfg(feature = "image-registry")]
                                 let chunk = {
                                     let mut result = image_interceptor.process(chunk);
 
-                                    if !result.events.is_empty() {
-                                        // Resolve cursor positions for each image event.
-                                        // Feed filtered bytes up to each event's offset
-                                        // to the cursor tracker, then capture position.
-                                        let mut cursor_fed_to = 0usize;
-                                        for event in &mut result.events {
-                                            let offset = event.filtered_byte_offset();
-                                            if offset > cursor_fed_to {
-                                                cursor_tracker.process(
-                                                    &result.filtered[cursor_fed_to..offset],
-                                                );
-                                                cursor_fed_to = offset;
-                                            }
-                                            let (row, col) = cursor_tracker.cursor_position();
-                                            event.set_position(bmux_image::ImagePosition {
-                                                row,
-                                                col,
-                                            });
-                                        }
-
-                                        let (cpw, cph) = cell_pixel_size_for_reader
-                                            .lock()
-                                            .map_or((8, 16), |s| *s);
-                                        let cpw = if cpw == 0 { 8 } else { cpw };
-                                        let cph = if cph == 0 { 16 } else { cph };
-                                        if let Ok(mut reg) = image_registry_for_reader.lock() {
-                                            for event in &result.events {
-                                                reg.handle_event(event.clone(), cpw, cph);
-                                            }
-                                        }
-                                        // Notify streaming clients that image state changed.
-                                        // Only emit on false→true transition to coalesce.
-                                        if image_dirty_for_reader
+                                    let (cpw, cph) =
+                                        cell_pixel_size_for_reader.lock().map_or((8, 16), |s| *s);
+                                    let Ok(mut registry) = image_registry_for_reader.lock() else {
+                                        break;
+                                    };
+                                    let before = registry.sequence();
+                                    ordered_image_output(
+                                        &mut cursor_tracker,
+                                        &mut protocol_engine,
+                                        &mut registry,
+                                        &mut result,
+                                        (
+                                            if cpw == 0 { 8 } else { cpw },
+                                            if cph == 0 { 16 } else { cph },
+                                        ),
+                                        &mut image_protocol_reply,
+                                    );
+                                    let changed = registry.sequence() != before;
+                                    drop(registry);
+                                    if changed
+                                        && image_dirty_for_reader
                                             .compare_exchange(
                                                 false,
                                                 true,
@@ -4474,24 +4558,22 @@ impl SessionRuntimeManager {
                                                 Ordering::SeqCst,
                                             )
                                             .is_ok()
-                                        {
-                                            publish_pane_event(PaneEvent::ImageAvailable {
-                                                session_id: session_id.0,
-                                                pane_id,
-                                            });
-                                        }
-                                        for event in &result.events {
-                                            let payload = image_event_to_recording_payload(event);
-                                            record_to_all_runtimes(
-                                                RecordingEventKind::PaneImage,
-                                                payload,
-                                                RecordMeta {
-                                                    session_id: Some(session_id.0),
-                                                    pane_id: Some(pane_id),
-                                                    client_id: None,
-                                                },
-                                            );
-                                        }
+                                    {
+                                        publish_pane_event(PaneEvent::ImageAvailable {
+                                            session_id: session_id.0,
+                                            pane_id,
+                                        });
+                                    }
+                                    for event in &result.events {
+                                        record_to_all_runtimes(
+                                            RecordingEventKind::PaneImage,
+                                            image_event_to_recording_payload(event),
+                                            RecordMeta {
+                                                session_id: Some(session_id.0),
+                                                pane_id: Some(pane_id),
+                                                client_id: None,
+                                            },
+                                        );
                                     }
                                     result.filtered
                                 };
@@ -4536,29 +4618,6 @@ impl SessionRuntimeManager {
                                 }
                                 let chunk = metadata.filtered;
                                 let chunk = chunk.as_slice();
-
-                                // Detect screen-clearing CSI sequences (\e[2J, \e[3J)
-                                // and clear the image registry when they occur.
-                                #[cfg(feature = "image-registry")]
-                                if chunk_contains_screen_clear(chunk) {
-                                    if let Ok(mut reg) = image_registry_for_reader.lock() {
-                                        reg.clear();
-                                    }
-                                    if image_dirty_for_reader
-                                        .compare_exchange(
-                                            false,
-                                            true,
-                                            Ordering::SeqCst,
-                                            Ordering::SeqCst,
-                                        )
-                                        .is_ok()
-                                    {
-                                        publish_pane_event(PaneEvent::ImageAvailable {
-                                            session_id: session_id.0,
-                                            pane_id,
-                                        });
-                                    }
-                                }
 
                                 // Update terminal mode tracking (mouse protocol,
                                 // cursor/keypad modes, synchronized update) BEFORE
@@ -4612,36 +4671,14 @@ impl SessionRuntimeManager {
                                         client_id: None,
                                     },
                                 );
+                                #[cfg(not(feature = "image-registry"))]
                                 let reply = protocol_reply_for_chunk(
                                     &mut protocol_engine,
                                     &mut cursor_tracker,
                                     chunk,
                                 );
-                                // Detect scroll events and shift image positions.
                                 #[cfg(feature = "image-registry")]
-                                {
-                                    let scroll_delta = cursor_tracker.drain_scroll_delta();
-                                    if scroll_delta > 0 {
-                                        if let Ok(mut reg) = image_registry_for_reader.lock() {
-                                            reg.scroll_up(scroll_delta);
-                                        }
-                                        // Notify streaming clients that image positions shifted.
-                                        if image_dirty_for_reader
-                                            .compare_exchange(
-                                                false,
-                                                true,
-                                                Ordering::SeqCst,
-                                                Ordering::SeqCst,
-                                            )
-                                            .is_ok()
-                                        {
-                                            publish_pane_event(PaneEvent::ImageAvailable {
-                                                session_id: session_id.0,
-                                                pane_id,
-                                            });
-                                        }
-                                    }
-                                }
+                                let reply = image_protocol_reply;
                                 if !reply.is_empty() {
                                     record_to_all_runtimes(
                                         RecordingEventKind::ProtocolReplyRaw,
