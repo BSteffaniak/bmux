@@ -98,6 +98,49 @@ fn decode_theme_selection(bytes: &[u8]) -> Result<Option<String>, String> {
 #[derive(Default)]
 pub struct ThemePlugin {
     lifecycle_context: Option<NativeLifecycleContext>,
+    selection: std::sync::Mutex<Option<control_contract::theme_control_v1::Snapshot>>,
+}
+
+impl ThemePlugin {
+    fn select_live_theme(
+        &self,
+        context: &NativeServiceContext,
+        expected_revision: u64,
+        value: ThemeSelection,
+    ) -> Result<control_contract::theme_control_v1::Snapshot, String> {
+        let mut state = self
+            .selection
+            .lock()
+            .map_err(|_| "theme state requires recovery")?;
+        let current = state
+            .as_ref()
+            .ok_or("read current theme before selecting")?;
+        if current.revision != expected_revision {
+            return Err("stale theme revision".into());
+        }
+        let revision = current
+            .revision
+            .checked_add(1)
+            .ok_or("theme revision exhausted")?;
+        let settings = parse_settings(context.settings.as_ref());
+        let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
+        let theme = resolve_picker_value(&catalog, &value.picker_value(), &settings)
+            .ok_or("theme not found")?;
+        try_apply_theme_extensions(
+            context,
+            &theme,
+            &theme_catalog_plugin_ids(&catalog),
+            &context.connection.config_dir_candidates,
+        )?;
+        publish_runtime_appearance(&theme);
+        let snapshot = control_contract::theme_control_v1::Snapshot {
+            revision,
+            selection: value,
+        };
+        *state = Some(snapshot.clone());
+        drop(state);
+        Ok(snapshot)
+    }
 }
 
 impl RustPlugin for ThemePlugin {
@@ -111,7 +154,6 @@ impl RustPlugin for ThemePlugin {
             "theme plugin activating",
         );
         self.lifecycle_context = Some(context.clone());
-        apply_configured_appearance(&context);
         apply_configured_theme_extensions(&context);
         Ok(EXIT_OK)
     }
@@ -125,7 +167,6 @@ impl RustPlugin for ThemePlugin {
                 event_kind = %event.kind.as_str(),
                 "theme plugin handling lifecycle event; reapplying theme state",
             );
-            apply_configured_appearance(context);
             apply_configured_theme_extensions(context);
         }
         Ok(EXIT_OK)
@@ -139,6 +180,21 @@ impl RustPlugin for ThemePlugin {
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
+            "theme-control-v1", "current" => |_req: (), ctx| {
+                let mut selection = self.selection.lock().map_err(|_| ServiceResponse::error("theme_state_poisoned", "theme selection requires recovery"))?;
+                if selection.is_none() {
+                    let settings = parse_settings(ctx.settings.as_ref());
+                    let catalog = load_theme_catalog(&ctx.connection.config_dir_candidate_paths());
+                    let active = active_theme_stack(ctx, &settings, &catalog).ok_or_else(|| ServiceResponse::error("theme_not_found", "theme selection requires recovery"))?;
+                    let value = ThemeSelection::from_picker_value(&picker_selection_name(&active)).ok_or_else(|| ServiceResponse::error("invalid_selection", "invalid startup selection"))?;
+                    *selection = Some(control_contract::theme_control_v1::Snapshot { revision: 0, selection: value });
+                }
+                Ok::<_, ServiceResponse>(selection.clone().expect("initialized selection"))
+            },
+            "theme-control-v1", "select" => |req: control_contract::theme_control_v1::client::SelectRequest, ctx| {
+                let result = self.select_live_theme(ctx, req.expected_revision, req.selection);
+                Ok::<_, ServiceResponse>(result)
+            },
             "theme-state", "active-appearance" => |_req: (), ctx| {
                 let appearance = active_runtime_appearance(ctx).ok_or_else(|| {
                     ServiceResponse::error("theme_not_found", "active theme was not found")
@@ -521,21 +577,6 @@ fn pick_theme(context: &NativeCommandContext) -> Result<i32, PluginCommandError>
     Ok(EXIT_OK)
 }
 
-fn apply_configured_appearance(context: &NativeLifecycleContext) {
-    if let Some(active) = configured_theme(context) {
-        log_active_theme(context, &active);
-        publish_runtime_appearance(&active.theme);
-        info!(
-            source = ?active.source,
-            requested_name = active.requested_name.as_deref().unwrap_or(""),
-            stack = ?active.stack,
-            "runtime appearance published for active theme",
-        );
-    } else {
-        warn!("no active theme resolved for runtime appearance apply");
-    }
-}
-
 fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
     let Some(active) = configured_theme(context) else {
         warn!("no active theme resolved for startup extension apply");
@@ -550,12 +591,17 @@ fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
         extension_plugin_count = all_plugin_ids.len(),
         "applying theme extension settings",
     );
-    apply_theme_extensions(
+    if let Err(error) = try_apply_theme_extensions(
         context,
         &active.theme,
         &all_plugin_ids,
         &context.connection.config_dir_candidates,
-    );
+    ) {
+        warn!(%error, "startup theme failed; retaining previous appearance");
+        return;
+    }
+    log_active_theme(context, &active);
+    publish_runtime_appearance(&active.theme);
     let settings = parse_settings(context.settings.as_ref());
     if active.source == ActiveThemeSource::Persisted {
         apply_configured_theme_settings(context, &active.theme, &settings);
@@ -565,6 +611,13 @@ fn apply_configured_theme_extensions(context: &NativeLifecycleContext) {
 fn active_runtime_appearance(
     context: &(impl ThemeHostContext + ?Sized),
 ) -> Option<RuntimeAppearance> {
+    // Queries must agree with the appearance already published to attachments.
+    // Configuration is only the bootstrap fallback before a retained value exists.
+    if let Ok((appearance, _)) = bmux_plugin::global_event_bus()
+        .subscribe_state::<RuntimeAppearance>(&RUNTIME_APPEARANCE_STATE_KIND)
+    {
+        return Some((*appearance).clone());
+    }
     configured_theme(context).map(|active| active.theme.appearance)
 }
 
@@ -2467,6 +2520,97 @@ mod tests {
     }
 
     #[test]
+    fn active_appearance_query_returns_published_live_appearance() {
+        let catalog = load_theme_catalog(&[]);
+        let live =
+            resolve_theme_picker_selection(&catalog, "hacker", &ThemePluginSettings::default())
+                .expect("live theme");
+        publish_runtime_appearance(&live);
+        let context = service_context(Some(
+            toml::from_str("theme = 'minimal'").expect("startup settings"),
+        ));
+        let actual = active_runtime_appearance(&context).expect("retained appearance");
+        assert_eq!(actual, live.appearance);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn startup_rejection_keeps_previous_published_appearance() {
+        let previous = resolve_theme_picker_selection(
+            &load_theme_catalog(&[]),
+            "hacker",
+            &ThemePluginSettings::default(),
+        )
+        .expect("previous");
+        publish_runtime_appearance(&previous);
+        let router: TestServiceRouter = Arc::new(|_, _, _, _, _, _, _| {
+            encode_service_message(&Err::<(), _>(
+                bmux_decoration_plugin_api::decoration_state::ValidationResult::Errors {
+                    errors: Vec::new(),
+                },
+            ))
+        });
+        let _router = install_test_service_router(router);
+        let context =
+            lifecycle_context(Some(toml::from_str("theme = 'minimal'").expect("settings")));
+        ThemePlugin::default()
+            .activate(context.clone())
+            .expect("activation remains available");
+        assert_eq!(
+            active_runtime_appearance(&context).expect("retained"),
+            previous.appearance
+        );
+    }
+
+    #[test]
+    fn control_current_retains_selection_across_config_changes() {
+        let plugin = ThemePlugin::default();
+        let mut context =
+            service_context(Some(toml::from_str("theme = 'hacker'").expect("settings")));
+        context.request.service.interface_id = "theme-control-v1".to_string();
+        context.request.operation = "current".to_string();
+        let first = plugin.invoke_service(context.clone());
+        assert!(first.error.is_none());
+        context.settings = Some(toml::from_str("theme = 'minimal'").expect("settings"));
+        let second = plugin.invoke_service(context);
+        assert!(second.error.is_none());
+        assert_eq!(first.payload, second.payload);
+        let state: control_contract::theme_control_v1::Snapshot =
+            decode_service_message(&second.payload).expect("snapshot");
+        assert_eq!(state.revision, 0);
+        assert_eq!(state.selection, ThemeSelection::Configured);
+    }
+
+    #[test]
+    fn stale_selection_revision_is_rejected_before_effects() {
+        let plugin = ThemePlugin {
+            selection: std::sync::Mutex::new(Some(control_contract::theme_control_v1::Snapshot {
+                revision: 4,
+                selection: ThemeSelection::Configured,
+            })),
+            ..ThemePlugin::default()
+        };
+        let result = plugin.select_live_theme(
+            &service_context(None),
+            3,
+            ThemeSelection::Preset {
+                name: "hacker".into(),
+            },
+        );
+        assert_eq!(result.expect_err("stale revision"), "stale theme revision");
+        assert_eq!(
+            plugin
+                .selection
+                .lock()
+                .expect("state")
+                .as_ref()
+                .expect("snapshot")
+                .revision,
+            4
+        );
+    }
+
+    #[test]
     fn active_appearance_service_uses_declared_theme() {
         let plugin = ThemePlugin::default();
         let context = service_context(Some(toml::Value::Table(toml::map::Map::from_iter([(
@@ -2774,6 +2918,7 @@ mod tests {
         ]))));
         let mut plugin = ThemePlugin {
             lifecycle_context: Some(context),
+            ..ThemePlugin::default()
         };
 
         plugin
