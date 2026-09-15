@@ -2097,6 +2097,28 @@ fn run_plugin_command_internal_with_state(
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
     let _host_kernel_factory_guard =
         kernel_client_factory.map(|f| enter_host_kernel_client_factory(Arc::clone(f)));
+    let _async_route =
+        bmux_plugin::capture_async_command_route(bmux_plugin::ASYNC_SERVICE_ROUTE_V1)
+            .ok()
+            .map(|route| {
+                let services = context
+                    .services
+                    .iter()
+                    .filter(|service| {
+                        context
+                            .required_capabilities
+                            .iter()
+                            .chain(context.provided_capabilities.iter())
+                            .any(|capability| capability == service.capability.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                route
+                    .with_services(services)
+                    .map(bmux_plugin::enter_async_command_route)
+            })
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
     let run_started = Instant::now();
     let run_result =
         loaded.run_command_with_context_and_outcome(command_name, args, Some(&context));

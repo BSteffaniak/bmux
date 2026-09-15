@@ -93,13 +93,42 @@ pub struct AsyncServiceRequest {
     pub interface_id: String,
     pub operation: String,
     pub payload: Vec<u8>,
-    pub response: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+    response: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+}
+
+impl AsyncServiceRequest {
+    /// Whether the caller has stopped waiting. Check before starting a side effect;
+    /// cancellation does not undo work already dispatched.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.response.is_closed()
+    }
+
+    /// Complete a request without retaining an oversized response in the channel.
+    ///
+    /// # Errors
+    /// Returns an error if the caller has stopped waiting.
+    pub fn respond(self, response: Result<Vec<u8>, String>) -> Result<(), String> {
+        let response = match response {
+            Ok(bytes) if bytes.len() > MAX_ASYNC_SERVICE_BYTES => {
+                Err("async service response exceeds size limit".into())
+            }
+            Err(message) if message.len() > MAX_ASYNC_SERVICE_BYTES => {
+                Err("async service error exceeds size limit".into())
+            }
+            response => response,
+        };
+        self.response
+            .send(response)
+            .map_err(|_| "async service caller closed".into())
+    }
 }
 
 /// A captured route that never reconnects or switches to another registration.
 #[derive(Debug, Clone)]
 pub struct AsyncServiceClient {
     sender: tokio::sync::mpsc::Sender<AsyncServiceRequest>,
+    services: Option<std::sync::Arc<[bmux_plugin_sdk::RegisteredService]>>,
 }
 
 impl AsyncServiceClient {
@@ -117,8 +146,68 @@ impl AsyncServiceClient {
         if sender.max_capacity() > 16 {
             return Err("async service route capacity exceeds 16".into());
         }
-        Ok(Self { sender })
+        Ok(Self {
+            sender,
+            services: None,
+        })
     }
+
+    /// Restrict the route to the issuing context's service inventory.
+    /// This is defense in depth; the host must still authorize dispatch.
+    ///
+    /// # Errors
+    /// Rejects inventories larger than 1024 services.
+    pub fn with_services(
+        mut self,
+        services: Vec<bmux_plugin_sdk::RegisteredService>,
+    ) -> Result<Self, String> {
+        if services.len() > 1024 {
+            return Err("async service inventory exceeds limit".into());
+        }
+        self.services = Some(services.into());
+        Ok(self)
+    }
+}
+
+thread_local! {
+    static ASYNC_COMMAND_ROUTE: std::cell::RefCell<Option<AsyncServiceClient>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Restores the previous command route on the issuing thread.
+/// Captured clients retain their original channel independently of this scope.
+pub struct AsyncCommandRouteGuard {
+    previous: Option<AsyncServiceClient>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for AsyncCommandRouteGuard {
+    fn drop(&mut self) {
+        ASYNC_COMMAND_ROUTE.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Install a host-authorized route while entering a bundled command.
+#[must_use]
+pub fn enter_async_command_route(client: AsyncServiceClient) -> AsyncCommandRouteGuard {
+    let previous = ASYNC_COMMAND_ROUTE.with(|slot| slot.replace(Some(client)));
+    AsyncCommandRouteGuard {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// Capture a negotiated route before spawning background work.
+///
+/// # Errors
+/// Rejects unsupported versions or hosts that did not install a route. Never
+/// falls back to a new connection or a later command's route.
+pub fn capture_async_command_route(version: u16) -> Result<AsyncServiceClient, String> {
+    if version != ASYNC_SERVICE_ROUTE_V1 {
+        return Err("unsupported async service route version".into());
+    }
+    ASYNC_COMMAND_ROUTE
+        .with(|slot| slot.borrow().clone())
+        .ok_or_else(|| "async command route unavailable".into())
 }
 
 impl TypedDispatchClient for AsyncServiceClient {
@@ -138,6 +227,19 @@ impl TypedDispatchClient for AsyncServiceClient {
                 .any(|value| value.len() > 1024)
         {
             return Err(error("async service request exceeds size limit"));
+        }
+        let service_kind = match kind {
+            InvokeServiceKind::Query => ServiceKind::Query,
+            InvokeServiceKind::Command => ServiceKind::Command,
+        };
+        if self.services.as_ref().is_some_and(|services| {
+            !services.iter().any(|service| {
+                service.capability.as_str() == capability
+                    && service.kind == service_kind
+                    && service.interface_id == interface_id
+            })
+        }) {
+            return Err(error("service is outside the captured route inventory"));
         }
         let (response, receiver) = tokio::sync::oneshot::channel();
         self.sender
@@ -181,7 +283,8 @@ mod tests {
         let host = tokio::spawn(async move {
             let request = requests.recv().await.expect("request");
             assert_eq!(request.capability, "test.capability");
-            request.response.send(Ok(request.payload)).expect("reply");
+            let payload = request.payload.clone();
+            request.respond(Ok(payload)).expect("reply");
         });
         assert_eq!(
             client
@@ -260,8 +363,8 @@ mod tests {
         let request = requests.recv().await.expect("request");
         call.abort();
         assert!(call.await.expect_err("cancelled").is_cancelled());
-        assert!(request.response.is_closed());
-        assert!(request.response.send(Ok(vec![])).is_err());
+        assert!(request.is_cancelled());
+        assert!(request.respond(Ok(vec![])).is_err());
     }
 
     #[tokio::test]
@@ -290,8 +393,7 @@ mod tests {
             let request = requests.recv().await.expect("request");
             assert!(
                 request
-                    .response
-                    .send(Ok(vec![0; MAX_ASYNC_SERVICE_BYTES + 1]))
+                    .respond(Ok(vec![0; MAX_ASYNC_SERVICE_BYTES + 1]))
                     .is_ok()
             );
         });
@@ -302,6 +404,58 @@ mod tests {
                 .is_err()
         );
         host.await.expect("host");
+    }
+
+    #[tokio::test]
+    async fn async_route_empty_inventory_denies_before_enqueue() {
+        let (sender, mut requests) = tokio::sync::mpsc::channel(1);
+        let mut client = AsyncServiceClient::bind(1, sender)
+            .expect("route")
+            .with_services(vec![])
+            .expect("inventory");
+        assert!(
+            client
+                .invoke_service_raw("test", InvokeServiceKind::Query, "test", "test", vec![])
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            requests.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn captured_command_route_survives_scope_without_rebinding() {
+        assert!(capture_async_command_route(1).is_err());
+        let (sender, mut original) = tokio::sync::mpsc::channel(1);
+        let mut captured = {
+            let _scope =
+                enter_async_command_route(AsyncServiceClient::bind(1, sender).expect("route"));
+            assert!(capture_async_command_route(2).is_err());
+            capture_async_command_route(1).expect("capture")
+        };
+        assert!(capture_async_command_route(1).is_err());
+        let (sender, mut replacement) = tokio::sync::mpsc::channel(1);
+        {
+            let _scope = enter_async_command_route(
+                AsyncServiceClient::bind(1, sender).expect("replacement"),
+            );
+            assert!(capture_async_command_route(1).is_ok());
+        }
+        let call = tokio::spawn(async move {
+            captured
+                .invoke_service_raw("test", InvokeServiceKind::Query, "test", "test", vec![])
+                .await
+        });
+        original
+            .recv()
+            .await
+            .expect("original route")
+            .respond(Ok(vec![42]))
+            .expect("reply");
+        assert_eq!(call.await.expect("task").expect("result"), vec![42]);
+        assert!(replacement.try_recv().is_err());
     }
 
     struct FakeCaller;

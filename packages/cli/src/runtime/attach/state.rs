@@ -240,6 +240,7 @@ impl AttachDirtyFlags {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
+    pub async_services: Option<bmux_plugin::AsyncServiceClient>,
     pub presentation_events: std::sync::Arc<bmux_plugin::EventBus>,
     pub presentation_extensions: std::sync::Arc<bmux_plugin::RenderExtensionRegistry>,
     pub presentation_layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
@@ -596,6 +597,7 @@ impl AttachViewState {
     }
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
+            async_services: None,
             presentation_events: bmux_plugin::global_event_bus(),
             presentation_extensions: bmux_plugin::global_render_extension_registry(),
             presentation_layouts: bmux_plugin::layout::global_plugin_layout_registry_handle(),

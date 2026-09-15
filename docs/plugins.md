@@ -847,7 +847,11 @@ Resolution behavior is deterministic:
 Background caller-process work needs an explicitly negotiated, versioned generic
 asynchronous service handle captured in its command context. This direction was
 approved to repair service calls that outlive the synchronous command invocation.
-It is not yet an implemented capability.
+The bundled in-process command path implements version 1 through
+`enter_async_command_route` and `capture_async_command_route`. Capture must occur
+at command entry before spawning; the captured handle survives scope exit.
+Unsupported versions and absent routes fail explicitly. Dynamic-plugin wire
+negotiation is not implemented by this in-process capture mechanism.
 
 The handle must retain its original invoking transport and authority, use bounded
 requests and responses, and close permanently when that attachment ends. Old tasks

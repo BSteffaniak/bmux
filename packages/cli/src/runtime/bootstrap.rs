@@ -200,6 +200,12 @@ fn server_start_child_arguments(
         "start".to_string(),
         "--foreground-internal".to_string(),
     ];
+    if let Some(path) = bmux_config::ConfigLoadOverrides::for_process().cli_config_path {
+        arguments.splice(
+            0..0,
+            ["--config".to_string(), path.to_string_lossy().into_owned()],
+        );
+    }
     arguments.extend(rolling_start_override_args(
         rolling_enabled_override,
         rolling_options,

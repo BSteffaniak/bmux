@@ -110,8 +110,9 @@ pub use startup_gate::{
 };
 pub use static_vtable_registry::{register_static_vtable, static_vtable};
 pub use typed_dispatch_bridge::{
-    ASYNC_SERVICE_ROUTE_V1, AsyncServiceClient, AsyncServiceRequest, ServiceCallerDispatchClient,
-    block_on_typed_dispatch,
+    ASYNC_SERVICE_ROUTE_V1, AsyncCommandRouteGuard, AsyncServiceClient, AsyncServiceRequest,
+    ServiceCallerDispatchClient, block_on_typed_dispatch, capture_async_command_route,
+    enter_async_command_route,
 };
 pub use typed_service_caller::TypedServiceCaller;
 

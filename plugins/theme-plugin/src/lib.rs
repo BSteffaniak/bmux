@@ -241,16 +241,23 @@ impl ThemePlugin {
                     .insert(provider_id.to_string(), payload);
             }
             Err(error) => {
-                let restored = previous.as_ref().is_some_and(|payload| {
-                    provider.apply_settings.is_some()
-                        && apply_theme_settings_provider_payload(
-                            context,
-                            provider_id,
-                            provider,
-                            payload,
-                        )
-                        .is_ok()
-                });
+                let restored = previous.as_ref().map_or_else(
+                    || {
+                        provider.reset_settings.as_ref().is_some_and(|endpoint| {
+                            call_theme_settings_service::<_, ()>(context, endpoint, &()).is_ok()
+                        })
+                    },
+                    |payload| {
+                        provider.apply_settings.is_some()
+                            && apply_theme_settings_provider_payload(
+                                context,
+                                provider_id,
+                                provider,
+                                payload,
+                            )
+                            .is_ok()
+                    },
+                );
                 if !restored {
                     self.recovery_required
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -1393,7 +1400,9 @@ fn pick_theme(context: &NativeCommandContext) -> Result<i32, PluginCommandError>
     let handle = tokio::runtime::Handle::try_current().map_err(|_| {
         PluginCommandError::unavailable("no tokio runtime available; theme picker requires attach")
     })?;
-    handle.spawn(run_theme_picker(context.clone()));
+    let route = bmux_plugin::capture_async_command_route(bmux_plugin::ASYNC_SERVICE_ROUTE_V1)
+        .map_err(PluginCommandError::unavailable)?;
+    handle.spawn(run_theme_picker_with_route(context.clone(), Some(route)));
     Ok(EXIT_OK)
 }
 
@@ -1555,7 +1564,33 @@ fn picker_request(
         .width_range(48, 96)
 }
 
+struct PickerControl<'a> {
+    context: &'a NativeCommandContext,
+    route: Option<bmux_plugin::AsyncServiceClient>,
+}
+
+impl bmux_plugin_sdk::TypedDispatchClient for PickerControl<'_> {
+    async fn invoke_service_raw(
+        &mut self,
+        capability: &str,
+        kind: bmux_ipc::InvokeServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, bmux_plugin_sdk::TypedDispatchClientError> {
+        if let Some(route) = &mut self.route {
+            return route
+                .invoke_service_raw(capability, kind, interface_id, operation, payload)
+                .await;
+        }
+        bmux_plugin::ServiceCallerDispatchClient::new(self.context)
+            .invoke_service_raw(capability, kind, interface_id, operation, payload)
+            .await
+    }
+}
+
 struct PickerPreviewGuard {
+    route: Option<bmux_plugin::AsyncServiceClient>,
     context: NativeCommandContext,
     token: Option<u64>,
 }
@@ -1563,6 +1598,22 @@ struct PickerPreviewGuard {
 impl Drop for PickerPreviewGuard {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
+            if let Some(mut route) = self.route.take() {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let result = control_contract::theme_control_v1::client::cancel_preview(
+                            &mut route, token,
+                        )
+                        .await;
+                        if !matches!(result, Ok(Ok(()))) {
+                            warn!(?result, "cancelled picker preview requires recovery");
+                        }
+                    });
+                } else {
+                    warn!("picker cleanup requires server lease recovery");
+                }
+                return;
+            }
             // The ServiceCaller adapter completes synchronously, so cleanup does
             // not depend on spawning a task into a runtime that is shutting down.
             let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&self.context);
@@ -1576,27 +1627,23 @@ impl Drop for PickerPreviewGuard {
     }
 }
 
-async fn cancel_picker_preview(context: &NativeCommandContext, token: u64) {
-    let mut control = bmux_plugin::ServiceCallerDispatchClient::new(context);
-    let cleanup =
-        control_contract::theme_control_v1::client::cancel_preview(&mut control, token).await;
+async fn cancel_picker_preview(control: &mut PickerControl<'_>, token: u64) {
+    let cleanup = control_contract::theme_control_v1::client::cancel_preview(control, token).await;
     if !matches!(cleanup, Ok(Ok(()))) {
         warn!(?cleanup, "theme restoration failed");
     }
 }
 
 async fn confirm_picker_selection(
-    context: &NativeCommandContext,
+    control: &mut PickerControl<'_>,
     token: Option<u64>,
     revision: u64,
     selection: ThemeSelection,
 ) -> bool {
-    let mut control = bmux_plugin::ServiceCallerDispatchClient::new(context);
     let result = if let Some(token) = token {
-        control_contract::theme_control_v1::client::confirm_preview(&mut control, token, selection)
-            .await
+        control_contract::theme_control_v1::client::confirm_preview(control, token, selection).await
     } else {
-        control_contract::theme_control_v1::client::select(&mut control, revision, selection).await
+        control_contract::theme_control_v1::client::select(control, revision, selection).await
     };
     if !matches!(result, Ok(Ok(_))) {
         warn!(?result, "theme confirmation failed");
@@ -1605,7 +1652,15 @@ async fn confirm_picker_selection(
     true
 }
 
+#[cfg(test)]
 async fn run_theme_picker(context: NativeCommandContext) {
+    run_theme_picker_with_route(context, None).await;
+}
+
+async fn run_theme_picker_with_route(
+    context: NativeCommandContext,
+    route: Option<bmux_plugin::AsyncServiceClient>,
+) {
     let Ok(settings) = try_parse_settings(context.settings.as_ref())
         .inspect_err(|error| warn!(%error, "cannot open theme picker"))
     else {
@@ -1613,7 +1668,10 @@ async fn run_theme_picker(context: NativeCommandContext) {
     };
     let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
 
-    let mut control = bmux_plugin::ServiceCallerDispatchClient::new(&context);
+    let mut control = PickerControl {
+        context: &context,
+        route: route.clone(),
+    };
     let current = match control_contract::theme_control_v1::client::current(&mut control).await {
         Ok(current) => current,
         Err(error) => {
@@ -1622,7 +1680,6 @@ async fn run_theme_picker(context: NativeCommandContext) {
         }
     };
     let active_name = current.selection.picker_value();
-    let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
 
     let request = picker_request(
         picker_options(&catalog, &settings, &active_name),
@@ -1635,6 +1692,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
     };
 
     let mut preview_guard = PickerPreviewGuard {
+        route,
         context: context.clone(),
         token: None,
     };
@@ -1683,16 +1741,17 @@ async fn run_theme_picker(context: NativeCommandContext) {
         && let Some(theme) = resolve_picker_value(&catalog, &name, &settings)
     {
         let selection = ThemeSelection::from_picker_value(&name).expect("resolved picker value");
-        if !confirm_picker_selection(&context, preview_token, current.revision, selection).await {
+        if !confirm_picker_selection(&mut control, preview_token, current.revision, selection).await
+        {
             if let Some(token) = preview_token {
-                cancel_picker_preview(&context, token).await;
+                cancel_picker_preview(&mut control, token).await;
                 preview_guard.token = None;
             }
             return;
         }
         preview_guard.token = None;
         if name != CONFIGURED_SELECTION {
-            configure_theme_settings_providers(&context, &theme, &settings, &all_plugin_ids).await;
+            configure_theme_settings_providers(&context, &theme, &settings, &mut control).await;
         }
         info!(theme = %name, persistence = ?settings.persistence, "theme selected");
         return;
@@ -1700,11 +1759,7 @@ async fn run_theme_picker(context: NativeCommandContext) {
 
     if let Some(token) = preview_token {
         preview_guard.token = None;
-        let cleanup =
-            control_contract::theme_control_v1::client::cancel_preview(&mut control, token).await;
-        if !matches!(cleanup, Ok(Ok(()))) {
-            warn!(?cleanup, "theme restoration failed");
-        }
+        cancel_picker_preview(&mut control, token).await;
     }
 }
 
@@ -1712,26 +1767,19 @@ async fn configure_theme_settings_providers(
     context: &NativeCommandContext,
     theme: &ResolvedTheme,
     settings: &ThemePluginSettings,
-    all_plugin_ids: &[String],
+    control: &mut PickerControl<'_>,
 ) {
     for (provider_id, provider) in &theme.settings.providers {
         if !provider.prompt_on_select.unwrap_or(false) {
             continue;
         }
-        configure_theme_settings_provider(
-            context,
-            theme,
-            provider_id,
-            provider,
-            settings,
-            all_plugin_ids,
-        )
-        .await;
+        configure_theme_settings_provider(context, theme, provider_id, provider, settings, control)
+            .await;
     }
 }
 
 async fn submit_external_settings(
-    context: &NativeCommandContext,
+    control: &mut PickerControl<'_>,
     revision: u64,
     provider_id: &str,
     values: &BTreeMap<String, bmux_plugin_sdk::PromptFormValue>,
@@ -1739,9 +1787,8 @@ async fn submit_external_settings(
     let Ok(json) = serde_json::to_vec(values) else {
         return;
     };
-    let mut control = bmux_plugin::ServiceCallerDispatchClient::new(context);
     let result = control_contract::theme_control_v1::client::apply_external_form(
-        &mut control,
+        control,
         revision,
         provider_id.to_string(),
         json,
@@ -1758,10 +1805,9 @@ async fn configure_theme_settings_provider(
     provider_id: &str,
     provider: &ThemeSettingsProviderSpec,
     settings: &ThemePluginSettings,
-    _all_plugin_ids: &[String],
+    control: &mut PickerControl<'_>,
 ) {
-    let mut control = bmux_plugin::ServiceCallerDispatchClient::new(context);
-    let Ok(snapshot) = control_contract::theme_control_v1::client::current(&mut control)
+    let Ok(snapshot) = control_contract::theme_control_v1::client::current(control)
         .await
         .inspect_err(|error| warn!(%error, "cannot read settings revision"))
     else {
@@ -1812,7 +1858,7 @@ async fn configure_theme_settings_provider(
         return;
     };
     if revision.is_none() && provider.apply_form.is_some() {
-        submit_external_settings(context, form_revision, provider_id, &values).await;
+        submit_external_settings(control, form_revision, provider_id, &values).await;
         return;
     }
     let settings_payload = if let Some(apply_endpoint) = provider.apply_form.as_ref() {
@@ -1834,7 +1880,7 @@ async fn configure_theme_settings_provider(
     };
     if let Some(revision) = revision {
         let result = control_contract::theme_control_v1::client::set_component_settings(
-            &mut control,
+            control,
             revision,
             provider_id.to_string(),
             settings_payload.json,
@@ -3999,10 +4045,12 @@ mod tests {
             });
         let _router = install_test_service_router(router);
         drop(PickerPreviewGuard {
+            route: None,
             context: picker_context(),
             token: Some(7),
         });
         drop(PickerPreviewGuard {
+            route: None,
             context: picker_context(),
             token: None,
         });
@@ -4820,6 +4868,73 @@ operation = "reset"
     }
 
     #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn failed_first_external_form_uses_reset_contract() {
+        let mut original = resolve_picker_value(
+            &load_theme_catalog(&[]),
+            CONFIGURED_SELECTION,
+            &ThemePluginSettings::default(),
+        )
+        .expect("theme");
+        let endpoint = |operation: &str| ThemeSettingsEndpoint {
+            capability: "test.settings".into(),
+            interface_id: "settings-v1".into(),
+            operation: operation.into(),
+            kind: ThemeSettingsServiceKind::Command,
+        };
+        original.settings.providers.insert(
+            "test".into(),
+            ThemeSettingsProviderSpec {
+                apply_form: Some(endpoint("apply")),
+                reset_settings: Some(endpoint("reset")),
+                ..ThemeSettingsProviderSpec::default()
+            },
+        );
+        let plugin = ThemePlugin {
+            selection: Mutex::new(Some(LiveTheme {
+                snapshot: control_contract::theme_control_v1::Snapshot {
+                    revision: 8,
+                    selection: ThemeSelection::Configured,
+                },
+                resolved: original,
+            })),
+            ..ThemePlugin::default()
+        };
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = calls.clone();
+        let router: TestServiceRouter = Arc::new(move |_, _, _, _, _, operation, _| {
+            observed.lock().expect("calls").push(operation.to_string());
+            if operation == "apply" {
+                return Err(bmux_plugin_sdk::PluginError::InvalidPluginId {
+                    id: "injected failure".into(),
+                });
+            }
+            assert_eq!(operation, "reset");
+            encode_service_message(&())
+        });
+        let _router = install_test_service_router(router);
+        assert!(
+            plugin
+                .apply_external_form(&service_context(None), 8, "test", b"{}")
+                .is_err()
+        );
+        assert_eq!(*calls.lock().expect("calls"), ["apply", "reset"]);
+        let live = plugin
+            .selection
+            .lock()
+            .expect("state")
+            .clone()
+            .expect("live");
+        assert_eq!(live.snapshot.revision, 8);
+        assert!(live.resolved.external_payloads.is_empty());
+        assert!(
+            !plugin
+                .recovery_required
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[test]
     fn external_payload_without_apply_contract_is_rejected() {
         let mut provider = performance_settings_provider();
         provider.apply_settings = None;
@@ -5171,6 +5286,51 @@ operation = "reset"
                 .and_then(toml::Value::as_str),
             Some("thick"),
         );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn startup_restores_saved_provider_value_over_configuration_without_writes() {
+        let applied = Arc::new(Mutex::new(Vec::new()));
+        let observed = applied.clone();
+        let router: TestServiceRouter =
+            Arc::new(move |_, _, capability, _, interface, operation, payload| {
+                if capability == "bmux.storage" {
+                    assert_eq!(operation, "get", "startup must not rewrite preferences");
+                    let request: StorageGetRequest = decode_service_message(&payload).expect("get");
+                    let value = if request.key.as_str() == "selected_theme" {
+                        b"performance".to_vec()
+                    } else {
+                        assert_eq!(request.key.as_str(), "theme_settings.performance");
+                        br#"{"sample_interval_ms":2500}"#.to_vec()
+                    };
+                    return encode_service_message(&StorageGetResponse { value: Some(value) });
+                }
+                if interface == "performance-theme-settings" {
+                    assert_eq!(operation, "set-settings");
+                    let settings: ThemeSettingsPayload =
+                        decode_service_message(&payload).expect("settings");
+                    observed
+                        .lock()
+                        .expect("applied")
+                        .push(settings.json.clone());
+                    return encode_service_message(&settings);
+                }
+                assert_eq!(capability, "bmux.decoration.write");
+                encode_service_message(&Ok::<
+                    (),
+                    bmux_decoration_plugin_api::decoration_state::ValidationResult,
+                >(()))
+            });
+        let _router = install_test_service_router(router);
+        let context = lifecycle_context(Some(toml::from_str(
+            "persistence = 'persist_between_connects'\n[theme_settings.performance]\nsample_interval_ms = 999\n"
+        ).expect("configuration")));
+        apply_configured_theme_extensions(&context);
+        let restored = applied.lock().expect("applied").clone();
+        assert_eq!(restored.len(), 1);
+        let value: serde_json::Value = serde_json::from_slice(&restored[0]).expect("payload");
+        assert_eq!(value["sample_interval_ms"], 2500);
     }
 
     #[test]

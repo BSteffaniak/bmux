@@ -3691,6 +3691,14 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         view_state.bracketed_paste_enabled,
     )?;
     let mut attach_input_processor = InputProcessor::new(attach_keymap.clone(), keyboard_enhanced);
+    let (async_service_tx, mut async_service_rx) = tokio::sync::mpsc::channel(16);
+    view_state.async_services = Some(
+        bmux_plugin::AsyncServiceClient::bind(
+            bmux_plugin::ASYNC_SERVICE_ROUTE_V1,
+            async_service_tx,
+        )
+        .map_err(anyhow::Error::msg)?,
+    );
     let (prompt_host_tx, mut prompt_host_rx) = tokio::sync::mpsc::unbounded_channel();
     let _prompt_host_guard = prompt::register_host(prompt_host_tx);
     let mut prompt_host_open = true;
@@ -3885,6 +3893,22 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                         exit_reason = reason;
                         break;
                     }
+                }
+            }
+
+            Some(mut request) = async_service_rx.recv() => {
+                if !request.is_cancelled() {
+                    let result = client.request_raw(bmux_ipc::Request::InvokeService {
+                        capability: request.capability.clone(), kind: request.kind,
+                        interface_id: request.interface_id.clone(), operation: request.operation.clone(),
+                        payload: std::mem::take(&mut request.payload),
+                    }).await.map_err(|error| error.to_string()).and_then(|response| {
+                        match response {
+                            bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ServiceInvoked { payload }) => Ok(payload),
+                            other => Err(format!("unexpected async service response: {other:?}")),
+                        }
+                    });
+                    let _ = request.respond(result);
                 }
             }
 
@@ -5992,7 +6016,9 @@ pub async fn handle_attach_plugin_command_action(
             let args = args.to_vec();
             let factory = kernel_client_factory.cloned();
             let caller = view_state.self_client_id;
+            let async_services = view_state.async_services.clone();
             let command = tokio::task::spawn_blocking(move || {
+                let _async_route = async_services.map(bmux_plugin::enter_async_command_route);
                 let _transport = super::super::plugin_kernel::enter_invoking_transport(sender);
                 run_attach_plugin_command_local(
                     &plugin_id,

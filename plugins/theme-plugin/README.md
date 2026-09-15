@@ -42,15 +42,13 @@ retain a checkpoint of the original script instances, and cancellation restores
 those instances rather than recompiling them. Failed rollback requires recovery
 instead of being reported as a successful restoration.
 
-**Known live-attachment limitation:** the picker currently spawns background
-work after its caller-process command returns. The command-scoped transport
-route does not survive that return, so subsequent remote service calls can use
-different connection identities. Live preview cancellation can consequently
-fail its ownership check and leave a preview active, blocking selection and
-refresh until successful cleanup. Local and cross-plugin unit tests do not
-establish safety for this path. Resolving this requires a context-bound,
-attachment-lifetime route; a replaceable process-global fallback or relaxed
-preview ownership checks would not preserve isolation.
+The bundled picker captures a version-1 asynchronous service route before
+spawning background work. Preview, cancellation, and confirmation use the
+original attachment connection even after the command returns. The bounded
+route closes on detach and never reconnects under a replacement identity.
+Hosts without this route report the picker as unavailable rather than falling
+back to unsafe preview ownership. This capture mechanism is currently for
+bundled in-process commands, not a new dynamic-plugin wire ABI.
 
 `bmux theme refresh` reloads the current selection's configuration and files.
 It preserves the selection and does not write a reconnect preference. A failed
@@ -58,9 +56,10 @@ refresh leaves the retained selection/revision unchanged; rollback failures are
 reported explicitly. Saving configuration or Lua files does not automatically
 reload them. Bundled Lua assets require rebuilding the plugin to change them.
 
-Cross-process override provenance and external settings-provider consistency
-still require end-to-end validation; do not assume those integration paths are
-complete solely from the local control-service tests.
+Daemon startup forwards the explicit `--config` overlay so refresh reads the
+same highest-precedence file and reports malformed overrides. Saved interactive
+provider values are restored for persisted presets across server restarts;
+configured selection bypasses those values without deleting them.
 
 ## Theme File Precedence
 
