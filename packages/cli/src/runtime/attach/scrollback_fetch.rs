@@ -29,19 +29,20 @@ impl Drop for Fetch {
 pub(super) async fn fetch(
     mut client: bmux_plugin::AsyncServiceClient,
     request: Request,
+    cache: std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
 ) -> Result<PaneScrollbackWindow, String> {
+    let mut cache = cache.lock().await;
     let rows = request.rows.saturating_add(32).min(256).max(request.rows);
     if let Some(pin) = request.pin {
         let mut last_error = None;
         for count in [rows, request.rows] {
-            let result = crate::pane_runtime_client::captured_history_window_outcome(
+            let result = crate::pane_runtime_client::captured_history_window_cached(
                 &mut client,
-                request.session,
-                request.pane,
-                pin,
+                (request.session, request.pane, pin),
                 request.offset,
                 count,
                 (request.width, request.anchor, request.delta),
+                &mut cache,
             )
             .await;
             match result {
@@ -49,13 +50,19 @@ pub(super) async fn fetch(
                     return Ok(window);
                 }
                 Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) => {}
-                Err(error) => last_error = Some(error.to_string()),
+                Err(error) => {
+                    // Failed/cancelled assembly must not leave a partial tail
+                    // index to be mistaken for a complete cached capture.
+                    *cache = crate::pane_runtime_client::CapturedHistoryCache::default();
+                    last_error = Some(error.to_string());
+                }
             }
         }
         if request.anchor.is_some() {
             return Err(last_error.unwrap_or_else(|| "captured history window unavailable".into()));
         }
     }
+    drop(cache);
     let windows = crate::pane_runtime_client::attach_pane_grid_window_state_streaming(
         &mut client,
         request.session,
@@ -112,7 +119,7 @@ mod tests {
         };
         let fetch = Fetch {
             request,
-            task: tokio::spawn(fetch(client, request)),
+            task: tokio::spawn(fetch(client, request, std::sync::Arc::default())),
         };
         let held_request = receiver.recv().await.unwrap();
         assert!(!fetch.task.is_finished());

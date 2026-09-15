@@ -263,6 +263,8 @@ pub struct AttachViewState {
     /// Scrollback history itself lives on the server (pane-runtime plugin);
     /// these are just this client's per-pane view offsets into that history.
     pub pane_scrollback: PaneScrollbackViews,
+    pub(super) decoded_history:
+        std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
     pub(super) scrollback_fetch: Option<super::scrollback_fetch::Fetch>,
     pub(super) scrollback_cache: super::scrollback_cache::ScrollbackCache,
     /// Set when leaving frozen scrollback so the next post-event pass drains
@@ -615,6 +617,7 @@ impl AttachViewState {
             local_presentation: None,
             active_mode_id: "normal".to_string(),
             pane_scrollback: PaneScrollbackViews::new(),
+            decoded_history: std::sync::Arc::default(),
             scrollback_fetch: None,
             scrollback_cache: super::scrollback_cache::ScrollbackCache::default(),
             scrollback_replay_pending: false,

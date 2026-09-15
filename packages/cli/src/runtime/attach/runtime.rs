@@ -9948,7 +9948,11 @@ fn ensure_pane_scrollback_windows(
     {
         view_state.scrollback_fetch = Some(super::scrollback_fetch::Fetch {
             request,
-            task: tokio::spawn(super::scrollback_fetch::fetch(client, request)),
+            task: tokio::spawn(super::scrollback_fetch::fetch(
+                client,
+                request,
+                view_state.decoded_history.clone(),
+            )),
         });
     }
     Ok(())

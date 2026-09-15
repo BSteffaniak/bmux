@@ -701,14 +701,15 @@ mod history_tests {
             stream_end: 0,
             created_epoch_secs: 0,
         };
-        let outcome = super::captured_history_window_outcome(
+        let mut cache = super::CapturedHistoryCache::default();
+        let identity = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), pin);
+        let outcome = super::captured_history_window_cached(
             &mut client,
-            uuid::Uuid::new_v4(),
-            uuid::Uuid::new_v4(),
-            pin,
+            identity,
             0,
             60,
             (2, None, 0),
+            &mut cache,
         )
         .await
         .unwrap();
@@ -717,6 +718,27 @@ mod history_tests {
         };
         assert_eq!(window.rows.len(), 60);
         assert_eq!(client.0, 60);
+        let remaining = cache.remaining;
+        for _ in 0..10 {
+            let next = super::captured_history_window_cached(
+                &mut client,
+                identity,
+                0,
+                60,
+                (2, None, 0),
+                &mut cache,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(next, super::CapturedWindowOutcome::Window(_)));
+        }
+        assert_eq!(client.0, 60, "warm fetches must not read services");
+        assert_eq!(
+            cache.remaining, remaining,
+            "projection must not consume retained budget"
+        );
+        cache.prepare(uuid::Uuid::new_v4(), identity.1, pin);
+        assert!(cache.decoded.lines.is_empty());
     }
 
     struct HistoryClient;
@@ -1051,10 +1073,35 @@ pub async fn captured_history_window(
     )
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "bounded navigation and assembly share one request and byte budget"
-)]
+#[derive(Default)]
+pub struct CapturedHistoryCache {
+    identity: Option<(Uuid, Uuid, bmux_attach_pipeline::ScrollbackPin)>,
+    decoded: CapturedLineCache,
+    styles: Vec<bmux_terminal_grid::Style>,
+    remaining: usize,
+    tail_loaded: bool,
+    history: Vec<(u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>)>,
+}
+
+impl CapturedHistoryCache {
+    fn prepare(&mut self, session: Uuid, pane: Uuid, pin: bmux_attach_pipeline::ScrollbackPin) {
+        let identity = (session, pane, pin);
+        // One capture per attachment worker, with a fixed retained allocation
+        // allowance. Eviction is reconstructible and never changes the pin.
+        if self.identity != Some(identity)
+            || self.remaining < 1024 * 1024
+            || self.decoded.lines.len() >= 256
+        {
+            *self = Self {
+                identity: Some(identity),
+                remaining: 2 * 1024 * 1024,
+                ..Self::default()
+            };
+        }
+    }
+}
+
+#[cfg(test)]
 pub async fn captured_history_window_outcome(
     client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     session_id: Uuid,
@@ -1068,13 +1115,42 @@ pub async fn captured_history_window_outcome(
         isize,
     ),
 ) -> ClientResult<CapturedWindowOutcome> {
+    captured_history_window_cached(
+        client,
+        (session_id, pane_id, pin),
+        offset,
+        rows,
+        projection,
+        &mut CapturedHistoryCache::default(),
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "bounded navigation and assembly share capture state"
+)]
+pub async fn captured_history_window_cached(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    identity: (Uuid, Uuid, bmux_attach_pipeline::ScrollbackPin),
+    offset: usize,
+    rows: usize,
+    projection: (
+        usize,
+        Option<bmux_attach_pipeline::CapturedHistoryAnchor>,
+        isize,
+    ),
+    cache: &mut CapturedHistoryCache,
+) -> ClientResult<CapturedWindowOutcome> {
+    let (session_id, pane_id, pin) = identity;
+    cache.prepare(session_id, pane_id, pin);
     let mut cached_client = CaptureReadCache {
         client,
         replies: Vec::new(),
         remaining: 256 * 1024,
     };
     let client = &mut cached_client;
-    let mut decoded = CapturedLineCache::default();
+    let decoded = &mut cache.decoded;
     let (width, mut bottom_anchor, local_delta) = projection;
     let mut local_skip = usize::try_from(local_delta).unwrap_or(0);
     let Some(meta) = pin.capture else {
@@ -1103,24 +1179,28 @@ pub async fn captured_history_window_outcome(
     }) {
         return Ok(CapturedWindowOutcome::Unavailable);
     }
-    let mut remaining: usize = 2 * 1024 * 1024;
+    let remaining = &mut cache.remaining;
     let mut requests_left = 256;
-    let mut styles = Vec::new();
+    let mut projection_budget: usize = 2 * 1024 * 1024;
+    let styles = &mut cache.styles;
     if bottom_anchor.is_none() && offset < usize::from(meta.height) {
         // Assemble the captured screen once. Resolving subsequent viewport
         // lines reuses the assemblies and their palette instead of rescanning
         // and decoding every prefix for each logical line.
         let end = u32::try_from(meta.lines + u64::from(meta.height))
             .map_err(|error| history_decode_error(&error))?;
-        decoded
-            .resolve(
-                client,
-                session_id,
-                &capture,
-                end,
-                (&mut remaining, &mut styles, &mut requests_left),
-            )
-            .await?;
+        if !cache.tail_loaded {
+            decoded
+                .resolve(
+                    client,
+                    session_id,
+                    &capture,
+                    end,
+                    (remaining, styles, &mut requests_left),
+                )
+                .await?;
+            cache.tail_loaded = true;
+        }
         let mut skip = offset;
         for (index, line) in decoded.lines.iter().rev() {
             let count = line.projected_rows(usize::from(meta.width));
@@ -1154,7 +1234,7 @@ pub async fn captured_history_window_outcome(
                     session_id,
                     &capture,
                     anchor.line_index,
-                    (&mut remaining, &mut styles, &mut requests_left),
+                    (remaining, styles, &mut requests_left),
                 )
                 .await?
             else {
@@ -1203,7 +1283,7 @@ pub async fn captured_history_window_outcome(
     anchors
         .try_reserve_exact(rows)
         .map_err(|error| history_decode_error(&error))?;
-    remaining = remaining
+    projection_budget = projection_budget
         .checked_sub(rows.saturating_mul(std::mem::size_of::<
             bmux_attach_pipeline::CapturedHistoryAnchor,
         >()))
@@ -1221,26 +1301,36 @@ pub async fn captured_history_window_outcome(
                     session_id,
                     &capture,
                     index,
-                    (&mut remaining, &mut styles, &mut requests_left),
+                    (remaining, styles, &mut requests_left),
                 )
                 .await?
             else {
                 return Ok(CapturedWindowOutcome::Unavailable);
             };
             line
+        } else if let Some((_, line)) = cache.history.iter().find(|(key, _)| *key == index) {
+            std::sync::Arc::clone(line)
         } else {
-            std::sync::Arc::new(
+            let line = std::sync::Arc::new(
                 fetch_captured_history_line(
                     client,
                     session_id,
                     &capture,
                     index,
-                    &mut remaining,
-                    &mut styles,
+                    remaining,
+                    styles,
                     &mut requests_left,
                 )
                 .await?,
-            )
+            );
+            *remaining = remaining
+                .checked_sub(std::mem::size_of::<(
+                    u32,
+                    std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>,
+                )>())
+                .ok_or_else(|| history_decode_error(&"history cache metadata budget"))?;
+            cache.history.push((index, std::sync::Arc::clone(&line)));
+            line
         };
         let count = line.projected_rows(usize::from(meta.width));
         if skip >= count {
@@ -1263,7 +1353,7 @@ pub async fn captured_history_window_outcome(
                     session_id,
                     &capture,
                     index,
-                    (&mut remaining, &mut styles, &mut requests_left),
+                    (remaining, styles, &mut requests_left),
                 )
                 .await?
                 .ok_or_else(|| history_decode_error(&"unavailable joined pending line"))?;
@@ -1294,7 +1384,7 @@ pub async fn captured_history_window_outcome(
         local_skip -= skipped;
         let end = end - skipped;
         let start = end.saturating_sub(rows - selected.len());
-        let projected = project_captured_range(&line, width, start..end, &mut remaining)?;
+        let projected = project_captured_range(&line, width, start..end, &mut projection_budget)?;
         for row in (start..end).rev() {
             let column = line
                 .column_for_row(width, row)
@@ -1320,7 +1410,7 @@ pub async fn captured_history_window_outcome(
         bmux_attach_pipeline::PaneScrollbackWindow {
             projection_width: width,
             row_anchors: anchors,
-            palette: bmux_terminal_grid::StylePalette::from_styles(styles),
+            palette: bmux_terminal_grid::StylePalette::from_styles(styles.clone()),
             rows: selected,
             scrollback_offset: offset,
             max_scrollback_offset: pin.max_scrollback_offset,
@@ -1567,6 +1657,7 @@ impl CapturedLineCache {
             .map_err(|error| history_decode_error(&error))?;
         if !self.lines.iter().any(|(key, _)| *key == index) {
             self.lines.push((index, std::sync::Arc::clone(&line)));
+            self.lines.sort_by_key(|(index, _)| *index);
         }
         Ok(Some(line))
     }
@@ -1817,12 +1908,25 @@ fn project_captured_range(
     // Charge before projection, including temporary and retained row/cell arrays.
     // Deliberately retain charges for discarded rows: the whole fetch has a
     // cumulative allocation allowance, not a fresh allowance for every line.
+    // Charge only text intersecting the requested projection, not the entire
+    // logical line (which may be much larger than this viewport).
+    let start_column = line.column_for_row(width, range.start).unwrap_or(0);
+    let end_column = line.column_for_row(width, range.end).unwrap_or(usize::MAX);
+    let mut column = 0_usize;
     let text = line
         .completed()
         .ok_or_else(|| history_decode_error(&"unfinished tail line"))?
         .0
         .iter()
-        .try_fold(0_usize, |bytes, cell| bytes.checked_add(cell.text().len()))
+        .try_fold(0_usize, |bytes, cell| {
+            let start = column;
+            column = column.saturating_add(usize::from(cell.width()));
+            bytes.checked_add(if column > start_column && start < end_column {
+                cell.text().len()
+            } else {
+                0
+            })
+        })
         .ok_or_else(|| history_decode_error(&"tail text overflow"))?;
     let charge = selected
         .checked_mul(width)
@@ -1933,22 +2037,26 @@ fn decode_history_cells(
                 if cells.len() >= 256 || !(1..=2).contains(&width) || text.len() > 4096 {
                     return Err(A::Error::custom("invalid history cell limits"));
                 }
-                // Charge both temporary decoded and retained copies, plus a
-                // conservative palette slot even when the style already exists.
-                let charge =
-                    2 * (std::mem::size_of::<Cell>() + text.len()) + std::mem::size_of::<Style>();
+                let existing_style = self.styles.iter().position(|entry| *entry == style);
+                // Temporary and retained cell copies coexist during assembly;
+                // palette storage is charged only when a new slot is retained.
+                let charge = 2 * (std::mem::size_of::<Cell>() + text.len())
+                    + if existing_style.is_none() {
+                        std::mem::size_of::<Style>()
+                    } else {
+                        0
+                    };
                 *self.remaining = self
                     .remaining
                     .checked_sub(charge)
                     .ok_or_else(|| A::Error::custom("history budget exhausted"))?;
-                let index =
-                    if let Some(index) = self.styles.iter().position(|entry| *entry == style) {
-                        index
-                    } else {
-                        self.styles.try_reserve_exact(1).map_err(A::Error::custom)?;
-                        self.styles.push(style);
-                        self.styles.len() - 1
-                    };
+                let index = if let Some(index) = existing_style {
+                    index
+                } else {
+                    self.styles.try_reserve_exact(1).map_err(A::Error::custom)?;
+                    self.styles.push(style);
+                    self.styles.len() - 1
+                };
                 cells.try_reserve_exact(1).map_err(A::Error::custom)?;
                 cells.push(Cell::new(
                     text,
