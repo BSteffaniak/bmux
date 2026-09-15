@@ -11,7 +11,7 @@ placement = "bottom" # or "top"
 height = 1
 order = 100
 preset = "tab_rail" # "minimal" or "classic"
-tab_label_max_width = 20
+tab_label_max_width = "unlimited" # default; or 1..=65535 terminal cells
 tab_template = "{name}"
 show_session_name = false
 show_context_name = false

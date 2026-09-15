@@ -85,13 +85,19 @@ pub fn parse_settings(value: Option<&toml::Value>) -> Result<Settings, PluginCom
     } else if table.get("show_tab_index").and_then(toml::Value::as_bool) == Some(true) {
         settings.label_template = "{index}:{name}".to_string();
     }
-    settings.maximum_label_width = parse_bounded_u16(
-        table,
-        "tab_label_max_width",
-        settings.maximum_label_width,
-        1,
-        u16::MAX,
-    )?;
+    if let Some(value) = table.get("tab_label_max_width") {
+        settings.maximum_label_width = if value.as_str() == Some("unlimited") {
+            None
+        } else {
+            Some(parse_bounded_u16(
+                table,
+                "tab_label_max_width",
+                u16::MAX,
+                1,
+                u16::MAX,
+            )?)
+        };
+    }
     settings.maximum_visible_tabs =
         parse_optional_count(table, "max_tabs", settings.maximum_visible_tabs)?;
 

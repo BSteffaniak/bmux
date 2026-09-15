@@ -142,7 +142,7 @@ struct Settings {
     bold_active: bool,
     underline_active: bool,
     maximum_visible_tabs: Option<usize>,
-    maximum_label_width: u16,
+    maximum_label_width: Option<u16>,
     label_template: String,
     tab_scope: TabScope,
     tab_order: TabOrder,
@@ -179,7 +179,7 @@ impl Default for Settings {
             bold_active: true,
             underline_active: false,
             maximum_visible_tabs: None,
-            maximum_label_width: 20,
+            maximum_label_width: None,
             label_template: "{name}".to_string(),
             tab_scope: TabScope::AllContexts,
             tab_order: TabOrder::Stable,
@@ -987,7 +987,10 @@ fn tab_label(settings: &Settings, tab: &tabs_list::TabListEntry, index: usize) -
         )
         .replace('\u{0}', "{")
         .replace('\u{1}', "}");
-    truncate_to_width(&label, usize::from(settings.maximum_label_width))
+    truncate_to_width(
+        &label,
+        settings.maximum_label_width.map_or(usize::MAX, usize::from),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -2834,7 +2837,7 @@ bar_bg = "#112233"
         assert_eq!(settings.height, 2);
         assert_eq!(settings.label_template, "{index}:{name}");
         assert_eq!(settings.maximum_visible_tabs, Some(8));
-        assert_eq!(settings.maximum_label_width, 20);
+        assert_eq!(settings.maximum_label_width, None);
         assert!(!settings.show_mode);
         assert_eq!(settings.hint_policy, HintPolicy::Always);
         assert_eq!(settings.density, Density::Compact);
@@ -2862,10 +2865,31 @@ bar_bg = "#112233"
         };
         let settings = Settings {
             label_template: "{index}:{name}".to_string(),
-            maximum_label_width: 5,
+            maximum_label_width: Some(5),
             ..Settings::default()
         };
         assert_eq!(tab_label(&settings, &tab, 0), "1:界");
+    }
+
+    #[test]
+    fn label_width_accepts_unlimited_and_preserves_numeric_limits() {
+        assert_eq!(Settings::parse(None).unwrap().maximum_label_width, None);
+        for (value, expected) in [
+            ("\"unlimited\"", None),
+            ("300", Some(300)),
+            ("1", Some(1)),
+            ("65535", Some(u16::MAX)),
+        ] {
+            let config = toml::from_str(&format!("tab_label_max_width = {value}")).unwrap();
+            assert_eq!(
+                Settings::parse(Some(&config)).unwrap().maximum_label_width,
+                expected
+            );
+        }
+        for value in ["0", "-1", "65536", "true", "1.5", "\"auto\""] {
+            let config = toml::from_str(&format!("tab_label_max_width = {value}")).unwrap();
+            assert!(Settings::parse(Some(&config)).is_err(), "{value}");
+        }
     }
 
     #[test]

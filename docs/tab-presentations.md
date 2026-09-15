@@ -41,7 +41,7 @@ placement = "bottom"            # "top" or "bottom"
 height = 1                       # 1..=4 cells
 order = 100                      # lower layout order allocates first
 preset = "tab_rail"             # "minimal" or "classic"
-tab_label_max_width = 20
+tab_label_max_width = "unlimited" # default; or 1..=65535 terminal cells
 tab_template = "{name}"
 show_session_name = false
 show_context_name = false
@@ -74,7 +74,9 @@ The bar composes width-packed tabs with right-aligned mode, role, follow, and
 conditional hint/message modules. Optional session/context modules occupy the
 left side after tabs. Templates support `{name}`, `{index}`, `{index0}`,
 `{session}`, `{marker}`, `{id}`, and `{active}` with Unicode-cell-safe width
-limits and literal double braces.
+limits and literal double braces. Tab names have no explicit width cap by default
+(or with `tab_label_max_width = "unlimited"`); the strip still clips to available
+terminal space. Set a positive integer such as `300` to cap names in terminal cells.
 
 Optional color keys under `[plugins.settings."bmux.tab_bar".colors]` cover
 the bar, active/inactive/hover tabs, modules, and overflow using `#RRGGBB`

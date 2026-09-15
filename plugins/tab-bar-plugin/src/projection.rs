@@ -847,7 +847,10 @@ fn render_tab_template_ranges(
     local: &AttachLocalPresentationSnapshot,
 ) -> (String, Vec<(usize, usize)>) {
     let mut ranges = Vec::new();
-    let name = truncate_cells(&tab.name, usize::from(settings.maximum_label_width));
+    let name = truncate_cells(
+        &tab.name,
+        settings.maximum_label_width.map_or(usize::MAX, usize::from),
+    );
     let session = local.session_label.as_deref().unwrap_or("");
     let mut output = String::with_capacity(settings.label_template.len());
     let mut chars = settings.label_template.chars().peekable();
@@ -1153,6 +1156,39 @@ mod tests {
         assert!(text.contains(" main "));
         assert!(text.contains(" NORMAL "));
         assert!(text.contains(" write "));
+    }
+
+    #[test]
+    fn uncapped_labels_use_available_space_and_stay_within_the_strip() {
+        let name = "a long tab name that exceeds twenty cells";
+        let tabs = [tab(1, name, true)];
+        let settings = Settings::default();
+        assert_eq!(
+            render_tab_template(&settings, &tabs[0], 0, &local(100)),
+            name
+        );
+        let capped = Settings {
+            maximum_label_width: Some(5),
+            ..Settings::default()
+        };
+        assert_eq!(
+            render_tab_template(&capped, &tabs[0], 0, &local(100)),
+            "a lon"
+        );
+        for width in [10, 40, 100] {
+            let projected = project_bar(
+                &settings,
+                &tabs,
+                &local(width),
+                None,
+                &ProjectionInteraction::default(),
+            );
+            let text = projected.plain_text();
+            assert_eq!(UnicodeWidthStr::width(text.as_str()), usize::from(width));
+            if width == 100 {
+                assert!(text.contains(name));
+            }
+        }
     }
 
     #[test]
