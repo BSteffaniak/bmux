@@ -65,7 +65,7 @@ See [`../../docs/tui-runtime.md`](../../docs/tui-runtime.md) for the full archit
 
 ## Cargo features
 
-Defaults enable `all-protocols`, including Crossterm. Use `--no-default-features`
+Defaults enable `all-protocols` and `crossterm` independently. Use `--no-default-features`
 (or `default-features = false` in a dependency declaration) for a minimal build,
 then opt into individual features as needed.
 
@@ -73,5 +73,5 @@ then opt into individual features as needed.
 - `images`: generic image-aware presentation without enabling a host protocol.
 - `image-kitty`: Kitty graphics output.
 - `image-sixel`: Sixel output.
-- `all-protocols`: all three image protocols plus the Crossterm input/lifecycle backend.
+- `all-protocols`: all three image protocols, without selecting an input/lifecycle backend.
 - `image-iterm2`: iTerm2 inline-image output.

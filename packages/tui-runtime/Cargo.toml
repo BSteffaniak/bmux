@@ -36,10 +36,10 @@ tokio        = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 bmux_keyboard = { workspace = true }
 
 [features]
-# Convenience bundle for interactive demos; individual codecs remain backend-neutral.
-all-protocols    = ["image-kitty", "image-sixel", "image-iterm2", "crossterm"]
+# Image protocol bundle, independent of the terminal input/lifecycle backend.
+all-protocols    = ["image-kitty", "image-sixel", "image-iterm2"]
 crossterm        = ["bmux_tui/crossterm"]
-default          = ["all-protocols"]
+default          = ["all-protocols", "crossterm"]
 fail-on-warnings = ["bmux_image?/fail-on-warnings"]
 image-iterm2     = ["images", "bmux_image/iterm2"]
 image-kitty      = ["images", "bmux_image/kitty"]
