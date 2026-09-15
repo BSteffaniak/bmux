@@ -842,6 +842,29 @@ Resolution behavior is deterministic:
   - keep compatibility seams in shared constants/helpers rather than
     ad-hoc call sites
 
+## Accepted direction: asynchronous service routing
+
+Background caller-process work needs an explicitly negotiated, versioned generic
+asynchronous service handle captured in its command context. This direction was
+approved to repair service calls that outlive the synchronous command invocation.
+It is not yet an implemented capability.
+
+The handle must retain its original invoking transport and authority, use bounded
+requests and responses, and close permanently when that attachment ends. Old tasks
+must never acquire a later attachment's route. Closed or unsupported handles return
+explicit errors; they do not fall back to fresh connections. The attach loop must
+continue servicing input, presentation, and requests while plugin work is pending.
+
+The existing native bridge representation and semantics remain unchanged. Hosts
+advertise the new version before plugins select it. Generated BPDL clients remain
+the modeled service interface; this mechanism adds no domain operations to
+`HostRuntimeApi`. Host-side checks bind the handle to the issuing context and its
+permitted services rather than trusting caller-supplied identity.
+
+Acceptance requires coverage of task migration and command return, cancellation,
+detach and reattach isolation, bounded backpressure, unsupported versions, and a
+live picker preview/cancel/confirm workflow using the original attachment route.
+
 ## Process runtime protocol v1
 
 `runtime = "process"` plugins communicate with BMUX over framed stdio

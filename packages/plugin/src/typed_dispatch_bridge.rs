@@ -81,10 +81,228 @@ pub fn block_on_typed_dispatch<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// Version of the bounded asynchronous service route.
+pub const ASYNC_SERVICE_ROUTE_V1: u16 = 1;
+const MAX_ASYNC_SERVICE_BYTES: usize = 1024 * 1024;
+
+/// One request for the owner of an asynchronous service route to dispatch.
+/// Identity and authorization belong to the issuing host context, not this payload.
+pub struct AsyncServiceRequest {
+    pub capability: String,
+    pub kind: InvokeServiceKind,
+    pub interface_id: String,
+    pub operation: String,
+    pub payload: Vec<u8>,
+    pub response: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+}
+
+/// A captured route that never reconnects or switches to another registration.
+#[derive(Debug, Clone)]
+pub struct AsyncServiceClient {
+    sender: tokio::sync::mpsc::Sender<AsyncServiceRequest>,
+}
+
+impl AsyncServiceClient {
+    /// Bind a negotiated route. The host must authorize requests before dispatch.
+    ///
+    /// # Errors
+    /// Rejects unsupported versions and channels larger than the route budget.
+    pub fn bind(
+        version: u16,
+        sender: tokio::sync::mpsc::Sender<AsyncServiceRequest>,
+    ) -> Result<Self, String> {
+        if version != ASYNC_SERVICE_ROUTE_V1 {
+            return Err("unsupported async service route version".into());
+        }
+        if sender.max_capacity() > 16 {
+            return Err("async service route capacity exceeds 16".into());
+        }
+        Ok(Self { sender })
+    }
+}
+
+impl TypedDispatchClient for AsyncServiceClient {
+    async fn invoke_service_raw(
+        &mut self,
+        capability: &str,
+        kind: InvokeServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, TypedDispatchClientError> {
+        let error =
+            |message: &str| TypedDispatchClientError::transport(interface_id, operation, message);
+        if payload.len() > MAX_ASYNC_SERVICE_BYTES
+            || [capability, interface_id, operation]
+                .iter()
+                .any(|value| value.len() > 1024)
+        {
+            return Err(error("async service request exceeds size limit"));
+        }
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .try_send(AsyncServiceRequest {
+                capability: capability.into(),
+                kind,
+                interface_id: interface_id.into(),
+                operation: operation.into(),
+                payload,
+                response,
+            })
+            .map_err(|failure| match failure {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    error("async service route full")
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    error("async service route closed")
+                }
+            })?;
+        let result = receiver
+            .await
+            .map_err(|_| error("async service response closed"))?
+            .map_err(|message| error(&message))?;
+        if result.len() > MAX_ASYNC_SERVICE_BYTES {
+            return Err(error("async service response exceeds size limit"));
+        }
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bmux_plugin_sdk::Result as PluginResult;
+
+    #[tokio::test]
+    async fn async_route_round_trip_and_closure() {
+        let (sender, mut requests) = tokio::sync::mpsc::channel(1);
+        assert!(AsyncServiceClient::bind(2, sender.clone()).is_err());
+        let mut client = AsyncServiceClient::bind(1, sender).expect("version one");
+        let host = tokio::spawn(async move {
+            let request = requests.recv().await.expect("request");
+            assert_eq!(request.capability, "test.capability");
+            request.response.send(Ok(request.payload)).expect("reply");
+        });
+        assert_eq!(
+            client
+                .invoke_service_raw(
+                    "test.capability",
+                    InvokeServiceKind::Query,
+                    "test-interface",
+                    "test-op",
+                    vec![1]
+                )
+                .await
+                .expect("response"),
+            vec![1]
+        );
+        host.await.expect("host");
+        assert!(
+            client
+                .invoke_service_raw(
+                    "test.capability",
+                    InvokeServiceKind::Query,
+                    "test-interface",
+                    "test-op",
+                    vec![]
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn async_route_rejects_full_queue_and_oversized_request() {
+        let (sender, _requests) = tokio::sync::mpsc::channel(1);
+        let mut client = AsyncServiceClient::bind(1, sender.clone()).expect("route");
+        assert!(
+            client
+                .invoke_service_raw(
+                    "test",
+                    InvokeServiceKind::Query,
+                    "test",
+                    "test",
+                    vec![0; MAX_ASYNC_SERVICE_BYTES + 1]
+                )
+                .await
+                .is_err()
+        );
+        let (response, _receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            sender
+                .try_send(AsyncServiceRequest {
+                    capability: "test".into(),
+                    kind: InvokeServiceKind::Query,
+                    interface_id: "test".into(),
+                    operation: "test".into(),
+                    payload: vec![],
+                    response
+                })
+                .is_ok()
+        );
+        assert!(
+            client
+                .invoke_service_raw("test", InvokeServiceKind::Query, "test", "test", vec![])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn async_route_cancelled_call_closes_reply_receiver() {
+        let (sender, mut requests) = tokio::sync::mpsc::channel(1);
+        let mut client = AsyncServiceClient::bind(1, sender).expect("route");
+        let call = tokio::spawn(async move {
+            client
+                .invoke_service_raw("test", InvokeServiceKind::Query, "test", "test", vec![])
+                .await
+        });
+        let request = requests.recv().await.expect("request");
+        call.abort();
+        assert!(call.await.expect_err("cancelled").is_cancelled());
+        assert!(request.response.is_closed());
+        assert!(request.response.send(Ok(vec![])).is_err());
+    }
+
+    #[tokio::test]
+    async fn async_route_old_handle_cannot_use_replacement() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let mut old = AsyncServiceClient::bind(1, sender).expect("old route");
+        drop(receiver);
+        let (sender, mut replacement) = tokio::sync::mpsc::channel(1);
+        let _new = AsyncServiceClient::bind(1, sender).expect("new route");
+        assert!(
+            old.invoke_service_raw("test", InvokeServiceKind::Query, "test", "test", vec![])
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            replacement.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_route_rejects_oversized_response() {
+        let (sender, mut requests) = tokio::sync::mpsc::channel(1);
+        let mut client = AsyncServiceClient::bind(1, sender).expect("route");
+        let host = tokio::spawn(async move {
+            let request = requests.recv().await.expect("request");
+            assert!(
+                request
+                    .response
+                    .send(Ok(vec![0; MAX_ASYNC_SERVICE_BYTES + 1]))
+                    .is_ok()
+            );
+        });
+        assert!(
+            client
+                .invoke_service_raw("test", InvokeServiceKind::Query, "test", "test", vec![])
+                .await
+                .is_err()
+        );
+        host.await.expect("host");
+    }
 
     struct FakeCaller;
 

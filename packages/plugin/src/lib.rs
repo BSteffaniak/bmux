@@ -109,7 +109,10 @@ pub use startup_gate::{
     register_startup_ready_gate, registered_startup_ready_gates,
 };
 pub use static_vtable_registry::{register_static_vtable, static_vtable};
-pub use typed_dispatch_bridge::{ServiceCallerDispatchClient, block_on_typed_dispatch};
+pub use typed_dispatch_bridge::{
+    ASYNC_SERVICE_ROUTE_V1, AsyncServiceClient, AsyncServiceRequest, ServiceCallerDispatchClient,
+    block_on_typed_dispatch,
+};
 pub use typed_service_caller::TypedServiceCaller;
 
 /// Default exported symbol used to invoke a plugin command.
