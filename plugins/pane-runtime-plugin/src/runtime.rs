@@ -1193,7 +1193,7 @@ fn ordered_image_output(
     output: &mut bmux_image::intercept::InterceptResult,
     cell_pixels: (u16, u16),
     replies: &mut Vec<u8>,
-) {
+) -> std::io::Result<()> {
     let mut fed = 0;
     for event in &mut output.events {
         let offset = event.filtered_byte_offset();
@@ -1203,7 +1203,7 @@ fn ordered_image_output(
             registry,
             &output.filtered[fed..offset],
             replies,
-        );
+        )?;
         fed = offset;
         let (row, col) = tracker.cursor_position();
         event.set_position(bmux_image::ImagePosition { row, col });
@@ -1215,7 +1215,7 @@ fn ordered_image_output(
         registry,
         &output.filtered[fed..],
         replies,
-    );
+    )
 }
 
 #[cfg(feature = "image-registry")]
@@ -1225,25 +1225,34 @@ fn image_terminal_bytes(
     registry: &mut bmux_image::ImageRegistry,
     bytes: &[u8],
     replies: &mut Vec<u8>,
-) {
+) -> std::io::Result<()> {
     for byte in bytes {
         let erase = tracker.terminal_grid.grid().display_erase_revision();
+        let history_erase = tracker.terminal_grid.grid().history_erase_revision();
+        let reset = tracker.terminal_grid.grid().reset_revision();
         replies.extend(protocol_reply_for_chunk(
             protocol,
             tracker,
             std::slice::from_ref(byte),
         ));
+        if reset != tracker.terminal_grid.grid().reset_revision() {
+            registry.reset();
+        }
         registry.set_alternate_screen(
             tracker.terminal_grid.grid().mode() == bmux_terminal_grid::GridMode::Alternate,
         );
-        if erase != tracker.terminal_grid.grid().display_erase_revision() {
+        if history_erase != tracker.terminal_grid.grid().history_erase_revision() {
             registry.clear();
+        } else if erase != tracker.terminal_grid.grid().display_erase_revision() {
+            registry.clear_display();
         }
         let scrolled = tracker.drain_scroll_delta();
         if scrolled > 0 {
-            registry.scroll_up(scrolled);
+            registry.scroll_up(scrolled)?;
+            registry.evict_history(tracker.terminal_grid.grid().max_scrollback_offset());
         }
     }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "image-registry"))]
@@ -1271,7 +1280,8 @@ mod image_lifecycle_tests {
                     &mut output,
                     (8, 16),
                     &mut Vec::new(),
-                );
+                )
+                .unwrap();
             }
             assert_eq!(registry.images().len(), 1, "split {split}");
             assert_eq!(
@@ -1287,7 +1297,8 @@ mod image_lifecycle_tests {
                 &mut output,
                 (8, 16),
                 &mut Vec::new(),
-            );
+            )
+            .unwrap();
             assert!(registry.images().is_empty());
         }
     }
@@ -4536,7 +4547,7 @@ impl SessionRuntimeManager {
                                         break;
                                     };
                                     let before = registry.sequence();
-                                    ordered_image_output(
+                                    if let Err(error) = ordered_image_output(
                                         &mut cursor_tracker,
                                         &mut protocol_engine,
                                         &mut registry,
@@ -4546,7 +4557,10 @@ impl SessionRuntimeManager {
                                             if cph == 0 { 16 } else { cph },
                                         ),
                                         &mut image_protocol_reply,
-                                    );
+                                    ) {
+                                        warn!(%pane_id, %error, "image projection failed; stopping output reader");
+                                        break;
+                                    }
                                     let changed = registry.sequence() != before;
                                     drop(registry);
                                     if changed

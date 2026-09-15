@@ -617,6 +617,8 @@ pub struct TerminalGrid {
     content_revision: u64,
     /// Monotonic invalidation counter for full display erasures.
     display_erase_revision: u64,
+    history_erase_revision: u64,
+    reset_revision: u64,
     total_scrolled_rows: u64,
     autowrap: bool,
     pending_wrap: bool,
@@ -721,6 +723,8 @@ impl TerminalGrid {
             revision: 0,
             content_revision: 0,
             display_erase_revision: 0,
+            history_erase_revision: 0,
+            reset_revision: 0,
             total_scrolled_rows: 0,
             autowrap: true,
             pending_wrap: false,
@@ -816,6 +820,8 @@ impl TerminalGrid {
             revision: snapshot.revision,
             content_revision: snapshot.content_revision,
             display_erase_revision: 0,
+            history_erase_revision: 0,
+            reset_revision: 0,
             total_scrolled_rows: snapshot
                 .total_scrolled_rows
                 .unwrap_or(u64::from(snapshot.scrollback_rows)),
@@ -1172,6 +1178,18 @@ impl TerminalGrid {
         self.display_erase_revision
     }
 
+    /// Local invalidation token for explicit history erasure.
+    #[must_use]
+    pub const fn history_erase_revision(&self) -> u64 {
+        self.history_erase_revision
+    }
+
+    /// Local invalidation token for a complete terminal reset.
+    #[must_use]
+    pub const fn reset_revision(&self) -> u64 {
+        self.reset_revision
+    }
+
     pub(crate) fn erase_display(&mut self, mode: usize) {
         let fill = self.erase_style();
         match mode {
@@ -1193,6 +1211,7 @@ impl TerminalGrid {
                     self.fill_viewport_row(row, fill);
                 }
                 if mode == 3 && self.mode == GridMode::Main {
+                    self.history_erase_revision = self.history_erase_revision.wrapping_add(1);
                     self.history_truncated |= self.history_line_count() > 0;
                     self.history_bytes = 0;
                     self.main_history.clear();
@@ -1507,6 +1526,9 @@ impl TerminalGrid {
         if let Ok(mut reset) = Self::new(width, height, self.limits) {
             reset.revision = self.revision;
             reset.content_revision = self.content_revision;
+            reset.display_erase_revision = self.display_erase_revision.wrapping_add(1);
+            reset.history_erase_revision = self.history_erase_revision.wrapping_add(1);
+            reset.reset_revision = self.reset_revision.wrapping_add(1);
             reset.bump_content_revision();
             *self = reset;
         }
@@ -2376,6 +2398,8 @@ impl TerminalGrid {
             revision: self.revision,
             content_revision: self.content_revision,
             display_erase_revision: self.display_erase_revision,
+            history_erase_revision: self.history_erase_revision,
+            reset_revision: self.reset_revision,
             total_scrolled_rows: self.total_scrolled_rows,
             autowrap: self.autowrap,
             pending_wrap: self.pending_wrap,

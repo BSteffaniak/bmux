@@ -305,48 +305,42 @@ impl ImageRegistry {
             .sum()
     }
 
-    /// Shift all image positions up when the pane scrolls.
-    ///
-    /// Call this when the pane's content scrolls by `lines` rows.
-    /// Images that scroll entirely above the viewport are removed.
-    pub fn scroll_up(&mut self, lines: u16) {
+    /// Advance retained anchors and rebuild the live crop from original pixels.
+    /// Fully offscreen originals remain available for history projection.
+    pub fn scroll_up(&mut self, lines: u16) -> std::io::Result<()> {
         if lines == 0 {
-            return;
+            return Ok(());
         }
         for (_, row) in self.history.values_mut() {
             *row = row.saturating_sub(i64::from(lines));
         }
-        self.sequence += 1;
-        let seq = self.sequence;
-        let change_log = &mut self.change_log;
-        self.images.retain_mut(|img| {
-            if img.position.row < lines {
-                if img.position.row + img.cell_size.rows > lines {
-                    let original_row = img.position.row;
-                    img.position.row = 0;
-                    img.cell_size.rows -= lines - original_row;
-                    change_log.push(ChangeLogEntry::Added {
-                        sequence: seq,
-                        image: img.clone(),
-                    });
-                    true
-                } else {
-                    change_log.push(ChangeLogEntry::Removed {
-                        sequence: seq,
-                        image_id: img.id,
-                    });
-                    false
+        let projected = match self.project_viewport(0, u16::MAX) {
+            Ok(projected) => projected,
+            Err(error) => {
+                for (_, row) in self.history.values_mut() {
+                    *row = row.saturating_add(i64::from(lines));
                 }
-            } else {
-                img.position.row -= lines;
-                change_log.push(ChangeLogEntry::Added {
-                    sequence: seq,
-                    image: img.clone(),
-                });
-                true
+                return Err(error);
             }
-        });
+        };
+        self.sequence += 1;
+        for old in &self.images {
+            if !projected.iter().any(|image| image.id == old.id) {
+                self.change_log.push(ChangeLogEntry::Removed {
+                    sequence: self.sequence,
+                    image_id: old.id,
+                });
+            }
+        }
+        for image in &projected {
+            self.change_log.push(ChangeLogEntry::Added {
+                sequence: self.sequence,
+                image: image.clone(),
+            });
+        }
+        self.images = projected;
         self.compact_change_log();
+        Ok(())
     }
 
     /// Replace the registry contents with a caller-projected image scene.
@@ -456,7 +450,7 @@ impl ImageRegistry {
                     );
                 }
                 projected.cell_size.rows = visible_rows;
-                if projected.payload.raw.is_none() {
+                if projected.payload.raw.is_none() && projected.payload.pixels.is_some() {
                     match encode_projected_payload(&projected) {
                         Ok(raw) => projected.payload.raw = Some(raw),
                         Err(error) => return Some(Err(error)),
@@ -472,8 +466,15 @@ impl ImageRegistry {
         let oldest = i64::try_from(retained_rows)
             .unwrap_or(i64::MAX)
             .saturating_neg();
+        let before = self.history.len();
         self.history
             .retain(|_, (image, row)| row.saturating_add(i64::from(image.cell_size.rows)) > oldest);
+        if self.history.len() != before {
+            self.sequence += 1;
+        }
+        #[cfg(feature = "kitty")]
+        self.kitty_placements
+            .retain(|_, id| self.history.contains_key(id));
     }
 
     /// Compute a delta since the given sequence number.
@@ -552,6 +553,35 @@ impl ImageRegistry {
         self.sequence
     }
 
+    /// Clear the active display while preserving placements entirely in history.
+    pub fn clear_display(&mut self) {
+        let retained = self
+            .history
+            .iter()
+            .filter(|(_, (image, row))| row.saturating_add(i64::from(image.cell_size.rows)) <= 0)
+            .map(|(id, value)| (*id, value.clone()))
+            .collect();
+        self.sequence += 1;
+        for image in &self.images {
+            self.change_log.push(ChangeLogEntry::Removed {
+                sequence: self.sequence,
+                image_id: image.id,
+            });
+        }
+        self.images.clear();
+        self.history = retained;
+        #[cfg(feature = "kitty")]
+        self.kitty_placements
+            .retain(|_, id| self.history.contains_key(id));
+        self.compact_change_log();
+    }
+
+    /// Reset both screen namespaces without allowing hidden images to return.
+    pub fn reset(&mut self) {
+        self.clear();
+        self.normal_screen = None;
+    }
+
     /// Remove all images (e.g., on screen clear).
     pub fn clear(&mut self) {
         self.sequence += 1;
@@ -574,12 +604,12 @@ impl ImageRegistry {
 
     #[cfg(feature = "kitty")]
     fn remove_image(&mut self, id: u64) {
-        self.history.remove(&id);
+        let removed_history = self.history.remove(&id).is_some();
         self.kitty_placements
             .retain(|_, retained_id| *retained_id != id);
         let before = self.images.len();
         self.images.retain(|image| image.id != id);
-        if self.images.len() != before {
+        if self.images.len() != before || removed_history {
             self.sequence += 1;
             self.change_log.push(ChangeLogEntry::Removed {
                 sequence: self.sequence,
@@ -897,7 +927,7 @@ mod tests {
             },
         );
 
-        reg.scroll_up(3);
+        reg.scroll_up(3).unwrap();
 
         // First image (row 0, height 2) scrolled above row 3 entirely -> removed.
         // Second image (row 5) -> row 2.
@@ -910,8 +940,16 @@ mod tests {
         let mut reg = ImageRegistry::new(10, 0);
         // Image at row 2, spanning 5 rows (rows 2..7).
         reg.add_image(
-            ImageProtocol::Sixel,
-            ImagePayload::default(),
+            ImageProtocol::KittyGraphics,
+            ImagePayload {
+                raw: None,
+                pixels: Some(crate::model::PixelBuffer {
+                    width: 40,
+                    height: 80,
+                    format: crate::model::PixelFormat::Rgba8,
+                    data: vec![255; 40 * 80 * 4],
+                }),
+            },
             ImagePosition { row: 2, col: 0 },
             ImageCellSize { rows: 5, cols: 5 },
             ImagePixelSize {
@@ -923,7 +961,7 @@ mod tests {
         // Scroll up by 4: rows 0..4 disappear. The image originally at rows
         // 2..7 loses its top 2 rows (rows 2..4) and keeps the bottom 3 (rows
         // 4..7, now shifted to 0..3).
-        reg.scroll_up(4);
+        reg.scroll_up(4).unwrap();
 
         assert_eq!(reg.images().len(), 1);
         let img = &reg.images()[0];

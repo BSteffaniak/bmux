@@ -107,8 +107,8 @@ mod pipeline {
         assert!(delta.removed.contains(&alternate_id));
         assert!(!delta.removed.contains(&main_id));
         let before = registry.sequence();
-        registry.scroll_up(1);
-        registry.scroll_up(1);
+        registry.scroll_up(1).unwrap();
+        registry.scroll_up(1).unwrap();
         let delta = registry.delta_since(before);
         assert_eq!(delta.added.len(), 1);
         assert_eq!(delta.added[0].position.row, 3);
@@ -125,7 +125,7 @@ mod pipeline {
             registry.handle_event(event, 1, 6);
         }
         let original = registry.images()[0].clone();
-        registry.scroll_up(1);
+        registry.scroll_up(1).unwrap();
         let clipped = registry.project_viewport(0, 10).unwrap();
         assert_eq!(clipped[0].cell_size.rows, 1);
         assert_eq!(clipped[0].pixel_size.height, 6);
@@ -139,13 +139,59 @@ mod pipeline {
             decoded.data,
             clipped[0].payload.pixels.as_ref().unwrap().data
         );
-        registry.scroll_up(4);
+        registry.scroll_up(4).unwrap();
         assert!(registry.project_viewport(0, 10).unwrap().is_empty());
         assert_eq!(registry.images_in_viewport(5, 10).len(), 1);
         let restored = registry.project_viewport(5, 10).unwrap();
         assert_eq!(restored[0], original);
         registry.evict_history(3);
         assert!(registry.project_viewport(5, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn display_clear_preserves_history_but_reset_discards_both_screens() {
+        let mut registry = ImageRegistry::default();
+        let mut interceptor = ImageInterceptor::new();
+        for event in interceptor
+            .process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\")
+            .events
+        {
+            registry.handle_event(event, 8, 16);
+        }
+        registry.scroll_up(2).unwrap();
+        registry.clear_display();
+        assert_eq!(registry.project_viewport(2, 10).unwrap().len(), 1);
+        registry.set_alternate_screen(true);
+        registry.reset();
+        registry.set_alternate_screen(false);
+        assert!(registry.project_viewport(2, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn kitty_history_remains_deletable_after_display_clear() {
+        let mut registry = ImageRegistry::default();
+        let mut interceptor = ImageInterceptor::new();
+        let mut wire = b"\x1b_".to_vec();
+        wire.extend(bmux_image::codec::kitty::encode_transmit(
+            42,
+            KittyFormat::Rgba,
+            &[255, 0, 0, 255],
+            1,
+            1,
+        ));
+        wire.extend_from_slice(b"\x1b\\\x1b_Ga=p,i=42,p=7;\x1b\\");
+        for event in interceptor.process(&wire).events {
+            registry.handle_event(event, 8, 16);
+        }
+        registry.scroll_up(2).unwrap();
+        registry.clear_display();
+        assert_eq!(registry.project_viewport(2, 10).unwrap().len(), 1);
+        let before = registry.sequence();
+        for event in interceptor.process(b"\x1b_Ga=d,d=p,i=42,p=7;\x1b\\").events {
+            registry.handle_event(event, 8, 16);
+        }
+        assert!(registry.sequence() > before);
+        assert!(registry.project_viewport(2, 10).unwrap().is_empty());
     }
 
     #[test]
@@ -402,11 +448,11 @@ mod pipeline {
         assert_eq!(registry.images()[0].position.row, 10);
 
         // Scroll up by 3 lines: row 10 → row 7.
-        registry.scroll_up(3);
+        registry.scroll_up(3).unwrap();
         assert_eq!(registry.images()[0].position.row, 7);
 
         // Scroll up by 8 more (image at row 7 with 1 row height → evicted at row <0).
-        registry.scroll_up(8);
+        registry.scroll_up(8).unwrap();
         assert!(registry.images().is_empty());
     }
 
