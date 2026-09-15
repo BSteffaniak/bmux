@@ -1,6 +1,7 @@
 execution_class = "native_fast"
 id = "bmux.theme"
 name = "bmux Theme"
+optional_capabilities = ["bmux.performance.write"]
 owns_namespaces = ["theme"]
 provided_capabilities = [
     "bmux.theme.read",

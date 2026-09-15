@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bmux_appearance            = { workspace = true }
 bmux_clients_plugin_api    = { workspace = true }
+bmux_codec                 = { workspace = true }
 bmux_config                = { workspace = true }
 bmux_decoration_plugin_api = { workspace = true }
 bmux_ipc                   = { workspace = true }
@@ -27,6 +28,13 @@ serde_json                 = { workspace = true }
 tokio                      = { workspace = true }
 toml                       = { workspace = true, features = ["parse"] }
 tracing                    = { workspace = true }
+
+[dev-dependencies]
+bmux_decoration_plugin = { workspace = true, features = ["static-bundled"] }
+
+[package.metadata.cargo-machete]
+# BPDL-generated clients and byte-list fields reference these crates directly.
+ignored = ["bmux_codec", "bmux_ipc"]
 
 [features]
 fail-on-warnings = [

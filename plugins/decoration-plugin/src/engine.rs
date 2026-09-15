@@ -48,6 +48,13 @@ pub(crate) enum DecorationEngineCommand {
         border: BorderStyle,
         reply: tokio::sync::oneshot::Sender<Result<(), SetStyleError>>,
     },
+    DiscardScriptCheckpoint {
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    ScriptCheckpoint {
+        restore: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     ApplyThemeExtension {
         toml_text: String,
         config_dir_candidates: Vec<PathBuf>,
@@ -203,6 +210,27 @@ impl DecorationEngine {
         }
     }
 
+    fn handle_script_checkpoint(&mut self, restore: bool) -> Result<(), String> {
+        if !restore {
+            return crate::checkpoint_script_state(&mut self.state);
+        }
+        crate::restore_script_state(&mut self.state)?;
+        let access = self
+            .state
+            .current_theme
+            .as_ref()
+            .and_then(|theme| theme.script_access.clone());
+        let generation = self.state.script_subscription_generation;
+        crate::install_script_event_subscriptions(
+            &self.shared,
+            &mut self.state,
+            access,
+            generation,
+        );
+        self.publish_read_model_if(true);
+        Ok(())
+    }
+
     fn handle_command(&mut self, command: DecorationEngineCommand) {
         match command {
             DecorationEngineCommand::SetPaneBorder {
@@ -218,6 +246,15 @@ impl DecorationEngine {
                 let changed = set_default_border_direct(&mut self.state, border);
                 self.publish_read_model_if(changed);
                 let _ = reply.send(Ok(()));
+            }
+            DecorationEngineCommand::DiscardScriptCheckpoint { reply } => {
+                self.state.script_checkpoint = None;
+                self.state.script_checkpoint_started = None;
+                let _ = reply.send(Ok(()));
+            }
+            DecorationEngineCommand::ScriptCheckpoint { restore, reply } => {
+                let result = self.handle_script_checkpoint(restore);
+                let _ = reply.send(result);
             }
             DecorationEngineCommand::ApplyThemeExtension {
                 toml_text,

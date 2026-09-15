@@ -5,6 +5,12 @@ Owns runtime theme selection for bmux. Declare the startup theme in
 preview, persistence, additive theme stacks, and generic theme-extension
 fanout.
 
+The performance settings capability is optional: themes without performance
+settings do not require the performance plugin. Applying settings for an absent
+provider returns an error rather than silently accepting an incomplete theme.
+Decoration remains a required dependency for extension application and script
+preview checkpoints.
+
 With `persistence = "persist_between_connects"`, a saved picker preset takes
 precedence over both `themes` and split `appearance_themes` / `component_themes`
 stacks on reconnect. The preset resolves the same way as a live picker selection;
@@ -28,10 +34,33 @@ malformed records are errors rather than configured-mode defaults. Older BMUX
 versions do not understand these records; downgrade requires restoring a legacy
 preference from a backup rather than treating the new record as a preset name.
 
-The picker currently reconstructs its initial selection from configuration and
-storage. Shared live-state authority, exact cancellation restoration, and an
-explicit file-refresh command are not yet implemented. Saving configuration or
-Lua files does not automatically reload them.
+The picker reads the theme owner's current selection and uses revision-checked
+control services for selection, preview, confirmation, and cancellation. One
+attachment owns a preview at a time. Active pickers renew their preview lease;
+detach or lease expiry restores the prior theme. Lua-backed decoration previews
+retain a checkpoint of the original script instances, and cancellation restores
+those instances rather than recompiling them. Failed rollback requires recovery
+instead of being reported as a successful restoration.
+
+**Known live-attachment limitation:** the picker currently spawns background
+work after its caller-process command returns. The command-scoped transport
+route does not survive that return, so subsequent remote service calls can use
+different connection identities. Live preview cancellation can consequently
+fail its ownership check and leave a preview active, blocking selection and
+refresh until successful cleanup. Local and cross-plugin unit tests do not
+establish safety for this path. Resolving this requires a context-bound,
+attachment-lifetime route; a replaceable process-global fallback or relaxed
+preview ownership checks would not preserve isolation.
+
+`bmux theme refresh` reloads the current selection's configuration and files.
+It preserves the selection and does not write a reconnect preference. A failed
+refresh leaves the retained selection/revision unchanged; rollback failures are
+reported explicitly. Saving configuration or Lua files does not automatically
+reload them. Bundled Lua assets require rebuilding the plugin to change them.
+
+Cross-process override provenance and external settings-provider consistency
+still require end-to-end validation; do not assume those integration paths are
+complete solely from the local control-service tests.
 
 ## Theme File Precedence
 

@@ -163,6 +163,7 @@ interface performance-state {
 
 @capability(PERFORMANCE_WRITE)
 interface performance-commands {
+    command reset-theme-header-settings() -> unit;
     command set-settings(settings: performance-types.performance-runtime-settings)
         -> performance-types.performance-runtime-settings;
     command start-watch(watch: performance-types.metric-watch)

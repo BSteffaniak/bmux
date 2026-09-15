@@ -111,6 +111,17 @@ impl ConfigLoadOverrides {
         }
     }
 
+    /// Capture the overrides selected for this process, preserving startup
+    /// precedence when a caller reloads through an explicitly resolved path.
+    #[must_use]
+    pub fn for_process() -> Self {
+        process_config_overrides()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| Self::from_env_with_cli(None))
+    }
+
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.base_config_path.is_none()

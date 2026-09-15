@@ -82,6 +82,12 @@ interface_id = "performance-theme-settings"
 kind         = "command"
 operation    = "apply-form"
 
+[settings.providers.performance.reset_settings]
+capability   = "bmux.performance.write"
+interface_id = "performance-commands"
+kind         = "command"
+operation    = "reset-theme-header-settings"
+
 [settings.providers.performance.apply_settings]
 capability   = "bmux.theme.settings"
 interface_id = "performance-theme-settings"

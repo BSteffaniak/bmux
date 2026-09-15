@@ -132,6 +132,9 @@ struct State {
     /// Currently-loaded extension supplied through `theme-extension:apply`;
     /// `None` means "no extension observed; paint with built-in ASCII defaults".
     current_theme: Option<DecorationThemeExtension>,
+    /// Detached script state retained for one preview transaction.
+    script_checkpoint: Option<Box<State>>,
+    script_checkpoint_started: Option<Instant>,
     /// Compiled legacy decoration script, if any. `None` means the theme
     /// did not request a top-level script, or scripting was disabled at build
     /// time, or compilation failed (the loader logs the failure).
@@ -442,6 +445,30 @@ impl DecorationStateService for DecorationServiceHandle {
 }
 
 impl DecorationCommandsService for DecorationServiceHandle {
+    fn discard_script_checkpoint<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async {
+            Err("checkpoint operations require identity-bearing service dispatch".into())
+        })
+    }
+
+    fn checkpoint_script_state<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async {
+            Err("checkpoint operations require identity-bearing service dispatch".into())
+        })
+    }
+
+    fn restore_script_state<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async {
+            Err("checkpoint operations require identity-bearing service dispatch".into())
+        })
+    }
+
     fn set_pane_border<'a>(
         &'a self,
         pane_id: Uuid,
@@ -1754,6 +1781,65 @@ fn apply_theme_extension_toml(
     })
 }
 
+fn swap_script_state(state: &mut State, other: &mut State) {
+    std::mem::swap(&mut state.current_theme, &mut other.current_theme);
+    std::mem::swap(&mut state.script_backend, &mut other.script_backend);
+    std::mem::swap(&mut state.script_path, &mut other.script_path);
+    std::mem::swap(&mut state.script_source_hash, &mut other.script_source_hash);
+    std::mem::swap(&mut state.script_started_at, &mut other.script_started_at);
+    std::mem::swap(&mut state.script_frame, &mut other.script_frame);
+    std::mem::swap(&mut state.script_perf, &mut other.script_perf);
+    std::mem::swap(&mut state.script_events, &mut other.script_events);
+    std::mem::swap(
+        &mut state.script_event_subscriptions,
+        &mut other.script_event_subscriptions,
+    );
+    std::mem::swap(&mut state.script_components, &mut other.script_components);
+    std::mem::swap(&mut state.animation_hz, &mut other.animation_hz);
+    std::mem::swap(
+        &mut state.script_first_invoke_logged,
+        &mut other.script_first_invoke_logged,
+    );
+}
+
+fn checkpoint_script_state(state: &mut State) -> Result<(), String> {
+    if state.script_checkpoint.is_some() {
+        return Err("decoration checkpoint already exists".into());
+    }
+    let mut checkpoint = Box::new(State::default());
+    swap_script_state(state, &mut checkpoint);
+    state.script_checkpoint = Some(checkpoint);
+    state.script_checkpoint_started = Some(Instant::now());
+    state.script_subscription_generation = state.script_subscription_generation.saturating_add(1);
+    state.animation_generation = state.animation_generation.saturating_add(1);
+    Ok(())
+}
+
+fn restore_script_state(state: &mut State) -> Result<(), String> {
+    let mut checkpoint = state
+        .script_checkpoint
+        .take()
+        .ok_or("no decoration checkpoint")?;
+    let suspended = state
+        .script_checkpoint_started
+        .take()
+        .map_or(Duration::ZERO, |start| start.elapsed());
+    if let Some(start) = checkpoint.script_started_at {
+        checkpoint.script_started_at = start.checked_add(suspended);
+    }
+    for component in checkpoint.script_components.values_mut() {
+        if let Some(start) = component.script_started_at {
+            component.script_started_at = start.checked_add(suspended);
+        }
+    }
+    swap_script_state(state, &mut checkpoint);
+    state.script_subscription_generation = state.script_subscription_generation.saturating_add(1);
+    state.animation_generation = state.animation_generation.saturating_add(1);
+    clear_visual_projection_state(state);
+    publish_scene_if_changed(state);
+    Ok(())
+}
+
 fn script_replacement_error(path: &str, message: &str) -> ValidationResult {
     ValidationResult::Errors {
         errors: vec![ValidationError {
@@ -1841,13 +1927,19 @@ fn apply_theme_extension_toml_direct(
             "script could not be compiled",
         ));
     }
+    let same_access = state
+        .current_theme
+        .as_ref()
+        .and_then(|theme| theme.script_access.as_ref())
+        == extension.script_access.as_ref();
     reuse_script_components(state, &mut prepared, &extension, &script_host_access);
     state.script_components = prepared.script_components;
     state.current_theme = Some(extension);
     clear_visual_projection_state(state);
     state.animation_hz = animation_hz;
     state.animation_generation = state.animation_generation.saturating_add(1);
-    let preserve_script = state.script_backend.is_some()
+    let preserve_script = same_access
+        && state.script_backend.is_some()
         && state.script_path == prepared.script_path
         && state.script_source_hash == prepared.script_source_hash
         && script_host_access.service_grants.is_empty();
@@ -2921,8 +3013,30 @@ impl RustPlugin for DecorationPlugin {
         // `bmux_codec`-encoded payload, runs the same logic the
         // `DecorationStateService` trait methods use against the
         // shared state, and encodes the response back.
+        // Checkpoints are owned by the theme coordinator, not arbitrary script
+        // callers which may also hold decoration.write. Enforce at dispatch
+        // before queuing any mutation of server-owned VM state.
+        if matches!(
+            context.request.operation.as_str(),
+            "checkpoint-script-state" | "restore-script-state" | "discard-script-checkpoint"
+        ) && context.request.caller_plugin_id != "bmux.theme"
+        {
+            return bmux_plugin_sdk::ServiceResponse::error(
+                "checkpoint_owner_required",
+                "only the theme coordinator may manage script checkpoints",
+            );
+        }
         let state = self.state.clone();
         bmux_plugin_sdk::route_service!(context, {
+            "decoration-commands", "discard-script-checkpoint" => |_req: (), _ctx| {
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(send_engine_command_blocking(&state, |reply| DecorationEngineCommand::DiscardScriptCheckpoint { reply }).unwrap_or_else(|| Err("decoration engine unavailable".into())))
+            },
+            "decoration-commands", "checkpoint-script-state" => |_req: (), _ctx| {
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(send_engine_command_blocking(&state, |reply| DecorationEngineCommand::ScriptCheckpoint { restore: false, reply }).unwrap_or_else(|| Err("decoration engine unavailable".into())))
+            },
+            "decoration-commands", "restore-script-state" => |_req: (), _ctx| {
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(send_engine_command_blocking(&state, |reply| DecorationEngineCommand::ScriptCheckpoint { restore: true, reply }).unwrap_or_else(|| Err("decoration engine unavailable".into())))
+            },
             "decoration-state", "pane-decoration" => |req: PaneDecorationArgs, _ctx| {
                 let result = state.read_model(|model| Some(pane_decoration_from_read_model(model, req.pane_id)));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(result)
@@ -5636,6 +5750,51 @@ exited = ""
                 &backend,
                 runtime.backend.as_ref().expect("backend")
             ));
+            checkpoint_script_state(state).expect("preview checkpoint");
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("preview replacement");
+            assert!(!Arc::ptr_eq(
+                &backend,
+                state.script_components[&id]
+                    .backend
+                    .as_ref()
+                    .expect("preview backend")
+            ));
+            restore_script_state(state).expect("cancel preview");
+            assert!(Arc::ptr_eq(
+                &backend,
+                state.script_components[&id]
+                    .backend
+                    .as_ref()
+                    .expect("restored backend")
+            ));
+            let restored_frame = state.script_components[&id].script_frame;
+            assert!(restored_frame >= 42);
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("refresh restored composition");
+            assert!(Arc::ptr_eq(
+                &backend,
+                state.script_components[&id]
+                    .backend
+                    .as_ref()
+                    .expect("refreshed backend")
+            ));
+            assert_eq!(
+                state.script_components[&id].script_frame,
+                restored_frame + 1
+            );
         });
     }
 
@@ -5684,6 +5843,171 @@ exited = ""
                     .as_ref()
                     .expect("backend")
             ));
+        });
+    }
+
+    #[test]
+    fn removing_script_access_replaces_top_level_backend() {
+        let plugin = DecorationPlugin::new();
+        let shared = plugin.state.clone();
+        plugin.state.with_state(move |state| {
+            let mut extension = decoration_extension_from_theme(include_str!(
+                "../../theme-plugin/assets/themes/pulse-border.toml"
+            ));
+            extension.script_access = Some(
+                bmux_decoration_plugin_api::decoration_state::ScriptAccessSpec {
+                    state_channels: Vec::new(),
+                    event_channels: Vec::new(),
+                    services: vec![
+                        bmux_decoration_plugin_api::decoration_state::ScriptServiceGrant {
+                            capability: "example.read".into(),
+                            kind: "query".into(),
+                            interface_id: "example".into(),
+                            operation: "get".into(),
+                        },
+                    ],
+                },
+            );
+            let text = toml::to_string(&extension).expect("serialize");
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("install");
+            state.script_started_at = Instant::now().checked_sub(Duration::from_mins(1));
+            let previous_start = state.script_started_at;
+            extension.script_access = None;
+            let text = toml::to_string(&extension).expect("serialize");
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("revoke");
+            assert_ne!(state.script_started_at, previous_start);
+        });
+    }
+
+    #[test]
+    fn script_checkpoint_restores_original_runtime_without_recompile() {
+        let plugin = DecorationPlugin::new();
+        let shared = plugin.state.clone();
+        plugin.state.with_state(move |state| {
+            let extension = decoration_extension_from_theme(include_str!(
+                "../../theme-plugin/assets/themes/pulse-border.toml"
+            ));
+            let text = toml::to_string(&extension).expect("serialize");
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("apply");
+            state.script_frame = 41;
+            let started = state.script_started_at;
+            checkpoint_script_state(state).expect("checkpoint");
+            assert!(state.script_backend.is_none());
+            assert!(checkpoint_script_state(state).is_err());
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("replacement");
+            restore_script_state(state).expect("restore");
+            assert!(state.script_started_at >= started);
+            assert!(state.script_frame >= 41);
+            assert!(state.script_checkpoint.is_none());
+        });
+    }
+
+    #[test]
+    fn checkpoint_restoration_excludes_suspended_animation_time() {
+        let start = Instant::now();
+        let mut state = State {
+            script_started_at: Some(start),
+            ..State::default()
+        };
+        checkpoint_script_state(&mut state).expect("checkpoint");
+        state.script_checkpoint_started = start.checked_sub(Duration::from_secs(2));
+        restore_script_state(&mut state).expect("restore");
+        let restored = state.script_started_at.expect("clock");
+        assert!(restored.duration_since(start) >= Duration::from_secs(2));
+        assert!(state.script_checkpoint_started.is_none());
+    }
+
+    #[test]
+    fn identity_less_typed_checkpoint_calls_are_rejected() {
+        let plugin = DecorationPlugin::new();
+        let handle = DecorationServiceHandle::new(plugin.state.clone());
+        assert!(block_on(handle.checkpoint_script_state()).is_err());
+        assert!(block_on(handle.restore_script_state()).is_err());
+        assert!(block_on(handle.discard_script_checkpoint()).is_err());
+        plugin
+            .state
+            .with_state(|state| assert!(state.script_checkpoint.is_none()));
+    }
+
+    #[test]
+    fn engine_checkpoint_restore_updates_read_model() {
+        let plugin = DecorationPlugin::new();
+        let shared = plugin.state.clone();
+        plugin.state.with_state(move |state| {
+            let extension = decoration_extension_from_theme(include_str!(
+                "../../theme-plugin/assets/themes/pulse-border.toml"
+            ));
+            let text = toml::to_string(&extension).expect("serialize");
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                &text,
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("apply");
+        });
+        send_engine_command_blocking(&plugin.state, |reply| {
+            DecorationEngineCommand::ScriptCheckpoint {
+                restore: false,
+                reply,
+            }
+        })
+        .expect("reply")
+        .expect("checkpoint");
+        let shared = plugin.state.clone();
+        plugin.state.with_state(move |state| {
+            apply_theme_extension_toml_direct(
+                &shared,
+                state,
+                "",
+                &[],
+                &ScriptHostAccess::default(),
+            )
+            .expect("clear preview");
+        });
+        send_engine_command_blocking(&plugin.state, |reply| {
+            DecorationEngineCommand::ScriptCheckpoint {
+                restore: true,
+                reply,
+            }
+        })
+        .expect("reply")
+        .expect("restore");
+        plugin
+            .state
+            .read_model(|model| assert!(model.current_theme.is_some()));
+        plugin.state.with_state(|state| {
+            assert!(state.script_backend.is_some());
+            assert!(state.script_checkpoint.is_none());
         });
     }
 

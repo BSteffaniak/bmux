@@ -127,6 +127,10 @@ impl RustPlugin for PerformancePlugin {
             "performance-state", "get-theme-header-settings" => |_req: (), _ctx| {
                 Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(handle_get_theme_header_settings())
             },
+            "performance-commands", "reset-theme-header-settings" => |_req: (), _ctx| {
+                handle_set_theme_header_settings(ThemeHeaderSettings::default());
+                Ok::<(), ServiceResponse>(())
+            },
             "performance-commands", "set-theme-header-settings" => |req: SetThemeHeaderSettingsRequest, _ctx| {
                 Ok::<performance_types::ThemeHeaderSettings, ServiceResponse>(handle_set_theme_header_settings(req.settings))
             },

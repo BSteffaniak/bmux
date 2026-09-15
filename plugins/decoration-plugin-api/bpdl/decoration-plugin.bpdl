@@ -320,6 +320,9 @@ interface decoration-state {
 
 @capability(DECORATION_WRITE)
 interface decoration-commands {
+    command checkpoint-script-state() -> result<unit, string>;
+    command restore-script-state() -> result<unit, string>;
+    command discard-script-checkpoint() -> result<unit, string>;
     // Errors a `notify-*` command can produce. The notification
     // commands are transitional between core and plugin ownership of
     // geometry; for now they always succeed unless the pane is

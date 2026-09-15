@@ -18,6 +18,7 @@ interface theme-control-v1 {
 
     // Serialized through the owner, including reads, so callers receive a
     // coherent selection/revision pair before attempting a mutation.
+    command apply-external-form(expected-revision: u64, provider: string, json: list<u8>) -> result<snapshot, string>;
     command current() -> snapshot;
     command select(expected-revision: u64, selection: selection) -> result<snapshot, string>;
     command refresh(expected-revision: u64) -> result<snapshot, string>;
@@ -26,4 +27,5 @@ interface theme-control-v1 {
     command cancel-preview(token: u64) -> result<unit, string>;
     command confirm-preview(token: u64, selection: selection) -> result<snapshot, string>;
     command renew-preview(token: u64) -> result<unit, string>;
+    command set-component-settings(expected-revision: u64, provider: string, json: list<u8>) -> result<snapshot, string>;
 }
