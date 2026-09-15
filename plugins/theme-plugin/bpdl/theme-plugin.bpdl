@@ -25,4 +25,5 @@ interface theme-control-v1 {
     command preview(token: u64, selection: selection) -> result<unit, string>;
     command cancel-preview(token: u64) -> result<unit, string>;
     command confirm-preview(token: u64, selection: selection) -> result<snapshot, string>;
+    command renew-preview(token: u64) -> result<unit, string>;
 }

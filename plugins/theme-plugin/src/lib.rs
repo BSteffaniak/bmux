@@ -9,7 +9,6 @@ use bmux_appearance::{
     RuntimeContentEffectPatch, RuntimeContentEffectScope, RuntimeStatusAppearancePatch,
 };
 use bmux_config::{BmuxConfig, ConfigLoadOverrides, ConfigScopeTarget, ScopedConfigLoadRequest};
-use bmux_ipc::Request as IpcRequest;
 use bmux_plugin::prompt;
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
@@ -106,17 +105,116 @@ struct ThemePreview {
     owner: String,
     original: LiveTheme,
     owners: BTreeSet<String>,
+    expires_at: std::time::Instant,
+}
+
+struct DetachTask(tokio::task::JoinHandle<()>);
+
+impl Drop for DetachTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Default)]
 pub struct ThemePlugin {
     lifecycle_context: Option<NativeLifecycleContext>,
     selection: std::sync::Mutex<Option<LiveTheme>>,
-    preview: std::sync::Mutex<Option<ThemePreview>>,
+    preview: std::sync::Arc<std::sync::Mutex<Option<ThemePreview>>>,
     preview_sequence: std::sync::atomic::AtomicU64,
+    recovery_required: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    detach_task: Option<DetachTask>,
 }
 
 impl ThemePlugin {
+    fn reapply_live_theme(
+        &self,
+        context: &NativeLifecycleContext,
+    ) -> Result<(), PluginCommandError> {
+        let preview = self
+            .preview
+            .lock()
+            .map_err(|_| PluginCommandError::unavailable("preview requires recovery"))?;
+        if preview.is_some() {
+            return Ok(());
+        }
+        let selection = self
+            .selection
+            .lock()
+            .map_err(|_| PluginCommandError::unavailable("theme requires recovery"))?;
+        if let Some(live) = selection.as_ref() {
+            try_apply_theme_extensions(
+                context,
+                &live.resolved,
+                &live.resolved.plugins.keys().cloned().collect::<Vec<_>>(),
+                &context.connection.config_dir_candidates,
+            )
+            .map_err(PluginCommandError::unavailable)?;
+            publish_runtime_appearance(&live.resolved);
+        } else {
+            apply_configured_theme_extensions(context);
+        }
+        drop(selection);
+        drop(preview);
+        Ok(())
+    }
+
+    fn watch_detach(&mut self, context: &NativeLifecycleContext) {
+        if self.detach_task.is_some() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut events = bmux_plugin::global_event_bus()
+            .subscribe::<bmux_clients_plugin_api::clients_events::ClientEvent>(
+                &bmux_clients_plugin_api::clients_events::EVENT_KIND,
+            )
+            .ok();
+        let preview = self.preview.clone();
+        let recovery = self.recovery_required.clone();
+        let context = context.clone();
+        self.detach_task = Some(DetachTask(handle.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                let owner = tokio::select! {
+                    _ = tick.tick() => None,
+                    event = async {
+                        match events.as_mut() {
+                            Some(events) => events.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => if let Ok(event) = event {
+                        match event.as_ref() {
+                            bmux_clients_plugin_api::clients_events::ClientEvent::Detached { client_id } => Some(client_id.to_string()),
+                            _ => continue,
+                        }
+                    } else { events = None; None }
+                };
+                let Ok(mut guard) = preview.lock() else {
+                    recovery.store(true, std::sync::atomic::Ordering::Release);
+                    break;
+                };
+                let Some(active) = guard.as_ref().filter(|active| owner.as_ref() == Some(&active.owner) || std::time::Instant::now() >= active.expires_at) else {
+                    continue;
+                };
+                if try_apply_theme_extensions(
+                    &context,
+                    &active.original.resolved,
+                    &active.owners.iter().cloned().collect::<Vec<_>>(),
+                    &context.connection.config_dir_candidates,
+                )
+                .is_err()
+                {
+                    recovery.store(true, std::sync::atomic::Ordering::Release);
+                    continue;
+                }
+                publish_runtime_appearance(&active.original.resolved);
+                *guard = None;
+            }
+        })));
+    }
+
     fn begin_preview(&self, context: &NativeServiceContext, revision: u64) -> Result<u64, String> {
         let owner = context
             .caller_client_id
@@ -153,9 +251,31 @@ impl ThemePlugin {
             owner,
             original,
             owners,
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(30),
         });
         drop(preview);
         Ok(token)
+    }
+
+    fn renew_preview(&self, context: &NativeServiceContext, token: u64) -> Result<(), String> {
+        let owner = context
+            .caller_client_id
+            .ok_or("preview requires attachment")?
+            .to_string();
+        let mut preview = self
+            .preview
+            .lock()
+            .map_err(|_| "preview requires recovery")?;
+        let active = preview.as_mut().ok_or("no active preview")?;
+        if active.owner != owner
+            || active.token != token
+            || std::time::Instant::now() >= active.expires_at
+        {
+            return Err("stale or foreign preview".into());
+        }
+        active.expires_at = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        drop(preview);
+        Ok(())
     }
 
     fn preview_theme(
@@ -173,20 +293,37 @@ impl ThemePlugin {
             .lock()
             .map_err(|_| "preview requires recovery")?;
         let active = preview.as_mut().ok_or("no active preview")?;
-        if active.token != token || active.owner != owner {
+        if active.token != token
+            || active.owner != owner
+            || std::time::Instant::now() >= active.expires_at
+        {
             return Err("stale or foreign preview".into());
         }
-        let settings = parse_settings(context.settings.as_ref());
+        let settings = try_parse_settings(context.settings.as_ref())?;
         let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
         let theme = resolve_picker_value(&catalog, &value.picker_value(), &settings)
             .ok_or("theme not found")?;
         active.owners.extend(theme.plugins.keys().cloned());
-        try_apply_theme_extensions(
+        let owners = active.owners.iter().cloned().collect::<Vec<_>>();
+        if let Err(error) = try_apply_theme_extensions(
             context,
             &theme,
-            &active.owners.iter().cloned().collect::<Vec<_>>(),
+            &owners,
             &context.connection.config_dir_candidates,
-        )?;
+        ) {
+            if let Err(restore) = try_apply_theme_extensions(
+                context,
+                &active.original.resolved,
+                &owners,
+                &context.connection.config_dir_candidates,
+            ) {
+                self.recovery_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(format!("{error}; preview recovery failed: {restore}"));
+            }
+            publish_runtime_appearance(&active.original.resolved);
+            return Err(error);
+        }
         publish_runtime_appearance(&theme);
         drop(preview);
         Ok(())
@@ -207,7 +344,10 @@ impl ThemePlugin {
             .lock()
             .map_err(|_| "preview requires recovery")?;
         let active = preview.as_ref().ok_or("no active preview")?;
-        if active.token != token || active.owner != owner {
+        if active.token != token
+            || active.owner != owner
+            || std::time::Instant::now() >= active.expires_at
+        {
             return Err("stale or foreign preview".into());
         }
         // Clear every owner visited during preview, including owners absent from
@@ -217,7 +357,11 @@ impl ThemePlugin {
             &active.original.resolved,
             &active.owners.iter().cloned().collect::<Vec<_>>(),
             &context.connection.config_dir_candidates,
-        )?;
+        )
+        .inspect_err(|_| {
+            self.recovery_required
+                .store(true, std::sync::atomic::Ordering::Release);
+        })?;
         publish_runtime_appearance(&active.original.resolved);
         let result = self.select_without_preview(context, active.original.snapshot.revision, value);
         if result.is_ok() {
@@ -245,7 +389,11 @@ impl ThemePlugin {
             &active.original.resolved,
             &active.owners.iter().cloned().collect::<Vec<_>>(),
             &context.connection.config_dir_candidates,
-        )?;
+        )
+        .inspect_err(|_| {
+            self.recovery_required
+                .store(true, std::sync::atomic::Ordering::Release);
+        })?;
         publish_runtime_appearance(&active.original.resolved);
         *preview = None;
         drop(preview);
@@ -329,7 +477,11 @@ impl ThemePlugin {
                 &owners,
                 &context.connection.config_dir_candidates,
             )
-            .map_err(|restore| format!("{error}; recovery failed: {restore}"))?;
+            .map_err(|restore| {
+                self.recovery_required
+                    .store(true, std::sync::atomic::Ordering::Release);
+                format!("{error}; recovery failed: {restore}")
+            })?;
             return Err(error);
         }
         let snapshot = control_contract::theme_control_v1::Snapshot {
@@ -384,7 +536,7 @@ impl ThemePlugin {
             .revision
             .checked_add(1)
             .ok_or("theme revision exhausted")?;
-        let settings = parse_settings(context.settings.as_ref());
+        let settings = try_parse_settings(context.settings.as_ref())?;
         let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
         let theme = resolve_picker_value(&catalog, &value.picker_value(), &settings)
             .ok_or("theme not found")?;
@@ -417,6 +569,8 @@ impl ThemePlugin {
                 &owners,
                 &context.connection.config_dir_candidates,
             ) {
+                self.recovery_required
+                    .store(true, std::sync::atomic::Ordering::Release);
                 return Err(format!("{error}; theme recovery failed: {restore_error}"));
             }
             return Err(error);
@@ -446,11 +600,17 @@ impl RustPlugin for ThemePlugin {
             "theme plugin activating",
         );
         self.lifecycle_context = Some(context.clone());
+        self.watch_detach(&context);
         apply_configured_theme_extensions(&context);
         Ok(EXIT_OK)
     }
 
     fn handle_event(&mut self, event: PluginEvent) -> Result<i32, PluginCommandError> {
+        if self.detach_task.is_none()
+            && let Some(context) = self.lifecycle_context.clone()
+        {
+            self.watch_detach(&context);
+        }
         if event.kind.as_str() == "bmux.core/server_started"
             && let Some(context) = self.lifecycle_context.as_ref()
         {
@@ -459,7 +619,7 @@ impl RustPlugin for ThemePlugin {
                 event_kind = %event.kind.as_str(),
                 "theme plugin handling lifecycle event; reapplying theme state",
             );
-            apply_configured_theme_extensions(context);
+            self.reapply_live_theme(context)?;
         }
         Ok(EXIT_OK)
     }
@@ -472,11 +632,20 @@ impl RustPlugin for ThemePlugin {
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        if self
+            .recovery_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return ServiceResponse::error(
+                "theme_recovery_required",
+                "theme rollback failed; restart or repair the theme owner before further operations",
+            );
+        }
         bmux_plugin_sdk::route_service!(context, {
             "theme-control-v1", "current" => |_req: (), ctx| {
                 let mut selection = self.selection.lock().map_err(|_| ServiceResponse::error("theme_state_poisoned", "theme selection requires recovery"))?;
                 if selection.is_none() {
-                    let settings = parse_settings(ctx.settings.as_ref());
+                    let settings = try_parse_settings(ctx.settings.as_ref()).map_err(|error| ServiceResponse::error("invalid_theme_settings", error))?;
                     let catalog = load_theme_catalog(&ctx.connection.config_dir_candidate_paths());
                     let active = active_theme_stack(ctx, &settings, &catalog).ok_or_else(|| ServiceResponse::error("theme_not_found", "theme selection requires recovery"))?;
                     let value = ThemeSelection::from_picker_value(&picker_selection_name(&active)).ok_or_else(|| ServiceResponse::error("invalid_selection", "invalid startup selection"))?;
@@ -487,6 +656,9 @@ impl RustPlugin for ThemePlugin {
             },
             "theme-control-v1", "begin-preview" => |req: control_contract::theme_control_v1::client::BeginPreviewRequest, ctx| {
                 Ok::<_, ServiceResponse>(self.begin_preview(ctx, req.expected_revision))
+            },
+            "theme-control-v1", "renew-preview" => |req: control_contract::theme_control_v1::client::RenewPreviewRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.renew_preview(ctx, req.token))
             },
             "theme-control-v1", "preview" => |req: control_contract::theme_control_v1::client::PreviewRequest, ctx| {
                 Ok::<_, ServiceResponse>(self.preview_theme(ctx, req.token, &req.selection))
@@ -961,7 +1133,13 @@ fn active_runtime_appearance_for_scope(
 }
 
 fn configured_theme(context: &(impl ThemeHostContext + ?Sized)) -> Option<ActiveThemeResolution> {
-    let settings = parse_settings(context.settings_value());
+    let settings = match try_parse_settings(context.settings_value()) {
+        Ok(settings) => settings,
+        Err(error) => {
+            warn!(%error, "theme configuration requires recovery");
+            return None;
+        }
+    };
     configured_theme_with_settings(context, &settings)
 }
 
@@ -1017,21 +1195,6 @@ fn publish_runtime_appearance(theme: &ResolvedTheme) {
     }
 }
 
-fn publish_runtime_appearance_to_host(context: &impl ServiceCaller, theme: &ResolvedTheme) {
-    publish_runtime_appearance(theme);
-    let appearance = theme.appearance.clone();
-    let Ok(payload) = serde_json::to_vec(&appearance) else {
-        return;
-    };
-    let response = context.execute_kernel_request(IpcRequest::EmitOnPluginBus {
-        kind: RUNTIME_APPEARANCE_STATE_KIND.as_str().to_string(),
-        payload,
-    });
-    if let Err(error) = response {
-        warn!(%error, "failed relaying runtime appearance to host event bus");
-    }
-}
-
 fn picker_active_name(stack: &[String]) -> String {
     stack
         .iter()
@@ -1063,13 +1226,63 @@ fn picker_request(
         .width_range(48, 96)
 }
 
-async fn run_theme_picker(context: NativeCommandContext) {
-    let settings = parse_settings(context.settings.as_ref());
-    let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
-    if catalog.is_empty() {
-        warn!("theme picker opened with empty catalog");
-        return;
+struct PickerPreviewGuard {
+    context: NativeCommandContext,
+    token: Option<u64>,
+}
+
+impl Drop for PickerPreviewGuard {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            // The ServiceCaller adapter completes synchronously, so cleanup does
+            // not depend on spawning a task into a runtime that is shutting down.
+            let mut client = bmux_plugin::ServiceCallerDispatchClient::new(&self.context);
+            let result = bmux_plugin::block_on_typed_dispatch(
+                control_contract::theme_control_v1::client::cancel_preview(&mut client, token),
+            );
+            if !matches!(result, Ok(Ok(()))) {
+                warn!(?result, "cancelled picker preview requires recovery");
+            }
+        }
     }
+}
+
+async fn cancel_picker_preview(context: &NativeCommandContext, token: u64) {
+    let mut control = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let cleanup =
+        control_contract::theme_control_v1::client::cancel_preview(&mut control, token).await;
+    if !matches!(cleanup, Ok(Ok(()))) {
+        warn!(?cleanup, "theme restoration failed");
+    }
+}
+
+async fn confirm_picker_selection(
+    context: &NativeCommandContext,
+    token: Option<u64>,
+    revision: u64,
+    selection: ThemeSelection,
+) -> bool {
+    let mut control = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let result = if let Some(token) = token {
+        control_contract::theme_control_v1::client::confirm_preview(&mut control, token, selection)
+            .await
+    } else {
+        control_contract::theme_control_v1::client::select(&mut control, revision, selection).await
+    };
+    if !matches!(result, Ok(Ok(_))) {
+        warn!(?result, "theme confirmation failed");
+        return false;
+    }
+    true
+}
+
+async fn run_theme_picker(context: NativeCommandContext) {
+    let Ok(settings) = try_parse_settings(context.settings.as_ref())
+        .inspect_err(|error| warn!(%error, "cannot open theme picker"))
+    else {
+        return;
+    };
+    let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
 
     let mut control = bmux_plugin::ServiceCallerDispatchClient::new(&context);
     let current = match control_contract::theme_control_v1::client::current(&mut control).await {
@@ -1080,9 +1293,6 @@ async fn run_theme_picker(context: NativeCommandContext) {
         }
     };
     let active_name = current.selection.picker_value();
-    let Some(original_theme) = resolve_picker_value(&catalog, &active_name, &settings) else {
-        return;
-    };
     let all_plugin_ids = theme_catalog_plugin_ids(&catalog);
 
     let request = picker_request(
@@ -1095,7 +1305,12 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     };
 
-    let mut previewed = false;
+    let mut preview_guard = PickerPreviewGuard {
+        context: context.clone(),
+        token: None,
+    };
+    let mut preview_token = None;
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut events_open = true;
     let selected_name = loop {
         tokio::select! {
@@ -1106,16 +1321,28 @@ async fn run_theme_picker(context: NativeCommandContext) {
                     Ok(PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_)) | Err(_) => None,
                 };
             }
+            _ = heartbeat.tick() => {
+                if let Some(token) = preview_token
+                    && !matches!(control_contract::theme_control_v1::client::renew_preview(&mut control, token).await, Ok(Ok(()))) {
+                    break None;
+                }
+            }
             event = event_rx.recv(), if events_open => {
                 let Some(event) = event else {
                     events_open = false;
                     continue;
                 };
                 if let PromptEvent::SelectionChanged { value, .. } = event
-                    && let Some(theme) = resolve_picker_value(&catalog, &value, &settings)
+                    && let Some(selection) = ThemeSelection::from_picker_value(&value)
                 {
-                    previewed = true;
-                    if !apply_picker_theme(&context, &theme, &all_plugin_ids) {
+                    if preview_token.is_none() {
+                        match control_contract::theme_control_v1::client::begin_preview(&mut control, current.revision).await {
+                            Ok(Ok(token)) => { preview_token = Some(token); preview_guard.token = Some(token); },
+                            error => { warn!(?error, "cannot begin theme preview"); break None; }
+                        }
+                    }
+                    let token = preview_token.expect("preview acquired");
+                    if !matches!(control_contract::theme_control_v1::client::preview(&mut control, token, selection).await, Ok(Ok(()))) {
                         break None;
                     }
                 }
@@ -1126,25 +1353,15 @@ async fn run_theme_picker(context: NativeCommandContext) {
     if let Some(name) = selected_name
         && let Some(theme) = resolve_picker_value(&catalog, &name, &settings)
     {
-        if !apply_picker_theme(&context, &theme, &all_plugin_ids) {
-            restore_picker_theme(&context, &original_theme, &all_plugin_ids);
+        let selection = ThemeSelection::from_picker_value(&name).expect("resolved picker value");
+        if !confirm_picker_selection(&context, preview_token, current.revision, selection).await {
+            if let Some(token) = preview_token {
+                cancel_picker_preview(&context, token).await;
+                preview_guard.token = None;
+            }
             return;
         }
-        if matches!(
-            settings.persistence,
-            ThemePersistence::PersistBetweenConnects
-        ) {
-            if persist_theme_name(&context, &name).is_err() {
-                restore_picker_theme(&context, &original_theme, &all_plugin_ids);
-                return;
-            }
-        } else {
-            info!(
-                theme = %name,
-                persistence = ?settings.persistence,
-                "theme selection not persisted because persistence is disabled",
-            );
-        }
+        preview_guard.token = None;
         if name != CONFIGURED_SELECTION {
             apply_configured_theme_settings(&context, &theme, &settings);
             configure_theme_settings_providers(&context, &theme, &settings, &all_plugin_ids).await;
@@ -1153,37 +1370,14 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     }
 
-    if previewed {
-        restore_picker_theme(&context, &original_theme, &all_plugin_ids);
+    if let Some(token) = preview_token {
+        preview_guard.token = None;
+        let cleanup =
+            control_contract::theme_control_v1::client::cancel_preview(&mut control, token).await;
+        if !matches!(cleanup, Ok(Ok(()))) {
+            warn!(?cleanup, "theme restoration failed");
+        }
     }
-}
-
-fn restore_picker_theme(
-    context: &NativeCommandContext,
-    theme: &ResolvedTheme,
-    plugin_ids: &[String],
-) {
-    if !apply_picker_theme(context, theme, plugin_ids) {
-        warn!("theme restoration failed; presentation requires recovery");
-    }
-}
-
-fn apply_picker_theme(
-    context: &NativeCommandContext,
-    theme: &ResolvedTheme,
-    plugin_ids: &[String],
-) -> bool {
-    if let Err(error) = try_apply_theme_extensions(
-        context,
-        theme,
-        plugin_ids,
-        &context.connection.config_dir_candidates,
-    ) {
-        warn!(%error, "theme selection application failed");
-        return false;
-    }
-    publish_runtime_appearance_to_host(context, theme);
-    true
 }
 
 async fn configure_theme_settings_providers(
@@ -1665,6 +1859,15 @@ where
         &endpoint.operation,
         request,
     )
+}
+
+fn try_parse_settings(settings: Option<&toml::Value>) -> Result<ThemePluginSettings, String> {
+    settings
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .map_err(|error| format!("invalid theme settings: {error}"))
+        .map(Option::unwrap_or_default)
 }
 
 fn parse_settings(settings: Option<&toml::Value>) -> ThemePluginSettings {
@@ -2697,7 +2900,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
-    async fn picker_storage_failure_restores_previous_extension() {
+    async fn picker_delegates_failed_selection_to_control_authority() {
         let applied = Arc::new(Mutex::new(Vec::<String>::new()));
         let observed = applied.clone();
         let router: TestServiceRouter =
@@ -2710,6 +2913,22 @@ mod tests {
                                 name: "hacker".into(),
                             },
                         })
+                    }
+                    ("bmux.theme.write", "select") => {
+                        let request: control_contract::theme_control_v1::client::SelectRequest =
+                            decode_service_message(&payload).expect("selection request");
+                        assert_eq!(request.expected_revision, 0);
+                        assert_eq!(
+                            request.selection,
+                            ThemeSelection::Preset {
+                                name: "minimal".into()
+                            }
+                        );
+                        observed.lock().expect("calls").push("select".into());
+                        encode_service_message(&Err::<
+                            control_contract::theme_control_v1::Snapshot,
+                            String,
+                        >("storage failure".into()))
                     }
                     ("bmux.storage", "get") => encode_service_message(&StorageGetResponse {
                         value: Some(b"hacker".to_vec()),
@@ -2745,15 +2964,7 @@ mod tests {
                 .expect("response");
         };
         tokio::join!(run_theme_picker(context), host);
-        let applied = applied.lock().expect("applied");
-        assert_eq!(applied.len(), 2);
-        let catalog = load_theme_catalog(&[]);
-        let original =
-            resolve_theme_picker_selection(&catalog, "hacker", &ThemePluginSettings::default())
-                .expect("original");
-        let restored: toml::Value = toml::from_str(&applied[1]).expect("restored");
-        drop(applied);
-        assert_eq!(&restored, &original.plugins["bmux.decoration"]);
+        assert_eq!(&*applied.lock().expect("calls"), &["select"]);
     }
 
     #[test]
@@ -3215,6 +3426,274 @@ mod tests {
         assert!(plugin.preview.lock().expect("preview").is_none());
         assert!(plugin.confirm_preview(&context, token, choice).is_err());
         assert!(plugin.cancel_preview(&context, token).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn dropped_picker_guard_cancels_owned_preview() {
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let observed = cancelled.clone();
+        let router: TestServiceRouter =
+            Arc::new(move |_, _, capability, _, interface, operation, payload| {
+                assert_eq!(capability, "bmux.theme.write");
+                assert_eq!(interface, "theme-control-v1");
+                assert_eq!(operation, "cancel-preview");
+                let request: control_contract::theme_control_v1::client::CancelPreviewRequest =
+                    decode_service_message(&payload).expect("request");
+                observed.lock().expect("cancelled").push(request.token);
+                encode_service_message(&Ok::<(), String>(()))
+            });
+        let _router = install_test_service_router(router);
+        drop(PickerPreviewGuard {
+            context: picker_context(),
+            token: Some(7),
+        });
+        drop(PickerPreviewGuard {
+            context: picker_context(),
+            token: None,
+        });
+        assert_eq!(&*cancelled.lock().expect("cancelled"), &[7]);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn failed_preview_restoration_blocks_authoritative_queries() {
+        let plugin = ThemePlugin::default();
+        let mut context =
+            service_context(Some(toml::from_str("theme = 'hacker'").expect("settings")));
+        context.caller_client_id = Some(
+            "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("uuid"),
+        );
+        context.request.service.interface_id = "theme-control-v1".into();
+        context.request.operation = "current".into();
+        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        let token = plugin.begin_preview(&context, 0).expect("preview");
+        let router: TestServiceRouter = Arc::new(|_, _, _, _, _, _, _| {
+            encode_service_message(&Err::<(), _>(
+                bmux_decoration_plugin_api::decoration_state::ValidationResult::Errors {
+                    errors: Vec::new(),
+                },
+            ))
+        });
+        let _router = install_test_service_router(router);
+        assert!(plugin.cancel_preview(&context, token).is_err());
+        assert!(
+            plugin
+                .recovery_required
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(plugin.invoke_service(context).error.is_some());
+    }
+
+    #[tokio::test]
+    async fn detached_owner_releases_server_preview() {
+        let bus = bmux_plugin::global_event_bus();
+        bus.register_channel::<bmux_clients_plugin_api::clients_events::ClientEvent>(
+            bmux_clients_plugin_api::clients_events::EVENT_KIND,
+        );
+        let mut plugin = ThemePlugin::default();
+        plugin.watch_detach(&lifecycle_context(None));
+        let mut context = service_context(None);
+        let id = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("uuid");
+        context.caller_client_id = Some(id);
+        context.request.service.interface_id = "theme-control-v1".into();
+        context.request.operation = "current".into();
+        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        plugin.begin_preview(&context, 0).expect("begin");
+        bus.emit(
+            &bmux_clients_plugin_api::clients_events::EVENT_KIND,
+            bmux_clients_plugin_api::clients_events::ClientEvent::Detached { client_id: id },
+        )
+        .expect("detach");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if plugin.preview.lock().expect("preview").is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server cleanup");
+    }
+
+    #[tokio::test]
+    async fn expired_preview_is_cleaned_without_clients_event_stream() {
+        let mut plugin = ThemePlugin::default();
+        plugin.watch_detach(&lifecycle_context(None));
+        let mut context = service_context(None);
+        context.caller_client_id = Some(
+            "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("uuid"),
+        );
+        context.request.service.interface_id = "theme-control-v1".into();
+        context.request.operation = "current".into();
+        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        let token = plugin.begin_preview(&context, 0).expect("begin");
+        plugin
+            .preview
+            .lock()
+            .expect("preview")
+            .as_mut()
+            .expect("active")
+            .expires_at = std::time::Instant::now();
+        assert!(plugin.renew_preview(&context, token).is_err());
+        assert!(
+            plugin
+                .preview_theme(&context, token, &ThemeSelection::Configured)
+                .is_err()
+        );
+        assert!(
+            plugin
+                .confirm_preview(&context, token, ThemeSelection::Configured)
+                .is_err()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if plugin.preview.lock().expect("preview").is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expired preview cleanup");
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn lifecycle_reapply_preserves_committed_live_selection() {
+        let theme = resolve_theme_picker_selection(
+            &load_theme_catalog(&[]),
+            "hacker",
+            &ThemePluginSettings::default(),
+        )
+        .expect("theme");
+        let context =
+            lifecycle_context(Some(toml::from_str("theme = 'minimal'").expect("settings")));
+        let mut plugin = ThemePlugin {
+            lifecycle_context: Some(context),
+            selection: std::sync::Mutex::new(Some(LiveTheme {
+                snapshot: control_contract::theme_control_v1::Snapshot {
+                    revision: 7,
+                    selection: ThemeSelection::Preset {
+                        name: "hacker".into(),
+                    },
+                },
+                resolved: theme.clone(),
+            })),
+            ..ThemePlugin::default()
+        };
+        let router: TestServiceRouter = Arc::new(|_, _, capability, _, _, _, _| {
+            assert_eq!(capability, "bmux.decoration.write");
+            encode_service_message(&Ok::<
+                (),
+                bmux_decoration_plugin_api::decoration_state::ValidationResult,
+            >(()))
+        });
+        let _router = install_test_service_router(router);
+        plugin
+            .handle_event(PluginEvent {
+                kind: PluginEventKind::from_owned("bmux.core/server_started".into()),
+                payload: serde_json::json!({}),
+            })
+            .expect("reapply");
+        assert_eq!(
+            active_runtime_appearance(&service_context(None)).expect("appearance"),
+            theme.appearance
+        );
+        assert_eq!(
+            plugin
+                .selection
+                .lock()
+                .expect("state")
+                .as_ref()
+                .expect("live")
+                .snapshot
+                .revision,
+            7
+        );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn rejected_preview_restores_original_before_returning() {
+        let plugin = ThemePlugin::default();
+        let mut context =
+            service_context(Some(toml::from_str("theme = 'hacker'").expect("settings")));
+        context.caller_client_id = Some(
+            "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("uuid"),
+        );
+        context.request.service.interface_id = "theme-control-v1".into();
+        context.request.operation = "current".into();
+        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        let token = plugin.begin_preview(&context, 0).expect("begin");
+        let calls = Arc::new(Mutex::new(0));
+        let observed = calls.clone();
+        let router: TestServiceRouter = Arc::new(move |_, _, capability, _, _, _, _| {
+            assert_eq!(capability, "bmux.decoration.write");
+            let reject = {
+                let mut count = observed.lock().expect("count");
+                *count += 1;
+                *count == 1
+            };
+            let result: Result<(), bmux_decoration_plugin_api::decoration_state::ValidationResult> =
+                if reject {
+                    Err(
+                        bmux_decoration_plugin_api::decoration_state::ValidationResult::Errors {
+                            errors: Vec::new(),
+                        },
+                    )
+                } else {
+                    Ok(())
+                };
+            encode_service_message(&result)
+        });
+        let _router = install_test_service_router(router);
+        assert!(
+            plugin
+                .preview_theme(
+                    &context,
+                    token,
+                    &ThemeSelection::Preset {
+                        name: "minimal".into()
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(*calls.lock().expect("count"), 2);
+        assert!(
+            !plugin
+                .recovery_required
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(
+            active_runtime_appearance(&context)
+                .expect("appearance")
+                .foreground,
+            "#39ff14"
+        );
+    }
+
+    #[test]
+    fn invalid_theme_settings_are_rejected_by_control_initialization() {
+        let plugin = ThemePlugin::default();
+        let mut context = service_context(Some(
+            toml::from_str("appearance_themes = 42").expect("valid TOML"),
+        ));
+        context.request.service.interface_id = "theme-control-v1".into();
+        context.request.operation = "current".into();
+        assert!(plugin.invoke_service(context).error.is_some());
+        assert!(plugin.selection.lock().expect("selection").is_none());
+        assert!(try_parse_settings(Some(&toml::Value::String("bad".into()))).is_err());
+        assert!(try_parse_settings(None).is_ok());
     }
 
     #[test]
