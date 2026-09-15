@@ -23,7 +23,7 @@ pub(super) fn subtract(rect: Rect, cover: Rect) -> Vec<Rect> {
     .collect()
 }
 
-pub(super) fn decoded(image: &crate::model::PaneImage) -> std::io::Result<PixelBuffer> {
+pub(crate) fn decoded(image: &crate::model::PaneImage) -> std::io::Result<PixelBuffer> {
     if image.payload.pixels.is_some() {
         return pixels(&image.payload);
     }

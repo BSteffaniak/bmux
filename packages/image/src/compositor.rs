@@ -5,7 +5,7 @@
 //! terminal coordinates, clips to pane boundaries, and emits the
 //! appropriate protocol-specific escape sequences.
 
-mod clipping;
+pub(crate) mod clipping;
 use std::io::Write;
 
 #[cfg(feature = "iterm2")]

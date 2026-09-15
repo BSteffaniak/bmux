@@ -83,6 +83,72 @@ mod pipeline {
     }
 
     #[test]
+    fn coalesced_image_delta_does_not_resurrect_exited_screen() {
+        let mut registry = ImageRegistry::default();
+        let event = ImageEvent::SixelImage {
+            data: b"#1;2;100;0;0~".to_vec(),
+            position: ImagePosition { row: 5, col: 0 },
+            pixel_size: ImagePixelSize {
+                width: 1,
+                height: 6,
+            },
+            filtered_byte_offset: 0,
+        };
+        registry.handle_event(event.clone(), 8, 16);
+        let main_id = registry.images()[0].id;
+        let before = registry.sequence();
+        registry.set_alternate_screen(true);
+        registry.handle_event(event, 8, 16);
+        let alternate_id = registry.images()[0].id;
+        registry.set_alternate_screen(false);
+        let delta = registry.delta_since(before);
+        assert_eq!(delta.added.len(), 1);
+        assert_eq!(delta.added[0].id, main_id);
+        assert!(delta.removed.contains(&alternate_id));
+        assert!(!delta.removed.contains(&main_id));
+        let before = registry.sequence();
+        registry.scroll_up(1);
+        registry.scroll_up(1);
+        let delta = registry.delta_since(before);
+        assert_eq!(delta.added.len(), 1);
+        assert_eq!(delta.added[0].position.row, 3);
+    }
+
+    #[test]
+    fn retained_image_recovers_original_geometry_after_scrolling_back() {
+        let mut registry = ImageRegistry::default();
+        let mut interceptor = ImageInterceptor::new();
+        for event in interceptor
+            .process(b"\x1bPq\"1;1;2;12#1;2;100;0;0~~-~~\x1b\\")
+            .events
+        {
+            registry.handle_event(event, 1, 6);
+        }
+        let original = registry.images()[0].clone();
+        registry.scroll_up(1);
+        let clipped = registry.project_viewport(0, 10).unwrap();
+        assert_eq!(clipped[0].cell_size.rows, 1);
+        assert_eq!(clipped[0].pixel_size.height, 6);
+        let wire = bmux_attach_image_protocol::AttachPaneImage::from(&clipped[0]);
+        assert!(!wire.raw_data.is_empty());
+        let restored_crop = PaneImage::from(&wire);
+        let decoded =
+            bmux_image::codec::sixel::decode(restored_crop.payload.raw.as_ref().unwrap()).unwrap();
+        assert_eq!(decoded.height, 6);
+        assert_eq!(
+            decoded.data,
+            clipped[0].payload.pixels.as_ref().unwrap().data
+        );
+        registry.scroll_up(4);
+        assert!(registry.project_viewport(0, 10).unwrap().is_empty());
+        assert_eq!(registry.images_in_viewport(5, 10).len(), 1);
+        let restored = registry.project_viewport(5, 10).unwrap();
+        assert_eq!(restored[0], original);
+        registry.evict_history(3);
+        assert!(registry.project_viewport(5, 10).unwrap().is_empty());
+    }
+
+    #[test]
     fn split_sixel_offsets_are_relative_to_each_read() {
         let mut interceptor = ImageInterceptor::new();
         let first = interceptor.process(b"label\r\n\x1bPq\"1;1;2;6#1;2;100;0;0");

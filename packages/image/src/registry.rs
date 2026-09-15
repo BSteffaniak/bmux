@@ -32,6 +32,8 @@ struct KittyChunkAccumulator {
 #[allow(dead_code)] // Fields used when image features are enabled; dead in minimal feature combos
 pub struct ImageRegistry {
     images: Vec<PaneImage>,
+    /// Original placements retained independently of the live projection.
+    history: std::collections::BTreeMap<u64, (PaneImage, i64)>,
     /// Hidden normal-screen state while an alternate screen is active.
     normal_screen: Option<Box<ImageRegistry>>,
     next_id: u64,
@@ -61,6 +63,7 @@ impl ImageRegistry {
     pub fn new(max_images: usize, max_bytes: usize) -> Self {
         Self {
             images: Vec::new(),
+            history: std::collections::BTreeMap::new(),
             normal_screen: None,
             next_id: 1,
             sequence: 0,
@@ -217,6 +220,8 @@ impl ImageRegistry {
             pixel_size,
         };
 
+        self.history
+            .insert(id, (image.clone(), i64::from(position.row)));
         self.change_log.push(ChangeLogEntry::Added {
             sequence: self.sequence,
             image: image.clone(),
@@ -248,9 +253,35 @@ impl ImageRegistry {
                 });
             }
         }
+        while self.history.len() > self.max_images
+            || (self.max_bytes > 0
+                && self
+                    .history
+                    .values()
+                    .map(|(image, _)| {
+                        image.payload.raw.as_ref().map_or(0, Vec::len)
+                            + image
+                                .payload
+                                .pixels
+                                .as_ref()
+                                .map_or(0, |pixels| pixels.data.len())
+                    })
+                    .sum::<usize>()
+                    > self.max_bytes)
+        {
+            let Some((id, _)) = self.history.pop_first() else {
+                break;
+            };
+            self.images.retain(|image| image.id != id);
+            self.sequence += 1;
+            self.change_log.push(ChangeLogEntry::Removed {
+                sequence: self.sequence,
+                image_id: id,
+            });
+        }
         #[cfg(feature = "kitty")]
         self.kitty_placements
-            .retain(|_, id| self.images.iter().any(|image| image.id == *id));
+            .retain(|_, id| self.history.contains_key(id));
         self.compact_change_log();
     }
 
@@ -279,6 +310,12 @@ impl ImageRegistry {
     /// Call this when the pane's content scrolls by `lines` rows.
     /// Images that scroll entirely above the viewport are removed.
     pub fn scroll_up(&mut self, lines: u16) {
+        if lines == 0 {
+            return;
+        }
+        for (_, row) in self.history.values_mut() {
+            *row = row.saturating_sub(i64::from(lines));
+        }
         self.sequence += 1;
         let seq = self.sequence;
         let change_log = &mut self.change_log;
@@ -288,6 +325,10 @@ impl ImageRegistry {
                     let original_row = img.position.row;
                     img.position.row = 0;
                     img.cell_size.rows -= lines - original_row;
+                    change_log.push(ChangeLogEntry::Added {
+                        sequence: seq,
+                        image: img.clone(),
+                    });
                     true
                 } else {
                     change_log.push(ChangeLogEntry::Removed {
@@ -298,9 +339,14 @@ impl ImageRegistry {
                 }
             } else {
                 img.position.row -= lines;
+                change_log.push(ChangeLogEntry::Added {
+                    sequence: seq,
+                    image: img.clone(),
+                });
                 true
             }
         });
+        self.compact_change_log();
     }
 
     /// Replace the registry contents with a caller-projected image scene.
@@ -339,6 +385,10 @@ impl ImageRegistry {
                 changed = true;
             }
         }
+        self.history = images
+            .iter()
+            .map(|image| (image.id, (image.clone(), i64::from(image.position.row))))
+            .collect();
         self.images = images;
         if changed {
             self.compact_change_log();
@@ -353,11 +403,77 @@ impl ImageRegistry {
 
     /// Get images visible within a viewport of `height` rows starting at
     /// scrollback `offset` (0 = bottom/live).
-    pub fn images_in_viewport(&self, _offset: usize, height: u16) -> Vec<&PaneImage> {
-        self.images
-            .iter()
-            .filter(|img| img.position.row < height)
+    pub fn images_in_viewport(&self, offset: usize, height: u16) -> Vec<&PaneImage> {
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        self.history
+            .values()
+            .filter_map(|(image, row)| {
+                let top = row.saturating_add(offset);
+                (top < i64::from(height) && top.saturating_add(i64::from(image.cell_size.rows)) > 0)
+                    .then_some(image)
+            })
             .collect()
+    }
+
+    /// Build a cropped viewport without modifying original pixels or placement size.
+    /// Decode failures are explicit rather than presenting a healthy empty image.
+    pub fn project_viewport(&self, offset: usize, height: u16) -> std::io::Result<Vec<PaneImage>> {
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        self.history
+            .values()
+            .filter_map(|(image, row)| {
+                let top = row.saturating_add(offset);
+                let bottom = top.saturating_add(i64::from(image.cell_size.rows));
+                if top >= i64::from(height) || bottom <= 0 {
+                    return None;
+                }
+                let skipped = u16::try_from(top.saturating_neg().max(0)).unwrap_or(u16::MAX);
+                let visible_rows =
+                    u16::try_from(bottom.min(i64::from(height)) - top.max(0)).unwrap_or(0);
+                let mut projected = image.clone();
+                projected.position.row = u16::try_from(top.max(0)).unwrap_or(u16::MAX);
+                if skipped > 0 || visible_rows != image.cell_size.rows {
+                    let pixels = match crate::compositor::clipping::decoded(image) {
+                        Ok(pixels) => pixels,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    projected.payload.pixels = Some(pixels);
+                    projected.payload.raw = None;
+                    projected.pixel_size = crate::tui::crop_to_visible(
+                        &mut projected.payload,
+                        bmux_tui::geometry::Rect::new(
+                            0,
+                            0,
+                            image.cell_size.cols,
+                            image.cell_size.rows,
+                        ),
+                        bmux_tui::geometry::Rect::new(
+                            0,
+                            skipped,
+                            image.cell_size.cols,
+                            visible_rows,
+                        ),
+                    );
+                }
+                projected.cell_size.rows = visible_rows;
+                if projected.payload.raw.is_none() {
+                    match encode_projected_payload(&projected) {
+                        Ok(raw) => projected.payload.raw = Some(raw),
+                        Err(error) => return Some(Err(error)),
+                    }
+                }
+                Some(Ok(projected))
+            })
+            .collect()
+    }
+
+    /// Remove placements whose final row is older than retained terminal history.
+    pub fn evict_history(&mut self, retained_rows: usize) {
+        let oldest = i64::try_from(retained_rows)
+            .unwrap_or(i64::MAX)
+            .saturating_neg();
+        self.history
+            .retain(|_, (image, row)| row.saturating_add(i64::from(image.cell_size.rows)) > oldest);
     }
 
     /// Compute a delta since the given sequence number.
@@ -398,20 +514,29 @@ impl ImageRegistry {
             };
         }
 
-        // Build delta from the change log.
+        // A client may miss several updates, including placement and deletion
+        // in the same PTY read. Return only the final state of each touched ID;
+        // applying removals before additions must never resurrect an old image.
+        let touched = self
+            .change_log
+            .iter()
+            .filter_map(|entry| match entry {
+                ChangeLogEntry::Added { sequence, image } if *sequence > since_sequence => {
+                    Some(image.id)
+                }
+                ChangeLogEntry::Removed { sequence, image_id } if *sequence > since_sequence => {
+                    Some(*image_id)
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
         let mut added = Vec::new();
         let mut removed = Vec::new();
-        for entry in &self.change_log {
-            match entry {
-                ChangeLogEntry::Added { sequence, image } if *sequence > since_sequence => {
-                    added.push(image.clone());
-                }
-                ChangeLogEntry::Removed {
-                    sequence, image_id, ..
-                } if *sequence > since_sequence => {
-                    removed.push(*image_id);
-                }
-                _ => {}
+        for id in touched {
+            if let Some(image) = self.images.iter().find(|image| image.id == id) {
+                added.push(image.clone());
+            } else {
+                removed.push(id);
             }
         }
 
@@ -437,6 +562,7 @@ impl ImageRegistry {
             });
         }
         self.images.clear();
+        self.history.clear();
         self.compact_change_log();
         #[cfg(feature = "kitty")]
         {
@@ -448,6 +574,7 @@ impl ImageRegistry {
 
     #[cfg(feature = "kitty")]
     fn remove_image(&mut self, id: u64) {
+        self.history.remove(&id);
         self.kitty_placements
             .retain(|_, retained_id| *retained_id != id);
         let before = self.images.len();
@@ -643,6 +770,44 @@ impl ImageRegistry {
                 // Queries are forwarded, not stored.
             }
         }
+    }
+}
+
+/// Preserve the existing protocol payload representation for a cropped view.
+fn encode_projected_payload(image: &PaneImage) -> std::io::Result<Vec<u8>> {
+    use image::ImageEncoder;
+    let pixels = image
+        .payload
+        .pixels
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("projected image has no pixels"))?;
+    #[cfg(feature = "sixel")]
+    if image.protocol == ImageProtocol::Sixel {
+        return crate::codec::sixel::encode(pixels)
+            .ok_or_else(|| std::io::Error::other("could not encode projected Sixel image"));
+    }
+    let color = match pixels.format {
+        crate::model::PixelFormat::Rgb8 => image::ExtendedColorType::Rgb8,
+        crate::model::PixelFormat::Rgba8 => image::ExtendedColorType::Rgba8,
+        crate::model::PixelFormat::Png => {
+            return Err(std::io::Error::other("projection requires decoded pixels"));
+        }
+    };
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(&pixels.data, pixels.width, pixels.height, color)
+        .map_err(std::io::Error::other)?;
+    match image.protocol {
+        ImageProtocol::KittyGraphics => Ok(png),
+        #[cfg(feature = "iterm2")]
+        ImageProtocol::ITerm2 => Ok(crate::codec::iterm2::encode_body_with_cells(
+            &png,
+            image.cell_size.cols,
+            image.cell_size.rows,
+        )),
+        _ => Err(std::io::Error::other(
+            "projected image protocol is not enabled",
+        )),
     }
 }
 
