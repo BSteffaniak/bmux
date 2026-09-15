@@ -1,5 +1,5 @@
 //! Three source protocols in one alternate-screen demo.
-//! Run with `--features image-kitty,image-sixel,image-iterm2,crossterm`.
+//! Run with `--features all-protocols`.
 
 use std::io::{self, Write};
 use std::time::Duration;

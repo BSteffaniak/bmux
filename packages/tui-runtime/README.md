@@ -24,7 +24,7 @@ retention depends on the terminal/multiplexer, not the shell's command history.
 ## Three-protocol alternate-screen demo
 
 ```sh
-cargo run -p bmux_tui_runtime --example image_protocols --features image-kitty,image-sixel,image-iterm2,crossterm
+cargo run -p bmux_tui_runtime --example image_protocols --features all-protocols
 ```
 
 Shows three labeled checkerboards simultaneously, emitting each source protocol
@@ -69,4 +69,5 @@ See [`../../docs/tui-runtime.md`](../../docs/tui-runtime.md) for the full archit
 - `images`: generic image-aware presentation without enabling a host protocol.
 - `image-kitty`: Kitty graphics output.
 - `image-sixel`: Sixel output.
+- `all-protocols`: all three image protocols plus the Crossterm input/lifecycle backend.
 - `image-iterm2`: iTerm2 inline-image output.
