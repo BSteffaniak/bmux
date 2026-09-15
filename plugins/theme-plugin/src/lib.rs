@@ -95,14 +95,275 @@ fn decode_theme_selection(bytes: &[u8]) -> Result<Option<String>, String> {
     Ok(Some(normalized_theme_name(text)))
 }
 
+#[derive(Clone)]
+struct LiveTheme {
+    snapshot: control_contract::theme_control_v1::Snapshot,
+    resolved: ResolvedTheme,
+}
+
+struct ThemePreview {
+    token: u64,
+    owner: String,
+    original: LiveTheme,
+    owners: BTreeSet<String>,
+}
+
 #[derive(Default)]
 pub struct ThemePlugin {
     lifecycle_context: Option<NativeLifecycleContext>,
-    selection: std::sync::Mutex<Option<control_contract::theme_control_v1::Snapshot>>,
+    selection: std::sync::Mutex<Option<LiveTheme>>,
+    preview: std::sync::Mutex<Option<ThemePreview>>,
+    preview_sequence: std::sync::atomic::AtomicU64,
 }
 
 impl ThemePlugin {
+    fn begin_preview(&self, context: &NativeServiceContext, revision: u64) -> Result<u64, String> {
+        let owner = context
+            .caller_client_id
+            .ok_or("preview requires an attachment")?
+            .to_string();
+        let mut preview = self
+            .preview
+            .lock()
+            .map_err(|_| "preview requires recovery")?;
+        if preview.is_some() {
+            return Err("another theme preview is active".into());
+        }
+        let original = self
+            .selection
+            .lock()
+            .map_err(|_| "theme requires recovery")?
+            .clone()
+            .ok_or("read current theme first")?;
+        if original.snapshot.revision != revision {
+            return Err("stale theme revision".into());
+        }
+        let token = self
+            .preview_sequence
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |value| value.checked_add(1),
+            )
+            .map_err(|_| "preview sequence exhausted")?
+            + 1;
+        let owners = original.resolved.plugins.keys().cloned().collect();
+        *preview = Some(ThemePreview {
+            token,
+            owner,
+            original,
+            owners,
+        });
+        drop(preview);
+        Ok(token)
+    }
+
+    fn preview_theme(
+        &self,
+        context: &NativeServiceContext,
+        token: u64,
+        value: &ThemeSelection,
+    ) -> Result<(), String> {
+        let owner = context
+            .caller_client_id
+            .ok_or("preview requires an attachment")?
+            .to_string();
+        let mut preview = self
+            .preview
+            .lock()
+            .map_err(|_| "preview requires recovery")?;
+        let active = preview.as_mut().ok_or("no active preview")?;
+        if active.token != token || active.owner != owner {
+            return Err("stale or foreign preview".into());
+        }
+        let settings = parse_settings(context.settings.as_ref());
+        let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
+        let theme = resolve_picker_value(&catalog, &value.picker_value(), &settings)
+            .ok_or("theme not found")?;
+        active.owners.extend(theme.plugins.keys().cloned());
+        try_apply_theme_extensions(
+            context,
+            &theme,
+            &active.owners.iter().cloned().collect::<Vec<_>>(),
+            &context.connection.config_dir_candidates,
+        )?;
+        publish_runtime_appearance(&theme);
+        drop(preview);
+        Ok(())
+    }
+
+    fn confirm_preview(
+        &self,
+        context: &NativeServiceContext,
+        token: u64,
+        value: ThemeSelection,
+    ) -> Result<control_contract::theme_control_v1::Snapshot, String> {
+        let owner = context
+            .caller_client_id
+            .ok_or("preview requires an attachment")?
+            .to_string();
+        let mut preview = self
+            .preview
+            .lock()
+            .map_err(|_| "preview requires recovery")?;
+        let active = preview.as_ref().ok_or("no active preview")?;
+        if active.token != token || active.owner != owner {
+            return Err("stale or foreign preview".into());
+        }
+        // Clear every owner visited during preview, including owners absent from
+        // the final selection and from the current on-disk catalog.
+        try_apply_theme_extensions(
+            context,
+            &active.original.resolved,
+            &active.owners.iter().cloned().collect::<Vec<_>>(),
+            &context.connection.config_dir_candidates,
+        )?;
+        publish_runtime_appearance(&active.original.resolved);
+        let result = self.select_without_preview(context, active.original.snapshot.revision, value);
+        if result.is_ok() {
+            *preview = None;
+        }
+        drop(preview);
+        result
+    }
+
+    fn cancel_preview(&self, context: &NativeServiceContext, token: u64) -> Result<(), String> {
+        let owner = context
+            .caller_client_id
+            .ok_or("preview requires an attachment")?
+            .to_string();
+        let mut preview = self
+            .preview
+            .lock()
+            .map_err(|_| "preview requires recovery")?;
+        let active = preview.as_ref().ok_or("no active preview")?;
+        if active.token != token || active.owner != owner {
+            return Err("stale or foreign preview".into());
+        }
+        try_apply_theme_extensions(
+            context,
+            &active.original.resolved,
+            &active.owners.iter().cloned().collect::<Vec<_>>(),
+            &context.connection.config_dir_candidates,
+        )?;
+        publish_runtime_appearance(&active.original.resolved);
+        *preview = None;
+        drop(preview);
+        Ok(())
+    }
+
+    fn refresh_live_theme(
+        &self,
+        context: &NativeServiceContext,
+        expected_revision: u64,
+    ) -> Result<control_contract::theme_control_v1::Snapshot, String> {
+        let preview_guard = self
+            .preview
+            .lock()
+            .map_err(|_| "preview requires recovery")?;
+        if preview_guard.is_some() {
+            return Err("theme preview is active".into());
+        }
+        let result = self.refresh_without_preview(context, expected_revision);
+        drop(preview_guard);
+        result
+    }
+
+    fn refresh_without_preview(
+        &self,
+        context: &NativeServiceContext,
+        expected_revision: u64,
+    ) -> Result<control_contract::theme_control_v1::Snapshot, String> {
+        let mut state = self
+            .selection
+            .lock()
+            .map_err(|_| "theme state requires recovery")?;
+        let current = state
+            .as_ref()
+            .ok_or("read current theme before refreshing")?;
+        if current.snapshot.revision != expected_revision {
+            return Err("stale theme revision".into());
+        }
+        let revision = expected_revision
+            .checked_add(1)
+            .ok_or("theme revision exhausted")?;
+        let config_path = context
+            .connection
+            .probe_config_file("bmux.toml")
+            .unwrap_or_else(|| config_paths_from_connection(&context.connection).config_file());
+        let config = BmuxConfig::load_from_path(&config_path).map_err(|error| error.to_string())?;
+        let settings: ThemePluginSettings = config
+            .plugins
+            .settings
+            .get("bmux.theme")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(|error| format!("invalid theme settings: {error}"))?
+            .unwrap_or_default();
+        let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
+        let theme = resolve_picker_value(
+            &catalog,
+            &current.snapshot.selection.picker_value(),
+            &settings,
+        )
+        .ok_or("refreshed theme not found")?;
+        let owners: Vec<String> = current
+            .resolved
+            .plugins
+            .keys()
+            .chain(theme.plugins.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if let Err(error) = try_apply_theme_extensions(
+            context,
+            &theme,
+            &owners,
+            &context.connection.config_dir_candidates,
+        ) {
+            try_apply_theme_extensions(
+                context,
+                &current.resolved,
+                &owners,
+                &context.connection.config_dir_candidates,
+            )
+            .map_err(|restore| format!("{error}; recovery failed: {restore}"))?;
+            return Err(error);
+        }
+        let snapshot = control_contract::theme_control_v1::Snapshot {
+            revision,
+            selection: current.snapshot.selection.clone(),
+        };
+        publish_runtime_appearance(&theme);
+        *state = Some(LiveTheme {
+            snapshot: snapshot.clone(),
+            resolved: theme,
+        });
+        drop(state);
+        Ok(snapshot)
+    }
+
     fn select_live_theme(
+        &self,
+        context: &NativeServiceContext,
+        expected_revision: u64,
+        value: ThemeSelection,
+    ) -> Result<control_contract::theme_control_v1::Snapshot, String> {
+        let preview_guard = self
+            .preview
+            .lock()
+            .map_err(|_| "preview requires recovery")?;
+        if preview_guard.is_some() {
+            return Err("theme preview is active".into());
+        }
+        let result = self.select_without_preview(context, expected_revision, value);
+        drop(preview_guard);
+        result
+    }
+
+    fn select_without_preview(
         &self,
         context: &NativeServiceContext,
         expected_revision: u64,
@@ -115,10 +376,11 @@ impl ThemePlugin {
         let current = state
             .as_ref()
             .ok_or("read current theme before selecting")?;
-        if current.revision != expected_revision {
+        if current.snapshot.revision != expected_revision {
             return Err("stale theme revision".into());
         }
         let revision = current
+            .snapshot
             .revision
             .checked_add(1)
             .ok_or("theme revision exhausted")?;
@@ -126,18 +388,48 @@ impl ThemePlugin {
         let catalog = load_theme_catalog(&context.connection.config_dir_candidate_paths());
         let theme = resolve_picker_value(&catalog, &value.picker_value(), &settings)
             .ok_or("theme not found")?;
-        try_apply_theme_extensions(
+        let owners: Vec<String> = theme_catalog_plugin_ids(&catalog)
+            .into_iter()
+            .chain(current.resolved.plugins.keys().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let apply = try_apply_theme_extensions(
             context,
             &theme,
-            &theme_catalog_plugin_ids(&catalog),
+            &owners,
             &context.connection.config_dir_candidates,
-        )?;
+        )
+        .and_then(|()| {
+            if matches!(
+                settings.persistence,
+                ThemePersistence::PersistBetweenConnects
+            ) {
+                persist_theme_name(context, &value.picker_value())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = apply {
+            if let Err(restore_error) = try_apply_theme_extensions(
+                context,
+                &current.resolved,
+                &owners,
+                &context.connection.config_dir_candidates,
+            ) {
+                return Err(format!("{error}; theme recovery failed: {restore_error}"));
+            }
+            return Err(error);
+        }
         publish_runtime_appearance(&theme);
         let snapshot = control_contract::theme_control_v1::Snapshot {
             revision,
             selection: value,
         };
-        *state = Some(snapshot.clone());
+        *state = Some(LiveTheme {
+            snapshot: snapshot.clone(),
+            resolved: theme,
+        });
         drop(state);
         Ok(snapshot)
     }
@@ -175,6 +467,7 @@ impl RustPlugin for ThemePlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         bmux_plugin_sdk::route_command!(context, {
             "pick-theme" => pick_theme(&context),
+            "refresh-theme" => refresh_theme(&context),
         })
     }
 
@@ -187,9 +480,25 @@ impl RustPlugin for ThemePlugin {
                     let catalog = load_theme_catalog(&ctx.connection.config_dir_candidate_paths());
                     let active = active_theme_stack(ctx, &settings, &catalog).ok_or_else(|| ServiceResponse::error("theme_not_found", "theme selection requires recovery"))?;
                     let value = ThemeSelection::from_picker_value(&picker_selection_name(&active)).ok_or_else(|| ServiceResponse::error("invalid_selection", "invalid startup selection"))?;
-                    *selection = Some(control_contract::theme_control_v1::Snapshot { revision: 0, selection: value });
+                    let resolved = resolve_picker_value(&catalog, &value.picker_value(), &settings).ok_or_else(|| ServiceResponse::error("theme_not_found", "theme could not be resolved"))?;
+                    *selection = Some(LiveTheme { snapshot: control_contract::theme_control_v1::Snapshot { revision: 0, selection: value }, resolved });
                 }
-                Ok::<_, ServiceResponse>(selection.clone().expect("initialized selection"))
+                Ok::<_, ServiceResponse>(selection.as_ref().expect("initialized selection").snapshot.clone())
+            },
+            "theme-control-v1", "begin-preview" => |req: control_contract::theme_control_v1::client::BeginPreviewRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.begin_preview(ctx, req.expected_revision))
+            },
+            "theme-control-v1", "preview" => |req: control_contract::theme_control_v1::client::PreviewRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.preview_theme(ctx, req.token, &req.selection))
+            },
+            "theme-control-v1", "confirm-preview" => |req: control_contract::theme_control_v1::client::ConfirmPreviewRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.confirm_preview(ctx, req.token, req.selection))
+            },
+            "theme-control-v1", "cancel-preview" => |req: control_contract::theme_control_v1::client::CancelPreviewRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.cancel_preview(ctx, req.token))
+            },
+            "theme-control-v1", "refresh" => |req: control_contract::theme_control_v1::client::RefreshRequest, ctx| {
+                Ok::<_, ServiceResponse>(self.refresh_live_theme(ctx, req.expected_revision))
             },
             "theme-control-v1", "select" => |req: control_contract::theme_control_v1::client::SelectRequest, ctx| {
                 let result = self.select_live_theme(ctx, req.expected_revision, req.selection);
@@ -569,6 +878,21 @@ impl ThemeHostContext for NativeServiceContext {
     }
 }
 
+fn refresh_theme(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let current = bmux_plugin::block_on_typed_dispatch(
+        control_contract::theme_control_v1::client::current(&mut client),
+    )
+    .map_err(|error| PluginCommandError::unavailable(error.to_string()))?;
+    bmux_plugin::block_on_typed_dispatch(control_contract::theme_control_v1::client::refresh(
+        &mut client,
+        current.revision,
+    ))
+    .map_err(|error| PluginCommandError::unavailable(error.to_string()))?
+    .map_err(PluginCommandError::unavailable)?;
+    Ok(EXIT_OK)
+}
+
 fn pick_theme(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
     let handle = tokio::runtime::Handle::try_current().map_err(|_| {
         PluginCommandError::unavailable("no tokio runtime available; theme picker requires attach")
@@ -747,10 +1071,15 @@ async fn run_theme_picker(context: NativeCommandContext) {
         return;
     }
 
-    let Some(active_stack) = active_theme_stack(&context, &settings, &catalog) else {
-        return;
+    let mut control = bmux_plugin::ServiceCallerDispatchClient::new(&context);
+    let current = match control_contract::theme_control_v1::client::current(&mut control).await {
+        Ok(current) => current,
+        Err(error) => {
+            warn!(%error, "theme control unavailable");
+            return;
+        }
     };
-    let active_name = picker_selection_name(&active_stack);
+    let active_name = current.selection.picker_value();
     let Some(original_theme) = resolve_picker_value(&catalog, &active_name, &settings) else {
         return;
     };
@@ -2335,7 +2664,13 @@ mod tests {
     async fn picker_rejection_and_closed_events_do_not_apply_themes() {
         let calls = Arc::new(Mutex::new(0_usize));
         let observed = calls.clone();
-        let router: TestServiceRouter = Arc::new(move |_, _, _, _, _, _, _| {
+        let router: TestServiceRouter = Arc::new(move |_, _, capability, _, _, _, _| {
+            if capability == "bmux.theme.write" {
+                return encode_service_message(&control_contract::theme_control_v1::Snapshot {
+                    revision: 0,
+                    selection: ThemeSelection::Configured,
+                });
+            }
             *observed.lock().expect("calls") += 1;
             Ok(Vec::new())
         });
@@ -2368,6 +2703,14 @@ mod tests {
         let router: TestServiceRouter =
             Arc::new(move |_, _, capability, _, _, operation, payload| {
                 match (capability, operation) {
+                    ("bmux.theme.write", "current") => {
+                        encode_service_message(&control_contract::theme_control_v1::Snapshot {
+                            revision: 0,
+                            selection: ThemeSelection::Preset {
+                                name: "hacker".into(),
+                            },
+                        })
+                    }
                     ("bmux.storage", "get") => encode_service_message(&StorageGetResponse {
                         value: Some(b"hacker".to_vec()),
                     }),
@@ -2450,6 +2793,14 @@ mod tests {
         let observed = writes.clone();
         let router: TestServiceRouter = Arc::new(
             move |_, _, capability, _, _, operation, _| match (capability, operation) {
+                ("bmux.theme.write", "current") => {
+                    encode_service_message(&control_contract::theme_control_v1::Snapshot {
+                        revision: 0,
+                        selection: ThemeSelection::Preset {
+                            name: "hacker".into(),
+                        },
+                    })
+                }
                 ("bmux.storage", "get") => encode_service_message(&StorageGetResponse {
                     value: Some(b"hacker".to_vec()),
                 }),
@@ -2584,9 +2935,17 @@ mod tests {
     #[test]
     fn stale_selection_revision_is_rejected_before_effects() {
         let plugin = ThemePlugin {
-            selection: std::sync::Mutex::new(Some(control_contract::theme_control_v1::Snapshot {
-                revision: 4,
-                selection: ThemeSelection::Configured,
+            selection: std::sync::Mutex::new(Some(LiveTheme {
+                snapshot: control_contract::theme_control_v1::Snapshot {
+                    revision: 4,
+                    selection: ThemeSelection::Configured,
+                },
+                resolved: resolve_picker_value(
+                    &load_theme_catalog(&[]),
+                    CONFIGURED_SELECTION,
+                    &ThemePluginSettings::default(),
+                )
+                .expect("theme"),
             })),
             ..ThemePlugin::default()
         };
@@ -2605,9 +2964,257 @@ mod tests {
                 .expect("state")
                 .as_ref()
                 .expect("snapshot")
+                .snapshot
                 .revision,
             4
         );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn live_selection_failure_preserves_revision_and_resolved_theme() {
+        let original = resolve_picker_value(
+            &load_theme_catalog(&[]),
+            CONFIGURED_SELECTION,
+            &ThemePluginSettings::default(),
+        )
+        .expect("theme");
+        let plugin = ThemePlugin {
+            selection: std::sync::Mutex::new(Some(LiveTheme {
+                snapshot: control_contract::theme_control_v1::Snapshot {
+                    revision: 4,
+                    selection: ThemeSelection::Configured,
+                },
+                resolved: original.clone(),
+            })),
+            ..ThemePlugin::default()
+        };
+        let router: TestServiceRouter = Arc::new(|_, _, capability, _, _, operation, _| {
+            if capability == "bmux.storage" && operation == "set" {
+                return Err(bmux_plugin_sdk::PluginError::InvalidPluginId {
+                    id: "storage failure".into(),
+                });
+            }
+            encode_service_message(&Ok::<
+                (),
+                bmux_decoration_plugin_api::decoration_state::ValidationResult,
+            >(()))
+        });
+        let _router = install_test_service_router(router);
+        let context = service_context(Some(
+            toml::from_str("persistence = 'persist_between_connects'").expect("settings"),
+        ));
+        assert!(
+            plugin
+                .select_live_theme(
+                    &context,
+                    4,
+                    ThemeSelection::Preset {
+                        name: "hacker".into()
+                    }
+                )
+                .is_err()
+        );
+        let live = plugin
+            .selection
+            .lock()
+            .expect("state")
+            .clone()
+            .expect("live");
+        assert_eq!(live.snapshot.revision, 4);
+        assert_eq!(live.snapshot.selection, ThemeSelection::Configured);
+        assert_eq!(live.resolved.appearance, original.appearance);
+        assert_eq!(live.resolved.plugins, original.plugins);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn refresh_keeps_selection_and_does_not_write_preference() {
+        let dir = temp_theme_dir("refresh");
+        let mut context = service_context(None);
+        context.connection.config_dir = dir.to_string_lossy().into_owned();
+        context.connection.config_dir_candidates = vec![context.connection.config_dir.clone()];
+        let original = resolve_theme_picker_selection(
+            &load_theme_catalog(&[]),
+            "hacker",
+            &ThemePluginSettings::default(),
+        )
+        .expect("original");
+        let plugin = ThemePlugin {
+            selection: std::sync::Mutex::new(Some(LiveTheme {
+                snapshot: control_contract::theme_control_v1::Snapshot {
+                    revision: 4,
+                    selection: ThemeSelection::Preset {
+                        name: "hacker".into(),
+                    },
+                },
+                resolved: original,
+            })),
+            ..ThemePlugin::default()
+        };
+        std::fs::create_dir_all(dir.join("themes")).expect("themes");
+        std::fs::write(dir.join("themes/hacker.toml"), "foreground = '#112233'")
+            .expect("theme file");
+        let router: TestServiceRouter = Arc::new(|_, _, capability, _, _, operation, _| {
+            assert_ne!(
+                capability, "bmux.storage",
+                "refresh must not write preferences"
+            );
+            assert_eq!(operation, "apply-theme-extension");
+            encode_service_message(&Ok::<
+                (),
+                bmux_decoration_plugin_api::decoration_state::ValidationResult,
+            >(()))
+        });
+        let _router = install_test_service_router(router);
+        let snapshot = plugin.refresh_live_theme(&context, 4).expect("refresh");
+        assert_eq!(snapshot.revision, 5);
+        assert_eq!(
+            snapshot.selection,
+            ThemeSelection::Preset {
+                name: "hacker".into()
+            }
+        );
+        let live = plugin
+            .selection
+            .lock()
+            .expect("state")
+            .clone()
+            .expect("live");
+        assert_eq!(live.resolved.appearance.foreground, "#112233");
+        assert!(plugin.refresh_live_theme(&context, 4).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn configured_refresh_reads_fallback_config_directory() {
+        let primary = temp_theme_dir("refresh-primary");
+        let fallback = temp_theme_dir("refresh-fallback");
+        std::fs::write(fallback.join("bmux.toml"), "[plugins.settings.\"bmux.theme\"]\nappearance_themes = ['hacker']\ncomponent_themes = ['minimal']\n").expect("config");
+        let mut context = service_context(None);
+        context.connection.config_dir = primary.to_string_lossy().into_owned();
+        context.connection.config_dir_candidates = vec![
+            context.connection.config_dir.clone(),
+            fallback.to_string_lossy().into_owned(),
+        ];
+        let original = resolve_picker_value(
+            &load_theme_catalog(&[]),
+            CONFIGURED_SELECTION,
+            &ThemePluginSettings::default(),
+        )
+        .expect("original");
+        let plugin = ThemePlugin {
+            selection: std::sync::Mutex::new(Some(LiveTheme {
+                snapshot: control_contract::theme_control_v1::Snapshot {
+                    revision: 1,
+                    selection: ThemeSelection::Configured,
+                },
+                resolved: original,
+            })),
+            ..ThemePlugin::default()
+        };
+        let router: TestServiceRouter = Arc::new(|_, _, capability, _, _, _, _| {
+            assert_eq!(capability, "bmux.decoration.write");
+            encode_service_message(&Ok::<
+                (),
+                bmux_decoration_plugin_api::decoration_state::ValidationResult,
+            >(()))
+        });
+        let _router = install_test_service_router(router);
+        plugin
+            .refresh_live_theme(&context, 1)
+            .expect("refresh fallback");
+        let live = plugin
+            .selection
+            .lock()
+            .expect("state")
+            .clone()
+            .expect("live");
+        assert_eq!(live.resolved.appearance.foreground, "#39ff14");
+        assert_eq!(live.snapshot.selection, ThemeSelection::Configured);
+    }
+
+    #[test]
+    fn preview_rejects_foreign_owner_and_competing_mutations() {
+        let plugin = ThemePlugin::default();
+        let mut context = service_context(None);
+        context.caller_client_id = Some(
+            "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("uuid"),
+        );
+        context.request.service.interface_id = "theme-control-v1".into();
+        context.request.operation = "current".into();
+        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        let token = plugin.begin_preview(&context, 0).expect("preview");
+        assert!(plugin.begin_preview(&context, 0).is_err());
+        assert!(
+            plugin
+                .select_live_theme(&context, 0, ThemeSelection::Configured)
+                .is_err()
+        );
+        assert!(plugin.refresh_live_theme(&context, 0).is_err());
+        context.caller_client_id = Some(
+            "00000000-0000-0000-0000-000000000002"
+                .parse()
+                .expect("uuid"),
+        );
+        assert!(plugin.cancel_preview(&context, token).is_err());
+        assert!(
+            plugin
+                .preview_theme(&context, token, &ThemeSelection::Configured)
+                .is_err()
+        );
+        assert!(plugin.preview.lock().expect("preview state").is_some());
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    fn preview_confirmation_commits_once_and_releases_owner() {
+        let plugin = ThemePlugin::default();
+        let mut context = service_context(None);
+        context.caller_client_id = Some(
+            "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("uuid"),
+        );
+        context.request.service.interface_id = "theme-control-v1".into();
+        context.request.operation = "current".into();
+        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        let token = plugin.begin_preview(&context, 0).expect("preview");
+        let router: TestServiceRouter = Arc::new(|_, _, capability, _, _, _, _| {
+            assert_eq!(capability, "bmux.decoration.write");
+            encode_service_message(&Ok::<
+                (),
+                bmux_decoration_plugin_api::decoration_state::ValidationResult,
+            >(()))
+        });
+        let _router = install_test_service_router(router);
+        let choice = ThemeSelection::Preset {
+            name: "hacker".into(),
+        };
+        plugin
+            .preview_theme(&context, token, &choice)
+            .expect("preview theme");
+        assert_eq!(
+            plugin
+                .selection
+                .lock()
+                .expect("state")
+                .as_ref()
+                .expect("live")
+                .snapshot
+                .revision,
+            0
+        );
+        let committed = plugin
+            .confirm_preview(&context, token, choice.clone())
+            .expect("confirm");
+        assert_eq!(committed.selection, choice);
+        assert_eq!(committed.revision, 1);
+        assert!(plugin.preview.lock().expect("preview").is_none());
+        assert!(plugin.confirm_preview(&context, token, choice).is_err());
+        assert!(plugin.cancel_preview(&context, token).is_err());
     }
 
     #[test]

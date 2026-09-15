@@ -1,6 +1,7 @@
 execution_class = "native_fast"
 id = "bmux.theme"
 name = "bmux Theme"
+owns_namespaces = ["theme"]
 provided_capabilities = [
     "bmux.theme.read",
     "bmux.theme.write",
@@ -36,3 +37,11 @@ expose_in_cli  = false
 name           = "pick-theme"
 path           = ["theme", "pick"]
 summary        = "Open the runtime theme picker"
+
+[[commands]]
+accepts_repeat = false
+execution      = "caller_process"
+expose_in_cli  = true
+name           = "refresh-theme"
+path           = ["theme", "refresh"]
+summary        = "Refresh the selected theme from configuration and files"

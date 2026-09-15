@@ -20,4 +20,9 @@ interface theme-control-v1 {
     // coherent selection/revision pair before attempting a mutation.
     command current() -> snapshot;
     command select(expected-revision: u64, selection: selection) -> result<snapshot, string>;
+    command refresh(expected-revision: u64) -> result<snapshot, string>;
+    command begin-preview(expected-revision: u64) -> result<u64, string>;
+    command preview(token: u64, selection: selection) -> result<unit, string>;
+    command cancel-preview(token: u64) -> result<unit, string>;
+    command confirm-preview(token: u64, selection: selection) -> result<snapshot, string>;
 }
