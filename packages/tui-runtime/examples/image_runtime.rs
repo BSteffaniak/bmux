@@ -1,6 +1,6 @@
 //! Print a Kitty image inline, leaving it in the terminal after exit.
 //!
-//! `cargo run -p bmux_tui_runtime --example image_runtime --features image-kitty`
+//! `cargo run -p bmux_tui_runtime --example image_runtime`
 //! No alternate screen, raw mode, input reader, or image deletion is needed.
 
 use std::io::{self, Write};

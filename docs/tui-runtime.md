@@ -181,8 +181,10 @@ interaction metadata only after both outputs succeed.
 
 Image support is split into additive Cargo features: `images` enables the
 presenter and individual `image-kitty`, `image-sixel`, and `image-iterm2`
-features enable host protocols. Text-only runtime users retain the default
-minimal dependency graph.
+features enable host protocols. Defaults enable `all-protocols`, which includes
+all three protocols and Crossterm. Text-only runtime users can retain a minimal
+dependency graph with `default-features = false` (`--no-default-features` for
+Cargo commands).
 
 Environment-only detection is safe before input admission because it performs
 no terminal I/O. Active capability queries must run after raw mode is active

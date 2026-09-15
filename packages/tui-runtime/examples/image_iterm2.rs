@@ -1,5 +1,5 @@
 //! Print an iTerm2 checkerboard inline without an alternate screen or input loop.
-//! `cargo run -p bmux_tui_runtime --example image_iterm2 --features image-iterm2`
+//! `cargo run -p bmux_tui_runtime --example image_iterm2`
 
 use std::io::{self, Write};
 

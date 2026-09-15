@@ -11,9 +11,9 @@ leaving the image above the shell prompt. Run each in a terminal supporting its
 protocol (or inside an updated BMUX, which translates to the host protocol):
 
 ```sh
-cargo run -p bmux_tui_runtime --example image_runtime --features image-kitty
-cargo run -p bmux_tui_runtime --example image_sixel --features image-sixel
-cargo run -p bmux_tui_runtime --example image_iterm2 --features image-iterm2
+cargo run -p bmux_tui_runtime --example image_runtime
+cargo run -p bmux_tui_runtime --example image_sixel
+cargo run -p bmux_tui_runtime --example image_iterm2
 ```
 
 Kitty and iTerm2 request 16×8 cells. Sixel uses a 128×96-pixel raster and reserves
@@ -24,7 +24,7 @@ retention depends on the terminal/multiplexer, not the shell's command history.
 ## Three-protocol alternate-screen demo
 
 ```sh
-cargo run -p bmux_tui_runtime --example image_protocols --features all-protocols
+cargo run -p bmux_tui_runtime --example image_protocols
 ```
 
 Shows three labeled checkerboards simultaneously, emitting each source protocol
@@ -39,8 +39,8 @@ and terminal modes are restored on exit.
 
 With the `images` feature, `ImageTerminalPresenter` connects protocol-neutral
 `bmux_tui::image::ImageContribution` values to BMUX's host image compositor.
-Protocol implementations remain opt-in through `image-kitty`, `image-sixel`,
-and `image-iterm2`.
+All three protocols and Crossterm are enabled by default. With defaults disabled,
+select protocols through `image-kitty`, `image-sixel`, and `image-iterm2`.
 
 The presenter commits cell output, the reconciled image scene, and interaction
 metadata through one synchronized terminal update and flush. A failed cell or
@@ -64,6 +64,10 @@ completed.
 See [`../../docs/tui-runtime.md`](../../docs/tui-runtime.md) for the full architecture contract.
 
 ## Cargo features
+
+Defaults enable `all-protocols`, including Crossterm. Use `--no-default-features`
+(or `default-features = false` in a dependency declaration) for a minimal build,
+then opt into individual features as needed.
 
 - `crossterm`: managed Crossterm input and terminal event conversion.
 - `images`: generic image-aware presentation without enabling a host protocol.

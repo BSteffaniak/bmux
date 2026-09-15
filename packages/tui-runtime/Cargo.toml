@@ -39,7 +39,7 @@ bmux_keyboard = { workspace = true }
 # Convenience bundle for interactive demos; individual codecs remain backend-neutral.
 all-protocols    = ["image-kitty", "image-sixel", "image-iterm2", "crossterm"]
 crossterm        = ["bmux_tui/crossterm"]
-default          = []
+default          = ["all-protocols"]
 fail-on-warnings = ["bmux_image?/fail-on-warnings"]
 image-iterm2     = ["images", "bmux_image/iterm2"]
 image-kitty      = ["images", "bmux_image/kitty"]

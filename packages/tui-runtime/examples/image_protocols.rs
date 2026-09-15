@@ -1,5 +1,5 @@
 //! Three source protocols in one alternate-screen demo.
-//! Run with `--features all-protocols`.
+//! `cargo run -p bmux_tui_runtime --example image_protocols`
 
 use std::io::{self, Write};
 use std::time::Duration;

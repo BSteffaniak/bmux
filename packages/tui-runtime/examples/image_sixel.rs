@@ -1,5 +1,5 @@
 //! Print a Sixel checkerboard inline without an alternate screen or input loop.
-//! `cargo run -p bmux_tui_runtime --example image_sixel --features image-sixel`
+//! `cargo run -p bmux_tui_runtime --example image_sixel`
 
 use std::io::{self, Write};
 
