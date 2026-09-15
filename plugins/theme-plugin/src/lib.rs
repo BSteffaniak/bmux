@@ -1634,6 +1634,17 @@ async fn cancel_picker_preview(control: &mut PickerControl<'_>, token: u64) {
     }
 }
 
+fn report_picker_error(message: String) {
+    warn!(%message, "theme selection failed");
+    let request = bmux_plugin_sdk::PromptRequest::confirm("Theme could not be applied")
+        .message(message)
+        .confirm_labels("OK", "Close")
+        .policy(bmux_plugin_sdk::PromptPolicy::Enqueue);
+    if let Err(error) = prompt::submit(request) {
+        warn!(%error, "could not display theme error");
+    }
+}
+
 async fn confirm_picker_selection(
     control: &mut PickerControl<'_>,
     token: Option<u64>,
@@ -1646,7 +1657,7 @@ async fn confirm_picker_selection(
         control_contract::theme_control_v1::client::select(control, revision, selection).await
     };
     if !matches!(result, Ok(Ok(_))) {
-        warn!(?result, "theme confirmation failed");
+        report_picker_error(format!("Confirmation failed: {result:?}"));
         return false;
     }
     true
@@ -1729,7 +1740,9 @@ async fn run_theme_picker_with_route(
                         }
                     }
                     let token = preview_token.expect("preview acquired");
-                    if !matches!(control_contract::theme_control_v1::client::preview(&mut control, token, selection).await, Ok(Ok(()))) {
+                    let result = control_contract::theme_control_v1::client::preview(&mut control, token, selection).await;
+                    if !matches!(result, Ok(Ok(()))) {
+                        report_picker_error(format!("Preview failed: {result:?}"));
                         break None;
                     }
                 }
@@ -5073,6 +5086,56 @@ operation = "reset"
                 .iter()
                 .any(|value| value.as_str() == Some("bmux.performance.write"))
         );
+    }
+
+    #[test]
+    fn configured_performance_pulse_composition_has_complete_border_chrome() {
+        let settings: ThemePluginSettings = toml::from_str(
+            r#"
+            appearance_themes = ["performance", "mode-aware"]
+            component_themes = ["performance", "pulse-border"]
+            [components."performance.border"]
+            enabled = false
+            [components."pulse.border"]
+            below = ["performance.header"]
+            [components."pulse.border".settings]
+            color-source = "performance-colors-v1"
+            heat-mode = "cpu-memory"
+            memory-green-percent = "5"
+            memory-yellow-percent = "15"
+            memory-orange-percent = "30"
+            memory-red-percent = "50"
+            period-ms = "2000"
+            smoothing-ms = "500"
+            brightness-min = "0.6"
+            brightness-max = "1"
+            [component_targets]
+            "performance.*" = { kind = "all-panes" }
+        "#,
+        )
+        .expect("settings");
+        let theme = resolve_picker_value(&load_theme_catalog(&[]), CONFIGURED_SELECTION, &settings)
+            .expect("configured theme");
+        let extension = &theme.plugins["bmux.decoration"];
+        assert!(extension.get("unfocused").is_some());
+        assert_eq!(
+            extension["components"]["performance.border"]["enabled"].as_bool(),
+            Some(false)
+        );
+        let plugin = bmux_decoration_plugin::DecorationPlugin::new();
+        let mut context = service_context(None);
+        context.request.service.interface_id = "decoration-commands".into();
+        context.request.operation = "apply-theme-extension".into();
+        context.request.payload = encode_service_message(&ApplyThemeExtensionArgs {
+            toml: toml::to_string(extension).expect("extension"),
+            config_dir_candidates: vec![],
+        })
+        .expect("request");
+        let response = plugin.invoke_service(context);
+        assert!(response.error.is_none(), "{response:?}");
+        let result: Result<(), bmux_decoration_plugin_api::decoration_state::ValidationResult> =
+            decode_service_message(&response.payload).expect("response");
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

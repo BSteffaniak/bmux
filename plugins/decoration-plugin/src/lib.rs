@@ -1730,30 +1730,73 @@ fn scene_snapshot_from_state(state: &mut State) -> DecorationScene {
 /// Used by the `validate-theme-extension` query so external callers
 /// (tests, a future `bmux config validate` CLI) can round-trip a
 /// theme file without reaching into plugin internals.
-fn validate_theme_extension_toml(text: &str) -> ValidationResult {
-    // Parse as generic TOML first so individual field errors can be
-    // attributed to paths. `try_into::<DecorationThemeExtension>()`
-    // then re-checks the shape. Both failure modes go through the
-    // same `Errors` variant so the caller always has a vec.
-    let parsed: toml::Value = match toml::from_str(text) {
-        Ok(v) => v,
-        Err(err) => {
-            return ValidationResult::Errors {
-                errors: vec![ValidationError {
-                    path: "<root>".to_string(),
-                    message: format!("TOML parse error: {err}"),
-                }],
-            };
+// Theme layers may supply only components or individual border fields. Fill
+// omitted TOML fields from the owner's defaults, without relaxing wire decoding
+// or replacing explicitly supplied (including invalid) values.
+fn fill_decoration_defaults(value: &mut toml::Value, defaults: toml::Value) {
+    if let (toml::Value::Table(value), toml::Value::Table(defaults)) = (value, defaults) {
+        for (key, default) in defaults {
+            if let Some(existing) = value.get_mut(&key) {
+                fill_decoration_defaults(existing, default);
+            } else {
+                value.insert(key, default);
+            }
         }
-    };
-    match parsed.try_into::<DecorationThemeExtension>() {
-        Ok(_) => ValidationResult::Ok,
-        Err(err) => ValidationResult::Errors {
+    }
+}
+
+fn parse_decoration_extension(text: &str) -> Result<DecorationThemeExtension, ValidationResult> {
+    let mut parsed =
+        toml::from_str::<toml::Value>(text).map_err(|error| ValidationResult::Errors {
             errors: vec![ValidationError {
-                path: "<schema>".to_string(),
-                message: err.to_string(),
+                path: "<root>".into(),
+                message: error.to_string(),
             }],
+        })?;
+    let border = || BorderSpec {
+        style: "single-line".into(),
+        fg: "#ffffff".into(),
+        bg: String::new(),
+        gradient_from: String::new(),
+        gradient_to: String::new(),
+        gradient_axis: String::new(),
+        glyphs_custom: Vec::new(),
+    };
+    let defaults = toml::Value::try_from(DecorationThemeExtension {
+        unfocused: border(),
+        focused: border(),
+        zoomed: border(),
+        badges: bmux_decoration_plugin_api::decoration_state::BadgeSpec {
+            running: String::new(),
+            exited: String::new(),
         },
+        animation: None,
+        script: None,
+        script_access: None,
+        input: None,
+        components: None,
+    })
+    .map_err(|error| ValidationResult::Errors {
+        errors: vec![ValidationError {
+            path: "<defaults>".into(),
+            message: error.to_string(),
+        }],
+    })?;
+    fill_decoration_defaults(&mut parsed, defaults);
+    parsed
+        .try_into()
+        .map_err(|error: toml::de::Error| ValidationResult::Errors {
+            errors: vec![ValidationError {
+                path: "<schema>".into(),
+                message: error.to_string(),
+            }],
+        })
+}
+
+fn validate_theme_extension_toml(text: &str) -> ValidationResult {
+    match parse_decoration_extension(text) {
+        Ok(_) => ValidationResult::Ok,
+        Err(error) => error,
     }
 }
 
@@ -1867,19 +1910,7 @@ fn apply_theme_extension_toml_direct(
         return Ok(());
     }
 
-    let parsed = toml::from_str::<toml::Value>(text).map_err(|err| ValidationResult::Errors {
-        errors: vec![ValidationError {
-            path: "<root>".to_string(),
-            message: format!("TOML parse error: {err}"),
-        }],
-    })?;
-    let extension: DecorationThemeExtension =
-        parsed.try_into().map_err(|err| ValidationResult::Errors {
-            errors: vec![ValidationError {
-                path: "<schema>".to_string(),
-                message: err.to_string(),
-            }],
-        })?;
+    let extension = parse_decoration_extension(text)?;
     let script = extension
         .script
         .as_deref()
@@ -5373,20 +5404,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_theme_extension_rejects_missing_required_field() {
-        let text = r##"
-        [unfocused]
-        style = "rounded"
-        fg = "#1a4d1a"
-        # missing bg/gradient/etc
-        "##;
-        let result = validate_theme_extension_toml(text);
-        match result {
-            ValidationResult::Errors { errors } => {
-                assert!(!errors.is_empty(), "expected at least one validation error");
-            }
-            ValidationResult::Ok => panic!("expected validation errors; got Ok"),
-        }
+    fn validate_theme_extension_defaults_omitted_toml_fields() {
+        let text = "[unfocused]\nstyle = 'rounded'\nfg = '#1a4d1a'\n";
+        assert_eq!(validate_theme_extension_toml(text), ValidationResult::Ok);
+        let parsed = parse_decoration_extension(text).expect("partial theme");
+        assert_eq!(parsed.unfocused.fg, "#1a4d1a");
+        assert!(parsed.unfocused.bg.is_empty());
     }
 
     #[test]
@@ -5705,6 +5728,24 @@ exited = ""
                 assert!(state.current_theme.is_none());
             }
         });
+    }
+
+    #[test]
+    fn partial_decoration_toml_defaults_borders_but_rejects_invalid_fields() {
+        let extension = parse_decoration_extension("[components.test]\nscript = 'pulse'\n")
+            .expect("partial extension");
+        assert!(
+            extension
+                .components
+                .expect("components")
+                .contains_key("test")
+        );
+        assert!(matches!(
+            validate_theme_extension_toml("[focused]\nfg = '#abcdef'\n"),
+            ValidationResult::Ok
+        ));
+        assert!(parse_decoration_extension("unfocused = 42").is_err());
+        assert!(parse_decoration_extension("[focused]\nstyle = 42\n").is_err());
     }
 
     #[test]
