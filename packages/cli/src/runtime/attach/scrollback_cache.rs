@@ -20,6 +20,28 @@ pub(super) struct ScrollbackCache {
 }
 
 impl ScrollbackCache {
+    pub fn advance(&mut self, pane: Uuid, previous: u64, current: u64) {
+        let Some(growth) = current
+            .checked_sub(previous)
+            .and_then(|n| usize::try_from(n).ok())
+        else {
+            self.invalidate(pane);
+            return;
+        };
+        for entry in &mut self.entries {
+            if entry.pane == pane
+                && entry.pin.is_none()
+                && entry.window.total_scrolled_rows == previous
+            {
+                entry.window.total_scrolled_rows = current;
+                entry.window.scrollback_offset =
+                    entry.window.scrollback_offset.saturating_add(growth);
+                entry.window.max_scrollback_offset =
+                    entry.window.max_scrollback_offset.saturating_add(growth);
+            }
+        }
+    }
+
     pub fn invalidate(&mut self, pane: Uuid) {
         self.entries.retain(|entry| {
             if entry.pane == pane {
@@ -41,7 +63,11 @@ impl ScrollbackCache {
     ) -> Option<PaneScrollbackWindow> {
         self.entries.iter().rev().find_map(|entry| {
             let window = &entry.window;
-            if entry.pane != pane || entry.pin != pin || window.projection_width != width {
+            if entry.pane != pane
+                || entry.pin != pin
+                || window.projection_width != width
+                || offset > window.max_scrollback_offset
+            {
                 return None;
             }
             let shift = offset.checked_sub(window.scrollback_offset)?;
@@ -161,6 +187,20 @@ mod tests {
         assert!(cache.get(pane, None, 9, 80, 20).is_none());
         assert!(cache.get(pane, None, 10, 79, 20).is_none());
         assert!(cache.get(Uuid::new_v4(), None, 10, 80, 20).is_none());
+    }
+
+    #[test]
+    fn live_growth_rebases_cached_rows_without_discarding_them() {
+        let pane = Uuid::new_v4();
+        let mut cache = ScrollbackCache::default();
+        cache.insert(pane, None, &window());
+        cache.advance(pane, 100, 110);
+        let hit = cache.get(pane, None, 20, 80, 20).unwrap();
+        assert_eq!(hit.total_scrolled_rows, 110);
+        assert_eq!(hit.total_scrolled_rows - hit.scrollback_offset as u64, 90);
+        assert!(cache.get(pane, None, 10, 80, 20).is_none());
+        cache.advance(pane, 110, 1);
+        assert!(cache.get(pane, None, 20, 80, 20).is_none());
     }
 
     #[test]

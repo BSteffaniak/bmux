@@ -554,9 +554,8 @@ use super::state::{
 use super::tui_surface::{buffer_render_ops, component_theme, surface_buffer};
 use crate::connection::CliAttachEndpointConnector;
 use crate::pane_runtime_client::{
-    BmuxPaneRuntimeClientExt, PaneGridWindowRequest, StreamingAttachInputExt,
-    attach_pane_grid_delta_state_streaming, attach_pane_grid_snapshot_state_streaming,
-    attach_pane_grid_window_state_streaming, attach_pane_scrollback_pin_streaming,
+    BmuxPaneRuntimeClientExt, StreamingAttachInputExt, attach_pane_grid_delta_state_streaming,
+    attach_pane_grid_snapshot_state_streaming, attach_pane_scrollback_pin_streaming,
     attach_pane_scrollback_unpin_streaming, pane_scrollback_rule_metadata_streaming,
 };
 use bmux_plugin::{RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderOp};
@@ -3691,6 +3690,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         view_state.bracketed_paste_enabled,
     )?;
     let mut attach_input_processor = InputProcessor::new(attach_keymap.clone(), keyboard_enhanced);
+    let async_service_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     let (async_service_tx, mut async_service_rx) = tokio::sync::mpsc::channel(16);
     view_state.async_services = Some(
         bmux_plugin::AsyncServiceClient::bind(
@@ -3896,19 +3896,69 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                 }
             }
 
+            history = async {
+                match view_state.scrollback_fetch.as_mut() {
+                    Some(fetch) => (&mut fetch.task).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let fetch = view_state.scrollback_fetch.take().expect("active history fetch");
+                let request = fetch.request;
+                let current = view_state.scrollback_for(request.pane);
+                let valid = view_state.attached_id == request.session
+                    && current.is_some_and(|view| view.pin == request.pin && view.offset == request.offset)
+                    && attach_pane_inner_size(&view_state, request.pane) == Some((request.width, request.rows));
+                let succeeded = matches!(&history, Ok(Ok(_)));
+                if valid {
+                    match history {
+                        Ok(Ok(window)) => {
+                            // Live responses may advance physical numbering. Old
+                            // entries must not be interpreted in the new epoch.
+                            if let Some(total) = request.total {
+                                view_state.scrollback_cache.advance(request.pane, total, window.total_scrolled_rows);
+                            }
+                            publish_scrollback_window(&mut view_state, request.pane, window);
+                            view_state.dirty.mark_pane_dirty(request.pane, AttachDirtySource::PaneOutput);
+                        }
+                        result => {
+                            let error = match result {
+                                Ok(Err(error)) => error,
+                                Err(error) => error.to_string(),
+                                Ok(Ok(_)) => unreachable!(),
+                            };
+                            view_state.set_transient_status(format!("history fetch failed: {error}"), Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
+                        }
+                    }
+                }
+                if !valid || succeeded {
+                    ensure_pane_scrollback_windows(&mut client, &mut view_state, false)?;
+                }
+            }
+
             Some(mut request) = async_service_rx.recv() => {
                 if !request.is_cancelled() {
-                    let result = client.request_raw(bmux_ipc::Request::InvokeService {
+                    let Ok(permit) = async_service_slots.clone().try_acquire_owned() else {
+                        let _ = request.respond(Err("async service request capacity exhausted".into()));
+                        continue;
+                    };
+                    let response = client.start_request(bmux_ipc::Request::InvokeService {
                         capability: request.capability.clone(), kind: request.kind,
                         interface_id: request.interface_id.clone(), operation: request.operation.clone(),
                         payload: std::mem::take(&mut request.payload),
-                    }).await.map_err(|error| error.to_string()).and_then(|response| {
+                    }).await;
+                    tokio::spawn(async move {
+                    let _permit = permit;
+                    let result = match response {
+                        Ok(response) => response.await,
+                        Err(error) => Err(error),
+                    }.map_err(|error| error.to_string()).and_then(|response| {
                         match response {
                             bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ServiceInvoked { payload }) => Ok(payload),
                             other => Err(format!("unexpected async service response: {other:?}")),
                         }
                     });
                     let _ = request.respond(result);
+                    });
                 }
             }
 
@@ -4557,7 +4607,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
             if drained_any_data
                 && !view_state.pane_scrollback.is_empty()
                 && let Err(error) =
-                    ensure_pane_scrollback_windows(&mut client, &mut view_state, true).await
+                    ensure_pane_scrollback_windows(&mut client, &mut view_state, true)
             {
                 view_state.set_transient_status(
                     format!(
@@ -9805,207 +9855,101 @@ async fn hydrate_attach_structured_grid_snapshots(
     Ok(hydrated)
 }
 
-/// Fetch bounded scrollback windows for every pane currently in scrollback.
-///
-/// Scrollback history is server-owned; this pulls one viewport-sized window per
-/// scrolled pane. The wire request is already multi-pane, so every pane in
-/// scrollback is refreshed in a single round trip. Keeping unfocused panes
-/// refreshed is what lets them stay frozen at their own offset while they keep
-/// producing output (the server's `anchor_total_scrolled_rows` handling).
+/// Resolve cached windows locally and schedule at most one missing history read.
+/// Completed live history remains anchored while output appends; mutable screen
+/// rows refresh through the same background route, never in the input handler.
 #[allow(
     clippy::too_many_lines,
     reason = "window selection, fallback and selection-anchor reconciliation form one ordered refresh workflow"
 )]
-async fn ensure_pane_scrollback_windows(
-    client: &mut StreamingBmuxClient,
+fn ensure_pane_scrollback_windows(
+    _client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     force_refresh: bool,
 ) -> std::result::Result<(), ClientError> {
-    if view_state.pane_scrollback.is_empty() {
-        return Ok(());
-    }
-
-    let mut captured_windows = Vec::new();
-    let mut retained_offsets = Vec::new();
-    let mut requests = Vec::new();
-    let mut requested_panes = BTreeSet::new();
-    for (pane_id, view) in &view_state.pane_scrollback {
-        let Some((width, rows)) = attach_pane_inner_size(view_state, *pane_id) else {
+    let mut ready = Vec::new();
+    let mut next = None;
+    for (pane, view) in &view_state.pane_scrollback {
+        let Some((width, rows)) = attach_pane_inner_size(view_state, *pane) else {
             continue;
         };
-        let cached_window = view_state
+        let previous = view_state
             .pane_buffers
-            .get(pane_id)
+            .get(pane)
             .and_then(|buffer| buffer.scrollback_window.as_ref());
-        // Live output cannot change an immutable capture. Only navigation or
-        // geometry changes require refreshing a pinned viewport.
-        if (!force_refresh || view.pin.is_some())
-            && cached_window.is_some_and(|window| {
+        // Completed history rows are stable during append; a viewport that
+        // still overlaps the live screen is mutable and must refresh.
+        let mutable_tail = force_refresh && view.pin.is_none() && view.offset < rows;
+        if mutable_tail {
+            view_state.scrollback_cache.invalidate(*pane);
+        }
+        if !mutable_tail
+            && previous.is_some_and(|window| {
                 window.scrollback_offset == view.offset
                     && window.rows.len() == rows
-                    && (window.projection_width == 0 || window.projection_width == width)
+                    && window.projection_width == width
             })
         {
             continue;
         }
-        if (force_refresh && view.pin.is_none()) || cached_window.is_none() {
-            view_state.scrollback_cache.invalidate(*pane_id);
+        if previous.is_none() {
+            view_state.scrollback_cache.invalidate(*pane);
         }
         if let Some(window) =
             view_state
                 .scrollback_cache
-                .get(*pane_id, view.pin, view.offset, width, rows)
+                .get(*pane, view.pin, view.offset, width, rows)
         {
-            captured_windows.push((*pane_id, window));
+            ready.push((*pane, window));
             continue;
         }
-        let fetch_rows = rows
-            .saturating_add(view.pin.map_or(32, |pin| {
-                pin.max_scrollback_offset
-                    .saturating_sub(view.offset)
-                    .min(32)
-            }))
-            .min(256)
-            .max(rows);
-        if let Some(pin) = view.pin {
-            let fetch = crate::pane_runtime_client::captured_history_window_outcome(
-                client,
-                view_state.attached_id,
-                *pane_id,
-                pin,
-                view.offset,
-                fetch_rows,
-                (
-                    width,
-                    cached_window.and_then(|window| window.row_anchors.last().copied()),
-                    cached_window
-                        .filter(|window| !window.row_anchors.is_empty())
-                        .map_or(0, |window| {
-                            let distance =
-                                isize::try_from(view.offset.abs_diff(window.scrollback_offset))
-                                    .unwrap_or(isize::MAX);
-                            if view.offset >= window.scrollback_offset {
-                                distance
-                            } else {
-                                -distance
-                            }
-                        }),
-                ),
-            );
-            match fetch.await {
-                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(window)) => {
-                    captured_windows.push((*pane_id, window));
-                    continue;
-                }
-                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) | Err(_) => {
-                    if fetch_rows != rows {
-                        // Near the oldest retained row, prefetch may exceed the
-                        // capture even though the requested viewport is valid.
-                        let fallback = crate::pane_runtime_client::captured_history_window_outcome(
-                            client,
-                            view_state.attached_id,
-                            *pane_id,
-                            pin,
-                            view.offset,
-                            rows,
-                            (
-                                width,
-                                cached_window.and_then(|window| window.row_anchors.last().copied()),
-                                cached_window
-                                    .filter(|window| !window.row_anchors.is_empty())
-                                    .map_or(0, |window| {
-                                        let distance = isize::try_from(
-                                            view.offset.abs_diff(window.scrollback_offset),
-                                        )
-                                        .unwrap_or(isize::MAX);
-                                        if view.offset >= window.scrollback_offset {
-                                            distance
-                                        } else {
-                                            -distance
-                                        }
-                                    }),
-                            ),
-                        )
-                        .await;
-                        if let Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(
-                            window,
-                        )) = fallback
-                        {
-                            captured_windows.push((*pane_id, window));
-                            continue;
+        if next.is_none() {
+            next = Some(super::scrollback_fetch::Request {
+                session: view_state.attached_id,
+                pane: *pane,
+                pin: view.pin,
+                offset: view.offset,
+                width,
+                rows,
+                total: previous
+                    .filter(|_| view.pin.is_none())
+                    .map(|window| window.total_scrolled_rows),
+                anchor: previous.and_then(|window| window.row_anchors.last().copied()),
+                delta: previous
+                    .filter(|window| !window.row_anchors.is_empty())
+                    .map_or(0, |window| {
+                        let distance =
+                            isize::try_from(view.offset.abs_diff(window.scrollback_offset))
+                                .unwrap_or(isize::MAX);
+                        if view.offset >= window.scrollback_offset {
+                            distance
+                        } else {
+                            -distance
                         }
-                    }
-                }
-            }
-            if let Some(window) = cached_window.filter(|window| !window.row_anchors.is_empty()) {
-                // This offset now counts local navigation steps. Sending it to
-                // snapshot transport would silently reinterpret it as capture
-                // rows. Keep the last coherent window on exhaustion/failure.
-                retained_offsets.push((*pane_id, window.scrollback_offset));
-                continue;
-            }
+                    }),
+            });
         }
-        requested_panes.insert(*pane_id);
-        requests.push(PaneGridWindowRequest {
-            pane_id: *pane_id,
-            scrollback_offset: view.offset,
-            rows: fetch_rows,
-            anchor_total_scrolled_rows: if view.pin.is_some() {
-                None
-            } else {
-                cached_window.map(|window| window.total_scrolled_rows)
-            },
-            pin_id: view.pin.map(|pin| pin.pin_id),
+    }
+    for (pane, window) in ready {
+        publish_scrollback_window(view_state, pane, window);
+    }
+    if view_state.scrollback_fetch.is_none()
+        && next.is_some()
+        && view_state.async_services.is_none()
+    {
+        return Err(ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: "asynchronous history route unavailable".into(),
         });
     }
-
-    for (pane_id, offset) in retained_offsets {
-        if let Some(view) = view_state.scrollback_for_mut(pane_id) {
-            view.offset = offset;
-        }
-    }
-    for (pane_id, window) in captured_windows {
-        publish_scrollback_window(view_state, pane_id, window);
-    }
-    if requests.is_empty() {
-        return Ok(());
-    }
-
-    let windows =
-        attach_pane_grid_window_state_streaming(client, view_state.attached_id, requests).await?;
-
-    for window in windows {
-        let pane_id = window.pane_id;
-        if !requested_panes.contains(&pane_id) {
-            continue;
-        }
-        let decoded = serde_json::from_slice::<bmux_terminal_grid::GridSnapshot>(&window.encoded)
-            .map_err(|error| ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("decoding structured scrollback window: {error}"),
-        })?;
-        let grid = bmux_terminal_grid::TerminalGrid::from_snapshot(
-            &decoded,
-            bmux_terminal_grid::GridLimits::default(),
-        )
-        .map_err(|error| ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("hydrating structured scrollback window: {error}"),
-        })?;
-
-        publish_scrollback_window(
-            view_state,
-            pane_id,
-            PaneScrollbackWindow {
-                projection_width: usize::from(decoded.width),
-                row_anchors: Vec::new(),
-                palette: grid.palette().clone(),
-                scrollback_offset: window.scrollback_offset,
-                max_scrollback_offset: window.max_scrollback_offset,
-                total_scrolled_rows: window.total_scrolled_rows,
-                rows: grid.display_rows(0, decoded.rows.len()),
-            },
-        );
+    if view_state.scrollback_fetch.is_none()
+        && let Some(request) = next
+        && let Some(client) = view_state.async_services.clone()
+    {
+        view_state.scrollback_fetch = Some(super::scrollback_fetch::Fetch {
+            request,
+            task: tokio::spawn(super::scrollback_fetch::fetch(client, request)),
+        });
     }
     Ok(())
 }
@@ -10074,6 +10018,7 @@ async fn handle_attach_mouse_scrollback_with_window(
     };
     let was_active = view_state.scrollback_active_for(pane_id);
     if !was_active {
+        view_state.scrollback_fetch = None;
         view_state.scrollback_cache.invalidate(pane_id);
     }
     let previous_pin = view_state.scrollback_for(pane_id).and_then(|view| view.pin);
@@ -10126,7 +10071,7 @@ async fn handle_attach_mouse_scrollback_with_window(
         }
     }
 
-    ensure_pane_scrollback_windows(client, view_state, false).await?;
+    ensure_pane_scrollback_windows(client, view_state, false)?;
 
     if matches!(kind, MouseEventKind::ScrollUp)
         && !was_active
@@ -10136,7 +10081,7 @@ async fn handle_attach_mouse_scrollback_with_window(
             .is_some_and(|view| view.offset == before_offset)
     {
         step_attach_scrollback_for(view_state, pane_id, -scroll_lines);
-        ensure_pane_scrollback_windows(client, view_state, false).await?;
+        ensure_pane_scrollback_windows(client, view_state, false)?;
     }
 
     Ok(true)
@@ -10332,7 +10277,7 @@ async fn handle_attach_ui_action_with_scrollback(
             | RuntimeAction::MoveCursorUp
     ) && view_state.scrollback_active();
     if needs_max_before {
-        ensure_pane_scrollback_windows(client, view_state, false).await?;
+        ensure_pane_scrollback_windows(client, view_state, false)?;
     }
 
     handle_attach_ui_action_at(action, view_state, now);
@@ -10348,7 +10293,7 @@ async fn handle_attach_ui_action_with_scrollback(
         pin_focused_scrollback_if_configured(client, view_state, &config, now).await;
     }
     if !view_state.pane_scrollback.is_empty() {
-        ensure_pane_scrollback_windows(client, view_state, false).await?;
+        ensure_pane_scrollback_windows(client, view_state, false)?;
     }
     Ok(())
 }
@@ -10392,6 +10337,7 @@ async fn hydrate_attach_state_from_snapshot_mode(
         view_state.pane_input_mode_hints.clear();
         // A different session or a full resync invalidates every cached view.
         view_state.pane_scrollback.clear();
+        view_state.scrollback_fetch = None;
         view_state.scrollback_cache = super::scrollback_cache::ScrollbackCache::default();
     } else {
         view_state
@@ -11401,8 +11347,7 @@ pub async fn handle_attach_terminal_event(
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
-                if let Err(error) = ensure_pane_scrollback_windows(client, view_state, false).await
-                {
+                if let Err(error) = ensure_pane_scrollback_windows(client, view_state, false) {
                     view_state.set_transient_status(
                         format!(
                             "scrollback window fetch failed: {}",
@@ -13045,7 +12990,7 @@ async fn handle_attach_mouse_event_at(
             {
                 let config = BmuxConfig::load().unwrap_or_default();
                 pin_focused_scrollback_if_configured(client, view_state, &config, now).await;
-                ensure_pane_scrollback_windows(client, view_state, false).await?;
+                ensure_pane_scrollback_windows(client, view_state, false)?;
             }
             return Ok(());
         }

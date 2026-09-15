@@ -1030,6 +1030,17 @@ impl StreamingBmuxClient {
     ///
     /// Returns an error if transport, serialization, or timeout occurs.
     pub async fn request_raw(&mut self, request: Request) -> Result<Response> {
+        self.start_request(request).await?.await
+    }
+
+    /// Send on this authenticated connection, returning an independently owned reply future.
+    ///
+    /// # Errors
+    /// Returns an error if serialization or sending fails.
+    pub async fn start_request(
+        &mut self,
+        request: Request,
+    ) -> Result<impl std::future::Future<Output = Result<Response>> + Send + 'static> {
         let request_id = self.take_request_id();
         let request_kind = request_kind_name(&request);
         let request_detail = request_detail(&request);
@@ -1053,73 +1064,87 @@ impl StreamingBmuxClient {
         }
 
         let send_started = std::time::Instant::now();
-        if let Err(e) = tokio::time::timeout(self.timeout, self.writer.send_envelope(&envelope))
-            .await
-            .map_err(|_| ClientError::Timeout(self.timeout))?
-        {
-            self.pending.lock().await.remove(&request_id);
-            return Err(ClientError::Transport(e));
+        match tokio::time::timeout(self.timeout, self.writer.send_envelope(&envelope)).await {
+            Ok(Ok(())) => {}
+            result => {
+                self.pending.lock().await.remove(&request_id);
+                return Err(match result {
+                    Ok(Err(error)) => ClientError::Transport(error),
+                    Err(_) => ClientError::Timeout(self.timeout),
+                    Ok(Ok(())) => unreachable!(),
+                });
+            }
         }
         let send_us = send_started.elapsed().as_micros();
 
-        let recv_started = std::time::Instant::now();
-        let response = tokio::time::timeout(self.timeout, rx)
-            .await
-            .map_err(|_| {
-                let elapsed_ms = started_at.elapsed().as_millis();
-                warn!(
-                    request_id,
-                    request = request_kind,
-                    request_detail = request_detail.as_str(),
-                    timeout_ms = self.timeout.as_millis(),
-                    elapsed_ms,
-                    "streaming_ipc.request.timeout"
-                );
-                let pending = Arc::clone(&self.pending);
-                let timed_out = Arc::clone(&self.timed_out);
-                tokio::spawn(async move {
-                    pending.lock().await.remove(&request_id);
-                    timed_out.lock().await.insert(
+        let timeout = self.timeout;
+        let pending = Arc::clone(&self.pending);
+        let timed_out = Arc::clone(&self.timed_out);
+        let reply_task = tokio::spawn(async move {
+            let recv_started = std::time::Instant::now();
+            let response = tokio::time::timeout(timeout, rx)
+                .await
+                .map_err(|_| {
+                    let elapsed_ms = started_at.elapsed().as_millis();
+                    warn!(
                         request_id,
-                        TimedOutRequest {
-                            request: request_kind,
-                            detail: request_detail,
-                            elapsed_ms,
-                        },
+                        request = request_kind,
+                        request_detail = request_detail.as_str(),
+                        timeout_ms = timeout.as_millis(),
+                        elapsed_ms,
+                        "streaming_ipc.request.timeout"
                     );
-                });
-                ClientError::Timeout(self.timeout)
-            })?
-            .map_err(|_| {
-                ClientError::Transport(IpcTransportError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "reader task dropped before response",
-                )))
-            })??;
-        let recv_us = recv_started.elapsed().as_micros();
+                    tokio::spawn(async move {
+                        pending.lock().await.remove(&request_id);
+                        timed_out.lock().await.insert(
+                            request_id,
+                            TimedOutRequest {
+                                request: request_kind,
+                                detail: request_detail,
+                                elapsed_ms,
+                            },
+                        );
+                    });
+                    ClientError::Timeout(timeout)
+                })?
+                .map_err(|_| {
+                    ClientError::Transport(IpcTransportError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "reader task dropped before response",
+                    )))
+                })??;
+            let recv_us = recv_started.elapsed().as_micros();
 
-        debug!(
-            request_id,
-            request = request_kind,
-            response = response_kind_name(&response),
-            duration_ms = started_at.elapsed().as_millis(),
-            "streaming_ipc.request.done"
-        );
-        emit_ipc_request_timing(
-            &request,
-            request_id,
-            response_kind_name(&response),
-            IpcClientTiming {
-                encode: encode_us,
-                send: send_us,
-                frame_encode: 0,
-                socket_write: 0,
-                recv: recv_us,
-                decode: 0,
-                total: started_at.elapsed().as_micros(),
-            },
-        );
-        Ok(response)
+            debug!(
+                request_id,
+                request = request_kind,
+                response = response_kind_name(&response),
+                duration_ms = started_at.elapsed().as_millis(),
+                "streaming_ipc.request.done"
+            );
+            emit_ipc_request_timing(
+                &request,
+                request_id,
+                response_kind_name(&response),
+                IpcClientTiming {
+                    encode: encode_us,
+                    send: send_us,
+                    frame_encode: 0,
+                    socket_write: 0,
+                    recv: recv_us,
+                    decode: 0,
+                    total: started_at.elapsed().as_micros(),
+                },
+            );
+            Ok(response)
+        });
+        Ok(async move {
+            reply_task.await.map_err(|error| {
+                ClientError::Transport(IpcTransportError::Io(std::io::Error::other(
+                    error.to_string(),
+                )))
+            })?
+        })
     }
 
     async fn request(&mut self, request: Request) -> Result<ResponsePayload> {

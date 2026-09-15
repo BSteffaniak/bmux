@@ -145,7 +145,7 @@ pub async fn attach_pane_grid_snapshot_state_streaming(
 }
 
 pub async fn attach_pane_grid_window_state_streaming(
-    client: &mut bmux_client::StreamingBmuxClient,
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     session_id: Uuid,
     windows: Vec<PaneGridWindowRequest>,
 ) -> ClientResult<Vec<PaneGridWindowResult>> {
