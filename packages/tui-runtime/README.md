@@ -21,6 +21,20 @@ Kitty and iTerm2 request 16×8 cells. Sixel uses a 128×96-pixel raster and rese
 These demos do not enter raw mode or the alternate screen. Image scrollback
 retention depends on the terminal/multiplexer, not the shell's command history.
 
+## Three-protocol alternate-screen demo
+
+```sh
+cargo run -p bmux_tui_runtime --example image_protocols --features image-kitty,image-sixel,image-iterm2,crossterm
+```
+
+Shows three labeled checkerboards simultaneously, emitting each source protocol
+independently. Press `q`, Escape, or Ctrl-C to quit. Resizing redraws the demo;
+windows smaller than 60×14 show a resize message. Sixel uses a 64×48-pixel raster
+(the other two request 12×6 cells), so sizes depend on font metrics. Use cells at
+least 4×8 pixels. Inside BMUX the source protocols are translated to the host's
+protocol; outside BMUX the terminal must support all three. The alternate screen
+and terminal modes are restored on exit.
+
 ## Image-capable presentation
 
 With the `images` feature, `ImageTerminalPresenter` connects protocol-neutral

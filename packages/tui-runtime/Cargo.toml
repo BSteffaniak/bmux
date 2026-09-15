@@ -22,6 +22,10 @@ required-features = ["image-sixel"]
 name              = "image_iterm2"
 required-features = ["image-iterm2"]
 
+[[example]]
+name              = "image_protocols"
+required-features = ["image-kitty", "image-sixel", "image-iterm2", "crossterm"]
+
 [dependencies]
 bmux_image   = { workspace = true, optional = true }
 bmux_tui     = { workspace = true }
