@@ -32,6 +32,7 @@ pub(super) async fn fetch(
 ) -> Result<PaneScrollbackWindow, String> {
     let rows = request.rows.saturating_add(32).min(256).max(request.rows);
     if let Some(pin) = request.pin {
+        let mut last_error = None;
         for count in [rows, request.rows] {
             let result = crate::pane_runtime_client::captured_history_window_outcome(
                 &mut client,
@@ -42,14 +43,17 @@ pub(super) async fn fetch(
                 count,
                 (request.width, request.anchor, request.delta),
             )
-            .await
-            .map_err(|error| error.to_string())?;
-            if let crate::pane_runtime_client::CapturedWindowOutcome::Window(window) = result {
-                return Ok(window);
+            .await;
+            match result {
+                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(window)) => {
+                    return Ok(window);
+                }
+                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) => {}
+                Err(error) => last_error = Some(error.to_string()),
             }
         }
         if request.anchor.is_some() {
-            return Err("captured history window unavailable".into());
+            return Err(last_error.unwrap_or_else(|| "captured history window unavailable".into()));
         }
     }
     let windows = crate::pane_runtime_client::attach_pane_grid_window_state_streaming(
