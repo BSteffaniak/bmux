@@ -137,6 +137,9 @@ impl ImageInterceptor {
     /// the cursor position at the right moment, then call
     /// `event.set_position(pos)` before passing to the registry.
     pub fn process(&mut self, input: &[u8]) -> InterceptResult {
+        // Bytes preceding a sequence split across reads were already delivered
+        // in the previous result. Its offset is relative to this new chunk.
+        self.capture_filtered_offset = 0;
         let mut filtered = Vec::with_capacity(input.len());
         #[allow(unused_mut)]
         let mut events = Vec::new();

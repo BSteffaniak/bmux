@@ -14,6 +14,14 @@ version     = { workspace = true }
 name              = "image_runtime"
 required-features = ["image-kitty"]
 
+[[example]]
+name              = "image_sixel"
+required-features = ["image-sixel"]
+
+[[example]]
+name              = "image_iterm2"
+required-features = ["image-iterm2"]
+
 [dependencies]
 bmux_image   = { workspace = true, optional = true }
 bmux_tui     = { workspace = true }

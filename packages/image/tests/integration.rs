@@ -8,6 +8,139 @@ mod pipeline {
     use bmux_image::registry::ImageRegistry;
 
     #[test]
+    fn split_sixel_offsets_are_relative_to_each_read() {
+        let mut interceptor = ImageInterceptor::new();
+        let first = interceptor.process(b"label\r\n\x1bPq\"1;1;2;6#1;2;100;0;0");
+        assert_eq!(first.filtered, b"label\r\n");
+        let second = interceptor.process(b"#1~~\x1b\\done");
+        assert_eq!(second.filtered, b"done");
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].filtered_byte_offset(), 0);
+    }
+
+    #[test]
+    fn inline_protocols_use_host_encoding_and_preserve_geometry() {
+        let rgba = vec![
+            255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255,
+        ];
+        let pixels = PixelBuffer {
+            data: rgba.clone(),
+            width: 2,
+            height: 2,
+            format: PixelFormat::Rgba8,
+        };
+        let mut png = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut png),
+            &rgba,
+            2,
+            2,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        let mut sixel = b"\x1bPq".to_vec();
+        sixel.extend(bmux_image::codec::sixel::encode(&pixels).unwrap());
+        sixel.extend_from_slice(b"\x1b\\");
+        let mut iterm = b"\x1b]1337;File=".to_vec();
+        iterm.extend(bmux_image::codec::iterm2::encode_body_with_cells(
+            &png, 16, 8,
+        ));
+        iterm.push(7);
+        for (wire, cols, rows) in [(sixel, 1, 1), (iterm, 16, 8)] {
+            let mut registry = ImageRegistry::default();
+            for mut event in ImageInterceptor::new().process(&wire).events {
+                event.set_position(ImagePosition { row: 3, col: 2 });
+                registry.handle_event(event, 10, 20);
+            }
+            let source = &registry.images()[0];
+            assert_eq!(source.cell_size, ImageCellSize { cols, rows });
+            assert_eq!(
+                source.pixel_size,
+                ImagePixelSize {
+                    width: 2,
+                    height: 2
+                }
+            );
+            let transport = bmux_attach_image_protocol::AttachPaneImage::from(source);
+            let restored = PaneImage::from(&transport);
+            for protocol in 0..3 {
+                let caps = bmux_image::host_caps::HostImageCapabilities {
+                    kitty_graphics: protocol == 0,
+                    sixel: protocol == 1,
+                    iterm2_inline: protocol == 2,
+                    cell_pixel_width: 10,
+                    cell_pixel_height: 20,
+                    ..Default::default()
+                };
+                let mut output = Vec::new();
+                bmux_image::compositor::render_pane_images_clipped(
+                    &mut output,
+                    std::slice::from_ref(&restored),
+                    bmux_image::compositor::PaneRect {
+                        x: 0,
+                        y: 0,
+                        w: 80,
+                        h: 24,
+                    },
+                    &[],
+                    &caps,
+                    &mut Default::default(),
+                )
+                .unwrap();
+                let mut decoded_registry = ImageRegistry::default();
+                for event in ImageInterceptor::new().process(&output).events {
+                    decoded_registry.handle_event(event, 10, 20);
+                }
+                assert_eq!(decoded_registry.images().len(), 1);
+                let image = &decoded_registry.images()[0];
+                assert_eq!(
+                    image.protocol,
+                    [
+                        ImageProtocol::KittyGraphics,
+                        ImageProtocol::Sixel,
+                        ImageProtocol::ITerm2
+                    ][protocol]
+                );
+                if protocol == 1 {
+                    let decoded =
+                        bmux_image::codec::sixel::decode(image.payload.raw.as_ref().unwrap())
+                            .unwrap();
+                    let (width, height) = if source.protocol == ImageProtocol::Sixel {
+                        (2, 2)
+                    } else {
+                        (160, 160)
+                    };
+                    assert_eq!((decoded.width, decoded.height), (width, height));
+                    for y in 0..height {
+                        for x in 0..width {
+                            let expected = if (x < width / 2) == (y < height / 2) {
+                                &rgba[..4]
+                            } else {
+                                &rgba[4..8]
+                            };
+                            let offset = ((y * width + x) * 4) as usize;
+                            assert_eq!(&decoded.data[offset..offset + 4], expected);
+                        }
+                    }
+                } else if protocol == 2 {
+                    let (_, bytes) =
+                        bmux_image::codec::iterm2::parse_body(image.payload.raw.as_ref().unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        image::load_from_memory(&bytes)
+                            .unwrap()
+                            .to_rgba8()
+                            .into_raw(),
+                        rgba
+                    );
+                } else {
+                    assert_eq!(image.payload.pixels.as_ref().unwrap().data, rgba);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn kitty_rgba_survives_attach_transport_and_host_rendering() {
         let rgba = vec![
             255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255,
@@ -227,8 +360,17 @@ mod pipeline {
 
         // Simulate an iTerm2 inline image OSC.
         let mut input = Vec::new();
-        input.extend_from_slice(b"\x1b]1337;File=inline=1:");
-        input.extend_from_slice(b"AAAA"); // base64 image data
+        input.extend_from_slice(b"\x1b]1337;File=");
+        let mut png = Vec::new();
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut png),
+            &[255, 0, 0, 255],
+            1,
+            1,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+        input.extend(bmux_image::codec::iterm2::encode_body(&png, true));
         input.push(0x07); // BEL terminator
 
         let result = interceptor.process(&input);

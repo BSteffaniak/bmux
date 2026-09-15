@@ -128,8 +128,7 @@ pub fn render_pane_images(
     Ok(())
 }
 
-/// Render only visible decoded fragments. Raw payloads are accepted only when
-/// no clipping is required; unsafe passthrough is rejected explicitly.
+/// Decode and render visible fragments using the host's selected protocol.
 pub fn render_pane_images_clipped(
     out: &mut impl Write,
     images: &[PaneImage],
@@ -161,8 +160,11 @@ pub fn render_pane_images_clipped(
         }
         for visible in fragments.into_iter().filter(|rect| !rect.is_empty()) {
             let mut fragment = image.clone();
+            // Decode even an unclipped image: its source protocol may differ
+            // from the host protocol, and passthrough would bypass negotiation.
+            fragment.payload.pixels = Some(clipping::decoded(image)?);
+            fragment.payload.raw = None;
             if visible != destination {
-                fragment.payload.pixels = Some(clipping::decoded(image)?);
                 fragment.pixel_size =
                     crate::tui::crop_to_visible(&mut fragment.payload, destination, visible);
                 fragment.payload.raw = None;
@@ -267,6 +269,47 @@ fn emit_from_pixels(
     match host_caps.preferred_protocol() {
         #[cfg(feature = "sixel")]
         Some(crate::model::ImageProtocol::Sixel) => {
+            let target_width =
+                u32::from(image.cell_size.cols) * u32::from(host_caps.cell_pixel_width);
+            let target_height =
+                u32::from(image.cell_size.rows) * u32::from(host_caps.cell_pixel_height);
+            let scaled;
+            let pixels = if image.protocol != crate::model::ImageProtocol::Sixel
+                && target_width > 0
+                && target_height > 0
+                && (target_width != pixels.width || target_height != pixels.height)
+            {
+                if u64::from(target_width) * u64::from(target_height) > 16 * 1024 * 1024 {
+                    return Err(std::io::Error::other(
+                        "sixel placement exceeds pixel budget",
+                    ));
+                }
+                let decoded = clipping::pixels(&image.payload)?;
+                let rgba = match decoded.format {
+                    crate::model::PixelFormat::Rgb8 => image::DynamicImage::ImageRgb8(
+                        image::RgbImage::from_raw(decoded.width, decoded.height, decoded.data)
+                            .ok_or_else(|| std::io::Error::other("invalid RGB image"))?,
+                    )
+                    .to_rgba8(),
+                    _ => image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.data)
+                        .ok_or_else(|| std::io::Error::other("invalid RGBA image"))?,
+                };
+                scaled = crate::model::PixelBuffer {
+                    data: image::imageops::resize(
+                        &rgba,
+                        target_width,
+                        target_height,
+                        image::imageops::FilterType::Nearest,
+                    )
+                    .into_raw(),
+                    width: target_width,
+                    height: target_height,
+                    format: crate::model::PixelFormat::Rgba8,
+                };
+                &scaled
+            } else {
+                pixels
+            };
             if let Some(sixel_data) = crate::codec::sixel::encode(pixels) {
                 out.write_all(b"\x1bPq")?;
                 out.write_all(&sixel_data)?;

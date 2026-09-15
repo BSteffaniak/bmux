@@ -114,13 +114,34 @@ impl ImageRegistry {
 
             #[cfg(feature = "iterm2")]
             ImageEvent::ITerm2Image { data, position, .. } => {
-                // iTerm2 images are base64-encoded; we don't know pixel size
-                // until decoding. Store with a placeholder size.
-                let pixel_size = ImagePixelSize {
-                    width: 0,
-                    height: 0,
+                let Some((params, bytes)) = crate::codec::iterm2::parse_body(&data) else {
+                    return;
                 };
-                let cell_size = ImageCellSize { rows: 1, cols: 1 };
+                if !params.inline {
+                    return;
+                }
+                let Some(pixel_size) = crate::codec::iterm2::estimate_pixel_size(&bytes) else {
+                    return;
+                };
+                let mut cell_size =
+                    pixel_size_to_cells(pixel_size, cell_pixel_width, cell_pixel_height);
+                // Bare numeric dimensions in OSC 1337 are terminal cells.
+                if let Some(cols) = params
+                    .width
+                    .as_deref()
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .filter(|value| *value > 0)
+                {
+                    cell_size.cols = cols;
+                }
+                if let Some(rows) = params
+                    .height
+                    .as_deref()
+                    .and_then(|value| value.parse::<u16>().ok())
+                    .filter(|value| *value > 0)
+                {
+                    cell_size.rows = rows;
+                }
                 self.add_image(
                     ImageProtocol::ITerm2,
                     ImagePayload {

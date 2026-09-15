@@ -4,6 +4,23 @@ Bounded, domain-neutral scheduling and presentation runtime for terminal user in
 
 The crate owns event admission, fair scheduling, commands, timers, redraw coalescing, render cadence, terminal input lifecycle, shutdown, and neutral runtime statistics. Application state and product behavior remain with the consumer.
 
+## Inline protocol examples
+
+Each example prints a red/blue checkerboard in the normal screen and exits,
+leaving the image above the shell prompt. Run each in a terminal supporting its
+protocol (or inside an updated BMUX, which translates to the host protocol):
+
+```sh
+cargo run -p bmux_tui_runtime --example image_runtime --features image-kitty
+cargo run -p bmux_tui_runtime --example image_sixel --features image-sixel
+cargo run -p bmux_tui_runtime --example image_iterm2 --features image-iterm2
+```
+
+Kitty and iTerm2 request 16×8 cells. Sixel uses a 128×96-pixel raster and reserves
+12 rows; use a terminal with at least 14 rows and cell height of at least 8 pixels.
+These demos do not enter raw mode or the alternate screen. Image scrollback
+retention depends on the terminal/multiplexer, not the shell's command history.
+
 ## Image-capable presentation
 
 With the `images` feature, `ImageTerminalPresenter` connects protocol-neutral
