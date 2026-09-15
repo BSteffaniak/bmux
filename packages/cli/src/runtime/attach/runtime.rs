@@ -9837,7 +9837,9 @@ async fn ensure_pane_scrollback_windows(
             .pane_buffers
             .get(pane_id)
             .and_then(|buffer| buffer.scrollback_window.as_ref());
-        if !force_refresh
+        // Live output cannot change an immutable capture. Only navigation or
+        // geometry changes require refreshing a pinned viewport.
+        if (!force_refresh || view.pin.is_some())
             && cached_window.is_some_and(|window| {
                 window.scrollback_offset == view.offset
                     && window.rows.len() == rows
@@ -9846,6 +9848,25 @@ async fn ensure_pane_scrollback_windows(
         {
             continue;
         }
+        if (force_refresh && view.pin.is_none()) || cached_window.is_none() {
+            view_state.scrollback_cache.invalidate(*pane_id);
+        }
+        if let Some(window) =
+            view_state
+                .scrollback_cache
+                .get(*pane_id, view.pin, view.offset, width, rows)
+        {
+            captured_windows.push((*pane_id, window));
+            continue;
+        }
+        let fetch_rows = rows
+            .saturating_add(view.pin.map_or(32, |pin| {
+                pin.max_scrollback_offset
+                    .saturating_sub(view.offset)
+                    .min(32)
+            }))
+            .min(256)
+            .max(rows);
         if let Some(pin) = view.pin {
             let fetch = crate::pane_runtime_client::captured_history_window_outcome(
                 client,
@@ -9853,7 +9874,7 @@ async fn ensure_pane_scrollback_windows(
                 *pane_id,
                 pin,
                 view.offset,
-                rows,
+                fetch_rows,
                 (
                     width,
                     cached_window.and_then(|window| window.row_anchors.last().copied()),
@@ -9876,7 +9897,45 @@ async fn ensure_pane_scrollback_windows(
                     captured_windows.push((*pane_id, window));
                     continue;
                 }
-                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) | Err(_) => {}
+                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) | Err(_) => {
+                    if fetch_rows != rows {
+                        // Near the oldest retained row, prefetch may exceed the
+                        // capture even though the requested viewport is valid.
+                        let fallback = crate::pane_runtime_client::captured_history_window_outcome(
+                            client,
+                            view_state.attached_id,
+                            *pane_id,
+                            pin,
+                            view.offset,
+                            rows,
+                            (
+                                width,
+                                cached_window.and_then(|window| window.row_anchors.last().copied()),
+                                cached_window
+                                    .filter(|window| !window.row_anchors.is_empty())
+                                    .map_or(0, |window| {
+                                        let distance = isize::try_from(
+                                            view.offset.abs_diff(window.scrollback_offset),
+                                        )
+                                        .unwrap_or(isize::MAX);
+                                        if view.offset >= window.scrollback_offset {
+                                            distance
+                                        } else {
+                                            -distance
+                                        }
+                                    }),
+                            ),
+                        )
+                        .await;
+                        if let Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(
+                            window,
+                        )) = fallback
+                        {
+                            captured_windows.push((*pane_id, window));
+                            continue;
+                        }
+                    }
+                }
             }
             if let Some(window) = cached_window.filter(|window| !window.row_anchors.is_empty()) {
                 // This offset now counts local navigation steps. Sending it to
@@ -9890,7 +9949,7 @@ async fn ensure_pane_scrollback_windows(
         requests.push(PaneGridWindowRequest {
             pane_id: *pane_id,
             scrollback_offset: view.offset,
-            rows,
+            rows: fetch_rows,
             anchor_total_scrolled_rows: if view.pin.is_some() {
                 None
             } else {
@@ -9938,13 +9997,13 @@ async fn ensure_pane_scrollback_windows(
             view_state,
             pane_id,
             PaneScrollbackWindow {
-                projection_width: 0,
+                projection_width: usize::from(decoded.width),
                 row_anchors: Vec::new(),
                 palette: grid.palette().clone(),
                 scrollback_offset: window.scrollback_offset,
                 max_scrollback_offset: window.max_scrollback_offset,
                 total_scrolled_rows: window.total_scrolled_rows,
-                rows: grid.viewport_rows(),
+                rows: grid.display_rows(0, decoded.rows.len()),
             },
         );
     }
@@ -9957,8 +10016,17 @@ async fn ensure_pane_scrollback_windows(
 fn publish_scrollback_window(
     view_state: &mut AttachViewState,
     pane_id: Uuid,
-    window: PaneScrollbackWindow,
+    mut window: PaneScrollbackWindow,
 ) {
+    let pin = view_state.scrollback_for(pane_id).and_then(|view| view.pin);
+    view_state.scrollback_cache.insert(pane_id, pin, &window);
+    if let Some((_, rows)) = attach_pane_inner_size(view_state, pane_id) {
+        let excess = window.rows.len().saturating_sub(rows);
+        window.rows.drain(..excess);
+        if !window.row_anchors.is_empty() {
+            window.row_anchors.drain(..excess);
+        }
+    }
     let previous_base = view_state
         .pane_buffers
         .get(&pane_id)
@@ -10005,6 +10073,9 @@ async fn handle_attach_mouse_scrollback_with_window(
         return Ok(false);
     };
     let was_active = view_state.scrollback_active_for(pane_id);
+    if !was_active {
+        view_state.scrollback_cache.invalidate(pane_id);
+    }
     let previous_pin = view_state.scrollback_for(pane_id).and_then(|view| view.pin);
     let before_offset = view_state
         .scrollback_for(pane_id)
@@ -10321,6 +10392,7 @@ async fn hydrate_attach_state_from_snapshot_mode(
         view_state.pane_input_mode_hints.clear();
         // A different session or a full resync invalidates every cached view.
         view_state.pane_scrollback.clear();
+        view_state.scrollback_cache = super::scrollback_cache::ScrollbackCache::default();
     } else {
         view_state
             .pane_buffers
