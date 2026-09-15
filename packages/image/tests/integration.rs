@@ -8,6 +8,46 @@ mod pipeline {
     use bmux_image::registry::ImageRegistry;
 
     #[test]
+    fn kitty_placement_replacement_and_deletion_remove_retained_images() {
+        let mut registry = ImageRegistry::default();
+        let mut interceptor = ImageInterceptor::new();
+        let mut wire = b"\x1b_".to_vec();
+        wire.extend(bmux_image::codec::kitty::encode_transmit(
+            42,
+            KittyFormat::Rgba,
+            &[255, 0, 0, 255],
+            1,
+            1,
+        ));
+        wire.extend_from_slice(b"\x1b\\\x1b_Ga=p,i=42,p=7;\x1b\\");
+        for event in interceptor.process(&wire).events {
+            registry.handle_event(event, 8, 16);
+        }
+        let old_id = registry.images()[0].id;
+        let sequence = registry.sequence();
+        for event in interceptor.process(b"\x1b_Ga=p,i=42,p=7;\x1b\\").events {
+            registry.handle_event(event, 8, 16);
+        }
+        assert_eq!(registry.images().len(), 1);
+        assert!(registry.delta_since(sequence).removed.contains(&old_id));
+        let current_id = registry.images()[0].id;
+        let sequence = registry.sequence();
+        for event in interceptor.process(b"\x1b_Ga=d,d=p,i=42,p=7;\x1b\\").events {
+            registry.handle_event(event, 8, 16);
+        }
+        assert!(registry.images().is_empty());
+        assert!(registry.delta_since(sequence).removed.contains(&current_id));
+        for event in interceptor
+            .process(b"\x1bPq#1;2;100;0;0~\x1b\\\x1b_Ga=p,i=42,p=8;\x1b\\\x1b_Ga=d,d=a;\x1b\\")
+            .events
+        {
+            registry.handle_event(event, 8, 16);
+        }
+        assert_eq!(registry.images().len(), 1);
+        assert_eq!(registry.images()[0].protocol, ImageProtocol::Sixel);
+    }
+
+    #[test]
     fn split_sixel_offsets_are_relative_to_each_read() {
         let mut interceptor = ImageInterceptor::new();
         let first = interceptor.process(b"label\r\n\x1bPq\"1;1;2;6#1;2;100;0;0");

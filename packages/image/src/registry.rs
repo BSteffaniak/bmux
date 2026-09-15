@@ -48,7 +48,7 @@ pub struct ImageRegistry {
     #[cfg(feature = "kitty")]
     kitty_transmitted: std::collections::BTreeMap<u32, crate::model::KittyTransmittedImage>,
     #[cfg(feature = "kitty")]
-    kitty_placements: Vec<crate::model::KittyPlacement>,
+    kitty_placements: std::collections::BTreeMap<(u32, u32), u64>,
     /// Accumulator for kitty chunked transmissions.
     #[cfg(feature = "kitty")]
     kitty_pending_chunks: std::collections::BTreeMap<u32, KittyChunkAccumulator>,
@@ -68,7 +68,7 @@ impl ImageRegistry {
             #[cfg(feature = "kitty")]
             kitty_transmitted: std::collections::BTreeMap::new(),
             #[cfg(feature = "kitty")]
-            kitty_placements: Vec::new(),
+            kitty_placements: std::collections::BTreeMap::new(),
             #[cfg(feature = "kitty")]
             kitty_pending_chunks: std::collections::BTreeMap::new(),
         }
@@ -210,6 +210,10 @@ impl ImageRegistry {
                 });
             }
         }
+        #[cfg(feature = "kitty")]
+        self.kitty_placements
+            .retain(|_, id| self.images.iter().any(|image| image.id == *id));
+        self.compact_change_log();
     }
 
     /// Compact the change log if it exceeds the maximum size.
@@ -404,6 +408,22 @@ impl ImageRegistry {
         }
     }
 
+    #[cfg(feature = "kitty")]
+    fn remove_image(&mut self, id: u64) {
+        self.kitty_placements
+            .retain(|_, retained_id| *retained_id != id);
+        let before = self.images.len();
+        self.images.retain(|image| image.id != id);
+        if self.images.len() != before {
+            self.sequence += 1;
+            self.change_log.push(ChangeLogEntry::Removed {
+                sequence: self.sequence,
+                image_id: id,
+            });
+            self.compact_change_log();
+        }
+    }
+
     /// Handle a kitty graphics command.
     #[cfg(feature = "kitty")]
     fn handle_kitty_command(
@@ -530,6 +550,11 @@ impl ImageRegistry {
                         }
                         png
                     };
+                    let key = (placement.image_id, placement.placement_id);
+                    if let Some(old_id) = self.kitty_placements.remove(&key) {
+                        self.remove_image(old_id);
+                    }
+                    let retained_id = self.next_id;
                     self.add_image(
                         ImageProtocol::KittyGraphics,
                         ImagePayload {
@@ -540,31 +565,42 @@ impl ImageRegistry {
                         cell_size,
                         pixel_size,
                     );
-                }
-                self.kitty_placements.push(placement);
-            }
-            KittyCommand::Delete { specifier } => {
-                match specifier {
-                    KittyDeleteSpecifier::All => self.clear(),
-                    KittyDeleteSpecifier::ByImageId(id) => {
-                        self.kitty_transmitted.remove(&id);
-                        self.kitty_placements.retain(|p| p.image_id != id);
-                        // Also remove rendered PaneImages from this kitty image.
-                        // For now, we don't track which PaneImage came from which
-                        // kitty image_id, so this is a TODO.
-                        self.sequence += 1;
-                    }
-                    KittyDeleteSpecifier::ByPlacementId {
-                        image_id,
-                        placement_id,
-                    } => {
-                        self.kitty_placements.retain(|p| {
-                            !(p.image_id == image_id && p.placement_id == placement_id)
-                        });
-                        self.sequence += 1;
+                    if self.images.iter().any(|image| image.id == retained_id) {
+                        self.kitty_placements.insert(key, retained_id);
                     }
                 }
             }
+            KittyCommand::Delete { specifier } => match specifier {
+                KittyDeleteSpecifier::All => {
+                    let ids = self.kitty_placements.values().copied().collect::<Vec<_>>();
+                    for id in ids {
+                        self.remove_image(id);
+                    }
+                }
+                KittyDeleteSpecifier::ByImageId(id) => {
+                    self.kitty_transmitted.remove(&id);
+                    let ids = self
+                        .kitty_placements
+                        .iter()
+                        .filter_map(|(&(image_id, _), &retained_id)| {
+                            (image_id == id).then_some(retained_id)
+                        })
+                        .collect::<Vec<_>>();
+                    for retained_id in ids {
+                        self.remove_image(retained_id);
+                    }
+                }
+                KittyDeleteSpecifier::ByPlacementId {
+                    image_id,
+                    placement_id,
+                } => {
+                    if let Some(retained_id) =
+                        self.kitty_placements.remove(&(image_id, placement_id))
+                    {
+                        self.remove_image(retained_id);
+                    }
+                }
+            },
             KittyCommand::Query { .. } => {
                 // Queries are forwarded, not stored.
             }
