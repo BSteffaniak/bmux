@@ -7,6 +7,65 @@ mod pipeline {
     use bmux_image::model::*;
     use bmux_image::registry::ImageRegistry;
 
+    #[test]
+    fn kitty_rgba_survives_attach_transport_and_host_rendering() {
+        let rgba = vec![
+            255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255,
+        ];
+        let mut wire = b"\x1b_".to_vec();
+        wire.extend(bmux_image::codec::kitty::encode_transmit(
+            42,
+            KittyFormat::Rgba,
+            &rgba,
+            2,
+            2,
+        ));
+        wire.extend_from_slice(b"\x1b\\\x1b_Ga=p,i=42,p=7,c=16,r=8,C=1,q=2;\x1b\\");
+        let mut interceptor = ImageInterceptor::new();
+        let mut registry = ImageRegistry::default();
+        for mut event in interceptor.process(&wire).events {
+            event.set_position(ImagePosition { row: 3, col: 5 });
+            registry.handle_event(event, 10, 20);
+        }
+        let image = &registry.images()[0];
+        assert_eq!(image.cell_size, ImageCellSize { rows: 8, cols: 16 });
+        let transported: bmux_attach_image_protocol::AttachPaneImage = image.into();
+        let restored = PaneImage::from(&transported);
+        let decoded = image::load_from_memory(restored.payload.raw.as_ref().unwrap())
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(decoded.into_raw(), rgba);
+        let caps = bmux_image::host_caps::HostImageCapabilities {
+            kitty_graphics: true,
+            ..Default::default()
+        };
+        for mode in [
+            bmux_image::config::ImageDecodeMode::Server,
+            bmux_image::config::ImageDecodeMode::Client,
+            bmux_image::config::ImageDecodeMode::Passthrough,
+        ] {
+            let mut output = Vec::new();
+            bmux_image::compositor::render_pane_images(
+                &mut output,
+                std::slice::from_ref(&restored),
+                bmux_image::compositor::PaneRect {
+                    x: 0,
+                    y: 0,
+                    w: 80,
+                    h: 24,
+                },
+                &caps,
+                mode,
+                &mut Default::default(),
+            )
+            .unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("f=100"));
+            assert!(text.contains("c=16,r=8"));
+            assert!(text.contains("\x1b[4;6H"));
+        }
+    }
+
     /// Full pipeline: sixel data flows from interceptor → registry → delta.
     #[test]
     fn sixel_intercept_to_registry_to_delta() {

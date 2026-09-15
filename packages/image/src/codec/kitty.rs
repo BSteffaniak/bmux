@@ -73,12 +73,12 @@ pub fn parse_command(body: &[u8], cursor_pos: ImagePosition) -> Option<KittyComm
                 .and_then(|v| v.parse::<i32>().ok())
                 .unwrap_or(0);
 
-            // Position: use cursor position if not specified in the command.
-            let col = parse_u32(&params, "C").map(|v| v as u16);
-            let row = parse_u32(&params, "R").map(|v| v as u16);
-            let position = ImagePosition {
-                row: row.unwrap_or(cursor_pos.row),
-                col: col.unwrap_or(cursor_pos.col),
+            // Kitty placements are anchored at the current cursor. C controls
+            // cursor movement; it is not a column coordinate.
+            let position = cursor_pos;
+            let cell_size = crate::model::ImageCellSize {
+                cols: u16::try_from(parse_u32(&params, "c").unwrap_or(0)).ok()?,
+                rows: u16::try_from(parse_u32(&params, "r").unwrap_or(0)).ok()?,
             };
 
             // Source rectangle for sub-image display.
@@ -101,6 +101,7 @@ pub fn parse_command(body: &[u8], cursor_pos: ImagePosition) -> Option<KittyComm
                 image_id,
                 placement_id,
                 position,
+                cell_size,
                 source_rect,
                 z_index,
             }))
@@ -278,8 +279,8 @@ mod tests {
 
     #[test]
     fn parse_place_command() {
-        let body = b"Ga=p,i=42,p=1,C=10,R=5";
-        let pos = ImagePosition { row: 0, col: 0 };
+        let body = b"Ga=p,i=42,p=1,C=1,c=16,r=8";
+        let pos = ImagePosition { row: 5, col: 10 };
         let cmd = parse_command(body, pos).unwrap();
         match cmd {
             KittyCommand::Place(placement) => {

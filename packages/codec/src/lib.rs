@@ -1003,6 +1003,27 @@ mod tests {
     }
 
     #[test]
+    fn raw_bytes_adapter_roundtrips_json() {
+        for maybe_payload in [None, Some(vec![]), Some(vec![0, 128, 255])] {
+            let value = WithRawBytesAdapter {
+                name: "image".into(),
+                payload: vec![0, 128, 255],
+                maybe_payload,
+            };
+            let json = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<WithRawBytesAdapter>(&json).unwrap(),
+                value
+            );
+            let json_value = serde_json::to_value(&value).unwrap();
+            assert_eq!(
+                serde_json::from_value::<WithRawBytesAdapter>(json_value).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
     fn raw_bytes_adapter_rejects_truncated_payload() {
         let value = WithRawBytesAdapter {
             name: "bytes".into(),

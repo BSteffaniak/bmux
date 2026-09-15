@@ -462,13 +462,58 @@ impl ImageRegistry {
                         width: transmitted.width,
                         height: transmitted.height,
                     };
-                    let cell_size =
+                    let mut cell_size =
                         pixel_size_to_cells(pixel_size, cell_pixel_width, cell_pixel_height);
+                    if placement.cell_size.cols > 0 {
+                        cell_size.cols = placement.cell_size.cols;
+                    }
+                    if placement.cell_size.rows > 0 {
+                        cell_size.rows = placement.cell_size.rows;
+                    }
+                    // Preserve the transmitted format rather than treating raw
+                    // RGB/RGBA bytes as an encoded PNG during host rendering.
+                    let format = match transmitted.format {
+                        crate::model::KittyFormat::Rgb => crate::model::PixelFormat::Rgb8,
+                        crate::model::KittyFormat::Rgba => crate::model::PixelFormat::Rgba8,
+                        crate::model::KittyFormat::Png => crate::model::PixelFormat::Png,
+                    };
+                    let pixels = crate::model::PixelBuffer {
+                        data: transmitted.data.clone(),
+                        width: transmitted.width,
+                        height: transmitted.height,
+                        format,
+                    };
+                    // The existing attach representation carries Kitty PNG
+                    // payloads. Normalize here without changing the wire format.
+                    let raw = if format == crate::model::PixelFormat::Png {
+                        pixels.data.clone()
+                    } else {
+                        use image::ImageEncoder;
+                        let color = if format == crate::model::PixelFormat::Rgb8 {
+                            image::ExtendedColorType::Rgb8
+                        } else {
+                            image::ExtendedColorType::Rgba8
+                        };
+                        let expected = u64::from(pixels.width)
+                            .checked_mul(u64::from(pixels.height))
+                            .and_then(|size| size.checked_mul(u64::from(color.channel_count())));
+                        if expected != Some(pixels.data.len() as u64) {
+                            return;
+                        }
+                        let mut png = Vec::new();
+                        if image::codecs::png::PngEncoder::new(&mut png)
+                            .write_image(&pixels.data, pixels.width, pixels.height, color)
+                            .is_err()
+                        {
+                            return;
+                        }
+                        png
+                    };
                     self.add_image(
                         ImageProtocol::KittyGraphics,
                         ImagePayload {
-                            raw: Some(transmitted.data.clone()),
-                            pixels: None,
+                            raw: Some(raw),
+                            pixels: Some(pixels),
                         },
                         placement.position,
                         cell_size,

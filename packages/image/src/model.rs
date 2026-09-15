@@ -65,7 +65,7 @@ pub struct ImagePosition {
 }
 
 /// How many cells an image occupies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageCellSize {
     pub rows: u16,
     pub cols: u16,
@@ -145,6 +145,9 @@ pub struct KittyPlacement {
     pub image_id: u32,
     pub placement_id: u32,
     pub position: ImagePosition,
+    /// Requested display extent in terminal cells (zero means automatic).
+    #[serde(default)]
+    pub cell_size: ImageCellSize,
     pub source_rect: Option<KittySourceRect>,
     pub z_index: i32,
 }
@@ -261,7 +264,11 @@ impl ImageEvent {
             #[cfg(feature = "sixel")]
             Self::SixelImage { position, .. } => *position = pos,
             #[cfg(feature = "kitty")]
-            Self::KittyCommand { .. } => {}
+            Self::KittyCommand { command, .. } => {
+                if let KittyCommand::Place(placement) = command {
+                    placement.position = pos;
+                }
+            }
             #[cfg(feature = "iterm2")]
             Self::ITerm2Image { position, .. } => *position = pos,
             #[allow(unreachable_patterns)]

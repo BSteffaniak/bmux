@@ -1,75 +1,38 @@
-//! Minimal protocol-neutral image presenter example.
+//! Print a Kitty image inline, leaving it in the terminal after exit.
 //!
-//! Run with a host protocol feature, for example:
 //! `cargo run -p bmux_tui_runtime --example image_runtime --features image-kitty`
+//! No alternate screen, raw mode, input reader, or image deletion is needed.
 
-use std::io;
+use std::io::{self, Write};
 
-use bmux_tui::geometry::Rect;
-use bmux_tui::image::{
-    ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
-};
-use bmux_tui_runtime::{
-    ImageTerminalPresenter, Program, Runtime, RuntimeConfig, RuntimeEvent, Update,
-};
-
-struct ExampleProgram {
-    presented: bool,
-}
-
-impl Program for ExampleProgram {
-    type Message = ();
-    type Error = std::convert::Infallible;
-
-    fn presentation_committed(&mut self, _report: bmux_tui_runtime::PresentReport) -> Update<()> {
-        self.presented = true;
-        Update::exit()
+fn main() -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    let id = std::process::id().max(1);
+    let pixels = [
+        255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255,
+    ];
+    writeln!(out, "BMUX inline image")?;
+    // Reserve space first (including at the bottom of the screen), then return
+    // to its top using relative movement. Never overwrite earlier shell output.
+    for _ in 0..8 {
+        writeln!(out)?;
     }
-
-    fn update(&mut self, _event: RuntimeEvent<()>) -> Result<Update<()>, Self::Error> {
-        Ok(Update::none())
+    write!(out, "\r\x1b[8A")?;
+    for chunk in bmux_image::codec::kitty::encode_transmit_chunks(
+        id,
+        bmux_image::KittyFormat::Rgba,
+        &pixels,
+        2,
+        2,
+    ) {
+        out.write_all(b"\x1b_")?;
+        out.write_all(&chunk)?;
+        out.write_all(b"\x1b\\")?;
     }
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let area = Rect::new(0, 0, 24, 6);
-    let terminal = bmux_tui::terminal::Terminal::new(io::stdout(), area);
-    let presenter = ImageTerminalPresenter::detect(
-        terminal,
-        |_: &mut ExampleProgram, cx: &mut bmux_tui::paint::PaintCx<'_, '_>| {
-            cx.write_line(
-                bmux_tui::paint::LocalRect::new(0, 0, 24, 1),
-                &bmux_tui::text::Line::raw("BMUX protocol-neutral image"),
-            );
-            cx.push_image(ImageContribution::Present(ImagePlacement {
-                key: ImageKey::new("example.checkerboard"),
-                payload: ImagePayload::Pixels {
-                    bytes: vec![
-                        255, 0, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255,
-                    ],
-                    width: 2,
-                    height: 2,
-                    format: ImagePixelFormat::Rgba8,
-                },
-                destination: Rect::new(0, 2, 4, 2),
-                clip: cx.clip(),
-                lifecycle: ImageLifecycle::Frame,
-            }));
-        },
-        bmux_image::ImageConfig::default(),
-    );
-    let (runtime, handle) = Runtime::new(
-        ExampleProgram { presented: false },
-        presenter,
-        RuntimeConfig::default(),
-    );
-    handle.request_redraw();
-    let mut output = match runtime.run().await {
-        Ok(output) => output,
-        Err(_) => return Err("image runtime failed".into()),
-    };
-    output.presenter.cleanup_images()?;
-    assert!(output.program.presented);
-    Ok(())
+    // C=1 keeps the cursor at the placement origin; advance below it ourselves.
+    write!(
+        out,
+        "\x1b_Ga=p,i={id},p={id},c=16,r=8,C=1,q=2;\x1b\\\x1b[8B\r"
+    )?;
+    out.flush()
 }

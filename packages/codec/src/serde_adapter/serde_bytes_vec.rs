@@ -22,6 +22,9 @@ pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     D: Deserializer<'de>,
 {
+    if deserializer.is_human_readable() {
+        return serde::Deserialize::deserialize(deserializer);
+    }
     deserializer.deserialize_byte_buf(ByteVecVisitor)
 }
 
@@ -97,6 +100,9 @@ pub mod option {
     where
         D: Deserializer<'de>,
     {
+        if deserializer.is_human_readable() {
+            return serde::Deserialize::deserialize(deserializer);
+        }
         deserializer.deserialize_option(OptionByteVecVisitor)
     }
 

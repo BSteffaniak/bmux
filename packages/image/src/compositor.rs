@@ -225,11 +225,12 @@ fn emit_passthrough(
 
             // Always re-place at the (potentially updated) position.
             out.write_all(b"\x1b_")?;
-            out.write_all(&crate::codec::kitty::encode_place(
+            out.write_all(&crate::codec::kitty::encode_place_with_z_and_cells(
                 host_image_id,
                 placement_id,
-                host_y,
-                host_x,
+                0,
+                image.cell_size.cols,
+                image.cell_size.rows,
             ))?;
             out.write_all(b"\x1b\\")?;
         }
