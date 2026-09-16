@@ -1626,7 +1626,7 @@ impl TerminalGrid {
     }
 
     pub(crate) fn scroll_region_up(&mut self, top: usize, bottom: usize, count: usize) {
-        if top >= bottom || bottom >= self.height {
+        if top > bottom || bottom >= self.height {
             return;
         }
         if top == 0 && bottom == self.height.saturating_sub(1) {
@@ -1645,7 +1645,7 @@ impl TerminalGrid {
     }
 
     pub(crate) fn scroll_region_down(&mut self, top: usize, bottom: usize, count: usize) {
-        if top >= bottom || bottom >= self.height {
+        if top > bottom || bottom >= self.height {
             return;
         }
         let fill = self.erase_style();
@@ -3182,6 +3182,23 @@ mod tests {
         let rows = grid.main_content_rows();
         let text = rows.iter().map(row_text).collect::<Vec<_>>();
         assert_eq!(text, vec!["before", "", "after"]);
+    }
+
+    #[test]
+    fn single_row_alternate_scroll_clears_content_without_main_history() {
+        for sequence in [b"\n".as_slice(), b"\x1bM"] {
+            let mut grid = TerminalGrid::new(10, 1, GridLimits::default()).unwrap();
+            grid.process(b"main\x1b[?1049halt");
+            grid.process(sequence);
+            assert_eq!(row_text(&grid.display_rows(0, 1)[0]), "");
+            assert_eq!(grid.total_scrolled_rows(), 0);
+            assert_eq!(
+                grid.viewport_scroll_revision(),
+                u64::from(sequence == b"\n")
+            );
+            grid.process(b"\x1b[?1049l");
+            assert_eq!(row_text(&grid.display_rows(0, 1)[0]), "main");
+        }
     }
 
     #[test]
