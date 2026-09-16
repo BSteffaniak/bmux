@@ -85,8 +85,13 @@ impl ImageHistorySnapshot {
             *row = mapped_row;
             image.position.col = column;
         }
+        // Exclude horizontally invisible placements before vertical cropping,
+        // which may decode payloads and must not fail for an invisible image.
+        projected
+            .registry
+            .history
+            .retain(|_, (image, _)| image.position.col < width);
         let mut images = projected.registry.project_viewport(0, height)?;
-        images.retain(|image| image.position.col < width);
         for image in &mut images {
             let columns = image.cell_size.cols.min(width - image.position.col);
             if columns < image.cell_size.cols {
@@ -1125,6 +1130,32 @@ mod tests {
             );
             assert_eq!(registry.images().len(), usize::from(resized > 4));
         }
+    }
+
+    #[test]
+    fn mapped_projection_skips_invisible_payload_before_cropping() {
+        let mut registry = ImageRegistry::default();
+        registry.add_image(
+            ImageProtocol::Sixel,
+            ImagePayload::default(),
+            ImagePosition { row: 0, col: 10 },
+            ImageCellSize { rows: 2, cols: 2 },
+            ImagePixelSize {
+                width: 16,
+                height: 32,
+            },
+        );
+        let snapshot = registry.capture_history(&mut 100_000).unwrap();
+        let projected = snapshot
+            .project_mapped(5, 1, &mut 100_000, |row, col| Ok((row, col)))
+            .unwrap();
+        assert!(projected.is_empty());
+        // The same payload must still fail if it is visible and needs cropping.
+        assert!(
+            snapshot
+                .project_mapped(20, 1, &mut 100_000, |row, col| Ok((row, col)))
+                .is_err()
+        );
     }
 
     #[test]
