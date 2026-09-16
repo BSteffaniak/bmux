@@ -2479,7 +2479,10 @@ impl PaneRuntimeHandle {
         let mut images_changed = false;
         if let Ok(mut grid) = self.terminal_grid.lock() {
             #[cfg(feature = "image-registry")]
-            if cols == tracker.cols && rows != tracker.rows && rows > 0 && images.has_main_images()
+            if (cols != tracker.cols || rows != tracker.rows)
+                && rows > 0
+                && cols > 0
+                && images.has_main_images()
             {
                 // Stage geometry before committing image projection and grids.
                 let mut budget = RESPONSE_OUTPUT_BUDGET;
@@ -2487,15 +2490,32 @@ impl PaneRuntimeHandle {
                 else {
                     return;
                 };
-                let Ok(Some(shift)) = resized.resize_with_main_row_shift(cols, rows) else {
+                let Ok(shift) = resized.resize_with_main_row_shift(cols, rows) else {
                     return;
                 };
                 if let Err(error) = images.remap_positions(rows, |row, column| {
-                    row.checked_sub(shift)
-                        .map(|row| (row, column))
-                        .ok_or_else(|| std::io::Error::other("image resize anchor overflow"))
+                    if let Some(shift) = shift {
+                        return row
+                            .checked_sub(shift)
+                            .map(|row| (row, column))
+                            .ok_or_else(|| std::io::Error::other("image resize anchor overflow"));
+                    }
+                    let (row, column) = tracker
+                        .terminal_grid
+                        .grid()
+                        .retained_position_after_resize(
+                            row,
+                            usize::from(column),
+                            cols,
+                            rows,
+                            &mut budget,
+                        )
+                        .map_err(|error| {
+                            std::io::Error::other(format!("image reflow anchor: {error:?}"))
+                        })?;
+                    Ok((row, u16::try_from(column).map_err(std::io::Error::other)?))
                 }) {
-                    warn!(%error, "image height resize failed; retaining previous geometry");
+                    warn!(%error, "image resize failed; retaining previous geometry");
                     return;
                 }
                 images
@@ -13576,6 +13596,82 @@ mod tests {
 
     #[cfg(feature = "image-registry")]
     #[tokio::test]
+    async fn width_resize_restores_image_from_pending_wrapped_line() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(2, 4);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijkl");
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        let original = pane
+            .image_registry
+            .lock()
+            .unwrap()
+            .project_viewport(1, 2)
+            .unwrap();
+        assert_eq!(original.len(), 1);
+        pane.resize_pty(2, 8);
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (2, 8));
+        assert_eq!(pane.image_registry.lock().unwrap().images(), original);
+        pane.resize_pty(2, 4);
+        let images = pane.image_registry.lock().unwrap();
+        assert!(images.images().is_empty());
+        assert_eq!(images.project_viewport(1, 2).unwrap(), original);
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn width_resize_remaps_hidden_history_without_exposing_images() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(2, 4);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut output =
+            interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijkl\x1b[?1049h");
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut protocol,
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        pane.resize_pty(2, 8);
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (2, 8));
+        assert!(pane.image_registry.lock().unwrap().images().is_empty());
+        let mut output = interceptor.process(b"\x1b[?1049l");
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut protocol,
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        let images = pane.image_registry.lock().unwrap();
+        assert_eq!(images.images().len(), 1);
+        assert_eq!(images.images()[0].position.row, 0);
+        assert_eq!(images.images()[0].position.col, 0);
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
     async fn height_resize_restores_image_from_pending_wrapped_line() {
         let pane_id = Uuid::new_v4();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -13711,6 +13807,56 @@ mod tests {
         assert!(pane.image_registry.lock().unwrap().images().is_empty());
         pane.resize_pty(5, 80);
         assert_eq!(pane.image_registry.lock().unwrap().images(), original);
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn unmappable_width_resize_preserves_images_and_both_grids() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(2, 8);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        // Placement in trailing blank cells has no retained text anchor.
+        let mut output = interceptor.process(b"\x1b[1;7H\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\");
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        let before = pane.image_registry.lock().unwrap().images().to_vec();
+        let sequence = pane.image_registry.lock().unwrap().sequence();
+        let revision = pane.terminal_grid.lock().unwrap().grid().revision();
+        let tracker_revision = pane
+            .cursor_tracker
+            .lock()
+            .unwrap()
+            .terminal_grid
+            .grid()
+            .revision();
+        pane.resize_pty(2, 4);
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (2, 8));
+        assert_eq!(
+            pane.terminal_grid.lock().unwrap().grid().revision(),
+            revision
+        );
+        assert_eq!(
+            pane.cursor_tracker
+                .lock()
+                .unwrap()
+                .terminal_grid
+                .grid()
+                .revision(),
+            tracker_revision
+        );
+        let images = pane.image_registry.lock().unwrap();
+        assert_eq!(images.images(), before);
+        assert_eq!(images.sequence(), sequence);
     }
 
     #[tokio::test]

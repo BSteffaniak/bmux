@@ -2273,6 +2273,209 @@ impl TerminalGrid {
         self.alt_rows[start..end].to_vec()
     }
 
+    /// Map a live main-screen cell through the logical lines used by resize.
+    /// The returned row is signed relative to the new viewport; negative rows
+    /// have moved into history. This does not mutate the source grid.
+    ///
+    /// # Errors
+    /// Rejects invalid dimensions, unavailable/trimmed cells, wide-cell
+    /// interiors, and captures exceeding the caller's allocation budget.
+    pub fn live_position_after_resize(
+        &self,
+        row: usize,
+        column: usize,
+        width: u16,
+        height: u16,
+        budget: &mut usize,
+    ) -> Result<(i64, usize), HistorySliceError> {
+        if width == 0 || height == 0 || row >= self.main_rows.len() || column >= self.width {
+            return Err(HistorySliceError::Unavailable);
+        }
+        if self.main_rows[row]
+            .cells()
+            .get(column)
+            .is_some_and(Cell::is_wide_continuation)
+        {
+            return Err(HistorySliceError::Unavailable);
+        }
+        self.charge_resize_working_copy(budget)?;
+        let mut capture = self
+            .try_clone_charged(budget)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let main_cursor = match self.mode {
+            GridMode::Main => self.cursor,
+            GridMode::Alternate => self.saved_cursor,
+        };
+        let mut source = std::mem::take(&mut capture.main_rows)
+            .into_iter()
+            .collect::<Vec<_>>();
+        Self::trim_resize_rows(&mut source, main_cursor);
+        if row >= source.len() {
+            return Err(HistorySliceError::Unavailable);
+        }
+        let anchor = capture
+            .live_cursor_anchor(
+                &source,
+                Cursor {
+                    row,
+                    col: column,
+                    visible: true,
+                },
+            )
+            .ok_or(HistorySliceError::Unavailable)?;
+        let lines = capture.live_logical_lines(&source);
+        let width = usize::from(width);
+        let total: usize = lines
+            .iter()
+            .map(|line| projected_row_count(&line.cells, width))
+            .sum();
+        let prefix: usize = lines
+            .iter()
+            .take(anchor.logical_line)
+            .map(|line| projected_row_count(&line.cells, width))
+            .sum();
+        let cells = &lines
+            .get(anchor.logical_line)
+            .ok_or(HistorySliceError::Unavailable)?
+            .cells;
+        let mapped =
+            crate::reflow::row_for_logical_column_retained(cells, width, anchor.logical_col, false)
+                .filter(|row| *row < projected_row_count(cells, width))
+                .ok_or(HistorySliceError::Unavailable)?;
+        let start = crate::reflow::logical_column_for_row_retained(cells, width, mapped, false)
+            .ok_or(HistorySliceError::Unavailable)?;
+        let absolute =
+            i64::try_from(prefix + mapped).map_err(|_| HistorySliceError::BudgetExhausted)?;
+        let top = i64::try_from(total.saturating_sub(usize::from(height)))
+            .map_err(|_| HistorySliceError::BudgetExhausted)?;
+        Ok((absolute - top, anchor.logical_col - start))
+    }
+
+    /// Map a retained main-screen position through resize. Negative input rows
+    /// address history relative to the old viewport. Output is relative to the
+    /// new viewport, before retention eviction.
+    ///
+    /// # Errors
+    /// Rejects unavailable anchors, invalid dimensions and exhausted budgets.
+    pub fn retained_position_after_resize(
+        &self,
+        row: i64,
+        column: usize,
+        width: u16,
+        height: u16,
+        budget: &mut usize,
+    ) -> Result<(i64, usize), HistorySliceError> {
+        if row >= 0 {
+            return self.live_position_after_resize(
+                usize::try_from(row).map_err(|_| HistorySliceError::Unavailable)?,
+                column,
+                width,
+                height,
+                budget,
+            );
+        }
+        if width == 0 || height == 0 || column >= self.width {
+            return Err(HistorySliceError::Unavailable);
+        }
+        let pending = projected_pending_row_count(&self.pending_history_cells, self.width);
+        let history = self.history_projected_row_count();
+        let absolute = i64::try_from(history + pending)
+            .ok()
+            .and_then(|base| base.checked_add(row))
+            .and_then(|row| usize::try_from(row).ok())
+            .ok_or(HistorySliceError::Unavailable)?;
+        self.charge_resize_working_copy(budget)?;
+        let mut capture = self
+            .try_clone_charged(budget)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let cursor = if self.mode == GridMode::Main {
+            self.cursor
+        } else {
+            self.saved_cursor
+        };
+        let mut source = std::mem::take(&mut capture.main_rows)
+            .into_iter()
+            .collect::<Vec<_>>();
+        Self::trim_resize_rows(&mut source, cursor);
+        let lines = capture.live_logical_lines(&source);
+        let width = usize::from(width);
+        let top = lines
+            .iter()
+            .map(|line| projected_row_count(&line.cells, width))
+            .sum::<usize>()
+            .saturating_sub(usize::from(height));
+        let (mapped, col) = if absolute < history {
+            let (mapped, col) = self.history_position_at_width(absolute, column, width, budget)?;
+            let history_rows: usize = self
+                .main_history
+                .iter()
+                .map(|line| projected_row_count(&line.cells, width))
+                .sum();
+            (
+                i64::try_from(mapped).map_err(|_| HistorySliceError::BudgetExhausted)?
+                    - i64::try_from(history_rows)
+                        .map_err(|_| HistorySliceError::BudgetExhausted)?,
+                col,
+            )
+        } else {
+            let logical = crate::reflow::logical_column_for_row_retained(
+                &self.pending_history_cells,
+                self.width,
+                absolute - history,
+                false,
+            )
+            .and_then(|start| start.checked_add(column))
+            .ok_or(HistorySliceError::Unavailable)?;
+            let cells = &lines[0].cells;
+            let mapped =
+                crate::reflow::row_for_logical_column_retained(cells, width, logical, false)
+                    .filter(|row| *row < projected_row_count(cells, width))
+                    .ok_or(HistorySliceError::Unavailable)?;
+            let start = crate::reflow::logical_column_for_row_retained(cells, width, mapped, false)
+                .ok_or(HistorySliceError::Unavailable)?;
+            (
+                i64::try_from(mapped).map_err(|_| HistorySliceError::BudgetExhausted)?,
+                logical - start,
+            )
+        };
+        Ok((
+            mapped - i64::try_from(top).map_err(|_| HistorySliceError::BudgetExhausted)?,
+            col,
+        ))
+    }
+
+    fn charge_resize_working_copy(&self, budget: &mut usize) -> Result<(), HistorySliceError> {
+        let text_bytes = self
+            .main_rows
+            .iter()
+            .flat_map(PhysicalRow::cells)
+            .try_fold(0usize, |bytes, cell| bytes.checked_add(cell.text().len()))
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let working = self
+            .main_rows
+            .len()
+            .checked_mul(self.width)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<Cell>() + 1))
+            .and_then(|bytes| bytes.checked_add(text_bytes))
+            .and_then(|bytes| bytes.checked_add(history_cells_bytes(&self.pending_history_cells)))
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        *budget = budget
+            .checked_sub(working)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        Ok(())
+    }
+
+    fn trim_resize_rows(source_rows: &mut Vec<PhysicalRow>, main_cursor: Cursor) {
+        while source_rows.len() > 1
+            && source_rows
+                .last()
+                .is_some_and(|row| row_is_blank(row) && !row.wrapped())
+            && main_cursor.row < source_rows.len().saturating_sub(1)
+        {
+            source_rows.pop();
+        }
+    }
+
     fn resize_main_viewport(
         &mut self,
         new_width: usize,
@@ -2287,14 +2490,7 @@ impl TerminalGrid {
         let mut source_rows = std::mem::take(&mut self.main_rows)
             .into_iter()
             .collect::<Vec<_>>();
-        while source_rows.len() > 1
-            && source_rows
-                .last()
-                .is_some_and(|row| row_is_blank(row) && !row.wrapped())
-            && main_cursor.row < source_rows.len().saturating_sub(1)
-        {
-            source_rows.pop();
-        }
+        Self::trim_resize_rows(&mut source_rows, main_cursor);
         let anchor = self.live_cursor_anchor(&source_rows, main_cursor);
         let live_lines = self.live_logical_lines(&source_rows);
         let projected_counts = live_lines
@@ -3295,6 +3491,65 @@ mod tests {
         assert_eq!(grid.main_row_count_at_width(4, &mut 0).unwrap(), 1);
         assert!(grid.main_row_count_at_width(0, &mut 100_000).is_err());
         assert!(grid.main_row_count_at_width(2, &mut 1).is_err());
+    }
+
+    #[test]
+    fn live_resize_anchor_uses_trimmed_lines_and_signed_history_rows() {
+        let mut grid = TerminalGrid::new(8, 3, GridLimits::default()).unwrap();
+        grid.process(b"abcdefghijkl");
+        assert_eq!(
+            grid.live_position_after_resize(1, 2, 4, 2, &mut 100_000)
+                .unwrap(),
+            (1, 2)
+        );
+        assert_eq!(
+            grid.live_position_after_resize(0, 0, 4, 2, &mut 100_000)
+                .unwrap(),
+            (-1, 0)
+        );
+        assert!(
+            grid.live_position_after_resize(2, 0, 4, 2, &mut 100_000)
+                .is_err()
+        );
+        assert!(grid.live_position_after_resize(0, 0, 4, 2, &mut 0).is_err());
+        grid.resize(4, 2).unwrap();
+        assert_eq!(grid.display_rows(0, 2)[1].cells()[2].text(), "k");
+    }
+
+    #[test]
+    fn retained_resize_anchor_maps_history_and_pending_prefix() {
+        let mut grid = TerminalGrid::new(4, 2, GridLimits::default()).unwrap();
+        grid.process(b"old\r\nabcdefghijkl");
+        assert_eq!(
+            grid.retained_position_after_resize(-1, 0, 8, 2, &mut 100_000)
+                .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            grid.retained_position_after_resize(-2, 0, 8, 2, &mut 100_000)
+                .unwrap(),
+            (-1, 0)
+        );
+        grid.resize(8, 2).unwrap();
+        assert_eq!(row_text(&grid.display_rows(0, 2)[0]), "abcdefgh");
+    }
+
+    #[test]
+    fn resize_working_budget_includes_grapheme_text() {
+        let mut grid = TerminalGrid::new(4, 2, GridLimits::default()).unwrap();
+        grid.process("a\u{301}\u{302}\u{303}".as_bytes());
+        let metadata = 8 * (std::mem::size_of::<Cell>() + 1);
+        let mut insufficient = metadata;
+        assert!(grid.charge_resize_working_copy(&mut insufficient).is_err());
+        let text_bytes: usize = grid
+            .main_rows
+            .iter()
+            .flat_map(PhysicalRow::cells)
+            .map(|cell| cell.text().len())
+            .sum();
+        let mut budget = metadata + text_bytes;
+        grid.charge_resize_working_copy(&mut budget).unwrap();
+        assert_eq!(budget, 0);
     }
 
     #[test]
