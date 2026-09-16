@@ -2426,6 +2426,16 @@ impl TerminalGrid {
             )
             .and_then(|start| start.checked_add(column))
             .ok_or(HistorySliceError::Unavailable)?;
+            let source_row = crate::reflow::row_for_logical_column_retained(
+                &self.pending_history_cells,
+                self.width,
+                logical,
+                false,
+            )
+            .ok_or(HistorySliceError::Unavailable)?;
+            if source_row != absolute - history {
+                return Err(HistorySliceError::Unavailable);
+            }
             let cells = &lines[0].cells;
             let mapped =
                 crate::reflow::row_for_logical_column_retained(cells, width, logical, false)
