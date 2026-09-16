@@ -721,9 +721,11 @@ fn control_read_error(error: ConsensusReadError) -> ControlServiceError {
 fn consensus_config(cluster_id: &str) -> Result<Arc<Config>, ConsensusRuntimeError> {
     let config = Config {
         cluster_name: cluster_id.to_owned(),
-        heartbeat_interval: 50,
-        election_timeout_min: 150,
-        election_timeout_max: 300,
+        // Authenticated peer RPCs include service dispatch and durable storage;
+        // allow those operations to finish before treating a healthy leader as lost.
+        heartbeat_interval: 100,
+        election_timeout_min: 750,
+        election_timeout_max: 1500,
         snapshot_policy: SnapshotPolicy::LogsSinceLast(SNAPSHOT_LOG_THRESHOLD),
         max_in_snapshot_log_to_keep: 0,
         purge_batch_size: 64,
