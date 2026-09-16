@@ -2354,6 +2354,28 @@ mod tests {
     }
 
     #[test]
+    fn retained_main_position_mapping_includes_pending_and_live_rows() {
+        let mut stream =
+            super::TerminalGridStream::new(4, 2, crate::GridLimits::default()).unwrap();
+        stream.process(b"abcdefghijkl");
+        let grid = stream.grid();
+        assert_eq!(
+            grid.main_position_at_width(0, 0, 8, &mut 100_000).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            grid.main_position_at_width(1, 0, 8, &mut 100_000).unwrap(),
+            (0, 4)
+        );
+        assert_eq!(
+            grid.main_position_at_width(2, 0, 8, &mut 100_000).unwrap(),
+            (1, 0)
+        );
+        assert!(grid.main_position_at_width(2, 0, 8, &mut 1).is_err());
+        assert!(grid.main_position_at_width(3, 0, 8, &mut 100_000).is_err());
+    }
+
+    #[test]
     fn captured_history_position_reflows_with_text_and_rejects_wide_interiors() {
         let mut stream =
             super::TerminalGridStream::new(4, 2, crate::GridLimits::default()).unwrap();

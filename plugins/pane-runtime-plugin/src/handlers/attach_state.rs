@@ -660,6 +660,20 @@ pub fn history_images(
     )
 }
 
+pub fn history_images_reflowed(
+    req: &HistoryImagesArgs,
+    ctx: &NativeServiceContext,
+) -> Result<bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1, AttachStateError> {
+    let encoded = crate::runtime::captured_image_window_reflowed(req, caller_client_id(ctx))
+        .map_err(|error| failed(error.to_string()))?;
+    Ok(
+        bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1 {
+            capture_id: req.capture_id,
+            encoded,
+        },
+    )
+}
+
 pub fn attach_pane_images(
     req: &AttachPaneImagesArgs,
     _ctx: &NativeServiceContext,

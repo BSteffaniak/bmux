@@ -66,6 +66,25 @@ pub struct ImageHistorySnapshot {
 }
 
 impl ImageHistorySnapshot {
+    /// Project captured placements through a caller-owned content mapping.
+    /// Mapping returns a viewport-relative row and column; source geometry stays
+    /// unchanged. The caller supplies the same captured text mapping for every
+    /// placement and charges its work independently of this allocation budget.
+    pub fn project_mapped(
+        &self,
+        height: u16,
+        budget: &mut usize,
+        mut map: impl FnMut(i64, u16) -> std::io::Result<(i64, u16)>,
+    ) -> std::io::Result<Vec<PaneImage>> {
+        let mut projected = self.registry.capture_history(budget)?;
+        for (image, row) in projected.registry.history.values_mut() {
+            let (mapped_row, column) = map(*row, image.position.col)?;
+            *row = mapped_row;
+            image.position.col = column;
+        }
+        projected.registry.project_viewport(0, height)
+    }
+
     /// Project this capture without observing subsequent output or deletion.
     pub fn project_viewport(&self, offset: usize, height: u16) -> std::io::Result<Vec<PaneImage>> {
         self.registry.project_viewport(offset, height)
@@ -368,6 +387,63 @@ impl ImageRegistry {
             Err(error) => {
                 for (_, row) in self.history.values_mut() {
                     *row = row.saturating_add(i64::from(lines));
+                }
+                return Err(error);
+            }
+        };
+        self.sequence += 1;
+        for old in &self.images {
+            if !projected.iter().any(|image| image.id == old.id) {
+                self.change_log.push(ChangeLogEntry::Removed {
+                    sequence: self.sequence,
+                    image_id: old.id,
+                });
+            }
+        }
+        for image in &projected {
+            self.change_log.push(ChangeLogEntry::Added {
+                sequence: self.sequence,
+                image: image.clone(),
+            });
+        }
+        self.images = projected;
+        self.compact_change_log();
+        Ok(())
+    }
+
+    /// Atomically remap retained normal-screen anchors during a geometry change.
+    /// The caller maps against the pre-resize text capture. A failed mapping or
+    /// crop leaves all placement state and revisions unchanged.
+    pub fn remap_positions(
+        &mut self,
+        height: u16,
+        mut map: impl FnMut(i64, u16) -> std::io::Result<(i64, u16)>,
+    ) -> std::io::Result<()> {
+        if let Some(normal) = self.normal_screen.as_mut() {
+            return normal.remap_positions(height, map);
+        }
+        let positions = self
+            .history
+            .iter()
+            .map(|(&id, (image, row))| map(*row, image.position.col).map(|position| (id, position)))
+            .collect::<std::io::Result<std::collections::BTreeMap<_, _>>>()?;
+        let original = self
+            .history
+            .iter()
+            .map(|(&id, (image, row))| (id, (*row, image.position.col)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for (id, (image, row)) in &mut self.history {
+            let (mapped_row, column) = positions[id];
+            *row = mapped_row;
+            image.position.col = column;
+        }
+        let projected = match self.project_viewport(0, height) {
+            Ok(projected) => projected,
+            Err(error) => {
+                for (id, (image, row)) in &mut self.history {
+                    let (old_row, column) = original[id];
+                    *row = old_row;
+                    image.position.col = column;
                 }
                 return Err(error);
             }

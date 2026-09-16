@@ -1312,6 +1312,12 @@ mod image_lifecycle_tests {
         assert_eq!(encode_captured_image_window(&pin, &request).unwrap(), b"[]");
         request.width = 40;
         assert!(encode_captured_image_window(&pin, &request).is_err());
+        request.scrollback_offset = 5;
+        let reflowed = encode_reflowed_image_window(&pin, &request).unwrap();
+        let reflowed: Vec<bmux_attach_image_protocol::AttachPaneImage> =
+            serde_json::from_slice(&reflowed).unwrap();
+        assert_eq!(reflowed.len(), 1);
+        assert_eq!(reflowed[0].position_row, 0);
         request.width = 80;
         request.scrollback_offset = 100;
         assert!(encode_captured_image_window(&pin, &request).is_err());
@@ -8340,9 +8346,24 @@ struct PaneExitEvent {
     pane_id: Uuid,
 }
 
+pub(crate) fn captured_image_window_reflowed(
+    request: &crate::handlers::attach_state::HistoryImagesArgs,
+    client: ClientId,
+) -> Result<Vec<u8>, SessionRuntimeError> {
+    captured_image_window_impl(request, client, true)
+}
+
 pub(crate) fn captured_image_window(
     request: &crate::handlers::attach_state::HistoryImagesArgs,
     client: ClientId,
+) -> Result<Vec<u8>, SessionRuntimeError> {
+    captured_image_window_impl(request, client, false)
+}
+
+fn captured_image_window_impl(
+    request: &crate::handlers::attach_state::HistoryImagesArgs,
+    client: ClientId,
+    reflow: bool,
 ) -> Result<Vec<u8>, SessionRuntimeError> {
     if request.rows == 0 || request.rows > 256 {
         return Err(SessionRuntimeError::ResponseBudgetExceeded);
@@ -8364,7 +8385,84 @@ pub(crate) fn captured_image_window(
             .ok_or(SessionRuntimeError::NotFound)?;
         Arc::clone(&pin.grid)
     };
-    encode_captured_image_window(&pin, request)
+    if reflow {
+        encode_reflowed_image_window(&pin, request)
+    } else {
+        encode_captured_image_window(&pin, request)
+    }
+}
+
+fn encode_reflowed_image_window(
+    pin: &CapturedPinGrid,
+    request: &crate::handlers::attach_state::HistoryImagesArgs,
+) -> Result<Vec<u8>, SessionRuntimeError> {
+    if request.width == 0 || request.width > 4096 || request.rows == 0 || request.rows > 256 {
+        return Err(SessionRuntimeError::ResponseBudgetExceeded);
+    }
+    let mut budget = RESPONSE_OUTPUT_BUDGET;
+    let count = pin.grid.main_row_count();
+    let (last_row, _) = pin
+        .grid
+        .main_position_at_width(
+            count.saturating_sub(1),
+            pin.grid.width().saturating_sub(1),
+            usize::from(request.width),
+            &mut budget,
+        )
+        .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
+    let projected_count = last_row
+        .checked_add(1)
+        .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+    let offset = request.scrollback_offset as usize;
+    if offset > projected_count.saturating_sub(pin.grid.height()) {
+        return Err(SessionRuntimeError::ResponseBudgetExceeded);
+    }
+    let top = i64::try_from(
+        projected_count
+            .saturating_sub(pin.grid.height())
+            .saturating_sub(offset),
+    )
+    .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
+    #[cfg(feature = "image-registry")]
+    let images = {
+        let snapshot = pin.images.as_ref().ok_or(SessionRuntimeError::NotFound)?;
+        let base = i64::try_from(count.saturating_sub(pin.grid.height()))
+            .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
+        let mut image_budget = RESPONSE_OUTPUT_BUDGET;
+        snapshot
+            .project_mapped(request.rows, &mut image_budget, |row, column| {
+                let absolute =
+                    usize::try_from(base.saturating_add(row)).map_err(std::io::Error::other)?;
+                let (row, column) = pin
+                    .grid
+                    .main_position_at_width(
+                        absolute,
+                        usize::from(column),
+                        usize::from(request.width),
+                        &mut budget,
+                    )
+                    .map_err(|error| {
+                        std::io::Error::other(format!("image anchor mapping: {error:?}"))
+                    })?;
+                Ok((
+                    i64::try_from(row).map_err(std::io::Error::other)? - top,
+                    u16::try_from(column).map_err(std::io::Error::other)?,
+                ))
+            })
+            .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?
+            .iter()
+            .map(bmux_attach_image_protocol::AttachPaneImage::from)
+            .collect::<Vec<_>>()
+    };
+    #[cfg(not(feature = "image-registry"))]
+    let images: Vec<bmux_attach_image_protocol::AttachPaneImage> = {
+        let _ = top;
+        Vec::new()
+    };
+    let mut count = EncodedByteCount(0, RESPONSE_OUTPUT_BUDGET);
+    serde_json::to_writer(&mut count, &images)
+        .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
+    serde_json::to_vec(&images).map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)
 }
 
 fn encode_captured_image_window(

@@ -823,6 +823,17 @@ interface attach-runtime-state {
         rows: u16,
     ) -> result<history-images-v1, attach-state-error>;
 
+    // Reflows captured anchors at width; offset is measured in projected rows.
+    query attach-history-images-v2(
+        session_id: uuid,
+        pane_id: uuid,
+        pin_id: u64,
+        capture_id: uuid,
+        width: u16,
+        scrollback_offset: u32,
+        rows: u16,
+    ) -> result<history-images-v1, attach-state-error>;
+
     query attach-pane-images(
         session_id: uuid,
         pane_ids: list<uuid>,

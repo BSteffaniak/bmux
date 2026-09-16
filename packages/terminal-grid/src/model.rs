@@ -1748,6 +1748,82 @@ impl TerminalGrid {
         Err(HistorySliceError::Unavailable)
     }
 
+    /// Map a position in the retained main screen into another presentation width.
+    /// Unlike `history_position_at_width`, includes pending and live rows and
+    /// preserves explicit row padding. Positions belong to this capture only.
+    /// `budget` bounds source materialization; work is bounded by admitted cells.
+    ///
+    /// # Errors
+    /// Rejects unavailable rows, zero widths, wide-cell interiors, and captures
+    /// exceeding the caller's allocation budget.
+    pub fn main_position_at_width(
+        &self,
+        row: usize,
+        column: usize,
+        width: usize,
+        budget: &mut usize,
+    ) -> Result<(usize, usize), HistorySliceError> {
+        let count = self.main_row_count();
+        if row >= count || column >= self.width || width == 0 {
+            return Err(HistorySliceError::Unavailable);
+        }
+        // The padded logical working copy can contain every source cell. Charge
+        // it separately from the physical snapshot, before allocating either.
+        let working = count
+            .checked_mul(self.width)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<Cell>() + 1))
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        *budget = budget
+            .checked_sub(working)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let rows = self
+            .try_display_rows_charged(0, count, true, budget)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let mut cells = Vec::new();
+        let mut start = 0usize;
+        let mut projected_start = 0usize;
+        let mut anchor = None;
+        for (index, physical) in rows.iter().enumerate() {
+            if index == row {
+                anchor = Some(
+                    (index - start)
+                        .checked_mul(self.width)
+                        .and_then(|prefix| prefix.checked_add(column))
+                        .ok_or(HistorySliceError::BudgetExhausted)?,
+                );
+            }
+            let text_bytes = physical
+                .cells()
+                .iter()
+                .try_fold(0usize, |total, cell| total.checked_add(cell.text().len()))
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            *budget = budget
+                .checked_sub(text_bytes)
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            cells.extend(row_logical_cells(physical, self.width));
+            if !physical.wrapped() || index + 1 == rows.len() {
+                if let Some(anchor) = anchor {
+                    let mapped_row =
+                        crate::reflow::row_for_logical_column_retained(&cells, width, anchor, true)
+                            .ok_or(HistorySliceError::Unavailable)?;
+                    let mapped_start = crate::reflow::logical_column_for_row_retained(
+                        &cells, width, mapped_row, true,
+                    )
+                    .ok_or(HistorySliceError::Unavailable)?;
+                    return Ok((projected_start + mapped_row, anchor - mapped_start));
+                }
+                projected_start = projected_start
+                    .checked_add(crate::reflow::projected_logical_line_row_count_retained(
+                        &cells, width, true,
+                    ))
+                    .ok_or(HistorySliceError::BudgetExhausted)?;
+                cells.clear();
+                start = index + 1;
+            }
+        }
+        Err(HistorySliceError::Unavailable)
+    }
+
     /// Read a bounded slice without allocating or projecting physical rows.
     ///
     /// The caller must bind `revision` and `line_index` to one capture identity;

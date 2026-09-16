@@ -217,6 +217,34 @@ mod pipeline {
     }
 
     #[test]
+    fn remapping_retained_positions_is_atomic_and_preserves_source_pixels() {
+        let mut registry = ImageRegistry::default();
+        let mut interceptor = ImageInterceptor::new();
+        for event in interceptor
+            .process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\")
+            .events
+        {
+            registry.handle_event(event, 8, 16);
+        }
+        let original = registry.images()[0].clone();
+        let revision = registry.sequence();
+        assert!(
+            registry
+                .remap_positions(24, |_, _| Err(std::io::Error::other("unavailable anchor")))
+                .is_err()
+        );
+        assert_eq!(registry.sequence(), revision);
+        assert_eq!(registry.images()[0], original);
+        registry
+            .remap_positions(24, |row, col| Ok((row + 2, col + 3)))
+            .unwrap();
+        assert_eq!(registry.images()[0].position.row, 2);
+        assert_eq!(registry.images()[0].position.col, 3);
+        assert_eq!(registry.images()[0].payload, original.payload);
+        assert_eq!(registry.delta_since(revision).added[0].position.row, 2);
+    }
+
+    #[test]
     fn split_sixel_offsets_are_relative_to_each_read() {
         let mut interceptor = ImageInterceptor::new();
         let first = interceptor.process(b"label\r\n\x1bPq\"1;1;2;6#1;2;100;0;0");
