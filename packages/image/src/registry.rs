@@ -58,7 +58,56 @@ pub struct ImageRegistry {
     kitty_pending_chunks: std::collections::BTreeMap<u32, KittyChunkAccumulator>,
 }
 
+/// Immutable retained placements for a text capture. No live delta log or
+/// in-progress protocol transfers are copied into a history pin.
+#[derive(Clone)]
+pub struct ImageHistorySnapshot {
+    registry: ImageRegistry,
+}
+
+impl ImageHistorySnapshot {
+    /// Project this capture without observing subsequent output or deletion.
+    pub fn project_viewport(&self, offset: usize, height: u16) -> std::io::Result<Vec<PaneImage>> {
+        self.registry.project_viewport(offset, height)
+    }
+}
+
 impl ImageRegistry {
+    /// Copy retained placements only after charging their complete allocation.
+    /// The caller must capture text under the same execution-state lock boundary.
+    pub fn capture_history(&self, budget: &mut usize) -> std::io::Result<ImageHistorySnapshot> {
+        let source = self.normal_screen.as_deref().unwrap_or(self);
+        let bytes = source
+            .history
+            .values()
+            .try_fold(std::mem::size_of::<ImageRegistry>(), |total, (image, _)| {
+                total
+                    .checked_add(std::mem::size_of::<PaneImage>() + 128)
+                    .and_then(|total| {
+                        total.checked_add(image.payload.raw.as_ref().map_or(0, Vec::len))
+                    })
+                    .and_then(|total| {
+                        total.checked_add(
+                            image
+                                .payload
+                                .pixels
+                                .as_ref()
+                                .map_or(0, |pixels| pixels.data.len()),
+                        )
+                    })
+            })
+            .ok_or_else(|| std::io::Error::other("image capture size overflow"))?;
+        let remaining = budget
+            .checked_sub(bytes)
+            .ok_or_else(|| std::io::Error::other("image capture budget exhausted"))?;
+        let mut registry = Self::new(source.max_images, source.max_bytes);
+        registry.history = source.history.clone();
+        registry.sequence = source.sequence;
+        registry.next_id = source.next_id;
+        *budget = remaining;
+        Ok(ImageHistorySnapshot { registry })
+    }
+
     /// Create a new empty registry.
     pub fn new(max_images: usize, max_bytes: usize) -> Self {
         Self {

@@ -221,6 +221,9 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "attach-runtime-state", "attach-pane-grid-delta-state" => |req: attach_state::AttachPaneGridDeltaArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_delta_state(&req, ctx))
         },
+        "attach-runtime-state", "attach-history-images-v1" => |req: attach_state::HistoryImagesArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::history_images(&req, ctx))
+        },
         "attach-runtime-state", "attach-pane-images" => |req: attach_state::AttachPaneImagesArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_images(&req, ctx))
         },

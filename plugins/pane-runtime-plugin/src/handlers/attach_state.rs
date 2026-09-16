@@ -635,6 +635,31 @@ pub fn attach_pane_grid_delta_state(
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryImagesArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub pin_id: u64,
+    pub capture_id: Uuid,
+    pub width: u16,
+    pub scrollback_offset: u32,
+    pub rows: u16,
+}
+
+pub fn history_images(
+    req: &HistoryImagesArgs,
+    ctx: &NativeServiceContext,
+) -> Result<bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1, AttachStateError> {
+    let encoded = crate::runtime::captured_image_window(req, caller_client_id(ctx))
+        .map_err(|error| failed(error.to_string()))?;
+    Ok(
+        bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1 {
+            capture_id: req.capture_id,
+            encoded,
+        },
+    )
+}
+
 pub fn attach_pane_images(
     req: &AttachPaneImagesArgs,
     _ctx: &NativeServiceContext,

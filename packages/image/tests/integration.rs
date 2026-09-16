@@ -195,6 +195,28 @@ mod pipeline {
     }
 
     #[test]
+    fn history_capture_is_bounded_and_independent_of_live_mutations() {
+        let mut registry = ImageRegistry::default();
+        let mut interceptor = ImageInterceptor::new();
+        for event in interceptor
+            .process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\")
+            .events
+        {
+            registry.handle_event(event, 8, 16);
+        }
+        let mut insufficient = 1;
+        assert!(registry.capture_history(&mut insufficient).is_err());
+        assert_eq!(insufficient, 1);
+        registry.scroll_up(2).unwrap();
+        let mut budget = 1024 * 1024;
+        let capture = registry.capture_history(&mut budget).unwrap();
+        assert!(budget < 1024 * 1024);
+        registry.reset();
+        assert_eq!(capture.project_viewport(2, 10).unwrap().len(), 1);
+        assert!(registry.project_viewport(2, 10).unwrap().is_empty());
+    }
+
+    #[test]
     fn split_sixel_offsets_are_relative_to_each_read() {
         let mut interceptor = ImageInterceptor::new();
         let first = interceptor.process(b"label\r\n\x1bPq\"1;1;2;6#1;2;100;0;0");

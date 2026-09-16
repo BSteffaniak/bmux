@@ -95,11 +95,7 @@ fn admit_retained_pin(
             if *id == session_id && *key == (client_id, pane_id) {
                 continue;
             }
-            let bytes = pin
-                .grid
-                .grid
-                .retained_capacity_bytes()
-                .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+            let bytes = pin.grid.reservation.bytes;
             remaining = remaining
                 .checked_sub(bytes)
                 .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
@@ -592,13 +588,21 @@ impl Drop for PinReservation {
 
 struct CapturedPinGrid {
     grid: TerminalGrid,
+    #[cfg(feature = "image-registry")]
+    images: Option<bmux_image::registry::ImageHistorySnapshot>,
     // Drop the grid before releasing its charge, including for retired readers.
     reservation: PinReservation,
 }
 
+#[cfg(not(feature = "image-registry"))]
 impl CapturedPinGrid {
     fn new(grid: TerminalGrid, reservation: PinReservation) -> Result<Self, SessionRuntimeError> {
-        let mut captured = Self { grid, reservation };
+        let mut captured = Self {
+            grid,
+            reservation,
+            #[cfg(feature = "image-registry")]
+            images: None,
+        };
         captured.reservation.shrink(
             captured
                 .grid
@@ -1258,6 +1262,103 @@ fn image_terminal_bytes(
 #[cfg(all(test, feature = "image-registry"))]
 mod image_lifecycle_tests {
     use super::*;
+
+    #[test]
+    fn pinned_image_query_projects_history_and_rejects_incompatible_geometry() {
+        let mut tracker = PaneCursorTracker::new(3, 80);
+        let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut registry = bmux_image::ImageRegistry::default();
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n");
+        ordered_image_output(
+            &mut tracker,
+            &mut protocol,
+            &mut registry,
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let mut budget = RESPONSE_OUTPUT_BUDGET;
+        let images = registry.capture_history(&mut budget).unwrap();
+        let grid = tracker
+            .terminal_grid
+            .grid()
+            .try_clone_charged(&mut budget)
+            .unwrap();
+        let bytes = RESPONSE_OUTPUT_BUDGET - budget;
+        let pin = CapturedPinGrid {
+            grid,
+            images: Some(images),
+            reservation: PinReservation::acquire(&Arc::new(AtomicUsize::new(0)), bytes).unwrap(),
+        };
+        registry.reset();
+        let mut request = crate::handlers::attach_state::HistoryImagesArgs {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            pin_id: 1,
+            capture_id: Uuid::new_v4(),
+            width: 80,
+            scrollback_offset: 1,
+            rows: 3,
+        };
+        let encoded = encode_captured_image_window(&pin, &request).unwrap();
+        let images: Vec<bmux_attach_image_protocol::AttachPaneImage> =
+            serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].position_row, 0);
+        assert!(!images[0].raw_data.is_empty());
+        request.scrollback_offset = 0;
+        assert_eq!(encode_captured_image_window(&pin, &request).unwrap(), b"[]");
+        request.width = 40;
+        assert!(encode_captured_image_window(&pin, &request).is_err());
+        request.width = 80;
+        request.scrollback_offset = 100;
+        assert!(encode_captured_image_window(&pin, &request).is_err());
+    }
+
+    #[test]
+    fn scroll_then_place_uses_final_cursor_without_double_processing() {
+        let image = b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\";
+        let mut bytes = b"one\r\ntwo\r\nthree\r\nfour\r\n".to_vec();
+        bytes.extend_from_slice(image);
+        for split in 0..=bytes.len() {
+            let mut tracker = PaneCursorTracker::new(3, 80);
+            let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+            let mut registry = bmux_image::ImageRegistry::default();
+            let mut interceptor = bmux_image::ImageInterceptor::new();
+            for chunk in [&bytes[..split], &bytes[split..]] {
+                let mut output = interceptor.process(chunk);
+                ordered_image_output(
+                    &mut tracker,
+                    &mut protocol,
+                    &mut registry,
+                    &mut output,
+                    (8, 16),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            }
+            assert_eq!(registry.images().len(), 1, "split {split}");
+            assert_eq!(registry.images()[0].position.row, 2, "split {split}");
+            for _ in 0..3 {
+                let mut output = interceptor.process(b"\r\n");
+                ordered_image_output(
+                    &mut tracker,
+                    &mut protocol,
+                    &mut registry,
+                    &mut output,
+                    (8, 16),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            }
+            assert!(registry.images().is_empty());
+            let historical = registry.project_viewport(3, 3).unwrap();
+            assert_eq!(historical.len(), 1, "split {split}");
+            assert_eq!(historical[0].position.row, 2);
+        }
+    }
 
     #[test]
     fn screen_switches_and_erases_preserve_stream_order_at_every_split() {
@@ -4538,14 +4639,13 @@ impl SessionRuntimeManager {
                                 #[cfg(feature = "image-registry")]
                                 let mut image_protocol_reply = Vec::new();
                                 #[cfg(feature = "image-registry")]
+                                let Ok(mut registry) = image_registry_for_reader.lock() else { break; };
+                                #[cfg(feature = "image-registry")]
                                 let chunk = {
                                     let mut result = image_interceptor.process(chunk);
 
                                     let (cpw, cph) =
                                         cell_pixel_size_for_reader.lock().map_or((8, 16), |s| *s);
-                                    let Ok(mut registry) = image_registry_for_reader.lock() else {
-                                        break;
-                                    };
                                     let before = registry.sequence();
                                     if let Err(error) = ordered_image_output(
                                         &mut cursor_tracker,
@@ -4562,7 +4662,6 @@ impl SessionRuntimeManager {
                                         break;
                                     }
                                     let changed = registry.sequence() != before;
-                                    drop(registry);
                                     if changed
                                         && image_dirty_for_reader
                                             .compare_exchange(
@@ -4657,6 +4756,8 @@ impl SessionRuntimeManager {
                                 {
                                     break;
                                 }
+                                #[cfg(feature = "image-registry")]
+                                drop(registry);
                                 // Notify streaming clients that new output is available.
                                 // Only emit when transitioning false→true to coalesce
                                 // thousands of per-chunk writes into ~1 event per fetch cycle.
@@ -7650,6 +7751,20 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         let reservation =
             PinReservation::acquire(&self.retained_pin_bytes, RESPONSE_OUTPUT_BUDGET)?;
         let mut capture_budget = RESPONSE_OUTPUT_BUDGET;
+        // Same order as the PTY writer: image state, grid, then output.
+        #[cfg(feature = "image-registry")]
+        let image_guard = pane
+            .image_registry
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?;
+        #[cfg(feature = "image-registry")]
+        let image_budget_before = capture_budget;
+        #[cfg(feature = "image-registry")]
+        let captured_images = image_guard
+            .capture_history(&mut capture_budget)
+            .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
+        #[cfg(feature = "image-registry")]
+        let image_bytes = image_budget_before - capture_budget;
         let (captured_grid, stream_end) = {
             let grid = pane
                 .terminal_grid
@@ -7666,6 +7781,8 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 .end_offset();
             (captured_grid, stream_end)
         };
+        #[cfg(feature = "image-registry")]
+        drop(image_guard);
         let width =
             u16::try_from(captured_grid.width()).map_err(|_| SessionRuntimeError::Closed)?;
         let height =
@@ -7688,7 +7805,22 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         drop(full_snapshot);
         // Couple storage and charge before entering the publication closure: its
         // early returns and lock failures must free storage before admission.
+        #[cfg(not(feature = "image-registry"))]
         let captured = Arc::new(CapturedPinGrid::new(captured_grid, reservation)?);
+        #[cfg(feature = "image-registry")]
+        let captured = {
+            let bytes = captured_grid
+                .retained_capacity_bytes()
+                .and_then(|bytes| bytes.checked_add(image_bytes))
+                .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+            let mut reservation = reservation;
+            reservation.shrink(bytes)?;
+            Arc::new(CapturedPinGrid {
+                grid: captured_grid,
+                images: Some(captured_images),
+                reservation,
+            })
+        };
         self.with_lock_named("attach_scrollback_pin.store", |manager| {
             admit_retained_pin(manager, session_id, client_id, pane_id, &captured.grid)?;
             let runtime = manager
@@ -8206,6 +8338,62 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
 struct PaneExitEvent {
     session_id: SessionId,
     pane_id: Uuid,
+}
+
+pub(crate) fn captured_image_window(
+    request: &crate::handlers::attach_state::HistoryImagesArgs,
+    client: ClientId,
+) -> Result<Vec<u8>, SessionRuntimeError> {
+    if request.rows == 0 || request.rows > 256 {
+        return Err(SessionRuntimeError::ResponseBudgetExceeded);
+    }
+    let handle = pane_padding_handle().ok_or(SessionRuntimeError::Closed)?;
+    let pin = {
+        let manager = handle.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
+        let runtime = manager
+            .runtimes
+            .get(&SessionId(request.session_id))
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if !runtime.attached_clients.contains(&client) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
+        let pin = runtime
+            .scrollback_pins
+            .get(&(client, request.pane_id))
+            .filter(|pin| pin.id == request.pin_id && pin.capture_id == request.capture_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        Arc::clone(&pin.grid)
+    };
+    encode_captured_image_window(&pin, request)
+}
+
+fn encode_captured_image_window(
+    pin: &CapturedPinGrid,
+    request: &crate::handlers::attach_state::HistoryImagesArgs,
+) -> Result<Vec<u8>, SessionRuntimeError> {
+    if request.rows == 0
+        || request.rows > 256
+        || usize::from(request.width) != pin.grid.width()
+        || request.scrollback_offset as usize > pin.grid.max_scrollback_offset()
+    {
+        return Err(SessionRuntimeError::ResponseBudgetExceeded);
+    }
+    #[cfg(feature = "image-registry")]
+    let images = pin
+        .images
+        .as_ref()
+        .ok_or(SessionRuntimeError::NotFound)?
+        .project_viewport(request.scrollback_offset as usize, request.rows)
+        .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?
+        .iter()
+        .map(bmux_attach_image_protocol::AttachPaneImage::from)
+        .collect::<Vec<_>>();
+    #[cfg(not(feature = "image-registry"))]
+    let images: Vec<bmux_attach_image_protocol::AttachPaneImage> = Vec::new();
+    let mut count = EncodedByteCount(0, RESPONSE_OUTPUT_BUDGET);
+    serde_json::to_writer(&mut count, &images)
+        .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
+    serde_json::to_vec(&images).map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)
 }
 
 fn pane_padding_handle() -> Option<PanePaddingRuntimeHandle> {
@@ -11209,11 +11397,15 @@ mod tests {
         let other_session = SessionId(Uuid::new_v4());
         let client = ClientId(Uuid::new_v4());
         let pane = Uuid::new_v4();
+        let terminal_grid =
+            bmux_terminal_grid::TerminalGrid::new(1, 1, GridLimits::default()).unwrap();
+        let bytes = terminal_grid.retained_capacity_bytes().unwrap();
         let grid = Arc::new(CapturedPinGrid {
-            grid: bmux_terminal_grid::TerminalGrid::new(1, 1, GridLimits::default()).unwrap(),
-            reservation: PinReservation::acquire(&Arc::new(AtomicUsize::new(0)), 0).unwrap(),
+            grid: terminal_grid,
+            #[cfg(feature = "image-registry")]
+            images: None,
+            reservation: PinReservation::acquire(&Arc::new(AtomicUsize::new(0)), bytes).unwrap(),
         });
-        let bytes = grid.grid.retained_capacity_bytes().unwrap();
         let mut other = runtime_with_panes(&[pane]);
         // Shared test backing keeps the fixture cheap; admission deliberately
         // charges each registered pin conservatively even when backing aliases.
@@ -12171,7 +12363,7 @@ mod tests {
         };
         let weak_grid = Arc::downgrade(&reader.grid);
         let backing_reader = Arc::clone(&reader.grid);
-        let bytes = backing_reader.grid.retained_capacity_bytes().unwrap();
+        let bytes = backing_reader.reservation.bytes;
         assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), bytes);
         let before = reader.grid.grid.snapshot(0, 1);
         let ack = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_scrollback_unpin(

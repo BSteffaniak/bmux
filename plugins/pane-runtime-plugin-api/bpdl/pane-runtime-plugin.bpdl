@@ -806,6 +806,23 @@ interface attach-runtime-state {
         max_batches_per_pane: u32,
     ) -> result<attach-pane-grid-delta, attach-state-error>;
 
+    record history-images-v1 {
+        capture_id: uuid,
+        // Complete replacement for this capture/window, including an empty list.
+        // JSON-encoded Vec<AttachPaneImage> in the existing image wire format.
+        encoded: list<u8>,
+    }
+
+    query attach-history-images-v1(
+        session_id: uuid,
+        pane_id: uuid,
+        pin_id: u64,
+        capture_id: uuid,
+        width: u16,
+        scrollback_offset: u32,
+        rows: u16,
+    ) -> result<history-images-v1, attach-state-error>;
+
     query attach-pane-images(
         session_id: uuid,
         pane_ids: list<uuid>,
