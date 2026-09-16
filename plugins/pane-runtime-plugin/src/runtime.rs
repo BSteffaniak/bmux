@@ -1378,6 +1378,38 @@ mod image_lifecycle_tests {
     }
 
     #[test]
+    fn reset_discards_both_screen_image_namespaces_at_every_split() {
+        let image = b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\";
+        let mut bytes = image.to_vec();
+        bytes.extend_from_slice(b"\r\n\r\n\r\n\x1b[?1049h");
+        bytes.extend_from_slice(image);
+        bytes.extend_from_slice(b"\x1bc\x1b[?1049l");
+        for split in 0..=bytes.len() {
+            let mut tracker = PaneCursorTracker::new(3, 80);
+            let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+            let mut registry = bmux_image::ImageRegistry::default();
+            let mut interceptor = bmux_image::ImageInterceptor::new();
+            for chunk in [&bytes[..split], &bytes[split..]] {
+                let mut output = interceptor.process(chunk);
+                ordered_image_output(
+                    &mut tracker,
+                    &mut protocol,
+                    &mut registry,
+                    &mut output,
+                    (8, 16),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            }
+            assert!(registry.images().is_empty(), "split {split}");
+            assert!(
+                registry.project_viewport(1, 3).unwrap().is_empty(),
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
     fn alternate_screen_scrolling_preserves_normal_image_history() {
         let image = b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\";
         let mut bytes = image.to_vec();
@@ -12289,6 +12321,100 @@ mod tests {
             assert_eq!(response.error, None);
             Ok(response.payload)
         }
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn generated_history_images_survive_live_reset_and_reject_stale_capture() {
+        struct RestorePadding {
+            previous: Option<Arc<std::sync::RwLock<PanePaddingRuntimeHandle>>>,
+            manager: Arc<Mutex<SessionRuntimeManager>>,
+        }
+        impl Drop for RestorePadding {
+            fn drop(&mut self) {
+                if let Some(previous) = self.previous.take() {
+                    bmux_plugin::global_plugin_state_registry().register(&previous);
+                } else {
+                    self.manager.lock().unwrap().runtimes.clear();
+                }
+            }
+        }
+        use bmux_pane_runtime_plugin_api::attach_runtime_state::client;
+
+        let session = SessionId(Uuid::new_v4());
+        let caller = ClientId(Uuid::new_v4());
+        let pane = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane]);
+        runtime.attached_clients.insert(caller);
+        let images = Arc::clone(&runtime.panes[&pane].image_registry);
+        let mut tracker = PaneCursorTracker::new(3, 80);
+        let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n");
+        ordered_image_output(
+            &mut tracker,
+            &mut protocol,
+            &mut images.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        *runtime.panes[&pane].terminal_grid.lock().unwrap() = tracker.terminal_grid;
+        let manager = Arc::new(Mutex::new(manager_with_runtime(session, runtime)));
+        let padding = Arc::new(std::sync::RwLock::new(PanePaddingRuntimeHandle(
+            Arc::clone(&manager),
+        )));
+        let _restore_padding = RestorePadding {
+            previous: bmux_plugin::global_plugin_state_registry().register(&padding),
+            manager: Arc::clone(&manager),
+        };
+        let adapter = ServerSessionRuntimeAdapter::new(manager);
+        let handle = Arc::new(std::sync::RwLock::new(
+            bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter),
+        ));
+        let registry = bmux_plugin::global_plugin_state_registry();
+        let _restore = HistoryRegistryRestore(registry.register(&handle));
+        let mut dispatch = HistoryDispatch(caller.0);
+        let capture = client::attach_history_capture_v1(&mut dispatch, session.0, pane)
+            .await
+            .unwrap()
+            .unwrap();
+        images.lock().unwrap().reset();
+        let response = client::attach_history_images_v2(
+            &mut dispatch,
+            session.0,
+            pane,
+            capture.pin.pin_id,
+            capture.capture_id,
+            80,
+            1,
+            3,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.capture_id, capture.capture_id);
+        let recovered: Vec<bmux_attach_image_protocol::AttachPaneImage> =
+            serde_json::from_slice(&response.encoded).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].position_row, 0);
+        assert!(!recovered[0].raw_data.is_empty());
+        assert!(
+            client::attach_history_images_v2(
+                &mut dispatch,
+                session.0,
+                pane,
+                capture.pin.pin_id,
+                Uuid::new_v4(),
+                80,
+                1,
+                3,
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
     }
 
     async fn assert_history_fetch_errors(

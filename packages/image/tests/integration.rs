@@ -309,13 +309,17 @@ mod pipeline {
         assert_eq!(delta.added.len(), 1);
         assert_eq!(delta.added[0].id, main_id);
         assert!(delta.removed.contains(&alternate_id));
-        assert!(!delta.removed.contains(&main_id));
+        assert!(delta.removed.contains(&main_id));
+        let mut replica = registry.images().to_vec();
         let before = registry.sequence();
         registry.scroll_up(1).unwrap();
         registry.scroll_up(1).unwrap();
         let delta = registry.delta_since(before);
         assert_eq!(delta.added.len(), 1);
         assert_eq!(delta.added[0].position.row, 3);
+        replica.retain(|image| !delta.removed.contains(&image.id));
+        replica.extend(delta.added);
+        assert_eq!(replica, registry.images());
     }
 
     #[test]

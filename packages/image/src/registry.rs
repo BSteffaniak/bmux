@@ -467,6 +467,13 @@ impl ImageRegistry {
             return Ok(());
         }
         let projected = self.project_viewport(0, height)?;
+        // An empty hidden screen still needs the new geometry. Otherwise
+        // leaving alternate mode restores a stale height for future images.
+        if let Some(normal) = self.normal_screen.as_mut()
+            && normal.history.is_empty()
+        {
+            normal.viewport_height = height;
+        }
         self.commit_alternate_projection(projected);
         self.viewport_height = height;
         Ok(())
@@ -761,6 +768,10 @@ impl ImageRegistry {
         let mut removed = Vec::new();
         for id in touched {
             if let Some(image) = self.images.iter().find(|image| image.id == id) {
+                // Consumers apply removals before additions. Include the ID
+                // even when it survives so a moved/cropped placement replaces
+                // its previous projection rather than accumulating duplicates.
+                removed.push(id);
                 added.push(image.clone());
             } else {
                 removed.push(id);
@@ -1093,6 +1104,28 @@ fn pixel_size_to_cells(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternate_resize_updates_empty_hidden_screen_geometry() {
+        for (initial, resized) in [(3, 6), (6, 3)] {
+            let mut registry = ImageRegistry::default().with_viewport_height(initial);
+            registry.set_alternate_screen(true);
+            registry.resize_alternate_viewport(resized).unwrap();
+            registry.set_alternate_screen(false);
+            assert_eq!(registry.viewport_height, resized);
+            registry.add_image(
+                ImageProtocol::Sixel,
+                ImagePayload::default(),
+                ImagePosition { row: 4, col: 0 },
+                ImageCellSize { rows: 1, cols: 1 },
+                ImagePixelSize {
+                    width: 8,
+                    height: 16,
+                },
+            );
+            assert_eq!(registry.images().len(), usize::from(resized > 4));
+        }
+    }
 
     #[test]
     fn pixel_size_to_cells_rounds_up() {
