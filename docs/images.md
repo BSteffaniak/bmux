@@ -21,6 +21,75 @@ When a program running inside a bmux pane emits image escape sequences, bmux:
 
 Applications can use the implemented image operations without a bmux-specific API. Compatibility depends on the host terminal, protocol operations, image format, and build features; support for a protocol does not imply support for every animation, transport, or placement extension. Test the applications and terminals you intend to use.
 
+## Scrollback Image Presentation
+
+Live output scrolling and attachment scrollback are different paths. Currently,
+inline images follow live output, but the attachment scrollback renderer does not
+consume captured image windows. Entering scrollback can therefore leave images
+positioned against live output while text displays history. Service-level image
+retention tests do not establish support for attachment scrollback rendering.
+
+### Target ownership and presentation contract
+
+The pane-runtime plugin owns capture selection, history navigation, generated
+history-service calls, and assembly of a coherent text/image window. The core
+attachment runtime schedules neutral work and consumes retained presentation; it
+must not gain additional pane-history service calls or interpret capture policy.
+
+A displayed historical window binds text and images to the same capture, logical
+anchor, projection width, and visible height. Navigation resolves this window
+once. The existing `attach-history-images-v2` offset is measured in projected
+rows, so a text-navigation offset cannot be passed through without proving it
+identifies the same projected window. If that conversion cannot be performed
+within the request budget, introduce a versioned anchored-window contract rather
+than changing v2 semantics or guessing an offset.
+
+Image content must use a bounded, owner-scoped resource mechanism separate from
+text/cell paint operations. Retained placements reference immutable resource
+identities and revisions; they do not embed raw terminal protocol bytes in
+`RenderOp`. This preserves the graphics-payload exclusion guard. Resource
+publication validates encoded size, decoded dimensions, and total retained bytes
+before admission; missing or evicted resources require explicit repair rather
+than silently displaying an incomplete window.
+
+Placements belong to the producer's own retained surface and use its geometry,
+clipping, stacking, and occlusion. They cannot target another owner's allocation.
+Runtime content and plugin image placements must converge on the same retained
+compositor, not a second overlay ordering model. Reuse the neutral TUI image
+primitives and terminal presenter where compatible with these semantics.
+
+### Atomic window and frame transitions
+
+The attachment-side plugin controller publishes complete text/image replacements,
+including empty image lists. It rejects responses for obsolete capture identities,
+request generations, dimensions, or attachment targets. Prefetched rows must be
+trimmed with the corresponding image origin adjustment; cached windows include
+both components and remain bounded.
+
+While a replacement loads, retain the last coherent displayed window rather than
+mixing new text with old images. Output arriving while pinned updates live state
+without moving the captured view. Resizing reprojects both components from the
+same logical anchor. Leaving scrollback replaces the historical window with
+current live text and images. Capture invalidation enters an explicit recovery
+state, never a live-image fallback over historical text. Alternate-screen image
+state remains isolated from normal-screen history.
+
+Image placement and interaction authority advance only after successful terminal
+presentation. Failed writes retain the last committed scene and require repair;
+owner removal, empty replacement, and normal shutdown remove owned host image
+placements without deleting unrelated terminal images.
+
+### Required behavioral proof
+
+An attachment integration test must drive the production controller and presenter:
+place an image beside identifiable text, scroll it offscreen, enter history,
+navigate away and back, append output while pinned, resize narrower and wider,
+and return live. Assert image identity, text-relative position, clipping, and
+removal at each transition. Include stale/out-of-order responses, unavailable
+captures, failed presentation, alternate-screen transitions, and image-disabled
+builds. Protocol-level coverage and a real PTY reproduction complement this test;
+passing capture-service tests alone is insufficient.
+
 ## Testing Image Support
 
 ### Using kitten (Kitty protocol)
