@@ -759,6 +759,20 @@ impl AttachViewState {
         self.scrollback_for_mut(pane_id)
     }
 
+    /// Live images must never be projected over captured historical text.
+    /// Historical graphics need their own capture-bound viewport projection;
+    /// absence of that projection is not permission to substitute live images.
+    #[must_use]
+    pub fn presented_live_images(
+        &self,
+        pane_id: Uuid,
+    ) -> &[bmux_attach_image_protocol::AttachPaneImage] {
+        if self.scrollback_active_for(pane_id) {
+            return &[];
+        }
+        self.pane_images.get(&pane_id).map_or(&[], Vec::as_slice)
+    }
+
     /// Whether the *focused* pane is in scrollback.
     ///
     /// This derives the UI-level "scroll mode" from the focused pane rather
@@ -805,6 +819,44 @@ impl AttachViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_text_never_uses_live_images_and_exit_restores_them() {
+        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
+            session_id: Uuid::from_u128(1),
+            context_id: None,
+            can_write: true,
+        });
+        let pane = Uuid::from_u128(2);
+        let image = bmux_attach_image_protocol::AttachPaneImage {
+            id: 1,
+            protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
+            raw_data: Vec::new(),
+            compression: bmux_attach_image_protocol::CompressionId::None,
+            position_row: 0,
+            position_col: 0,
+            cell_rows: 1,
+            cell_cols: 1,
+            pixel_width: 1,
+            pixel_height: 1,
+        };
+        state.pane_images.insert(pane, vec![image]);
+        assert_eq!(state.presented_live_images(pane).len(), 1);
+        state.pane_scrollback.insert(
+            pane,
+            PaneScrollbackView {
+                offset: 1,
+                cursor: AttachScrollbackCursor { row: 0, col: 0 },
+                selection_anchor: None,
+                captured_selection: None,
+                pin: None,
+            },
+        );
+        assert!(state.presented_live_images(pane).is_empty());
+        assert_eq!(state.pane_images[&pane].len(), 1);
+        assert!(state.exit_scrollback_for(pane));
+        assert_eq!(state.presented_live_images(pane).len(), 1);
+    }
 
     fn test_floating_drag() -> AttachMouseFloatingDrag {
         AttachMouseFloatingDrag {

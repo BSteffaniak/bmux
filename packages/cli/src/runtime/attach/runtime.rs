@@ -8728,9 +8728,8 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
             let Some(pane_id) = surface.pane_id else {
                 continue;
             };
-            if let Some(images) = view_state.pane_images.get(&pane_id)
-                && !images.is_empty()
-            {
+            let images = view_state.presented_live_images(pane_id);
+            if !images.is_empty() {
                 let pane_images: Vec<bmux_image::PaneImage> =
                     images.iter().map(bmux_image::PaneImage::from).collect();
                 let pane_rect = bmux_image::compositor::PaneRect {
@@ -8984,8 +8983,8 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
             let Some(pane_id) = surface.pane_id else {
                 continue;
             };
-            if let Some(images) = view_state.pane_images.get(&pane_id) {
-                for img in images {
+            {
+                for img in view_state.presented_live_images(pane_id) {
                     let mut adjusted = img.clone();
                     // Offset pane-local coords by surface position + 1
                     // for the pane border, matching the live compositor's
