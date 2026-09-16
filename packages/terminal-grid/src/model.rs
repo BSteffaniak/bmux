@@ -1666,6 +1666,88 @@ impl TerminalGrid {
         self.main_history.len() + usize::from(!self.pending_history_cells.is_empty())
     }
 
+    /// Map a completed-history cell boundary between presentation widths.
+    ///
+    /// Coordinates are relative to the retained history prefix of this exact
+    /// grid capture, not durable identities across mutations. Pending/live rows
+    /// are deliberately excluded. `work` bounds cells inspected, including empty
+    /// lines, and is charged before scanning each line.
+    ///
+    /// # Errors
+    /// Rejects zero widths, exhausted work, unavailable rows, and positions
+    /// inside wide cells or trimmed padding.
+    pub fn history_position_at_width(
+        &self,
+        row: usize,
+        column: usize,
+        width: usize,
+        work: &mut usize,
+    ) -> Result<(usize, usize), HistorySliceError> {
+        if width == 0 || column >= self.width {
+            return Err(HistorySliceError::Unavailable);
+        }
+        let mut old_start = 0usize;
+        let mut new_start = 0usize;
+        for line in &self.main_history {
+            // Row counting and both anchor conversions each scan the line.
+            let charge = line
+                .cells
+                .len()
+                .max(1)
+                .checked_mul(8)
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            *work = work
+                .checked_sub(charge)
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            let old_count = projected_logical_line_row_count(&line.cells, self.width);
+            let new_count = projected_logical_line_row_count(&line.cells, width);
+            if row < old_start.saturating_add(old_count) {
+                let local_row = row - old_start;
+                let logical = crate::reflow::logical_column_for_row_retained(
+                    &line.cells,
+                    self.width,
+                    local_row,
+                    false,
+                )
+                .and_then(|start| start.checked_add(column))
+                .ok_or(HistorySliceError::Unavailable)?;
+                let old_row = crate::reflow::row_for_logical_column_retained(
+                    &line.cells,
+                    self.width,
+                    logical,
+                    false,
+                )
+                .ok_or(HistorySliceError::Unavailable)?;
+                if old_row != local_row {
+                    return Err(HistorySliceError::Unavailable);
+                }
+                let new_row = crate::reflow::row_for_logical_column_retained(
+                    &line.cells,
+                    width,
+                    logical,
+                    false,
+                )
+                .filter(|row| *row < new_count)
+                .ok_or(HistorySliceError::Unavailable)?;
+                let start = crate::reflow::logical_column_for_row_retained(
+                    &line.cells,
+                    width,
+                    new_row,
+                    false,
+                )
+                .ok_or(HistorySliceError::Unavailable)?;
+                return Ok((new_start + new_row, logical - start));
+            }
+            old_start = old_start
+                .checked_add(old_count)
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            new_start = new_start
+                .checked_add(new_count)
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+        }
+        Err(HistorySliceError::Unavailable)
+    }
+
     /// Read a bounded slice without allocating or projecting physical rows.
     ///
     /// The caller must bind `revision` and `line_index` to one capture identity;

@@ -2354,6 +2354,25 @@ mod tests {
     }
 
     #[test]
+    fn captured_history_position_reflows_with_text_and_rejects_wide_interiors() {
+        let mut stream =
+            super::TerminalGridStream::new(4, 2, crate::GridLimits::default()).unwrap();
+        stream.process("ab界cd\r\nx\r\ny\r\nz\r\n".as_bytes());
+        let grid = stream.grid();
+        assert_eq!(
+            grid.history_position_at_width(1, 0, 8, &mut 1000).unwrap(),
+            (0, 4)
+        );
+        assert_eq!(
+            grid.history_position_at_width(0, 2, 3, &mut 1000).unwrap(),
+            (1, 0)
+        );
+        assert!(grid.history_position_at_width(0, 3, 3, &mut 1000).is_err());
+        assert!(grid.history_position_at_width(1, 0, 8, &mut 0).is_err());
+        assert!(grid.history_position_at_width(1, 0, 0, &mut 1000).is_err());
+    }
+
+    #[test]
     fn sparse_wrapped_history_converges_after_independent_reflow() {
         let limits = GridLimits::default();
         for text in ["abcdefghijklmnopqrstuvwxyz", "界界界界界界界界界界界界界"] {
