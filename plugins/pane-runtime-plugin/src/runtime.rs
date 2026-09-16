@@ -1335,6 +1335,58 @@ mod image_lifecycle_tests {
     }
 
     #[test]
+    fn pinned_image_reflow_accepts_a_trailing_wide_character() {
+        let mut tracker = PaneCursorTracker::new(1, 4);
+        let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut registry = bmux_image::ImageRegistry::default().with_viewport_height(1);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output = interceptor.process("\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\ab界".as_bytes());
+        ordered_image_output(
+            &mut tracker,
+            &mut protocol,
+            &mut registry,
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let mut budget = RESPONSE_OUTPUT_BUDGET;
+        let images = registry.capture_history(&mut budget).unwrap();
+        let grid = tracker
+            .terminal_grid
+            .grid()
+            .try_clone_charged(&mut budget)
+            .unwrap();
+        let pin = CapturedPinGrid {
+            grid,
+            images: Some(images),
+            reservation: PinReservation::acquire(
+                &Arc::new(AtomicUsize::new(0)),
+                RESPONSE_OUTPUT_BUDGET - budget,
+            )
+            .unwrap(),
+        };
+        for (width, scrollback_offset) in [(4, 0), (2, 1)] {
+            let request = crate::handlers::attach_state::HistoryImagesArgs {
+                session_id: Uuid::new_v4(),
+                pane_id: Uuid::new_v4(),
+                pin_id: 1,
+                capture_id: Uuid::new_v4(),
+                width,
+                scrollback_offset,
+                rows: 1,
+            };
+            let images: Vec<bmux_attach_image_protocol::AttachPaneImage> =
+                serde_json::from_slice(&encode_reflowed_image_window(&pin, &request).unwrap())
+                    .unwrap();
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].position_row, 0);
+            assert_eq!(images[0].position_col, 0);
+            assert!(!images[0].raw_data.is_empty());
+        }
+    }
+
+    #[test]
     fn scroll_then_place_uses_final_cursor_without_double_processing() {
         let image = b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\";
         let mut bytes = b"one\r\ntwo\r\nthree\r\nfour\r\n".to_vec();
@@ -1433,6 +1485,30 @@ mod image_lifecycle_tests {
         assert_eq!(registry.images().len(), 1);
         assert_eq!(registry.images()[0].position.row, 1);
         assert_eq!(tracker.terminal_grid.grid().total_scrolled_rows(), 0);
+    }
+
+    #[test]
+    fn alternate_images_do_not_borrow_normal_scrollback_retention() {
+        let mut tracker = PaneCursorTracker::new(3, 80);
+        let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut registry = bmux_image::ImageRegistry::default().with_viewport_height(3);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output = interceptor.process(
+            b"normal\r\n\r\n\r\n\r\n\x1b[?1049h\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n",
+        );
+        ordered_image_output(
+            &mut tracker,
+            &mut protocol,
+            &mut registry,
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(tracker.terminal_grid.grid().main_row_count() > 3);
+        assert_eq!(tracker.terminal_grid.grid().max_scrollback_offset(), 0);
+        assert!(registry.images().is_empty());
+        assert!(registry.project_viewport(1, 3).unwrap().is_empty());
     }
 
     #[test]
@@ -8586,18 +8662,10 @@ fn encode_reflowed_image_window(
     }
     let mut budget = RESPONSE_OUTPUT_BUDGET;
     let count = pin.grid.main_row_count();
-    let (last_row, _) = pin
+    let projected_count = pin
         .grid
-        .main_position_at_width(
-            count.saturating_sub(1),
-            pin.grid.width().saturating_sub(1),
-            usize::from(request.width),
-            &mut budget,
-        )
+        .main_row_count_at_width(usize::from(request.width), &mut budget)
         .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
-    let projected_count = last_row
-        .checked_add(1)
-        .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
     let offset = request.scrollback_offset as usize;
     let visible_rows = usize::from(request.rows);
     if offset > projected_count.saturating_sub(visible_rows) {

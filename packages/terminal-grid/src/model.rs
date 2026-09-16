@@ -1782,6 +1782,57 @@ impl TerminalGrid {
         Err(HistorySliceError::Unavailable)
     }
 
+    /// Count padded main-screen rows at a presentation width without using a
+    /// cell position as an end marker (the final cell may be a wide continuation).
+    ///
+    /// # Errors
+    /// Rejects zero width and captures exceeding the allocation budget.
+    pub fn main_row_count_at_width(
+        &self,
+        width: usize,
+        budget: &mut usize,
+    ) -> Result<usize, HistorySliceError> {
+        if width == 0 {
+            return Err(HistorySliceError::Unavailable);
+        }
+        let count = self.main_row_count();
+        if width == self.width {
+            return Ok(count);
+        }
+        let working = count
+            .checked_mul(self.width)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<Cell>() + 1))
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        *budget = budget
+            .checked_sub(working)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let rows = self
+            .try_display_rows_charged(0, count, true, budget)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let mut cells = Vec::new();
+        let mut total = 0usize;
+        for (index, physical) in rows.iter().enumerate() {
+            let text_bytes = physical
+                .cells()
+                .iter()
+                .try_fold(0usize, |total, cell| total.checked_add(cell.text().len()))
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            *budget = budget
+                .checked_sub(text_bytes)
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            cells.extend(row_logical_cells(physical, self.width));
+            if !physical.wrapped() || index + 1 == rows.len() {
+                total = total
+                    .checked_add(crate::reflow::projected_logical_line_row_count_retained(
+                        &cells, width, true,
+                    ))
+                    .ok_or(HistorySliceError::BudgetExhausted)?;
+                cells.clear();
+            }
+        }
+        Ok(total)
+    }
+
     /// Map a position in the retained main screen into another presentation width.
     /// Unlike `history_position_at_width`, includes pending and live rows and
     /// preserves explicit row padding. Positions belong to this capture only.
@@ -1800,6 +1851,20 @@ impl TerminalGrid {
         let count = self.main_row_count();
         if row >= count || column >= self.width || width == 0 {
             return Err(HistorySliceError::Unavailable);
+        }
+        if width == self.width {
+            let rows = self
+                .try_display_rows_charged(count - row - 1, 1, true, budget)
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            let physical = rows.first().ok_or(HistorySliceError::Unavailable)?;
+            if physical
+                .cells()
+                .get(column)
+                .is_some_and(Cell::is_wide_continuation)
+            {
+                return Err(HistorySliceError::Unavailable);
+            }
+            return Ok((row, column));
         }
         // The padded logical working copy can contain every source cell. Charge
         // it separately from the physical snapshot, before allocating either.
@@ -3199,6 +3264,37 @@ mod tests {
             grid.process(b"\x1b[?1049l");
             assert_eq!(row_text(&grid.display_rows(0, 1)[0]), "main");
         }
+    }
+
+    #[test]
+    fn same_width_anchor_mapping_only_materializes_the_selected_row() {
+        let mut grid = TerminalGrid::new(80, 3, GridLimits::default()).unwrap();
+        for _ in 0..100 {
+            grid.process(b"history\r\n");
+        }
+        let mut budget = 4096;
+        assert_eq!(
+            grid.main_position_at_width(0, 1, 80, &mut budget).unwrap(),
+            (0, 1)
+        );
+        let mut wide = TerminalGrid::new(4, 1, GridLimits::default()).unwrap();
+        wide.process("ab界".as_bytes());
+        assert!(wide.main_position_at_width(0, 3, 4, &mut 4096).is_err());
+        assert_eq!(
+            wide.main_position_at_width(0, 2, 4, &mut 4096).unwrap(),
+            (0, 2)
+        );
+    }
+
+    #[test]
+    fn projected_main_row_count_accepts_trailing_wide_continuation() {
+        let mut grid = TerminalGrid::new(4, 1, GridLimits::default()).unwrap();
+        grid.process("ab界".as_bytes());
+        assert!(grid.main_position_at_width(0, 3, 2, &mut 100_000).is_err());
+        assert_eq!(grid.main_row_count_at_width(2, &mut 100_000).unwrap(), 2);
+        assert_eq!(grid.main_row_count_at_width(4, &mut 0).unwrap(), 1);
+        assert!(grid.main_row_count_at_width(0, &mut 100_000).is_err());
+        assert!(grid.main_row_count_at_width(2, &mut 1).is_err());
     }
 
     #[test]
