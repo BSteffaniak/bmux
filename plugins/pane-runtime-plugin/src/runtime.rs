@@ -8681,6 +8681,7 @@ fn encode_reflowed_image_window(
         return Err(SessionRuntimeError::ResponseBudgetExceeded);
     }
     let mut budget = RESPONSE_OUTPUT_BUDGET;
+    #[cfg(feature = "image-registry")]
     let count = pin.grid.main_row_count();
     let projected_count = pin
         .grid
@@ -12514,6 +12515,14 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].position_row, 0);
         assert!(!recovered[0].raw_data.is_empty());
+        assert_history_image_window_replacement(
+            &mut dispatch,
+            session,
+            pane,
+            &capture,
+            &response.encoded,
+        )
+        .await;
         assert!(
             client::attach_history_images_v2(
                 &mut dispatch,
@@ -12529,6 +12538,40 @@ mod tests {
             .unwrap()
             .is_err()
         );
+    }
+
+    async fn assert_history_image_window_replacement(
+        dispatch: &mut HistoryDispatch,
+        session: SessionId,
+        pane: Uuid,
+        capture: &bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryCaptureV1,
+        expected: &[u8],
+    ) {
+        // Each query is a complete window replacement. Visiting the live edge
+        // must clear the overlay without destroying the immutable capture.
+        for offset in [0, 1, 0, 1] {
+            let window = bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_history_images_v2(
+                dispatch,
+                session.0,
+                pane,
+                capture.pin.pin_id,
+                capture.capture_id,
+                80,
+                offset,
+                3,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(window.capture_id, capture.capture_id);
+            let projected: Vec<bmux_attach_image_protocol::AttachPaneImage> =
+                serde_json::from_slice(&window.encoded).unwrap();
+            if offset == 0 {
+                assert!(projected.is_empty());
+            } else {
+                assert_eq!(window.encoded, expected);
+            }
+        }
     }
 
     async fn assert_history_fetch_errors(
