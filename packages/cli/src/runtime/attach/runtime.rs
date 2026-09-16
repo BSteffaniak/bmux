@@ -5325,9 +5325,17 @@ fn handle_pane_runtime_plugin_event(
             *pane_output_pending = true;
             PaneRuntimePluginEventOutcome::default()
         }
-        pane_events::PaneEvent::ImageAvailable { .. } => PaneRuntimePluginEventOutcome {
-            image_fetch_requested: true,
-        },
+        pane_events::PaneEvent::ImageAvailable {
+            session_id,
+            pane_id,
+        } if session_id == view_state.attached_id => {
+            view_state
+                .dirty
+                .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
+            PaneRuntimePluginEventOutcome {
+                image_fetch_requested: true,
+            }
+        }
         pane_events::PaneEvent::AttachViewChanged {
             context_id,
             session_id,
@@ -21598,6 +21606,41 @@ mod tests {
 
         // This must not panic or return Err.
         let _keymap = attach_keymap_from_config(&config);
+    }
+
+    #[test]
+    fn image_only_event_schedules_fetch_and_frame_for_its_attachment() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let mut view = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view.dirty.clear_frame_damage();
+        let mut output_pending = false;
+        let outcome = handle_pane_runtime_plugin_event(
+            pane_events::PaneEvent::ImageAvailable {
+                session_id,
+                pane_id,
+            },
+            &mut view,
+            &mut output_pending,
+        );
+        assert!(outcome.image_fetch_requested);
+        assert!(view.dirty.pane_dirty_ids.contains(&pane_id));
+        assert!(!output_pending);
+        view.dirty.clear_frame_damage();
+        let outcome = handle_pane_runtime_plugin_event(
+            pane_events::PaneEvent::ImageAvailable {
+                session_id: Uuid::new_v4(),
+                pane_id,
+            },
+            &mut view,
+            &mut output_pending,
+        );
+        assert!(!outcome.image_fetch_requested);
+        assert!(view.dirty.pane_dirty_ids.is_empty());
     }
 
     #[test]
