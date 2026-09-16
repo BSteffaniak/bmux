@@ -166,7 +166,7 @@ fn write_stale_lock(root: &Path, pid: u32) {
 
 #[test]
 #[serial]
-fn sandbox_dev_prefers_workspace_debug_binary() {
+fn sandbox_dev_uses_invoked_binary() {
     let sandbox = CommandSandbox::new("dev-prefers-debug-binary");
     let mut command = sandbox.command();
     let output = command
@@ -182,17 +182,110 @@ fn sandbox_dev_prefers_workspace_debug_binary() {
 
     let json = parse_json_stdout(&output);
     assert_schema_version(&json);
-    let expected = workspace_root().join("target").join("debug").join("bmux");
-    if expected.exists() {
-        let bmux_bin = json["bmux_bin"]
-            .as_str()
-            .expect("sandbox dev json should include bmux_bin");
-        assert_eq!(
-            Path::new(bmux_bin),
-            expected,
-            "sandbox dev should prefer workspace debug binary"
-        );
-    }
+    let actual = Path::new(json["bmux_bin"].as_str().unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(actual, bmux_binary().canonicalize().unwrap());
+}
+
+#[test]
+#[serial]
+fn inherited_config_snapshot_is_private_and_keeps_normal_state_untouched() {
+    let sandbox = CommandSandbox::new("inherit-config");
+    let text =
+        "[server.gateway]\nenabled = true\nquick = true\n[plugins.custom]\nopaque = 'preserved'\n";
+    sandbox.write_config(text);
+    let sentinel = sandbox.root.path().join("state/normal-state");
+    std::fs::write(&sentinel, "unchanged").unwrap();
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "dev",
+            "--inherit-config",
+            "--json",
+            "--",
+            "--version",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_json_stdout(&output);
+    let root = Path::new(report["sandbox_root"].as_str().unwrap());
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("config/bmux/bmux.toml")).unwrap())
+            .unwrap();
+    assert_eq!(
+        config["server"]["gateway"]["enabled"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(
+        config["plugins"]["custom"]["opaque"].as_str(),
+        Some("preserved")
+    );
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "unchanged");
+    assert_eq!(
+        std::fs::read_to_string(sandbox.root.path().join("config/bmux.toml")).unwrap(),
+        text
+    );
+    assert!(!root.join("state/normal-state").exists());
+    assert!(root.join("development.json").exists());
+    let control = sandbox
+        .command()
+        .args(["sandbox", "attach", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!control.status.success());
+    assert!(String::from_utf8_lossy(&control.stderr).contains("not running"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[serial]
+fn inherited_sandbox_server_survives_launcher_and_stops_independently() {
+    let sandbox = CommandSandbox::new("inherit-lifecycle");
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    sandbox.write_config(&format!(
+        "[server.gateway]\nenabled = true\nquick = true\nlisten = '{}'\n",
+        occupied.local_addr().unwrap()
+    ));
+    let output = sandbox
+        .command()
+        .args([
+            "sandbox",
+            "dev",
+            "--inherit-config",
+            "--json",
+            "--",
+            "server",
+            "start",
+            "--daemon",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = parse_json_stdout(&output);
+    let root = report["sandbox_root"].as_str().unwrap();
+    let stopped = sandbox
+        .command()
+        .args(["sandbox", "stop", root])
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(!sandbox.root.path().join("runtime/server.sock").exists());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

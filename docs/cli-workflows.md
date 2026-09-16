@@ -52,6 +52,12 @@ bmux server autostart print      # side-effect-free declaration output
 bmux server autostart uninstall
 # Named runtimes receive isolated native service identities:
 bmux --runtime dev server autostart install
+# Test the invoked binary with normal settings but fresh writable BMUX state.
+# No arguments after -- are needed for interactive startup.
+bmux sandbox dev --inherit-config
+# Reconnect or explicitly stop the retained test server using its printed id/path:
+bmux sandbox attach <id-or-path>
+bmux sandbox stop <id-or-path>
 # Ephemeral sandbox run (fully isolated config/runtime/data/state/logs)
 bmux sandbox run -- server status
 bmux sandbox run --bmux-bin ./target/debug/bmux --env-mode inherit -- --version
@@ -166,6 +172,7 @@ Imperative installation refuses symlinked, read-only, conflicting, or externally
 Runtime selection vs sandbox isolation:
 
 - Use `--runtime <name>` to run multiple local bmux runtime instances side-by-side while still using your normal config/data/state roots.
+- Use `bmux sandbox dev --inherit-config` for local build testing with a private snapshot of your normal settings and fresh BMUX config/runtime/data/state/log directories. It uses the invoked binary (or explicit `--bmux-bin`), disables gateway startup, and preserves your shell environment and working directory. Detaching retains the server; use the printed `sandbox attach` or `sandbox stop` command. A changed binary requires stopping the old sandbox before testing the rebuild. This is not an OS security sandbox: configured external paths, plugin artifacts, and external services remain shared. Do not use config snapshots as shareable diagnostics; they can contain secrets.
 - Use `bmux sandbox ...` when you want a throwaway isolated environment (config/runtime/data/state/logs/home/tmp) for safe local build testing and failure triage.
 - `BMUX_LOG_DIR`: explicit log directory
 - `BMUX_STATE_DIR`: explicit state directory

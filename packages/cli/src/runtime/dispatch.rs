@@ -190,6 +190,8 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
         },
         Command::Sandbox { command } => match command {
             SandboxCommand::Dev { .. } => BuiltInHandlerId::SandboxDev,
+            SandboxCommand::Attach { .. } => BuiltInHandlerId::SandboxAttach,
+            SandboxCommand::Stop { .. } => BuiltInHandlerId::SandboxStop,
             SandboxCommand::Run { .. } => BuiltInHandlerId::SandboxRun,
             SandboxCommand::List { .. } => BuiltInHandlerId::SandboxList,
             SandboxCommand::Status { .. } => BuiltInHandlerId::SandboxStatus,
@@ -1203,6 +1205,7 @@ pub(super) async fn dispatch_built_in_command(
             Command::Sandbox {
                 command:
                     SandboxCommand::Dev {
+                        inherit_config,
                         bmux_bin,
                         env_mode,
                         json,
@@ -1213,9 +1216,8 @@ pub(super) async fn dispatch_built_in_command(
                     },
             },
         ) => {
-            let dev_bmux_bin = default_dev_bmux_bin();
             let options = RunSandboxOptions {
-                bmux_bin: bmux_bin.as_deref().or(dev_bmux_bin.as_deref()),
+                bmux_bin: bmux_bin.as_deref(),
                 env_mode: *env_mode,
                 keep: true,
                 json: *json,
@@ -1223,8 +1225,24 @@ pub(super) async fn dispatch_built_in_command(
                 timeout_secs: *timeout,
                 name: name.as_deref(),
             };
-            run_sandbox_run(options, command).await
+            if *inherit_config {
+                super::sandbox_cli::run_inherited_sandbox(options, command).await
+            } else {
+                run_sandbox_run(options, command).await
+            }
         }
+        (
+            BuiltInHandlerId::SandboxAttach,
+            Command::Sandbox {
+                command: SandboxCommand::Attach { sandbox },
+            },
+        ) => super::sandbox_cli::run_inherited_sandbox_control(sandbox, false).await,
+        (
+            BuiltInHandlerId::SandboxStop,
+            Command::Sandbox {
+                command: SandboxCommand::Stop { sandbox },
+            },
+        ) => super::sandbox_cli::run_inherited_sandbox_control(sandbox, true).await,
         (
             BuiltInHandlerId::SandboxRun,
             Command::Sandbox {
@@ -1693,13 +1711,6 @@ pub(super) async fn dispatch_built_in_command(
         ) => super::slot_cli::run_slot_print(*format),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
-}
-
-fn default_dev_bmux_bin() -> Option<String> {
-    let candidate = std::path::Path::new("target").join("debug").join("bmux");
-    candidate
-        .exists()
-        .then(|| candidate.to_string_lossy().to_string())
 }
 
 const fn bool_override(positive: bool, negative: bool) -> Option<bool> {

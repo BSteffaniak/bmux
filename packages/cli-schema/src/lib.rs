@@ -909,9 +909,12 @@ pub enum PlaybookCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SandboxCommand {
-    /// Run bmux in a dev-friendly isolated sandbox (prefers local debug build)
+    /// Run bmux in a dev-friendly isolated sandbox using the invoked binary
     Dev {
-        /// Path to bmux binary to execute (default: ./target/debug/bmux if present)
+        /// Snapshot normal settings while isolating all BMUX writable state
+        #[arg(long)]
+        inherit_config: bool,
+        /// Path to bmux binary to execute (default: current executable)
         #[arg(long)]
         bmux_bin: Option<String>,
         /// Sandbox environment mode
@@ -929,16 +932,18 @@ pub enum SandboxCommand {
         /// Optional human-friendly sandbox label
         #[arg(long)]
         name: Option<String>,
-        /// bmux arguments to execute inside sandbox (pass after --)
+        /// Optional bmux arguments; defaults to interactive startup
         #[arg(
-            required = true,
-            num_args = 1..,
             trailing_var_arg = true,
             allow_hyphen_values = true,
             value_name = "ARGS"
         )]
         command: Vec<String>,
     },
+    /// Attach to a retained inherited-config sandbox
+    Attach { sandbox: String },
+    /// Stop only a retained inherited-config sandbox's server
+    Stop { sandbox: String },
     /// Run bmux in an isolated ephemeral environment
     Run {
         /// Path to bmux binary to execute (default: current executable)
@@ -3757,6 +3762,7 @@ mod tests {
         assert!(matches!(
             command,
             SandboxCommand::Dev {
+                inherit_config: false,
                 bmux_bin: None,
                 env_mode: SandboxEnvModeArg::Clean,
                 json: false,

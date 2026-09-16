@@ -27,7 +27,7 @@ use super::{
     load_enabled_plugins, map_client_connect_error, plugin_event_bridge_loop, plugin_system_event,
     register_plugin_service_handlers, remove_server_pid_file, resolve_log_level,
     run_session_attach_with_client, scan_available_plugins, server_is_running, tracing_level,
-    try_kill_pid, validate_enabled_plugins, wait_for_server_running, write_server_pid_file,
+    validate_enabled_plugins, wait_for_server_running, write_server_pid_file,
     write_server_runtime_metadata,
 };
 use crate::runtime::diagnostics_layer::OperationalDiagnosticsLayer;
@@ -188,6 +188,18 @@ pub(super) fn next_default_tab_name(sessions: &[SessionSummary]) -> String {
     }
 }
 
+fn startup_diagnostics_tail(path: &std::path::Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return "startup diagnostics unavailable".into();
+    };
+    let length = file.metadata().map_or(0, |metadata| metadata.len());
+    let _ = file.seek(SeekFrom::Start(length.saturating_sub(8192)));
+    let mut bytes = Vec::new();
+    let _ = file.take(8192).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn server_start_child_arguments(
     rolling_enabled_override: Option<bool>,
     rolling_options: &RecordingRollingStartOptions,
@@ -328,18 +340,57 @@ async fn run_server_start_inner(
         if let Some(startup_recording) = startup_recording.as_ref() {
             set_startup_recording_env(&mut child, startup_recording)?;
         }
+        let startup_log = paths.runtime_dir.join("server-startup.log");
+        let mut startup_options = std::fs::OpenOptions::new();
+        startup_options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            startup_options.mode(0o600);
+        }
+        let startup_output = startup_options
+            .open(&startup_log)
+            .context("failed opening server startup diagnostics")?;
         child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = child.spawn().context("failed to spawn background server")?;
+            .stderr(Stdio::from(startup_output));
+        let mut child = child.spawn().context("failed to spawn background server")?;
         write_server_pid_file(child.id())?;
         write_server_runtime_metadata(child.id())?;
 
-        if !wait_for_server_running(SERVER_START_TIMEOUT, local_connection_context).await? {
-            let _ = try_kill_pid(child.id());
-            let _ = remove_server_pid_file();
-            anyhow::bail!("background server did not become ready before timeout")
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .context("failed checking background server")?
+            {
+                let _ = remove_server_pid_file();
+                anyhow::bail!(
+                    "background server exited with {status}; startup diagnostics: {}\n{}",
+                    startup_log.display(),
+                    startup_diagnostics_tail(&startup_log)
+                );
+            }
+            if wait_for_server_running(
+                std::time::Duration::from_millis(100),
+                local_connection_context,
+            )
+            .await?
+            {
+                break;
+            }
+            if started.elapsed() >= SERVER_START_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = remove_server_pid_file();
+                anyhow::bail!(
+                    "background server did not become ready before timeout; startup diagnostics: {}\n{}",
+                    startup_log.display(),
+                    startup_diagnostics_tail(&startup_log)
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
         println!("bmux server started in daemon mode (pid {})", child.id());

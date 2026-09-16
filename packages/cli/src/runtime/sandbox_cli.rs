@@ -20,6 +20,9 @@ use crate::sandbox_meta::{
     write_manifest as write_sandbox_manifest,
 };
 
+mod inherited;
+pub(super) use inherited::{run_inherited_sandbox, run_inherited_sandbox_control};
+
 const SANDBOX_PREFIX: &str = "bmux-sbx-";
 const PID_MARKER_FILE: &str = "sandbox.pid";
 const DEFAULT_CLEANUP_MIN_AGE: Duration = Duration::from_mins(5);
@@ -226,6 +229,10 @@ impl SandboxPaths {
             suffix
         ));
 
+        Self::at_root(root_dir)
+    }
+
+    fn at_root(root_dir: PathBuf) -> Self {
         let config_home = root_dir.join("config");
         let data_home = root_dir.join("data");
         let runtime_dir = root_dir.join("runtime");
@@ -442,6 +449,14 @@ pub(super) async fn run_sandbox_run(
     command_args: &[String],
 ) -> Result<u8> {
     let sandbox = SandboxPaths::new(options.name);
+    run_sandbox_at(options, command_args, sandbox).await
+}
+
+async fn run_sandbox_at(
+    options: RunSandboxOptions<'_>,
+    command_args: &[String],
+    sandbox: SandboxPaths,
+) -> Result<u8> {
     sandbox.ensure_dirs()?;
     write_pid_marker(&sandbox.root_dir)?;
 
@@ -495,6 +510,10 @@ pub(super) async fn run_sandbox_run(
     manifest.status = final_status.to_string();
     manifest.exit_code = Some(raw_exit_code);
     manifest.kept = kept;
+    if sandbox_socket_alive(&sandbox.root_dir) {
+        manifest.status = "running".to_string();
+        manifest.kept = true;
+    }
     write_manifest(&sandbox.root_dir, &manifest)?;
     let _ = upsert_sandbox_index_entry(&manifest);
 
@@ -512,7 +531,7 @@ pub(super) async fn run_sandbox_run(
         &manifest,
     )?;
 
-    if !kept {
+    if !kept && !sandbox_socket_alive(&sandbox.root_dir) {
         drop(lock_guard);
         let _ = std::fs::remove_dir_all(&sandbox.root_dir);
         let _ = remove_sandbox_index_entry(&sandbox.root_dir);
@@ -570,6 +589,9 @@ async fn spawn_and_wait(
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
     apply_sandbox_env(&mut command, sandbox, env_mode);
+    if sandbox.root_dir.join("development.json").exists() {
+        inherited::configure_child(&mut command, sandbox)?;
+    }
 
     let start = Instant::now();
     let mut last_heartbeat = Instant::now();
@@ -1294,6 +1316,10 @@ pub(super) async fn run_sandbox_rerun(options: RerunSandboxOptions<'_>) -> Resul
         options.inspect.source_filter,
         &collection.candidates,
     )?;
+    anyhow::ensure!(
+        !root.join("development.json").exists(),
+        "use `sandbox attach` to reconnect, or `sandbox dev --inherit-config` for a fresh development sandbox"
+    );
     let manifest = read_manifest(&root)?;
     anyhow::ensure!(
         !manifest.command.is_empty(),
@@ -3146,6 +3172,9 @@ fn apply_sandbox_env(
     sandbox: &SandboxPaths,
     env_mode: SandboxEnvModeArg,
 ) {
+    if inherited::apply_environment(command, sandbox) {
+        return;
+    }
     if matches!(
         env_mode,
         SandboxEnvModeArg::Clean | SandboxEnvModeArg::Hermetic

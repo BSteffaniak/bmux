@@ -296,7 +296,15 @@ mod tests {
             &active,
         )
         .expect("queue live state");
-        std::thread::sleep(SAVE_DEBOUNCE + Duration::from_millis(100));
+        // Scheduling the background writer can take longer on a busy test runner.
+        // Wait for the observable commit, not an assumed scheduling deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while ScrollbackModeStateFile::load(&paths).get(session_id, pane_id)
+            != Some(ScrollbackMode::Live)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             ScrollbackModeStateFile::load(&paths).get(session_id, pane_id),
             Some(ScrollbackMode::Live)

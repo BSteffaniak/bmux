@@ -2993,11 +2993,25 @@ impl BmuxConfig {
         Self::load_from_path_with_resolution(&paths.config_file(), None)
     }
 
-    /// Load configuration from default location using explicit layered overrides.
+    /// Return the layered, untyped configuration for a private configuration snapshot.
+    ///
+    /// Unknown plugin settings are preserved. Relative paths retain their meaning
+    /// only when the consumer preserves the original working directory.
     ///
     /// # Errors
+    /// Returns an error if any configuration layer cannot be read or parsed.
+    pub fn snapshot_raw_configuration() -> Result<toml::Value> {
+        merged_raw_config_value_with_overrides(
+            &ConfigPaths::default().config_file(),
+            Some(&ConfigLoadOverrides::for_process()),
+        )
+        .map(|value| value.unwrap_or_else(|| toml::Value::Table(toml::Table::new())))
+    }
+
+    /// Load layered configuration with explicit overrides.
     ///
-    /// Returns an error if the configuration file cannot be read or parsed.
+    /// # Errors
+    /// Returns an error if a configuration layer cannot be read or parsed.
     pub fn load_with_overrides(overrides: &ConfigLoadOverrides) -> Result<Self> {
         let paths = ConfigPaths::default();
         Self::load_from_path_with_overrides(&paths.config_file(), overrides)
