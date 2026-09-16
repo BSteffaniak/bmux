@@ -1717,6 +1717,17 @@ impl TerminalGrid {
         width: usize,
         work: &mut usize,
     ) -> Result<(usize, usize), HistorySliceError> {
+        self.map_history_position(row, column, width, work, false)
+    }
+
+    fn map_history_position(
+        &self,
+        row: usize,
+        column: usize,
+        width: usize,
+        work: &mut usize,
+        allow_blank: bool,
+    ) -> Result<(usize, usize), HistorySliceError> {
         if width == 0 || column >= self.width {
             return Err(HistorySliceError::Unavailable);
         }
@@ -1745,6 +1756,12 @@ impl TerminalGrid {
                 )
                 .and_then(|start| start.checked_add(column))
                 .ok_or(HistorySliceError::Unavailable)?;
+                if allow_blank && logical >= logical_width(&line.cells) {
+                    return new_start
+                        .checked_add(logical / width)
+                        .map(|row| (row, logical % width))
+                        .ok_or(HistorySliceError::BudgetExhausted);
+                }
                 let old_row = crate::reflow::row_for_logical_column_retained(
                     &line.cells,
                     self.width,
@@ -2416,7 +2433,7 @@ impl TerminalGrid {
             .sum::<usize>()
             .saturating_sub(usize::from(height));
         let (mapped, col) = if absolute < history {
-            let (mapped, col) = self.history_position_at_width(absolute, column, width, budget)?;
+            let (mapped, col) = self.map_history_position(absolute, column, width, budget, true)?;
             let history_rows: usize = self
                 .main_history
                 .iter()
@@ -3581,6 +3598,17 @@ mod tests {
             grid.live_position_after_resize(0, 2, 4, 2, &mut 100_000)
                 .unwrap(),
             (-3, 2),
+        );
+        grid.resize(4, 2).unwrap();
+        // Resize accepts cell placements in padding; text lookup stays strict.
+        assert!(
+            grid.history_position_at_width(0, 2, 8, &mut 100_000)
+                .is_err()
+        );
+        assert_eq!(
+            grid.retained_position_after_resize(-3, 2, 8, 2, &mut 100_000)
+                .unwrap(),
+            (-2, 2)
         );
     }
 
