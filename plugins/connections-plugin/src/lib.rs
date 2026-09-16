@@ -474,12 +474,21 @@ mod tests {
             .expect("register service");
         let running = std::sync::Arc::clone(&server);
         let task = tokio::spawn(async move { running.run().await });
-        for _ in 0..100 {
-            if paths.server_socket().exists() {
-                break;
+        // A bound socket path can exist before listen() makes it connectable.
+        // Wait for an actual connection rather than racing that startup interval.
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if tokio::net::UnixStream::connect(paths.server_socket())
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        })
+        .await;
+        assert!(ready.is_ok(), "local server did not become connectable");
 
         let request = InvokeServiceRequest {
             invocation: bmux_connections_plugin_api::connection_types::ServiceInvocation {
