@@ -245,6 +245,35 @@ mod pipeline {
     }
 
     #[test]
+    fn mapped_history_clips_right_edge_without_resizing_original() {
+        let mut registry = ImageRegistry::default();
+        let mut interceptor = ImageInterceptor::new();
+        for event in interceptor
+            .process(b"\x1bPq\"1;1;4;6#1;2;100;0;0~~~~\x1b\\")
+            .events
+        {
+            registry.handle_event(event, 1, 6);
+        }
+        let snapshot = registry.capture_history(&mut 100_000).unwrap();
+        let clipped = snapshot
+            .project_mapped(3, 10, &mut 100_000, |row, _| Ok((row, 2)))
+            .unwrap();
+        assert_eq!(clipped.len(), 1);
+        assert_eq!(clipped[0].cell_size.cols, 1);
+        assert_eq!(clipped[0].pixel_size.width, 1);
+        let decoded =
+            bmux_image::codec::sixel::decode(clipped[0].payload.raw.as_ref().unwrap()).unwrap();
+        assert_eq!(decoded.width, 1);
+        assert_eq!(registry.images()[0].cell_size.cols, 4);
+        assert!(
+            snapshot
+                .project_mapped(3, 10, &mut 100_000, |row, _| Ok((row, 3)))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn split_sixel_offsets_are_relative_to_each_read() {
         let mut interceptor = ImageInterceptor::new();
         let first = interceptor.process(b"label\r\n\x1bPq\"1;1;2;6#1;2;100;0;0");

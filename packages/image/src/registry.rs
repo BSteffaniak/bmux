@@ -72,6 +72,7 @@ impl ImageHistorySnapshot {
     /// placement and charges its work independently of this allocation budget.
     pub fn project_mapped(
         &self,
+        width: u16,
         height: u16,
         budget: &mut usize,
         mut map: impl FnMut(i64, u16) -> std::io::Result<(i64, u16)>,
@@ -82,7 +83,23 @@ impl ImageHistorySnapshot {
             *row = mapped_row;
             image.position.col = column;
         }
-        projected.registry.project_viewport(0, height)
+        let mut images = projected.registry.project_viewport(0, height)?;
+        images.retain(|image| image.position.col < width);
+        for image in &mut images {
+            let columns = image.cell_size.cols.min(width - image.position.col);
+            if columns < image.cell_size.cols {
+                image.payload.pixels = Some(crate::compositor::clipping::decoded(image)?);
+                image.payload.raw = None;
+                image.pixel_size = crate::tui::crop_to_visible(
+                    &mut image.payload,
+                    bmux_tui::geometry::Rect::new(0, 0, image.cell_size.cols, image.cell_size.rows),
+                    bmux_tui::geometry::Rect::new(0, 0, columns, image.cell_size.rows),
+                );
+                image.cell_size.cols = columns;
+                image.payload.raw = Some(encode_projected_payload(image)?);
+            }
+        }
+        Ok(images)
     }
 
     /// Project this capture without observing subsequent output or deletion.

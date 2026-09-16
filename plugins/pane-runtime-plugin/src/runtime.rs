@@ -1319,6 +1319,14 @@ mod image_lifecycle_tests {
         assert_eq!(reflowed.len(), 1);
         assert_eq!(reflowed[0].position_row, 0);
         request.width = 80;
+        request.rows = 1;
+        request.scrollback_offset = 1;
+        assert_eq!(encode_reflowed_image_window(&pin, &request).unwrap(), b"[]");
+        request.scrollback_offset = 3;
+        let short: Vec<bmux_attach_image_protocol::AttachPaneImage> =
+            serde_json::from_slice(&encode_reflowed_image_window(&pin, &request).unwrap()).unwrap();
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].position_row, 0);
         request.scrollback_offset = 100;
         assert!(encode_captured_image_window(&pin, &request).is_err());
     }
@@ -4700,6 +4708,37 @@ impl SessionRuntimeManager {
                                 let chunk = chunk.as_slice();
 
                                 let metadata = shell_metadata_parser.process_chunk(chunk);
+                                let chunk = metadata.filtered;
+                                let chunk = chunk.as_slice();
+
+                                // Update terminal mode tracking (mouse protocol,
+                                // cursor/keypad modes, synchronized update) BEFORE
+                                // making the chunk visible in the output buffer.
+                                // This ensures per-pane mode snapshots are always
+                                // consistent with or ahead of the buffered data.
+                                terminal_mode_tracker.process(chunk);
+                                if let Ok(mut protocol) = mouse_protocol_state_for_reader.lock() {
+                                    *protocol = terminal_mode_tracker.current_protocol();
+                                }
+                                if let Ok(mut mode_state) = input_mode_state_for_reader.lock() {
+                                    *mode_state = terminal_mode_tracker.current_input_modes();
+                                }
+                                sync_update_for_reader
+                                    .store(terminal_mode_tracker.sync_update, Ordering::SeqCst);
+
+                                if process_pane_output(
+                                    &terminal_grid_for_reader,
+                                    &reader_output,
+                                    chunk,
+                                )
+                                .is_err()
+                                {
+                                    break;
+                                }
+                                #[cfg(feature = "image-registry")]
+                                drop(registry);
+                                // Metadata callbacks can acquire the runtime manager. Never
+                                // invoke them while holding image/grid/output capture locks.
                                 if !metadata.events.is_empty() {
                                     let padding_before = pane_padding_state(session_id, pane_id);
                                     let mut replay_command = None;
@@ -4735,35 +4774,6 @@ impl SessionRuntimeManager {
                                         notify_pane_metadata_changed(session_id, pane_id, before);
                                     }
                                 }
-                                let chunk = metadata.filtered;
-                                let chunk = chunk.as_slice();
-
-                                // Update terminal mode tracking (mouse protocol,
-                                // cursor/keypad modes, synchronized update) BEFORE
-                                // making the chunk visible in the output buffer.
-                                // This ensures per-pane mode snapshots are always
-                                // consistent with or ahead of the buffered data.
-                                terminal_mode_tracker.process(chunk);
-                                if let Ok(mut protocol) = mouse_protocol_state_for_reader.lock() {
-                                    *protocol = terminal_mode_tracker.current_protocol();
-                                }
-                                if let Ok(mut mode_state) = input_mode_state_for_reader.lock() {
-                                    *mode_state = terminal_mode_tracker.current_input_modes();
-                                }
-                                sync_update_for_reader
-                                    .store(terminal_mode_tracker.sync_update, Ordering::SeqCst);
-
-                                if process_pane_output(
-                                    &terminal_grid_for_reader,
-                                    &reader_output,
-                                    chunk,
-                                )
-                                .is_err()
-                                {
-                                    break;
-                                }
-                                #[cfg(feature = "image-registry")]
-                                drop(registry);
                                 // Notify streaming clients that new output is available.
                                 // Only emit when transitioning false→true to coalesce
                                 // thousands of per-chunk writes into ~1 event per fetch cycle.
@@ -8414,12 +8424,13 @@ fn encode_reflowed_image_window(
         .checked_add(1)
         .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
     let offset = request.scrollback_offset as usize;
-    if offset > projected_count.saturating_sub(pin.grid.height()) {
+    let visible_rows = usize::from(request.rows);
+    if offset > projected_count.saturating_sub(visible_rows) {
         return Err(SessionRuntimeError::ResponseBudgetExceeded);
     }
     let top = i64::try_from(
         projected_count
-            .saturating_sub(pin.grid.height())
+            .saturating_sub(visible_rows)
             .saturating_sub(offset),
     )
     .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
@@ -8430,25 +8441,30 @@ fn encode_reflowed_image_window(
             .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
         let mut image_budget = RESPONSE_OUTPUT_BUDGET;
         snapshot
-            .project_mapped(request.rows, &mut image_budget, |row, column| {
-                let absolute =
-                    usize::try_from(base.saturating_add(row)).map_err(std::io::Error::other)?;
-                let (row, column) = pin
-                    .grid
-                    .main_position_at_width(
-                        absolute,
-                        usize::from(column),
-                        usize::from(request.width),
-                        &mut budget,
-                    )
-                    .map_err(|error| {
-                        std::io::Error::other(format!("image anchor mapping: {error:?}"))
-                    })?;
-                Ok((
-                    i64::try_from(row).map_err(std::io::Error::other)? - top,
-                    u16::try_from(column).map_err(std::io::Error::other)?,
-                ))
-            })
+            .project_mapped(
+                request.width,
+                request.rows,
+                &mut image_budget,
+                |row, column| {
+                    let absolute =
+                        usize::try_from(base.saturating_add(row)).map_err(std::io::Error::other)?;
+                    let (row, column) = pin
+                        .grid
+                        .main_position_at_width(
+                            absolute,
+                            usize::from(column),
+                            usize::from(request.width),
+                            &mut budget,
+                        )
+                        .map_err(|error| {
+                            std::io::Error::other(format!("image anchor mapping: {error:?}"))
+                        })?;
+                    Ok((
+                        i64::try_from(row).map_err(std::io::Error::other)? - top,
+                        u16::try_from(column).map_err(std::io::Error::other)?,
+                    ))
+                },
+            )
             .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?
             .iter()
             .map(bmux_attach_image_protocol::AttachPaneImage::from)
