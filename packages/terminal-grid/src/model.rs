@@ -620,6 +620,8 @@ pub struct TerminalGrid {
     history_erase_revision: u64,
     reset_revision: u64,
     total_scrolled_rows: u64,
+    /// Local full-viewport scroll events, including alternate-screen scrolling.
+    viewport_scroll_revision: u64,
     autowrap: bool,
     pending_wrap: bool,
     scroll_region: Option<(usize, usize)>,
@@ -726,6 +728,7 @@ impl TerminalGrid {
             history_erase_revision: 0,
             reset_revision: 0,
             total_scrolled_rows: 0,
+            viewport_scroll_revision: 0,
             autowrap: true,
             pending_wrap: false,
             scroll_region: None,
@@ -822,6 +825,7 @@ impl TerminalGrid {
             display_erase_revision: 0,
             history_erase_revision: 0,
             reset_revision: 0,
+            viewport_scroll_revision: 0,
             total_scrolled_rows: snapshot
                 .total_scrolled_rows
                 .unwrap_or(u64::from(snapshot.scrollback_rows)),
@@ -856,6 +860,13 @@ impl TerminalGrid {
     #[must_use]
     pub const fn height(&self) -> usize {
         self.height
+    }
+
+    /// Local full-viewport scroll counter for ordered output observers.
+    /// Unlike history accounting, this also advances on the alternate screen.
+    #[must_use]
+    pub const fn viewport_scroll_revision(&self) -> u64 {
+        self.viewport_scroll_revision
     }
 
     #[must_use]
@@ -1544,6 +1555,7 @@ impl TerminalGrid {
             reset.content_revision = self.content_revision;
             reset.display_erase_revision = self.display_erase_revision.wrapping_add(1);
             reset.history_erase_revision = self.history_erase_revision.wrapping_add(1);
+            reset.viewport_scroll_revision = self.viewport_scroll_revision;
             reset.reset_revision = self.reset_revision.wrapping_add(1);
             reset.bump_content_revision();
             *self = reset;
@@ -1617,6 +1629,11 @@ impl TerminalGrid {
         if top >= bottom || bottom >= self.height {
             return;
         }
+        if top == 0 && bottom == self.height.saturating_sub(1) {
+            self.viewport_scroll_revision = self
+                .viewport_scroll_revision
+                .wrapping_add(u64::try_from(count.min(bottom - top + 1)).unwrap_or(u64::MAX));
+        }
         let fill = self.erase_style();
         for _ in 0..count.min(bottom - top + 1) {
             for row in top..bottom {
@@ -1642,6 +1659,7 @@ impl TerminalGrid {
     }
 
     fn scroll_up_one(&mut self) {
+        self.viewport_scroll_revision = self.viewport_scroll_revision.wrapping_add(1);
         let fill = self.erase_style();
         match self.mode {
             GridMode::Main => {
@@ -2583,6 +2601,7 @@ impl TerminalGrid {
             display_erase_revision: self.display_erase_revision,
             history_erase_revision: self.history_erase_revision,
             reset_revision: self.reset_revision,
+            viewport_scroll_revision: self.viewport_scroll_revision,
             total_scrolled_rows: self.total_scrolled_rows,
             autowrap: self.autowrap,
             pending_wrap: self.pending_wrap,

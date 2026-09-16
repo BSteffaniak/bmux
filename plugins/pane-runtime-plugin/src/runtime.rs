@@ -1104,8 +1104,8 @@ impl PaneCursorTracker {
     /// Returns the number of lines that scrolled since last drain.
     #[cfg(feature = "image-registry")]
     fn drain_scroll_delta(&mut self) -> u16 {
-        let total_scrolled = self.terminal_grid.grid().total_scrolled_rows();
-        let delta = total_scrolled.saturating_sub(self.total_scrollback);
+        let total_scrolled = self.terminal_grid.grid().viewport_scroll_revision();
+        let delta = total_scrolled.wrapping_sub(self.total_scrollback);
         self.total_scrollback = total_scrolled;
         u16::try_from(delta).unwrap_or(u16::MAX)
     }
@@ -1407,6 +1407,32 @@ mod image_lifecycle_tests {
                 "split {split}"
             );
         }
+    }
+
+    #[test]
+    fn alternate_scroll_moves_images_without_creating_main_history() {
+        let mut tracker = PaneCursorTracker::new(3, 80);
+        let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut registry = bmux_image::ImageRegistry::default().with_viewport_height(3);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        for bytes in [
+            b"\x1b[?1049h\x1b[3;1H\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\".as_slice(),
+            b"\r\n",
+        ] {
+            let mut output = interceptor.process(bytes);
+            ordered_image_output(
+                &mut tracker,
+                &mut protocol,
+                &mut registry,
+                &mut output,
+                (8, 16),
+                &mut Vec::new(),
+            )
+            .unwrap();
+        }
+        assert_eq!(registry.images().len(), 1);
+        assert_eq!(registry.images()[0].position.row, 1);
+        assert_eq!(tracker.terminal_grid.grid().total_scrolled_rows(), 0);
     }
 
     #[test]
