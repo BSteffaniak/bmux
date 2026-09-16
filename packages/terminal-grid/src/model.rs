@@ -2338,6 +2338,17 @@ impl TerminalGrid {
             .get(anchor.logical_line)
             .ok_or(HistorySliceError::Unavailable)?
             .cells;
+        if anchor.logical_col >= logical_width(cells) {
+            // Use cursor-style virtual columns, but do not clamp the row:
+            // placements moved into history must not reappear at the top.
+            let absolute = prefix
+                .checked_add(anchor.logical_col / width)
+                .and_then(|row| i64::try_from(row).ok())
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            let top = i64::try_from(total.saturating_sub(usize::from(height)))
+                .map_err(|_| HistorySliceError::BudgetExhausted)?;
+            return Ok((absolute - top, anchor.logical_col % width));
+        }
         let mapped =
             crate::reflow::row_for_logical_column_retained(cells, width, anchor.logical_col, false)
                 .filter(|row| *row < projected_row_count(cells, width))
@@ -3560,6 +3571,17 @@ mod tests {
         let mut budget = metadata + text_bytes;
         grid.charge_resize_working_copy(&mut budget).unwrap();
         assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn blank_resize_anchor_can_move_into_history_without_cursor_clamping() {
+        let mut grid = TerminalGrid::new(8, 3, GridLimits::default()).unwrap();
+        grid.process(b"a\r\nbbbbbbbb\r\ncccccccc");
+        assert_eq!(
+            grid.live_position_after_resize(0, 2, 4, 2, &mut 100_000)
+                .unwrap(),
+            (-3, 2),
+        );
     }
 
     #[test]

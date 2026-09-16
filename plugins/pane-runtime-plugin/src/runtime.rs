@@ -13811,7 +13811,7 @@ mod tests {
 
     #[cfg(feature = "image-registry")]
     #[tokio::test]
-    async fn unmappable_width_resize_preserves_images_and_both_grids() {
+    async fn blank_cell_width_resize_tracks_cursor_without_creating_text() {
         let pane_id = Uuid::new_v4();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
@@ -13829,34 +13829,18 @@ mod tests {
         )
         .unwrap();
         pane.terminal_grid.lock().unwrap().process(&output.filtered);
-        let before = pane.image_registry.lock().unwrap().images().to_vec();
-        let sequence = pane.image_registry.lock().unwrap().sequence();
-        let revision = pane.terminal_grid.lock().unwrap().grid().revision();
-        let tracker_revision = pane
-            .cursor_tracker
-            .lock()
-            .unwrap()
-            .terminal_grid
-            .grid()
-            .revision();
+        let id = pane.image_registry.lock().unwrap().images()[0].id;
         pane.resize_pty(2, 4);
-        assert_eq!(*pane.last_requested_size.lock().unwrap(), (2, 8));
-        assert_eq!(
-            pane.terminal_grid.lock().unwrap().grid().revision(),
-            revision
-        );
-        assert_eq!(
-            pane.cursor_tracker
-                .lock()
-                .unwrap()
-                .terminal_grid
-                .grid()
-                .revision(),
-            tracker_revision
-        );
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (2, 4));
+        let tracker = pane.cursor_tracker.lock().unwrap();
+        let cursor = tracker.terminal_grid.grid().cursor();
+        let grid = pane.terminal_grid.lock().unwrap();
+        assert_eq!(grid.grid().cursor(), cursor);
         let images = pane.image_registry.lock().unwrap();
-        assert_eq!(images.images(), before);
-        assert_eq!(images.sequence(), sequence);
+        assert_eq!(images.images().len(), 1);
+        assert_eq!(images.images()[0].id, id);
+        assert_eq!(usize::from(images.images()[0].position.row), cursor.row);
+        assert_eq!(usize::from(images.images()[0].position.col), cursor.col);
     }
 
     #[tokio::test]
