@@ -79,6 +79,9 @@ impl ImageHistorySnapshot {
         budget: &mut usize,
         mut map: impl FnMut(i64, u16) -> std::io::Result<(i64, u16)>,
     ) -> std::io::Result<Vec<PaneImage>> {
+        if width == 0 || height == 0 {
+            return Ok(Vec::new());
+        }
         let mut projected = self.registry.capture_history(budget)?;
         for (image, row) in projected.registry.history.values_mut() {
             let (mapped_row, column) = map(*row, image.position.col)?;
@@ -640,6 +643,9 @@ impl ImageRegistry {
     /// Build a cropped viewport without modifying original pixels or placement size.
     /// Decode failures are explicit rather than presenting a healthy empty image.
     pub fn project_viewport(&self, offset: usize, height: u16) -> std::io::Result<Vec<PaneImage>> {
+        if height == 0 {
+            return Ok(Vec::new());
+        }
         let offset = i64::try_from(offset).unwrap_or(i64::MAX);
         self.history
             .values()
@@ -1156,6 +1162,52 @@ mod tests {
                 .project_mapped(20, 1, &mut 100_000, |row, col| Ok((row, col)))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn empty_viewport_does_not_decode_a_straddling_image() {
+        let mut registry = ImageRegistry::default();
+        registry.add_image(
+            ImageProtocol::Sixel,
+            ImagePayload::default(),
+            ImagePosition { row: 0, col: 0 },
+            ImageCellSize { rows: 2, cols: 1 },
+            ImagePixelSize {
+                width: 8,
+                height: 32,
+            },
+        );
+        // Retain an undecodable placement crossing the top edge. Any nonempty
+        // viewport would need to crop it and must report its invalid payload.
+        registry.history.values_mut().next().unwrap().1 = -1;
+        assert!(registry.project_viewport(0, 0).unwrap().is_empty());
+        assert!(registry.project_viewport(0, 1).is_err());
+    }
+
+    #[test]
+    fn empty_mapped_viewport_neither_allocates_nor_maps_anchors() {
+        let mut registry = ImageRegistry::default();
+        registry.add_image(
+            ImageProtocol::Sixel,
+            ImagePayload::default(),
+            ImagePosition { row: 0, col: 0 },
+            ImageCellSize { rows: 1, cols: 1 },
+            ImagePixelSize {
+                width: 8,
+                height: 16,
+            },
+        );
+        let snapshot = registry.capture_history(&mut 100_000).unwrap();
+        for (width, height) in [(0, 1), (1, 0), (0, 0)] {
+            let mut budget = 0;
+            let images = snapshot
+                .project_mapped(width, height, &mut budget, |_, _| {
+                    panic!("empty window must not map anchors")
+                })
+                .unwrap();
+            assert!(images.is_empty());
+            assert_eq!(budget, 0);
+        }
     }
 
     #[test]
