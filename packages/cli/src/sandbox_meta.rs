@@ -290,14 +290,56 @@ fn write_index_entries(entries: Vec<SandboxIndexEntry>) -> Result<()> {
 }
 
 fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp_path = path.with_extension("tmp");
-    std::fs::write(&temp_path, bytes)
-        .with_context(|| format!("failed writing {}", temp_path.display()))?;
-    std::fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed renaming {} to {}",
-            temp_path.display(),
-            path.display()
-        )
-    })
+    use std::io::Write;
+
+    let temp_path = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .with_context(|| format!("failed creating {}", temp_path.display()))?;
+    let result = (|| {
+        file.write_all(bytes)
+            .with_context(|| format!("failed writing {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed syncing {}", temp_path.display()))?;
+        drop(file);
+        std::fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed renaming {} to {}",
+                temp_path.display(),
+                path.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn concurrent_atomic_writes_do_not_share_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sandbox.json");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for value in 0..8_u8 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..20 {
+                        super::write_atomic_file(path, &[value; 1024]).unwrap();
+                    }
+                });
+            }
+        });
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 1024);
+        assert!(bytes.iter().all(|byte| *byte == bytes[0]));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 }

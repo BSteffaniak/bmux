@@ -145,6 +145,31 @@ impl ImageInterceptor {
         let mut events = Vec::new();
 
         for &byte in input {
+            if matches!(byte, 0x18 | 0x1A) {
+                // CAN/SUB cancel an in-flight control string, including one
+                // being discarded for exceeding its budget. Preserve the
+                // control byte so the downstream parser cancels its state too.
+                self.reset();
+                filtered.push(byte);
+                continue;
+            }
+            // ESC ends an unfinished control string. Unless followed by ST,
+            // interpret it as the start of the next escape sequence instead of
+            // appending subsequent terminal controls to the image payload.
+            let string_escape = match self.state {
+                #[cfg(feature = "sixel")]
+                State::SixelEscape => true,
+                #[cfg(feature = "kitty")]
+                State::KittyEscape => true,
+                #[cfg(feature = "iterm2")]
+                State::ITerm2Escape => true,
+                _ => false,
+            };
+            if string_escape && byte != b'\\' {
+                self.reset();
+                self.state = State::Escape;
+                self.capture_filtered_offset = filtered.len();
+            }
             match self.state {
                 State::Ground => {
                     if byte == 0x1B {
@@ -187,6 +212,11 @@ impl ImageInterceptor {
                             self.capture_position = ImagePosition { row: 0, col: 0 };
                         }
 
+                        0x1B => {
+                            // Consecutive ESC bytes restart the escape parser.
+                            filtered.push(0x1B);
+                            self.capture_filtered_offset = filtered.len();
+                        }
                         // Not an image-related sequence — pass through ESC + byte
                         _ => {
                             filtered.push(0x1B);
@@ -201,16 +231,22 @@ impl ImageInterceptor {
                 State::DcsEntry => {
                     // Accumulate DCS parameter/intermediate bytes until the
                     // final byte.  Sixel's final byte is 'q'.
-                    if (0x30..=0x3F).contains(&byte) {
-                        // Parameter byte (0-9, ;, etc.)
-                        self.dcs_intermediates.push(byte);
-                    } else if (0x20..=0x2F).contains(&byte) {
-                        // Intermediate byte
-                        self.dcs_intermediates.push(byte);
+                    if (0x20..=0x3F).contains(&byte) {
+                        if self.dcs_intermediates.len() >= self.max_encoded_image_bytes {
+                            // Discard the entire oversized DCS through ST, not
+                            // just its header: its body must not become text.
+                            self.dcs_intermediates.clear();
+                            self.buf.clear();
+                            self.discarding_oversized = true;
+                            self.state = State::SixelBody;
+                        } else {
+                            self.dcs_intermediates.push(byte);
+                        }
                     } else if byte == b'q' {
                         // Final byte = sixel!  Enter body accumulation.
                         self.state = State::SixelBody;
                         self.buf.clear();
+                        self.discarding_oversized = false;
                     } else {
                         // Not sixel — pass through the original DCS sequence.
                         filtered.push(0x1B);
@@ -227,25 +263,27 @@ impl ImageInterceptor {
                     if byte == 0x1B {
                         self.state = State::SixelEscape;
                     } else {
-                        self.buf.push(byte);
+                        self.push_image_byte(byte);
                     }
                 }
 
                 #[cfg(feature = "sixel")]
                 State::SixelEscape => {
                     if byte == b'\\' {
-                        let pixel_size = crate::codec::sixel::estimate_pixel_size(&self.buf);
-                        events.push(ImageEvent::SixelImage {
-                            data: std::mem::take(&mut self.buf),
-                            position: self.capture_position,
-                            pixel_size,
-                            filtered_byte_offset: self.capture_filtered_offset,
-                        });
+                        if let Some(data) = self.take_image_bytes() {
+                            let pixel_size = crate::codec::sixel::estimate_pixel_size(&data);
+                            events.push(ImageEvent::SixelImage {
+                                data,
+                                position: self.capture_position,
+                                pixel_size,
+                                filtered_byte_offset: self.capture_filtered_offset,
+                            });
+                        }
                         self.state = State::Ground;
                     } else {
                         // False alarm — ESC was part of the data.
-                        self.buf.push(0x1B);
-                        self.buf.push(byte);
+                        self.push_image_byte(0x1B);
+                        self.push_image_byte(byte);
                         self.state = State::SixelBody;
                     }
                 }
@@ -316,6 +354,7 @@ impl ImageInterceptor {
                                 // Matched "1337;File=" — enter body.
                                 self.state = State::ITerm2Body;
                                 self.buf.clear();
+                                self.discarding_oversized = false;
                             }
                             // else: keep accumulating prefix bytes
                         } else {
@@ -342,29 +381,33 @@ impl ImageInterceptor {
                         0x1B => self.state = State::ITerm2Escape,
                         0x07 => {
                             // BEL terminates OSC.
-                            events.push(ImageEvent::ITerm2Image {
-                                data: std::mem::take(&mut self.buf),
-                                position: self.capture_position,
-                                filtered_byte_offset: self.capture_filtered_offset,
-                            });
+                            if let Some(data) = self.take_image_bytes() {
+                                events.push(ImageEvent::ITerm2Image {
+                                    data,
+                                    position: self.capture_position,
+                                    filtered_byte_offset: self.capture_filtered_offset,
+                                });
+                            }
                             self.state = State::Ground;
                         }
-                        _ => self.buf.push(byte),
+                        _ => self.push_image_byte(byte),
                     }
                 }
 
                 #[cfg(feature = "iterm2")]
                 State::ITerm2Escape => {
                     if byte == b'\\' {
-                        events.push(ImageEvent::ITerm2Image {
-                            data: std::mem::take(&mut self.buf),
-                            position: self.capture_position,
-                            filtered_byte_offset: self.capture_filtered_offset,
-                        });
+                        if let Some(data) = self.take_image_bytes() {
+                            events.push(ImageEvent::ITerm2Image {
+                                data,
+                                position: self.capture_position,
+                                filtered_byte_offset: self.capture_filtered_offset,
+                            });
+                        }
                         self.state = State::Ground;
                     } else {
-                        self.buf.push(0x1B);
-                        self.buf.push(byte);
+                        self.push_image_byte(0x1B);
+                        self.push_image_byte(byte);
                         self.state = State::ITerm2Body;
                     }
                 }
@@ -399,6 +442,31 @@ impl Default for ImageInterceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "sixel")]
+    #[test]
+    fn oversized_dcs_header_is_bounded_and_recovers() {
+        for final_byte in [b'q', b'p'] {
+            let mut wire = b"before\x1bP12345".to_vec();
+            wire.push(final_byte);
+            wire.extend_from_slice(b"payload\x1b\\after\x1bPq~\x1b\\");
+            for split in 0..=wire.len() {
+                let mut interceptor = ImageInterceptor::with_max_encoded_bytes(4);
+                let mut filtered = Vec::new();
+                let mut events = Vec::new();
+                for chunk in [&wire[..split], &wire[split..]] {
+                    let result = interceptor.process(chunk);
+                    assert!(interceptor.dcs_intermediates.len() <= 4);
+                    assert!(interceptor.buf.len() <= 4);
+                    filtered.extend(result.filtered);
+                    events.extend(result.events);
+                }
+                assert_eq!(filtered, b"beforeafter", "split {split}");
+                assert_eq!(events.len(), 1, "split {split}");
+                assert!(matches!(&events[0], ImageEvent::SixelImage { data, .. } if data == b"~"));
+            }
+        }
+    }
 
     #[cfg(feature = "kitty")]
     #[test]

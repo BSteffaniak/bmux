@@ -48,6 +48,170 @@ mod pipeline {
     }
 
     #[test]
+    fn failed_alternate_crop_preserves_hidden_normal_anchors() {
+        let mut registry = ImageRegistry::default();
+        registry.handle_event(
+            ImageEvent::SixelImage {
+                data: b"#1;2;100;0;0~".to_vec(),
+                position: ImagePosition { row: 1, col: 2 },
+                pixel_size: ImagePixelSize {
+                    width: 1,
+                    height: 6,
+                },
+                filtered_byte_offset: 0,
+            },
+            8,
+            16,
+        );
+        let normal = registry.images().to_vec();
+        registry.set_alternate_screen(true);
+        registry.handle_event(
+            ImageEvent::SixelImage {
+                data: Vec::new(),
+                position: ImagePosition { row: 2, col: 0 },
+                pixel_size: ImagePixelSize {
+                    width: 8,
+                    height: 64,
+                },
+                filtered_byte_offset: 0,
+            },
+            8,
+            16,
+        );
+        let alternate = registry.images().to_vec();
+        let revision = registry.sequence();
+        let mut mapped = false;
+        assert!(
+            registry
+                .remap_positions(3, |row, column| {
+                    mapped = true;
+                    Ok((row - 1, column))
+                })
+                .is_err()
+        );
+        assert!(!mapped);
+        assert_eq!(registry.images(), alternate);
+        assert_eq!(registry.sequence(), revision);
+        registry.set_alternate_screen(false);
+        assert_eq!(registry.images(), normal);
+    }
+
+    #[test]
+    fn failed_normal_mapping_does_not_commit_alternate_projection() {
+        let mut registry = ImageRegistry::default();
+        let mut event = ImageInterceptor::new()
+            .process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\")
+            .events
+            .remove(0);
+        registry.handle_event(event.clone(), 8, 16);
+        let normal = registry.images().to_vec();
+        registry.set_alternate_screen(true);
+        event.set_position(ImagePosition { row: 4, col: 0 });
+        registry.handle_event(event, 8, 16);
+        let alternate = registry.images().to_vec();
+        let revision = registry.sequence();
+        assert!(
+            registry
+                .remap_positions(3, |_, _| { Err(std::io::Error::other("missing anchor")) })
+                .is_err()
+        );
+        assert_eq!(registry.images(), alternate);
+        assert_eq!(registry.sequence(), revision);
+        assert!(registry.delta_since(revision).removed.is_empty());
+        registry.set_alternate_screen(false);
+        assert_eq!(registry.images(), normal);
+    }
+
+    #[test]
+    fn scrolling_keeps_resized_alternate_viewport_clipped() {
+        let mut registry = ImageRegistry::default();
+        registry.set_alternate_screen(true);
+        let mut event = ImageInterceptor::new()
+            .process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\")
+            .events
+            .remove(0);
+        event.set_position(ImagePosition { row: 4, col: 0 });
+        registry.handle_event(event, 8, 16);
+        registry.resize_alternate_viewport(3).unwrap();
+        registry.scroll_up(1).unwrap();
+        assert!(registry.images().is_empty());
+        registry.scroll_up(1).unwrap();
+        assert_eq!(registry.images().len(), 1);
+        assert_eq!(registry.images()[0].position.row, 2);
+    }
+
+    #[test]
+    fn offscreen_placement_is_retained_until_scrolled_into_view() {
+        let mut registry = ImageRegistry::default().with_viewport_height(3);
+        let mut event = ImageInterceptor::new()
+            .process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\")
+            .events
+            .remove(0);
+        event.set_position(ImagePosition { row: 4, col: 0 });
+        registry.handle_event(event, 8, 16);
+        assert!(registry.images().is_empty());
+        assert!(registry.delta_since(0).added.is_empty());
+        assert!(registry.has_main_images());
+        registry.scroll_up(2).unwrap();
+        assert_eq!(registry.images().len(), 1);
+        assert_eq!(registry.images()[0].position.row, 2);
+        assert_eq!(registry.delta_since(0).added, registry.images());
+    }
+
+    #[test]
+    fn alternate_viewport_resize_restores_original_placements() {
+        let mut registry = ImageRegistry::default();
+        let event = ImageInterceptor::new()
+            .process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\")
+            .events
+            .remove(0);
+        registry.handle_event(event.clone(), 8, 16);
+        let normal = registry.images().to_vec();
+        registry.set_alternate_screen(true);
+        let mut event = event;
+        event.set_position(ImagePosition { row: 4, col: 0 });
+        registry.handle_event(event, 8, 16);
+        let alternate = registry.images().to_vec();
+        let revision = registry.sequence();
+        registry.resize_alternate_viewport(3).unwrap();
+        assert!(registry.images().is_empty());
+        assert!(
+            registry
+                .delta_since(revision)
+                .removed
+                .contains(&alternate[0].id)
+        );
+        registry.resize_alternate_viewport(6).unwrap();
+        assert_eq!(registry.images(), alternate);
+        registry.set_alternate_screen(false);
+        assert_eq!(registry.images(), normal);
+    }
+
+    #[test]
+    fn main_history_eviction_does_not_mutate_alternate_images() {
+        let mut registry = ImageRegistry::default();
+        assert!(!registry.has_main_images());
+        let mut interceptor = ImageInterceptor::new();
+        let events = interceptor
+            .process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\")
+            .events;
+        registry.handle_event(events[0].clone(), 8, 16);
+        registry.scroll_up(2).unwrap();
+        assert!(registry.has_main_images());
+        registry.set_alternate_screen(true);
+        assert!(registry.has_main_images());
+        registry.handle_event(events[0].clone(), 8, 16);
+        let alternate = registry.images().to_vec();
+        let revision = registry.sequence();
+        registry.evict_main_history(0);
+        assert!(!registry.has_main_images());
+        assert_eq!(registry.images(), alternate);
+        assert_eq!(registry.sequence(), revision);
+        registry.set_alternate_screen(false);
+        assert!(registry.project_viewport(2, 3).unwrap().is_empty());
+    }
+
+    #[test]
     fn alternate_screen_registry_restores_normal_images() {
         let mut registry = ImageRegistry::default();
         let event = ImageEvent::SixelImage {
@@ -80,6 +244,46 @@ mod pipeline {
         registry.clear();
         registry.set_alternate_screen(false);
         assert_eq!(registry.images()[0].id, main_id);
+    }
+
+    #[test]
+    fn hidden_normal_screen_remapping_preserves_alternate_projection() {
+        let mut registry = ImageRegistry::default();
+        let event = ImageEvent::SixelImage {
+            data: b"#1;2;100;0;0~".to_vec(),
+            position: ImagePosition { row: 2, col: 3 },
+            pixel_size: ImagePixelSize {
+                width: 1,
+                height: 6,
+            },
+            filtered_byte_offset: 0,
+        };
+        registry.handle_event(event.clone(), 8, 16);
+        let original = registry.images()[0].clone();
+        registry.set_alternate_screen(true);
+        registry.handle_event(event, 8, 16);
+        let alternate = registry.images()[0].clone();
+        let revision = registry.sequence();
+
+        assert!(
+            registry
+                .remap_positions(24, |_, _| Err(std::io::Error::other("unavailable anchor")))
+                .is_err()
+        );
+        registry
+            .remap_positions(24, |row, col| Ok((row + 4, col + 2)))
+            .unwrap();
+        assert_eq!(registry.images(), std::slice::from_ref(&alternate));
+        assert_eq!(registry.sequence(), revision);
+
+        registry.set_alternate_screen(false);
+        let restored = &registry.images()[0];
+        assert_eq!(restored.id, original.id);
+        assert_eq!(restored.position, ImagePosition { row: 6, col: 5 });
+        assert_eq!(restored.payload, original.payload);
+        let delta = registry.delta_since(revision);
+        assert!(delta.removed.contains(&alternate.id));
+        assert!(delta.added.iter().any(|image| image == restored));
     }
 
     #[test]
@@ -403,6 +607,136 @@ mod pipeline {
                     assert_eq!(image.payload.pixels.as_ref().unwrap().data, rgba);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn interrupted_images_do_not_swallow_screen_switches() {
+        for prefix in [
+            b"\x1bPq~~~~~".as_slice(),
+            b"\x1b_Ga=t;AAAAA".as_slice(),
+            b"\x1b]1337;File=AAAAA".as_slice(),
+        ] {
+            for limit in [4, 1024] {
+                let mut wire = prefix.to_vec();
+                wire.extend_from_slice(b"\x1b[?1049htext\x1bPq~\x1b\\");
+                for split in 0..=wire.len() {
+                    let mut interceptor = ImageInterceptor::with_max_encoded_bytes(limit);
+                    let mut filtered = Vec::new();
+                    let mut events = Vec::new();
+                    for chunk in [&wire[..split], &wire[split..]] {
+                        let result = interceptor.process(chunk);
+                        filtered.extend(result.filtered);
+                        events.extend(result.events);
+                    }
+                    assert_eq!(filtered, b"\x1b[?1049htext", "split {split}");
+                    assert_eq!(events.len(), 1, "split {split}");
+                    assert!(
+                        matches!(&events[0], ImageEvent::SixelImage { data, .. } if data == b"~")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_images_preserve_following_screen_changes_at_every_split() {
+        for prefix in [
+            b"\x1bPq~~~~~".as_slice(),
+            b"\x1b_Ga=t;AAAAA".as_slice(),
+            b"\x1b]1337;File=AAAAA".as_slice(),
+        ] {
+            for cancel in [0x18, 0x1A] {
+                for limit in [4, 1024] {
+                    let mut wire = prefix.to_vec();
+                    wire.push(cancel);
+                    wire.extend_from_slice(b"\x1b[?1049htext\x1bPq~\x1b\\");
+                    let mut expected = vec![cancel];
+                    expected.extend_from_slice(b"\x1b[?1049htext");
+                    for split in 0..=wire.len() {
+                        let mut interceptor = ImageInterceptor::with_max_encoded_bytes(limit);
+                        let mut filtered = Vec::new();
+                        let mut events = Vec::new();
+                        for chunk in [&wire[..split], &wire[split..]] {
+                            let result = interceptor.process(chunk);
+                            filtered.extend(result.filtered);
+                            events.extend(result.events);
+                        }
+                        assert_eq!(filtered, expected, "split {split}");
+                        assert_eq!(events.len(), 1, "split {split}");
+                        assert!(
+                            matches!(&events[0], ImageEvent::SixelImage { data, .. } if data == b"~")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_iterm2_recovers_at_every_read_split() {
+        for terminator in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            let mut wire = b"before\x1b]1337;File=12345".to_vec();
+            wire.extend_from_slice(terminator);
+            wire.extend_from_slice(b"after\x1b]1337;File=1234");
+            wire.extend_from_slice(terminator);
+            for split in 0..=wire.len() {
+                let mut interceptor = ImageInterceptor::with_max_encoded_bytes(4);
+                let mut filtered = Vec::new();
+                let mut events = Vec::new();
+                for chunk in [&wire[..split], &wire[split..]] {
+                    let result = interceptor.process(chunk);
+                    filtered.extend(result.filtered);
+                    events.extend(result.events);
+                }
+                assert_eq!(filtered, b"beforeafter", "split {split}");
+                assert_eq!(events.len(), 1, "split {split}");
+                let ImageEvent::ITerm2Image { data, .. } = &events[0] else {
+                    panic!("expected iTerm2 image");
+                };
+                assert_eq!(data, b"1234", "split {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_sixel_recovers_at_every_read_split() {
+        let wire = b"before\x1bPq~~~~~\x1b\\after\x1bPq~\x1b\\";
+        for split in 0..=wire.len() {
+            let mut interceptor = ImageInterceptor::with_max_encoded_bytes(4);
+            let mut filtered = Vec::new();
+            let mut events = Vec::new();
+            for chunk in [&wire[..split], &wire[split..]] {
+                let result = interceptor.process(chunk);
+                filtered.extend(result.filtered);
+                events.extend(result.events);
+            }
+            assert_eq!(filtered, b"beforeafter", "split {split}");
+            assert_eq!(events.len(), 1, "split {split}");
+            let ImageEvent::SixelImage { data, .. } = &events[0] else {
+                panic!("expected Sixel image");
+            };
+            assert_eq!(data, b"~", "split {split}");
+        }
+    }
+
+    #[test]
+    fn kitty_delete_cancels_partial_transmission_at_every_read_split() {
+        let wire = b"\x1b_Ga=t,f=32,s=1,v=1,i=42,m=1;AQI=\x1b\\\x1b_Ga=d,d=i,i=42;\x1b\\\x1b_Ga=t,f=32,s=1,v=1,i=42,m=0;AwQFBg==\x1b\\\x1b_Ga=p,i=42,p=7;\x1b\\";
+        for split in 0..=wire.len() {
+            let mut interceptor = ImageInterceptor::new();
+            let mut registry = ImageRegistry::default();
+            for chunk in [&wire[..split], &wire[split..]] {
+                for event in interceptor.process(chunk).events {
+                    registry.handle_event(event, 8, 16);
+                }
+            }
+            assert_eq!(registry.images().len(), 1, "split {split}");
+            let image = &registry.images()[0];
+            let pixels = image::load_from_memory(image.payload.raw.as_ref().unwrap())
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(pixels.into_raw(), vec![3, 4, 5, 6], "split {split}");
         }
     }
 

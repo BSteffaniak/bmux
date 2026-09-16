@@ -36,6 +36,8 @@ pub struct ImageRegistry {
     history: std::collections::BTreeMap<u64, (PaneImage, i64)>,
     /// Hidden normal-screen state while an alternate screen is active.
     normal_screen: Option<Box<ImageRegistry>>,
+    /// Height used for subsequent live scroll projections.
+    viewport_height: u16,
     next_id: u64,
     /// Monotonic sequence counter; incremented on every mutation.
     sequence: u64,
@@ -109,6 +111,17 @@ impl ImageHistorySnapshot {
 }
 
 impl ImageRegistry {
+    /// Whether normal-screen placements need remapping, including hidden history.
+    #[must_use]
+    pub fn has_main_images(&self) -> bool {
+        !self
+            .normal_screen
+            .as_deref()
+            .unwrap_or(self)
+            .history
+            .is_empty()
+    }
+
     /// Copy retained placements only after charging their complete allocation.
     /// The caller must capture text under the same execution-state lock boundary.
     pub fn capture_history(&self, budget: &mut usize) -> std::io::Result<ImageHistorySnapshot> {
@@ -150,6 +163,7 @@ impl ImageRegistry {
             images: Vec::new(),
             history: std::collections::BTreeMap::new(),
             normal_screen: None,
+            viewport_height: u16::MAX,
             next_id: 1,
             sequence: 0,
             max_images,
@@ -165,6 +179,13 @@ impl ImageRegistry {
         }
     }
 
+    /// Set the initial viewport while constructing an empty registry.
+    #[must_use]
+    pub fn with_viewport_height(mut self, height: u16) -> Self {
+        self.viewport_height = height;
+        self
+    }
+
     /// Switch screen-local image state, preserving the hidden normal screen.
     /// Placement IDs and change sequence remain monotonic across switches.
     pub fn set_alternate_screen(&mut self, alternate: bool) {
@@ -176,7 +197,8 @@ impl ImageRegistry {
         let next_id = self.next_id;
         let log = std::mem::take(&mut self.change_log);
         if alternate {
-            let empty = Self::new(self.max_images, self.max_bytes);
+            let mut empty = Self::new(self.max_images, self.max_bytes);
+            empty.viewport_height = self.viewport_height;
             let normal = std::mem::replace(self, empty);
             self.normal_screen = Some(Box::new(normal));
         } else if let Some(normal) = self.normal_screen.take() {
@@ -307,11 +329,13 @@ impl ImageRegistry {
 
         self.history
             .insert(id, (image.clone(), i64::from(position.row)));
-        self.change_log.push(ChangeLogEntry::Added {
-            sequence: self.sequence,
-            image: image.clone(),
-        });
-        self.images.push(image);
+        if position.row < self.viewport_height {
+            self.change_log.push(ChangeLogEntry::Added {
+                sequence: self.sequence,
+                image: image.clone(),
+            });
+            self.images.push(image);
+        }
         self.compact_change_log();
         self.enforce_limits();
     }
@@ -396,14 +420,19 @@ impl ImageRegistry {
         if lines == 0 {
             return Ok(());
         }
+        let original_rows = self
+            .history
+            .iter()
+            .map(|(&id, (_, row))| (id, *row))
+            .collect::<std::collections::BTreeMap<_, _>>();
         for (_, row) in self.history.values_mut() {
             *row = row.saturating_sub(i64::from(lines));
         }
-        let projected = match self.project_viewport(0, u16::MAX) {
+        let projected = match self.project_viewport(0, self.viewport_height) {
             Ok(projected) => projected,
             Err(error) => {
-                for (_, row) in self.history.values_mut() {
-                    *row = row.saturating_add(i64::from(lines));
+                for (id, (_, row)) in &mut self.history {
+                    *row = original_rows[id];
                 }
                 return Err(error);
             }
@@ -428,6 +457,44 @@ impl ImageRegistry {
         Ok(())
     }
 
+    /// Reproject the active alternate screen after a height change without
+    /// moving its placements or touching hidden normal-screen history.
+    pub fn resize_alternate_viewport(&mut self, height: u16) -> std::io::Result<()> {
+        if self.normal_screen.is_none() {
+            if self.history.is_empty() {
+                self.viewport_height = height;
+            }
+            return Ok(());
+        }
+        let projected = self.project_viewport(0, height)?;
+        self.commit_alternate_projection(projected);
+        self.viewport_height = height;
+        Ok(())
+    }
+
+    fn commit_alternate_projection(&mut self, projected: Vec<PaneImage>) {
+        if projected == self.images {
+            return;
+        }
+        self.sequence += 1;
+        for old in &self.images {
+            if !projected.iter().any(|image| image.id == old.id) {
+                self.change_log.push(ChangeLogEntry::Removed {
+                    sequence: self.sequence,
+                    image_id: old.id,
+                });
+            }
+        }
+        for image in &projected {
+            self.change_log.push(ChangeLogEntry::Added {
+                sequence: self.sequence,
+                image: image.clone(),
+            });
+        }
+        self.images = projected;
+        self.compact_change_log();
+    }
+
     /// Atomically remap retained normal-screen anchors during a geometry change.
     /// The caller maps against the pre-resize text capture. A failed mapping or
     /// crop leaves all placement state and revisions unchanged.
@@ -436,8 +503,14 @@ impl ImageRegistry {
         height: u16,
         mut map: impl FnMut(i64, u16) -> std::io::Result<(i64, u16)>,
     ) -> std::io::Result<()> {
-        if let Some(normal) = self.normal_screen.as_mut() {
-            return normal.remap_positions(height, map);
+        if self.normal_screen.is_some() {
+            let projected = self.project_viewport(0, height)?;
+            if let Some(normal) = self.normal_screen.as_mut() {
+                normal.remap_positions(height, map)?;
+            }
+            self.commit_alternate_projection(projected);
+            self.viewport_height = height;
+            return Ok(());
         }
         let positions = self
             .history
@@ -481,6 +554,7 @@ impl ImageRegistry {
             });
         }
         self.images = projected;
+        self.viewport_height = height;
         self.compact_change_log();
         Ok(())
     }
@@ -604,6 +678,16 @@ impl ImageRegistry {
     }
 
     /// Remove placements whose final row is older than retained terminal history.
+    /// Apply main-screen retention after a geometry change, including while
+    /// the main screen is hidden. Alternate-screen placements are unaffected.
+    pub fn evict_main_history(&mut self, retained_rows: usize) {
+        if let Some(normal) = self.normal_screen.as_mut() {
+            normal.evict_history(retained_rows);
+        } else {
+            self.evict_history(retained_rows);
+        }
+    }
+
     pub fn evict_history(&mut self, retained_rows: usize) {
         let oldest = i64::try_from(retained_rows)
             .unwrap_or(i64::MAX)
@@ -916,6 +1000,7 @@ impl ImageRegistry {
                 }
                 KittyDeleteSpecifier::ByImageId(id) => {
                     self.kitty_transmitted.remove(&id);
+                    self.kitty_pending_chunks.remove(&id);
                     let ids = self
                         .kitty_placements
                         .iter()
@@ -1043,6 +1128,84 @@ mod tests {
         // Oldest images were evicted; newest two remain.
         assert_eq!(reg.images()[0].position.row, 3);
         assert_eq!(reg.images()[1].position.row, 4);
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn deleting_image_discards_pending_transmission() {
+        use crate::model::{KittyCommand, KittyDeleteSpecifier, KittyFormat};
+
+        let mut reg = ImageRegistry::default();
+        reg.handle_kitty_command(
+            KittyCommand::Transmit {
+                image_id: 42,
+                format: KittyFormat::Rgba,
+                data: vec![1, 2],
+                width: 1,
+                height: 1,
+                more_chunks: true,
+            },
+            8,
+            16,
+        );
+        reg.handle_kitty_command(
+            KittyCommand::Delete {
+                specifier: KittyDeleteSpecifier::ByImageId(42),
+            },
+            8,
+            16,
+        );
+        assert!(!reg.kitty_pending_chunks.contains_key(&42));
+        reg.handle_kitty_command(
+            KittyCommand::Transmit {
+                image_id: 42,
+                format: KittyFormat::Rgba,
+                data: vec![3, 4, 5, 6],
+                width: 1,
+                height: 1,
+                more_chunks: false,
+            },
+            8,
+            16,
+        );
+        assert_eq!(reg.kitty_transmitted[&42].data, vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn failed_scroll_restores_saturated_history_positions() {
+        let mut reg = ImageRegistry::new(10, 0);
+        for row in [0, 1] {
+            reg.add_image(
+                ImageProtocol::Sixel,
+                ImagePayload::default(),
+                ImagePosition { row, col: 0 },
+                ImageCellSize { rows: 3, cols: 1 },
+                ImagePixelSize {
+                    width: 8,
+                    height: 48,
+                },
+            );
+        }
+        reg.history.values_mut().next().unwrap().1 = i64::MIN;
+        let rows = reg
+            .history
+            .values()
+            .map(|(_, row)| *row)
+            .collect::<Vec<_>>();
+        let images = reg.images().to_vec();
+        let revision = reg.sequence();
+
+        // The second image needs cropping, but has no decodable payload.
+        assert!(reg.scroll_up(2).is_err());
+        assert_eq!(
+            reg.history
+                .values()
+                .map(|(_, row)| *row)
+                .collect::<Vec<_>>(),
+            rows
+        );
+        assert_eq!(reg.images(), images);
+        assert_eq!(reg.sequence(), revision);
     }
 
     #[test]

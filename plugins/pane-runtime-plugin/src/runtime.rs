@@ -772,6 +772,8 @@ fn apply_shell_metadata_events_and_take_prompt_replay(
 }
 
 struct PaneRuntimeHandle {
+    #[cfg(feature = "image-registry")]
+    session_id: SessionId,
     meta: PaneRuntimeMeta,
     process_id: Arc<std::sync::Mutex<Option<u32>>>,
     process_group_id: Arc<std::sync::Mutex<Option<i32>>>,
@@ -785,6 +787,7 @@ struct PaneRuntimeHandle {
     terminal_grid_deltas: Arc<std::sync::Mutex<TerminalGridDeltaLog>>,
     exited: Arc<AtomicBool>,
     last_requested_size: Arc<std::sync::Mutex<(u16, u16)>>,
+    cursor_tracker: Arc<std::sync::Mutex<PaneCursorTracker>>,
     /// Set to `true` by the PTY reader when new output arrives. The broadcast
     /// event is only emitted on the `false→true` transition, coalescing
     /// thousands of per-chunk writes into ~1 event per fetch cycle.
@@ -1371,6 +1374,38 @@ mod image_lifecycle_tests {
             let historical = registry.project_viewport(3, 3).unwrap();
             assert_eq!(historical.len(), 1, "split {split}");
             assert_eq!(historical[0].position.row, 2);
+        }
+    }
+
+    #[test]
+    fn alternate_screen_scrolling_preserves_normal_image_history() {
+        let image = b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\";
+        let mut bytes = image.to_vec();
+        bytes.extend_from_slice(b"\r\n\r\n\r\n\x1b[?1049h");
+        bytes.extend_from_slice(image);
+        bytes.extend_from_slice(b"\r\n\r\n\r\n\r\n\x1b[3J\x1b[?1049l");
+        for split in 0..=bytes.len() {
+            let mut tracker = PaneCursorTracker::new(3, 80);
+            let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+            let mut registry = bmux_image::ImageRegistry::default();
+            let mut interceptor = bmux_image::ImageInterceptor::new();
+            for chunk in [&bytes[..split], &bytes[split..]] {
+                let mut output = interceptor.process(chunk);
+                ordered_image_output(
+                    &mut tracker,
+                    &mut protocol,
+                    &mut registry,
+                    &mut output,
+                    (8, 16),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            }
+            assert!(registry.images().is_empty(), "split {split}");
+            let history = registry.project_viewport(1, 3).unwrap();
+            assert_eq!(history.len(), 1, "split {split}");
+            assert_eq!(history[0].id, 1, "split {split}");
+            assert_eq!(history[0].position.row, 0, "split {split}");
         }
     }
 
@@ -2292,15 +2327,83 @@ impl PaneRuntimeHandle {
     }
 
     fn resize_pty(&self, rows: u16, cols: u16) {
-        if let Ok(mut last) = self.last_requested_size.lock() {
-            *last = (rows, cols);
-        }
+        // Serialize geometry publication with the reader's entire output chunk.
+        // The reader acquires size before image state, grid, and output.
+        let Ok(mut last) = self.last_requested_size.lock() else {
+            return;
+        };
+        let Ok(mut tracker) = self.cursor_tracker.lock() else {
+            return;
+        };
+        // Pinned captures hold image state before grid/output. Participate in
+        // that ordering so a resize cannot bisect a combined capture.
+        #[cfg(feature = "image-registry")]
+        let Ok(mut images) = self.image_registry.lock() else {
+            return;
+        };
+        #[cfg(feature = "image-registry")]
+        let mut images_changed = false;
         if let Ok(mut grid) = self.terminal_grid.lock() {
-            let _ = grid.resize(cols, rows);
+            #[cfg(feature = "image-registry")]
+            if cols == tracker.cols && rows != tracker.rows && rows > 0 && images.has_main_images()
+            {
+                // Stage geometry before committing image projection and grids.
+                let mut budget = RESPONSE_OUTPUT_BUDGET;
+                let Some(mut resized) = tracker.terminal_grid.grid().try_clone_charged(&mut budget)
+                else {
+                    return;
+                };
+                let Ok(Some(shift)) = resized.resize_with_main_row_shift(cols, rows) else {
+                    return;
+                };
+                if let Err(error) = images.remap_positions(rows, |row, column| {
+                    row.checked_sub(shift)
+                        .map(|row| (row, column))
+                        .ok_or_else(|| std::io::Error::other("image resize anchor overflow"))
+                }) {
+                    warn!(%error, "image height resize failed; retaining previous geometry");
+                    return;
+                }
+                images
+                    .evict_main_history(resized.main_row_count().saturating_sub(resized.height()));
+                images_changed = true;
+            }
+            #[cfg(feature = "image-registry")]
+            if rows > 0 && cols > 0 && rows != tracker.rows && !images_changed {
+                let revision = images.sequence();
+                if let Err(error) = images.resize_alternate_viewport(rows) {
+                    warn!(%error, "alternate image resize failed; retaining previous geometry");
+                    return;
+                }
+                images_changed = images.sequence() != revision;
+            }
+            if grid.resize(cols, rows).is_err() {
+                return;
+            }
+        } else {
+            return;
         }
+        tracker.resize(rows, cols);
+        *last = (rows, cols);
         let _ = self
             .input_tx
             .send(PaneRuntimeCommand::Resize { rows, cols });
+        #[cfg(feature = "image-registry")]
+        drop(images);
+        drop(tracker);
+        drop(last);
+        #[cfg(feature = "image-registry")]
+        if images_changed
+            && self
+                .image_dirty
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            publish_pane_event(PaneEvent::ImageAvailable {
+                session_id: self.session_id.0,
+                pane_id: self.meta.id,
+            });
+        }
     }
 }
 
@@ -4344,6 +4447,11 @@ impl SessionRuntimeManager {
         let terminal_grid_for_reader = Arc::clone(&terminal_grid);
         let terminal_grid_deltas = Arc::new(std::sync::Mutex::new(TerminalGridDeltaLog::default()));
         let last_requested_size = Arc::new(std::sync::Mutex::new((initial_rows, initial_cols)));
+        let cursor_tracker = Arc::new(std::sync::Mutex::new(PaneCursorTracker::new(
+            initial_rows,
+            initial_cols,
+        )));
+        let cursor_tracker_for_reader = Arc::clone(&cursor_tracker);
         let shell = pane_meta.shell.clone();
         let launch = pane_meta.launch.clone();
         let launch_resolution_error = resolved_launch.err().map(|error| error.to_string());
@@ -4396,16 +4504,19 @@ impl SessionRuntimeManager {
         #[cfg(feature = "image-registry")]
         let image_registry = {
             let img_config = image_config.clone();
-            Arc::new(std::sync::Mutex::new(if img_config.enabled {
-                #[allow(clippy::cast_possible_truncation)]
-                bmux_image::ImageRegistry::new(
-                    img_config.max_images_per_pane as usize,
-                    img_config.max_image_bytes as usize,
-                )
-            } else {
-                // Disabled: zero-capacity registry that drops everything.
-                bmux_image::ImageRegistry::new(0, 0)
-            }))
+            Arc::new(std::sync::Mutex::new(
+                (if img_config.enabled {
+                    #[allow(clippy::cast_possible_truncation)]
+                    bmux_image::ImageRegistry::new(
+                        img_config.max_images_per_pane as usize,
+                        img_config.max_image_bytes as usize,
+                    )
+                } else {
+                    // Disabled: zero-capacity registry that drops everything.
+                    bmux_image::ImageRegistry::new(0, 0)
+                })
+                .with_viewport_height(initial_rows),
+            ))
         };
         #[cfg(feature = "image-registry")]
         let image_registry_for_reader = Arc::clone(&image_registry);
@@ -4617,10 +4728,6 @@ impl SessionRuntimeManager {
                     let mut buffer = [0_u8; 8192];
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile)
                         .with_bracketed_paste_support(bracketed_paste_supported);
-                    let (initial_rows, initial_cols) = last_requested_size_for_reader
-                        .lock()
-                        .map_or((24, 80), |size| *size);
-                    let mut cursor_tracker = PaneCursorTracker::new(initial_rows, initial_cols);
                     let mut terminal_mode_tracker = PaneTerminalModeTracker::default();
                     let mut shell_metadata_parser = PaneShellMetadataParser::default();
 
@@ -4640,11 +4747,16 @@ impl SessionRuntimeManager {
                             Ok(0) | Err(_) => break,
                             Ok(bytes_read) => {
                                 let chunk = &buffer[..bytes_read];
-                                if let Ok((rows, cols)) =
-                                    last_requested_size_for_reader.lock().map(|size| *size)
-                                {
-                                    cursor_tracker.resize(rows, cols);
-                                }
+                                // Keep resize requests out until both image state
+                                // and the shared grid have consumed this chunk.
+                                let Ok(requested_size) = last_requested_size_for_reader.lock() else {
+                                    break;
+                                };
+                                let Ok(mut cursor_tracker) = cursor_tracker_for_reader.lock() else {
+                                    break;
+                                };
+                                let (rows, cols) = *requested_size;
+                                cursor_tracker.resize(rows, cols);
 
                                 // When image support is enabled, run the interceptor
                                 // to extract image sequences from the byte stream.
@@ -4735,8 +4847,16 @@ impl SessionRuntimeManager {
                                 {
                                     break;
                                 }
+                                #[cfg(not(feature = "image-registry"))]
+                                let reply = protocol_reply_for_chunk(
+                                    &mut protocol_engine,
+                                    &mut cursor_tracker,
+                                    chunk,
+                                );
                                 #[cfg(feature = "image-registry")]
                                 drop(registry);
+                                drop(cursor_tracker);
+                                drop(requested_size);
                                 // Metadata callbacks can acquire the runtime manager. Never
                                 // invoke them while holding image/grid/output capture locks.
                                 if !metadata.events.is_empty() {
@@ -4801,12 +4921,6 @@ impl SessionRuntimeManager {
                                         pane_id: Some(pane_id),
                                         client_id: None,
                                     },
-                                );
-                                #[cfg(not(feature = "image-registry"))]
-                                let reply = protocol_reply_for_chunk(
-                                    &mut protocol_engine,
-                                    &mut cursor_tracker,
-                                    chunk,
                                 );
                                 #[cfg(feature = "image-registry")]
                                 let reply = image_protocol_reply;
@@ -4912,6 +5026,8 @@ impl SessionRuntimeManager {
             .get(&(session_id, pane_meta.id))
             .copied();
         PaneRuntimeHandle {
+            #[cfg(feature = "image-registry")]
+            session_id,
             meta: pane_meta,
             process_id,
             process_group_id,
@@ -4925,6 +5041,7 @@ impl SessionRuntimeManager {
             terminal_grid_deltas,
             exited,
             last_requested_size,
+            cursor_tracker,
             output_dirty,
             sync_update_in_progress,
             mouse_protocol_state,
@@ -10759,6 +10876,8 @@ mod tests {
             let _ = stop_rx.await;
         });
         PaneRuntimeHandle {
+            #[cfg(feature = "image-registry")]
+            session_id: SessionId(Uuid::nil()),
             meta: PaneRuntimeMeta {
                 id,
                 name: None,
@@ -10783,6 +10902,7 @@ mod tests {
             terminal_grid_deltas: Arc::new(std::sync::Mutex::new(TerminalGridDeltaLog::default())),
             exited: Arc::new(AtomicBool::new(false)),
             last_requested_size: Arc::new(std::sync::Mutex::new((1, 1))),
+            cursor_tracker: Arc::new(std::sync::Mutex::new(PaneCursorTracker::new(1, 1))),
             output_dirty: Arc::new(AtomicBool::new(false)),
             sync_update_in_progress: Arc::new(AtomicBool::new(false)),
             mouse_protocol_state: Arc::new(std::sync::Mutex::new(
@@ -13003,6 +13123,392 @@ mod tests {
             .apply_delta(&batches[0], GridLimits::default())
             .expect("delta should apply to matching revision");
         assert_eq!(row_text(&consumer.grid().viewport_rows()[0]), "hello");
+    }
+
+    #[tokio::test]
+    async fn resize_waits_for_output_geometry_guard() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+        pane.resize_pty(2, 10);
+        let size = pane.last_requested_size.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                pane.resize_pty(4, 20);
+                finished_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            let blocked = finished_rx.recv_timeout(Duration::from_millis(20));
+            let width_during_output = pane.terminal_grid.lock().unwrap().grid().width();
+            drop(size);
+            assert!(matches!(
+                blocked,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(width_during_output, 10);
+            finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (4, 20));
+        let tracker = pane.cursor_tracker.lock().unwrap();
+        assert_eq!((tracker.rows, tracker.cols), (4, 20));
+        assert_eq!(tracker.terminal_grid.grid().width(), 20);
+        assert_eq!(tracker.terminal_grid.grid().height(), 4);
+        let grid = pane.terminal_grid.lock().unwrap();
+        assert_eq!(grid.grid().width(), 20);
+        assert_eq!(grid.grid().height(), 4);
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn resize_waits_for_image_capture_guard() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+        pane.resize_pty(2, 10);
+        let images = pane.image_registry.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                pane.resize_pty(4, 20);
+                finished_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            let blocked = finished_rx.recv_timeout(Duration::from_millis(20));
+            let width_during_capture = pane.terminal_grid.lock().unwrap().grid().width();
+            drop(images);
+            assert!(matches!(
+                blocked,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(width_during_capture, 10);
+            finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (4, 20));
+    }
+
+    #[tokio::test]
+    async fn resize_preserves_partial_cursor_escape_state() {
+        for prefix in [
+            b"\x1b".as_slice(),
+            b"\x1b[".as_slice(),
+            b"\x1b[4;".as_slice(),
+        ] {
+            let pane_id = Uuid::new_v4();
+            let runtime = runtime_with_panes(&[pane_id]);
+            let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+            pane.resize_pty(2, 10);
+            pane.cursor_tracker.lock().unwrap().process(prefix);
+            pane.terminal_grid.lock().unwrap().process(prefix);
+            pane.resize_pty(5, 20);
+            let suffix = &b"\x1b[4;15H"[prefix.len()..];
+            let mut tracker = pane.cursor_tracker.lock().unwrap();
+            tracker.process(suffix);
+            let mut grid = pane.terminal_grid.lock().unwrap();
+            grid.process(suffix);
+            assert_eq!(tracker.cursor_position(), (3, 14));
+            assert_eq!(grid.grid().cursor().row, 3);
+            assert_eq!(grid.grid().cursor().col, 14);
+        }
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn height_growth_preserves_retained_image_anchor() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(3, 80);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n");
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        let before = pane
+            .image_registry
+            .lock()
+            .unwrap()
+            .project_viewport(1, 3)
+            .unwrap();
+        pane.resize_pty(5, 80);
+        let images = pane.image_registry.lock().unwrap();
+        assert_eq!(images.project_viewport(1, 3).unwrap(), before);
+        assert!(pane.image_dirty.load(Ordering::SeqCst));
+        assert_eq!(pane.cursor_tracker.lock().unwrap().rows, 5);
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn failed_image_height_growth_preserves_both_grids() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(3, 80);
+        // A placement crossing the new bottom requires a decode to crop it.
+        // An absent payload makes that projection fail deterministically.
+        let mut images = pane.image_registry.lock().unwrap();
+        images.handle_event(
+            bmux_image::ImageEvent::SixelImage {
+                data: Vec::new(),
+                position: bmux_image::ImagePosition { row: 4, col: 0 },
+                pixel_size: bmux_image::ImagePixelSize {
+                    width: 8,
+                    height: 64,
+                },
+                filtered_byte_offset: 0,
+            },
+            8,
+            16,
+        );
+        let revision = images.sequence();
+        let original = images.images().to_vec();
+        drop(images);
+        pane.resize_pty(5, 80);
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (3, 80));
+        assert_eq!(pane.terminal_grid.lock().unwrap().grid().height(), 3);
+        assert_eq!(pane.cursor_tracker.lock().unwrap().rows, 3);
+        let images = pane.image_registry.lock().unwrap();
+        assert_eq!(images.sequence(), revision);
+        assert_eq!(images.images(), original);
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn height_shrink_moves_image_into_history() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(5, 80);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output =
+            interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\a\r\nb\r\nc\r\nd\r\ne");
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        let original = pane.image_registry.lock().unwrap().images()[0].clone();
+        pane.resize_pty(3, 80);
+        let images = pane.image_registry.lock().unwrap();
+        assert!(images.images().is_empty());
+        assert_eq!(images.project_viewport(2, 3).unwrap(), vec![original]);
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn height_shrink_evicts_images_with_text_history() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(5, 80);
+        *pane.terminal_grid.lock().unwrap() =
+            TerminalGridStream::new(80, 5, GridLimits { scrollback_rows: 0 }).unwrap();
+        pane.cursor_tracker.lock().unwrap().terminal_grid =
+            TerminalGridStream::new(80, 5, GridLimits { scrollback_rows: 0 }).unwrap();
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output =
+            interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\a\r\nb\r\nc\r\nd\r\ne");
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        assert_eq!(pane.image_registry.lock().unwrap().images().len(), 1);
+        pane.resize_pty(3, 80);
+        assert_eq!(
+            pane.terminal_grid
+                .lock()
+                .unwrap()
+                .grid()
+                .scrollback_rows_hint(),
+            0
+        );
+        assert!(
+            pane.image_registry
+                .lock()
+                .unwrap()
+                .project_viewport(2, 3)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn height_resize_restores_image_from_pending_wrapped_line() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(2, 5);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijklmnop");
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        let original = pane
+            .image_registry
+            .lock()
+            .unwrap()
+            .project_viewport(2, 2)
+            .unwrap();
+        assert_eq!(original.len(), 1);
+        assert!(pane.image_registry.lock().unwrap().images().is_empty());
+        pane.resize_pty(4, 5);
+        assert_eq!(pane.image_registry.lock().unwrap().images(), original);
+        pane.resize_pty(2, 5);
+        let images = pane.image_registry.lock().unwrap();
+        assert!(images.images().is_empty());
+        assert_eq!(images.project_viewport(2, 2).unwrap(), original);
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn text_only_resize_does_not_require_image_capture_budget() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(3, 80);
+        let text =
+            b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n"
+                .repeat(8000);
+        {
+            let mut tracker = pane.cursor_tracker.lock().unwrap();
+            tracker.process(&text);
+            let mut budget = RESPONSE_OUTPUT_BUDGET;
+            assert!(
+                tracker
+                    .terminal_grid
+                    .grid()
+                    .try_clone_charged(&mut budget)
+                    .is_none()
+            );
+        }
+        pane.terminal_grid.lock().unwrap().process(&text);
+        pane.resize_pty(5, 80);
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (5, 80));
+        assert_eq!(pane.cursor_tracker.lock().unwrap().rows, 5);
+        assert_eq!(pane.terminal_grid.lock().unwrap().grid().height(), 5);
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn height_resize_remaps_hidden_main_images_only() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(2, 5);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let image = b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\";
+        let mut bytes = image.to_vec();
+        bytes.extend_from_slice(b"abcdefghijklmnop\x1b[?1049h");
+        bytes.extend_from_slice(image);
+        let mut output = interceptor.process(&bytes);
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut protocol,
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        let alternate = pane.image_registry.lock().unwrap().images().to_vec();
+        assert_eq!(alternate.len(), 1);
+        pane.resize_pty(4, 5);
+        assert_eq!(pane.image_registry.lock().unwrap().images(), alternate);
+        let mut output = interceptor.process(b"\x1b[?1049l");
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut protocol,
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        let images = pane.image_registry.lock().unwrap();
+        assert_eq!(images.images().len(), 1);
+        assert_eq!(images.images()[0].id, 1);
+        assert_eq!(images.images()[0].position.row, 0);
+        assert_ne!(images.images()[0].id, alternate[0].id);
+    }
+
+    #[cfg(feature = "image-registry")]
+    #[tokio::test]
+    async fn alternate_only_images_reproject_on_height_resize() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).unwrap();
+        pane.resize_pty(5, 80);
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output =
+            interceptor.process(b"\x1b[?1049h\x1b[5;1H\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\");
+        ordered_image_output(
+            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
+            &mut pane.image_registry.lock().unwrap(),
+            &mut output,
+            (8, 16),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        pane.terminal_grid.lock().unwrap().process(&output.filtered);
+        let original = pane.image_registry.lock().unwrap().images().to_vec();
+        assert_eq!(original.len(), 1);
+        assert!(!pane.image_registry.lock().unwrap().has_main_images());
+        pane.resize_pty(3, 80);
+        assert!(pane.image_registry.lock().unwrap().images().is_empty());
+        pane.resize_pty(5, 80);
+        assert_eq!(pane.image_registry.lock().unwrap().images(), original);
+    }
+
+    #[tokio::test]
+    async fn rejected_resize_preserves_published_geometry() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+        pane.resize_pty(2, 10);
+        let revision = pane.terminal_grid.lock().unwrap().grid().revision();
+
+        for (rows, cols) in [(0, 10), (2, 0), (0, 0)] {
+            pane.resize_pty(rows, cols);
+            assert_eq!(*pane.last_requested_size.lock().unwrap(), (2, 10));
+            let grid = pane.terminal_grid.lock().unwrap();
+            assert_eq!(grid.grid().width(), 10);
+            assert_eq!(grid.grid().height(), 2);
+            assert_eq!(grid.grid().revision(), revision);
+        }
     }
 
     #[tokio::test]

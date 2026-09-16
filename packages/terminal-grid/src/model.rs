@@ -909,19 +909,35 @@ impl TerminalGrid {
     ///
     /// Returns an error if width or height is zero.
     pub fn resize(&mut self, width: u16, height: u16) -> Result<(), TerminalGridError> {
+        self.resize_with_main_row_shift(width, height).map(|_| ())
+    }
+
+    /// Resize, returning the signed main viewport shift for unchanged columns.
+    /// Positive values move old viewport positions toward history. The shift
+    /// excludes history eviction; width reflow returns `None`.
+    ///
+    /// # Errors
+    /// Returns an error for zero dimensions.
+    pub fn resize_with_main_row_shift(
+        &mut self,
+        width: u16,
+        height: u16,
+    ) -> Result<Option<i64>, TerminalGridError> {
         let width = usize::from(width);
         let height = usize::from(height);
         if width == 0 || height == 0 {
             return Err(TerminalGridError::ZeroDimensions);
         }
         if self.width == width && self.height == height {
-            return Ok(());
+            return Ok(Some(0));
         }
+        let same_width = self.width == width;
         let main_cursor = match self.mode {
             GridMode::Main => self.cursor,
             GridMode::Alternate => self.saved_cursor,
         };
-        let resized_main_cursor = self.resize_main_viewport(width, height, main_cursor);
+        let (resized_main_cursor, row_shift) =
+            self.resize_main_viewport(width, height, main_cursor);
         match self.mode {
             GridMode::Main => self.cursor = resized_main_cursor,
             GridMode::Alternate => {
@@ -949,7 +965,7 @@ impl TerminalGrid {
         self.cursor = clamp_cursor_to_dimensions(self.cursor, width, height);
         self.saved_cursor = clamp_cursor_to_dimensions(self.saved_cursor, width, height);
         self.bump_content_revision();
-        Ok(())
+        Ok(same_width.then_some(row_shift))
     }
 
     pub fn set_mode(&mut self, mode: GridMode) {
@@ -2179,7 +2195,12 @@ impl TerminalGrid {
         new_width: usize,
         new_height: usize,
         main_cursor: Cursor,
-    ) -> Cursor {
+    ) -> (Cursor, i64) {
+        let pending_rows = if self.pending_history_cells.is_empty() {
+            0
+        } else {
+            projected_row_count(&self.pending_history_cells, self.width)
+        };
         let mut source_rows = std::mem::take(&mut self.main_rows)
             .into_iter()
             .collect::<Vec<_>>();
@@ -2240,14 +2261,18 @@ impl TerminalGrid {
             }
         }
         self.main_rows = next_rows;
-        Self::restored_live_cursor_anchor(
+        let cursor = Self::restored_live_cursor_anchor(
             main_cursor,
             anchor,
             &projected_counts,
             keep_start,
             new_width,
             new_height,
-        )
+        );
+        // Both counts are bounded by the retained grid allocation.
+        let shift = i64::try_from(keep_start).unwrap_or(i64::MAX)
+            - i64::try_from(pending_rows).unwrap_or(i64::MAX);
+        (cursor, shift)
     }
 
     fn live_cursor_anchor(
@@ -3420,6 +3445,27 @@ mod tests {
             grid.process(b"\x1b[?1049l");
             assert_eq!(grid.scrollback_rows_hint(), expected);
         }
+    }
+
+    #[test]
+    fn height_resize_shift_tracks_pending_rows_and_eviction() {
+        let mut wrapped = TerminalGrid::new(5, 2, GridLimits::default()).unwrap();
+        wrapped.process(b"abcdefghijklmnop");
+        assert!(!wrapped.pending_history_cells.is_empty());
+        let before = wrapped.cursor().row;
+        let shift = wrapped.resize_with_main_row_shift(5, 4).unwrap().unwrap();
+        assert_eq!(shift, -2);
+        assert_eq!(wrapped.cursor().row, before + 2);
+        let shift = wrapped.resize_with_main_row_shift(5, 2).unwrap().unwrap();
+        assert_eq!(shift, 2);
+        assert_eq!(wrapped.cursor().row, before);
+
+        let mut evicted = TerminalGrid::new(5, 4, GridLimits { scrollback_rows: 0 }).unwrap();
+        evicted.process(b"a\r\nb\r\nc\r\nd");
+        assert_eq!(evicted.resize_with_main_row_shift(5, 2).unwrap(), Some(2));
+        assert_eq!(evicted.scrollback_rows_hint(), 0);
+        assert_eq!(evicted.cursor().row, 1);
+        assert_eq!(evicted.resize_with_main_row_shift(10, 2).unwrap(), None);
     }
 
     #[test]
