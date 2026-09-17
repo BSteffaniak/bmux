@@ -4,7 +4,7 @@
 @shell sh
 
 new-session
-send-keys keys="for i in 1 2 3 4 5 6; do echo PRE_PROMPT_$i; done\r"
+send-keys keys="set +m; for i in 1 2 3 4 5 6; do echo PRE_PROMPT_$i; done\r"
 wait-for pattern='PRE_PROMPT_6'
 send-keys keys="printf '\\e[12;34H'; printf '\\e[?1049h\\e[2J\\e[HSEQ_TUI'; printf '\\e[?10'; sleep 0.02; printf '49l'; printf '\\e7\\e[1;1H%s%s\\e8' ALT_ RESTORED; sleep 6\r"
 wait-for pattern='ALT_RESTORED'

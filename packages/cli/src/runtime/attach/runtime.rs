@@ -15410,6 +15410,86 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "image-sixel")]
+    #[test]
+    fn historical_images_are_emitted_and_cleared_by_attachment_frames() {
+        let session = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
+            session_id: session,
+            context_id: None,
+            can_write: true,
+        });
+        let layout = retry_test_layout(&mut state, pane, session);
+        state.host_image_caps = bmux_image::host_caps::HostImageCapabilities {
+            sixel: true,
+            ..Default::default()
+        };
+        state.pane_scrollback.insert(
+            pane,
+            bmux_attach_pipeline::PaneScrollbackView {
+                offset: 1,
+                cursor: bmux_attach_pipeline::AttachScrollbackCursor { row: 0, col: 0 },
+                selection_anchor: None,
+                captured_selection: None,
+                pin: None,
+            },
+        );
+        state.pane_buffers.get_mut(&pane).unwrap().scrollback_window =
+            Some(bmux_attach_pipeline::PaneScrollbackWindow {
+                images: vec![bmux_attach_image_protocol::AttachPaneImage {
+                    id: 42,
+                    protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
+                    raw_data: b"\"1;1;1;6#1;2;100;0;0~".to_vec(),
+                    compression: bmux_attach_image_protocol::CompressionId::None,
+                    position_row: 0,
+                    position_col: 3,
+                    cell_rows: 1,
+                    cell_cols: 1,
+                    pixel_width: 1,
+                    pixel_height: 6,
+                }],
+                projection_width: 78,
+                row_anchors: Vec::new(),
+                palette: bmux_terminal_grid::StylePalette::default(),
+                scrollback_offset: 1,
+                max_scrollback_offset: 1,
+                total_scrolled_rows: 1,
+                rows: vec![bmux_terminal_grid::PhysicalRow::default(); 22],
+            });
+        for visible in [true, false] {
+            if !visible {
+                state
+                    .pane_buffers
+                    .get_mut(&pane)
+                    .unwrap()
+                    .scrollback_window
+                    .as_mut()
+                    .unwrap()
+                    .images
+                    .clear();
+            }
+            state.dirty.mark_full_frame(AttachDirtySource::Scrollback);
+            let mut output = Vec::new();
+            render_attach_frame_to_writer(
+                &mut output,
+                &mut state,
+                &layout,
+                &RuntimeAppearance::default(),
+                &[],
+                0,
+                &bmux_config::DamageBehaviorConfig::default(),
+                u64::MAX,
+                &mut DisplayCaptureFanout::default(),
+                TerminalGeometry { cols: 80, rows: 24 },
+                None,
+            )
+            .unwrap();
+            assert_eq!(output.windows(2).any(|bytes| bytes == b"\x1bP"), visible);
+            assert_eq!(state.pane_images_presented, visible);
+        }
+    }
+
     fn retry_test_layout(
         state: &mut AttachViewState,
         pane_id: Uuid,

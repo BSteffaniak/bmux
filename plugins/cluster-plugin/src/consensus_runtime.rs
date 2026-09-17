@@ -293,7 +293,13 @@ impl ConsensusNode {
         &self,
         voters: std::collections::BTreeMap<NodeId, BasicNode>,
     ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
+        let submission_started = std::time::Instant::now();
         let _submission = self.membership_submission.lock().await;
+        tracing::debug!(
+            node_id = %self.node_id,
+            wait_ms = submission_started.elapsed().as_millis(),
+            "consensus membership submission admitted"
+        );
         let authenticated = voters
             .into_iter()
             .map(|(node_id, node)| {
@@ -362,16 +368,23 @@ impl ConsensusNode {
             .collect::<std::collections::BTreeSet<_>>();
         for (node_id, node) in authenticated {
             validate_admission_term(admission_term, self.current_term())?;
+            tracing::info!(node_id = %self.node_id, learner_id = %node_id, "consensus learner admission started");
+            let started = std::time::Instant::now();
             self.raft
                 .add_learner(node_id, node, true)
                 .await
                 .map_err(client_write_error)?;
+            tracing::info!(node_id = %self.node_id, learner_id = %node_id, elapsed_ms = started.elapsed().as_millis(), "consensus learner admission completed");
         }
         validate_admission_term(admission_term, self.current_term())?;
-        self.raft
+        tracing::info!(node_id = %self.node_id, voter_count = voter_ids.len(), "consensus voter-set commit started");
+        let result = self
+            .raft
             .change_membership(voter_ids, false)
             .await
-            .map_err(client_write_error)
+            .map_err(client_write_error);
+        tracing::info!(node_id = %self.node_id, succeeded = result.is_ok(), elapsed_ms = submission_started.elapsed().as_millis(), "consensus voter-set commit finished");
+        result
     }
 
     /// Executes a generated control mutation and returns its typed response.

@@ -5287,6 +5287,233 @@ mod tests {
         result.unwrap();
     }
 
+    #[tokio::test]
+    async fn real_capture_fetch_recovers_scrolled_image_across_widths() {
+        use crate::playbook::sandbox::{SandboxServer, SandboxStartOptions};
+        use crate::runtime::attach::scrollback_fetch::{Request, fetch_with_client};
+        use bmux_attach_pipeline::{CapturedHistoryAnchor, ScrollbackPin};
+        use bmux_pane_runtime_plugin_api::attach_runtime_state as api;
+        let executable = std::env::current_exe().unwrap();
+        let binary = executable.parent().unwrap().parent().unwrap().join("bmux");
+        let sandbox = SandboxServer::start(SandboxStartOptions {
+            shell: Some("sh"),
+            plugin_config: &crate::playbook::types::PluginConfig::default(),
+            startup_timeout: std::time::Duration::from_secs(15),
+            env: &std::collections::BTreeMap::new(),
+            env_mode: crate::playbook::types::SandboxEnvMode::Clean,
+            binary: Some(&binary),
+            sandbox_config_file: None,
+            bundled_plugin_ids: &[],
+        })
+        .await
+        .unwrap();
+        let result = async {
+            let mut client = sandbox.connect("history-image-fetch-test").await?;
+            // Use the baseline session created by the sandbox through its public CLI.
+            let session = crate::playbook::engine::typed_new_session_playbook(&mut client, None).await?;
+            let grant = client.attach_grant(SessionSelector::ById(session)).await?;
+            client.open_attach_stream_info(&grant).await?;
+            let pane = client.attach_layout(session).await?.panes[0].id;
+            client.attach_input(session, b"printf '\\033[2J\\033[H'; printf '%050d' 0; printf '\\033Pq\"1;1;1;6#1;2;100;0;0~\\033\\\\MARK'; i=0; while [ $i -lt 60 ]; do printf '\\r\\nROW'; i=$((i+1)); done\r".to_vec()).await?;
+            let capture = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let capture = api::client::attach_history_capture_v1(&mut client, session, pane).await?
+                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    if capture.history_line_count > 30 { break Ok::<_, anyhow::Error>(capture); }
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                }
+            }).await??;
+            let pin = ScrollbackPin {
+                capture: Some(bmux_attach_pipeline::ScrollbackCapture {
+                    identity: capture.capture_id, lines: capture.history_line_count,
+                    truncated: capture.history_truncated, width: capture.width, height: capture.height,
+                }),
+                pin_id: capture.pin.pin_id, total_scrolled_rows: capture.pin.total_scrolled_rows,
+                max_scrollback_offset: capture.pin.max_scrollback_offset as usize,
+                stream_end: capture.pin.stream_end, created_epoch_secs: 0,
+            };
+            let cache = std::sync::Arc::default();
+            let mut recovered = false;
+            for width in [80, 40, 120, 80] {
+                // Locate the image in retained history without depending on shell startup rows.
+                for line in 0..capture.history_line_count {
+                    let request = Request {
+                        session, pane, pin: Some(pin), offset: 1, width, rows: 1,
+                        total: None, anchor: Some(CapturedHistoryAnchor {
+                            capture_id: capture.capture_id, line_index: u32::try_from(line)?, column: if width == 40 { 40 } else { 0 },
+                        }), delta: 0,
+                    };
+                    let window = fetch_with_client(&mut client, request, std::sync::Arc::clone(&cache))
+                        .await.map_err(anyhow::Error::msg)?;
+                    if !window.images.is_empty() {
+                        assert_eq!(window.images[0].position_row, 0);
+                        let expected_column = 50 % width;
+                        assert_eq!(usize::from(window.images[0].position_col), expected_column);
+                        assert_eq!(window.rows[0].cells()[expected_column].text(), "M");
+                        assert!(!window.images[0].raw_data.is_empty());
+                        #[cfg(feature = "image-sixel")]
+                        assert_recovered_image_emits_at_viewport_origin(&window);
+                        #[cfg(feature = "image-sixel")]
+                        assert_recovered_image_in_frame(session, pane, pin, window);
+                        recovered = true;
+                        break;
+                    }
+                }
+                anyhow::ensure!(recovered, "historical image not recovered at width {width}");
+                recovered = false;
+            }
+            Ok::<_, anyhow::Error>(())
+        }.await;
+        sandbox.shutdown(false).await.unwrap();
+        result.unwrap();
+    }
+
+    #[cfg(feature = "image-sixel")]
+    fn assert_recovered_image_in_frame(
+        session: Uuid,
+        pane: Uuid,
+        pin: bmux_attach_pipeline::ScrollbackPin,
+        window: bmux_attach_pipeline::PaneScrollbackWindow,
+    ) {
+        use crate::runtime::attach::{
+            input::TerminalGeometry,
+            runtime::{DisplayCaptureFanout, render_attach_frame_to_writer},
+            state::{AttachDirtySource, AttachViewState},
+        };
+        use bmux_attach_layout_protocol::{
+            AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+            PaneLayoutNode,
+        };
+        let width = u16::try_from(window.projection_width).unwrap();
+        let image_column = window.images[0].position_col;
+        let rect = AttachRect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: 3,
+        };
+        let layout = bmux_client::AttachLayoutState {
+            context_id: None,
+            session_id: session,
+            focused_pane_id: pane,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf { pane_id: pane },
+            zoomed: false,
+            scene: AttachScene {
+                session_id: session,
+                focus: AttachFocusTarget::Pane { pane_id: pane },
+                surfaces: vec![AttachSurface {
+                    id: pane,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: bmux_attach_layout_protocol::AttachLayer::Pane,
+                    z: 0,
+                    rect,
+                    content_rect: AttachRect { h: 1, ..rect },
+                    interactive_regions: Vec::new(),
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: false,
+                    pane_id: Some(pane),
+                }],
+            },
+        };
+        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
+            session_id: session,
+            context_id: None,
+            can_write: true,
+        });
+        state.host_image_caps = bmux_image::host_caps::HostImageCapabilities {
+            sixel: true,
+            ..Default::default()
+        };
+        state.pane_scrollback.insert(
+            pane,
+            bmux_attach_pipeline::PaneScrollbackView {
+                offset: window.scrollback_offset,
+                cursor: bmux_attach_pipeline::AttachScrollbackCursor { row: 0, col: 0 },
+                selection_anchor: None,
+                captured_selection: None,
+                pin: Some(pin),
+            },
+        );
+        state
+            .pane_buffers
+            .entry(pane)
+            .or_default()
+            .scrollback_window = Some(window);
+        state.dirty.mark_full_frame(AttachDirtySource::Scrollback);
+        let mut output = Vec::new();
+        render_attach_frame_to_writer(
+            &mut output,
+            &mut state,
+            &layout,
+            &bmux_appearance::RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            TerminalGeometry {
+                cols: width,
+                rows: 3,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(output.windows(2).any(|bytes| bytes == b"\x1bP"));
+        assert!(
+            output.windows(4).any(|bytes| bytes == b"MARK"),
+            "attachment frame omitted captured text"
+        );
+        let cursor = format!("\x1b[1;{}H", image_column + 1);
+        assert!(
+            output
+                .windows(cursor.len())
+                .any(|bytes| bytes == cursor.as_bytes())
+        );
+        assert!(state.pane_images_presented);
+    }
+
+    #[cfg(feature = "image-sixel")]
+    fn assert_recovered_image_emits_at_viewport_origin(
+        window: &bmux_attach_pipeline::PaneScrollbackWindow,
+    ) {
+        let images = window
+            .images
+            .iter()
+            .map(bmux_image::PaneImage::from)
+            .collect::<Vec<_>>();
+        let mut output = Vec::new();
+        bmux_image::compositor::render_pane_images_clipped(
+            &mut output,
+            &images,
+            bmux_image::compositor::PaneRect {
+                x: 5,
+                y: 7,
+                w: u16::try_from(window.projection_width).unwrap(),
+                h: 1,
+            },
+            &[],
+            &bmux_image::host_caps::HostImageCapabilities {
+                sixel: true,
+                ..Default::default()
+            },
+            &mut bmux_image::compositor::KittyHostState::default(),
+        )
+        .unwrap();
+        let cursor = format!("\x1b[8;{}H", 6 + window.images[0].position_col);
+        assert!(
+            output
+                .windows(cursor.len())
+                .any(|bytes| bytes == cursor.as_bytes())
+        );
+        assert!(
+            output.windows(2).any(|bytes| bytes == b"\x1bP"),
+            "missing recovered Sixel output"
+        );
+    }
+
     async fn wait_for_scrollback_mode(
         first: &RealAttachPlaybookRuntime,
         second: &RealAttachPlaybookRuntime,

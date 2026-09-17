@@ -412,12 +412,25 @@ mod tests {
             .expect("register service");
         let running = std::sync::Arc::clone(&server);
         let task = tokio::spawn(async move { running.run().await });
-        for _ in 0..100 {
-            if paths.server_socket().exists() {
-                break;
+        // Bind creates the path before listen/handshake readiness. Probe the
+        // connection, not the filesystem, without replaying the tested service.
+        let probe = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match BmuxClient::connect_with_paths(&paths, "connections-test-ready").await {
+                    Ok(client) => break client,
+                    Err(error) => {
+                        assert!(
+                            !task.is_finished(),
+                            "server stopped before readiness: {error}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .expect("server readiness deadline");
+        drop(probe);
 
         let resolve = bmux_connections_plugin_api::connections_state::client::ResolveRequest {
             target: "local".to_string(),

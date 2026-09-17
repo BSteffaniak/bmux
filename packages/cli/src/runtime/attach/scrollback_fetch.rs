@@ -3,7 +3,7 @@ use bmux_attach_pipeline::{CapturedHistoryAnchor, PaneScrollbackWindow, Scrollba
 use uuid::Uuid;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) struct Request {
+pub struct Request {
     pub session: Uuid,
     pub pane: Uuid,
     pub pin: Option<ScrollbackPin>,
@@ -31,13 +31,21 @@ pub(super) async fn fetch(
     request: Request,
     cache: std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
 ) -> Result<PaneScrollbackWindow, String> {
+    fetch_with_client(&mut client, request, cache).await
+}
+
+pub async fn fetch_with_client(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    request: Request,
+    cache: std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
+) -> Result<PaneScrollbackWindow, String> {
     let mut cache = cache.lock().await;
     let rows = request.rows;
     if let Some(pin) = request.pin {
         let mut last_error = None;
         for count in [rows, request.rows] {
             let result = crate::pane_runtime_client::captured_history_window_cached(
-                &mut client,
+                client,
                 (request.session, request.pane, pin),
                 request.offset,
                 count,
@@ -49,7 +57,7 @@ pub(super) async fn fetch(
                 Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(mut window)) => {
                     let origin = window.row_anchors.first().ok_or("missing capture origin")?;
                     let reply = bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_history_images_v3(
-                        &mut client, request.session, request.pane, pin.pin_id, origin.capture_id,
+                        client, request.session, request.pane, pin.pin_id, origin.capture_id,
                         u16::try_from(request.width).map_err(|error| error.to_string())?,
                         origin.line_index,
                         u32::try_from(origin.column).map_err(|error| error.to_string())?,
@@ -74,13 +82,14 @@ pub(super) async fn fetch(
                 }
             }
         }
-        if request.anchor.is_some() {
-            return Err(last_error.unwrap_or_else(|| "captured history window unavailable".into()));
-        }
+        // A capture-bound request must not degrade to a text-only physical
+        // snapshot: that would acknowledge a complete viewport while losing its
+        // graphics and logical origin. Legacy reads are only for unpinned views.
+        return Err(last_error.unwrap_or_else(|| "captured history window unavailable".into()));
     }
     drop(cache);
     let windows = crate::pane_runtime_client::attach_pane_grid_window_state_streaming(
-        &mut client,
+        client,
         request.session,
         vec![crate::pane_runtime_client::PaneGridWindowRequest {
             pane_id: request.pane,
@@ -118,6 +127,38 @@ pub(super) async fn fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_capture_never_falls_back_to_text_only_snapshot() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let client = bmux_plugin::AsyncServiceClient::bind(1, sender).unwrap();
+        let request = Request {
+            session: Uuid::new_v4(),
+            pane: Uuid::new_v4(),
+            pin: Some(ScrollbackPin {
+                capture: None,
+                pin_id: 1,
+                total_scrolled_rows: 100,
+                max_scrollback_offset: 100,
+                stream_end: 100,
+                created_epoch_secs: 0,
+            }),
+            offset: 10,
+            width: 80,
+            rows: 20,
+            total: Some(100),
+            anchor: None,
+            delta: 0,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            fetch(client, request, std::sync::Arc::default()),
+        )
+        .await
+        .expect("must reject without attempting legacy service");
+        assert!(result.is_err());
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn slow_history_service_does_not_block_the_caller_and_drop_cancels() {

@@ -12596,6 +12596,7 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].position_row, 0);
         assert!(!recovered[0].raw_data.is_empty());
+        assert_anchored_history_image_recovery(&mut dispatch, session, pane, &capture).await;
         assert_history_image_window_replacement(
             &mut dispatch,
             session,
@@ -12613,6 +12614,62 @@ mod tests {
                 Uuid::new_v4(),
                 80,
                 1,
+                3,
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    async fn assert_anchored_history_image_recovery(
+        dispatch: &mut HistoryDispatch,
+        session: SessionId,
+        pane: Uuid,
+        capture: &bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryCaptureV1,
+    ) {
+        use bmux_pane_runtime_plugin_api::attach_runtime_state::client;
+        for width in [80, 40, 120, 80] {
+            for line in [0, 1, 0] {
+                let response = client::attach_history_images_v3(
+                    dispatch,
+                    session.0,
+                    pane,
+                    capture.pin.pin_id,
+                    capture.capture_id,
+                    width,
+                    line,
+                    0,
+                    3,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(response.capture_id, capture.capture_id);
+                let images: Vec<bmux_attach_image_protocol::AttachPaneImage> =
+                    serde_json::from_slice(&response.encoded).unwrap();
+                if line == 0 {
+                    assert_eq!(images.len(), 1);
+                    assert_eq!((images[0].position_row, images[0].position_col), (0, 0));
+                    assert!(!images[0].raw_data.is_empty());
+                } else {
+                    assert!(
+                        images.is_empty(),
+                        "image-free window must replace old graphics"
+                    );
+                }
+            }
+        }
+        assert!(
+            client::attach_history_images_v3(
+                dispatch,
+                session.0,
+                pane,
+                capture.pin.pin_id,
+                Uuid::new_v4(),
+                80,
+                0,
+                0,
                 3,
             )
             .await

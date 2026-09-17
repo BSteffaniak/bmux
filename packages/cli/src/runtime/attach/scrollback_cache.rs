@@ -191,6 +191,46 @@ mod tests {
     }
 
     #[test]
+    fn captured_images_require_exact_viewport_and_count_toward_budget() {
+        let pane = Uuid::new_v4();
+        let mut source = window();
+        source.row_anchors = vec![
+            bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id: Uuid::new_v4(),
+                line_index: 0,
+                column: 0,
+            };
+            source.rows.len()
+        ];
+        source
+            .images
+            .push(bmux_attach_image_protocol::AttachPaneImage {
+                id: 1,
+                protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
+                compression: bmux_attach_image_protocol::CompressionId::None,
+                raw_data: vec![1, 2, 3],
+                position_row: 2,
+                position_col: 3,
+                cell_rows: 1,
+                cell_cols: 1,
+                pixel_width: 1,
+                pixel_height: 1,
+            });
+        let mut cache = ScrollbackCache::default();
+        cache.insert(pane, None, &source);
+        let hit = cache.get(pane, None, 10, 80, 40).unwrap();
+        assert_eq!(hit.images, source.images);
+        assert!(cache.get(pane, None, 11, 80, 39).is_none());
+        assert!(cache.get(pane, None, 10, 40, 40).is_none());
+        assert!(cache.get(pane, None, 10, 80, 20).is_none());
+        cache.invalidate(pane);
+        source.images[0].raw_data = vec![0; MAX_BYTES + 1];
+        cache.insert(pane, None, &source);
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
     fn overlapping_navigation_is_local_and_bounded() {
         let pane = Uuid::new_v4();
         let mut cache = ScrollbackCache::default();

@@ -611,16 +611,24 @@ mod tests {
         let server = Arc::new(bmux_server::BmuxServer::from_config_paths(&paths));
         let running = Arc::clone(&server);
         let task = tokio::spawn(async move { running.run().await });
-        for _ in 0..100 {
-            if paths.server_socket().exists() {
-                break;
+        // A socket path can exist between bind and listen. Readiness is a
+        // successful handshake, not filesystem visibility.
+        let client = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match BmuxClient::connect_with_paths(&paths, "attach-provider-test").await {
+                    Ok(client) => break client,
+                    Err(error) => {
+                        assert!(
+                            !task.is_finished(),
+                            "server stopped before readiness: {error}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        let client = BmuxClient::connect_with_paths(&paths, "attach-provider-test")
-            .await
-            .expect("connect client");
+        })
+        .await
+        .expect("server did not accept a client before the readiness deadline");
         let principal_id = client.principal_id();
         let provider = PaneRuntimeAttachProvider;
         let resolved = provider.resolve(&AttachTarget::parse("main")).unwrap();
