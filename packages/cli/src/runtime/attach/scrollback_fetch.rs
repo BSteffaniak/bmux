@@ -15,9 +15,45 @@ pub struct Request {
     pub delta: isize,
 }
 
+pub enum FetchError {
+    Unavailable,
+    Failed(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("capture viewport unavailable"),
+            Self::Failed(error) => f.write_str(error),
+        }
+    }
+}
+impl std::fmt::Debug for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for FetchError {}
+impl From<String> for FetchError {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+impl From<&str> for FetchError {
+    fn from(error: &str) -> Self {
+        Self::Failed(error.into())
+    }
+}
+
+pub(super) enum Outcome {
+    Ready(PaneScrollbackWindow),
+    Unavailable,
+    Failed(String),
+}
+
 pub(super) struct Fetch {
     pub request: Request,
-    pub task: tokio::task::JoinHandle<Result<PaneScrollbackWindow, String>>,
+    pub task: tokio::task::JoinHandle<Outcome>,
 }
 
 impl Drop for Fetch {
@@ -30,15 +66,19 @@ pub(super) async fn fetch(
     mut client: bmux_plugin::AsyncServiceClient,
     request: Request,
     cache: std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
-) -> Result<PaneScrollbackWindow, String> {
-    fetch_with_client(&mut client, request, cache).await
+) -> Outcome {
+    match fetch_with_client(&mut client, request, cache).await {
+        Ok(window) => Outcome::Ready(window),
+        Err(FetchError::Unavailable) => Outcome::Unavailable,
+        Err(FetchError::Failed(error)) => Outcome::Failed(error),
+    }
 }
 
 pub async fn fetch_with_client(
     client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     request: Request,
     cache: std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
-) -> Result<PaneScrollbackWindow, String> {
+) -> Result<PaneScrollbackWindow, FetchError> {
     let mut cache = cache.lock().await;
     let rows = request.rows;
     if let Some(pin) = request.pin {
@@ -90,7 +130,7 @@ pub async fn fetch_with_client(
         // A capture-bound request must not degrade to a text-only physical
         // snapshot: that would acknowledge a complete viewport while losing its
         // graphics and logical origin. Legacy reads are only for unpinned views.
-        return Err(last_error.unwrap_or_else(|| "captured history window unavailable".into()));
+        return Err(last_error.map_or(FetchError::Unavailable, FetchError::Failed));
     }
     drop(cache);
     let windows = crate::pane_runtime_client::attach_pane_grid_window_state_streaming(
@@ -161,7 +201,7 @@ mod tests {
         )
         .await
         .expect("must reject without attempting legacy service");
-        assert!(result.is_err());
+        assert!(matches!(result, Outcome::Unavailable));
         assert!(receiver.try_recv().is_err());
     }
 

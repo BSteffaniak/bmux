@@ -265,6 +265,7 @@ pub struct AttachViewState {
     pub pane_scrollback: PaneScrollbackViews,
     pub(super) decoded_history:
         std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
+    pub(super) pending_scroll: std::collections::BTreeMap<Uuid, usize>,
     pub(super) scrollback_fetch: Option<super::scrollback_fetch::Fetch>,
     pub(super) scrollback_cache: super::scrollback_cache::ScrollbackCache,
     /// Set when leaving frozen scrollback so the next post-event pass drains
@@ -618,6 +619,7 @@ impl AttachViewState {
             active_mode_id: "normal".to_string(),
             pane_scrollback: PaneScrollbackViews::new(),
             decoded_history: std::sync::Arc::default(),
+            pending_scroll: std::collections::BTreeMap::new(),
             scrollback_fetch: None,
             scrollback_cache: super::scrollback_cache::ScrollbackCache::default(),
             scrollback_replay_pending: false,
@@ -799,7 +801,31 @@ impl AttachViewState {
     }
 
     /// Leave scrollback for one specific pane.
+    /// Navigation intent is separate from the coherent displayed viewport.
+    pub fn requested_scroll_offset(&self, pane: Uuid) -> Option<usize> {
+        self.scrollback_for(pane).map(|view| {
+            self.pending_scroll
+                .get(&pane)
+                .copied()
+                .unwrap_or(view.offset)
+        })
+    }
+
+    pub fn request_scroll_offset(&mut self, pane: Uuid, offset: usize) {
+        if self.scrollback_active_for(pane) {
+            self.pending_scroll.insert(pane, offset);
+        }
+    }
+
     pub fn exit_scrollback_for(&mut self, pane_id: Uuid) -> bool {
+        self.pending_scroll.remove(&pane_id);
+        if self
+            .scrollback_fetch
+            .as_ref()
+            .is_some_and(|fetch| fetch.request.pane == pane_id)
+        {
+            self.scrollback_fetch = None;
+        }
         self.pane_scrollback.remove(&pane_id).is_some()
     }
 
@@ -811,6 +837,8 @@ impl AttachViewState {
 
     /// Drop scrollback views for panes that no longer exist.
     pub fn retain_scrollback_panes(&mut self, active_pane_ids: &BTreeSet<Uuid>) {
+        self.pending_scroll
+            .retain(|pane, _| active_pane_ids.contains(pane));
         self.pane_scrollback
             .retain(|pane_id, _| active_pane_ids.contains(pane_id));
     }

@@ -3906,12 +3906,12 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                 let request = fetch.request;
                 let current = view_state.scrollback_for(request.pane);
                 let valid = view_state.attached_id == request.session
-                    && current.is_some_and(|view| view.pin == request.pin && view.offset == request.offset)
+                    && current.is_some_and(|view| view.pin == request.pin && view_state.requested_scroll_offset(request.pane) == Some(request.offset))
                     && attach_pane_inner_size(&view_state, request.pane) == Some((request.width, request.rows));
-                let succeeded = matches!(&history, Ok(Ok(_)));
+                let succeeded = matches!(&history, Ok(super::scrollback_fetch::Outcome::Ready(_)));
                 if valid {
                     match history {
-                        Ok(Ok(window)) => {
+                        Ok(super::scrollback_fetch::Outcome::Ready(window)) => {
                             // Live responses may advance physical numbering. Old
                             // entries must not be interpreted in the new epoch.
                             if let Some(total) = request.total {
@@ -3922,10 +3922,12 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                         }
                         result => {
                             let error = match result {
-                                Ok(Err(error)) => error,
+                                Ok(super::scrollback_fetch::Outcome::Failed(error)) => error,
+                                Ok(super::scrollback_fetch::Outcome::Unavailable) => "capture viewport unavailable; previous view retained".into(),
                                 Err(error) => error.to_string(),
-                                Ok(Ok(_)) => unreachable!(),
+                                Ok(super::scrollback_fetch::Outcome::Ready(_)) => unreachable!(),
                             };
+                            view_state.pending_scroll.remove(&request.pane);
                             view_state.set_transient_status(format!("history fetch failed: {error}"), Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
                         }
                     }
@@ -6602,14 +6604,14 @@ pub fn handle_attach_ui_action_at(
         }
         RuntimeAction::ScrollTop if view_state.scrollback_active() => {
             let max_offset = max_attach_scrollback(view_state);
-            if let Some(view) = view_state.focused_scrollback_mut() {
-                view.offset = max_offset;
+            if let Some(pane) = view_state.focused_pane_id() {
+                view_state.request_scroll_offset(pane, max_offset);
             }
             clamp_attach_scrollback_cursor(view_state);
         }
         RuntimeAction::ScrollBottom if view_state.scrollback_active() => {
-            if let Some(view) = view_state.focused_scrollback_mut() {
-                view.offset = 0;
+            if let Some(pane) = view_state.focused_pane_id() {
+                view_state.request_scroll_offset(pane, 0);
             }
             clamp_attach_scrollback_cursor(view_state);
         }
@@ -6886,10 +6888,12 @@ pub fn step_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uui
         return;
     }
     let max_offset = max_attach_scrollback_for(view_state, pane_id);
-    if let Some(view) = view_state.scrollback_for_mut(pane_id) {
-        view.offset = adjust_attach_scrollback_offset(view.offset, delta, max_offset);
+    if let Some(offset) = view_state.requested_scroll_offset(pane_id) {
+        view_state.request_scroll_offset(
+            pane_id,
+            adjust_attach_scrollback_offset(offset, delta, max_offset),
+        );
     }
-    clamp_attach_scrollback_cursor_for(view_state, pane_id);
 }
 
 pub fn step_attach_scrollback(view_state: &mut AttachViewState, delta: isize) {
@@ -9884,7 +9888,11 @@ fn ensure_pane_scrollback_windows(
     if view_state.scrollback_fetch.as_ref().is_some_and(|fetch| {
         view_state
             .scrollback_for(fetch.request.pane)
-            .is_none_or(|view| view.pin != fetch.request.pin || view.offset != fetch.request.offset)
+            .is_none_or(|view| {
+                view.pin != fetch.request.pin
+                    || view_state.requested_scroll_offset(fetch.request.pane)
+                        != Some(fetch.request.offset)
+            })
             || attach_pane_inner_size(view_state, fetch.request.pane)
                 != Some((fetch.request.width, fetch.request.rows))
     }) {
@@ -9893,6 +9901,9 @@ fn ensure_pane_scrollback_windows(
     let mut ready = Vec::new();
     let mut next = None;
     for (pane, view) in &view_state.pane_scrollback {
+        let offset = view_state
+            .requested_scroll_offset(*pane)
+            .unwrap_or(view.offset);
         let Some((width, rows)) = attach_pane_inner_size(view_state, *pane) else {
             continue;
         };
@@ -9902,13 +9913,13 @@ fn ensure_pane_scrollback_windows(
             .and_then(|buffer| buffer.scrollback_window.as_ref());
         // Completed history rows are stable during append; a viewport that
         // still overlaps the live screen is mutable and must refresh.
-        let mutable_tail = force_refresh && view.pin.is_none() && view.offset < rows;
+        let mutable_tail = force_refresh && view.pin.is_none() && offset < rows;
         if mutable_tail {
             view_state.scrollback_cache.invalidate(*pane);
         }
         if !mutable_tail
             && previous.is_some_and(|window| {
-                window.scrollback_offset == view.offset
+                window.scrollback_offset == offset
                     && window.rows.len() == rows
                     && window.projection_width == width
             })
@@ -9918,10 +9929,9 @@ fn ensure_pane_scrollback_windows(
         if previous.is_none() {
             view_state.scrollback_cache.invalidate(*pane);
         }
-        if let Some(window) =
-            view_state
-                .scrollback_cache
-                .get(*pane, view.pin, view.offset, width, rows)
+        if let Some(window) = view_state
+            .scrollback_cache
+            .get(*pane, view.pin, offset, width, rows)
         {
             ready.push((*pane, window));
             continue;
@@ -9931,7 +9941,7 @@ fn ensure_pane_scrollback_windows(
                 session: view_state.attached_id,
                 pane: *pane,
                 pin: view.pin,
-                offset: view.offset,
+                offset,
                 width,
                 rows,
                 total: previous
@@ -9941,10 +9951,9 @@ fn ensure_pane_scrollback_windows(
                 delta: previous
                     .filter(|window| !window.row_anchors.is_empty())
                     .map_or(0, |window| {
-                        let distance =
-                            isize::try_from(view.offset.abs_diff(window.scrollback_offset))
-                                .unwrap_or(isize::MAX);
-                        if view.offset >= window.scrollback_offset {
+                        let distance = isize::try_from(offset.abs_diff(window.scrollback_offset))
+                            .unwrap_or(isize::MAX);
+                        if offset >= window.scrollback_offset {
                             distance
                         } else {
                             -distance
@@ -9989,6 +9998,7 @@ fn publish_scrollback_window(
     pane_id: Uuid,
     mut window: PaneScrollbackWindow,
 ) {
+    view_state.pending_scroll.remove(&pane_id);
     let pin = view_state.scrollback_for(pane_id).and_then(|view| view.pin);
     view_state.scrollback_cache.insert(pane_id, pin, &window);
     if let Some((width, rows)) = attach_pane_inner_size(view_state, pane_id)
@@ -10370,6 +10380,7 @@ async fn hydrate_attach_state_from_snapshot_mode(
         view_state.pane_input_mode_hints.clear();
         // A different session or a full resync invalidates every cached view.
         view_state.pane_scrollback.clear();
+        view_state.pending_scroll.clear();
         view_state.scrollback_fetch = None;
         view_state.scrollback_cache = super::scrollback_cache::ScrollbackCache::default();
     } else {
@@ -14263,8 +14274,8 @@ pub fn handle_attach_mouse_scrollback_for(
             step_attach_scrollback_for(view_state, pane_id, lines);
             if view_state.mouse.config.exit_scrollback_on_bottom
                 && view_state
-                    .scrollback_for(pane_id)
-                    .is_some_and(|view| view.offset == 0)
+                    .requested_scroll_offset(pane_id)
+                    .is_some_and(|offset| offset == 0)
                 && !view_state.selection_active_for(pane_id)
             {
                 view_state.exit_scrollback_for(pane_id);
@@ -17992,9 +18003,8 @@ mod tests {
         assert!(enter_attach_scrollback_for(&mut view_state, left_pane));
         step_attach_scrollback_for(&mut view_state, left_pane, -2);
         let left_offset = view_state
-            .scrollback_for(left_pane)
-            .expect("left pane in scrollback")
-            .offset;
+            .requested_scroll_offset(left_pane)
+            .expect("left pane in scrollback");
         assert!(left_offset > 0, "left pane should be scrolled back");
 
         // Focus the unrelated pane: it must not inherit scrollback state.
@@ -18017,16 +18027,19 @@ mod tests {
         step_attach_scrollback_for(&mut view_state, right_pane, -1);
         assert_eq!(
             view_state
-                .scrollback_for(left_pane)
-                .expect("left pane view")
-                .offset,
+                .requested_scroll_offset(left_pane)
+                .expect("left pane view"),
             left_offset,
             "scrolling one pane must not change another pane's offset"
         );
 
         // Returning focus restores the original pane's own position.
         test_focus_pane(&mut view_state, left_pane);
-        assert_eq!(test_scrollback_offset(&view_state), left_offset);
+        assert_eq!(
+            view_state.requested_scroll_offset(left_pane),
+            Some(left_offset)
+        );
+        assert_eq!(test_scrollback_offset(&view_state), 0);
         assert!(view_state.scrollback_active());
     }
 
@@ -20896,9 +20909,11 @@ mod tests {
         // the anchor line and the head line must still resolve to the same
         // text, now one row lower in the viewport.
         step_attach_scrollback(&mut view_state, -1);
-        if let Some(view) = view_state.focused_scrollback_mut() {
-            view.cursor = AttachScrollbackCursor { row: 2, col: 8 };
-        }
+        assert_eq!(test_scrollback_offset(&view_state), 0);
+        assert_eq!(
+            view_state.requested_scroll_offset(view_state.focused_pane_id().unwrap()),
+            Some(1)
+        );
         assert_eq!(selected_attach_text(&mut view_state), before);
     }
 
@@ -21235,7 +21250,11 @@ mod tests {
             MouseEventKind::ScrollUp,
         ));
         assert!(view_state.scrollback_active());
-        assert_eq!(test_scrollback_offset(&view_state), 1);
+        assert_eq!(test_scrollback_offset(&view_state), 0);
+        assert_eq!(
+            view_state.requested_scroll_offset(view_state.focused_pane_id().unwrap()),
+            Some(1)
+        );
     }
 
     #[test]
