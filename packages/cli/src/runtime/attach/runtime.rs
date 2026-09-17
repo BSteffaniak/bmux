@@ -3937,12 +3937,11 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                 }
             }
 
-            Some(mut request) = async_service_rx.recv() => {
+            Some((permit, mut request)) = async {
+                let permit = async_service_slots.clone().acquire_owned().await.expect("service semaphore open");
+                async_service_rx.recv().await.map(|request| (permit, request))
+            } => {
                 if !request.is_cancelled() {
-                    let Ok(permit) = async_service_slots.clone().try_acquire_owned() else {
-                        let _ = request.respond(Err("async service request capacity exhausted".into()));
-                        continue;
-                    };
                     let response = client.start_request(bmux_ipc::Request::InvokeService {
                         capability: request.capability.clone(), kind: request.kind,
                         interface_id: request.interface_id.clone(), operation: request.operation.clone(),

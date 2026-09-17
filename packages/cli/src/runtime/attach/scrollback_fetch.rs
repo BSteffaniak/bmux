@@ -63,10 +63,11 @@ impl Drop for Fetch {
 }
 
 pub(super) async fn fetch(
-    mut client: bmux_plugin::AsyncServiceClient,
+    client: bmux_plugin::AsyncServiceClient,
     request: Request,
     cache: std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
 ) -> Outcome {
+    let mut client = client.with_backpressure();
     match fetch_with_client(&mut client, request, cache).await {
         Ok(window) => Outcome::Ready(window),
         Err(FetchError::Unavailable) => Outcome::Unavailable,

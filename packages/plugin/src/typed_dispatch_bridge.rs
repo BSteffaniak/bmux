@@ -127,6 +127,7 @@ impl AsyncServiceRequest {
 /// A captured route that never reconnects or switches to another registration.
 #[derive(Debug, Clone)]
 pub struct AsyncServiceClient {
+    wait_for_capacity: bool,
     sender: tokio::sync::mpsc::Sender<AsyncServiceRequest>,
     services: Option<std::sync::Arc<[bmux_plugin_sdk::RegisteredService]>>,
 }
@@ -147,9 +148,18 @@ impl AsyncServiceClient {
             return Err("async service route capacity exceeds 16".into());
         }
         Ok(Self {
+            wait_for_capacity: false,
             sender,
             services: None,
         })
+    }
+
+    /// Opt into cancellable asynchronous queue admission for background work.
+    /// Existing routes retain their fail-fast admission semantics.
+    #[must_use]
+    pub const fn with_backpressure(mut self) -> Self {
+        self.wait_for_capacity = true;
+        self
     }
 
     /// Restrict the route to the issuing context's service inventory.
@@ -241,24 +251,39 @@ impl TypedDispatchClient for AsyncServiceClient {
         }) {
             return Err(error("service is outside the captured route inventory"));
         }
+        let permit = if self.wait_for_capacity {
+            Some(
+                self.sender
+                    .reserve()
+                    .await
+                    .map_err(|_| error("async service route closed"))?,
+            )
+        } else {
+            None
+        };
         let (response, receiver) = tokio::sync::oneshot::channel();
-        self.sender
-            .try_send(AsyncServiceRequest {
-                capability: capability.into(),
-                kind,
-                interface_id: interface_id.into(),
-                operation: operation.into(),
-                payload,
-                response,
-            })
-            .map_err(|failure| match failure {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                    error("async service route full")
-                }
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                    error("async service route closed")
-                }
-            })?;
+        let request = AsyncServiceRequest {
+            capability: capability.into(),
+            kind,
+            interface_id: interface_id.into(),
+            operation: operation.into(),
+            payload,
+            response,
+        };
+        if let Some(permit) = permit {
+            permit.send(request);
+        } else {
+            self.sender
+                .try_send(request)
+                .map_err(|failure| match failure {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                        error("async service route full")
+                    }
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                        error("async service route closed")
+                    }
+                })?;
+        }
         let result = receiver
             .await
             .map_err(|_| error("async service response closed"))?
@@ -349,6 +374,55 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn backpressured_route_waits_for_capacity_and_cancels_before_admission() {
+        let (sender, mut requests) = tokio::sync::mpsc::channel(1);
+        let (response, _receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(AsyncServiceRequest {
+                capability: "test".into(),
+                kind: InvokeServiceKind::Query,
+                interface_id: "test".into(),
+                operation: "occupied".into(),
+                payload: vec![],
+                response,
+            })
+            .await
+            .unwrap();
+        let mut client = AsyncServiceClient::bind(1, sender.clone())
+            .unwrap()
+            .with_backpressure();
+        let mut cancelled_client = client.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_client
+                .invoke_service_raw(
+                    "test",
+                    InvokeServiceKind::Query,
+                    "test",
+                    "cancelled",
+                    vec![],
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!cancelled.is_finished());
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        let pending = tokio::spawn(async move {
+            client
+                .invoke_service_raw("test", InvokeServiceKind::Query, "test", "pending", vec![])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+        assert_eq!(requests.recv().await.unwrap().operation, "occupied");
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.operation, "pending");
+        request.respond(Ok(vec![42])).unwrap();
+        assert_eq!(pending.await.unwrap().unwrap(), vec![42]);
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
