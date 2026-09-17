@@ -531,9 +531,7 @@ impl PaneRenderBuffer {
     ) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
         self.scrollback_window
             .as_ref()
-            .filter(|window| {
-                window.scrollback_offset == view.offset && !window.row_anchors.is_empty()
-            })
+            .filter(|window| !window.row_anchors.is_empty())
             .map_or_else(
                 || view.selection_bounds(self.scrollback_viewport_base(Some(view))),
                 |window| window.selection_bounds(view),
@@ -548,7 +546,7 @@ impl PaneRenderBuffer {
     ) -> &bmux_terminal_grid::StylePalette {
         self.scrollback_window
             .as_ref()
-            .filter(|window| view.is_some_and(|view| view.offset == window.scrollback_offset))
+            .filter(|_| view.is_some())
             .map_or_else(
                 || self.terminal_grid.grid().palette(),
                 |window| &window.palette,
@@ -562,11 +560,11 @@ impl PaneRenderBuffer {
     /// copy path must go through it, otherwise they can disagree about which
     /// history line each viewport row holds.
     ///
-    /// The server-provided window is authoritative when it matches the view's
-    /// offset. Otherwise the client's own grid is projected at that offset: it
-    /// mirrors the same output stream, so it is a far better approximation than
-    /// blank rows while the window request is in flight — which matters most at
-    /// offset 0, where a mouse selection enters scrollback with no window yet.
+    /// The last published window remains authoritative while the requested
+    /// offset is loading. Its rows, palette, images, and selection coordinates
+    /// must move together; substituting local rows would leave historical images
+    /// fixed over text from a different viewport. Before the first publication,
+    /// use the local grid, with no historical images.
     #[must_use]
     pub fn scrollback_render_window(
         &self,
@@ -577,7 +575,7 @@ impl PaneRenderBuffer {
         let offset = view.map_or(0, |view| view.offset);
         self.scrollback_window
             .as_ref()
-            .filter(|window| view.is_some() && window.scrollback_offset == offset)
+            .filter(|_| view.is_some())
             .map_or_else(
                 || {
                     (
@@ -610,7 +608,7 @@ impl PaneRenderBuffer {
         let offset = view.map_or(0, |view| view.offset);
         self.scrollback_window
             .as_ref()
-            .filter(|window| view.is_some() && window.scrollback_offset == offset)
+            .filter(|_| view.is_some())
             .map_or_else(
                 || ScrollbackViewportBase::from_scrolled_rows(grid.total_scrolled_rows(), offset),
                 |window| {
@@ -735,6 +733,44 @@ mod tests {
         wide.remap_view_from(&narrow, &mut view);
         assert!(view.captured_selection.is_none());
         assert!(view.selection_anchor.is_none());
+    }
+
+    #[test]
+    fn pending_scroll_keeps_displayed_rows_palette_and_coordinates_together() {
+        let mut buffer = PaneRenderBuffer::default();
+        buffer.terminal_grid.process(b"live");
+        let mut captured = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+        captured.process(b"captured");
+        let rows = captured.grid().viewport_rows();
+        buffer.scrollback_window = Some(PaneScrollbackWindow {
+            images: Vec::new(),
+            projection_width: 80,
+            row_anchors: Vec::new(),
+            rows: rows.clone(),
+            palette: captured.grid().palette().clone(),
+            scrollback_offset: 5,
+            max_scrollback_offset: 100,
+            total_scrolled_rows: 100,
+        });
+        let mut view = PaneScrollbackView {
+            captured_selection: None,
+            selection_anchor: None,
+            offset: 5,
+            cursor: AttachScrollbackCursor { row: 0, col: 0 },
+            pin: None,
+        };
+        for requested in [6, 20, 4, 0] {
+            view.offset = requested;
+            let (displayed, base) = buffer.scrollback_render_window(Some(&view), 24);
+            assert_eq!(displayed, rows);
+            assert_eq!(base, ScrollbackViewportBase::from_scrolled_rows(100, 5));
+            assert_eq!(buffer.scrollback_viewport_base(Some(&view)), base);
+            assert!(std::ptr::eq(
+                buffer.scrollback_palette(Some(&view)),
+                &raw const buffer.scrollback_window.as_ref().unwrap().palette,
+            ));
+        }
+        assert_ne!(buffer.scrollback_render_window(None, 24).0, rows);
     }
 
     #[test]

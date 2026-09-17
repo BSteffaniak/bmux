@@ -9866,6 +9866,18 @@ fn ensure_pane_scrollback_windows(
     view_state: &mut AttachViewState,
     force_refresh: bool,
 ) -> std::result::Result<(), ClientError> {
+    // Do not let an obsolete viewport monopolize the bounded fetch slot.
+    // Dropping Fetch aborts its task; the replacement still publishes only if
+    // its capture, offset, and geometry match the requested viewport.
+    if view_state.scrollback_fetch.as_ref().is_some_and(|fetch| {
+        view_state
+            .scrollback_for(fetch.request.pane)
+            .is_none_or(|view| view.pin != fetch.request.pin || view.offset != fetch.request.offset)
+            || attach_pane_inner_size(view_state, fetch.request.pane)
+                != Some((fetch.request.width, fetch.request.rows))
+    }) {
+        view_state.scrollback_fetch = None;
+    }
     let mut ready = Vec::new();
     let mut next = None;
     for (pane, view) in &view_state.pane_scrollback {
