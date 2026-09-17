@@ -101,6 +101,10 @@ pub async fn fetch_with_client(
             .await;
             match result {
                 Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(mut window)) => {
+                    if let Some(images) = cache.cached_images(request.width, &window.row_anchors) {
+                        window.images = images;
+                        return Ok(window);
+                    }
                     let origin = window.row_anchors.first().ok_or("missing capture origin")?;
                     let reply = bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_history_images_v3(
                         client, request.session, request.pane, pin.pin_id, origin.capture_id,
@@ -117,6 +121,7 @@ pub async fn fetch_with_client(
                     }
                     window.images = serde_json::from_slice(&reply.encoded)
                         .map_err(|error| error.to_string())?;
+                    cache.retain_images(request.width, &window.row_anchors, &window.images);
                     return Ok(window);
                 }
                 Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) => {}

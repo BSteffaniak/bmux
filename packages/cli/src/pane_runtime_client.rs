@@ -737,6 +737,22 @@ mod history_tests {
             cache.remaining, remaining,
             "projection must not consume retained budget"
         );
+        cache.retain_images(2, &window.row_anchors, &[]);
+        let admitted = cache.remaining;
+        for offset in 0..40 {
+            let local = cache
+                .resident_window(identity, offset, 20, (2, None, 0))
+                .unwrap();
+            assert_eq!(local.rows.len(), 20);
+        }
+        assert_eq!(cache.remaining, admitted);
+        assert!(
+            cache
+                .resident_window(identity, 0, 20, (1, None, 0))
+                .is_none(),
+            "unknown resized image coverage must fetch"
+        );
+        assert_eq!(client.0, 60);
         cache.prepare(uuid::Uuid::new_v4(), identity.1, pin);
         assert!(cache.decoded.lines.is_empty());
     }
@@ -884,6 +900,79 @@ mod history_tests {
         }
         assert_eq!(remaining, admitted);
         assert!(remaining > 0);
+    }
+
+    #[test]
+    fn empty_image_coverage_is_local_but_never_crosses_capture_or_width() {
+        let id = uuid::Uuid::new_v4();
+        let anchors = (0..50)
+            .map(|line_index| bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id: id,
+                line_index,
+                column: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut cache = super::CapturedHistoryCache::default();
+        cache.retain_images(80, &anchors, &[]);
+        for start in 0..30 {
+            assert!(
+                cache
+                    .cached_images(80, &anchors[start..start + 20])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(cache.cached_images(40, &anchors[..20]).is_none());
+        let mut other = anchors.clone();
+        other[0].capture_id = uuid::Uuid::new_v4();
+        assert!(cache.cached_images(80, &other[..20]).is_none());
+        assert!(cache.cached_images(80, &[]).is_none());
+    }
+
+    #[test]
+    fn decoded_image_coverage_preserves_payload_and_bounds_eviction() {
+        let mut cache = super::CapturedHistoryCache::default();
+        let anchor = bmux_attach_pipeline::CapturedHistoryAnchor {
+            capture_id: uuid::Uuid::new_v4(),
+            line_index: 0,
+            column: 0,
+        };
+        let image = bmux_attach_image_protocol::AttachPaneImage {
+            id: 7,
+            protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
+            compression: bmux_attach_image_protocol::CompressionId::None,
+            raw_data: vec![1, 2, 3],
+            position_row: 0,
+            position_col: 1,
+            cell_rows: 1,
+            cell_cols: 2,
+            pixel_width: 16,
+            pixel_height: 16,
+        };
+        cache.retain_images(80, &[anchor], std::slice::from_ref(&image));
+        assert_eq!(cache.cached_images(80, &[anchor]).unwrap(), vec![image]);
+        assert!(cache.cached_images(40, &[anchor]).is_none());
+        for line_index in 1..=256 {
+            cache.retain_images(
+                80,
+                &[bmux_attach_pipeline::CapturedHistoryAnchor {
+                    line_index,
+                    ..anchor
+                }],
+                &[],
+            );
+        }
+        assert!(cache.cached_images(80, &[anchor]).is_none());
+        assert_eq!(cache.image_coverage.len(), 256);
+        assert_eq!(
+            cache.image_bytes,
+            cache
+                .image_coverage
+                .iter()
+                .map(|entry| entry.bytes)
+                .sum::<usize>()
+        );
+        assert!(cache.image_bytes <= 8 * 1024 * 1024);
     }
 
     struct HistoryClient;
@@ -1218,8 +1307,33 @@ pub async fn captured_history_window(
     )
 }
 
+/// No transport capability: a cache miss suspends until the local probe is
+/// dropped. The asynchronous worker remains responsible for admission and I/O.
+struct ResidentOnly;
+impl bmux_plugin_sdk::TypedDispatchClient for ResidentOnly {
+    async fn invoke_service_raw(
+        &mut self,
+        _capability: &str,
+        _kind: bmux_ipc::InvokeServiceKind,
+        _interface: &str,
+        _operation: &str,
+        _payload: Vec<u8>,
+    ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+        std::future::pending().await
+    }
+}
+
+struct CapturedImageCoverage {
+    width: usize,
+    anchors: Vec<bmux_attach_pipeline::CapturedHistoryAnchor>,
+    images: Vec<bmux_attach_image_protocol::AttachPaneImage>,
+    bytes: usize,
+}
+
 #[derive(Default)]
 pub struct CapturedHistoryCache {
+    image_coverage: std::collections::VecDeque<CapturedImageCoverage>,
+    image_bytes: usize,
     identity: Option<(Uuid, Uuid, bmux_attach_pipeline::ScrollbackPin)>,
     decoded: CapturedLineCache,
     styles: Vec<bmux_terminal_grid::Style>,
@@ -1229,6 +1343,102 @@ pub struct CapturedHistoryCache {
 }
 
 impl CapturedHistoryCache {
+    /// Poll the shared resolver using resident data only. Missing content yields
+    /// immediately: this caller cannot send transport requests or await I/O.
+    pub fn resident_window(
+        &mut self,
+        identity: (Uuid, Uuid, bmux_attach_pipeline::ScrollbackPin),
+        offset: usize,
+        rows: usize,
+        projection: (
+            usize,
+            Option<bmux_attach_pipeline::CapturedHistoryAnchor>,
+            isize,
+        ),
+    ) -> Option<bmux_attach_pipeline::PaneScrollbackWindow> {
+        use futures_util::FutureExt;
+        if self.identity != Some(identity) || self.remaining < 4 * 1024 * 1024 {
+            return None;
+        }
+        let remaining = self.remaining;
+        let outcome = captured_history_window_cached(
+            &mut ResidentOnly,
+            identity,
+            offset,
+            rows,
+            projection,
+            self,
+        )
+        .now_or_never();
+        // An unsuccessful probe must not consume admission credits merely for
+        // asking whether a missing line is resident.
+        let Some(Ok(CapturedWindowOutcome::Window(mut window))) = outcome else {
+            self.remaining = remaining;
+            return None;
+        };
+        window.images = self.cached_images(projection.0, &window.row_anchors)?;
+        Some(window)
+    }
+
+    /// A cached empty response proves absence over every subrange. Nonempty
+    /// image responses are reusable only at the exact origin and geometry.
+    pub fn cached_images(
+        &self,
+        width: usize,
+        anchors: &[bmux_attach_pipeline::CapturedHistoryAnchor],
+    ) -> Option<Vec<bmux_attach_image_protocol::AttachPaneImage>> {
+        if anchors.is_empty() {
+            return None;
+        }
+        self.image_coverage.iter().rev().find_map(|entry| {
+            if entry.width != width {
+                return None;
+            }
+            let exact = entry.anchors == anchors;
+            let empty = entry.images.is_empty();
+            if !(exact
+                || (empty
+                    && entry
+                        .anchors
+                        .windows(anchors.len())
+                        .any(|range| range == anchors)))
+            {
+                return None;
+            }
+            Some(entry.images.clone())
+        })
+    }
+
+    pub fn retain_images(
+        &mut self,
+        width: usize,
+        anchors: &[bmux_attach_pipeline::CapturedHistoryAnchor],
+        images: &[bmux_attach_image_protocol::AttachPaneImage],
+    ) {
+        const LIMIT: usize = 8 * 1024 * 1024;
+        let bytes = images.iter().fold(
+            std::mem::size_of_val(images)
+                .saturating_add(std::mem::size_of_val(anchors))
+                .saturating_add(std::mem::size_of::<CapturedImageCoverage>()),
+            |bytes, image| bytes.saturating_add(image.raw_data.len()),
+        );
+        if bytes > LIMIT || anchors.is_empty() {
+            return;
+        }
+        while self.image_bytes.saturating_add(bytes) > LIMIT || self.image_coverage.len() >= 256 {
+            if let Some(old) = self.image_coverage.pop_front() {
+                self.image_bytes -= old.bytes;
+            }
+        }
+        self.image_bytes += bytes;
+        self.image_coverage.push_back(CapturedImageCoverage {
+            width,
+            anchors: anchors.to_vec(),
+            images: images.to_vec(),
+            bytes,
+        });
+    }
+
     fn prepare(&mut self, session: Uuid, pane: Uuid, pin: bmux_attach_pipeline::ScrollbackPin) {
         let identity = (session, pane, pin);
         // One capture per attachment worker, with a fixed retained allocation

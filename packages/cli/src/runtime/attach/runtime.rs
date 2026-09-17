@@ -9938,6 +9938,31 @@ fn ensure_pane_scrollback_windows(
             ready.push((*pane, window));
             continue;
         }
+        if let Some(pin) = view.pin
+            && let Ok(mut cache) = view_state.decoded_history.try_lock()
+        {
+            let anchor = previous.and_then(|window| window.row_anchors.last().copied());
+            let delta = previous
+                .filter(|window| !window.row_anchors.is_empty())
+                .map_or(0, |window| {
+                    let distance = isize::try_from(offset.abs_diff(window.scrollback_offset))
+                        .unwrap_or(isize::MAX);
+                    if offset >= window.scrollback_offset {
+                        distance
+                    } else {
+                        -distance
+                    }
+                });
+            if let Some(window) = cache.resident_window(
+                (view_state.attached_id, *pane, pin),
+                offset,
+                rows,
+                (width, anchor, delta),
+            ) {
+                ready.push((*pane, window));
+                continue;
+            }
+        }
         if next.is_none() {
             next = Some(super::scrollback_fetch::Request {
                 session: view_state.attached_id,
