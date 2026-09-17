@@ -12,7 +12,7 @@ version     = { workspace = true }
 
 [[example]]
 name              = "image_runtime"
-required-features = ["image-kitty"]
+required-features = ["images"]
 
 [[example]]
 name              = "image_sixel"

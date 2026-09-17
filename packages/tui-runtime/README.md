@@ -11,10 +11,22 @@ leaving the image above the shell prompt. Run each in a terminal supporting its
 protocol (or inside an updated BMUX, which translates to the host protocol):
 
 ```sh
-cargo run -p bmux_tui_runtime --example image_runtime
+cargo run -p bmux_tui_runtime --example image_runtime -- --protocol kitty
+cargo run -p bmux_tui_runtime --example image_runtime -- --protocol sixel
+cargo run -p bmux_tui_runtime --example image_runtime -- --protocol iterm2
 cargo run -p bmux_tui_runtime --example image_sixel
 cargo run -p bmux_tui_runtime --example image_iterm2
 ```
+
+With exactly one protocol feature enabled, `image_runtime` selects it automatically:
+
+```sh
+cargo run -p bmux_tui_runtime --example image_runtime --no-default-features --features image-sixel
+```
+
+Multiple enabled protocols require `--protocol`; disabled or unknown protocols
+produce an error before any terminal output. Selection does not probe the terminal
+or silently fall back to another protocol.
 
 Kitty and iTerm2 request 16×8 cells. Sixel uses a 128×96-pixel raster and reserves
 12 rows; use a terminal with at least 14 rows and cell height of at least 8 pixels.

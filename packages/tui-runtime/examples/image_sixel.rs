@@ -3,7 +3,7 @@
 
 use std::io::{self, Write};
 
-fn main() -> io::Result<()> {
+pub(crate) fn main() -> io::Result<()> {
     // Sixel dimensions are pixels, not terminal cells. This remains visible
     // without relying on a particular terminal's font metrics.
     let (width, height) = (128, 96);

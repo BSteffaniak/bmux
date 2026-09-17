@@ -11,7 +11,7 @@ const CHECKERBOARD_PNG: &[u8] = &[
     130,
 ];
 
-fn main() -> io::Result<()> {
+pub(crate) fn main() -> io::Result<()> {
     let mut out = io::stdout().lock();
     writeln!(out, "BMUX iTerm2 inline image (16x8 cells)")?;
     for _ in 0..8 {
