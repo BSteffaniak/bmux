@@ -1339,7 +1339,8 @@ pub struct CapturedHistoryCache {
     styles: Vec<bmux_terminal_grid::Style>,
     remaining: usize,
     tail_loaded: bool,
-    history: Vec<(u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>)>,
+    history:
+        std::collections::BTreeMap<u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>>,
 }
 
 impl CapturedHistoryCache {
@@ -1662,7 +1663,7 @@ pub async fn captured_history_window_cached(
                 return Ok(CapturedWindowOutcome::Unavailable);
             };
             line
-        } else if let Some((_, line)) = cache.history.iter().find(|(key, _)| *key == index) {
+        } else if let Some(line) = cache.history.get(&index) {
             std::sync::Arc::clone(line)
         } else {
             let line = std::sync::Arc::new(
@@ -1678,12 +1679,9 @@ pub async fn captured_history_window_cached(
                 .await?,
             );
             *remaining = remaining
-                .checked_sub(std::mem::size_of::<(
-                    u32,
-                    std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>,
-                )>())
+                .checked_sub(HISTORY_INDEX_ENTRY_BYTES)
                 .ok_or_else(|| history_decode_error(&"history cache metadata budget"))?;
-            cache.history.push((index, std::sync::Arc::clone(&line)));
+            cache.history.insert(index, std::sync::Arc::clone(&line));
             line
         };
         let count = line.projected_rows(usize::from(meta.width));
@@ -2015,6 +2013,9 @@ async fn resolve_tail_entry(
     Ok(None)
 }
 
+// Conservative per-entry tree-node allowance, including sparsely occupied nodes.
+const HISTORY_INDEX_ENTRY_BYTES: usize = 256;
+
 #[derive(Default)]
 struct CapturedLineCache {
     /// First logical index beyond the immutable captured screen.
@@ -2022,7 +2023,7 @@ struct CapturedLineCache {
     /// Resume only at a completed logical-line boundary. Cancelled partial
     /// assembly never advances this cursor.
     tail_resume: Option<(u16, usize)>,
-    lines: Vec<(u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>)>,
+    lines: std::collections::BTreeMap<u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>>,
 }
 
 impl CapturedLineCache {
@@ -2037,15 +2038,14 @@ impl CapturedLineCache {
         if self.end.is_some_and(|end| index >= end) {
             return Ok(None);
         }
-        if let Some((_, line)) = self.lines.iter().find(|(key, _)| *key == index) {
+        if let Some(line) = self.lines.get(&index) {
             return Ok(Some(std::sync::Arc::clone(line)));
         }
         let (remaining, styles, requests) = budgets;
         // Admission is byte-budgeted below, including line metadata. A fixed
         // entry count rejects cheap short lines despite ample memory headroom.
         let charge = std::mem::size_of::<bmux_terminal_grid::HistoryLineAssembly>()
-            + 4 * std::mem::size_of::<usize>()
-            + std::mem::size_of::<u32>();
+            + HISTORY_INDEX_ENTRY_BYTES;
         *remaining = remaining
             .checked_sub(charge)
             .ok_or_else(|| history_decode_error(&"decoded line metadata budget"))?;
@@ -2063,18 +2063,13 @@ impl CapturedLineCache {
             // exact boundary, not the potentially distant requested index.
             self.end = self
                 .lines
-                .iter()
-                .map(|(key, _)| key.saturating_add(1))
-                .max();
+                .last_key_value()
+                .map(|(key, _)| key.saturating_add(1));
             return Ok(None);
         };
         self.lines
-            .try_reserve_exact(1)
-            .map_err(|error| history_decode_error(&error))?;
-        if !self.lines.iter().any(|(key, _)| *key == index) {
-            self.lines.push((index, std::sync::Arc::clone(&line)));
-            self.lines.sort_by_key(|(index, _)| *index);
-        }
+            .entry(index)
+            .or_insert_with(|| std::sync::Arc::clone(&line));
         Ok(Some(line))
     }
 }
@@ -2199,7 +2194,7 @@ async fn fetch_captured_content_line(
         }
         if line.completed().is_some() {
             let key = u32::try_from(logical).map_err(|error| history_decode_error(&error))?;
-            if let Some((_, cached)) = lines.iter().find(|(existing, _)| *existing == key) {
+            if let Some(cached) = lines.get(&key) {
                 *tail_resume = Some((row + 1, logical + 1));
                 if logical == index as usize {
                     return Ok(Some(std::sync::Arc::clone(cached)));
@@ -2209,14 +2204,12 @@ async fn fetch_captured_content_line(
                     HistoryLineAssembly::new(capture.capture_id.as_u128(), logical, *budget, false);
                 continue;
             }
-            let charge = std::mem::size_of::<HistoryLineAssembly>()
-                + 4 * std::mem::size_of::<usize>()
-                + std::mem::size_of::<u32>();
+            let charge = std::mem::size_of::<HistoryLineAssembly>() + HISTORY_INDEX_ENTRY_BYTES;
             *budget = budget
                 .checked_sub(charge)
                 .ok_or_else(|| history_decode_error(&"decoded line metadata budget"))?;
             let completed = std::sync::Arc::new(line);
-            lines.push((key, std::sync::Arc::clone(&completed)));
+            lines.insert(key, std::sync::Arc::clone(&completed));
             *tail_resume = Some((row + 1, logical + 1));
             if logical == index as usize {
                 return Ok(Some(completed));

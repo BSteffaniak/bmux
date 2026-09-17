@@ -556,9 +556,20 @@ fn push_line(
     open: bool,
     budget: &mut ContentBudget,
 ) -> Result<(), HistorySliceError> {
-    while !open && cells.last().is_some_and(Cell::is_discardable_blank) {
-        cells.pop();
+    if !open {
+        while cells.last().is_some_and(Cell::is_discardable_blank) {
+            cells.pop();
+        }
     }
+    push_retained_line(lines, cells, open, budget)
+}
+
+fn push_retained_line(
+    lines: &mut Vec<ContentLine>,
+    cells: Vec<Cell>,
+    open: bool,
+    budget: &mut ContentBudget,
+) -> Result<(), HistorySliceError> {
     let count = cells
         .len()
         .checked_add(1)
@@ -593,6 +604,38 @@ fn push_line(
 }
 
 impl ContentProjection {
+    /// Build a caller-owned projection from ordered canonical logical lines.
+    /// The boolean marks continuation beyond a line's final cell. All supplied
+    /// cells, including significant trailing blanks, are preserved. Source
+    /// identity/revision and completeness are asserted by the caller.
+    ///
+    /// # Errors
+    /// Returns `BudgetExhausted` before exceeding source-copy allowances.
+    pub fn from_lines<'a>(
+        capture: u128,
+        revision: u64,
+        source: impl IntoIterator<Item = (&'a [Cell], bool)>,
+        more_above: bool,
+        history_truncated: bool,
+        mut budget: ContentBudget,
+    ) -> Result<Self, HistorySliceError> {
+        let mut lines = Vec::new();
+        for (cells, open) in source {
+            let mut copied = Vec::new();
+            copy_cells(&mut copied, cells, &mut budget)?;
+            push_retained_line(&mut lines, copied, open, &mut budget)?;
+        }
+        Ok(Self {
+            capture,
+            revision,
+            lines,
+            more_above,
+            history_truncated,
+            viewport_prefix_continues: false,
+            index: None,
+        })
+    }
+
     /// Whether a viewport capture begins mid-line with its prefix outside the
     /// viewport. The first visible fragment's logical origin is `(line: 0,
     /// column: 0)` in this capture, not an offset into hidden history.

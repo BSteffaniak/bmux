@@ -30,6 +30,45 @@ fn texts(rows: &[PhysicalRow]) -> Vec<String> {
 }
 
 #[test]
+fn canonical_lines_preserve_blanks_and_reflow_without_terminal_replay() {
+    let cells = vec![
+        Cell::new("界", crate::StyleId::DEFAULT, 2),
+        Cell::new("e\u{301}", crate::StyleId::DEFAULT, 1),
+        Cell::blank(crate::StyleId::DEFAULT),
+    ];
+    let mut content =
+        ContentProjection::from_lines(99, 7, [(cells.as_slice(), false)], false, false, budget())
+            .unwrap();
+    content.prepare(2, budget()).unwrap();
+    let narrow = content.tail(10, budget().bytes).unwrap();
+    assert_eq!(crate::row_text(&narrow.rows[0], 2), "界");
+    assert_eq!(crate::row_text(&narrow.rows[1], 2), "e\u{301} ");
+    assert_eq!(narrow.sources[1].end.column, 4);
+    let anchor = narrow.anchors[1];
+    content.prepare(8, budget()).unwrap();
+    assert_eq!(content.resolve(anchor), Some(0));
+    let wide = content.tail(10, budget().bytes).unwrap();
+    assert_eq!(crate::row_text(&wide.rows[0], 4), "界e\u{301} ");
+    assert_eq!(wide.sources[0].end.column, 4);
+    // A prepared index is reusable without any further source-scan allowance.
+    content
+        .prepare(8, ContentBudget { cells: 0, bytes: 0 })
+        .unwrap();
+    assert_eq!(content.revision(), 7);
+    assert!(
+        ContentProjection::from_lines(
+            99,
+            7,
+            [(cells.as_slice(), false)],
+            false,
+            false,
+            ContentBudget { cells: 0, bytes: 0 }
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn viewport_reflow_excludes_scrolled_progress_and_retains_cursor_row() {
     let (stream, _) = capture(
         "progress 20%\r\ncompile one\r\ncompile two\r\nprogress 30%",
