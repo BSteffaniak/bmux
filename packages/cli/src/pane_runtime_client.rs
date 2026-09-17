@@ -1292,7 +1292,9 @@ pub async fn captured_history_window_cached(
         .try_reserve_exact(rows)
         .map_err(|error| history_decode_error(&error))?;
     // Bound scanning independently of bytes (empty lines still cost requests).
+    let mut reached_oldest = false;
     for index in (0..scan_end).rev().take(256) {
+        reached_oldest = index == 0;
         let index = u32::try_from(index).map_err(|error| history_decode_error(&error))?;
         let mut line = if bottom_anchor.is_some() {
             let Some(line) = decoded
@@ -1401,7 +1403,49 @@ pub async fn captured_history_window_cached(
             break;
         }
     }
-    if selected.len() != rows {
+    let mut resolved_offset = offset;
+    if selected.len() != rows && reached_oldest {
+        // A boundary is a navigation result, not a missing capture. Resolve
+        // the oldest viewport forward so a taller projection cannot request
+        // rows before the beginning of the capture.
+        let deficit = rows - selected.len();
+        resolved_offset = offset.saturating_sub(deficit.saturating_add(local_skip));
+        selected.clear();
+        anchors.clear();
+        let mut index = 0_u32;
+        while selected.len() < rows && u64::from(index) < meta.lines + u64::from(meta.height) {
+            let Some(line) = decoded
+                .resolve(
+                    client,
+                    session_id,
+                    &capture,
+                    index,
+                    (remaining, styles, &mut requests_left),
+                )
+                .await?
+            else {
+                break;
+            };
+            let count = line.projected_rows(width).min(rows - selected.len());
+            let projected = project_captured_range(&line, width, 0..count, &mut projection_budget)?;
+            for row in 0..count {
+                anchors.push(bmux_attach_pipeline::CapturedHistoryAnchor {
+                    capture_id: meta.identity,
+                    line_index: index,
+                    column: line
+                        .column_for_row(width, row)
+                        .ok_or_else(|| history_decode_error(&"invalid boundary row"))?,
+                });
+            }
+            selected.extend(projected);
+            index += 1;
+        }
+        // A capture shorter than the viewport is valid; only actual source
+        // rows have anchors. Display padding is not fabricated source content.
+        selected.reverse();
+        anchors.reverse();
+    }
+    if selected.len() != rows && !reached_oldest {
         return Ok(CapturedWindowOutcome::Unavailable);
     }
     selected.reverse();
@@ -1413,8 +1457,12 @@ pub async fn captured_history_window_cached(
             row_anchors: anchors,
             palette: bmux_terminal_grid::StylePalette::from_styles(styles.clone()),
             rows: selected,
-            scrollback_offset: offset,
-            max_scrollback_offset: pin.max_scrollback_offset,
+            scrollback_offset: resolved_offset,
+            max_scrollback_offset: if reached_oldest {
+                resolved_offset
+            } else {
+                pin.max_scrollback_offset
+            },
             total_scrolled_rows: pin.total_scrolled_rows,
         },
     ))

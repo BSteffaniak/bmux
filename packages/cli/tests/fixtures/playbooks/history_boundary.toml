@@ -1,0 +1,5 @@
+[keybindings.modes.insert.bindings]
+"ctrl+a [" = "enter_scroll_mode"
+
+[behavior.scrollback]
+mode = "frozen"
