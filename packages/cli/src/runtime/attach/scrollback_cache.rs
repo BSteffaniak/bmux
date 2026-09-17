@@ -19,6 +19,48 @@ pub(super) struct ScrollbackCache {
     bytes: usize,
 }
 
+fn project_images(
+    images: &[bmux_attach_image_protocol::AttachPaneImage],
+    start: usize,
+    rows: usize,
+) -> Option<Vec<bmux_attach_image_protocol::AttachPaneImage>> {
+    if images.is_empty() {
+        return Some(Vec::new());
+    }
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    {
+        let images = images
+            .iter()
+            .map(bmux_image::PaneImage::from)
+            .collect::<Vec<_>>();
+        bmux_image::ImageRegistry::project_row_slice(
+            &images,
+            u16::try_from(start).ok()?,
+            u16::try_from(rows).ok()?,
+        )
+        .ok()
+        .map(|images| {
+            images
+                .iter()
+                .map(bmux_attach_image_protocol::AttachPaneImage::from)
+                .collect()
+        })
+    }
+    #[cfg(not(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    )))]
+    {
+        let _ = (start, rows);
+        None
+    }
+}
+
 impl ScrollbackCache {
     pub fn advance(&mut self, pane: Uuid, previous: u64, current: u64) {
         let Some(growth) = current
@@ -73,13 +115,13 @@ impl ScrollbackCache {
             let shift = offset.checked_sub(window.scrollback_offset)?;
             let end = window.rows.len().checked_sub(shift)?;
             let start = end.checked_sub(rows)?;
-            // Captured images are already cropped. Reusing a subrange would
-            // require another pixel crop, not merely shifting cell coordinates.
-            if !window.row_anchors.is_empty() && (start != 0 || end != window.rows.len()) {
-                return None;
-            }
+            let images = if start == 0 && end == window.rows.len() {
+                window.images.clone()
+            } else {
+                project_images(&window.images, start, rows)?
+            };
             Some(PaneScrollbackWindow {
-                images: window.images.clone(),
+                images,
                 projection_width: width,
                 row_anchors: if window.row_anchors.is_empty() {
                     Vec::new()
@@ -191,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_images_require_exact_viewport_and_count_toward_budget() {
+    fn captured_images_project_locally_and_count_toward_budget() {
         let pane = Uuid::new_v4();
         let mut source = window();
         source.row_anchors = vec![
@@ -220,9 +262,23 @@ mod tests {
         cache.insert(pane, None, &source);
         let hit = cache.get(pane, None, 10, 80, 40).unwrap();
         assert_eq!(hit.images, source.images);
-        assert!(cache.get(pane, None, 11, 80, 39).is_none());
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
+        {
+            let shifted = cache.get(pane, None, 11, 80, 38).unwrap();
+            assert_eq!(shifted.images[0].position_row, 1);
+            assert_eq!(shifted.images[0].raw_data, source.images[0].raw_data);
+            assert!(cache.get(pane, None, 10, 80, 20).unwrap().images.is_empty());
+            // Projection never mutates the retained source on direction reversal.
+            assert_eq!(
+                cache.get(pane, None, 10, 80, 40).unwrap().images,
+                source.images
+            );
+        }
         assert!(cache.get(pane, None, 10, 40, 40).is_none());
-        assert!(cache.get(pane, None, 10, 80, 20).is_none());
         cache.invalidate(pane);
         source.images[0].raw_data = vec![0; MAX_BYTES + 1];
         cache.insert(pane, None, &source);

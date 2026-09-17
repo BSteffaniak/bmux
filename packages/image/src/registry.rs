@@ -642,6 +642,26 @@ impl ImageRegistry {
 
     /// Build a cropped viewport without modifying original pixels or placement size.
     /// Decode failures are explicit rather than presenting a healthy empty image.
+    /// Crop an immutable image region to a local row slice. Always crop from
+    /// the retained source, never from a previously projected viewport.
+    pub fn project_row_slice(
+        images: &[PaneImage],
+        start: u16,
+        height: u16,
+    ) -> std::io::Result<Vec<PaneImage>> {
+        let mut registry = Self::default();
+        for image in images {
+            registry.history.insert(
+                image.id,
+                (
+                    image.clone(),
+                    i64::from(image.position.row) - i64::from(start),
+                ),
+            );
+        }
+        registry.project_viewport(0, height)
+    }
+
     pub fn project_viewport(&self, offset: usize, height: u16) -> std::io::Result<Vec<PaneImage>> {
         if height == 0 {
             return Ok(Vec::new());
@@ -1115,6 +1135,47 @@ fn pixel_size_to_cells(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_row_slices_crop_pixels_without_mutating_retained_source() {
+        let mut registry = ImageRegistry::default();
+        registry.add_image(
+            ImageProtocol::KittyGraphics,
+            ImagePayload {
+                pixels: Some(crate::model::PixelBuffer {
+                    width: 1,
+                    height: 4,
+                    format: crate::model::PixelFormat::Rgba8,
+                    data: vec![
+                        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+                    ],
+                }),
+                ..ImagePayload::default()
+            },
+            ImagePosition { row: 1, col: 0 },
+            ImageCellSize { rows: 4, cols: 1 },
+            ImagePixelSize {
+                width: 1,
+                height: 4,
+            },
+        );
+        let source = registry.images().to_vec();
+        for (start, expected) in [
+            (2, vec![0, 255, 0, 255, 0, 0, 255, 255]),
+            (1, vec![255, 0, 0, 255, 0, 255, 0, 255]),
+        ] {
+            let projected = ImageRegistry::project_row_slice(&source, start, 2).unwrap();
+            assert_eq!(projected[0].position.row, 0);
+            assert_eq!(projected[0].cell_size.rows, 2);
+            assert_eq!(projected[0].payload.pixels.as_ref().unwrap().data, expected);
+        }
+        assert!(
+            ImageRegistry::project_row_slice(&source, 5, 2)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(source[0].payload.pixels.as_ref().unwrap().height, 4);
+    }
 
     #[test]
     fn alternate_resize_updates_empty_hidden_screen_geometry() {

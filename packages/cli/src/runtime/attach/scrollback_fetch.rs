@@ -43,7 +43,11 @@ pub async fn fetch_with_client(
     let rows = request.rows;
     if let Some(pin) = request.pin {
         let mut last_error = None;
-        for count in [rows, request.rows] {
+        // Retain nearby older rows for local scrolling and direction reversals.
+        // The image service bounds projections to 256 rows; oversized terminals
+        // keep the exact-viewport path rather than truncating visible content.
+        let retained_rows = rows.saturating_mul(3).min(256).max(rows);
+        for count in [retained_rows, rows] {
             let result = crate::pane_runtime_client::captured_history_window_cached(
                 client,
                 (request.session, request.pane, pin),

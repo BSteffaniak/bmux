@@ -8620,13 +8620,6 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         feature = "image-iterm2"
     ))]
     let mut pending_kitty_state = view_state.kitty_host_state.clone();
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    pending_kitty_state.clear_placements(&mut frame_bytes)?;
-
     // Reconciliation describes encoded output, not yet-presented resources.
     // Keep the committed cache intact until the terminal accepts the frame.
     let mut pending_graphics_cache = view_state.terminal_graphics_cache.clone();
@@ -8638,10 +8631,29 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         queue!(frame_bytes, BeginSynchronizedUpdate)
             .context("failed queuing begin synchronized update")?;
     }
+    // Deletion belongs to the same synchronized frame as replacement pixels.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    pending_kitty_state.clear_placements(&mut frame_bytes)?;
     queue!(frame_bytes, SavePosition).context("failed queuing cursor save for attach frame")?;
     // Hide the cursor during the frame render to prevent it from visibly
     // jumping to every MoveTo position as pane content is drawn.
     queue!(frame_bytes, Hide).context("failed queuing cursor hide for attach frame")?;
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    if view_state.pane_images_presented {
+        // Repainting characters is not a portable raster deletion operation.
+        // ED2 repairs prior Sixel/iTerm2 pixels; the full-damage frame above
+        // reconstructs all cells and retained surfaces without erasing history.
+        queue!(frame_bytes, Clear(ClearType::All))
+            .context("failed clearing previous image frame")?;
+    }
     // Reflect the forced-hide in tracked state so apply_attach_cursor_state
     // will re-emit Show if the cursor should be visible after the frame.
     let cursor_state_before_forced_hide = view_state.last_cursor_state;
@@ -9979,12 +9991,18 @@ fn publish_scrollback_window(
 ) {
     let pin = view_state.scrollback_for(pane_id).and_then(|view| view.pin);
     view_state.scrollback_cache.insert(pane_id, pin, &window);
-    if let Some((_, rows)) = attach_pane_inner_size(view_state, pane_id) {
-        let excess = window.rows.len().saturating_sub(rows);
-        window.rows.drain(..excess);
-        if !window.row_anchors.is_empty() {
-            window.row_anchors.drain(..excess);
-        }
+    if let Some((width, rows)) = attach_pane_inner_size(view_state, pane_id)
+        && window.rows.len() > rows
+    {
+        let Some(projected) =
+            view_state
+                .scrollback_cache
+                .get(pane_id, pin, window.scrollback_offset, width, rows)
+        else {
+            // Never publish shifted text with uncropped image coordinates.
+            return;
+        };
+        window = projected;
     }
     let previous_base = view_state
         .pane_buffers
@@ -15498,6 +15516,17 @@ mod tests {
             )
             .unwrap();
             assert_eq!(output.windows(2).any(|bytes| bytes == b"\x1bP"), visible);
+            if !visible {
+                let clear = output
+                    .windows(4)
+                    .position(|bytes| bytes == b"\x1b[2J")
+                    .unwrap();
+                let begin = output
+                    .windows(8)
+                    .position(|bytes| bytes == b"\x1b[?2026h")
+                    .unwrap();
+                assert!(begin < clear, "raster deletion must be inside the frame");
+            }
             assert_eq!(state.pane_images_presented, visible);
         }
     }
