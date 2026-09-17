@@ -103,37 +103,100 @@ impl ScrollbackCache {
         width: usize,
         rows: usize,
     ) -> Option<PaneScrollbackWindow> {
-        self.entries.iter().rev().find_map(|entry| {
-            let window = &entry.window;
-            if entry.pane != pane
-                || entry.pin != pin
-                || window.projection_width != width
-                || offset > window.max_scrollback_offset
-            {
-                return None;
-            }
-            let shift = offset.checked_sub(window.scrollback_offset)?;
-            let end = window.rows.len().checked_sub(shift)?;
-            let start = end.checked_sub(rows)?;
-            let images = if start == 0 && end == window.rows.len() {
-                window.images.clone()
-            } else {
-                project_images(&window.images, start, rows)?
-            };
-            Some(PaneScrollbackWindow {
-                images,
-                projection_width: width,
-                row_anchors: if window.row_anchors.is_empty() {
-                    Vec::new()
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| {
+                let window = &entry.window;
+                if entry.pane != pane
+                    || entry.pin != pin
+                    || window.projection_width != width
+                    || offset > window.max_scrollback_offset
+                {
+                    return None;
+                }
+                let shift = offset.checked_sub(window.scrollback_offset)?;
+                let end = window.rows.len().checked_sub(shift)?;
+                let start = end.checked_sub(rows)?;
+                let images = if start == 0 && end == window.rows.len() {
+                    window.images.clone()
                 } else {
-                    window.row_anchors.get(start..end)?.to_vec()
-                },
-                palette: window.palette.clone(),
-                scrollback_offset: offset,
-                max_scrollback_offset: window.max_scrollback_offset,
-                total_scrolled_rows: window.total_scrolled_rows,
-                rows: window.rows[start..end].to_vec(),
+                    project_images(&window.images, start, rows)?
+                };
+                Some(PaneScrollbackWindow {
+                    images,
+                    projection_width: width,
+                    row_anchors: if window.row_anchors.is_empty() {
+                        Vec::new()
+                    } else {
+                        window.row_anchors.get(start..end)?.to_vec()
+                    },
+                    palette: window.palette.clone(),
+                    scrollback_offset: offset,
+                    max_scrollback_offset: window.max_scrollback_offset,
+                    total_scrolled_rows: window.total_scrolled_rows,
+                    rows: window.rows[start..end].to_vec(),
+                })
             })
+            .or_else(|| self.assemble_resident(pane, pin, offset, width, rows))
+    }
+
+    /// Assemble overlapping text-only projections without transport. Only one
+    /// source epoch and palette may contribute; image-bearing ranges keep the
+    /// existing coherent-window path until image coverage is range-addressable.
+    fn assemble_resident(
+        &self,
+        pane: Uuid,
+        pin: Option<ScrollbackPin>,
+        offset: usize,
+        width: usize,
+        rows: usize,
+    ) -> Option<PaneScrollbackWindow> {
+        if rows == 0 || rows > 256 {
+            return None;
+        }
+        let reference = self.entries.iter().rev().find(|entry| {
+            entry.pane == pane
+                && entry.pin == pin
+                && entry.window.projection_width == width
+                && offset <= entry.window.max_scrollback_offset
+        })?;
+        let base = &reference.window;
+        let captured = !base.row_anchors.is_empty();
+        let mut output = Vec::with_capacity(rows);
+        let mut anchors = Vec::with_capacity(if captured { rows } else { 0 });
+        for row in 0..rows {
+            let distance = offset.checked_add(rows - row - 1)?;
+            let (window, index) = self.entries.iter().rev().find_map(|entry| {
+                let window = &entry.window;
+                if entry.pane != pane
+                    || entry.pin != pin
+                    || window.projection_width != width
+                    || window.total_scrolled_rows != base.total_scrolled_rows
+                    || window.palette.styles() != base.palette.styles()
+                    || !window.images.is_empty()
+                    || window.row_anchors.is_empty() == captured
+                {
+                    return None;
+                }
+                let shift = distance.checked_sub(window.scrollback_offset)?;
+                let index = window.rows.len().checked_sub(shift.checked_add(1)?)?;
+                Some((window, index))
+            })?;
+            output.push(window.rows[index].clone());
+            if captured {
+                anchors.push(*window.row_anchors.get(index)?);
+            }
+        }
+        Some(PaneScrollbackWindow {
+            images: Vec::new(),
+            projection_width: width,
+            row_anchors: anchors,
+            palette: base.palette.clone(),
+            scrollback_offset: offset,
+            max_scrollback_offset: base.max_scrollback_offset,
+            total_scrolled_rows: base.total_scrolled_rows,
+            rows: output,
         })
     }
 
@@ -300,6 +363,27 @@ mod tests {
         assert!(cache.get(pane, None, 9, 80, 20).is_none());
         assert!(cache.get(pane, None, 10, 79, 20).is_none());
         assert!(cache.get(Uuid::new_v4(), None, 10, 80, 20).is_none());
+    }
+
+    #[test]
+    fn overlapping_windows_cover_intermediate_viewports_without_a_fetch() {
+        let pane = Uuid::new_v4();
+        let mut cache = ScrollbackCache::default();
+        let mut first = window();
+        first.rows.truncate(20);
+        cache.insert(pane, None, &first);
+        let mut second = window();
+        second.rows.truncate(20);
+        second.scrollback_offset = 20;
+        cache.insert(pane, None, &second);
+        for offset in 10..=20 {
+            let view = cache.get(pane, None, offset, 80, 20).unwrap();
+            assert_eq!(view.rows.len(), 20);
+            assert_eq!(view.scrollback_offset, offset);
+        }
+        // Never combine content from incompatible source numbering.
+        cache.entries.back_mut().unwrap().window.total_scrolled_rows += 1;
+        assert!(cache.get(pane, None, 15, 80, 20).is_none());
     }
 
     #[test]

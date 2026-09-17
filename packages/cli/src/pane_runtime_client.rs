@@ -763,8 +763,8 @@ mod history_tests {
         let session = uuid::Uuid::new_v4();
         // Incrementally resolving tail lines used to retain each preceding
         // prefix again, exceeding 256 entries with only 23 source lines.
+        let mut requests = 50;
         for index in 0..50 {
-            let mut requests = 256;
             assert!(
                 cache
                     .resolve(
@@ -780,7 +780,7 @@ mod history_tests {
             );
             assert_eq!(cache.lines.len(), index as usize + 1);
         }
-        let mut requests = 256;
+        assert_eq!(requests, 0, "exactly one request per source row");
         assert!(
             cache
                 .resolve(
@@ -826,6 +826,64 @@ mod history_tests {
         }
         assert_eq!(cache.lines.len(), 50);
         assert_eq!(remaining, admitted);
+    }
+
+    #[tokio::test]
+    async fn decoded_cache_retains_more_than_256_short_lines_within_byte_budget() {
+        let capture = super::AttachState::HistoryCaptureV1 {
+            width: 2,
+            height: 50,
+            capture_id: uuid::Uuid::new_v4(),
+            history_line_count: 1024,
+            history_truncated: false,
+            pin: super::AttachState::PaneScrollbackPin {
+                pane_id: uuid::Uuid::new_v4(),
+                pin_id: 1,
+                total_scrolled_rows: 1024,
+                max_scrollback_offset: 1024,
+                stream_end: 0,
+            },
+        };
+        let mut cache = super::CapturedLineCache::default();
+        let mut remaining = 16 * 1024 * 1024;
+        let mut styles = Vec::new();
+        let session = uuid::Uuid::new_v4();
+        for index in 0..1024 {
+            let mut requests = 2;
+            assert!(
+                cache
+                    .resolve(
+                        &mut HistoryClient,
+                        session,
+                        &capture,
+                        index,
+                        (&mut remaining, &mut styles, &mut requests)
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(cache.lines.len(), 1024);
+        let admitted = remaining;
+        for index in (0..1024).rev() {
+            let mut requests = 0;
+            assert!(
+                cache
+                    .resolve(
+                        &mut HistoryClient,
+                        session,
+                        &capture,
+                        index,
+                        (&mut remaining, &mut styles, &mut requests)
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(remaining, admitted);
+        assert!(remaining > 0);
     }
 
     struct HistoryClient;
@@ -1175,13 +1233,10 @@ impl CapturedHistoryCache {
         let identity = (session, pane, pin);
         // One capture per attachment worker, with a fixed retained allocation
         // allowance. Eviction is reconstructible and never changes the pin.
-        if self.identity != Some(identity)
-            || self.remaining < 1024 * 1024
-            || self.decoded.lines.len() >= 256
-        {
+        if self.identity != Some(identity) || self.remaining < 4 * 1024 * 1024 {
             *self = Self {
                 identity: Some(identity),
-                remaining: 2 * 1024 * 1024,
+                remaining: 16 * 1024 * 1024,
                 ..Self::default()
             };
         }
@@ -1754,6 +1809,9 @@ async fn resolve_tail_entry(
 struct CapturedLineCache {
     /// First logical index beyond the immutable captured screen.
     end: Option<u32>,
+    /// Resume only at a completed logical-line boundary. Cancelled partial
+    /// assembly never advances this cursor.
+    tail_resume: Option<(u16, usize)>,
     lines: Vec<(u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>)>,
 }
 
@@ -1773,9 +1831,8 @@ impl CapturedLineCache {
             return Ok(Some(std::sync::Arc::clone(line)));
         }
         let (remaining, styles, requests) = budgets;
-        if self.lines.len() >= 256 {
-            return Err(history_decode_error(&"decoded line cache limit"));
-        }
+        // Admission is byte-budgeted below, including line metadata. A fixed
+        // entry count rejects cheap short lines despite ample memory headroom.
         let charge = std::mem::size_of::<bmux_terminal_grid::HistoryLineAssembly>()
             + 4 * std::mem::size_of::<usize>()
             + std::mem::size_of::<u32>();
@@ -1788,7 +1845,7 @@ impl CapturedLineCache {
             capture,
             index,
             (remaining, styles, requests),
-            &mut self.lines,
+            self,
         )
         .await?
         else {
@@ -1823,14 +1880,21 @@ async fn fetch_captured_content_line(
     capture: &AttachState::HistoryCaptureV1,
     index: u32,
     budgets: (&mut usize, &mut Vec<bmux_terminal_grid::Style>, &mut usize),
-    lines: &mut Vec<(u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>)>,
+    cache: &mut CapturedLineCache,
 ) -> ClientResult<Option<std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>>> {
     use bmux_terminal_grid::{HistoryLineAssembly, HistorySlice, HistorySliceEnd};
+    let CapturedLineCache {
+        lines, tail_resume, ..
+    } = cache;
     let (budget, styles, requests) = budgets;
     let mut logical = usize::try_from(capture.history_line_count)
         .map_err(|error| history_decode_error(&error))?;
     let mut prefix = None;
-    if logical > 0 {
+    let resume = tail_resume.filter(|(_, logical)| index as usize >= *logical);
+    if let Some((_, next_logical)) = resume {
+        logical = next_logical;
+    }
+    if resume.is_none() && logical > 0 {
         let last = u32::try_from(logical - 1).map_err(|error| history_decode_error(&error))?;
         if index < last {
             return fetch_captured_history_line(
@@ -1872,7 +1936,7 @@ async fn fetch_captured_content_line(
         .map_err(|error| history_decode_error(&format!("{error:?}")))?;
     }
     line.retain_trailing_cells();
-    for row in 0..capture.height {
+    for row in resume.map_or(0, |(row, _)| row)..capture.height {
         let mut offset = 0;
         loop {
             *requests = requests
@@ -1926,6 +1990,7 @@ async fn fetch_captured_content_line(
         if line.completed().is_some() {
             let key = u32::try_from(logical).map_err(|error| history_decode_error(&error))?;
             if let Some((_, cached)) = lines.iter().find(|(existing, _)| *existing == key) {
+                *tail_resume = Some((row + 1, logical + 1));
                 if logical == index as usize {
                     return Ok(Some(std::sync::Arc::clone(cached)));
                 }
@@ -1933,9 +1998,6 @@ async fn fetch_captured_content_line(
                 line =
                     HistoryLineAssembly::new(capture.capture_id.as_u128(), logical, *budget, false);
                 continue;
-            }
-            if lines.len() >= 256 {
-                return Err(history_decode_error(&"decoded line cache limit"));
             }
             let charge = std::mem::size_of::<HistoryLineAssembly>()
                 + 4 * std::mem::size_of::<usize>()
@@ -1945,6 +2007,7 @@ async fn fetch_captured_content_line(
                 .ok_or_else(|| history_decode_error(&"decoded line metadata budget"))?;
             let completed = std::sync::Arc::new(line);
             lines.push((key, std::sync::Arc::clone(&completed)));
+            *tail_resume = Some((row + 1, logical + 1));
             if logical == index as usize {
                 return Ok(Some(completed));
             }
