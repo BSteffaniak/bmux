@@ -646,6 +646,32 @@ pub struct HistoryImagesArgs {
     pub rows: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchoredHistoryImagesArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub pin_id: u64,
+    pub capture_id: Uuid,
+    pub width: u16,
+    pub line_index: u32,
+    pub column: u32,
+    pub rows: u16,
+}
+
+pub fn history_images_anchored(
+    req: &AnchoredHistoryImagesArgs,
+    ctx: &NativeServiceContext,
+) -> Result<bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1, AttachStateError> {
+    let encoded = crate::runtime::captured_image_window_anchored(req, caller_client_id(ctx))
+        .map_err(|error| failed(error.to_string()))?;
+    Ok(
+        bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1 {
+            capture_id: req.capture_id,
+            encoded,
+        },
+    )
+}
+
 pub fn history_images(
     req: &HistoryImagesArgs,
     ctx: &NativeServiceContext,

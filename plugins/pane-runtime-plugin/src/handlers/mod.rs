@@ -227,6 +227,9 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "attach-runtime-state", "attach-history-images-v2" => |req: attach_state::HistoryImagesArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::history_images_reflowed(&req, ctx))
         },
+        "attach-runtime-state", "attach-history-images-v3" => |req: attach_state::AnchoredHistoryImagesArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::history_images_anchored(&req, ctx))
+        },
         "attach-runtime-state", "attach-pane-images" => |req: attach_state::AttachPaneImagesArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_images(&req, ctx))
         },

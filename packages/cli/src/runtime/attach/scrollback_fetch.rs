@@ -32,7 +32,7 @@ pub(super) async fn fetch(
     cache: std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
 ) -> Result<PaneScrollbackWindow, String> {
     let mut cache = cache.lock().await;
-    let rows = request.rows.saturating_add(32).min(256).max(request.rows);
+    let rows = request.rows;
     if let Some(pin) = request.pin {
         let mut last_error = None;
         for count in [rows, request.rows] {
@@ -46,7 +46,23 @@ pub(super) async fn fetch(
             )
             .await;
             match result {
-                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(window)) => {
+                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(mut window)) => {
+                    let origin = window.row_anchors.first().ok_or("missing capture origin")?;
+                    let reply = bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_history_images_v3(
+                        &mut client, request.session, request.pane, pin.pin_id, origin.capture_id,
+                        u16::try_from(request.width).map_err(|error| error.to_string())?,
+                        origin.line_index,
+                        u32::try_from(origin.column).map_err(|error| error.to_string())?,
+                        u16::try_from(window.rows.len()).map_err(|error| error.to_string())?,
+                    ).await.map_err(|error| error.to_string())?
+                        .map_err(|error| format!("historical images: {error:?}"))?;
+                    if reply.capture_id != origin.capture_id
+                        || reply.encoded.len() > 8 * 1024 * 1024
+                    {
+                        return Err("invalid historical image response".into());
+                    }
+                    window.images = serde_json::from_slice(&reply.encoded)
+                        .map_err(|error| error.to_string())?;
                     return Ok(window);
                 }
                 Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) => {}
@@ -88,6 +104,7 @@ pub(super) async fn fetch(
     )
     .map_err(|error| error.to_string())?;
     Ok(PaneScrollbackWindow {
+        images: Vec::new(),
         projection_width: usize::from(decoded.width),
         row_anchors: Vec::new(),
         palette: grid.palette().clone(),

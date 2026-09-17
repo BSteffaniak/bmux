@@ -1940,6 +1940,139 @@ impl TerminalGrid {
         Err(HistorySliceError::Unavailable)
     }
 
+    /// Map an execution-relative main-screen position into capture projection
+    /// coordinates. Negative rows address retained history, not the alternate
+    /// screen. Uses the same logical lines as `captured_anchor_at_width`.
+    ///
+    /// # Errors
+    /// Rejects evicted rows, wide-cell interiors, and exhausted work budgets.
+    pub fn captured_position_at_width(
+        &self,
+        row: i64,
+        column: usize,
+        width: usize,
+        budget: &mut usize,
+    ) -> Result<(usize, usize), HistorySliceError> {
+        if width == 0 || column >= self.width {
+            return Err(HistorySliceError::Unavailable);
+        }
+        let history = self.history_projected_row_count();
+        let pending = projected_pending_row_count(&self.pending_history_cells, self.width);
+        let base = history
+            .checked_add(pending)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let absolute = i64::try_from(base)
+            .ok()
+            .and_then(|base| base.checked_add(row))
+            .and_then(|row| usize::try_from(row).ok())
+            .ok_or(HistorySliceError::Unavailable)?;
+        if absolute < history {
+            return self.map_history_position(absolute, column, width, budget, true);
+        }
+        let mut line_index = self.main_history.len();
+        let mut logical = logical_width(&self.pending_history_cells);
+        if absolute < base {
+            let origin = crate::reflow::logical_column_for_row_retained(
+                &self.pending_history_cells,
+                self.width,
+                absolute - history,
+                false,
+            )
+            .ok_or(HistorySliceError::Unavailable)?;
+            return self.captured_anchor_at_width(line_index, origin + column, width, budget);
+        }
+        let target = absolute - base;
+        for (index, physical) in self.main_rows.iter().enumerate() {
+            *budget = budget
+                .checked_sub(physical.cells().len().max(1))
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            if index == target {
+                if physical
+                    .cells()
+                    .get(column)
+                    .is_some_and(Cell::is_wide_continuation)
+                {
+                    return Err(HistorySliceError::InvalidOffset);
+                }
+                return self.captured_anchor_at_width(line_index, logical + column, width, budget);
+            }
+            if physical.wrapped() {
+                logical = logical
+                    .checked_add(self.width)
+                    .ok_or(HistorySliceError::BudgetExhausted)?;
+            } else {
+                line_index += 1;
+                logical = 0;
+            }
+        }
+        Err(HistorySliceError::Unavailable)
+    }
+
+    /// Resolve a capture-wide logical anchor using the same line boundaries as
+    /// history slices followed by main-row slices. Completed history is trimmed;
+    /// a pending prefix joins the first main line, whose admitted padding remains.
+    /// Unlike resize mapping, this does not discard blank main rows.
+    ///
+    /// # Errors
+    /// Rejects invalid anchors, zero widths, and exhausted materialization budgets.
+    pub fn captured_anchor_at_width(
+        &self,
+        line_index: usize,
+        column: usize,
+        width: usize,
+        budget: &mut usize,
+    ) -> Result<(usize, usize), HistorySliceError> {
+        if width == 0 {
+            return Err(HistorySliceError::Unavailable);
+        }
+        let mut projected_start = 0usize;
+        for (index, line) in self.main_history.iter().enumerate() {
+            *budget = budget
+                .checked_sub(history_cells_bytes(&line.cells))
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            if index == line_index {
+                return captured_line_position(&line.cells, column, width, false, projected_start);
+            }
+            projected_start = projected_start
+                .checked_add(line.projected_row_count(width))
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+        }
+        *budget = budget
+            .checked_sub(history_cells_bytes(&self.pending_history_cells))
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let mut cells = try_clone_cells(&self.pending_history_cells)
+            .ok_or(HistorySliceError::BudgetExhausted)?;
+        let mut index = self.main_history.len();
+        for (row_index, row) in self.main_rows.iter().enumerate() {
+            let padded = if row.wrapped() {
+                self.width
+            } else {
+                row.cells().len().max(1)
+            };
+            let charge = padded
+                .checked_mul(std::mem::size_of::<Cell>() + 1)
+                .and_then(|charge| charge.checked_add(history_cells_bytes(row.cells())))
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            *budget = budget
+                .checked_sub(charge)
+                .ok_or(HistorySliceError::BudgetExhausted)?;
+            cells.extend(row_logical_cells(row, padded));
+            if !row.wrapped() || row_index + 1 == self.main_rows.len() {
+                if index == line_index {
+                    return captured_line_position(&cells, column, width, true, projected_start);
+                }
+                projected_start = projected_start
+                    .checked_add(crate::reflow::projected_logical_line_row_count_retained(
+                        &cells, width, true,
+                    ))
+                    .ok_or(HistorySliceError::BudgetExhausted)?;
+                cells.clear();
+                index += 1;
+            }
+        }
+        Err(HistorySliceError::Unavailable)
+    }
+
     /// Read a bounded slice without allocating or projecting physical rows.
     ///
     /// The caller must bind `revision` and `line_index` to one capture identity;
@@ -3107,6 +3240,28 @@ fn hydrate_logical_history(
     }
 }
 
+fn captured_line_position(
+    cells: &[Cell],
+    column: usize,
+    width: usize,
+    retain: bool,
+    start: usize,
+) -> Result<(usize, usize), HistorySliceError> {
+    let row = crate::reflow::row_for_logical_column_retained(cells, width, column, retain)
+        .filter(|row| {
+            *row < crate::reflow::projected_logical_line_row_count_retained(cells, width, retain)
+        })
+        .ok_or(HistorySliceError::InvalidOffset)?;
+    let origin = crate::reflow::logical_column_for_row_retained(cells, width, row, retain)
+        .ok_or(HistorySliceError::InvalidOffset)?;
+    Ok((
+        start
+            .checked_add(row)
+            .ok_or(HistorySliceError::BudgetExhausted)?,
+        column - origin,
+    ))
+}
+
 fn row_logical_cells(row: &PhysicalRow, width: usize) -> Vec<Cell> {
     row.visual_cells(width)
         .into_iter()
@@ -3517,6 +3672,82 @@ mod tests {
         assert_eq!(
             wide.main_position_at_width(0, 2, 4, &mut 4096).unwrap(),
             (0, 2)
+        );
+    }
+
+    #[test]
+    fn captured_anchor_joins_pending_prefix_without_padding_completed_history() {
+        let mut grid = TerminalGrid::new(8, 2, GridLimits::default()).unwrap();
+        grid.process(b"x\r\nabcdefghijklmnopqrst");
+        assert_eq!(grid.main_history.len(), 1);
+        assert!(!grid.pending_history_cells.is_empty());
+        assert_eq!(
+            grid.captured_anchor_at_width(0, 0, 4, &mut 100_000)
+                .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            grid.captured_anchor_at_width(1, 8, 4, &mut 100_000)
+                .unwrap(),
+            (3, 0)
+        );
+        assert!(grid.captured_anchor_at_width(1, 8, 4, &mut 0).is_err());
+        assert!(
+            grid.captured_anchor_at_width(20, 0, 4, &mut 100_000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn captured_positions_and_viewport_anchors_share_reflow_coordinates() {
+        let mut grid = TerminalGrid::new(8, 2, GridLimits::default()).unwrap();
+        grid.process(b"x\r\nabcdefghijklmnopqrst");
+        for width in [4, 8, 12] {
+            assert_eq!(
+                grid.captured_position_at_width(0, 0, width, &mut 100_000)
+                    .unwrap(),
+                grid.captured_anchor_at_width(1, 8, width, &mut 100_000)
+                    .unwrap(),
+            );
+            assert_eq!(
+                grid.captured_position_at_width(-1, 0, width, &mut 100_000)
+                    .unwrap(),
+                grid.captured_anchor_at_width(1, 0, width, &mut 100_000)
+                    .unwrap(),
+            );
+            assert_eq!(
+                grid.captured_position_at_width(-2, 0, width, &mut 100_000)
+                    .unwrap(),
+                (0, 0)
+            );
+        }
+        assert!(
+            grid.captured_position_at_width(-3, 0, 4, &mut 100_000)
+                .is_err()
+        );
+        assert!(
+            grid.captured_position_at_width(2, 0, 4, &mut 100_000)
+                .is_err()
+        );
+        assert!(grid.captured_position_at_width(0, 0, 4, &mut 0).is_err());
+    }
+
+    #[test]
+    fn captured_anchor_preserves_empty_rows_and_rejects_wide_interiors() {
+        let mut grid = TerminalGrid::new(8, 3, GridLimits::default()).unwrap();
+        grid.process("界\r\n\r\nz".as_bytes());
+        assert_eq!(
+            grid.captured_anchor_at_width(2, 0, 4, &mut 100_000)
+                .unwrap(),
+            (2, 0)
+        );
+        assert!(
+            grid.captured_anchor_at_width(0, 1, 4, &mut 100_000)
+                .is_err()
+        );
+        assert!(
+            grid.captured_anchor_at_width(0, 0, 0, &mut 100_000)
+                .is_err()
         );
     }
 

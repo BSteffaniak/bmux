@@ -763,14 +763,28 @@ impl AttachViewState {
     /// Historical graphics need their own capture-bound viewport projection;
     /// absence of that projection is not permission to substitute live images.
     #[must_use]
-    pub fn presented_live_images(
+    pub fn presented_images(
         &self,
         pane_id: Uuid,
     ) -> &[bmux_attach_image_protocol::AttachPaneImage] {
         if self.scrollback_active_for(pane_id) {
-            return &[];
+            return self
+                .pane_buffers
+                .get(&pane_id)
+                .and_then(|buffer| buffer.scrollback_window.as_ref())
+                .map_or(&[], |window| window.images.as_slice());
         }
         self.pane_images.get(&pane_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether the selected presentation contains graphics, including immutable
+    /// history windows after live image deletion. Used for raster damage repair.
+    #[must_use]
+    pub fn has_presented_images(&self) -> bool {
+        self.pane_images
+            .keys()
+            .chain(self.pane_buffers.keys())
+            .any(|pane| !self.presented_images(*pane).is_empty())
     }
 
     /// Whether the *focused* pane is in scrollback.
@@ -841,7 +855,7 @@ mod tests {
             pixel_height: 1,
         };
         state.pane_images.insert(pane, vec![image]);
-        assert_eq!(state.presented_live_images(pane).len(), 1);
+        assert_eq!(state.presented_images(pane).len(), 1);
         state.pane_scrollback.insert(
             pane,
             PaneScrollbackView {
@@ -852,10 +866,51 @@ mod tests {
                 pin: None,
             },
         );
-        assert!(state.presented_live_images(pane).is_empty());
+        assert!(state.presented_images(pane).is_empty());
         assert_eq!(state.pane_images[&pane].len(), 1);
         assert!(state.exit_scrollback_for(pane));
-        assert_eq!(state.presented_live_images(pane).len(), 1);
+        assert_eq!(state.presented_images(pane).len(), 1);
+        let historical = state.pane_images.remove(&pane).unwrap();
+        state.pane_scrollback.insert(
+            pane,
+            PaneScrollbackView {
+                offset: 1,
+                cursor: AttachScrollbackCursor { row: 0, col: 0 },
+                selection_anchor: None,
+                captured_selection: None,
+                pin: None,
+            },
+        );
+        state
+            .pane_buffers
+            .entry(pane)
+            .or_default()
+            .scrollback_window = Some(bmux_attach_pipeline::PaneScrollbackWindow {
+            images: historical,
+            projection_width: 80,
+            row_anchors: Vec::new(),
+            palette: bmux_terminal_grid::StylePalette::default(),
+            scrollback_offset: 1,
+            max_scrollback_offset: 1,
+            total_scrolled_rows: 1,
+            rows: Vec::new(),
+        });
+        assert!(
+            state.has_presented_images(),
+            "historical-only images need raster repair"
+        );
+        assert_eq!(state.presented_images(pane).len(), 1);
+        state
+            .pane_buffers
+            .get_mut(&pane)
+            .unwrap()
+            .scrollback_window
+            .as_mut()
+            .unwrap()
+            .images
+            .clear();
+        assert!(!state.has_presented_images());
+        assert!(state.presented_images(pane).is_empty());
     }
 
     fn test_floating_drag() -> AttachMouseFloatingDrag {

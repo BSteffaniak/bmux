@@ -356,6 +356,8 @@ pub struct CapturedHistoryAnchor {
 }
 
 pub struct PaneScrollbackWindow {
+    /// Complete capture-bound graphics for this exact viewport; never live deltas.
+    pub images: Vec<bmux_attach_image_protocol::AttachPaneImage>,
     /// Local projection width, or zero for legacy snapshot windows.
     pub projection_width: usize,
     /// Per-row content origins; empty for legacy physical snapshot windows.
@@ -656,6 +658,7 @@ mod tests {
         use bmux_terminal_grid::{GridLimits, TerminalGridStream};
         let capture_id = Uuid::new_v4();
         let window = |width: usize| PaneScrollbackWindow {
+            images: Vec::new(),
             projection_width: width,
             row_anchors: (0..6 / width)
                 .map(|row| CapturedHistoryAnchor {

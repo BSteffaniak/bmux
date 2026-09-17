@@ -834,6 +834,19 @@ interface attach-runtime-state {
         rows: u16,
     ) -> result<history-images-v1, attach-state-error>;
 
+    // Capture-wide logical origin, matching history/main-row slice assembly.
+    // Complete replacement, clipped to this exact projected viewport.
+    query attach-history-images-v3(
+        session_id: uuid,
+        pane_id: uuid,
+        pin_id: u64,
+        capture_id: uuid,
+        width: u16,
+        line_index: u32,
+        column: u32,
+        rows: u16,
+    ) -> result<history-images-v1, attach-state-error>;
+
     query attach-pane-images(
         session_id: uuid,
         pane_ids: list<uuid>,

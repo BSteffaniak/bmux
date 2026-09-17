@@ -9401,6 +9401,7 @@ mod tests {
             // Give each pane a frozen window so the only difference between the
             // two panes is whether it has a scrollback *view*.
             buffer.scrollback_window = Some(crate::types::PaneScrollbackWindow {
+                images: Vec::new(),
                 projection_width: 0,
                 row_anchors: Vec::new(),
                 palette: bmux_terminal_grid::StylePalette::from_styles(vec![

@@ -8568,12 +8568,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    if view_state.pane_images_presented
-        || view_state
-            .pane_images
-            .values()
-            .any(|images| !images.is_empty())
-    {
+    if view_state.pane_images_presented || view_state.has_presented_images() {
         // Non-persistent raster protocols require cell repair before replacing
         // or removing a prior image. Use an explicit full repair until damage
         // can retain protocol-specific raster footprints.
@@ -8728,7 +8723,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
             let Some(pane_id) = surface.pane_id else {
                 continue;
             };
-            let images = view_state.presented_live_images(pane_id);
+            let images = view_state.presented_images(pane_id);
             if !images.is_empty() {
                 let pane_images: Vec<bmux_image::PaneImage> =
                     images.iter().map(bmux_image::PaneImage::from).collect();
@@ -8959,10 +8954,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     ))]
     {
         view_state.kitty_host_state = pending_kitty_state;
-        view_state.pane_images_presented = view_state
-            .pane_images
-            .values()
-            .any(|images| !images.is_empty());
+        view_state.pane_images_presented = view_state.has_presented_images();
     }
 
     // Capture only frames that were successfully written and flushed.
@@ -8984,7 +8976,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
                 continue;
             };
             {
-                for img in view_state.presented_live_images(pane_id) {
+                for img in view_state.presented_images(pane_id) {
                     let mut adjusted = img.clone();
                     // Offset pane-local coords by surface position + 1
                     // for the pane border, matching the live compositor's
@@ -20805,6 +20797,7 @@ mod tests {
         });
         view.cursor = AttachScrollbackCursor { row: 2, col: 4 };
         let window = || PaneScrollbackWindow {
+            images: Vec::new(),
             projection_width: 0,
             row_anchors: Vec::new(),
             palette: bmux_terminal_grid::StylePalette::default(),
@@ -20858,6 +20851,7 @@ mod tests {
         }
         if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
             buffer.scrollback_window = Some(PaneScrollbackWindow {
+                images: Vec::new(),
                 projection_width: 0,
                 row_anchors: Vec::new(),
                 palette: bmux_terminal_grid::StylePalette::default(),

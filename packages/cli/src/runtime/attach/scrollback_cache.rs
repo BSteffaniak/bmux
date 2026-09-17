@@ -73,7 +73,13 @@ impl ScrollbackCache {
             let shift = offset.checked_sub(window.scrollback_offset)?;
             let end = window.rows.len().checked_sub(shift)?;
             let start = end.checked_sub(rows)?;
+            // Captured images are already cropped. Reusing a subrange would
+            // require another pixel crop, not merely shifting cell coordinates.
+            if !window.row_anchors.is_empty() && (start != 0 || end != window.rows.len()) {
+                return None;
+            }
             Some(PaneScrollbackWindow {
+                images: window.images.clone(),
                 projection_width: width,
                 row_anchors: if window.row_anchors.is_empty() {
                     Vec::new()
@@ -106,7 +112,16 @@ impl ScrollbackCache {
         }) {
             return;
         }
+        let image_bytes = source.images.iter().fold(0usize, |bytes, image| {
+            bytes
+                .saturating_add(std::mem::size_of_val(image))
+                .saturating_add(image.raw_data.len())
+        });
+        if image_bytes > MAX_BYTES {
+            return;
+        }
         let window = PaneScrollbackWindow {
+            images: source.images.clone(),
             projection_width: source.projection_width,
             row_anchors: source.row_anchors.clone(),
             palette: source.palette.clone(),
@@ -123,6 +138,7 @@ impl ScrollbackCache {
         let bytes = window.rows.iter().fold(
             palette
                 .len()
+                .saturating_add(image_bytes)
                 .saturating_add(std::mem::size_of::<Entry>())
                 .saturating_add(
                     window.rows.capacity() * std::mem::size_of::<bmux_terminal_grid::PhysicalRow>(),
@@ -163,6 +179,7 @@ mod tests {
 
     fn window() -> PaneScrollbackWindow {
         PaneScrollbackWindow {
+            images: Vec::new(),
             projection_width: 80,
             row_anchors: Vec::new(),
             palette: bmux_terminal_grid::StylePalette::default(),

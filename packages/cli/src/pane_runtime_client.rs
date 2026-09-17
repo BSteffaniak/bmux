@@ -1408,6 +1408,7 @@ pub async fn captured_history_window_cached(
     anchors.reverse();
     Ok(CapturedWindowOutcome::Window(
         bmux_attach_pipeline::PaneScrollbackWindow {
+            images: Vec::new(),
             projection_width: width,
             row_anchors: anchors,
             palette: bmux_terminal_grid::StylePalette::from_styles(styles.clone()),
@@ -1520,6 +1521,7 @@ pub async fn captured_tail_window(
         return Ok(None);
     }
     Ok(Some(bmux_attach_pipeline::PaneScrollbackWindow {
+        images: Vec::new(),
         projection_width: width,
         row_anchors: Vec::new(),
         palette: bmux_terminal_grid::StylePalette::from_styles(styles),
