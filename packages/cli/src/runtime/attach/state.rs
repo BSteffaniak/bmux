@@ -819,6 +819,10 @@ impl AttachViewState {
 
     pub fn exit_scrollback_for(&mut self, pane_id: Uuid) -> bool {
         self.pending_scroll.remove(&pane_id);
+        self.scrollback_cache.invalidate(pane_id);
+        if let Some(buffer) = self.pane_buffers.get_mut(&pane_id) {
+            buffer.scrollback_window = None;
+        }
         if self
             .scrollback_fetch
             .as_ref()

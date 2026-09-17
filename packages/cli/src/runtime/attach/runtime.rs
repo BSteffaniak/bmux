@@ -6763,6 +6763,13 @@ pub fn enter_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uu
     if view_state.scrollback_active_for(pane_id) {
         return true;
     }
+    // A new view must not inherit anchors, palettes, or images from a
+    // previously released capture, regardless of how that view was exited.
+    view_state.pending_scroll.remove(&pane_id);
+    view_state.scrollback_cache.invalidate(pane_id);
+    if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
+        buffer.scrollback_window = None;
+    }
     let Some((inner_w, inner_h)) = attach_pane_inner_size(view_state, pane_id) else {
         return false;
     };
@@ -10065,9 +10072,7 @@ async fn handle_attach_mouse_scrollback_with_window(
         view_state.scrollback_cache.invalidate(pane_id);
     }
     let previous_pin = view_state.scrollback_for(pane_id).and_then(|view| view.pin);
-    let before_offset = view_state
-        .scrollback_for(pane_id)
-        .map_or(0, |view| view.offset);
+    let before_offset = view_state.requested_scroll_offset(pane_id).unwrap_or(0);
     let scroll_lines =
         isize::try_from(view_state.mouse.config.scroll_lines_per_tick.max(1)).unwrap_or(isize::MAX);
     let consumed = handle_attach_mouse_scrollback_for(view_state, pane_id, kind);
@@ -10120,8 +10125,8 @@ async fn handle_attach_mouse_scrollback_with_window(
         && !was_active
         && view_state.scrollback_active_for(pane_id)
         && view_state
-            .scrollback_for(pane_id)
-            .is_some_and(|view| view.offset == before_offset)
+            .requested_scroll_offset(pane_id)
+            .is_some_and(|offset| offset == before_offset)
     {
         step_attach_scrollback_for(view_state, pane_id, -scroll_lines);
         ensure_pane_scrollback_windows(client, view_state, false)?;
@@ -20960,6 +20965,51 @@ mod tests {
                 col: 2
             })
         );
+    }
+
+    #[test]
+    fn wheel_exit_and_reentry_discard_previous_capture_projection() {
+        let mut state = attach_view_state_with_scrollback_fixture();
+        let pane = state.focused_pane_id().unwrap();
+        state.mouse.config.scroll_scrollback = true;
+        state.mouse.config.exit_scrollback_on_bottom = true;
+        state.mouse.config.scroll_lines_per_tick = 1;
+        assert!(enter_attach_scrollback(&mut state));
+        let capture = Uuid::new_v4();
+        publish_scrollback_window(
+            &mut state,
+            pane,
+            PaneScrollbackWindow {
+                images: Vec::new(),
+                projection_width: 80,
+                row_anchors: vec![bmux_attach_pipeline::CapturedHistoryAnchor {
+                    capture_id: capture,
+                    line_index: 0,
+                    column: 0,
+                }],
+                palette: bmux_terminal_grid::StylePalette::default(),
+                scrollback_offset: 1,
+                max_scrollback_offset: 100,
+                total_scrolled_rows: 100,
+                rows: vec![bmux_terminal_grid::PhysicalRow::default()],
+            },
+        );
+        assert!(handle_attach_mouse_scrollback_for(
+            &mut state,
+            pane,
+            MouseEventKind::ScrollDown
+        ));
+        assert!(!state.scrollback_active_for(pane));
+        assert!(state.pane_buffers[&pane].scrollback_window.is_none());
+        assert!(state.scrollback_cache.get(pane, None, 1, 80, 1).is_none());
+        assert!(handle_attach_mouse_scrollback_for(
+            &mut state,
+            pane,
+            MouseEventKind::ScrollUp
+        ));
+        assert!(state.scrollback_active_for(pane));
+        assert!(state.pane_buffers[&pane].scrollback_window.is_none());
+        assert_eq!(state.requested_scroll_offset(pane), Some(1));
     }
 
     #[test]
