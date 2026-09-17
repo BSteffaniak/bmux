@@ -741,6 +741,93 @@ mod history_tests {
         assert!(cache.decoded.lines.is_empty());
     }
 
+    #[tokio::test]
+    async fn captured_tail_boundary_retries_do_not_duplicate_decoded_lines() {
+        let capture = super::AttachState::HistoryCaptureV1 {
+            width: 2,
+            height: 50,
+            capture_id: uuid::Uuid::new_v4(),
+            history_line_count: 0,
+            history_truncated: false,
+            pin: super::AttachState::PaneScrollbackPin {
+                pane_id: uuid::Uuid::new_v4(),
+                pin_id: 1,
+                total_scrolled_rows: 0,
+                max_scrollback_offset: 0,
+                stream_end: 0,
+            },
+        };
+        let mut cache = super::CapturedLineCache::default();
+        let mut remaining = 2 * 1024 * 1024;
+        let mut styles = Vec::new();
+        let session = uuid::Uuid::new_v4();
+        // Incrementally resolving tail lines used to retain each preceding
+        // prefix again, exceeding 256 entries with only 23 source lines.
+        for index in 0..50 {
+            let mut requests = 256;
+            assert!(
+                cache
+                    .resolve(
+                        &mut HistoryClient,
+                        session,
+                        &capture,
+                        index,
+                        (&mut remaining, &mut styles, &mut requests)
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(cache.lines.len(), index as usize + 1);
+        }
+        let mut requests = 256;
+        assert!(
+            cache
+                .resolve(
+                    &mut HistoryClient,
+                    session,
+                    &capture,
+                    50,
+                    (&mut remaining, &mut styles, &mut requests)
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let admitted = remaining;
+        for _ in 0..100 {
+            let mut requests = 0;
+            assert!(
+                cache
+                    .resolve(
+                        &mut HistoryClient,
+                        session,
+                        &capture,
+                        50,
+                        (&mut remaining, &mut styles, &mut requests)
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                cache
+                    .resolve(
+                        &mut HistoryClient,
+                        session,
+                        &capture,
+                        49,
+                        (&mut remaining, &mut styles, &mut requests)
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(cache.lines.len(), 50);
+        assert_eq!(remaining, admitted);
+    }
+
     struct HistoryClient;
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryClient {
         async fn invoke_service_raw(
@@ -1665,6 +1752,8 @@ async fn resolve_tail_entry(
 
 #[derive(Default)]
 struct CapturedLineCache {
+    /// First logical index beyond the immutable captured screen.
+    end: Option<u32>,
     lines: Vec<(u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>)>,
 }
 
@@ -1677,6 +1766,9 @@ impl CapturedLineCache {
         index: u32,
         budgets: (&mut usize, &mut Vec<bmux_terminal_grid::Style>, &mut usize),
     ) -> ClientResult<Option<std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>>> {
+        if self.end.is_some_and(|end| index >= end) {
+            return Ok(None);
+        }
         if let Some((_, line)) = self.lines.iter().find(|(key, _)| *key == index) {
             return Ok(Some(std::sync::Arc::clone(line)));
         }
@@ -1700,6 +1792,13 @@ impl CapturedLineCache {
         )
         .await?
         else {
+            // The scan reached the end of this immutable capture. Remember the
+            // exact boundary, not the potentially distant requested index.
+            self.end = self
+                .lines
+                .iter()
+                .map(|(key, _)| key.saturating_add(1))
+                .max();
             return Ok(None);
         };
         self.lines
@@ -1826,6 +1925,15 @@ async fn fetch_captured_content_line(
         }
         if line.completed().is_some() {
             let key = u32::try_from(logical).map_err(|error| history_decode_error(&error))?;
+            if let Some((_, cached)) = lines.iter().find(|(existing, _)| *existing == key) {
+                if logical == index as usize {
+                    return Ok(Some(std::sync::Arc::clone(cached)));
+                }
+                logical += 1;
+                line =
+                    HistoryLineAssembly::new(capture.capture_id.as_u128(), logical, *budget, false);
+                continue;
+            }
             if lines.len() >= 256 {
                 return Err(history_decode_error(&"decoded line cache limit"));
             }
