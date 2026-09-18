@@ -244,6 +244,20 @@ impl HistoryLineAssembly {
         )
     }
 
+    /// Retained cell/text allocations for cache admission. Shared owners may
+    /// conservatively charge this more than once; it excludes allocator headers.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.cells.iter().fold(
+            std::mem::size_of::<Self>().saturating_add(
+                self.cells
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Cell>()),
+            ),
+            |bytes, cell| bytes.saturating_add(cell.text.capacity()),
+        )
+    }
+
     #[must_use]
     pub const fn next_offset(&self) -> usize {
         self.next_offset

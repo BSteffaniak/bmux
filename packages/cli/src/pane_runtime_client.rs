@@ -767,6 +767,7 @@ mod history_tests {
             "unknown resized image coverage must fetch"
         );
         assert_eq!(client.0, 60);
+        assert_resident_under_pressure(&mut cache, identity, &window);
         assert_partial_index(&mut cache, &window);
         assert_capture_replacement(&mut cache, identity);
     }
@@ -779,6 +780,30 @@ mod history_tests {
         cache.prepare(uuid::Uuid::new_v4(), identity.1, identity.2);
         assert!(!cache.matches_capture(identity));
         assert!(cache.decoded.lines.is_empty());
+    }
+
+    fn assert_resident_under_pressure(
+        cache: &mut super::CapturedHistoryCache,
+        identity: (uuid::Uuid, uuid::Uuid, bmux_attach_pipeline::ScrollbackPin),
+        window: &bmux_attach_pipeline::PaneScrollbackWindow,
+    ) {
+        let remaining = cache.remaining;
+        let revision = cache.revision.clone();
+        cache.remaining = 0;
+        let local = cache
+            .resident_window(identity, 0, 20, (2, window.row_anchors.last().copied(), 0))
+            .unwrap();
+        assert_eq!(local.rows.len(), 20);
+        assert_eq!(cache.remaining, 0);
+        assert!(std::sync::Arc::ptr_eq(&revision, &cache.revision));
+        let mut replaced = identity;
+        replaced.2.pin_id += 1;
+        assert!(
+            cache
+                .resident_window(replaced, 0, 20, (2, window.row_anchors.last().copied(), 0))
+                .is_none()
+        );
+        cache.remaining = remaining;
     }
 
     fn assert_partial_index(
@@ -933,6 +958,22 @@ mod history_tests {
             );
         }
         assert_eq!(cache.lines.len(), 1024);
+        let resident_identity = capture.capture_id;
+        let mut replica = super::CapturedHistoryCache {
+            decoded: cache.clone(),
+            remaining: 0,
+            ..super::CapturedHistoryCache::default()
+        };
+        replica.evict_distant(500);
+        assert!(replica.decoded.lines.contains_key(&500));
+        assert!(!replica.decoded.lines.contains_key(&0));
+        assert!(replica.remaining > 4 * 1024 * 1024);
+        assert_eq!(capture.capture_id, resident_identity);
+        assert_eq!(
+            cache.lines.len(),
+            1024,
+            "eviction must isolate worker snapshots"
+        );
         let admitted = remaining;
         for index in (0..1024).rev() {
             let mut requests = 0;
@@ -1876,11 +1917,16 @@ impl CapturedHistoryCache {
         ),
     ) -> Option<bmux_attach_pipeline::PaneScrollbackWindow> {
         use futures_util::FutureExt;
-        if self.identity != Some(identity) || self.remaining < 4 * 1024 * 1024 {
+        if self.identity != Some(identity) {
             return None;
         }
         if let Some(window) = self.indexed_window(offset, rows, projection) {
             return Some(window);
+        }
+        if self.remaining < 4 * 1024 * 1024 {
+            // Allocation pressure cannot invalidate an existing indexed view.
+            // Only a miss needs the worker's admission/eviction path.
+            return None;
         }
         // Probe against a copy-on-write transaction. A missing text/image
         // range must not leave partial assembly or uncharged metadata resident.
@@ -2009,11 +2055,41 @@ impl CapturedHistoryCache {
             }));
     }
 
+    fn evict_distant(&mut self, center: u32) {
+        let mut radius = 256_u32;
+        loop {
+            let range = center.saturating_sub(radius)..=center.saturating_add(radius);
+            std::sync::Arc::make_mut(&mut self.decoded.lines)
+                .retain(|line, _| range.contains(line));
+            std::sync::Arc::make_mut(&mut self.history).retain(|line, _| range.contains(line));
+            // Dropped prefix lines must remain reloadable; tail discovery cannot
+            // claim complete residency after eviction.
+            self.tail_loaded = false;
+            self.decoded.tail_resume = None;
+            self.decoded.end = None;
+            let mut bytes = self
+                .styles
+                .capacity()
+                .saturating_mul(std::mem::size_of::<bmux_terminal_grid::Style>());
+            for line in self.decoded.lines.values().chain(self.history.values()) {
+                bytes = bytes
+                    .saturating_add(line.retained_bytes().saturating_mul(2))
+                    .saturating_add(HISTORY_INDEX_ENTRY_BYTES);
+            }
+            self.remaining = (16_usize * 1024 * 1024).saturating_sub(bytes);
+            if self.remaining >= 4 * 1024 * 1024 || radius == 0 {
+                break;
+            }
+            radius /= 2;
+        }
+        self.changed();
+    }
+
     fn prepare(&mut self, session: Uuid, pane: Uuid, pin: bmux_attach_pipeline::ScrollbackPin) {
         let identity = (session, pane, pin);
         // One capture per attachment worker, with a fixed retained allocation
         // allowance. Eviction is reconstructible and never changes the pin.
-        if self.identity != Some(identity) || self.remaining < 4 * 1024 * 1024 {
+        if self.identity != Some(identity) {
             *self = Self {
                 identity: Some(identity),
                 remaining: 16 * 1024 * 1024,
@@ -2066,6 +2142,17 @@ pub async fn captured_history_window_cached(
 ) -> ClientResult<CapturedWindowOutcome> {
     let (session_id, pane_id, pin) = identity;
     cache.prepare(session_id, pane_id, pin);
+    if cache.remaining < 4 * 1024 * 1024 {
+        let center = projection.1.map_or_else(
+            || {
+                pin.capture.map_or(0, |capture| {
+                    u32::try_from(capture.lines).unwrap_or(u32::MAX)
+                })
+            },
+            |anchor| anchor.line_index,
+        );
+        cache.evict_distant(center);
+    }
     let mut cached_client = CaptureReadCache {
         client,
         replies: Vec::new(),
