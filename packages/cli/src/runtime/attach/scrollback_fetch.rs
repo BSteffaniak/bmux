@@ -15,6 +15,22 @@ pub struct Request {
     pub delta: isize,
 }
 
+impl Request {
+    /// Navigation may supersede presentation without invalidating immutable
+    /// content. Mutable live windows cannot use this admission shortcut.
+    pub(super) fn reusable_capture(
+        self,
+        session: Uuid,
+        pin: Option<ScrollbackPin>,
+        geometry: Option<(usize, usize)>,
+    ) -> bool {
+        self.pin.is_some()
+            && self.session == session
+            && self.pin == pin
+            && geometry == Some((self.width, self.rows))
+    }
+}
+
 pub enum FetchError {
     Unavailable,
     Failed(String),
@@ -181,6 +197,50 @@ pub async fn fetch_with_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn superseded_navigation_reuses_only_the_same_immutable_capture() {
+        let pin = ScrollbackPin {
+            capture: None,
+            pin_id: 1,
+            total_scrolled_rows: 100,
+            max_scrollback_offset: 100,
+            stream_end: 100,
+            created_epoch_secs: 0,
+        };
+        let request = Request {
+            session: Uuid::new_v4(),
+            pane: Uuid::new_v4(),
+            pin: Some(pin),
+            offset: 10,
+            width: 80,
+            rows: 24,
+            total: None,
+            anchor: None,
+            delta: 0,
+        };
+        assert!(request.reusable_capture(request.session, Some(pin), Some((80, 24))));
+        let moved = Request {
+            offset: 30,
+            ..request
+        };
+        assert!(moved.reusable_capture(request.session, Some(pin), Some((80, 24))));
+        assert!(!request.reusable_capture(Uuid::new_v4(), Some(pin), Some((80, 24))));
+        assert!(!request.reusable_capture(request.session, None, Some((80, 24))));
+        assert!(!request.reusable_capture(
+            request.session,
+            Some(ScrollbackPin { pin_id: 2, ..pin }),
+            Some((80, 24))
+        ));
+        assert!(!request.reusable_capture(request.session, Some(pin), Some((40, 24))));
+        assert!(
+            !Request {
+                pin: None,
+                ..request
+            }
+            .reusable_capture(request.session, None, Some((80, 24)))
+        );
+    }
 
     #[tokio::test]
     async fn unavailable_capture_never_falls_back_to_text_only_snapshot() {

@@ -3931,6 +3931,14 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                             view_state.set_transient_status(format!("history fetch failed: {error}"), Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
                         }
                     }
+                } else if request.reusable_capture(
+                    view_state.attached_id,
+                    current.and_then(|view| view.pin),
+                    attach_pane_inner_size(&view_state, request.pane),
+                ) && let Ok(super::scrollback_fetch::Outcome::Ready(window)) = history {
+                    // Superseded navigation must not discard useful immutable
+                    // rows or publish the old position over newer user intent.
+                    view_state.scrollback_cache.insert(request.pane, request.pin, &window);
                 }
                 if !valid || succeeded {
                     ensure_pane_scrollback_windows(&mut client, &mut view_state, false)?;
