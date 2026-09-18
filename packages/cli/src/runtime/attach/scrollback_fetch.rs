@@ -96,7 +96,8 @@ pub async fn fetch_with_client(
     request: Request,
     cache: std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
 ) -> Result<PaneScrollbackWindow, FetchError> {
-    let mut cache = cache.lock().await;
+    let shared_cache = cache;
+    let mut cache = shared_cache.lock().await;
     let rows = request.rows;
     if let Some(pin) = request.pin {
         let mut last_error = None;
@@ -125,6 +126,9 @@ pub async fn fetch_with_client(
                         return Ok(window);
                     }
                     let origin = window.row_anchors.first().ok_or("missing capture origin")?;
+                    // Image transport must not exclude local readers from the
+                    // already-decoded canonical content for an entire RPC.
+                    drop(cache);
                     let reply = bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_history_images_v3(
                         client, request.session, request.pane, pin.pin_id, origin.capture_id,
                         u16::try_from(request.width).map_err(|error| error.to_string())?,
@@ -140,7 +144,11 @@ pub async fn fetch_with_client(
                     }
                     window.images = serde_json::from_slice(&reply.encoded)
                         .map_err(|error| error.to_string())?;
-                    cache.retain_images(request.width, &window.row_anchors, &window.images);
+                    let mut cache = shared_cache.lock().await;
+                    if cache.matches_capture((request.session, request.pane, pin)) {
+                        cache.retain_images(request.width, &window.row_anchors, &window.images);
+                    }
+                    drop(cache);
                     return Ok(window);
                 }
                 Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) => {}

@@ -768,7 +768,16 @@ mod history_tests {
         );
         assert_eq!(client.0, 60);
         assert_partial_index(&mut cache, &window);
-        cache.prepare(uuid::Uuid::new_v4(), identity.1, pin);
+        assert_capture_replacement(&mut cache, identity);
+    }
+
+    fn assert_capture_replacement(
+        cache: &mut super::CapturedHistoryCache,
+        identity: (uuid::Uuid, uuid::Uuid, bmux_attach_pipeline::ScrollbackPin),
+    ) {
+        assert!(cache.matches_capture(identity));
+        cache.prepare(uuid::Uuid::new_v4(), identity.1, identity.2);
+        assert!(!cache.matches_capture(identity));
         assert!(cache.decoded.lines.is_empty());
     }
 
@@ -1486,6 +1495,13 @@ pub struct CapturedHistoryCache {
 }
 
 impl CapturedHistoryCache {
+    pub fn matches_capture(
+        &self,
+        identity: (Uuid, Uuid, bmux_attach_pipeline::ScrollbackPin),
+    ) -> bool {
+        self.identity == Some(identity)
+    }
+
     /// Index a bounded contiguous resident range around the requested anchor.
     /// Gaps remain explicit; partial residency never renumbers source identities.
     pub fn prepare_resident_index(&mut self, width: usize, line: u32) {
