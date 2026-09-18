@@ -787,6 +787,7 @@ mod history_tests {
         identity: (uuid::Uuid, uuid::Uuid, bmux_attach_pipeline::ScrollbackPin),
         window: &bmux_attach_pipeline::PaneScrollbackWindow,
     ) {
+        assert_numeric_index(cache, identity);
         let remaining = cache.remaining;
         let revision = cache.revision.clone();
         cache.remaining = 0;
@@ -803,6 +804,24 @@ mod history_tests {
                 .resident_window(replaced, 0, 20, (2, window.row_anchors.last().copied(), 0))
                 .is_none()
         );
+        cache.remaining = remaining;
+    }
+
+    fn assert_numeric_index(
+        cache: &mut super::CapturedHistoryCache,
+        identity: (uuid::Uuid, uuid::Uuid, bmux_attach_pipeline::ScrollbackPin),
+    ) {
+        let remaining = cache.remaining;
+        cache.remaining = 0;
+        for offset in 0..=40 {
+            let view = cache
+                .resident_window(identity, offset, 20, (2, None, 0))
+                .unwrap();
+            assert_eq!(
+                view.row_anchors[0].line_index,
+                u32::try_from(40 - offset).unwrap()
+            );
+        }
         cache.remaining = remaining;
     }
 
@@ -1938,19 +1957,33 @@ impl CapturedHistoryCache {
         if width != projection.0 || rows == 0 || rows > 256 {
             return None;
         }
-        let anchor = projection.1?;
-        let bottom = index
-            .resolve(bmux_terminal_grid::ContentAnchor {
-                capture: anchor.capture_id.as_u128(),
-                line: anchor.line_index.checked_sub(resident.first_line)? as usize,
-                column: anchor.column,
-            })?
-            .checked_add(1)?;
         let total = index.row_count()?;
-        let requested_end = if projection.2 >= 0 {
-            bottom.saturating_sub(projection.2.unsigned_abs())
+        let requested_end = if let Some(anchor) = projection.1 {
+            let bottom = index
+                .resolve(bmux_terminal_grid::ContentAnchor {
+                    capture: anchor.capture_id.as_u128(),
+                    line: anchor.line_index.checked_sub(resident.first_line)? as usize,
+                    column: anchor.column,
+                })?
+                .checked_add(1)?;
+            if projection.2 >= 0 {
+                bottom.saturating_sub(projection.2.unsigned_abs())
+            } else {
+                bottom.saturating_add(projection.2.unsigned_abs())
+            }
         } else {
-            bottom.saturating_add(projection.2.unsigned_abs())
+            // Numeric offsets use capture-time physical rows. Only a complete
+            // index at that width can resolve them without guessing reflow or
+            // treating a partial resident range as the full history.
+            let capture = pin.capture?;
+            if width != usize::from(capture.width)
+                || resident.first_line != 0
+                || self.decoded.end != Some(resident.end_line)
+                || projection.2 != 0
+            {
+                return None;
+            }
+            total.checked_sub(offset)?
         };
         if requested_end < rows || requested_end > total {
             return None;
