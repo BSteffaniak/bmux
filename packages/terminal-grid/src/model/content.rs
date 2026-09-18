@@ -604,6 +604,42 @@ fn push_retained_line(
 }
 
 impl ContentProjection {
+    /// Retained allocation size, excluding allocator bookkeeping. Compute at
+    /// cache admission rather than in a frame loop; shared owners charge once
+    /// per retained projection or conservatively overcount shared allocations.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        let lines = self.lines.iter().fold(
+            self.lines
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ContentLine>()),
+            |bytes, line| {
+                line.cells.iter().fold(
+                    bytes
+                        .saturating_add(
+                            line.cells
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<Cell>()),
+                        )
+                        .saturating_add(
+                            line.byte_offsets
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<usize>()),
+                        ),
+                    |bytes, cell| bytes.saturating_add(cell.text.capacity()),
+                )
+            },
+        );
+        lines
+            .saturating_add(self.index.as_ref().map_or(0, |index| {
+                index
+                    .rows
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<IndexedRow>())
+            }))
+            .saturating_add(std::mem::size_of::<Self>())
+    }
+
     /// Build a caller-owned projection from ordered canonical logical lines.
     /// The boolean marks continuation beyond a line's final cell. All supplied
     /// cells, including significant trailing blanks, are preserved. Source

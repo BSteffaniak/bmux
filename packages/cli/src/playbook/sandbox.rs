@@ -162,7 +162,7 @@ impl SandboxServer {
         } else {
             "failed"
         };
-        let keep = retain_on_failure || result.is_err();
+        let keep = retain_sandbox_after_shutdown(retain_on_failure, result.is_ok());
         let _ = write_playbook_manifest(
             &self.root_dir,
             self.paths(),
@@ -174,7 +174,7 @@ impl SandboxServer {
             keep,
         );
         clear_sandbox_lock(&self.root_dir);
-        if !retain_on_failure || result.is_ok() {
+        if !keep {
             let _ = std::fs::remove_dir_all(&self.root_dir);
         }
         result
@@ -210,6 +210,10 @@ impl SandboxServer {
             }
         }
     }
+}
+
+const fn retain_sandbox_after_shutdown(retain_requested: bool, shutdown_succeeded: bool) -> bool {
+    retain_requested || !shutdown_succeeded
 }
 
 impl Drop for SandboxServer {
@@ -716,6 +720,14 @@ impl ServerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_retains_requested_or_failed_sandbox_diagnostics() {
+        assert!(!retain_sandbox_after_shutdown(false, true));
+        assert!(retain_sandbox_after_shutdown(true, true));
+        assert!(retain_sandbox_after_shutdown(false, false));
+        assert!(retain_sandbox_after_shutdown(true, false));
+    }
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
 

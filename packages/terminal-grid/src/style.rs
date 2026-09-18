@@ -80,13 +80,13 @@ impl Style {
 /// Small style interner. The default style is always id 0.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StylePalette {
-    styles: Vec<Style>,
+    styles: std::sync::Arc<Vec<Style>>,
 }
 
 impl Default for StylePalette {
     fn default() -> Self {
         Self {
-            styles: vec![Style::default()],
+            styles: std::sync::Arc::new(vec![Style::default()]),
         }
     }
 }
@@ -95,6 +95,18 @@ impl StylePalette {
     /// Build a palette from styles already encoded in id order.
     #[must_use]
     pub fn from_styles(styles: Vec<Style>) -> Self {
+        if styles.is_empty() {
+            Self::default()
+        } else {
+            Self {
+                styles: std::sync::Arc::new(styles),
+            }
+        }
+    }
+
+    /// Share an immutable id-ordered palette without copying its entries.
+    #[must_use]
+    pub fn from_shared_styles(styles: std::sync::Arc<Vec<Style>>) -> Self {
         if styles.is_empty() {
             Self::default()
         } else {
@@ -108,7 +120,7 @@ impl StylePalette {
         if let Some(index) = self.styles.iter().position(|candidate| *candidate == style) {
             return StyleId(u32::try_from(index).unwrap_or(u32::MAX));
         }
-        self.styles.push(style);
+        std::sync::Arc::make_mut(&mut self.styles).push(style);
         StyleId(u32::try_from(self.styles.len() - 1).unwrap_or(u32::MAX))
     }
 
@@ -129,5 +141,36 @@ impl StylePalette {
     #[must_use]
     pub fn styles(&self) -> &[Style] {
         &self.styles
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_clones_share_until_mutation_and_preserve_wire_shape() {
+        let mut palette = StylePalette::default();
+        let saved = palette.clone();
+        assert!(std::sync::Arc::ptr_eq(&saved.styles, &palette.styles));
+        assert_eq!(palette.intern(Style::default()), StyleId::DEFAULT);
+        assert!(std::sync::Arc::ptr_eq(&saved.styles, &palette.styles));
+        let bold = Style {
+            bold: true,
+            ..Style::default()
+        };
+        let id = palette.intern(bold);
+        assert!(!std::sync::Arc::ptr_eq(&saved.styles, &palette.styles));
+        assert_eq!(saved.styles().len(), 1);
+        assert_eq!(palette.get(id), bold);
+        let wire = serde_json::to_value(&palette).unwrap();
+        assert_eq!(
+            wire["styles"],
+            serde_json::to_value(palette.styles()).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_value::<StylePalette>(wire).unwrap(),
+            palette
+        );
     }
 }

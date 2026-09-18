@@ -808,25 +808,39 @@ impl AttachViewState {
             .is_some_and(|pane_id| self.scrollback_active_for(pane_id))
     }
 
-    /// Leave scrollback for one specific pane.
-    /// Retain two independently bounded decoded replicas. Together with the
-    /// single worker's replacement index, this bounds attachment residency;
-    /// eviction only drops derived data, never daemon history or view state.
+    /// Reserve conservative worker headroom inside a 256 MiB attachment ceiling.
+    /// Charge other replicas and evict derived data, never authoritative history.
     pub(super) fn history_cache_for(
         &mut self,
         pane: Uuid,
     ) -> std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>> {
-        if !self.decoded_history.contains_key(&pane) && self.decoded_history.len() >= 2 {
-            if let Some(old) = self
-                .decoded_history
-                .keys()
-                .copied()
-                .find(|id| *id != self.focused_pane_id().unwrap_or(pane))
-            {
-                self.decoded_history.remove(&old);
-            } else if let Some(old) = self.decoded_history.keys().next().copied() {
-                self.decoded_history.remove(&old);
+        const RESIDENT_ALLOWANCE: usize = 96 * 1024 * 1024;
+        let mut charges = self
+            .decoded_history
+            .iter()
+            .filter(|(id, _)| **id != pane)
+            .map(|(id, cache)| {
+                (
+                    *id,
+                    cache
+                        .try_lock()
+                        .map_or(RESIDENT_ALLOWANCE, |cache| cache.retained_charge()),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Prefer preserving the focused pane, then small replicas. The remaining
+        // headroom covers the active replica, worker replacements, and windows.
+        let focused = self.focused_pane_id();
+        charges.sort_by_key(|(id, bytes)| (Some(*id) == focused, std::cmp::Reverse(*bytes)));
+        let mut total = charges
+            .iter()
+            .fold(0_usize, |sum, (_, bytes)| sum.saturating_add(*bytes));
+        for (id, bytes) in charges {
+            if total <= RESIDENT_ALLOWANCE && self.decoded_history.len() < 64 {
+                break;
             }
+            self.decoded_history.remove(&id);
+            total = total.saturating_sub(bytes);
         }
         self.decoded_history.entry(pane).or_default().clone()
     }
@@ -927,7 +941,7 @@ mod tests {
         assert!(!std::sync::Arc::ptr_eq(&first, &second));
         assert!(std::sync::Arc::ptr_eq(&first, &state.history_cache_for(a)));
         state.history_cache_for(Uuid::from_u128(3));
-        assert_eq!(state.decoded_history.len(), 2);
+        assert_eq!(state.decoded_history.len(), 3);
         state.exit_scrollback_for(b);
         assert!(!state.decoded_history.contains_key(&b));
         state.retain_scrollback_panes(&BTreeSet::new());

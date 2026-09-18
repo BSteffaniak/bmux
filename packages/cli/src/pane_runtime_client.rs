@@ -1227,6 +1227,45 @@ mod history_tests {
         assert!(!resident.publish_if_current(&before_reset, before_reset.clone()));
     }
 
+    #[test]
+    fn resident_probe_miss_preserves_cache_and_admission_revision() {
+        let mut cache = super::CapturedHistoryCache::default();
+        let pin = bmux_attach_pipeline::ScrollbackPin {
+            capture: Some(bmux_attach_pipeline::ScrollbackCapture {
+                identity: uuid::Uuid::new_v4(),
+                lines: 50,
+                truncated: false,
+                width: 80,
+                height: 24,
+            }),
+            pin_id: 1,
+            total_scrolled_rows: 50,
+            max_scrollback_offset: 50,
+            stream_end: 0,
+            created_epoch_secs: 0,
+        };
+        let identity = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), pin);
+        cache.prepare(identity.0, identity.1, pin);
+        let before = cache.clone();
+        for _ in 0..100 {
+            assert!(
+                cache
+                    .resident_window(identity, 0, 24, (80, None, 0))
+                    .is_none()
+            );
+        }
+        assert!(std::sync::Arc::ptr_eq(&before.revision, &cache.revision));
+        assert!(std::sync::Arc::ptr_eq(
+            &before.decoded.lines,
+            &cache.decoded.lines
+        ));
+        assert_eq!(cache.remaining, before.remaining);
+        assert_eq!(cache.decoded.end, before.decoded.end);
+        assert_eq!(cache.decoded.tail_resume, before.decoded.tail_resume);
+        assert_eq!(cache.tail_loaded, before.tail_loaded);
+        assert_eq!(cache.styles, before.styles);
+    }
+
     struct HistoryClient;
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryClient {
         async fn invoke_service_raw(
@@ -1587,6 +1626,7 @@ struct ResidentIndex {
     first_line: u32,
     end_line: u32,
     content: bmux_terminal_grid::ContentProjection,
+    bytes: usize,
 }
 
 #[derive(Default, Clone)]
@@ -1597,7 +1637,7 @@ pub struct CapturedHistoryCache {
     image_bytes: usize,
     identity: Option<(Uuid, Uuid, bmux_attach_pipeline::ScrollbackPin)>,
     decoded: CapturedLineCache,
-    styles: Vec<bmux_terminal_grid::Style>,
+    styles: std::sync::Arc<Vec<bmux_terminal_grid::Style>>,
     remaining: usize,
     tail_loaded: bool,
     history: std::sync::Arc<
@@ -1606,6 +1646,19 @@ pub struct CapturedHistoryCache {
 }
 
 impl CapturedHistoryCache {
+    /// Conservative admission charge: decoded allocations are charged by the
+    /// decoder; derived index allocations are measured after construction.
+    pub fn retained_charge(&self) -> usize {
+        (if self.identity.is_some() {
+            (16_usize * 1024 * 1024).saturating_sub(self.remaining)
+        } else {
+            0
+        })
+        .saturating_add(self.image_bytes)
+        .saturating_add(self.indexed.as_ref().map_or(0, |index| index.bytes))
+        .saturating_add(std::mem::size_of::<Self>())
+    }
+
     /// Publish only against the exact snapshot used to start background work.
     /// An allocation identity avoids counter wrap and same-source reset ABA.
     pub fn publish_if_current(&mut self, original: &Self, mut updated: Self) -> bool {
@@ -1682,6 +1735,7 @@ impl CapturedHistoryCache {
                 .is_ok()
             {
                 index.width = width;
+                index.bytes = index.content.retained_bytes();
             }
             return;
         }
@@ -1719,6 +1773,7 @@ impl CapturedHistoryCache {
                 width,
                 first_line: first,
                 end_line: end,
+                bytes: content.retained_bytes(),
                 content,
             }));
         }
@@ -1780,7 +1835,7 @@ impl CapturedHistoryCache {
             images,
             projection_width: width,
             row_anchors: anchors,
-            palette: bmux_terminal_grid::StylePalette::from_styles(self.styles.clone()),
+            palette: bmux_terminal_grid::StylePalette::from_shared_styles(self.styles.clone()),
             scrollback_offset: offset,
             max_scrollback_offset: pin.max_scrollback_offset,
             total_scrolled_rows: pin.total_scrolled_rows,
@@ -1808,34 +1863,33 @@ impl CapturedHistoryCache {
         if let Some(window) = self.indexed_window(offset, rows, projection) {
             return Some(window);
         }
-        let before_lines = std::sync::Arc::clone(&self.decoded.lines);
-        let before_history = std::sync::Arc::clone(&self.history);
-        let before_styles = self.styles.len();
-        let before_end = self.decoded.end;
-        let remaining = self.remaining;
+        // Probe against a copy-on-write transaction. A missing text/image
+        // range must not leave partial assembly or uncharged metadata resident.
+        let mut working = self.clone();
         let outcome = captured_history_window_cached(
             &mut ResidentOnly,
             identity,
             offset,
             rows,
             projection,
-            self,
+            &mut working,
         )
         .now_or_never();
-        if !std::sync::Arc::ptr_eq(&before_lines, &self.decoded.lines)
-            || !std::sync::Arc::ptr_eq(&before_history, &self.history)
-            || before_styles != self.styles.len()
-            || before_end != self.decoded.end
-        {
-            self.changed();
-        }
-        // An unsuccessful probe must not consume admission credits merely for
-        // asking whether a missing line is resident.
         let Some(Ok(CapturedWindowOutcome::Window(mut window))) = outcome else {
-            self.remaining = remaining;
             return None;
         };
-        window.images = self.cached_images(projection.0, &window.row_anchors)?;
+        window.images = working.cached_images(projection.0, &window.row_anchors)?;
+        if !std::sync::Arc::ptr_eq(&self.decoded.lines, &working.decoded.lines)
+            || !std::sync::Arc::ptr_eq(&self.history, &working.history)
+            || self.styles.len() != working.styles.len()
+            || self.decoded.end != working.decoded.end
+            || self.decoded.tail_resume != working.decoded.tail_resume
+            || self.tail_loaded != working.tail_loaded
+            || self.remaining != working.remaining
+        {
+            working.changed();
+            *self = working;
+        }
         Some(window)
     }
 
@@ -2031,7 +2085,7 @@ pub async fn captured_history_window_cached(
     let remaining = &mut cache.remaining;
     let mut requests_left = 256;
     let mut projection_budget: usize = 2 * 1024 * 1024;
-    let styles = &mut cache.styles;
+    let styles = std::sync::Arc::make_mut(&mut cache.styles);
     if bottom_anchor.is_none() && offset < usize::from(meta.height) {
         // Assemble the captured screen once. Resolving subsequent viewport
         // lines reuses the assemblies and their palette instead of rescanning
