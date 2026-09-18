@@ -1326,6 +1326,88 @@ mod history_tests {
         assert_eq!(styles.as_slice(), &[style, bold]);
     }
 
+    #[tokio::test]
+    async fn eviction_refetches_missing_lines_without_replacing_capture() {
+        let pin = bmux_attach_pipeline::ScrollbackPin {
+            capture: Some(bmux_attach_pipeline::ScrollbackCapture {
+                identity: uuid::Uuid::new_v4(),
+                lines: 1024,
+                truncated: false,
+                width: 2,
+                height: 2,
+            }),
+            pin_id: 7,
+            total_scrolled_rows: 1024,
+            max_scrollback_offset: 1024,
+            stream_end: 9000,
+            created_epoch_secs: 0,
+        };
+        let identity = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), pin);
+        let mut cache = super::CapturedHistoryCache::default();
+        // Content anchors establish separated ranges without an unrelated
+        // distant-offset scan.
+        for offset in [500, 900] {
+            let result = super::captured_history_window_cached(
+                &mut HistoryClient,
+                identity,
+                offset as usize,
+                2,
+                (
+                    2,
+                    Some(bmux_attach_pipeline::CapturedHistoryAnchor {
+                        capture_id: pin.capture.unwrap().identity,
+                        line_index: offset,
+                        column: 0,
+                    }),
+                    0,
+                ),
+                &mut cache,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(result, super::CapturedWindowOutcome::Window(_)));
+        }
+        let old = cache.clone();
+        let near = *cache.decoded.lines.keys().next_back().unwrap();
+        let distant = *cache.decoded.lines.keys().next().unwrap();
+        cache.remaining = 0;
+        cache.evict_distant(near);
+        assert!(cache.matches_capture(identity));
+        assert!(!cache.decoded.lines.contains_key(&distant));
+        assert!(cache.decoded.lines.contains_key(&near));
+        assert!(old.decoded.lines.contains_key(&distant));
+        let result = super::captured_history_window_cached(
+            &mut HistoryClient,
+            identity,
+            900,
+            2,
+            (
+                2,
+                Some(bmux_attach_pipeline::CapturedHistoryAnchor {
+                    capture_id: pin.capture.unwrap().identity,
+                    line_index: 500,
+                    column: 0,
+                }),
+                0,
+            ),
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        let super::CapturedWindowOutcome::Window(window) = result else {
+            panic!("missing refetched window")
+        };
+        assert_eq!(window.rows.len(), 2);
+        assert!(
+            window
+                .row_anchors
+                .iter()
+                .all(|anchor| anchor.capture_id == pin.capture.unwrap().identity)
+        );
+        assert!(cache.decoded.lines.contains_key(&distant));
+        assert!(cache.matches_capture(identity));
+    }
+
     struct HistoryClient;
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryClient {
         async fn invoke_service_raw(
