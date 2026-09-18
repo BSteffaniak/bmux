@@ -203,7 +203,7 @@ pub async fn fetch_captured_history_line(
     capture: &AttachState::HistoryCaptureV1,
     line_index: u32,
     remaining: &mut usize,
-    styles: &mut Vec<bmux_terminal_grid::Style>,
+    styles: &mut std::sync::Arc<Vec<bmux_terminal_grid::Style>>,
     requests_left: &mut usize,
 ) -> ClientResult<bmux_terminal_grid::HistoryLineAssembly> {
     use bmux_terminal_grid::{HistoryLineAssembly, HistorySlice, HistorySliceEnd};
@@ -469,7 +469,7 @@ mod history_tests {
             &capture,
             0,
             &mut 65536,
-            &mut Vec::new(),
+            &mut std::sync::Arc::new(Vec::new()),
             &mut 8,
         )
         .await
@@ -638,7 +638,7 @@ mod history_tests {
         };
         let mut cache = super::CapturedLineCache::default();
         let mut remaining = 65536;
-        let mut styles = Vec::new();
+        let mut styles = std::sync::Arc::new(Vec::new());
         let mut requests = 8;
         let session = uuid::Uuid::new_v4();
         let first = cache
@@ -827,7 +827,7 @@ mod history_tests {
         };
         let mut cache = super::CapturedLineCache::default();
         let mut remaining = 2 * 1024 * 1024;
-        let mut styles = Vec::new();
+        let mut styles = std::sync::Arc::new(Vec::new());
         let session = uuid::Uuid::new_v4();
         // Incrementally resolving tail lines used to retain each preceding
         // prefix again, exceeding 256 entries with only 23 source lines.
@@ -914,7 +914,7 @@ mod history_tests {
         };
         let mut cache = super::CapturedLineCache::default();
         let mut remaining = 16 * 1024 * 1024;
-        let mut styles = Vec::new();
+        let mut styles = std::sync::Arc::new(Vec::new());
         let session = uuid::Uuid::new_v4();
         for index in 0..1024 {
             let mut requests = 2;
@@ -1166,7 +1166,7 @@ mod history_tests {
         };
         let mut resident = super::CapturedLineCache::default();
         let mut bytes = 65536;
-        let mut styles = Vec::new();
+        let mut styles = std::sync::Arc::new(Vec::new());
         let mut requests = 10;
         let session = uuid::Uuid::new_v4();
         resident
@@ -1264,6 +1264,25 @@ mod history_tests {
         assert_eq!(cache.decoded.tail_resume, before.decoded.tail_resume);
         assert_eq!(cache.tail_loaded, before.tail_loaded);
         assert_eq!(cache.styles, before.styles);
+    }
+
+    #[test]
+    fn decoding_existing_styles_does_not_detach_shared_palette() {
+        let style = bmux_terminal_grid::Style::default();
+        let mut styles = std::sync::Arc::new(vec![style]);
+        let published = styles.clone();
+        let encoded = serde_json::to_vec(&vec![("a", 1_u8, style)]).unwrap();
+        super::decode_history_cells(&encoded, &mut styles, &mut 65536).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&styles, &published));
+        let bold = bmux_terminal_grid::Style {
+            bold: true,
+            ..style
+        };
+        let encoded = serde_json::to_vec(&vec![("b", 1_u8, bold)]).unwrap();
+        super::decode_history_cells(&encoded, &mut styles, &mut 65536).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&styles, &published));
+        assert_eq!(published.as_slice(), &[style]);
+        assert_eq!(styles.as_slice(), &[style, bold]);
     }
 
     struct HistoryClient;
@@ -1471,11 +1490,11 @@ mod history_tests {
     fn decoding_charges_cells_and_rejects_exhausted_budget() {
         let style = bmux_terminal_grid::Style::default();
         let encoded = serde_json::to_vec(&vec![("界", 2_u8, style)]).unwrap();
-        let mut styles = Vec::new();
+        let mut styles = std::sync::Arc::new(Vec::new());
         let mut budget = 1024;
         let cells = super::decode_history_cells(&encoded, &mut styles, &mut budget).unwrap();
         assert_eq!(cells[0].text(), "界");
-        assert_eq!(styles, vec![style]);
+        assert_eq!(styles.as_slice(), &[style]);
         assert!(budget < 1024);
         assert!(super::decode_history_cells(&encoded, &mut styles, &mut 0).is_err());
     }
@@ -2085,7 +2104,7 @@ pub async fn captured_history_window_cached(
     let remaining = &mut cache.remaining;
     let mut requests_left = 256;
     let mut projection_budget: usize = 2 * 1024 * 1024;
-    let styles = std::sync::Arc::make_mut(&mut cache.styles);
+    let styles = &mut cache.styles;
     if bottom_anchor.is_none() && offset < usize::from(meta.height) {
         // Assemble the captured screen once. Resolving subsequent viewport
         // lines reuses the assemblies and their palette instead of rescanning
@@ -2356,7 +2375,7 @@ pub async fn captured_history_window_cached(
             images: Vec::new(),
             projection_width: width,
             row_anchors: anchors,
-            palette: bmux_terminal_grid::StylePalette::from_styles(styles.clone()),
+            palette: bmux_terminal_grid::StylePalette::from_shared_styles(styles.clone()),
             rows: selected,
             scrollback_offset: resolved_offset,
             max_scrollback_offset: if reached_oldest {
@@ -2395,7 +2414,7 @@ pub async fn captured_tail_window(
         return Ok(None);
     }
     let mut budget = 2 * 1024 * 1024;
-    let mut styles = Vec::new();
+    let mut styles = std::sync::Arc::new(Vec::new());
     let mut output = Vec::new();
     let end_row = usize::from(meta.height) - offset;
     // Fetch forward so a row is never mistaken for a logical-line start.
@@ -2473,7 +2492,7 @@ pub async fn captured_tail_window(
         images: Vec::new(),
         projection_width: width,
         row_anchors: Vec::new(),
-        palette: bmux_terminal_grid::StylePalette::from_styles(styles),
+        palette: bmux_terminal_grid::StylePalette::from_shared_styles(styles),
         rows: output,
         scrollback_offset: offset,
         max_scrollback_offset: pin.max_scrollback_offset,
@@ -2489,7 +2508,7 @@ async fn resolve_tail_entry(
     capture: &AttachState::HistoryCaptureV1,
     offset: usize,
     budget: &mut usize,
-    styles: &mut Vec<bmux_terminal_grid::Style>,
+    styles: &mut std::sync::Arc<Vec<bmux_terminal_grid::Style>>,
     requests: &mut usize,
 ) -> ClientResult<Option<bmux_attach_pipeline::CapturedHistoryAnchor>> {
     use bmux_terminal_grid::HistorySliceEnd;
@@ -2586,7 +2605,11 @@ impl CapturedLineCache {
         session: Uuid,
         capture: &AttachState::HistoryCaptureV1,
         index: u32,
-        budgets: (&mut usize, &mut Vec<bmux_terminal_grid::Style>, &mut usize),
+        budgets: (
+            &mut usize,
+            &mut std::sync::Arc<Vec<bmux_terminal_grid::Style>>,
+            &mut usize,
+        ),
     ) -> ClientResult<Option<std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>>> {
         if self.end.is_some_and(|end| index >= end) {
             return Ok(None);
@@ -2637,7 +2660,11 @@ async fn fetch_captured_content_line(
     session: Uuid,
     capture: &AttachState::HistoryCaptureV1,
     index: u32,
-    budgets: (&mut usize, &mut Vec<bmux_terminal_grid::Style>, &mut usize),
+    budgets: (
+        &mut usize,
+        &mut std::sync::Arc<Vec<bmux_terminal_grid::Style>>,
+        &mut usize,
+    ),
     cache: &mut CapturedLineCache,
 ) -> ClientResult<Option<std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>>> {
     use bmux_terminal_grid::{HistoryLineAssembly, HistorySlice, HistorySliceEnd};
@@ -2790,7 +2817,7 @@ async fn captured_tail_prefix(
     pane: Uuid,
     pin: bmux_attach_pipeline::ScrollbackPin,
     budget: &mut usize,
-    styles: &mut Vec<bmux_terminal_grid::Style>,
+    styles: &mut std::sync::Arc<Vec<bmux_terminal_grid::Style>>,
     requests_left: &mut usize,
 ) -> ClientResult<bmux_terminal_grid::HistoryLineAssembly> {
     use bmux_terminal_grid::{HistoryLineAssembly, HistorySlice, HistorySliceEnd};
@@ -2928,7 +2955,7 @@ fn decode_tail_slice(
     reply: &AttachState::HistorySliceV1,
     offset: u32,
     width: u16,
-    styles: &mut Vec<bmux_terminal_grid::Style>,
+    styles: &mut std::sync::Arc<Vec<bmux_terminal_grid::Style>>,
     budget: &mut usize,
 ) -> ClientResult<Vec<bmux_terminal_grid::Cell>> {
     if reply.encoded.len() > 128 * 1024 {
@@ -2958,7 +2985,7 @@ fn pad_wrapped_tail(
     cells: &mut Vec<bmux_terminal_grid::Cell>,
     padding: usize,
     budget: &mut usize,
-    styles: &mut Vec<bmux_terminal_grid::Style>,
+    styles: &mut std::sync::Arc<Vec<bmux_terminal_grid::Style>>,
 ) -> ClientResult<()> {
     use bmux_terminal_grid::{Cell, Style, StyleId};
     let charge = padding
@@ -2971,10 +2998,10 @@ fn pad_wrapped_tail(
     let index = if let Some(index) = styles.iter().position(|style| *style == Style::default()) {
         index
     } else {
-        styles
+        std::sync::Arc::make_mut(styles)
             .try_reserve_exact(1)
             .map_err(|error| history_decode_error(&error))?;
-        styles.push(Style::default());
+        std::sync::Arc::make_mut(styles).push(Style::default());
         styles.len() - 1
     };
     let style = StyleId(u32::try_from(index).map_err(|error| history_decode_error(&error))?);
@@ -2994,12 +3021,12 @@ fn history_decode_error(error: &impl std::fmt::Display) -> ClientError {
 
 fn decode_history_cells(
     encoded: &[u8],
-    styles: &mut Vec<bmux_terminal_grid::Style>,
+    styles: &mut std::sync::Arc<Vec<bmux_terminal_grid::Style>>,
     remaining: &mut usize,
 ) -> ClientResult<Vec<bmux_terminal_grid::Cell>> {
     use serde::de::{Error, SeqAccess, Visitor};
     struct Cells<'a> {
-        styles: &'a mut Vec<bmux_terminal_grid::Style>,
+        styles: &'a mut std::sync::Arc<Vec<bmux_terminal_grid::Style>>,
         remaining: &'a mut usize,
     }
     impl<'de> Visitor<'de> for Cells<'_> {
@@ -3030,8 +3057,9 @@ fn decode_history_cells(
                 let index = if let Some(index) = existing_style {
                     index
                 } else {
-                    self.styles.try_reserve_exact(1).map_err(A::Error::custom)?;
-                    self.styles.push(style);
+                    let styles = std::sync::Arc::make_mut(self.styles);
+                    styles.try_reserve_exact(1).map_err(A::Error::custom)?;
+                    styles.push(style);
                     self.styles.len() - 1
                 };
                 cells.try_reserve_exact(1).map_err(A::Error::custom)?;
