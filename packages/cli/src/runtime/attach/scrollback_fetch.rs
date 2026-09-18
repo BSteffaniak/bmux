@@ -227,9 +227,7 @@ pub async fn fetch_with_client(
     let result = fetch_owned(client, request, &mut working).await;
     if result.is_ok() {
         let mut resident = cache.lock().await;
-        if resident.same_source(&original) {
-            *resident = working;
-        }
+        resident.publish_if_current(&original, working);
     }
     result
 }

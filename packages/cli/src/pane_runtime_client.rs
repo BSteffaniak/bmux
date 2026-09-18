@@ -786,7 +786,7 @@ mod history_tests {
         window: &bmux_attach_pipeline::PaneScrollbackWindow,
     ) {
         cache.indexed = None;
-        cache.decoded.lines.retain(|line, _| *line >= 20);
+        std::sync::Arc::make_mut(&mut cache.decoded.lines).retain(|line, _| *line >= 20);
         cache.prepare_resident_index(2, 40);
         assert_eq!(cache.indexed.as_ref().unwrap().first_line, 20);
         cache.prepare_resident_index(1, 40);
@@ -1070,7 +1070,7 @@ mod history_tests {
                 },
             )
             .unwrap();
-            cache.history.insert(index, std::sync::Arc::new(line));
+            std::sync::Arc::make_mut(&mut cache.history).insert(index, std::sync::Arc::new(line));
         }
         let anchors = (4900..5100)
             .map(|line_index| bmux_attach_pipeline::CapturedHistoryAnchor {
@@ -1146,6 +1146,85 @@ mod history_tests {
             ..anchors[0]
         }];
         assert!(cache.cached_images(80, &other).is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_snapshot_shares_line_index_until_mutation() {
+        let capture = super::AttachState::HistoryCaptureV1 {
+            width: 2,
+            height: 2,
+            capture_id: uuid::Uuid::new_v4(),
+            history_line_count: 10,
+            history_truncated: false,
+            pin: super::AttachState::PaneScrollbackPin {
+                pane_id: uuid::Uuid::new_v4(),
+                pin_id: 1,
+                total_scrolled_rows: 10,
+                max_scrollback_offset: 10,
+                stream_end: 0,
+            },
+        };
+        let mut resident = super::CapturedLineCache::default();
+        let mut bytes = 65536;
+        let mut styles = Vec::new();
+        let mut requests = 10;
+        let session = uuid::Uuid::new_v4();
+        resident
+            .resolve(
+                &mut HistoryClient,
+                session,
+                &capture,
+                0,
+                (&mut bytes, &mut styles, &mut requests),
+            )
+            .await
+            .unwrap();
+        let mut worker = resident.clone();
+        assert!(std::sync::Arc::ptr_eq(&resident.lines, &worker.lines));
+        worker
+            .resolve(
+                &mut HistoryClient,
+                session,
+                &capture,
+                0,
+                (&mut bytes, &mut styles, &mut requests),
+            )
+            .await
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&resident.lines, &worker.lines));
+        worker
+            .resolve(
+                &mut HistoryClient,
+                session,
+                &capture,
+                1,
+                (&mut bytes, &mut styles, &mut requests),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resident.lines.len(), 1);
+        assert_eq!(worker.lines.len(), 2);
+        assert!(!std::sync::Arc::ptr_eq(&resident.lines, &worker.lines));
+        assert!(std::sync::Arc::ptr_eq(
+            &resident.lines[&0],
+            &worker.lines[&0]
+        ));
+    }
+
+    #[test]
+    fn worker_publication_rejects_same_source_revision_changes() {
+        let mut resident = super::CapturedHistoryCache::default();
+        let original = resident.clone();
+        let mut first = original.clone();
+        first.remaining = 1234;
+        assert!(resident.publish_if_current(&original, first));
+        let mut obsolete = original.clone();
+        obsolete.remaining = 9876;
+        assert!(!resident.publish_if_current(&original, obsolete));
+        assert_eq!(resident.remaining, 1234);
+        let before_reset = resident.clone();
+        resident = super::CapturedHistoryCache::default();
+        assert!(!resident.publish_if_current(&before_reset, before_reset.clone()));
     }
 
     struct HistoryClient;
@@ -1512,6 +1591,7 @@ struct ResidentIndex {
 
 #[derive(Default, Clone)]
 pub struct CapturedHistoryCache {
+    revision: std::sync::Arc<()>,
     indexed: Option<std::sync::Arc<ResidentIndex>>,
     image_coverage: std::collections::VecDeque<std::sync::Arc<CapturedImageCoverage>>,
     image_bytes: usize,
@@ -1520,13 +1600,27 @@ pub struct CapturedHistoryCache {
     styles: Vec<bmux_terminal_grid::Style>,
     remaining: usize,
     tail_loaded: bool,
-    history:
+    history: std::sync::Arc<
         std::collections::BTreeMap<u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>>,
+    >,
 }
 
 impl CapturedHistoryCache {
-    pub fn same_source(&self, other: &Self) -> bool {
-        self.identity == other.identity
+    /// Publish only against the exact snapshot used to start background work.
+    /// An allocation identity avoids counter wrap and same-source reset ABA.
+    pub fn publish_if_current(&mut self, original: &Self, mut updated: Self) -> bool {
+        if self.identity != original.identity
+            || !std::sync::Arc::ptr_eq(&self.revision, &original.revision)
+        {
+            return false;
+        }
+        updated.revision = std::sync::Arc::new(());
+        *self = updated;
+        true
+    }
+
+    fn changed(&mut self) {
+        self.revision = std::sync::Arc::new(());
     }
 
     #[cfg(test)]
@@ -1714,6 +1808,10 @@ impl CapturedHistoryCache {
         if let Some(window) = self.indexed_window(offset, rows, projection) {
             return Some(window);
         }
+        let before_lines = std::sync::Arc::clone(&self.decoded.lines);
+        let before_history = std::sync::Arc::clone(&self.history);
+        let before_styles = self.styles.len();
+        let before_end = self.decoded.end;
         let remaining = self.remaining;
         let outcome = captured_history_window_cached(
             &mut ResidentOnly,
@@ -1724,6 +1822,13 @@ impl CapturedHistoryCache {
             self,
         )
         .now_or_never();
+        if !std::sync::Arc::ptr_eq(&before_lines, &self.decoded.lines)
+            || !std::sync::Arc::ptr_eq(&before_history, &self.history)
+            || before_styles != self.styles.len()
+            || before_end != self.decoded.end
+        {
+            self.changed();
+        }
         // An unsuccessful probe must not consume admission credits merely for
         // asking whether a missing line is resident.
         let Some(Ok(CapturedWindowOutcome::Window(mut window))) = outcome else {
@@ -1820,6 +1925,7 @@ impl CapturedHistoryCache {
                 self.image_bytes -= old.bytes;
             }
         }
+        self.changed();
         self.image_bytes += bytes;
         self.image_coverage
             .push_back(std::sync::Arc::new(CapturedImageCoverage {
@@ -2071,7 +2177,8 @@ pub async fn captured_history_window_cached(
             *remaining = remaining
                 .checked_sub(HISTORY_INDEX_ENTRY_BYTES)
                 .ok_or_else(|| history_decode_error(&"history cache metadata budget"))?;
-            cache.history.insert(index, std::sync::Arc::clone(&line));
+            std::sync::Arc::make_mut(&mut cache.history)
+                .insert(index, std::sync::Arc::clone(&line));
             line
         };
         let count = line.projected_rows(usize::from(meta.width));
@@ -2413,7 +2520,9 @@ struct CapturedLineCache {
     /// Resume only at a completed logical-line boundary. Cancelled partial
     /// assembly never advances this cursor.
     tail_resume: Option<(u16, usize)>,
-    lines: std::collections::BTreeMap<u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>>,
+    lines: std::sync::Arc<
+        std::collections::BTreeMap<u32, std::sync::Arc<bmux_terminal_grid::HistoryLineAssembly>>,
+    >,
 }
 
 impl CapturedLineCache {
@@ -2457,7 +2566,7 @@ impl CapturedLineCache {
                 .map(|(key, _)| key.saturating_add(1));
             return Ok(None);
         };
-        self.lines
+        std::sync::Arc::make_mut(&mut self.lines)
             .entry(index)
             .or_insert_with(|| std::sync::Arc::clone(&line));
         Ok(Some(line))
@@ -2599,7 +2708,7 @@ async fn fetch_captured_content_line(
                 .checked_sub(charge)
                 .ok_or_else(|| history_decode_error(&"decoded line metadata budget"))?;
             let completed = std::sync::Arc::new(line);
-            lines.insert(key, std::sync::Arc::clone(&completed));
+            std::sync::Arc::make_mut(lines).insert(key, std::sync::Arc::clone(&completed));
             *tail_resume = Some((row + 1, logical + 1));
             if logical == index as usize {
                 return Ok(Some(completed));
