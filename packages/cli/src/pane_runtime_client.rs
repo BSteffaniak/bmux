@@ -780,6 +780,15 @@ mod history_tests {
         cache.decoded.lines.retain(|line, _| *line >= 20);
         cache.prepare_resident_index(2, 40);
         assert_eq!(cache.indexed.as_ref().unwrap().first_line, 20);
+        cache.prepare_resident_index(1, 40);
+        assert_eq!(cache.indexed.as_ref().unwrap().width, 1);
+        assert_eq!(
+            cache.indexed.as_ref().unwrap().content.row_count(),
+            Some(80)
+        );
+        cache.prepare_resident_index(0, 40);
+        assert_eq!(cache.indexed.as_ref().unwrap().width, 1);
+        cache.prepare_resident_index(2, 40);
         let partial = cache
             .indexed_window(0, 20, (2, window.row_anchors.last().copied(), 0))
             .unwrap();
@@ -1007,6 +1016,97 @@ mod history_tests {
                 .sum::<usize>()
         );
         assert!(cache.image_bytes <= 8 * 1024 * 1024);
+    }
+
+    #[test]
+    #[ignore = "manual resident navigation benchmark; run with --ignored --nocapture"]
+    fn resident_history_navigation_benchmark() {
+        use bmux_terminal_grid::{
+            Cell, HistoryLineAssembly, HistorySlice, HistorySliceEnd, StyleId,
+        };
+        let mut cache = super::CapturedHistoryCache::default();
+        let capture = uuid::Uuid::new_v4();
+        let pin = bmux_attach_pipeline::ScrollbackPin {
+            capture: Some(bmux_attach_pipeline::ScrollbackCapture {
+                identity: capture,
+                lines: 10_000,
+                truncated: false,
+                width: 80,
+                height: 24,
+            }),
+            pin_id: 1,
+            total_scrolled_rows: 10_000,
+            max_scrollback_offset: 10_000,
+            stream_end: 0,
+            created_epoch_secs: 0,
+        };
+        let identity = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), pin);
+        cache.prepare(identity.0, identity.1, identity.2);
+        for index in 0..10_000_u32 {
+            let text = format!("row-{index:05} abcdefghijklmnopqrstuvwxyz");
+            let cells = text
+                .chars()
+                .map(|ch| Cell::new(ch.to_string(), StyleId::DEFAULT, 1))
+                .collect::<Vec<_>>();
+            let mut line =
+                HistoryLineAssembly::new(capture.as_u128(), index as usize, 65536, false);
+            line.append(
+                capture.as_u128(),
+                index as usize,
+                0,
+                &HistorySlice {
+                    cells: &cells,
+                    next_cell_offset: cells.len(),
+                    end: HistorySliceEnd::HardBreak,
+                },
+            )
+            .unwrap();
+            cache.history.insert(index, std::sync::Arc::new(line));
+        }
+        let anchors = (4900..5100)
+            .map(|line_index| bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id: capture,
+                line_index,
+                column: 0,
+            })
+            .collect::<Vec<_>>();
+        cache.retain_images(80, &anchors, &[]);
+        let started = std::time::Instant::now();
+        cache.prepare_resident_index(80, 5000);
+        let build = started.elapsed();
+        let mut samples = Vec::with_capacity(2000);
+        for step in 0..2000 {
+            let distance = step % 100;
+            let started = std::time::Instant::now();
+            let window = cache
+                .resident_window(
+                    identity,
+                    distance,
+                    24,
+                    (
+                        80,
+                        anchors.last().copied(),
+                        isize::try_from(distance).unwrap(),
+                    ),
+                )
+                .unwrap();
+            std::hint::black_box(&window);
+            samples.push(started.elapsed().as_nanos());
+            assert_eq!(window.rows.len(), 24);
+            assert_eq!(
+                window.row_anchors.last().unwrap().line_index,
+                5099 - u32::try_from(distance).unwrap()
+            );
+        }
+        samples.sort_unstable();
+        eprintln!(
+            "resident_history lines=10000 width=80 rows=24 samples=2000 index_build_us={} p50_ns={} p95_ns={} p99_ns={} max_ns={}",
+            build.as_micros(),
+            samples[1000],
+            samples[1900],
+            samples[1980],
+            samples[1999]
+        );
     }
 
     struct HistoryClient;
@@ -1417,6 +1517,28 @@ impl CapturedHistoryCache {
         }
         while end - line < 2048 && resident(end).is_some() {
             end += 1;
+        }
+        if let Some(index) = self.indexed.as_mut()
+            && index.first_line == first
+            && index.end_line == end
+        {
+            // Reflow the retained canonical source; changing presentation width
+            // does not require cloning source cells again. prepare is atomic on
+            // failure, so the old width remains usable until replacement succeeds.
+            if index
+                .content
+                .prepare(
+                    width,
+                    bmux_terminal_grid::ContentBudget {
+                        cells: 1_000_000,
+                        bytes: 32 * 1024 * 1024,
+                    },
+                )
+                .is_ok()
+            {
+                index.width = width;
+            }
+            return;
         }
         let mut lines = Vec::new();
         for index in first..end {
