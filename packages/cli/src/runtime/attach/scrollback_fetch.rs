@@ -41,6 +41,26 @@ impl Request {
         }
     }
 
+    fn live_window_request(self) -> crate::pane_runtime_client::PaneGridWindowRequest {
+        crate::pane_runtime_client::PaneGridWindowRequest {
+            pane_id: self.pane,
+            scrollback_offset: if self.boundary == Some(Boundary::Newest) {
+                0
+            } else {
+                self.offset
+            },
+            rows: self.rows,
+            // Following the current tail is deliberately unanchored. Applying
+            // growth from a historical window would land behind new output.
+            anchor_total_scrolled_rows: if self.boundary == Some(Boundary::Newest) {
+                None
+            } else {
+                self.total
+            },
+            pin_id: self.pin.map(|pin| pin.pin_id),
+        }
+    }
+
     pub(super) fn neighbors(self, window: &PaneScrollbackWindow) -> Vec<Self> {
         if self.pin.is_none() || self.rows == 0 {
             return Vec::new();
@@ -287,13 +307,7 @@ async fn fetch_owned(
     let windows = crate::pane_runtime_client::attach_pane_grid_window_state_streaming(
         client,
         request.session,
-        vec![crate::pane_runtime_client::PaneGridWindowRequest {
-            pane_id: request.pane,
-            scrollback_offset: request.offset,
-            rows,
-            anchor_total_scrolled_rows: request.total,
-            pin_id: request.pin.map(|pin| pin.pin_id),
-        }],
+        vec![request.live_window_request()],
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -323,6 +337,32 @@ async fn fetch_owned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_newest_does_not_reapply_historical_anchor_growth() {
+        let request = Request {
+            boundary: Some(Boundary::Newest),
+            session: Uuid::new_v4(),
+            pane: Uuid::new_v4(),
+            pin: None,
+            offset: 40,
+            width: 80,
+            rows: 24,
+            total: Some(100),
+            anchor: None,
+            delta: 0,
+        };
+        let newest = request.live_window_request();
+        assert_eq!(newest.scrollback_offset, 0);
+        assert_eq!(newest.anchor_total_scrolled_rows, None);
+        let relative = Request {
+            boundary: None,
+            ..request
+        }
+        .live_window_request();
+        assert_eq!(relative.scrollback_offset, 40);
+        assert_eq!(relative.anchor_total_scrolled_rows, Some(100));
+    }
 
     #[test]
     fn prefetch_is_bounded_bidirectional_and_capture_only() {
