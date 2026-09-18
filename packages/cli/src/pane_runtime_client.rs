@@ -738,8 +738,7 @@ mod history_tests {
             "projection must not consume retained budget"
         );
         cache.retain_images(2, &window.row_anchors, &[]);
-        cache.prepare_resident_index(2);
-        assert!(cache.indexed.is_some());
+        cache.prepare_resident_index(2, 30);
         let admitted = cache.remaining;
         for offset in 0..40 {
             let indexed = cache
@@ -768,8 +767,28 @@ mod history_tests {
             "unknown resized image coverage must fetch"
         );
         assert_eq!(client.0, 60);
+        assert_partial_index(&mut cache, &window);
         cache.prepare(uuid::Uuid::new_v4(), identity.1, pin);
         assert!(cache.decoded.lines.is_empty());
+    }
+
+    fn assert_partial_index(
+        cache: &mut super::CapturedHistoryCache,
+        window: &bmux_attach_pipeline::PaneScrollbackWindow,
+    ) {
+        cache.indexed = None;
+        cache.decoded.lines.retain(|line, _| *line >= 20);
+        cache.prepare_resident_index(2, 40);
+        assert_eq!(cache.indexed.as_ref().unwrap().first_line, 20);
+        let partial = cache
+            .indexed_window(0, 20, (2, window.row_anchors.last().copied(), 0))
+            .unwrap();
+        assert_eq!(partial.row_anchors[0].line_index, 40);
+        assert!(
+            cache
+                .indexed_window(50, 20, (2, window.row_anchors.last().copied(), 50))
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1345,9 +1364,16 @@ struct CapturedImageCoverage {
     bytes: usize,
 }
 
+struct ResidentIndex {
+    width: usize,
+    first_line: u32,
+    end_line: u32,
+    content: bmux_terminal_grid::ContentProjection,
+}
+
 #[derive(Default)]
 pub struct CapturedHistoryCache {
-    indexed: Option<(usize, bmux_terminal_grid::ContentProjection)>,
+    indexed: Option<ResidentIndex>,
     image_coverage: std::collections::VecDeque<CapturedImageCoverage>,
     image_bytes: usize,
     identity: Option<(Uuid, Uuid, bmux_attach_pipeline::ScrollbackPin)>,
@@ -1360,14 +1386,12 @@ pub struct CapturedHistoryCache {
 }
 
 impl CapturedHistoryCache {
-    /// Prepare a complete small capture off the input path. Partial captures
-    /// remain on the bounded fetch path rather than inventing missing lines.
-    pub fn prepare_resident_index(&mut self, width: usize) {
-        if self
-            .indexed
-            .as_ref()
-            .is_some_and(|(existing, _)| *existing == width)
-        {
+    /// Index a bounded contiguous resident range around the requested anchor.
+    /// Gaps remain explicit; partial residency never renumbers source identities.
+    pub fn prepare_resident_index(&mut self, width: usize, line: u32) {
+        if self.indexed.as_ref().is_some_and(|index| {
+            index.width == width && (index.first_line..index.end_line).contains(&line)
+        }) {
             return;
         }
         let Some((_, _, pin)) = self.identity else {
@@ -1376,11 +1400,26 @@ impl CapturedHistoryCache {
         let Some(meta) = pin.capture else {
             return;
         };
-        let Some(end) = self.decoded.end else {
-            return;
+        let resident = |index: u32| {
+            self.decoded
+                .lines
+                .get(&index)
+                .or_else(|| self.history.get(&index))
         };
+        if resident(line).is_none() {
+            return;
+        }
+        let mut first = line;
+        let mut end = line.saturating_add(1);
+        // Metadata scans are bounded independently of cell and byte budgets.
+        while line - first < 2048 && first > 0 && resident(first - 1).is_some() {
+            first -= 1;
+        }
+        while end - line < 2048 && resident(end).is_some() {
+            end += 1;
+        }
         let mut lines = Vec::new();
-        for index in 0..end {
+        for index in first..end {
             let Some(line) = self
                 .decoded
                 .lines
@@ -1402,14 +1441,19 @@ impl CapturedHistoryCache {
             meta.identity.as_u128(),
             0,
             lines,
-            false,
+            first != 0,
             meta.truncated,
             budget,
         ) else {
             return;
         };
         if content.prepare(width, budget).is_ok() {
-            self.indexed = Some((width, content));
+            self.indexed = Some(ResidentIndex {
+                width,
+                first_line: first,
+                end_line: end,
+                content,
+            });
         }
     }
 
@@ -1424,15 +1468,17 @@ impl CapturedHistoryCache {
         ),
     ) -> Option<bmux_attach_pipeline::PaneScrollbackWindow> {
         let (_, _, pin) = self.identity?;
-        let (width, index) = self.indexed.as_ref()?;
-        if *width != projection.0 || rows == 0 || rows > 256 {
+        let resident = self.indexed.as_ref()?;
+        let width = resident.width;
+        let index = &resident.content;
+        if width != projection.0 || rows == 0 || rows > 256 {
             return None;
         }
         let anchor = projection.1?;
         let bottom = index
             .resolve(bmux_terminal_grid::ContentAnchor {
                 capture: anchor.capture_id.as_u128(),
-                line: anchor.line_index as usize,
+                line: anchor.line_index.checked_sub(resident.first_line)? as usize,
                 column: anchor.column,
             })?
             .checked_add(1)?;
@@ -1442,7 +1488,7 @@ impl CapturedHistoryCache {
         } else {
             bottom.saturating_add(projection.2.unsigned_abs())
         };
-        if requested_end < rows.min(total) || requested_end > total {
+        if requested_end < rows || requested_end > total {
             return None;
         }
         let end = requested_end;
@@ -1455,15 +1501,17 @@ impl CapturedHistoryCache {
             .map(|anchor| {
                 Some(bmux_attach_pipeline::CapturedHistoryAnchor {
                     capture_id: Uuid::from_u128(anchor.capture),
-                    line_index: u32::try_from(anchor.line).ok()?,
+                    line_index: u32::try_from(anchor.line)
+                        .ok()?
+                        .checked_add(resident.first_line)?,
                     column: anchor.column,
                 })
             })
             .collect::<Option<Vec<_>>>()?;
-        let images = self.cached_images(*width, &anchors)?;
+        let images = self.cached_images(width, &anchors)?;
         Some(bmux_attach_pipeline::PaneScrollbackWindow {
             images,
-            projection_width: *width,
+            projection_width: width,
             row_anchors: anchors,
             palette: bmux_terminal_grid::StylePalette::from_styles(self.styles.clone()),
             scrollback_offset: offset,
