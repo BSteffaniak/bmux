@@ -263,9 +263,14 @@ pub struct AttachViewState {
     /// Scrollback history itself lives on the server (pane-runtime plugin);
     /// these are just this client's per-pane view offsets into that history.
     pub pane_scrollback: PaneScrollbackViews,
-    pub(super) decoded_history:
+    pub(super) decoded_history: std::collections::BTreeMap<
+        Uuid,
         std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
+    >,
+    pub(super) scroll_started: std::collections::BTreeMap<Uuid, (Instant, Instant)>,
+    pub(super) scroll_boundary: std::collections::BTreeMap<Uuid, super::scrollback_fetch::Boundary>,
     pub(super) pending_scroll: std::collections::BTreeMap<Uuid, usize>,
+    pub(super) history_prefetch: std::collections::VecDeque<super::scrollback_fetch::Request>,
     pub(super) scrollback_fetch: Option<super::scrollback_fetch::Fetch>,
     pub(super) scrollback_cache: super::scrollback_cache::ScrollbackCache,
     /// Set when leaving frozen scrollback so the next post-event pass drains
@@ -618,8 +623,11 @@ impl AttachViewState {
             local_presentation: None,
             active_mode_id: "normal".to_string(),
             pane_scrollback: PaneScrollbackViews::new(),
-            decoded_history: std::sync::Arc::default(),
+            decoded_history: std::collections::BTreeMap::new(),
+            scroll_started: std::collections::BTreeMap::new(),
+            scroll_boundary: std::collections::BTreeMap::new(),
             pending_scroll: std::collections::BTreeMap::new(),
+            history_prefetch: std::collections::VecDeque::new(),
             scrollback_fetch: None,
             scrollback_cache: super::scrollback_cache::ScrollbackCache::default(),
             scrollback_replay_pending: false,
@@ -801,6 +809,28 @@ impl AttachViewState {
     }
 
     /// Leave scrollback for one specific pane.
+    /// Retain two independently bounded decoded replicas. Together with the
+    /// single worker's replacement index, this bounds attachment residency;
+    /// eviction only drops derived data, never daemon history or view state.
+    pub(super) fn history_cache_for(
+        &mut self,
+        pane: Uuid,
+    ) -> std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>> {
+        if !self.decoded_history.contains_key(&pane) && self.decoded_history.len() >= 2 {
+            if let Some(old) = self
+                .decoded_history
+                .keys()
+                .copied()
+                .find(|id| *id != self.focused_pane_id().unwrap_or(pane))
+            {
+                self.decoded_history.remove(&old);
+            } else if let Some(old) = self.decoded_history.keys().next().copied() {
+                self.decoded_history.remove(&old);
+            }
+        }
+        self.decoded_history.entry(pane).or_default().clone()
+    }
+
     /// Navigation intent is separate from the coherent displayed viewport.
     pub fn requested_scroll_offset(&self, pane: Uuid) -> Option<usize> {
         self.scrollback_for(pane).map(|view| {
@@ -812,12 +842,25 @@ impl AttachViewState {
     }
 
     pub fn request_scroll_offset(&mut self, pane: Uuid, offset: usize) {
+        self.scroll_boundary.remove(&pane);
         if self.scrollback_active_for(pane) {
+            if self.requested_scroll_offset(pane) != Some(offset) {
+                let now = Instant::now();
+                self.scroll_started
+                    .entry(pane)
+                    .and_modify(|(_, latest)| *latest = now)
+                    .or_insert((now, now));
+            }
             self.pending_scroll.insert(pane, offset);
         }
     }
 
     pub fn exit_scrollback_for(&mut self, pane_id: Uuid) -> bool {
+        self.decoded_history.remove(&pane_id);
+        self.history_prefetch
+            .retain(|request| request.pane != pane_id);
+        self.scroll_boundary.remove(&pane_id);
+        self.scroll_started.remove(&pane_id);
         self.pending_scroll.remove(&pane_id);
         self.scrollback_cache.invalidate(pane_id);
         if let Some(buffer) = self.pane_buffers.get_mut(&pane_id) {
@@ -841,6 +884,10 @@ impl AttachViewState {
 
     /// Drop scrollback views for panes that no longer exist.
     pub fn retain_scrollback_panes(&mut self, active_pane_ids: &BTreeSet<Uuid>) {
+        self.scroll_started
+            .retain(|pane, _| active_pane_ids.contains(pane));
+        self.decoded_history
+            .retain(|pane, _| active_pane_ids.contains(pane));
         self.pending_scroll
             .retain(|pane, _| active_pane_ids.contains(pane));
         self.pane_scrollback
@@ -865,6 +912,27 @@ impl AttachViewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_replicas_are_pane_scoped_and_bounded() {
+        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
+            session_id: Uuid::new_v4(),
+            context_id: None,
+            can_write: true,
+        });
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let first = state.history_cache_for(a);
+        let second = state.history_cache_for(b);
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
+        assert!(std::sync::Arc::ptr_eq(&first, &state.history_cache_for(a)));
+        state.history_cache_for(Uuid::from_u128(3));
+        assert_eq!(state.decoded_history.len(), 2);
+        state.exit_scrollback_for(b);
+        assert!(!state.decoded_history.contains_key(&b));
+        state.retain_scrollback_panes(&BTreeSet::new());
+        assert!(state.decoded_history.is_empty());
+    }
 
     #[test]
     fn historical_text_never_uses_live_images_and_exit_restores_them() {

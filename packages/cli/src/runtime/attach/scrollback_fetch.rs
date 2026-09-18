@@ -3,7 +3,14 @@ use bmux_attach_pipeline::{CapturedHistoryAnchor, PaneScrollbackWindow, Scrollba
 use uuid::Uuid;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Boundary {
+    Oldest,
+    Newest,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Request {
+    pub boundary: Option<Boundary>,
     pub session: Uuid,
     pub pane: Uuid,
     pub pin: Option<ScrollbackPin>,
@@ -16,6 +23,104 @@ pub struct Request {
 }
 
 impl Request {
+    pub(super) fn projection(self) -> (usize, Option<CapturedHistoryAnchor>, isize) {
+        match self.boundary {
+            Some(Boundary::Oldest) => (
+                self.width,
+                self.pin
+                    .and_then(|pin| pin.capture)
+                    .map(|capture| CapturedHistoryAnchor {
+                        capture_id: capture.identity,
+                        line_index: 0,
+                        column: 0,
+                    }),
+                0,
+            ),
+            Some(Boundary::Newest) => (self.width, None, 0),
+            None => (self.width, self.anchor, self.delta),
+        }
+    }
+
+    pub(super) fn neighbors(self, window: &PaneScrollbackWindow) -> Vec<Self> {
+        if self.pin.is_none() || self.rows == 0 {
+            return Vec::new();
+        }
+        let Some(anchor) = window.row_anchors.last().copied() else {
+            return Vec::new();
+        };
+        let mut requests = Vec::with_capacity(2);
+        for offset in [
+            window
+                .scrollback_offset
+                .saturating_add(self.rows)
+                .min(window.max_scrollback_offset),
+            window.scrollback_offset.saturating_sub(self.rows),
+        ] {
+            if offset == window.scrollback_offset {
+                continue;
+            }
+            let distance =
+                isize::try_from(offset.abs_diff(window.scrollback_offset)).unwrap_or(isize::MAX);
+            requests.push(Self {
+                boundary: None,
+                offset,
+                anchor: Some(anchor),
+                delta: if offset > window.scrollback_offset {
+                    distance
+                } else {
+                    -distance
+                },
+                ..self
+            });
+        }
+        requests
+    }
+
+    /// Bound queued work by both screens and distance, closest first. This is
+    /// speculative capture hydration, never an alternate navigation authority.
+    pub(super) fn warm_range(self, window: &PaneScrollbackWindow) -> Vec<Self> {
+        let mut requests = self.neighbors(window);
+        let Some(anchor) = window.row_anchors.last().copied() else {
+            return requests;
+        };
+        if self.pin.is_none() || self.rows == 0 {
+            return requests;
+        }
+        for screens in 2_usize..=16 {
+            let distance = self.rows.saturating_mul(screens);
+            if distance > 2048 {
+                break;
+            }
+            for offset in [
+                window
+                    .scrollback_offset
+                    .saturating_add(distance)
+                    .min(window.max_scrollback_offset),
+                window.scrollback_offset.saturating_sub(distance),
+            ] {
+                if offset == window.scrollback_offset
+                    || requests.iter().any(|request| request.offset == offset)
+                {
+                    continue;
+                }
+                let delta = isize::try_from(offset.abs_diff(window.scrollback_offset))
+                    .unwrap_or(isize::MAX);
+                requests.push(Self {
+                    boundary: None,
+                    offset,
+                    anchor: Some(anchor),
+                    delta: if offset > window.scrollback_offset {
+                        delta
+                    } else {
+                        -delta
+                    },
+                    ..self
+                });
+            }
+        }
+        requests
+    }
+
     /// Navigation may supersede presentation without invalidating immutable
     /// content. Mutable live windows cannot use this admission shortcut.
     pub(super) fn reusable_capture(
@@ -68,6 +173,7 @@ pub(super) enum Outcome {
 }
 
 pub(super) struct Fetch {
+    pub prefetch: bool,
     pub request: Request,
     pub task: tokio::task::JoinHandle<Outcome>,
 }
@@ -96,8 +202,23 @@ pub async fn fetch_with_client(
     request: Request,
     cache: std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
 ) -> Result<PaneScrollbackWindow, FetchError> {
-    let shared_cache = cache;
-    let mut cache = shared_cache.lock().await;
+    let original = cache.lock().await.clone();
+    let mut working = original.clone();
+    let result = fetch_owned(client, request, &mut working).await;
+    if result.is_ok() {
+        let mut resident = cache.lock().await;
+        if resident.same_source(&original) {
+            *resident = working;
+        }
+    }
+    result
+}
+
+async fn fetch_owned(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    request: Request,
+    cache: &mut crate::pane_runtime_client::CapturedHistoryCache,
+) -> Result<PaneScrollbackWindow, FetchError> {
     let rows = request.rows;
     if let Some(pin) = request.pin {
         let mut last_error = None;
@@ -107,13 +228,18 @@ pub async fn fetch_with_client(
         // Resolve visible navigation first. A larger speculative viewport has
         // different boundary semantics and must not clamp the user's target.
         for count in [rows] {
+            let offset = if request.boundary == Some(Boundary::Newest) {
+                0
+            } else {
+                request.offset
+            };
             let result = crate::pane_runtime_client::captured_history_window_cached(
                 client,
                 (request.session, request.pane, pin),
-                request.offset,
+                offset,
                 count,
-                (request.width, request.anchor, request.delta),
-                &mut cache,
+                request.projection(),
+                cache,
             )
             .await;
             match result {
@@ -126,9 +252,6 @@ pub async fn fetch_with_client(
                         return Ok(window);
                     }
                     let origin = window.row_anchors.first().ok_or("missing capture origin")?;
-                    // Image transport must not exclude local readers from the
-                    // already-decoded canonical content for an entire RPC.
-                    drop(cache);
                     let reply = bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_history_images_v3(
                         client, request.session, request.pane, pin.pin_id, origin.capture_id,
                         u16::try_from(request.width).map_err(|error| error.to_string())?,
@@ -144,11 +267,7 @@ pub async fn fetch_with_client(
                     }
                     window.images = serde_json::from_slice(&reply.encoded)
                         .map_err(|error| error.to_string())?;
-                    let mut cache = shared_cache.lock().await;
-                    if cache.matches_capture((request.session, request.pane, pin)) {
-                        cache.retain_images(request.width, &window.row_anchors, &window.images);
-                    }
-                    drop(cache);
+                    cache.retain_images(request.width, &window.row_anchors, &window.images);
                     return Ok(window);
                 }
                 Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) => {}
@@ -165,7 +284,6 @@ pub async fn fetch_with_client(
         // graphics and logical origin. Legacy reads are only for unpinned views.
         return Err(last_error.map_or(FetchError::Unavailable, FetchError::Failed));
     }
-    drop(cache);
     let windows = crate::pane_runtime_client::attach_pane_grid_window_state_streaming(
         client,
         request.session,
@@ -207,6 +325,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prefetch_is_bounded_bidirectional_and_capture_only() {
+        let request = Request {
+            boundary: None,
+            session: Uuid::new_v4(),
+            pane: Uuid::new_v4(),
+            pin: Some(ScrollbackPin {
+                capture: None,
+                pin_id: 1,
+                total_scrolled_rows: 100,
+                max_scrollback_offset: 100,
+                stream_end: 0,
+                created_epoch_secs: 0,
+            }),
+            offset: 40,
+            width: 80,
+            rows: 20,
+            total: None,
+            anchor: None,
+            delta: 0,
+        };
+        let window = PaneScrollbackWindow {
+            images: Vec::new(),
+            projection_width: 80,
+            row_anchors: vec![CapturedHistoryAnchor {
+                capture_id: Uuid::new_v4(),
+                line_index: 50,
+                column: 0,
+            }],
+            palette: bmux_terminal_grid::StylePalette::default(),
+            scrollback_offset: 40,
+            max_scrollback_offset: 100,
+            total_scrolled_rows: 100,
+            rows: Vec::new(),
+        };
+        let neighbors = request.neighbors(&window);
+        assert_eq!(neighbors.len(), 2);
+        assert_eq!((neighbors[0].offset, neighbors[0].delta), (60, 20));
+        assert_eq!((neighbors[1].offset, neighbors[1].delta), (20, -20));
+        let warm = request.warm_range(&window);
+        assert!(warm.len() <= 32);
+        assert_eq!(warm[0].offset, 60);
+        assert!(warm.iter().all(|item| item.offset <= 100));
+        let distinct = warm
+            .iter()
+            .map(|item| item.offset)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct.len(), warm.len());
+        assert!(
+            Request { rows: 0, ..request }
+                .warm_range(&window)
+                .is_empty()
+        );
+        assert!(
+            Request {
+                pin: None,
+                ..request
+            }
+            .neighbors(&window)
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn superseded_navigation_reuses_only_the_same_immutable_capture() {
         let pin = ScrollbackPin {
             capture: None,
@@ -217,6 +398,7 @@ mod tests {
             created_epoch_secs: 0,
         };
         let request = Request {
+            boundary: None,
             session: Uuid::new_v4(),
             pane: Uuid::new_v4(),
             pin: Some(pin),
@@ -255,6 +437,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let client = bmux_plugin::AsyncServiceClient::bind(1, sender).unwrap();
         let request = Request {
+            boundary: None,
             session: Uuid::new_v4(),
             pane: Uuid::new_v4(),
             pin: Some(ScrollbackPin {
@@ -287,6 +470,7 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let client = bmux_plugin::AsyncServiceClient::bind(1, sender).unwrap();
         let request = Request {
+            boundary: None,
             session: Uuid::new_v4(),
             pane: Uuid::new_v4(),
             pin: None,
@@ -297,11 +481,37 @@ mod tests {
             anchor: None,
             delta: 0,
         };
+        let cache = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::pane_runtime_client::CapturedHistoryCache::default(),
+        ));
+        let request = Request {
+            boundary: None,
+            pin: Some(ScrollbackPin {
+                capture: Some(bmux_attach_pipeline::ScrollbackCapture {
+                    identity: Uuid::new_v4(),
+                    lines: 50,
+                    truncated: false,
+                    width: 80,
+                    height: 24,
+                }),
+                pin_id: 1,
+                total_scrolled_rows: 50,
+                max_scrollback_offset: 50,
+                stream_end: 0,
+                created_epoch_secs: 0,
+            }),
+            ..request
+        };
         let fetch = Fetch {
+            prefetch: false,
             request,
-            task: tokio::spawn(fetch(client, request, std::sync::Arc::default())),
+            task: tokio::spawn(fetch(client, request, cache.clone())),
         };
         let held_request = receiver.recv().await.unwrap();
+        assert!(
+            cache.try_lock().is_ok(),
+            "resident content must remain readable during history IPC"
+        );
         assert!(!fetch.task.is_finished());
         drop(fetch);
         tokio::task::yield_now().await;

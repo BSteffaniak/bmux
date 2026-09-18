@@ -1118,6 +1118,36 @@ mod history_tests {
         );
     }
 
+    #[test]
+    fn adjacent_empty_image_ranges_cover_navigation_without_rpc() {
+        let capture = uuid::Uuid::new_v4();
+        let anchors = (0..60)
+            .map(|line_index| bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id: capture,
+                line_index,
+                column: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut cache = super::CapturedHistoryCache::default();
+        cache.retain_images(80, &anchors[..20], &[]);
+        cache.retain_images(80, &anchors[20..40], &[]);
+        cache.retain_images(80, &anchors[40..], &[]);
+        for start in 0..=40 {
+            assert_eq!(
+                cache.cached_images(80, &anchors[start..start + 20]),
+                Some(Vec::new())
+            );
+        }
+        assert!(cache.cached_images(40, &anchors[10..30]).is_none());
+        cache.image_coverage.remove(1);
+        assert!(cache.cached_images(80, &anchors[10..30]).is_none());
+        let other = [bmux_attach_pipeline::CapturedHistoryAnchor {
+            capture_id: uuid::Uuid::new_v4(),
+            ..anchors[0]
+        }];
+        assert!(cache.cached_images(80, &other).is_none());
+    }
+
     struct HistoryClient;
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryClient {
         async fn invoke_service_raw(
@@ -1480,10 +1510,10 @@ struct ResidentIndex {
     content: bmux_terminal_grid::ContentProjection,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CapturedHistoryCache {
-    indexed: Option<ResidentIndex>,
-    image_coverage: std::collections::VecDeque<CapturedImageCoverage>,
+    indexed: Option<std::sync::Arc<ResidentIndex>>,
+    image_coverage: std::collections::VecDeque<std::sync::Arc<CapturedImageCoverage>>,
     image_bytes: usize,
     identity: Option<(Uuid, Uuid, bmux_attach_pipeline::ScrollbackPin)>,
     decoded: CapturedLineCache,
@@ -1495,6 +1525,11 @@ pub struct CapturedHistoryCache {
 }
 
 impl CapturedHistoryCache {
+    pub fn same_source(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+
+    #[cfg(test)]
     pub fn matches_capture(
         &self,
         identity: (Uuid, Uuid, bmux_attach_pipeline::ScrollbackPin),
@@ -1534,7 +1569,7 @@ impl CapturedHistoryCache {
         while end - line < 2048 && resident(end).is_some() {
             end += 1;
         }
-        if let Some(index) = self.indexed.as_mut()
+        if let Some(index) = self.indexed.as_mut().and_then(std::sync::Arc::get_mut)
             && index.first_line == first
             && index.end_line == end
         {
@@ -1586,12 +1621,12 @@ impl CapturedHistoryCache {
             return;
         };
         if content.prepare(width, budget).is_ok() {
-            self.indexed = Some(ResidentIndex {
+            self.indexed = Some(std::sync::Arc::new(ResidentIndex {
                 width,
                 first_line: first,
                 end_line: end,
                 content,
-            });
+            }));
         }
     }
 
@@ -1709,23 +1744,53 @@ impl CapturedHistoryCache {
         if anchors.is_empty() {
             return None;
         }
-        self.image_coverage.iter().rev().find_map(|entry| {
-            if entry.width != width {
-                return None;
-            }
-            let exact = entry.anchors == anchors;
-            let empty = entry.images.is_empty();
-            if !(exact
-                || (empty
-                    && entry
-                        .anchors
-                        .windows(anchors.len())
-                        .any(|range| range == anchors)))
-            {
-                return None;
-            }
-            Some(entry.images.clone())
-        })
+        self.image_coverage
+            .iter()
+            .rev()
+            .find_map(|entry| {
+                if entry.width != width {
+                    return None;
+                }
+                let exact = entry.anchors == anchors;
+                let empty = entry.images.is_empty();
+                if !(exact
+                    || (empty
+                        && entry
+                            .anchors
+                            .windows(anchors.len())
+                            .any(|range| range == anchors)))
+                {
+                    return None;
+                }
+                Some(entry.images.clone())
+            })
+            .or_else(|| {
+                // Every requested physical source row must be covered at this width.
+                // Do not infer empty coverage from a neighboring row or from another
+                // capture; anchors carry their capture identity in equality checks.
+                anchors
+                    .iter()
+                    .all(|anchor| {
+                        self.image_coverage.iter().any(|entry| {
+                            entry.width == width
+                                && entry.images.is_empty()
+                                && entry
+                                    .anchors
+                                    .binary_search_by_key(
+                                        &(anchor.capture_id, anchor.line_index, anchor.column),
+                                        |candidate| {
+                                            (
+                                                candidate.capture_id,
+                                                candidate.line_index,
+                                                candidate.column,
+                                            )
+                                        },
+                                    )
+                                    .is_ok()
+                        })
+                    })
+                    .then(Vec::new)
+            })
     }
 
     pub fn retain_images(
@@ -1741,7 +1806,13 @@ impl CapturedHistoryCache {
                 .saturating_add(std::mem::size_of::<CapturedImageCoverage>()),
             |bytes, image| bytes.saturating_add(image.raw_data.len()),
         );
-        if bytes > LIMIT || anchors.is_empty() {
+        if bytes > LIMIT
+            || anchors.is_empty()
+            || anchors.windows(2).any(|pair| {
+                (pair[0].capture_id, pair[0].line_index, pair[0].column)
+                    >= (pair[1].capture_id, pair[1].line_index, pair[1].column)
+            })
+        {
             return;
         }
         while self.image_bytes.saturating_add(bytes) > LIMIT || self.image_coverage.len() >= 256 {
@@ -1750,12 +1821,13 @@ impl CapturedHistoryCache {
             }
         }
         self.image_bytes += bytes;
-        self.image_coverage.push_back(CapturedImageCoverage {
-            width,
-            anchors: anchors.to_vec(),
-            images: images.to_vec(),
-            bytes,
-        });
+        self.image_coverage
+            .push_back(std::sync::Arc::new(CapturedImageCoverage {
+                width,
+                anchors: anchors.to_vec(),
+                images: images.to_vec(),
+                bytes,
+            }));
     }
 
     fn prepare(&mut self, session: Uuid, pane: Uuid, pin: bmux_attach_pipeline::ScrollbackPin) {
@@ -2334,7 +2406,7 @@ async fn resolve_tail_entry(
 // Conservative per-entry tree-node allowance, including sparsely occupied nodes.
 const HISTORY_INDEX_ENTRY_BYTES: usize = 256;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct CapturedLineCache {
     /// First logical index beyond the immutable captured screen.
     end: Option<u32>,

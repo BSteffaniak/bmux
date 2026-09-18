@@ -5338,6 +5338,7 @@ mod tests {
                 // Locate the image in retained history without depending on shell startup rows.
                 for line in 0..capture.history_line_count {
                     let request = Request {
+                        boundary: None,
                         session, pane, pin: Some(pin), offset: 1, width, rows: 1,
                         total: None, anchor: Some(CapturedHistoryAnchor {
                             capture_id: capture.capture_id, line_index: u32::try_from(line)?, column: if width == 40 { 40 } else { 0 },

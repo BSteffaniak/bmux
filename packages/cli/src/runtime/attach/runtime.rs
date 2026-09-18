@@ -3905,7 +3905,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                 let fetch = view_state.scrollback_fetch.take().expect("active history fetch");
                 let request = fetch.request;
                 let current = view_state.scrollback_for(request.pane);
-                let valid = view_state.attached_id == request.session
+                let valid = !fetch.prefetch && view_state.scroll_boundary.get(&request.pane).copied() == request.boundary && view_state.attached_id == request.session
                     && current.is_some_and(|view| view.pin == request.pin && view_state.requested_scroll_offset(request.pane) == Some(request.offset))
                     && attach_pane_inner_size(&view_state, request.pane) == Some((request.width, request.rows));
                 let succeeded = matches!(&history, Ok(super::scrollback_fetch::Outcome::Ready(_)));
@@ -3917,6 +3917,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                             if let Some(total) = request.total {
                                 view_state.scrollback_cache.advance(request.pane, total, window.total_scrolled_rows);
                             }
+                            view_state.history_prefetch = request.warm_range(&window).into();
                             publish_scrollback_window(&mut view_state, request.pane, window);
                             view_state.dirty.mark_pane_dirty(request.pane, AttachDirtySource::PaneOutput);
                         }
@@ -3927,7 +3928,9 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
                                 Err(error) => error.to_string(),
                                 Ok(super::scrollback_fetch::Outcome::Ready(_)) => unreachable!(),
                             };
+                            view_state.scroll_started.remove(&request.pane);
                             view_state.pending_scroll.remove(&request.pane);
+                            view_state.scroll_boundary.remove(&request.pane);
                             view_state.set_transient_status(format!("history fetch failed: {error}"), Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
                         }
                     }
@@ -6613,12 +6616,18 @@ pub fn handle_attach_ui_action_at(
             let max_offset = max_attach_scrollback(view_state);
             if let Some(pane) = view_state.focused_pane_id() {
                 view_state.request_scroll_offset(pane, max_offset);
+                view_state
+                    .scroll_boundary
+                    .insert(pane, super::scrollback_fetch::Boundary::Oldest);
             }
             clamp_attach_scrollback_cursor(view_state);
         }
         RuntimeAction::ScrollBottom if view_state.scrollback_active() => {
             if let Some(pane) = view_state.focused_pane_id() {
                 view_state.request_scroll_offset(pane, 0);
+                view_state
+                    .scroll_boundary
+                    .insert(pane, super::scrollback_fetch::Boundary::Newest);
             }
             clamp_attach_scrollback_cursor(view_state);
         }
@@ -8499,6 +8508,17 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             .mark_full_frame(AttachDirtySource::PluginCommand);
         return result;
     }
+    let now = Instant::now();
+    view_state.scroll_started.retain(|pane, (first, latest)| {
+        if view_state.pending_scroll.contains_key(pane) {
+            return true;
+        }
+        tracing::debug!(target: "attach.scrollback", pane_id = %pane,
+            oldest_input_to_frame_us = now.saturating_duration_since(*first).as_micros(),
+            latest_input_to_frame_us = now.saturating_duration_since(*latest).as_micros(),
+            "scrollback.frame_committed");
+        false
+    });
     let old_focus = view_state.plugin_focus.focused().and_then(|target| {
         previous.endpoint_for_region(target).map(|endpoint| {
             (
@@ -9900,9 +9920,11 @@ fn ensure_pane_scrollback_windows(
     // restarting assembly on every wheel tick. Completion checks the latest
     // offset before publishing; capture or geometry changes still cancel.
     if view_state.scrollback_fetch.as_ref().is_some_and(|fetch| {
-        view_state
-            .scrollback_for(fetch.request.pane)
-            .is_none_or(|view| view.pin != fetch.request.pin)
+        view_state.scroll_boundary.get(&fetch.request.pane).copied() != fetch.request.boundary
+            && !fetch.prefetch
+            || view_state
+                .scrollback_for(fetch.request.pane)
+                .is_none_or(|view| view.pin != fetch.request.pin)
             || attach_pane_inner_size(view_state, fetch.request.pane)
                 != Some((fetch.request.width, fetch.request.rows))
     }) {
@@ -9917,6 +9939,7 @@ fn ensure_pane_scrollback_windows(
         let Some((width, rows)) = attach_pane_inner_size(view_state, *pane) else {
             continue;
         };
+        let boundary = view_state.scroll_boundary.get(pane).copied();
         let previous = view_state
             .pane_buffers
             .get(pane)
@@ -9927,7 +9950,8 @@ fn ensure_pane_scrollback_windows(
         if mutable_tail {
             view_state.scrollback_cache.invalidate(*pane);
         }
-        if !mutable_tail
+        if boundary.is_none()
+            && !mutable_tail
             && previous.is_some_and(|window| {
                 window.scrollback_offset == offset
                     && window.rows.len() == rows
@@ -9939,15 +9963,17 @@ fn ensure_pane_scrollback_windows(
         if previous.is_none() {
             view_state.scrollback_cache.invalidate(*pane);
         }
-        if let Some(window) = view_state
-            .scrollback_cache
-            .get(*pane, view.pin, offset, width, rows)
+        if boundary.is_none()
+            && let Some(window) = view_state
+                .scrollback_cache
+                .get(*pane, view.pin, offset, width, rows)
         {
             ready.push((*pane, window));
             continue;
         }
         if let Some(pin) = view.pin
-            && let Ok(mut cache) = view_state.decoded_history.try_lock()
+            && let Some(shared) = view_state.decoded_history.get(pane)
+            && let Ok(mut cache) = shared.try_lock()
         {
             let anchor = previous.and_then(|window| window.row_anchors.last().copied());
             let delta = previous
@@ -9961,11 +9987,24 @@ fn ensure_pane_scrollback_windows(
                         -distance
                     }
                 });
+            let projection = super::scrollback_fetch::Request {
+                session: view_state.attached_id,
+                pane: *pane,
+                pin: Some(pin),
+                boundary,
+                offset,
+                width,
+                rows,
+                total: None,
+                anchor,
+                delta,
+            }
+            .projection();
             if let Some(window) = cache.resident_window(
                 (view_state.attached_id, *pane, pin),
                 offset,
                 rows,
-                (width, anchor, delta),
+                projection,
             ) {
                 ready.push((*pane, window));
                 continue;
@@ -9973,6 +10012,7 @@ fn ensure_pane_scrollback_windows(
         }
         if next.is_none() {
             next = Some(super::scrollback_fetch::Request {
+                boundary,
                 session: view_state.attached_id,
                 pane: *pane,
                 pin: view.pin,
@@ -10009,16 +10049,54 @@ fn ensure_pane_scrollback_windows(
             message: "asynchronous history route unavailable".into(),
         });
     }
+    if next.is_some()
+        && view_state
+            .scrollback_fetch
+            .as_ref()
+            .is_some_and(|fetch| fetch.prefetch)
+    {
+        view_state.scrollback_fetch = None;
+    }
+    let mut prefetch = false;
+    if next.is_none() && view_state.scrollback_fetch.is_none() {
+        while let Some(candidate) = view_state.history_prefetch.pop_front() {
+            let current = view_state.scrollback_for(candidate.pane);
+            if !candidate.reusable_capture(
+                view_state.attached_id,
+                current.and_then(|view| view.pin),
+                attach_pane_inner_size(view_state, candidate.pane),
+            ) {
+                continue;
+            }
+            if view_state
+                .scrollback_cache
+                .get(
+                    candidate.pane,
+                    candidate.pin,
+                    candidate.offset,
+                    candidate.width,
+                    candidate.rows,
+                )
+                .is_some()
+            {
+                continue;
+            }
+            next = Some(candidate);
+            prefetch = true;
+            break;
+        }
+    }
     if view_state.scrollback_fetch.is_none()
         && let Some(request) = next
         && let Some(client) = view_state.async_services.clone()
     {
         view_state.scrollback_fetch = Some(super::scrollback_fetch::Fetch {
+            prefetch,
             request,
             task: tokio::spawn(super::scrollback_fetch::fetch(
                 client,
                 request,
-                view_state.decoded_history.clone(),
+                view_state.history_cache_for(request.pane),
             )),
         });
     }
@@ -10033,6 +10111,7 @@ fn publish_scrollback_window(
     pane_id: Uuid,
     mut window: PaneScrollbackWindow,
 ) {
+    view_state.scroll_boundary.remove(&pane_id);
     view_state.pending_scroll.remove(&pane_id);
     let pin = view_state.scrollback_for(pane_id).and_then(|view| view.pin);
     view_state.scrollback_cache.insert(pane_id, pin, &window);
@@ -10413,7 +10492,11 @@ async fn hydrate_attach_state_from_snapshot_mode(
         view_state.pane_input_mode_hints.clear();
         // A different session or a full resync invalidates every cached view.
         view_state.pane_scrollback.clear();
+        view_state.decoded_history.clear();
+        view_state.history_prefetch.clear();
         view_state.pending_scroll.clear();
+        view_state.scroll_boundary.clear();
+        view_state.scroll_started.clear();
         view_state.scrollback_fetch = None;
         view_state.scrollback_cache = super::scrollback_cache::ScrollbackCache::default();
     } else {
@@ -15445,6 +15528,8 @@ mod tests {
                 visible: true,
             });
             state.last_cursor_state = prior_cursor;
+            let now = Instant::now();
+            state.scroll_started.insert(pane_id, (now, now));
             let result = render_attach_frame_to_writer(
                 &mut FailingWriter { fail_flush },
                 &mut state,
@@ -15459,6 +15544,7 @@ mod tests {
                 None,
             );
             assert!(result.is_err());
+            assert!(state.scroll_started.contains_key(&pane_id));
             assert_eq!(
                 state.last_cursor_state, prior_cursor,
                 "failed output committed cursor state"
