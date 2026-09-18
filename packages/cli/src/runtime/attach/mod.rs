@@ -9,7 +9,7 @@ pub mod prompt_ui;
 pub mod provider;
 pub mod render;
 pub mod runtime;
-mod scrollback_cache;
+pub mod scrollback_cache;
 pub mod scrollback_fetch;
 mod scrollback_modes;
 pub mod sim;

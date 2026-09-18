@@ -19,7 +19,7 @@ pub(super) struct ScrollbackCache {
     bytes: usize,
 }
 
-fn project_images(
+pub fn project_images(
     images: &[bmux_attach_image_protocol::AttachPaneImage],
     start: usize,
     rows: usize,

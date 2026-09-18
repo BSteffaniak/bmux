@@ -829,6 +829,7 @@ mod history_tests {
         cache: &mut super::CapturedHistoryCache,
         window: &bmux_attach_pipeline::PaneScrollbackWindow,
     ) {
+        let removed = cache.decoded.lines.clone();
         cache.indexed = None;
         std::sync::Arc::make_mut(&mut cache.decoded.lines).retain(|line, _| *line >= 20);
         cache.prepare_resident_index(2, 40);
@@ -851,6 +852,20 @@ mod history_tests {
                 .indexed_window(50, 20, (2, window.row_anchors.last().copied(), 50))
                 .is_none()
         );
+        let previous = cache.indexed.clone().unwrap();
+        cache.decoded.lines = removed;
+        cache.prepare_resident_index(2, 40);
+        assert_eq!(cache.indexed.as_ref().unwrap().first_line, 0);
+        assert_eq!(
+            previous.first_line, 20,
+            "published projection stays immutable"
+        );
+        let refreshed = cache.indexed.clone().unwrap();
+        cache.prepare_resident_index(2, 40);
+        assert!(std::sync::Arc::ptr_eq(
+            &refreshed,
+            cache.indexed.as_ref().unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -1427,6 +1442,46 @@ mod history_tests {
         assert!(cache.matches_capture(identity));
     }
 
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    #[test]
+    fn resident_image_subrange_rebases_placement_locally() {
+        let capture = uuid::Uuid::new_v4();
+        let anchors = (0..4)
+            .map(|line_index| bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id: capture,
+                line_index,
+                column: 0,
+            })
+            .collect::<Vec<_>>();
+        let image = bmux_attach_image_protocol::AttachPaneImage {
+            id: 1,
+            protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
+            raw_data: vec![1, 2],
+            compression: bmux_attach_image_protocol::CompressionId::None,
+            position_row: 2,
+            position_col: 0,
+            cell_rows: 1,
+            cell_cols: 1,
+            pixel_width: 1,
+            pixel_height: 1,
+        };
+        let mut cache = super::CapturedHistoryCache::default();
+        cache.retain_images(80, &anchors, std::slice::from_ref(&image));
+        let projected = cache.cached_images(80, &anchors[1..]).unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].position_row, 1);
+        assert_eq!(projected[0].raw_data, image.raw_data);
+        assert!(cache.cached_images(80, &anchors[..1]).unwrap().is_empty());
+        assert_eq!(
+            cache.cached_images(80, &anchors).unwrap()[0].position_row,
+            2
+        );
+    }
+
     struct HistoryClient;
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryClient {
         async fn invoke_service_raw(
@@ -1848,11 +1903,6 @@ impl CapturedHistoryCache {
     /// Index a bounded contiguous resident range around the requested anchor.
     /// Gaps remain explicit; partial residency never renumbers source identities.
     pub fn prepare_resident_index(&mut self, width: usize, line: u32) {
-        if self.indexed.as_ref().is_some_and(|index| {
-            index.width == width && (index.first_line..index.end_line).contains(&line)
-        }) {
-            return;
-        }
         let Some((_, _, pin)) = self.identity else {
             return;
         };
@@ -1876,6 +1926,13 @@ impl CapturedHistoryCache {
         }
         while end - line < 2048 && resident(end).is_some() {
             end += 1;
+        }
+        // Hydration may extend the range even when the requested anchor was
+        // already indexed. Reuse only after checking actual resident coverage.
+        if self.indexed.as_ref().is_some_and(|index| {
+            index.width == width && index.first_line == first && index.end_line == end
+        }) {
+            return;
         }
         if let Some(index) = self.indexed.as_mut().and_then(std::sync::Arc::get_mut)
             && index.first_line == first
@@ -2090,18 +2147,18 @@ impl CapturedHistoryCache {
                 if entry.width != width {
                     return None;
                 }
-                let exact = entry.anchors == anchors;
-                let empty = entry.images.is_empty();
-                if !(exact
-                    || (empty
-                        && entry
-                            .anchors
-                            .windows(anchors.len())
-                            .any(|range| range == anchors)))
-                {
-                    return None;
+                if entry.anchors == anchors {
+                    return Some(entry.images.clone());
                 }
-                Some(entry.images.clone())
+                let start = entry
+                    .anchors
+                    .windows(anchors.len())
+                    .position(|range| range == anchors)?;
+                crate::runtime::attach::scrollback_cache::project_images(
+                    &entry.images,
+                    start,
+                    anchors.len(),
+                )
             })
             .or_else(|| {
                 // Every requested physical source row must be covered at this width.
