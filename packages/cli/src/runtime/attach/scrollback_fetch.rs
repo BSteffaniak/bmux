@@ -101,6 +101,7 @@ pub async fn fetch_with_client(
             .await;
             match result {
                 Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(mut window)) => {
+                    cache.prepare_resident_index(request.width);
                     if let Some(images) = cache.cached_images(request.width, &window.row_anchors) {
                         window.images = images;
                         return Ok(window);
