@@ -69,6 +69,9 @@ impl Host {
         if entries.len() >= 1024 && !entries.contains_key(key) {
             return Err("resurrection launch limit reached".into());
         }
+        if let Some(old) = entries.get(key) {
+            stop_and_drain(old)?;
+        }
         let file = self.root.join(format!("{key}.json"));
         let execution = if restored && (!shell || replay) && file.exists() {
             let bytes = std::fs::File::open(&file).map_err(|e| e.to_string())?;
@@ -112,9 +115,7 @@ impl Host {
                 claim: None,
             }),
         });
-        if let Some(old) = entries.insert(key.to_owned(), Arc::clone(&entry)) {
-            old.stopped.store(true, Ordering::SeqCst);
-        }
+        entries.insert(key.to_owned(), Arc::clone(&entry));
         std::thread::spawn(move || {
             let _directory = directory;
             while !entry.stopped.load(Ordering::SeqCst) {
@@ -147,7 +148,7 @@ impl Host {
     pub fn bind(&self, key: &str, endpoint: &str, pid: u32) -> Result<bool, String> {
         let entry = self.entry(key, endpoint)?;
         let mut state = entry.state.lock().map_err(|e| e.to_string())?;
-        if state.pid.is_some() || pid == 0 {
+        if entry.stopped.load(Ordering::SeqCst) || state.pid.is_some() || pid == 0 {
             return Err("launch already bound or invalid PID".into());
         }
         state.pid = Some(pid);
@@ -157,6 +158,9 @@ impl Host {
     pub fn boundary(&self, key: &str, endpoint: &str, prompt: bool) -> Result<bool, String> {
         let entry = self.entry(key, endpoint)?;
         let mut state = entry.state.lock().map_err(|e| e.to_string())?;
+        if entry.stopped.load(Ordering::SeqCst) {
+            return Err("stale execution boundary".into());
+        }
         if !state.shell {
             return Ok(false);
         }
@@ -171,7 +175,10 @@ impl Host {
         state.initial_prompt = false;
         state.replay_start = false;
         let next = Execution::manual();
-        save(&entry.file, &next.committed)?;
+        if let Err(error) = save(&entry.file, &next.committed) {
+            entry.stopped.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
         state.execution.end();
         state.execution = next;
         state.epoch = state
@@ -183,9 +190,13 @@ impl Host {
     }
 
     pub fn close(&self, key: &str, endpoint: &str) -> Result<bool, String> {
-        let entry = self.entry(key, endpoint)?;
-        entry.stopped.store(true, Ordering::SeqCst);
-        self.entries.lock().map_err(|e| e.to_string())?.remove(key);
+        let mut entries = self.entries.lock().map_err(|e| e.to_string())?;
+        let entry = entries
+            .get(key)
+            .filter(|entry| entry.endpoint == endpoint)
+            .ok_or("stale launch endpoint")?;
+        stop_and_drain(entry)?;
+        entries.remove(key);
         Ok(true)
     }
 }
@@ -198,6 +209,15 @@ impl Drop for Host {
             }
         }
     }
+}
+
+fn stop_and_drain(entry: &Entry) -> Result<(), String> {
+    entry.stopped.store(true, Ordering::SeqCst);
+    // Serialize with checkpoint replacement. A writer already holding this lock
+    // finishes before the successor reads durable state; later writers are fenced.
+    let mut state = entry.state.lock().map_err(|e| e.to_string())?;
+    state.execution.end();
+    Ok(())
 }
 
 fn save(path: &Path, checkpoint: &Checkpoint) -> Result<(), String> {
@@ -379,16 +399,25 @@ fn belongs(peer: u32, root: u32, shell: bool) -> bool {
     if !shell {
         return peer == root;
     }
-    // Only the shell's immediate child may register, not arbitrary inherited descendants.
-    let output = std::process::Command::new("ps")
-        .args(["-o", "ppid=", "-p", &peer.to_string()])
+    // Parentage alone would allow an unrelated background job to claim recovery.
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "ppid=,pgid=,tpgid=", "-p", &peer.to_string()])
         .output();
     output
         .ok()
         .filter(|value| value.status.success())
         .and_then(|value| String::from_utf8(value.stdout).ok())
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        == Some(root)
+        .is_some_and(|value| foreground_child(&value, root))
+}
+
+fn foreground_child(identity: &str, root: u32) -> bool {
+    let mut fields = identity.split_whitespace();
+    let parent = fields.next().and_then(|value| value.parse::<u32>().ok());
+    let group = fields.next().and_then(|value| value.parse::<u32>().ok());
+    let foreground = fields.next().and_then(|value| value.parse::<u32>().ok());
+    parent == Some(root)
+        && group.is_some_and(|group| group > 0 && Some(group) == foreground)
+        && fields.next().is_none()
 }
 
 fn peer_pid(stream: &UnixStream) -> Result<u32, String> {

@@ -93,12 +93,76 @@ fn shell_replay_retains_only_initial_prompt_and_command() {
 }
 
 #[test]
+fn replacing_endpoint_drains_old_writer_and_stale_close_cannot_remove_successor() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = Arc::new(Host::new(directory.path().to_owned()).unwrap());
+    let key = uuid::Uuid::new_v4().to_string();
+    let old_endpoint = host.prepare(&key, false, false, false).unwrap();
+    let old = host.entry(&key, &old_endpoint).unwrap();
+    let mut writer = old.state.lock().unwrap();
+    let owner = writer.execution.register(uuid::Uuid::new_v4()).unwrap();
+    let candidate = writer
+        .execution
+        .update(owner, 1, Some("{\"session\":\"latest\"}".into()))
+        .unwrap();
+    let replacement_host = Arc::clone(&host);
+    let replacement_key = key.clone();
+    let replacement = std::thread::spawn(move || {
+        replacement_host
+            .prepare(&replacement_key, true, false, false)
+            .unwrap()
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !old.stopped.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replacement did not fence old writer"
+        );
+        std::thread::yield_now();
+    }
+    save(&old.file, &candidate).unwrap();
+    writer.execution.committed(candidate).unwrap();
+    drop(writer);
+    let endpoint = replacement.join().unwrap();
+    let current = host.entry(&key, &endpoint).unwrap();
+    assert_eq!(
+        current
+            .state
+            .lock()
+            .unwrap()
+            .execution
+            .committed
+            .descriptor
+            .as_deref(),
+        Some("{\"session\":\"latest\"}")
+    );
+    assert!(host.close(&key, &old_endpoint).is_err());
+    assert!(host.entry(&key, &endpoint).is_ok());
+}
+
+#[test]
 fn corrupt_checkpoint_does_not_become_empty_installation() {
     let directory = tempfile::tempdir().unwrap();
     let host = Host::new(directory.path().to_owned()).unwrap();
     let key = uuid::Uuid::new_v4().to_string();
     std::fs::write(directory.path().join(format!("{key}.json")), "corrupt").unwrap();
     assert!(host.prepare(&key, true, false, false).is_err());
+}
+
+#[test]
+fn shell_ownership_requires_current_foreground_child() {
+    assert!(foreground_child("100 200 200\n", 100));
+    for identity in [
+        "100 200 300",
+        "101 200 200",
+        "100 200 -1",
+        "100 0 0",
+        "100 200",
+        "100 200 200 extra",
+        "corrupt",
+    ] {
+        assert!(!foreground_child(identity, 100), "accepted {identity}");
+    }
 }
 
 #[test]
