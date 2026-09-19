@@ -262,6 +262,7 @@ pub struct AttachViewState {
     ///
     /// Scrollback history itself lives on the server (pane-runtime plugin);
     /// these are just this client's per-pane view offsets into that history.
+    pub(super) captured_alternate: BTreeSet<Uuid>,
     pub pane_scrollback: PaneScrollbackViews,
     pub(super) decoded_history: std::collections::BTreeMap<
         Uuid,
@@ -622,6 +623,7 @@ impl AttachViewState {
             ui_mode: AttachUiMode::Normal,
             local_presentation: None,
             active_mode_id: "normal".to_string(),
+            captured_alternate: BTreeSet::new(),
             pane_scrollback: PaneScrollbackViews::new(),
             decoded_history: std::collections::BTreeMap::new(),
             scroll_started: std::collections::BTreeMap::new(),
@@ -870,6 +872,7 @@ impl AttachViewState {
     }
 
     pub fn exit_scrollback_for(&mut self, pane_id: Uuid) -> bool {
+        self.captured_alternate.remove(&pane_id);
         self.decoded_history.remove(&pane_id);
         self.history_prefetch
             .retain(|request| request.pane != pane_id);
@@ -878,6 +881,7 @@ impl AttachViewState {
         self.pending_scroll.remove(&pane_id);
         self.scrollback_cache.invalidate(pane_id);
         if let Some(buffer) = self.pane_buffers.get_mut(&pane_id) {
+            buffer.retained_screen_copy = false;
             buffer.scrollback_window = None;
         }
         if self
@@ -898,6 +902,8 @@ impl AttachViewState {
 
     /// Drop scrollback views for panes that no longer exist.
     pub fn retain_scrollback_panes(&mut self, active_pane_ids: &BTreeSet<Uuid>) {
+        self.captured_alternate
+            .retain(|pane| active_pane_ids.contains(pane));
         self.scroll_started
             .retain(|pane, _| active_pane_ids.contains(pane));
         self.decoded_history

@@ -387,7 +387,9 @@ pub fn resize_attach_grids_for_scene_with_size(
         );
         if next_grid_size != previous_grid_size {
             buffer.prev_rows.clear();
-            buffer.scrollback_window = None;
+            if !buffer.retained_screen_copy {
+                buffer.scrollback_window = None;
+            }
         }
     }
 }

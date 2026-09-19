@@ -5260,7 +5260,8 @@ fn queue_pane_content_for_surface<W: io::Write>(
             // A pinned window is immutable, independent of the resized live
             // grid. Retain it until its replacement is published so selection
             // remapping can still inspect the previous content origins.
-            if stage.scrollback.is_none_or(|view| view.pin.is_none()) {
+            if !entry.retained_screen_copy && stage.scrollback.is_none_or(|view| view.pin.is_none())
+            {
                 entry.scrollback_window = None;
             }
         }

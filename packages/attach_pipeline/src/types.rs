@@ -230,6 +230,8 @@ pub struct PaneRenderBuffer {
     pub prev_rows: Vec<String>,
     pub sync_update_in_progress: bool,
     pub expected_stream_start: Option<u64>,
+    /// A caller-owned screen copy, independent of live geometry and history.
+    pub retained_screen_copy: bool,
     pub scrollback_window: Option<PaneScrollbackWindow>,
     pub extension_render_cache: BTreeMap<(String, Uuid), ExtensionRenderCacheEntry>,
     pub extension_layer_snapshot_cache: BTreeMap<(String, Uuid), ExtensionLayerSnapshotCacheEntry>,
@@ -630,6 +632,7 @@ impl Default for PaneRenderBuffer {
             prev_rows: Vec::new(),
             sync_update_in_progress: false,
             expected_stream_start: None,
+            retained_screen_copy: false,
             scrollback_window: None,
             extension_render_cache: BTreeMap::new(),
             extension_layer_snapshot_cache: BTreeMap::new(),

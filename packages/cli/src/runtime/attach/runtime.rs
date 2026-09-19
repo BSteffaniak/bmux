@@ -6578,7 +6578,7 @@ pub fn handle_attach_ui_action_at(
 ) {
     match action {
         RuntimeAction::EnterScrollMode => {
-            if enter_attach_scrollback(view_state) {
+            if enter_manual_copy_mode(view_state) {
             } else {
                 view_state.set_transient_status(
                     ATTACH_SCROLLBACK_UNAVAILABLE_STATUS,
@@ -6809,6 +6809,47 @@ pub fn enter_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uu
     true
 }
 
+fn enter_manual_copy_mode(view_state: &mut AttachViewState) -> bool {
+    let Some(pane) = view_state.focused_pane_id() else {
+        return false;
+    };
+    if view_state.scrollback_active_for(pane) {
+        return true;
+    }
+    let alternate = view_state.pane_buffers.get(&pane).is_some_and(|buffer| {
+        buffer.terminal_grid.grid().mode() == bmux_terminal_grid::GridMode::Alternate
+    });
+    if !enter_attach_scrollback_for(view_state, pane) {
+        return false;
+    }
+    if alternate {
+        let images = view_state
+            .pane_images
+            .get(&pane)
+            .cloned()
+            .unwrap_or_default();
+        let buffer = view_state
+            .pane_buffers
+            .get_mut(&pane)
+            .expect("entered pane exists");
+        let grid = buffer.terminal_grid.grid();
+        buffer.retained_screen_copy = true;
+        buffer.scrollback_window = Some(PaneScrollbackWindow {
+            images,
+            projection_width: grid.width(),
+            row_anchors: Vec::new(),
+            palette: grid.palette().clone(),
+            scrollback_offset: 0,
+            max_scrollback_offset: 0,
+            total_scrolled_rows: grid.total_scrolled_rows(),
+            rows: grid.viewport_rows(),
+        });
+        view_state.captured_alternate.insert(pane);
+    }
+    true
+}
+
+#[cfg(test)]
 pub fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
     let Some(pane_id) = view_state.focused_pane_id() else {
         return false;
@@ -7241,6 +7282,9 @@ pub fn adjust_attach_scrollback_offset(current: usize, delta: isize, max_offset:
 }
 
 pub fn max_attach_scrollback_for(view_state: &mut AttachViewState, pane_id: Uuid) -> usize {
+    if view_state.captured_alternate.contains(&pane_id) {
+        return 0;
+    }
     if let Some(max_offset) = view_state
         .scrollback_for(pane_id)
         .and_then(|view| view.pin.map(|pin| pin.max_scrollback_offset))
@@ -9896,7 +9940,9 @@ async fn hydrate_attach_structured_grid_snapshots(
             .set_alternate_screen(alternate_screen);
         buffer.visual_row_fingerprints.clear();
         buffer.expected_stream_start = Some(snapshot.stream_end);
-        buffer.scrollback_window = None;
+        if !buffer.retained_screen_copy {
+            buffer.scrollback_window = None;
+        }
         buffer.prev_rows.clear();
         hydrated.insert(snapshot.pane_id);
     }
@@ -9933,6 +9979,9 @@ fn ensure_pane_scrollback_windows(
     let mut ready = Vec::new();
     let mut next = None;
     for (pane, view) in &view_state.pane_scrollback {
+        if view_state.captured_alternate.contains(pane) {
+            continue;
+        }
         let offset = view_state
             .requested_scroll_offset(*pane)
             .unwrap_or(view.offset);
@@ -10443,7 +10492,12 @@ async fn handle_attach_ui_action_with_scrollback(
         unpin_scrollback(client, view_state.attached_id, pane_id, pin).await;
         view_state.scrollback_replay_pending = true;
     }
-    if entering && view_state.scrollback_active() {
+    if entering
+        && view_state.scrollback_active()
+        && !view_state
+            .focused_pane_id()
+            .is_some_and(|pane| view_state.captured_alternate.contains(&pane))
+    {
         let config = BmuxConfig::load().unwrap_or_default();
         pin_focused_scrollback_if_configured(client, view_state, &config, now).await;
     }
@@ -10491,6 +10545,7 @@ async fn hydrate_attach_state_from_snapshot_mode(
         view_state.pane_mouse_protocol_hints.clear();
         view_state.pane_input_mode_hints.clear();
         // A different session or a full resync invalidates every cached view.
+        view_state.captured_alternate.clear();
         view_state.pane_scrollback.clear();
         view_state.decoded_history.clear();
         view_state.history_prefetch.clear();
@@ -21401,6 +21456,61 @@ mod tests {
 
         confirm_attach_scrollback_at(&mut view_state, Instant::now());
         assert!(!view_state.scrollback_active());
+    }
+
+    #[test]
+    fn manual_alternate_copy_retains_screen_while_live_output_changes() {
+        let mut state = attach_view_state_with_scrollback_fixture();
+        let pane = state.focused_pane_id().unwrap();
+        state
+            .pane_buffers
+            .get_mut(&pane)
+            .unwrap()
+            .terminal_grid
+            .process(b"\x1b[?1049h\x1b[2J\x1b[HALT-COPY");
+        assert!(enter_manual_copy_mode(&mut state));
+        assert!(state.captured_alternate.contains(&pane));
+        assert_eq!(max_attach_scrollback_for(&mut state, pane), 0);
+        let before = state.pane_buffers[&pane]
+            .scrollback_window
+            .as_ref()
+            .unwrap()
+            .rows
+            .clone();
+        assert!(
+            before
+                .iter()
+                .any(|row| bmux_terminal_grid::row_text(row, 80).contains("ALT-COPY"))
+        );
+        state
+            .pane_buffers
+            .get_mut(&pane)
+            .unwrap()
+            .terminal_grid
+            .process(b"\x1b[HCHANGED\x1b[?1049l");
+        assert_eq!(
+            state.pane_buffers[&pane]
+                .scrollback_window
+                .as_ref()
+                .unwrap()
+                .rows,
+            before
+        );
+        let base =
+            state.pane_buffers[&pane].scrollback_viewport_base(state.scrollback_for(pane).as_ref());
+        let view = state.scrollback_for_mut(pane).unwrap();
+        view.selection_anchor = Some(AttachScrollbackPosition {
+            line: base.line_for_viewport_row(0),
+            col: 0,
+        });
+        view.cursor = AttachScrollbackCursor { row: 0, col: 7 };
+        assert_eq!(
+            selected_attach_text(&mut state).as_deref(),
+            Some("ALT-COPY")
+        );
+        assert!(state.exit_scrollback_for(pane));
+        assert!(!state.pane_buffers[&pane].retained_screen_copy);
+        assert!(!state.captured_alternate.contains(&pane));
     }
 
     #[test]
