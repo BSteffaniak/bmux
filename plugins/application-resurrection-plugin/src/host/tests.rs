@@ -141,6 +141,20 @@ fn replacing_endpoint_drains_old_writer_and_stale_close_cannot_remove_successor(
 }
 
 #[test]
+fn checkpoint_read_distinguishes_missing_from_unreadable_and_oversized() {
+    let directory = tempfile::tempdir().unwrap();
+    assert!(
+        load_checkpoint(&directory.path().join("missing"))
+            .unwrap()
+            .is_none()
+    );
+    assert!(load_checkpoint(directory.path()).is_err());
+    let large = directory.path().join("large");
+    std::fs::write(&large, vec![b' '; 65_537]).unwrap();
+    assert!(load_checkpoint(&large).is_err());
+}
+
+#[test]
 fn corrupt_checkpoint_does_not_become_empty_installation() {
     let directory = tempfile::tempdir().unwrap();
     let host = Host::new(directory.path().to_owned()).unwrap();

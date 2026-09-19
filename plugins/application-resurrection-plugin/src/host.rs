@@ -73,19 +73,11 @@ impl Host {
             stop_and_drain(old)?;
         }
         let file = self.root.join(format!("{key}.json"));
-        let execution = if restored && (!shell || replay) && file.exists() {
-            let bytes = std::fs::File::open(&file).map_err(|e| e.to_string())?;
-            let mut bounded = Vec::new();
-            bytes
-                .take(65_537)
-                .read_to_end(&mut bounded)
-                .map_err(|e| e.to_string())?;
-            if bounded.len() > 65_536 {
-                return Err("oversized checkpoint".into());
-            }
-            let checkpoint: Checkpoint =
-                serde_json::from_slice(&bounded).map_err(|e| e.to_string())?;
-            Execution::resurrect(checkpoint).map_err(str::to_owned)?
+        let execution = if restored && (!shell || replay) {
+            load_checkpoint(&file)?.map_or_else(
+                || Ok(Execution::manual()),
+                |checkpoint| Execution::resurrect(checkpoint).map_err(str::to_owned),
+            )?
         } else {
             Execution::manual()
         };
@@ -218,6 +210,25 @@ fn stop_and_drain(entry: &Entry) -> Result<(), String> {
     let mut state = entry.state.lock().map_err(|e| e.to_string())?;
     state.execution.end();
     Ok(())
+}
+
+fn load_checkpoint(path: &Path) -> Result<Option<Checkpoint>, String> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read resurrection checkpoint: {error}")),
+    };
+    let mut bytes = Vec::new();
+    file.take(65_537)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 65_536 {
+        return Err("oversized checkpoint".into());
+    }
+    let checkpoint: Checkpoint =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    checkpoint.validate().map_err(str::to_owned)?;
+    Ok(Some(checkpoint))
 }
 
 fn save(path: &Path, checkpoint: &Checkpoint) -> Result<(), String> {
