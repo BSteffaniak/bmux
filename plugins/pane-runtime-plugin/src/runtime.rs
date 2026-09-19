@@ -1694,6 +1694,7 @@ enum PaneShellMetadataTerminator {
 #[derive(Debug, Default)]
 struct PaneShellMetadataParser {
     state: PaneShellMetadataParserState,
+    token: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1746,7 +1747,9 @@ impl PaneShellMetadataParser {
                     if *saw_escape {
                         if *byte == b'\\' {
                             let payload = std::mem::take(payload);
-                            if let Some(event) = decode_shell_metadata_payload(&payload) {
+                            if let Some(event) =
+                                decode_bound_shell_metadata(&payload, self.token.as_deref())
+                            {
                                 out.events.push(event);
                             } else {
                                 append_raw_osc_sequence(
@@ -1766,7 +1769,9 @@ impl PaneShellMetadataParser {
                         *saw_escape = true;
                     } else if *byte == 0x07 {
                         let payload = std::mem::take(payload);
-                        if let Some(event) = decode_shell_metadata_payload(&payload) {
+                        if let Some(event) =
+                            decode_bound_shell_metadata(&payload, self.token.as_deref())
+                        {
                             out.events.push(event);
                         } else {
                             append_raw_osc_sequence(
@@ -1808,6 +1813,19 @@ fn append_raw_osc_sequence(
             output.push(b'\\');
         }
     }
+}
+
+fn decode_bound_shell_metadata(
+    payload: &[u8],
+    token: Option<&str>,
+) -> Option<PaneShellMetadataEvent> {
+    let Some(token) = token else {
+        return decode_shell_metadata_payload(payload);
+    };
+    let text = std::str::from_utf8(payload).ok()?;
+    let rest = text.strip_prefix(BMUX_SHELL_METADATA_PREFIX)?;
+    let rest = rest.strip_prefix(token)?.strip_prefix(';')?;
+    decode_shell_metadata_payload(format!("{BMUX_SHELL_METADATA_PREFIX}{rest}").as_bytes())
 }
 
 fn decode_shell_metadata_payload(payload: &[u8]) -> Option<PaneShellMetadataEvent> {
@@ -1952,6 +1970,7 @@ fn configure_shell_integration_command(
     command: &mut CommandBuilder,
     shell: &str,
     integration_root: Option<&std::path::Path>,
+    token: &str,
 ) -> Result<()> {
     let Some(integration_root) = integration_root else {
         return Ok(());
@@ -1960,7 +1979,13 @@ fn configure_shell_integration_command(
     match shell_kind_for_path(shell) {
         ShellKind::Bash => {
             let rcfile_path = integration_root.join("bash").join("bmux.bashrc");
-            write_shell_integration_file(&rcfile_path, shell_integration_bash_rcfile())?;
+            write_shell_integration_file(
+                &rcfile_path,
+                &shell_integration_bash_rcfile().replace(
+                    BMUX_SHELL_METADATA_PREFIX,
+                    &format!("{BMUX_SHELL_METADATA_PREFIX}{token};"),
+                ),
+            )?;
             command.arg("--rcfile");
             command.arg(&rcfile_path);
         }
@@ -1969,7 +1994,13 @@ fn configure_shell_integration_command(
             let zshenv_path = zdotdir.join(".zshenv");
             let zshrc_path = zdotdir.join(".zshrc");
             write_shell_integration_file(&zshenv_path, shell_integration_zsh_env())?;
-            write_shell_integration_file(&zshrc_path, shell_integration_zsh_rc())?;
+            write_shell_integration_file(
+                &zshrc_path,
+                &shell_integration_zsh_rc().replace(
+                    BMUX_SHELL_METADATA_PREFIX,
+                    &format!("{BMUX_SHELL_METADATA_PREFIX}{token};"),
+                ),
+            )?;
             command.env("ZDOTDIR", zdotdir.as_os_str());
             if let Ok(original_zdotdir) = std::env::var("ZDOTDIR")
                 && !original_zdotdir.trim().is_empty()
@@ -1980,7 +2011,13 @@ fn configure_shell_integration_command(
         ShellKind::Fish => {
             let xdg_config_home = integration_root.join("fish-xdg");
             let fish_config_path = xdg_config_home.join("fish").join("config.fish");
-            write_shell_integration_file(&fish_config_path, shell_integration_fish_config())?;
+            write_shell_integration_file(
+                &fish_config_path,
+                &shell_integration_fish_config().replace(
+                    BMUX_SHELL_METADATA_PREFIX,
+                    &format!("{BMUX_SHELL_METADATA_PREFIX}{token};"),
+                ),
+            )?;
             command.env("XDG_CONFIG_HOME", xdg_config_home.as_os_str());
             if let Ok(original_xdg_config_home) = std::env::var("XDG_CONFIG_HOME")
                 && !original_xdg_config_home.trim().is_empty()
@@ -1990,7 +2027,13 @@ fn configure_shell_integration_command(
         }
         ShellKind::Nu => {
             let config_path = integration_root.join("nu").join("config.nu");
-            write_shell_integration_file(&config_path, shell_integration_nu_config())?;
+            write_shell_integration_file(
+                &config_path,
+                &shell_integration_nu_config().replace(
+                    BMUX_SHELL_METADATA_PREFIX,
+                    &format!("{BMUX_SHELL_METADATA_PREFIX}{token};"),
+                ),
+            )?;
             command.arg("--config");
             command.arg(&config_path);
         }
@@ -2005,6 +2048,11 @@ fn write_shell_integration_file(path: &std::path::Path, contents: &str) -> Resul
         std::fs::create_dir_all(parent).with_context(|| {
             format!("failed creating shell integration dir {}", parent.display())
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     if let Ok(existing) = std::fs::read_to_string(path)
         && existing == contents
@@ -4634,7 +4682,11 @@ impl SessionRuntimeManager {
         let replay_command = pane_meta.resurrection.active_command.clone();
         let initial_cwd = pane_meta.resurrection.last_known_cwd.clone();
         let pane_exit_tx = self.pane_exit_tx.clone();
-        let shell_integration_root = self.shell_integration_root.clone();
+        let shell_marker_token = Uuid::new_v4().simple().to_string();
+        let shell_integration_root = self
+            .shell_integration_root
+            .as_ref()
+            .map(|root| root.join(&shell_marker_token));
         let output_buffer_for_reader = Arc::clone(&output_buffer);
         let process_id = Arc::new(std::sync::Mutex::new(None));
         let process_id_for_task = Arc::clone(&process_id);
@@ -4802,6 +4854,7 @@ impl SessionRuntimeManager {
                     &mut command,
                     &shell,
                     shell_integration_root.as_deref(),
+                    &shell_marker_token,
                 )
                 .map_or_else(
                     |error| {
@@ -4949,7 +5002,7 @@ impl SessionRuntimeManager {
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile)
                         .with_bracketed_paste_support(bracketed_paste_supported);
                     let mut terminal_mode_tracker = PaneTerminalModeTracker::default();
-                    let mut shell_metadata_parser = PaneShellMetadataParser::default();
+                    let mut shell_metadata_parser = PaneShellMetadataParser { token: Some(shell_marker_token), ..PaneShellMetadataParser::default() };
 
                     // Image interceptor: detects and extracts image escape sequences
                     // (Sixel, Kitty, iTerm2) from PTY output before they reach the
@@ -14677,6 +14730,35 @@ mod tests {
 
         assert_eq!(inspection.command.as_deref(), Some("opencode run"));
         assert_eq!(inspection.cwd.as_deref(), Some("/work/project"));
+    }
+
+    #[test]
+    fn shell_metadata_is_bound_to_launch_token_across_chunk_boundaries() {
+        let marker = b"\x1b]633;bmux;launch-token;prompt;L3RtcA==\x07";
+        for split in 0..=marker.len() {
+            let mut parser = PaneShellMetadataParser {
+                token: Some("launch-token".into()),
+                ..Default::default()
+            };
+            let mut events = parser.process_chunk(&marker[..split]).events;
+            events.extend(parser.process_chunk(&marker[split..]).events);
+            assert_eq!(
+                events,
+                vec![PaneShellMetadataEvent::Prompt { cwd: "/tmp".into() }]
+            );
+        }
+        for marker in [
+            b"\x1b]633;bmux;prompt;L3RtcA==\x07".as_slice(),
+            b"\x1b]633;bmux;old-token;prompt;L3RtcA==\x07",
+        ] {
+            let mut parser = PaneShellMetadataParser {
+                token: Some("launch-token".into()),
+                ..Default::default()
+            };
+            let result = parser.process_chunk(marker);
+            assert!(result.events.is_empty());
+            assert_eq!(result.filtered, marker);
+        }
     }
 
     #[test]

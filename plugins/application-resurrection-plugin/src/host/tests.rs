@@ -290,6 +290,48 @@ fn versioned_boundaries_return_identity_and_missing_references_fail() {
 }
 
 #[test]
+fn old_snapshot_cannot_adopt_or_overwrite_unassociated_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = Host::new(directory.path().to_owned()).unwrap();
+    let key = uuid::Uuid::new_v4().to_string();
+    let launch = host
+        .prepare_checked(&key, false, false, false, IdentityCheck::Expected(None))
+        .unwrap();
+    let file = directory.path().join(format!("{key}.json"));
+    let original = std::fs::read(&file).unwrap();
+    assert!(
+        host.prepare_checked(&key, true, false, false, IdentityCheck::Expected(None))
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), original);
+    let recovered = host
+        .prepare_checked(
+            &key,
+            true,
+            false,
+            false,
+            IdentityCheck::Expected(Some(&launch.invocation)),
+        )
+        .unwrap();
+    assert_eq!(recovered.invocation, launch.invocation);
+}
+
+#[test]
+fn old_snapshot_without_checkpoint_starts_without_a_restore_offer() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = Host::new(directory.path().to_owned()).unwrap();
+    let key = uuid::Uuid::new_v4().to_string();
+    let launch = host
+        .prepare_checked(&key, true, false, false, IdentityCheck::Expected(None))
+        .unwrap();
+    host.bind(&key, &launch.endpoint, std::process::id())
+        .unwrap();
+    let mut client = connect(&launch.endpoint, true);
+    let welcome: serde_json::Value = receive(&mut client).unwrap();
+    assert!(welcome["restore"].is_null());
+}
+
+#[test]
 fn checkpoint_read_distinguishes_missing_from_unreadable_and_oversized() {
     let directory = tempfile::tempdir().unwrap();
     assert!(

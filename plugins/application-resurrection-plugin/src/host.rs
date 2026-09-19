@@ -215,6 +215,10 @@ impl Host {
         if !state.shell {
             return Ok((false, state.execution.committed.invocation.to_string()));
         }
+        if !prompt && state.initial_prompt {
+            // Shell startup DEBUG/pre-exec hooks are not the replayed invocation.
+            return Ok((false, state.execution.committed.invocation.to_string()));
+        }
         if prompt && state.initial_prompt {
             state.initial_prompt = false;
             return Ok((true, state.execution.committed.invocation.to_string()));
