@@ -188,6 +188,21 @@ pub(super) fn next_default_tab_name(sessions: &[SessionSummary]) -> String {
     }
 }
 
+fn open_startup_diagnostics(runtime_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    std::fs::create_dir_all(runtime_dir)
+        .context("failed creating server startup diagnostics directory")?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(runtime_dir.join("server-startup.log"))
+        .context("failed opening server startup diagnostics")
+}
+
 fn startup_diagnostics_tail(path: &std::path::Path) -> String {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -341,16 +356,7 @@ async fn run_server_start_inner(
             set_startup_recording_env(&mut child, startup_recording)?;
         }
         let startup_log = paths.runtime_dir.join("server-startup.log");
-        let mut startup_options = std::fs::OpenOptions::new();
-        startup_options.create(true).write(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            startup_options.mode(0o600);
-        }
-        let startup_output = startup_options
-            .open(&startup_log)
-            .context("failed opening server startup diagnostics")?;
+        let startup_output = open_startup_diagnostics(&paths.runtime_dir)?;
         child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1066,6 +1072,40 @@ mod tests {
     use bmux_client::ClientError;
     use bmux_ipc::ErrorCode;
     use bmux_ipc::transport::IpcTransportError;
+
+    #[test]
+    fn startup_diagnostics_creates_selected_runtime_and_truncates_previous_output() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtimes/selected");
+        let log = runtime.join("server-startup.log");
+        assert!(!runtime.exists());
+        let mut file = open_startup_diagnostics(&runtime).unwrap();
+        file.write_all(b"previous startup failure").unwrap();
+        drop(file);
+        assert_eq!(startup_diagnostics_tail(&log), "previous startup failure");
+        drop(open_startup_diagnostics(&runtime).unwrap());
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        assert!(!root.path().join("server-startup.log").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn startup_diagnostics_rejects_non_directory_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        std::fs::write(&runtime, b"not a directory").unwrap();
+        assert!(open_startup_diagnostics(&runtime).is_err());
+        assert_eq!(std::fs::read(&runtime).unwrap(), b"not a directory");
+    }
 
     #[test]
     fn manual_daemon_child_arguments_preserve_foreground_internal_contract() {

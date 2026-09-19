@@ -222,7 +222,27 @@ pub async fn fetch_with_client(
     request: Request,
     cache: std::sync::Arc<tokio::sync::Mutex<crate::pane_runtime_client::CapturedHistoryCache>>,
 ) -> Result<PaneScrollbackWindow, FetchError> {
-    let original = cache.lock().await.clone();
+    let original = {
+        let mut resident = cache.lock().await;
+        if let Some(pin) = request.pin {
+            let offset = if request.boundary == Some(Boundary::Newest) {
+                0
+            } else {
+                request.offset
+            };
+            // Serve coherent resident text and images before cloning worker
+            // state. A read-only hit needs neither transport nor publication.
+            if let Some(window) = resident.resident_window(
+                (request.session, request.pane, pin),
+                offset,
+                request.rows,
+                request.projection(),
+            ) {
+                return Ok(window);
+            }
+        }
+        resident.clone()
+    };
     let mut working = original.clone();
     let result = fetch_owned(client, request, &mut working).await;
     if result.is_ok() {
@@ -237,40 +257,45 @@ async fn fetch_owned(
     request: Request,
     cache: &mut crate::pane_runtime_client::CapturedHistoryCache,
 ) -> Result<PaneScrollbackWindow, FetchError> {
-    let rows = request.rows;
     if let Some(pin) = request.pin {
-        let mut last_error = None;
-        // Retain nearby older rows for local scrolling and direction reversals.
-        // The image service bounds projections to 256 rows; oversized terminals
-        // keep the exact-viewport path rather than truncating visible content.
-        // Resolve visible navigation first. A larger speculative viewport has
-        // different boundary semantics and must not clamp the user's target.
-        for count in [rows] {
-            let offset = if request.boundary == Some(Boundary::Newest) {
-                0
-            } else {
-                request.offset
-            };
-            let result = crate::pane_runtime_client::captured_history_window_cached(
-                client,
-                (request.session, request.pane, pin),
-                offset,
-                count,
-                request.projection(),
-                cache,
-            )
-            .await;
-            match result {
-                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(mut window)) => {
-                    if let Some(origin) = window.row_anchors.last() {
-                        cache.prepare_resident_index(request.width, origin.line_index);
-                    }
-                    if let Some(images) = cache.cached_images(request.width, &window.row_anchors) {
-                        window.images = images;
-                        return Ok(window);
-                    }
-                    let origin = window.row_anchors.first().ok_or("missing capture origin")?;
-                    let reply = bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_history_images_v3(
+        return fetch_captured(client, request, pin, cache).await;
+    }
+    fetch_live(client, request).await
+}
+
+async fn fetch_captured(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    request: Request,
+    pin: ScrollbackPin,
+    cache: &mut crate::pane_runtime_client::CapturedHistoryCache,
+) -> Result<PaneScrollbackWindow, FetchError> {
+    let offset = if request.boundary == Some(Boundary::Newest) {
+        0
+    } else {
+        request.offset
+    };
+    // Resolve the exact viewport. Speculative ranges have different boundary
+    // semantics and must not clamp the user's navigation target.
+    let result = crate::pane_runtime_client::captured_history_window_cached(
+        client,
+        (request.session, request.pane, pin),
+        offset,
+        request.rows,
+        request.projection(),
+        cache,
+    )
+    .await;
+    match result {
+        Ok(crate::pane_runtime_client::CapturedWindowOutcome::Window(mut window)) => {
+            if let Some(origin) = window.row_anchors.last() {
+                cache.prepare_resident_index(request.width, origin.line_index);
+            }
+            if let Some(images) = cache.cached_images(request.width, &window.row_anchors) {
+                window.images = images;
+                return Ok(window);
+            }
+            let origin = window.row_anchors.first().ok_or("missing capture origin")?;
+            let reply = bmux_pane_runtime_plugin_api::attach_runtime_state::client::attach_history_images_v3(
                         client, request.session, request.pane, pin.pin_id, origin.capture_id,
                         u16::try_from(request.width).map_err(|error| error.to_string())?,
                         origin.line_index,
@@ -278,30 +303,31 @@ async fn fetch_owned(
                         u16::try_from(window.rows.len()).map_err(|error| error.to_string())?,
                     ).await.map_err(|error| error.to_string())?
                         .map_err(|error| format!("historical images: {error:?}"))?;
-                    if reply.capture_id != origin.capture_id
-                        || reply.encoded.len() > 8 * 1024 * 1024
-                    {
-                        return Err("invalid historical image response".into());
-                    }
-                    window.images = serde_json::from_slice(&reply.encoded)
-                        .map_err(|error| error.to_string())?;
-                    cache.retain_images(request.width, &window.row_anchors, &window.images);
-                    return Ok(window);
-                }
-                Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) => {}
-                Err(error) => {
-                    // Failed/cancelled assembly must not leave a partial tail
-                    // index to be mistaken for a complete cached capture.
-                    *cache = crate::pane_runtime_client::CapturedHistoryCache::default();
-                    last_error = Some(error.to_string());
-                }
+            if reply.capture_id != origin.capture_id || reply.encoded.len() > 8 * 1024 * 1024 {
+                return Err("invalid historical image response".into());
             }
+            window.images =
+                serde_json::from_slice(&reply.encoded).map_err(|error| error.to_string())?;
+            cache.retain_images(request.width, &window.row_anchors, &window.images);
+            Ok(window)
         }
-        // A capture-bound request must not degrade to a text-only physical
-        // snapshot: that would acknowledge a complete viewport while losing its
-        // graphics and logical origin. Legacy reads are only for unpinned views.
-        return Err(last_error.map_or(FetchError::Unavailable, FetchError::Failed));
+        // Never degrade a capture-bound request to a text-only live
+        // snapshot, losing its graphics and logical source identity.
+        Ok(crate::pane_runtime_client::CapturedWindowOutcome::Unavailable) => {
+            Err(FetchError::Unavailable)
+        }
+        Err(error) => {
+            // Failed assembly cannot publish a partial capture index.
+            *cache = crate::pane_runtime_client::CapturedHistoryCache::default();
+            Err(FetchError::Failed(error.to_string()))
+        }
     }
+}
+
+async fn fetch_live(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    request: Request,
+) -> Result<PaneScrollbackWindow, FetchError> {
     let windows = crate::pane_runtime_client::attach_pane_grid_window_state_streaming(
         client,
         request.session,

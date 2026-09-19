@@ -766,10 +766,120 @@ mod history_tests {
                 .is_none(),
             "unknown resized image coverage must fetch"
         );
-        assert_eq!(client.0, 60);
+        assert_warm_worker_needs_no_service(&cache, identity).await;
         assert_resident_under_pressure(&mut cache, identity, &window);
-        assert_partial_index(&mut cache, &window);
+        assert_resized_worker_needs_no_service(&mut cache, identity, &window).await;
         assert_capture_replacement(&mut cache, identity);
+    }
+
+    async fn assert_warm_worker_needs_no_service(
+        cache: &super::CapturedHistoryCache,
+        identity: (uuid::Uuid, uuid::Uuid, bmux_attach_pipeline::ScrollbackPin),
+    ) {
+        use crate::runtime::attach::scrollback_fetch::{Request, fetch_with_client};
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        // No responder runs: any accidental service call stalls until the timeout.
+        let mut client = bmux_plugin::AsyncServiceClient::bind(1, sender)
+            .unwrap()
+            .with_backpressure();
+        let mut resident = cache.clone();
+        // Indexed navigation must remain usable even when no decode admission
+        // remains; falling through to general assembly would fail this case.
+        resident.remaining = 0;
+        let revision = resident.revision.clone();
+        let cache = std::sync::Arc::new(tokio::sync::Mutex::new(resident));
+        for offset in [0, 40, 20, 1, 39, 0] {
+            let request = Request {
+                boundary: None,
+                session: identity.0,
+                pane: identity.1,
+                pin: Some(identity.2),
+                offset,
+                width: 2,
+                rows: 20,
+                total: Some(60),
+                anchor: None,
+                delta: 0,
+            };
+            let window = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                fetch_with_client(&mut client, request, cache.clone()),
+            )
+            .await
+            .expect("resident worker must not await the service")
+            .unwrap();
+            assert_eq!(window.rows.len(), 20);
+            assert_eq!(window.scrollback_offset, offset);
+            assert_eq!(
+                window.row_anchors[0].line_index,
+                u32::try_from(40 - offset).unwrap()
+            );
+            assert!(receiver.try_recv().is_err(), "resident worker sent IPC");
+            let resident = cache.lock().await;
+            assert_eq!(resident.remaining, 0);
+            assert!(std::sync::Arc::ptr_eq(&revision, &resident.revision));
+            drop(resident);
+        }
+    }
+
+    async fn assert_resized_worker_needs_no_service(
+        cache: &mut super::CapturedHistoryCache,
+        identity: (uuid::Uuid, uuid::Uuid, bmux_attach_pipeline::ScrollbackPin),
+        window: &bmux_attach_pipeline::PaneScrollbackWindow,
+    ) {
+        use crate::runtime::attach::scrollback_fetch::{Request, fetch_with_client};
+
+        assert_partial_index(cache, window);
+        cache.prepare_resident_index(1, 30);
+        let capture_id = identity.2.capture.unwrap().identity;
+        let anchors = (0..60)
+            .flat_map(|line_index| {
+                (0..2).map(move |column| bmux_attach_pipeline::CapturedHistoryAnchor {
+                    capture_id,
+                    line_index,
+                    column,
+                })
+            })
+            .collect::<Vec<_>>();
+        // Image coverage must be explicitly available at the reflowed width.
+        cache.retain_images(1, &anchors, &[]);
+        cache.remaining = 0;
+        let revision = cache.revision.clone();
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(cache.clone()));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut client = bmux_plugin::AsyncServiceClient::bind(1, sender)
+            .unwrap()
+            .with_backpressure();
+        for delta in [0, 100, 40, 1, 99, 0] {
+            let request = Request {
+                boundary: None,
+                session: identity.0,
+                pane: identity.1,
+                pin: Some(identity.2),
+                offset: 0,
+                width: 1,
+                rows: 20,
+                total: Some(60),
+                anchor: anchors.last().copied(),
+                delta,
+            };
+            let window = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                fetch_with_client(&mut client, request, shared.clone()),
+            )
+            .await
+            .expect("resident resized viewport must not wait for services")
+            .unwrap();
+            let start = 100 - usize::try_from(delta).unwrap();
+            assert_eq!(window.row_anchors, anchors[start..start + 20]);
+            assert_eq!(window.projection_width, 1);
+            assert!(receiver.try_recv().is_err());
+        }
+        assert!(std::sync::Arc::ptr_eq(
+            &revision,
+            &shared.lock().await.revision
+        ));
     }
 
     fn assert_capture_replacement(
@@ -1482,6 +1592,132 @@ mod history_tests {
         );
     }
 
+    #[test]
+    fn resident_image_coverage_validates_source_width_and_gaps() {
+        let capture = uuid::Uuid::new_v4();
+        let anchors = (0..10_000)
+            .map(|line_index| bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id: capture,
+                line_index,
+                column: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut cache = super::CapturedHistoryCache::default();
+        cache.retain_images(80, &anchors, &[]);
+        // Reversals and both boundaries reuse admitted known-empty coverage.
+        for start in [0, 9_976, 5_000, 20, 9_976, 0] {
+            assert_eq!(
+                cache.cached_images(80, &anchors[start..start + 24]),
+                Some(vec![])
+            );
+        }
+        assert!(cache.cached_images(40, &anchors[..24]).is_none());
+        let mut replaced = anchors[..24].to_vec();
+        replaced[12].capture_id = uuid::Uuid::new_v4();
+        assert!(cache.cached_images(80, &replaced).is_none());
+        let mut missing = anchors[9_976..].to_vec();
+        missing.last_mut().unwrap().line_index = 10_000;
+        assert!(cache.cached_images(80, &missing).is_none());
+        assert!(cache.cached_images(80, &[]).is_none());
+
+        let mut partial = super::CapturedHistoryCache::default();
+        partial.retain_images(80, &anchors[..12], &[]);
+        partial.retain_images(80, &anchors[13..24], &[]);
+        assert!(partial.cached_images(80, &anchors[..24]).is_none());
+        partial.retain_images(80, &anchors[12..13], &[]);
+        assert_eq!(partial.cached_images(80, &anchors[..24]), Some(vec![]));
+    }
+
+    #[test]
+    fn repeated_image_admission_preserves_budget_revision_and_other_ranges() {
+        let capture_id = uuid::Uuid::new_v4();
+        let anchors = (0..2)
+            .map(|line_index| bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id,
+                line_index,
+                column: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut cache = super::CapturedHistoryCache::default();
+        cache.retain_images(80, &anchors[..1], &[]);
+        cache.retain_images(80, &anchors[1..], &[]);
+        let bytes = cache.image_bytes;
+        let revision = cache.revision.clone();
+        for _ in 0..300 {
+            cache.retain_images(80, &anchors[1..], &[]);
+        }
+        assert_eq!(cache.image_bytes, bytes);
+        assert_eq!(cache.image_coverage.len(), 2);
+        assert!(std::sync::Arc::ptr_eq(&revision, &cache.revision));
+        assert_eq!(cache.cached_images(80, &anchors), Some(vec![]));
+    }
+
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    #[test]
+    fn refreshed_image_coverage_replaces_charge_without_mutating_snapshot() {
+        let anchors = [bmux_attach_pipeline::CapturedHistoryAnchor {
+            capture_id: uuid::Uuid::new_v4(),
+            line_index: 0,
+            column: 0,
+        }];
+        let image = bmux_attach_image_protocol::AttachPaneImage {
+            id: 1,
+            protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
+            raw_data: vec![1, 2],
+            compression: bmux_attach_image_protocol::CompressionId::None,
+            position_row: 0,
+            position_col: 0,
+            cell_rows: 1,
+            cell_cols: 1,
+            pixel_width: 1,
+            pixel_height: 1,
+        };
+        let mut cache = super::CapturedHistoryCache::default();
+        cache.retain_images(80, &anchors, std::slice::from_ref(&image));
+        let snapshot = cache.clone();
+        assert!(!cache.has_empty_image_coverage(80, &anchors));
+        cache.retain_images(80, &anchors, &[]);
+        assert!(cache.has_empty_image_coverage(80, &anchors));
+        assert!(!snapshot.has_empty_image_coverage(80, &anchors));
+        assert_eq!(cache.image_coverage.len(), 1);
+        assert!(cache.image_bytes < snapshot.image_bytes);
+        assert!(!std::sync::Arc::ptr_eq(&cache.revision, &snapshot.revision));
+        assert_eq!(cache.cached_images(80, &anchors), Some(vec![]));
+        assert_eq!(snapshot.cached_images(80, &anchors), Some(vec![image]));
+        assert_eq!(cache.image_bytes, cache.image_coverage[0].bytes);
+    }
+
+    #[test]
+    fn overlapping_empty_image_admission_reuses_existing_coverage() {
+        let capture_id = uuid::Uuid::new_v4();
+        let anchors = (0..1000)
+            .map(|line_index| bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id,
+                line_index,
+                column: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut cache = super::CapturedHistoryCache::default();
+        cache.retain_images(80, &anchors[..500], &[]);
+        cache.retain_images(80, &anchors[500..], &[]);
+        let bytes = cache.image_bytes;
+        let revision = cache.revision.clone();
+        for start in 0..=976 {
+            cache.retain_images(80, &anchors[start..start + 24], &[]);
+        }
+        assert_eq!(cache.image_coverage.len(), 2);
+        assert_eq!(cache.image_bytes, bytes);
+        assert!(std::sync::Arc::ptr_eq(&revision, &cache.revision));
+        assert_eq!(cache.cached_images(80, &anchors), Some(vec![]));
+        cache.retain_images(40, &anchors[..24], &[]);
+        assert_eq!(cache.image_coverage.len(), 3);
+        assert!(cache.image_bytes > bytes);
+    }
+
     struct HistoryClient;
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryClient {
         async fn invoke_service_raw(
@@ -2150,42 +2386,55 @@ impl CapturedHistoryCache {
                 if entry.anchors == anchors {
                     return Some(entry.images.clone());
                 }
+                // Coverage is strictly source-ordered at admission. Locate the
+                // viewport in logarithmic time instead of scanning the retained
+                // range on every scroll; compare only the visible anchors.
+                let first = anchors.first()?;
                 let start = entry
                     .anchors
-                    .windows(anchors.len())
-                    .position(|range| range == anchors)?;
+                    .binary_search_by_key(
+                        &(first.capture_id, first.line_index, first.column),
+                        |anchor| (anchor.capture_id, anchor.line_index, anchor.column),
+                    )
+                    .ok()?;
+                if entry
+                    .anchors
+                    .get(start..start.checked_add(anchors.len())?)?
+                    != anchors
+                {
+                    return None;
+                }
                 crate::runtime::attach::scrollback_cache::project_images(
                     &entry.images,
                     start,
                     anchors.len(),
                 )
             })
-            .or_else(|| {
-                // Every requested physical source row must be covered at this width.
-                // Do not infer empty coverage from a neighboring row or from another
-                // capture; anchors carry their capture identity in equality checks.
-                anchors
-                    .iter()
-                    .all(|anchor| {
-                        self.image_coverage.iter().any(|entry| {
-                            entry.width == width
-                                && entry.images.is_empty()
-                                && entry
-                                    .anchors
-                                    .binary_search_by_key(
-                                        &(anchor.capture_id, anchor.line_index, anchor.column),
-                                        |candidate| {
-                                            (
-                                                candidate.capture_id,
-                                                candidate.line_index,
-                                                candidate.column,
-                                            )
-                                        },
-                                    )
-                                    .is_ok()
-                        })
-                    })
-                    .then(Vec::new)
+            .or_else(|| self.has_empty_image_coverage(width, anchors).then(Vec::new))
+    }
+
+    fn has_empty_image_coverage(
+        &self,
+        width: usize,
+        anchors: &[bmux_attach_pipeline::CapturedHistoryAnchor],
+    ) -> bool {
+        // Inspect coverage metadata only: admission must not clone image payloads
+        // merely to discover that a range is not known-empty.
+        !anchors.is_empty()
+            && anchors.iter().all(|anchor| {
+                self.image_coverage.iter().any(|entry| {
+                    entry.width == width
+                        && entry.images.is_empty()
+                        && entry
+                            .anchors
+                            .binary_search_by_key(
+                                &(anchor.capture_id, anchor.line_index, anchor.column),
+                                |candidate| {
+                                    (candidate.capture_id, candidate.line_index, candidate.column)
+                                },
+                            )
+                            .is_ok()
+                })
             })
     }
 
@@ -2210,6 +2459,26 @@ impl CapturedHistoryCache {
             })
         {
             return;
+        }
+        // Captures are immutable. Known-empty coverage assembled from existing
+        // ranges is already sufficient; admitting every overlapping viewport
+        // would consume slots and evict useful distant coverage during scrolling.
+        if images.is_empty() && self.has_empty_image_coverage(width, anchors) {
+            return;
+        }
+        if let Some(index) = self
+            .image_coverage
+            .iter()
+            .position(|entry| entry.width == width && entry.anchors == anchors)
+        {
+            if self.image_coverage[index].images == images {
+                return;
+            }
+            // A refreshed range replaces its old projection rather than consuming
+            // a second admission slot. Arc-owned worker snapshots keep their view.
+            if let Some(old) = self.image_coverage.remove(index) {
+                self.image_bytes -= old.bytes;
+            }
         }
         while self.image_bytes.saturating_add(bytes) > LIMIT || self.image_coverage.len() >= 256 {
             if let Some(old) = self.image_coverage.pop_front() {
