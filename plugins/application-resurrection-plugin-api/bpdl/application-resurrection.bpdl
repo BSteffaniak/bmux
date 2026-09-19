@@ -1,0 +1,13 @@
+plugin bmux.application_resurrection version 1;
+
+capability RESURRECTION_HOST = bmux.application_resurrection.host;
+
+@capability(RESURRECTION_HOST)
+interface resurrection-host-v1 {
+    record host-status {
+        protocol: string,
+        available: bool,
+        reason: string?,
+    }
+    query status() -> host-status;
+}

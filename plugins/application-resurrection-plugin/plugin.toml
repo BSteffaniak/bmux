@@ -1,0 +1,13 @@
+execution_class       = "native_fast"
+id                    = "bmux.application_resurrection"
+name                  = "Application Resurrection"
+owns_namespaces       = []
+provided_capabilities = ["bmux.application_resurrection.host"]
+provided_features     = ["bmux.application_resurrection"]
+required_capabilities = []
+version               = "0.0.1-alpha.1"
+
+[[services]]
+capability   = "bmux.application_resurrection.host"
+interface_id = "resurrection-host-v1"
+kind         = "query"

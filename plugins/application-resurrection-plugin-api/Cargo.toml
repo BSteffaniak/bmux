@@ -1,0 +1,25 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Application resurrection host contracts"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "resurrection"]
+license     = { workspace = true }
+name        = "bmux_application_resurrection_plugin_api"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_ipc                  = { workspace = true }
+bmux_plugin_schema_macros = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+
+[package.metadata.cargo-machete]
+# BPDL generates Serde derives, SDK dispatch and IPC references.
+ignored = ["bmux_ipc", "bmux_plugin_sdk", "serde"]
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -70,6 +70,9 @@ bmux_tui_components = { workspace = true, features = [
 sshenv_vault = { workspace = true }
 
 # Bundled plugins (optional, statically linked as rlib when enabled)
+bmux_application_resurrection_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
 bmux_clients_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -283,6 +286,7 @@ bundled-plugins = [
     "bundled-plugin-prompted-actions",
     "bundled-plugin-recording",
     "bundled-plugin-sessions",
+    "bundled-plugin-application-resurrection",
     "bundled-plugin-snapshot",
     "bundled-plugin-sidebar",
     "bundled-plugin-tab-bar",
@@ -295,6 +299,9 @@ bundled-plugins = [
 ]
 
 # Individual plugin features for selective bundling
+bundled-plugin-application-resurrection = [
+    "dep:bmux_application_resurrection_plugin",
+]
 bundled-plugin-cli = ["dep:bmux_plugin_cli_plugin"]
 bundled-plugin-clients = ["dep:bmux_clients_plugin"]
 bundled-plugin-clipboard = ["dep:bmux_clipboard_plugin"]

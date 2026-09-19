@@ -96,6 +96,8 @@ members = [
     "plugins/recording-plugin-api",
     "plugins/sessions-plugin",
     "plugins/sessions-plugin-api",
+    "plugins/application-resurrection-plugin",
+    "plugins/application-resurrection-plugin-api",
     "plugins/snapshot-plugin",
     "plugins/snapshot-plugin-api",
     "plugins/sidebar-plugin",
@@ -221,45 +223,47 @@ hyperchad_docs_config_derive = { version = "0.4.0", default-features = false, gi
 hyperchad_docs_site = { version = "0.4.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 
 # Bundled plugin crates (used as optional rlib deps in bmux_cli)
-bmux_clients_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/clients-plugin" }
-bmux_clients_plugin_api              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/clients-plugin-api" }
-bmux_clipboard_plugin                = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/clipboard-plugin" }
-bmux_cluster_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin" }
-bmux_cluster_plugin_api              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin-api" }
-bmux_cluster_plugin_client           = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin-client" }
-bmux_command_palette_plugin          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/command-palette-plugin" }
-bmux_connections_plugin              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/connections-plugin" }
-bmux_connections_plugin_api          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/connections-plugin-api" }
-bmux_contexts_plugin                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/contexts-plugin" }
-bmux_contexts_plugin_api             = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/contexts-plugin-api" }
-bmux_control_catalog_plugin          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/control-catalog-plugin" }
-bmux_control_catalog_plugin_api      = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/control-catalog-plugin-api" }
-bmux_decoration_plugin               = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/decoration-plugin" }
-bmux_decoration_plugin_api           = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/decoration-plugin-api" }
-bmux_decoration_plugin_renderer      = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/decoration-plugin-renderer" }
-bmux_finder_plugin                   = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/finder-plugin" }
-bmux_pane_runtime_plugin             = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/pane-runtime-plugin" }
-bmux_pane_runtime_plugin_api         = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/pane-runtime-plugin-api" }
-bmux_performance_plugin              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/performance-plugin" }
-bmux_performance_plugin_api          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/performance-plugin-api" }
-bmux_permissions_plugin              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/permissions-plugin" }
-bmux_permissions_plugin_api          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/permissions-plugin-api" }
-bmux_plugin_cli_plugin               = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/plugin-cli-plugin" }
-bmux_prompted_actions_plugin         = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/prompted-actions-plugin" }
-bmux_recording_plugin                = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/recording-plugin" }
-bmux_recording_plugin_api            = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/recording-plugin-api" }
-bmux_sessions_plugin                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/sessions-plugin" }
-bmux_sessions_plugin_api             = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/sessions-plugin-api" }
-bmux_sidebar_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/sidebar-plugin" }
-bmux_snapshot_plugin                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/snapshot-plugin" }
-bmux_snapshot_plugin_api             = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/snapshot-plugin-api" }
-bmux_tab_bar_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tab-bar-plugin" }
-bmux_tabs_plugin                     = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tabs-plugin" }
-bmux_tabs_plugin_api                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tabs-plugin-api" }
-bmux_theme_plugin                    = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/theme-plugin" }
-bmux_visual_adapters_plugin_renderer = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/visual-adapters-plugin-renderer" }
-bmux_workspaces_plugin               = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/workspaces-plugin" }
-bmux_workspaces_plugin_api           = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/workspaces-plugin-api" }
+bmux_application_resurrection_plugin     = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/application-resurrection-plugin" }
+bmux_application_resurrection_plugin_api = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/application-resurrection-plugin-api" }
+bmux_clients_plugin                      = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/clients-plugin" }
+bmux_clients_plugin_api                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/clients-plugin-api" }
+bmux_clipboard_plugin                    = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/clipboard-plugin" }
+bmux_cluster_plugin                      = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin" }
+bmux_cluster_plugin_api                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin-api" }
+bmux_cluster_plugin_client               = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/cluster-plugin-client" }
+bmux_command_palette_plugin              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/command-palette-plugin" }
+bmux_connections_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/connections-plugin" }
+bmux_connections_plugin_api              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/connections-plugin-api" }
+bmux_contexts_plugin                     = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/contexts-plugin" }
+bmux_contexts_plugin_api                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/contexts-plugin-api" }
+bmux_control_catalog_plugin              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/control-catalog-plugin" }
+bmux_control_catalog_plugin_api          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/control-catalog-plugin-api" }
+bmux_decoration_plugin                   = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/decoration-plugin" }
+bmux_decoration_plugin_api               = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/decoration-plugin-api" }
+bmux_decoration_plugin_renderer          = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/decoration-plugin-renderer" }
+bmux_finder_plugin                       = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/finder-plugin" }
+bmux_pane_runtime_plugin                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/pane-runtime-plugin" }
+bmux_pane_runtime_plugin_api             = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/pane-runtime-plugin-api" }
+bmux_performance_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/performance-plugin" }
+bmux_performance_plugin_api              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/performance-plugin-api" }
+bmux_permissions_plugin                  = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/permissions-plugin" }
+bmux_permissions_plugin_api              = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/permissions-plugin-api" }
+bmux_plugin_cli_plugin                   = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/plugin-cli-plugin" }
+bmux_prompted_actions_plugin             = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/prompted-actions-plugin" }
+bmux_recording_plugin                    = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/recording-plugin" }
+bmux_recording_plugin_api                = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/recording-plugin-api" }
+bmux_sessions_plugin                     = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/sessions-plugin" }
+bmux_sessions_plugin_api                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/sessions-plugin-api" }
+bmux_sidebar_plugin                      = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/sidebar-plugin" }
+bmux_snapshot_plugin                     = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/snapshot-plugin" }
+bmux_snapshot_plugin_api                 = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/snapshot-plugin-api" }
+bmux_tab_bar_plugin                      = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tab-bar-plugin" }
+bmux_tabs_plugin                         = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tabs-plugin" }
+bmux_tabs_plugin_api                     = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/tabs-plugin-api" }
+bmux_theme_plugin                        = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/theme-plugin" }
+bmux_visual_adapters_plugin_renderer     = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/visual-adapters-plugin-renderer" }
+bmux_workspaces_plugin                   = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/workspaces-plugin" }
+bmux_workspaces_plugin_api               = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/workspaces-plugin-api" }
 
 # Docs site crates
 bmux_docs_site_ui = { version = "0.0.1-alpha.1", default-features = false, path = "packages/docs-site/ui" }

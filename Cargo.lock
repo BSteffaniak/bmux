@@ -1139,6 +1139,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_application_resurrection_plugin"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_application_resurrection_plugin_api",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_application_resurrection_plugin_api"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+]
+
+[[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.1"
 dependencies = [
@@ -1211,6 +1232,7 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
  "bmux_appearance",
+ "bmux_application_resurrection_plugin",
  "bmux_attach_image_protocol",
  "bmux_attach_layout_protocol",
  "bmux_attach_pipeline",

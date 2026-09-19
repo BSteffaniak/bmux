@@ -257,6 +257,11 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/pane-runtime-plugin/plugin.toml"),
     plugin_type = bmux_pane_runtime_plugin::PaneRuntimePlugin;
 
+    feature = "bundled-plugin-application-resurrection",
+    id = "bmux.application_resurrection",
+    manifest = include_str!("../../../../plugins/application-resurrection-plugin/plugin.toml"),
+    plugin_type = bmux_application_resurrection_plugin::ApplicationResurrectionPlugin;
+
     feature = "bundled-plugin-snapshot",
     id = "bmux.snapshot",
     manifest = include_str!("../../../../plugins/snapshot-plugin/plugin.toml"),
@@ -480,6 +485,8 @@ const fn static_bundled_workspace_plugin_dirs() -> &'static [&'static str] {
         "sessions-plugin",
         #[cfg(feature = "bundled-plugin-pane-runtime")]
         "pane-runtime-plugin",
+        #[cfg(feature = "bundled-plugin-application-resurrection")]
+        "application-resurrection-plugin",
         #[cfg(feature = "bundled-plugin-snapshot")]
         "snapshot-plugin",
         #[cfg(feature = "bundled-plugin-theme")]

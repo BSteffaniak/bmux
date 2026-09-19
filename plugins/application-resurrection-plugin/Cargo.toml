@@ -1,0 +1,26 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Application resurrection host adapter"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "resurrection"]
+license     = { workspace = true }
+name        = "bmux_application_resurrection_plugin"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmux_application_resurrection_plugin_api = { workspace = true }
+bmux_plugin_sdk                          = { workspace = true }
+serde                                    = { workspace = true, features = ["derive", "std"] }
+serde_json                               = { workspace = true }
+uuid                                     = { workspace = true, features = ["serde", "v4"] }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []
