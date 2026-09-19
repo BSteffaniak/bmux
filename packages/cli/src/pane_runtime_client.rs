@@ -890,6 +890,25 @@ mod history_tests {
         cache.prepare(uuid::Uuid::new_v4(), identity.1, identity.2);
         assert!(!cache.matches_capture(identity));
         assert!(cache.decoded.lines.is_empty());
+        let anchor = bmux_attach_pipeline::CapturedHistoryAnchor {
+            capture_id: identity.2.capture.unwrap().identity,
+            line_index: 0,
+            column: 0,
+        };
+        cache.retain_images(2, &[anchor], &[]);
+        let bytes = cache.image_bytes;
+        let revision = cache.revision.clone();
+        cache.retain_images(
+            2,
+            &[bmux_attach_pipeline::CapturedHistoryAnchor {
+                capture_id: uuid::Uuid::new_v4(),
+                ..anchor
+            }],
+            &[],
+        );
+        assert_eq!(cache.image_bytes, bytes);
+        assert_eq!(cache.image_coverage.len(), 1);
+        assert!(std::sync::Arc::ptr_eq(&revision, &cache.revision));
     }
 
     fn assert_resident_under_pressure(
@@ -971,11 +990,22 @@ mod history_tests {
             "published projection stays immutable"
         );
         let refreshed = cache.indexed.clone().unwrap();
+        let revision = cache.revision.clone();
         cache.prepare_resident_index(2, 40);
+        assert!(std::sync::Arc::ptr_eq(&revision, &cache.revision));
         assert!(std::sync::Arc::ptr_eq(
             &refreshed,
             cache.indexed.as_ref().unwrap()
         ));
+        let worker = cache.clone();
+        cache.prepare_resident_index(1, 40);
+        assert!(!std::sync::Arc::ptr_eq(&revision, &cache.revision));
+        assert!(!cache.publish_if_current(&worker, worker.clone()));
+        assert_eq!(cache.indexed.as_ref().unwrap().width, 1);
+        drop(worker);
+        let revision = cache.revision.clone();
+        cache.prepare_resident_index(2, 40);
+        assert!(!std::sync::Arc::ptr_eq(&revision, &cache.revision));
     }
 
     #[tokio::test]
@@ -1626,6 +1656,11 @@ mod history_tests {
         assert!(partial.cached_images(80, &anchors[..24]).is_none());
         partial.retain_images(80, &anchors[12..13], &[]);
         assert_eq!(partial.cached_images(80, &anchors[..24]), Some(vec![]));
+        // A newer sparse range must not hide complete older coverage. Advance
+        // only through matching runs, then resume lookup at the exact next row.
+        partial.retain_images(80, &[anchors[0], anchors[2], anchors[25]], &[]);
+        assert_eq!(partial.cached_images(80, &anchors[..24]), Some(vec![]));
+        assert!(partial.cached_images(80, &anchors[..26]).is_none());
     }
 
     #[test]
@@ -1716,6 +1751,30 @@ mod history_tests {
         cache.retain_images(40, &anchors[..24], &[]);
         assert_eq!(cache.image_coverage.len(), 3);
         assert!(cache.image_bytes > bytes);
+    }
+
+    #[test]
+    fn mixed_capture_image_admission_is_transactionally_rejected() {
+        let first = bmux_attach_pipeline::CapturedHistoryAnchor {
+            capture_id: uuid::Uuid::from_u128(1),
+            line_index: 0,
+            column: 0,
+        };
+        let second = bmux_attach_pipeline::CapturedHistoryAnchor {
+            capture_id: uuid::Uuid::from_u128(2),
+            ..first
+        };
+        let mut cache = super::CapturedHistoryCache::default();
+        cache.retain_images(80, &[first], &[]);
+        let bytes = cache.image_bytes;
+        let revision = cache.revision.clone();
+        // UUID ordering used to allow this range despite crossing captures.
+        cache.retain_images(80, &[first, second], &[]);
+        assert_eq!(cache.image_coverage.len(), 1);
+        assert_eq!(cache.image_bytes, bytes);
+        assert!(std::sync::Arc::ptr_eq(&revision, &cache.revision));
+        assert!(cache.cached_images(80, &[second]).is_none());
+        assert_eq!(cache.cached_images(80, &[first]), Some(vec![]));
     }
 
     struct HistoryClient;
@@ -2190,6 +2249,7 @@ impl CapturedHistoryCache {
             {
                 index.width = width;
                 index.bytes = index.content.retained_bytes();
+                self.changed();
             }
             return;
         }
@@ -2230,6 +2290,7 @@ impl CapturedHistoryCache {
                 bytes: content.retained_bytes(),
                 content,
             }));
+            self.changed();
         }
     }
 
@@ -2420,22 +2481,38 @@ impl CapturedHistoryCache {
     ) -> bool {
         // Inspect coverage metadata only: admission must not clone image payloads
         // merely to discover that a range is not known-empty.
-        !anchors.is_empty()
-            && anchors.iter().all(|anchor| {
-                self.image_coverage.iter().any(|entry| {
-                    entry.width == width
-                        && entry.images.is_empty()
-                        && entry
-                            .anchors
-                            .binary_search_by_key(
-                                &(anchor.capture_id, anchor.line_index, anchor.column),
-                                |candidate| {
-                                    (candidate.capture_id, candidate.line_index, candidate.column)
-                                },
-                            )
-                            .is_ok()
-                })
-            })
+        if anchors.is_empty() {
+            return false;
+        }
+        let mut remaining = anchors;
+        while let Some(anchor) = remaining.first() {
+            let covered = self.image_coverage.iter().rev().find_map(|entry| {
+                if entry.width != width || !entry.images.is_empty() {
+                    return None;
+                }
+                let start = entry
+                    .anchors
+                    .binary_search_by_key(
+                        &(anchor.capture_id, anchor.line_index, anchor.column),
+                        |candidate| (candidate.capture_id, candidate.line_index, candidate.column),
+                    )
+                    .ok()?;
+                // Validate actual source anchors, not just endpoints: resident
+                // coverage may contain gaps or have different reflow boundaries.
+                Some(
+                    entry.anchors[start..]
+                        .iter()
+                        .zip(remaining)
+                        .take_while(|(cached, requested)| cached == requested)
+                        .count(),
+                )
+            });
+            let Some(count) = covered.filter(|count| *count > 0) else {
+                return false;
+            };
+            remaining = &remaining[count..];
+        }
+        true
     }
 
     pub fn retain_images(
@@ -2454,10 +2531,19 @@ impl CapturedHistoryCache {
         if bytes > LIMIT
             || anchors.is_empty()
             || anchors.windows(2).any(|pair| {
-                (pair[0].capture_id, pair[0].line_index, pair[0].column)
-                    >= (pair[1].capture_id, pair[1].line_index, pair[1].column)
+                pair[0].capture_id != pair[1].capture_id
+                    || (pair[0].line_index, pair[0].column) >= (pair[1].line_index, pair[1].column)
             })
         {
+            return;
+        }
+        if self.identity.is_some_and(|(_, _, pin)| {
+            pin.capture.is_none_or(|capture| {
+                anchors
+                    .first()
+                    .is_none_or(|anchor| anchor.capture_id != capture.identity)
+            })
+        }) {
             return;
         }
         // Captures are immutable. Known-empty coverage assembled from existing
