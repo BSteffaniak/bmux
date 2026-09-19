@@ -500,6 +500,14 @@ fn foreground_child(identity: &str, root: u32) -> bool {
 fn peer_pid(stream: &UnixStream) -> Result<u32, String> {
     #[cfg(target_os = "macos")]
     {
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: both output pointers reference valid initialized credential storage.
+        let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
+        // SAFETY: geteuid has no arguments or memory-safety preconditions.
+        if result != 0 || uid != unsafe { libc::geteuid() } {
+            return Err("resurrection peer user identity mismatch".into());
+        }
         let mut pid: libc::pid_t = 0;
         let mut length = u32::try_from(std::mem::size_of_val(&pid)).map_err(|e| e.to_string())?;
         // SAFETY: buffer and length point to valid initialized storage of the expected size.
@@ -519,6 +527,8 @@ fn peer_pid(stream: &UnixStream) -> Result<u32, String> {
     }
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: all-zero is a valid initial representation for integer-only ucred;
+        // getsockopt fills it before its fields are used.
         let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
         let mut length =
             u32::try_from(std::mem::size_of_val(&credentials)).map_err(|e| e.to_string())?;
@@ -534,6 +544,10 @@ fn peer_pid(stream: &UnixStream) -> Result<u32, String> {
         };
         if result != 0 {
             return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: geteuid has no arguments or memory-safety preconditions.
+        if credentials.uid != unsafe { libc::geteuid() } {
+            return Err("resurrection peer user identity mismatch".into());
         }
         u32::try_from(credentials.pid).map_err(|e| e.to_string())
     }

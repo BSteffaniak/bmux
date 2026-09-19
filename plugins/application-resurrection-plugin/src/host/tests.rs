@@ -329,6 +329,13 @@ fn shell_ownership_requires_current_foreground_child() {
 }
 
 #[test]
+fn kernel_peer_credentials_identify_the_connecting_process() {
+    let (client, server) = UnixStream::pair().unwrap();
+    assert_eq!(peer_pid(&client).unwrap(), std::process::id());
+    assert_eq!(peer_pid(&server).unwrap(), std::process::id());
+}
+
+#[test]
 fn actual_peer_identity_rejects_forged_pid() {
     let directory = tempfile::tempdir().unwrap();
     let host = Host::new(directory.path().to_owned()).unwrap();
