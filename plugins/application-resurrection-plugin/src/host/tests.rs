@@ -171,6 +171,53 @@ fn versioned_prepare_rejects_checkpoint_from_another_invocation() {
 }
 
 #[test]
+fn versioned_boundaries_return_identity_and_missing_references_fail() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = Host::new(directory.path().to_owned()).unwrap();
+    let key = uuid::Uuid::new_v4().to_string();
+    assert!(
+        host.prepare_checked(
+            &key,
+            true,
+            false,
+            false,
+            IdentityCheck::Expected(Some("missing"))
+        )
+        .is_err()
+    );
+    let launch = host
+        .prepare_checked(&key, false, true, false, IdentityCheck::Expected(None))
+        .unwrap();
+    assert_eq!(
+        host.boundary_identity(&key, &launch.endpoint, true)
+            .unwrap(),
+        launch.invocation
+    );
+    let next = host
+        .boundary_identity(&key, &launch.endpoint, false)
+        .unwrap();
+    assert_ne!(next, launch.invocation);
+    let restored = host
+        .prepare_checked(&key, true, true, true, IdentityCheck::Expected(Some(&next)))
+        .unwrap();
+    assert_eq!(
+        host.boundary_identity(&key, &restored.endpoint, true)
+            .unwrap(),
+        next
+    );
+    assert_eq!(
+        host.boundary_identity(&key, &restored.endpoint, false)
+            .unwrap(),
+        next
+    );
+    assert_ne!(
+        host.boundary_identity(&key, &restored.endpoint, true)
+            .unwrap(),
+        next
+    );
+}
+
+#[test]
 fn checkpoint_read_distinguishes_missing_from_unreadable_and_oversized() {
     let directory = tempfile::tempdir().unwrap();
     assert!(

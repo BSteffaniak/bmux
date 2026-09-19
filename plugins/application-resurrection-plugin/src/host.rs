@@ -96,7 +96,12 @@ impl Host {
         let file = self.root.join(format!("{key}.json"));
         let execution = if restored && (!shell || replay) {
             load_checkpoint(&file)?.map_or_else(
-                || Ok(Execution::manual()),
+                || match identity {
+                    IdentityCheck::Expected(Some(_)) => {
+                        Err("pane references a missing resurrection checkpoint".into())
+                    }
+                    _ => Ok(Execution::manual()),
+                },
                 |checkpoint| {
                     if let IdentityCheck::Expected(expected) = identity
                         && expected != Some(checkpoint.invocation.to_string().as_str())
@@ -182,21 +187,41 @@ impl Host {
     }
 
     pub fn boundary(&self, key: &str, endpoint: &str, prompt: bool) -> Result<bool, String> {
+        self.advance_boundary(key, endpoint, prompt)
+            .map(|(changed, _)| changed)
+    }
+
+    pub fn boundary_identity(
+        &self,
+        key: &str,
+        endpoint: &str,
+        prompt: bool,
+    ) -> Result<String, String> {
+        self.advance_boundary(key, endpoint, prompt)
+            .map(|(_, invocation)| invocation)
+    }
+
+    fn advance_boundary(
+        &self,
+        key: &str,
+        endpoint: &str,
+        prompt: bool,
+    ) -> Result<(bool, String), String> {
         let entry = self.entry(key, endpoint)?;
         let mut state = entry.state.lock().map_err(|e| e.to_string())?;
         if entry.stopped.load(Ordering::SeqCst) {
             return Err("stale execution boundary".into());
         }
         if !state.shell {
-            return Ok(false);
+            return Ok((false, state.execution.committed.invocation.to_string()));
         }
         if prompt && state.initial_prompt {
             state.initial_prompt = false;
-            return Ok(true);
+            return Ok((true, state.execution.committed.invocation.to_string()));
         }
         if !prompt && state.replay_start {
             state.replay_start = false;
-            return Ok(true);
+            return Ok((true, state.execution.committed.invocation.to_string()));
         }
         state.initial_prompt = false;
         state.replay_start = false;
@@ -212,7 +237,7 @@ impl Host {
             .checked_add(1)
             .ok_or("execution epoch exhausted")?;
         state.claim = None;
-        Ok(true)
+        Ok((true, state.execution.committed.invocation.to_string()))
     }
 
     pub fn close(&self, key: &str, endpoint: &str) -> Result<bool, String> {
