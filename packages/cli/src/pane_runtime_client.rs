@@ -969,7 +969,9 @@ mod history_tests {
             cache.indexed.as_ref().unwrap().content.row_count(),
             Some(80)
         );
+        let revision = cache.revision.clone();
         cache.prepare_resident_index(0, 40);
+        assert!(std::sync::Arc::ptr_eq(&revision, &cache.revision));
         assert_eq!(cache.indexed.as_ref().unwrap().width, 1);
         cache.prepare_resident_index(2, 40);
         let partial = cache
@@ -1777,6 +1779,30 @@ mod history_tests {
         assert_eq!(cache.cached_images(80, &[first]), Some(vec![]));
     }
 
+    #[test]
+    fn retained_charge_includes_allocated_image_queue_slots() {
+        let mut cache = super::CapturedHistoryCache::default();
+        let anchor = bmux_attach_pipeline::CapturedHistoryAnchor {
+            capture_id: uuid::Uuid::new_v4(),
+            line_index: 0,
+            column: 0,
+        };
+        cache.retain_images(80, &[anchor], &[]);
+        let slots = cache.image_coverage.capacity()
+            * std::mem::size_of::<std::sync::Arc<super::CapturedImageCoverage>>();
+        assert!(slots > 0);
+        assert_eq!(
+            cache.retained_charge(),
+            std::mem::size_of_val(&cache) + cache.image_bytes + slots
+        );
+        cache.image_coverage.clear();
+        cache.image_bytes = 0;
+        assert_eq!(
+            cache.retained_charge(),
+            std::mem::size_of_val(&cache) + slots
+        );
+    }
+
     struct HistoryClient;
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryClient {
         async fn invoke_service_raw(
@@ -2166,6 +2192,11 @@ impl CapturedHistoryCache {
             0
         })
         .saturating_add(self.image_bytes)
+        .saturating_add(
+            self.image_coverage
+                .capacity()
+                .saturating_mul(std::mem::size_of::<std::sync::Arc<CapturedImageCoverage>>()),
+        )
         .saturating_add(self.indexed.as_ref().map_or(0, |index| index.bytes))
         .saturating_add(std::mem::size_of::<Self>())
     }
@@ -2198,6 +2229,9 @@ impl CapturedHistoryCache {
     /// Index a bounded contiguous resident range around the requested anchor.
     /// Gaps remain explicit; partial residency never renumbers source identities.
     pub fn prepare_resident_index(&mut self, width: usize, line: u32) {
+        if width == 0 {
+            return;
+        }
         let Some((_, _, pin)) = self.identity else {
             return;
         };

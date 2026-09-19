@@ -519,14 +519,24 @@ mod tests {
             anchor: None,
             delta: 0,
         };
+        let cache = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::pane_runtime_client::CapturedHistoryCache::default(),
+        ));
+        let original = cache.lock().await.clone();
+        let charge = original.retained_charge();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            fetch(client, request, std::sync::Arc::default()),
+            fetch(client, request, cache.clone()),
         )
         .await
         .expect("must reject without attempting legacy service");
         assert!(matches!(result, Outcome::Unavailable));
         assert!(receiver.try_recv().is_err());
+        let mut resident = cache.lock().await;
+        assert_eq!(resident.retained_charge(), charge);
+        assert!(!resident.matches_capture((request.session, request.pane, request.pin.unwrap())));
+        assert!(resident.publish_if_current(&original, original.clone()));
+        drop(resident);
     }
 
     #[tokio::test]
@@ -566,6 +576,8 @@ mod tests {
             }),
             ..request
         };
+        let original = cache.lock().await.clone();
+        let charge = original.retained_charge();
         let fetch = Fetch {
             prefetch: false,
             request,
@@ -580,5 +592,12 @@ mod tests {
         drop(fetch);
         tokio::task::yield_now().await;
         assert!(held_request.is_cancelled());
+        let mut resident = cache.lock().await;
+        assert_eq!(resident.retained_charge(), charge);
+        assert!(!resident.matches_capture((request.session, request.pane, request.pin.unwrap())));
+        // Publication against the original snapshot succeeds only if cancellation
+        // left both source identity and publication revision unchanged.
+        assert!(resident.publish_if_current(&original, original.clone()));
+        drop(resident);
     }
 }
