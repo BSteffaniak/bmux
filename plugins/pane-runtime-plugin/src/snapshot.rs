@@ -74,6 +74,8 @@ pub struct PaneRuntimeSessionSnapshotV1 {
 /// Per-pane record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneRuntimeSnapshotV1Pane {
+    #[serde(default)]
+    pub execution_token: Option<String>,
     pub id: Uuid,
     #[serde(default)]
     pub name: Option<String>,
@@ -237,6 +239,7 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
                     .and_then(|identity| identity.process_group_id);
 
                 PaneRuntimeSnapshotV1Pane {
+                    execution_token: pane.resurrection.execution_token,
                     id: pane.id,
                     name: pane.name,
                     shell: pane.shell,
@@ -347,6 +350,7 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result
                     env: command.env.clone(),
                 }),
                 resurrection: PaneResurrectionSnapshot {
+                    execution_token: pane.execution_token.clone(),
                     active_command: pane.active_command.clone(),
                     active_command_source: pane.active_command_source,
                     last_known_cwd: pane.last_known_cwd.clone(),
@@ -586,6 +590,7 @@ mod tests {
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
                 session_id,
                 panes: vec![PaneRuntimeSnapshotV1Pane {
+                    execution_token: None,
                     id: pane_id,
                     name: Some("editor".into()),
                     shell: "/bin/sh".into(),
@@ -665,6 +670,7 @@ mod tests {
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
                 session_id,
                 panes: vec![PaneRuntimeSnapshotV1Pane {
+                    execution_token: None,
                     id: pane_id,
                     name: Some("remote-a".into()),
                     shell: "/bin/sh".into(),
@@ -720,6 +726,7 @@ mod tests {
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
                 session_id,
                 panes: vec![PaneRuntimeSnapshotV1Pane {
+                    execution_token: None,
                     id: pane_id,
                     name: Some("pane-1".into()),
                     shell: "/bin/sh".into(),
@@ -782,6 +789,7 @@ mod tests {
     fn schema_omits_absent_padding_override_and_decodes_it_as_none() {
         let pane_id = Uuid::new_v4();
         let pane = PaneRuntimeSnapshotV1Pane {
+            execution_token: None,
             id: pane_id,
             name: None,
             shell: "/bin/sh".to_string(),

@@ -256,7 +256,9 @@ impl Drop for Host {
     fn drop(&mut self) {
         if let Ok(entries) = self.entries.lock() {
             for entry in entries.values() {
-                entry.stopped.store(true, Ordering::SeqCst);
+                if let Err(error) = stop_and_drain(entry) {
+                    tracing::warn!(%error, "failed draining resurrection writer during shutdown");
+                }
             }
         }
     }
@@ -342,6 +344,11 @@ fn send(stream: &mut UnixStream, value: &serde_json::Value) -> Result<(), String
 }
 
 fn configure_stream(stream: &UnixStream) -> Result<u32, String> {
+    // Accepted sockets can inherit O_NONBLOCK on BSD/macOS. Framing below uses
+    // bounded blocking reads; explicitly set the mode rather than race the hello.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(2)))
         .map_err(|e| e.to_string())?;

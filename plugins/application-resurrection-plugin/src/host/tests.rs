@@ -141,6 +141,78 @@ fn replacing_endpoint_drains_old_writer_and_stale_close_cannot_remove_successor(
 }
 
 #[test]
+fn versioned_socket_reopens_latest_session_after_host_shutdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = uuid::Uuid::new_v4().to_string();
+    let host = Host::new(directory.path().to_owned()).unwrap();
+    let launch = host
+        .prepare_checked(&key, false, false, false, IdentityCheck::Expected(None))
+        .unwrap();
+    host.bind(&key, &launch.endpoint, std::process::id())
+        .unwrap();
+    let mut client = connect(&launch.endpoint, true);
+    let welcome: serde_json::Value = receive(&mut client).unwrap();
+    assert!(welcome["restore"].is_null());
+    for (revision, session) in [(1, "first"), (2, "selected-at-shutdown")] {
+        send(
+            client.get_mut(),
+            &serde_json::json!({"operation":"selection", "revision":revision,
+            "descriptor":{"application":"test", "session":session}}),
+        )
+        .unwrap();
+        let ack: serde_json::Value = receive(&mut client).unwrap();
+        assert_eq!(ack["revision"], revision);
+    }
+    drop(host);
+    drop(client);
+    let restarted = Host::new(directory.path().to_owned()).unwrap();
+    let restored = restarted
+        .prepare_checked(
+            &key,
+            true,
+            false,
+            false,
+            IdentityCheck::Expected(Some(&launch.invocation)),
+        )
+        .unwrap();
+    restarted
+        .bind(&key, &restored.endpoint, std::process::id())
+        .unwrap();
+    let mut client = connect(&restored.endpoint, true);
+    let welcome: serde_json::Value = receive(&mut client).unwrap();
+    assert_eq!(welcome["restore"]["session"], "selected-at-shutdown");
+    assert_eq!(restored.invocation, launch.invocation);
+    send(
+        client.get_mut(),
+        &serde_json::json!({"operation":"selection","revision":1,"descriptor":null}),
+    )
+    .unwrap();
+    let ack: serde_json::Value = receive(&mut client).unwrap();
+    assert_eq!(ack["revision"], 1);
+    drop(restarted);
+    drop(client);
+    let restarted = Host::new(directory.path().to_owned()).unwrap();
+    let restored = restarted
+        .prepare_checked(
+            &key,
+            true,
+            false,
+            false,
+            IdentityCheck::Expected(Some(&launch.invocation)),
+        )
+        .unwrap();
+    restarted
+        .bind(&key, &restored.endpoint, std::process::id())
+        .unwrap();
+    let mut client = connect(&restored.endpoint, true);
+    let welcome: serde_json::Value = receive(&mut client).unwrap();
+    assert!(
+        welcome["restore"].is_null(),
+        "cleared draft must not reopen previous session"
+    );
+}
+
+#[test]
 fn versioned_prepare_rejects_checkpoint_from_another_invocation() {
     let directory = tempfile::tempdir().unwrap();
     let host = Host::new(directory.path().to_owned()).unwrap();

@@ -706,6 +706,7 @@ fn encode_grid_window(
 
 #[derive(Debug, Clone, Default)]
 struct PaneResurrectionRuntime {
+    execution_token: Option<String>,
     active_command: Option<String>,
     active_command_source: Option<PaneCommandSource>,
     last_known_cwd: Option<String>,
@@ -714,6 +715,7 @@ struct PaneResurrectionRuntime {
 impl PaneResurrectionRuntime {
     fn from_snapshot(snapshot: &PaneResurrectionSnapshot) -> Self {
         Self {
+            execution_token: snapshot.execution_token.clone(),
             active_command: snapshot.active_command.clone(),
             active_command_source: snapshot.active_command_source,
             last_known_cwd: snapshot.last_known_cwd.clone(),
@@ -722,6 +724,7 @@ impl PaneResurrectionRuntime {
 
     fn to_snapshot(&self) -> PaneResurrectionSnapshot {
         PaneResurrectionSnapshot {
+            execution_token: self.execution_token.clone(),
             active_command: self.active_command.clone(),
             active_command_source: self.active_command_source,
             last_known_cwd: self.last_known_cwd.clone(),
@@ -4749,6 +4752,10 @@ impl SessionRuntimeManager {
                     restoring,
                     launch.is_none(),
                     replay_command.is_some(),
+                    resurrection_state_for_reader
+                        .lock()
+                        .ok()
+                        .and_then(|state| state.execution_token.clone()),
                 ) {
                     Ok(value) => value,
                     Err(error) => {
@@ -4757,6 +4764,12 @@ impl SessionRuntimeManager {
                     }
                 }
             };
+            if let Some(resume) = &application_resume {
+                if let Ok(mut state) = resurrection_state_for_reader.lock() {
+                    state.execution_token = Some(resume.invocation.clone());
+                }
+                mark_snapshot_dirty_flag();
+            }
             let mut replay_on_prompt = false;
             let (mut command, failed_spawn_label) = if let Some(launch) = launch.as_ref() {
                 if let Err(error) = validate_explicit_launch(launch) {
@@ -5067,19 +5080,22 @@ impl SessionRuntimeManager {
                                 // Metadata callbacks can acquire the runtime manager. Never
                                 // invoke them while holding image/grid/output capture locks.
                                 if !metadata.events.is_empty() {
-                                    if let Some(resume) = &application_resume {
-                                        for event in &metadata.events {
-                                            if let Err(error) = resume.boundary(matches!(event, PaneShellMetadataEvent::Prompt { .. })) {
-                                                warn!(%error, "resurrection lifecycle update failed");
-                                                resume.close();
-                                            }
-                                        }
-                                    }
                                     let padding_before = pane_padding_state(session_id, pane_id);
                                     let mut replay_command = None;
                                     if let Ok(mut resurrection_state) =
                                         resurrection_state_for_reader.lock()
                                     {
+                                        if let Some(resume) = &application_resume {
+                                            for event in &metadata.events {
+                                                match resume.boundary(matches!(event, PaneShellMetadataEvent::Prompt { .. })) {
+                                                    Ok(identity) => resurrection_state.execution_token = Some(identity),
+                                                    Err(error) => {
+                                                        warn!(%error, "resurrection lifecycle update failed");
+                                                        resume.close();
+                                                    }
+                                                }
+                                            }
+                                        }
                                         if let Ok(mut pending_replay) =
                                             pending_prompt_replay_for_reader.lock()
                                         {
@@ -5558,6 +5574,7 @@ impl SessionRuntimeManager {
                     shell: pane.meta.shell.clone(),
                     launch: pane.meta.launch.clone(),
                     resurrection: PaneResurrectionSnapshot {
+                        execution_token: None,
                         active_command: None,
                         active_command_source: None,
                         last_known_cwd: preserved_cwd,
@@ -8524,9 +8541,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             let mut resurrection_runtime = pane
                 .resurrection_state
                 .lock()
-                .ok()
-                .map(|s| s.clone())
-                .unwrap_or_default();
+                .map_err(|_| anyhow::anyhow!("resurrection state lock poisoned"))?;
 
             if !pane.exited.load(Ordering::SeqCst)
                 && resurrection_runtime.active_command_source != Some(PaneCommandSource::Verbatim)
@@ -8559,10 +8574,6 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                     }
                     None => {}
                 }
-            }
-
-            if let Ok(mut state_guard) = pane.resurrection_state.lock() {
-                *state_guard = resurrection_runtime.clone();
             }
 
             let mut meta = pane.meta;
@@ -14703,6 +14714,7 @@ mod tests {
     #[test]
     fn prompt_replay_waits_for_shell_prompt_and_marks_command_active() {
         let mut state = PaneResurrectionRuntime {
+            execution_token: None,
             active_command: Some("lazygit".to_string()),
             active_command_source: Some(PaneCommandSource::Verbatim),
             last_known_cwd: Some("/work".to_string()),
@@ -14783,6 +14795,7 @@ mod tests {
             shell: "/nix/store/missing-nushell/bin/nu".to_string(),
             launch: None,
             resurrection: PaneResurrectionSnapshot {
+                execution_token: None,
                 active_command: Some("lazygit".to_string()),
                 active_command_source: Some(PaneCommandSource::Verbatim),
                 last_known_cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
@@ -14818,6 +14831,7 @@ mod tests {
             shell: "/missing/zsh".to_string(),
             launch: None,
             resurrection: PaneResurrectionSnapshot {
+                execution_token: None,
                 active_command: Some("print -r -- hello".to_string()),
                 active_command_source: Some(PaneCommandSource::Verbatim),
                 last_known_cwd: None,
@@ -14841,6 +14855,7 @@ mod tests {
             shell: "sh".to_string(),
             launch: None,
             resurrection: PaneResurrectionSnapshot {
+                execution_token: None,
                 active_command: None,
                 active_command_source: None,
                 last_known_cwd: Some(
@@ -14951,6 +14966,7 @@ mod tests {
             shell: "/missing/zsh".to_string(),
             launch: None,
             resurrection: PaneResurrectionSnapshot {
+                execution_token: None,
                 active_command: Some("zsh-only-command".to_string()),
                 active_command_source: Some(PaneCommandSource::Verbatim),
                 last_known_cwd: Some("/missing/cwd".to_string()),
@@ -15141,6 +15157,7 @@ mod tests {
                 shell: stale_shell.to_string(),
                 launch: None,
                 resurrection: PaneResurrectionSnapshot {
+                    execution_token: None,
                     active_command: None,
                     active_command_source: None,
                     last_known_cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),

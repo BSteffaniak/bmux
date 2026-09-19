@@ -39,6 +39,9 @@ pub struct PaneRuntimeMeta {
 /// `restore_runtime` path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaneResurrectionSnapshot {
+    /// Opaque execution identity used to validate independently persisted launch metadata.
+    #[serde(default)]
+    pub execution_token: Option<String>,
     #[serde(default)]
     pub active_command: Option<String>,
     #[serde(default)]
@@ -80,6 +83,7 @@ mod tests {
     #[test]
     fn resurrection_snapshot_round_trips() {
         let snap = PaneResurrectionSnapshot {
+            execution_token: Some("invocation-reference".into()),
             active_command: Some("vim".into()),
             active_command_source: Some(PaneCommandSource::Verbatim),
             last_known_cwd: Some("/tmp".into()),

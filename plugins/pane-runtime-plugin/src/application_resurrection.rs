@@ -20,6 +20,7 @@ pub struct Launch {
     caller: Arc<TypedServiceCaller>,
     key: String,
     pub endpoint: String,
+    pub invocation: String,
 }
 
 pub fn prepare(
@@ -27,24 +28,29 @@ pub fn prepare(
     restored: bool,
     shell: bool,
     replay: bool,
+    expected_invocation: Option<String>,
 ) -> Result<Option<Launch>, String> {
     let Some(caller) = CALLER.read().map_err(|e| e.to_string())?.clone() else {
         return Ok(None);
     };
     let mut dispatch = ServiceCallerDispatchClient::new(caller.as_ref());
-    let endpoint = block_on_typed_dispatch(client::prepare(
-        &mut dispatch,
-        key.clone(),
-        restored,
-        shell,
-        replay,
-    ))
+    let prepared = block_on_typed_dispatch(
+        bmux_application_resurrection_plugin_api::resurrection_launch_v2::client::prepare(
+            &mut dispatch,
+            key.clone(),
+            restored,
+            shell,
+            replay,
+            expected_invocation,
+        ),
+    )
     .map_err(|e| e.to_string())?
     .map_err(|e| format!("{e:?}"))?;
     Ok(Some(Launch {
         caller,
         key,
-        endpoint,
+        endpoint: prepared.endpoint,
+        invocation: prepared.invocation,
     }))
 }
 
@@ -61,17 +67,18 @@ impl Launch {
         .map_err(|e| format!("{e:?}"))?;
         Ok(())
     }
-    pub fn boundary(&self, prompt: bool) -> Result<(), String> {
+    pub fn boundary(&self, prompt: bool) -> Result<String, String> {
         let mut dispatch = ServiceCallerDispatchClient::new(self.caller.as_ref());
-        block_on_typed_dispatch(client::boundary(
-            &mut dispatch,
-            self.key.clone(),
-            self.endpoint.clone(),
-            prompt,
-        ))
+        block_on_typed_dispatch(
+            bmux_application_resurrection_plugin_api::resurrection_launch_v2::client::boundary(
+                &mut dispatch,
+                self.key.clone(),
+                self.endpoint.clone(),
+                prompt,
+            ),
+        )
         .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:?}"))?;
-        Ok(())
+        .map_err(|e| format!("{e:?}"))
     }
     pub fn close(&self) {
         let mut dispatch = ServiceCallerDispatchClient::new(self.caller.as_ref());
