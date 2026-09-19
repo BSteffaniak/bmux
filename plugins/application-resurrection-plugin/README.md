@@ -21,15 +21,36 @@ application session IDs or execute commands from descriptors.
 - Shell integration is limited to Bash, Zsh, Fish and Nushell. Other shells do not
   receive discovery. Explicit program launches do not need shell integration.
 
-## Validation and remaining hardening
+## Recovery and validation
 
-Socket tests exercise real peer authentication, acknowledged persistence, restored
-versus manual launch behavior, stale endpoints, and shell replay transitions.
-The implementation still needs a full Bcode-in-BMUX restart test and review of
-atomic association between the independent descriptor checkpoint and the pane
-snapshot. In particular, interrupted command changes must not pair a newer pane
-snapshot with an older descriptor. Shell marker provenance and foreground-process
-ownership also need stronger validation before claiming a hardened protocol.
+Pane snapshots retain an opaque invocation identity. The v2 launch contract rejects
+missing or mismatched referenced checkpoints rather than adopting another command's
+state. Shell metadata and identity transitions share a lock during snapshot capture.
+Interrupted transitions can therefore produce an explicit recovery error, not an
+offer for the wrong invocation. Old snapshots without a checkpoint launch normally;
+old snapshots with an unassociated checkpoint fail without overwriting it.
+
+Shell markers carry fresh per-launch tokens from private integration directories.
+This prevents ordinary output and stale recordings from impersonating shell hooks;
+same-user code able to read those files remains within the local trust boundary.
+Peer UID/PID and foreground child ownership are checked separately.
+
+`application_resurrection_integration` exercises real daemon restart for direct
+launch and Bash replay, including a subsequent manual launch receiving no offer.
+`bcode_resurrection_integration` runs the actual Bcode TUI with isolated state and
+no model requests. Its second launch omits the session argument and verifies that
+Bcode publishes the recovered session in the replacement generation. Run explicitly:
+
+```sh
+BCODE_RESURRECTION_TEST_BINARY=/absolute/path/to/bcode \
+  bash scripts/dev.sh cargo test -p bmux_cli \
+  --test bcode_resurrection_integration -- --ignored
+```
+
+The cross-repository test is ignored in the default suite because it requires a
+separately built Bcode binary. Nested/non-exec wrappers and remote applications are
+not automatically adopted. This experimental protocol is not an established
+cross-terminal standard.
 
 Discovery is not authorization. No private credentials are persisted. Normal
 application selection/opening remains the application's responsibility. Host
