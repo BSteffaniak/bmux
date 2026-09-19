@@ -188,9 +188,14 @@ pub(super) fn next_default_tab_name(sessions: &[SessionSummary]) -> String {
     }
 }
 
-fn open_startup_diagnostics(runtime_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    std::fs::create_dir_all(runtime_dir)
-        .context("failed creating server startup diagnostics directory")?;
+fn open_server_startup_log(runtime_dir: &std::path::Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(runtime_dir).with_context(|| {
+        format!(
+            "failed creating server runtime directory: {}",
+            runtime_dir.display()
+        )
+    })?;
+    let startup_log = runtime_dir.join("server-startup.log");
     let mut options = std::fs::OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(unix)]
@@ -198,9 +203,12 @@ fn open_startup_diagnostics(runtime_dir: &std::path::Path) -> anyhow::Result<std
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options
-        .open(runtime_dir.join("server-startup.log"))
-        .context("failed opening server startup diagnostics")
+    options.open(&startup_log).with_context(|| {
+        format!(
+            "failed opening server startup diagnostics: {}",
+            startup_log.display()
+        )
+    })
 }
 
 fn startup_diagnostics_tail(path: &std::path::Path) -> String {
@@ -356,7 +364,7 @@ async fn run_server_start_inner(
             set_startup_recording_env(&mut child, startup_recording)?;
         }
         let startup_log = paths.runtime_dir.join("server-startup.log");
-        let startup_output = open_startup_diagnostics(&paths.runtime_dir)?;
+        let startup_output = open_server_startup_log(&paths.runtime_dir)?;
         child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1074,37 +1082,59 @@ mod tests {
     use bmux_ipc::transport::IpcTransportError;
 
     #[test]
-    fn startup_diagnostics_creates_selected_runtime_and_truncates_previous_output() {
+    fn startup_log_creates_missing_runtime_directory_and_truncates_on_restart() {
         use std::io::Write;
 
-        let root = tempfile::tempdir().unwrap();
-        let runtime = root.path().join("runtimes/selected");
-        let log = runtime.join("server-startup.log");
-        assert!(!runtime.exists());
-        let mut file = open_startup_diagnostics(&runtime).unwrap();
-        file.write_all(b"previous startup failure").unwrap();
-        drop(file);
-        assert_eq!(startup_diagnostics_tail(&log), "previous startup failure");
-        drop(open_startup_diagnostics(&runtime).unwrap());
-        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+        let root = tempfile::tempdir().expect("temporary directory");
+        let runtime_dir = root.path().join("runtimes").join("test");
+        assert!(!runtime_dir.exists());
+        let mut log = open_server_startup_log(&runtime_dir).expect("open startup log");
+        log.write_all(b"startup diagnostics")
+            .expect("write diagnostics");
+        drop(log);
+        let path = runtime_dir.join("server-startup.log");
+        assert_eq!(
+            std::fs::read(&path).expect("read log"),
+            b"startup diagnostics"
+        );
+        assert_eq!(startup_diagnostics_tail(&path), "startup diagnostics");
         assert!(!root.path().join("server-startup.log").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
-                std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(&path)
+                    .expect("log metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
                 0o600
             );
         }
+        drop(open_server_startup_log(&runtime_dir).expect("reopen startup log"));
+        assert!(std::fs::read(&path).expect("read truncated log").is_empty());
     }
 
     #[test]
-    fn startup_diagnostics_rejects_non_directory_runtime() {
-        let root = tempfile::tempdir().unwrap();
-        let runtime = root.path().join("runtime");
-        std::fs::write(&runtime, b"not a directory").unwrap();
-        assert!(open_startup_diagnostics(&runtime).is_err());
-        assert_eq!(std::fs::read(&runtime).unwrap(), b"not a directory");
+    fn startup_log_reports_invalid_runtime_directory() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let runtime_dir = root.path().join("not-a-directory");
+        std::fs::write(&runtime_dir, b"existing file").expect("create blocking file");
+        let error = open_server_startup_log(&runtime_dir).expect_err("must reject file");
+        assert!(
+            error
+                .to_string()
+                .contains("failed creating server runtime directory")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&runtime_dir.display().to_string())
+        );
+        assert_eq!(
+            std::fs::read(runtime_dir).expect("read existing file"),
+            b"existing file"
+        );
     }
 
     #[test]
