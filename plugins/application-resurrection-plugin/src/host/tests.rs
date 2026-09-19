@@ -141,6 +141,36 @@ fn replacing_endpoint_drains_old_writer_and_stale_close_cannot_remove_successor(
 }
 
 #[test]
+fn versioned_prepare_rejects_checkpoint_from_another_invocation() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = Host::new(directory.path().to_owned()).unwrap();
+    let key = uuid::Uuid::new_v4().to_string();
+    let launch = host
+        .prepare_checked(&key, false, false, false, IdentityCheck::Expected(None))
+        .unwrap();
+    assert!(
+        host.prepare_checked(
+            &key,
+            true,
+            false,
+            false,
+            IdentityCheck::Expected(Some("wrong-invocation"))
+        )
+        .is_err()
+    );
+    let restored = host
+        .prepare_checked(
+            &key,
+            true,
+            false,
+            false,
+            IdentityCheck::Expected(Some(&launch.invocation)),
+        )
+        .unwrap();
+    assert_eq!(restored.invocation, launch.invocation);
+}
+
+#[test]
 fn checkpoint_read_distinguishes_missing_from_unreadable_and_oversized() {
     let directory = tempfile::tempdir().unwrap();
     assert!(

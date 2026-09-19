@@ -22,3 +22,13 @@ interface resurrection-launch-v1 {
     command boundary(key: string, endpoint: string, prompt: bool) -> result<bool, host-error>;
     command close(key: string, endpoint: string) -> result<bool, host-error>;
 }
+
+@capability(RESURRECTION_HOST)
+interface resurrection-launch-v2 {
+    record prepared-launch {
+        endpoint: string,
+        invocation: string,
+    }
+    command prepare(key: string, restored: bool, shell: bool, replay: bool, expected-invocation: string?)
+        -> result<prepared-launch, resurrection-launch-v1.host-error>;
+}

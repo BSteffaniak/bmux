@@ -57,6 +57,9 @@ impl RustPlugin for ApplicationResurrectionPlugin {
                 resurrection_launch_v1::client::PrepareEndpoint => |request, _context| {
                     Ok(host.ok_or_else(unavailable).and_then(|host| host.prepare(&request.key, request.restored, request.shell, request.replay).map_err(host_error)))
                 },
+                bmux_application_resurrection_plugin_api::resurrection_launch_v2::client::PrepareEndpoint => |request, _context| {
+                    Ok(host.ok_or_else(unavailable).and_then(|host| host.prepare_checked(&request.key, request.restored, request.shell, request.replay, host::IdentityCheck::Expected(request.expected_invocation.as_deref())).map_err(host_error)))
+                },
                 resurrection_launch_v1::client::BindEndpoint => |request, _context| {
                     Ok(host.ok_or_else(unavailable).and_then(|host| host.bind(&request.key, &request.endpoint, request.pid).map_err(host_error)))
                 },

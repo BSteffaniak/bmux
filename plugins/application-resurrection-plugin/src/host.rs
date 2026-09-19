@@ -16,6 +16,12 @@ mod tests;
 const PROTOCOL: &str = "application-resurrection/1";
 const LIMIT: u64 = 16_384;
 
+#[derive(Clone, Copy)]
+pub enum IdentityCheck<'a> {
+    Legacy,
+    Expected(Option<&'a str>),
+}
+
 pub struct Host {
     root: PathBuf,
     entries: Mutex<BTreeMap<String, Arc<Entry>>>,
@@ -59,6 +65,21 @@ impl Host {
         shell: bool,
         replay: bool,
     ) -> Result<String, String> {
+        self.prepare_checked(key, restored, shell, replay, IdentityCheck::Legacy)
+            .map(|launch| launch.endpoint)
+    }
+
+    pub fn prepare_checked(
+        &self,
+        key: &str,
+        restored: bool,
+        shell: bool,
+        replay: bool,
+        identity: IdentityCheck<'_>,
+    ) -> Result<
+        bmux_application_resurrection_plugin_api::resurrection_launch_v2::PreparedLaunch,
+        String,
+    > {
         if key.is_empty()
             || key.len() > 100
             || !key.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
@@ -76,11 +97,19 @@ impl Host {
         let execution = if restored && (!shell || replay) {
             load_checkpoint(&file)?.map_or_else(
                 || Ok(Execution::manual()),
-                |checkpoint| Execution::resurrect(checkpoint).map_err(str::to_owned),
+                |checkpoint| {
+                    if let IdentityCheck::Expected(expected) = identity
+                        && expected != Some(checkpoint.invocation.to_string().as_str())
+                    {
+                        return Err("resurrection checkpoint does not match pane invocation".into());
+                    }
+                    Execution::resurrect(checkpoint).map_err(str::to_owned)
+                },
             )?
         } else {
             Execution::manual()
         };
+        let invocation = execution.committed.invocation.to_string();
         save(&file, &execution.committed)?;
         // A short private directory avoids Unix socket path length limits, including on macOS.
         let directory = tempfile::Builder::new()
@@ -124,7 +153,12 @@ impl Host {
                 }
             }
         });
-        Ok(endpoint)
+        Ok(
+            bmux_application_resurrection_plugin_api::resurrection_launch_v2::PreparedLaunch {
+                endpoint,
+                invocation,
+            },
+        )
     }
 
     fn entry(&self, key: &str, endpoint: &str) -> Result<Arc<Entry>, String> {

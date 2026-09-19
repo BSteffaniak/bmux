@@ -16,3 +16,8 @@ kind         = "query"
 capability   = "bmux.application_resurrection.host"
 interface_id = "resurrection-launch-v1"
 kind         = "command"
+
+[[services]]
+capability   = "bmux.application_resurrection.host"
+interface_id = "resurrection-launch-v2"
+kind         = "command"
