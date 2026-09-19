@@ -15,6 +15,7 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use std::collections::BTreeMap;
 
+mod application_resurrection;
 mod commands;
 mod handlers;
 mod padding;
@@ -33,6 +34,7 @@ impl RustPlugin for PaneRuntimePlugin {
         &mut self,
         context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        application_resurrection::activate(&context);
         // Register the focus-state channel so subscribers (e.g.
         // the decoration plugin) can observe the focused pane per
         // session. Seeded empty — `publish_focus_state_snapshot`

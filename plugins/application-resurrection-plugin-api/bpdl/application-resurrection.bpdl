@@ -11,3 +11,14 @@ interface resurrection-host-v1 {
     }
     query status() -> host-status;
 }
+
+@capability(RESURRECTION_HOST)
+interface resurrection-launch-v1 {
+    variant host-error {
+        failed { message: string },
+    }
+    command prepare(key: string, restored: bool, shell: bool, replay: bool) -> result<string, host-error>;
+    command bind(key: string, endpoint: string, pid: u32) -> result<bool, host-error>;
+    command boundary(key: string, endpoint: string, prompt: bool) -> result<bool, host-error>;
+    command close(key: string, endpoint: string) -> result<bool, host-error>;
+}

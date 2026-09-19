@@ -4526,7 +4526,12 @@ impl SessionRuntimeManager {
                 .get(&pane_meta.id)
                 .copied()
                 .unwrap_or((24, 80));
-            let pane = self.spawn_pane_runtime(session_id, pane_meta.clone(), initial_size);
+            let pane = self.spawn_pane_runtime_with_restore(
+                session_id,
+                pane_meta.clone(),
+                initial_size,
+                true,
+            );
             let restored_meta = pane.meta.clone();
             self.register_pane_input(session_id, &pane);
             runtime_panes.insert(restored_meta.id, pane);
@@ -4556,12 +4561,22 @@ impl SessionRuntimeManager {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn spawn_pane_runtime(
+        &self,
+        session_id: SessionId,
+        pane_meta: PaneRuntimeMeta,
+        initial_size: (u16, u16),
+    ) -> PaneRuntimeHandle {
+        self.spawn_pane_runtime_with_restore(session_id, pane_meta, initial_size, false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn spawn_pane_runtime_with_restore(
         &self,
         session_id: SessionId,
         mut pane_meta: PaneRuntimeMeta,
         initial_size: (u16, u16),
+        restoring: bool,
     ) -> PaneRuntimeHandle {
         let resolved_launch = resolve_pane_launch(&pane_meta, &self.shell);
         if let Ok(resolved) = &resolved_launch {
@@ -4722,8 +4737,28 @@ impl SessionRuntimeManager {
                 }
             };
 
+            let application_resume = if launch.is_none()
+                && !matches!(
+                    shell_kind_for_path(&shell),
+                    ShellKind::Bash | ShellKind::Zsh | ShellKind::Fish | ShellKind::Nu
+                ) {
+                None
+            } else {
+                match crate::application_resurrection::prepare(
+                    pane_id.to_string(),
+                    restoring,
+                    launch.is_none(),
+                    replay_command.is_some(),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        fail_startup!(format!("application resurrection failed: {error}"));
+                        return;
+                    }
+                }
+            };
             let mut replay_on_prompt = false;
-            let (command, failed_spawn_label) = if let Some(launch) = launch.as_ref() {
+            let (mut command, failed_spawn_label) = if let Some(launch) = launch.as_ref() {
                 if let Err(error) = validate_explicit_launch(launch) {
                     fail_startup!(error.to_string());
                     return;
@@ -4769,6 +4804,10 @@ impl SessionRuntimeManager {
                     );
                 (command, format!("shell '{shell}'"))
             };
+            command.env_remove("APPLICATION_RESURRECTION_HOST");
+            if let Some(resume) = &application_resume {
+                command.env("APPLICATION_RESURRECTION_HOST", &resume.endpoint);
+            }
             let mut child = match pty_pair.slave.spawn_command(command) {
                 Ok(child) => child,
                 Err(error) => {
@@ -4776,6 +4815,18 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
+            if let Some(resume) = &application_resume {
+                let result = child
+                    .process_id()
+                    .ok_or_else(|| "spawned process has no PID".to_owned())
+                    .and_then(|pid| resume.bind(pid));
+                if let Err(error) = result {
+                    let _ = child.kill();
+                    resume.close();
+                    fail_startup!(format!("application resurrection bind failed: {error}"));
+                    return;
+                }
+            }
             if let Ok(mut pid) = process_id_for_task.lock() {
                 *pid = child.process_id();
             }
@@ -4830,6 +4881,7 @@ impl SessionRuntimeManager {
             let terminal_grid_for_waiter = Arc::clone(&terminal_grid_for_reader);
             let output_dirty_for_waiter = Arc::clone(&output_dirty_for_reader);
             let resurrection_state_for_waiter = Arc::clone(&resurrection_state_for_waiter_seed);
+            let application_resume_for_waiter = application_resume.clone();
             let child_waiter_done = Arc::new(AtomicBool::new(false));
             let child_waiter_done_for_thread = Arc::clone(&child_waiter_done);
             let child_waiter = std::thread::Builder::new()
@@ -4837,6 +4889,7 @@ impl SessionRuntimeManager {
                 .spawn(move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
                     let wait_result = child.wait();
+                    if let Some(resume) = application_resume_for_waiter { resume.close(); }
                     exited_for_waiter.store(true, Ordering::SeqCst);
                     if let Ok(mut reason) = exit_reason_for_waiter.lock()
                         && reason.is_none()
@@ -5014,6 +5067,14 @@ impl SessionRuntimeManager {
                                 // Metadata callbacks can acquire the runtime manager. Never
                                 // invoke them while holding image/grid/output capture locks.
                                 if !metadata.events.is_empty() {
+                                    if let Some(resume) = &application_resume {
+                                        for event in &metadata.events {
+                                            if let Err(error) = resume.boundary(matches!(event, PaneShellMetadataEvent::Prompt { .. })) {
+                                                warn!(%error, "resurrection lifecycle update failed");
+                                                resume.close();
+                                            }
+                                        }
+                                    }
                                     let padding_before = pane_padding_state(session_id, pane_id);
                                     let mut replay_command = None;
                                     if let Ok(mut resurrection_state) =

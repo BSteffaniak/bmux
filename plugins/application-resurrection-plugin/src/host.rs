@@ -1,0 +1,439 @@
+//! Durable, bounded local transport. Each socket belongs to one live pane launch.
+use crate::execution::{Checkpoint, Execution};
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+#[cfg(test)]
+mod tests;
+
+const PROTOCOL: &str = "application-resurrection/1";
+const LIMIT: u64 = 16_384;
+
+pub struct Host {
+    root: PathBuf,
+    entries: Mutex<BTreeMap<String, Arc<Entry>>>,
+}
+
+struct Entry {
+    endpoint: String,
+    file: PathBuf,
+    stopped: AtomicBool,
+    state: Mutex<State>,
+}
+
+struct State {
+    execution: Execution,
+    pid: Option<u32>,
+    shell: bool,
+    initial_prompt: bool,
+    replay_start: bool,
+    epoch: u64,
+    claim: Option<u32>,
+}
+
+impl Host {
+    pub fn new(root: PathBuf) -> Result<Self, String> {
+        if !root.is_absolute() {
+            return Err("resurrection storage root must be absolute".into());
+        }
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            root,
+            entries: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    pub fn prepare(
+        &self,
+        key: &str,
+        restored: bool,
+        shell: bool,
+        replay: bool,
+    ) -> Result<String, String> {
+        if key.is_empty()
+            || key.len() > 100
+            || !key.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+        {
+            return Err("invalid launch key".into());
+        }
+        let mut entries = self.entries.lock().map_err(|e| e.to_string())?;
+        if entries.len() >= 1024 && !entries.contains_key(key) {
+            return Err("resurrection launch limit reached".into());
+        }
+        let file = self.root.join(format!("{key}.json"));
+        let execution = if restored && (!shell || replay) && file.exists() {
+            let bytes = std::fs::File::open(&file).map_err(|e| e.to_string())?;
+            let mut bounded = Vec::new();
+            bytes
+                .take(65_537)
+                .read_to_end(&mut bounded)
+                .map_err(|e| e.to_string())?;
+            if bounded.len() > 65_536 {
+                return Err("oversized checkpoint".into());
+            }
+            let checkpoint: Checkpoint =
+                serde_json::from_slice(&bounded).map_err(|e| e.to_string())?;
+            Execution::resurrect(checkpoint).map_err(str::to_owned)?
+        } else {
+            Execution::manual()
+        };
+        save(&file, &execution.committed)?;
+        // A short private directory avoids Unix socket path length limits, including on macOS.
+        let directory = tempfile::Builder::new()
+            .prefix("bmux-resume-")
+            .tempdir_in("/tmp")
+            .map_err(|e| e.to_string())?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        let socket = directory.path().join("host");
+        let listener = UnixListener::bind(&socket).map_err(|e| e.to_string())?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let endpoint = format!("v1:{}", socket.display());
+        let entry = Arc::new(Entry {
+            endpoint: endpoint.clone(),
+            file,
+            stopped: AtomicBool::new(false),
+            state: Mutex::new(State {
+                execution,
+                pid: None,
+                shell,
+                initial_prompt: shell,
+                replay_start: shell && replay,
+                epoch: 0,
+                claim: None,
+            }),
+        });
+        if let Some(old) = entries.insert(key.to_owned(), Arc::clone(&entry)) {
+            old.stopped.store(true, Ordering::SeqCst);
+        }
+        std::thread::spawn(move || {
+            let _directory = directory;
+            while !entry.stopped.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if let Err(error) = serve(&entry, stream) {
+                            tracing::debug!(%error, "resurrection connection rejected");
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(endpoint)
+    }
+
+    fn entry(&self, key: &str, endpoint: &str) -> Result<Arc<Entry>, String> {
+        self.entries
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(key)
+            .filter(|entry| entry.endpoint == endpoint && !entry.stopped.load(Ordering::SeqCst))
+            .cloned()
+            .ok_or_else(|| "stale launch endpoint".into())
+    }
+
+    pub fn bind(&self, key: &str, endpoint: &str, pid: u32) -> Result<bool, String> {
+        let entry = self.entry(key, endpoint)?;
+        let mut state = entry.state.lock().map_err(|e| e.to_string())?;
+        if state.pid.is_some() || pid == 0 {
+            return Err("launch already bound or invalid PID".into());
+        }
+        state.pid = Some(pid);
+        Ok(true)
+    }
+
+    pub fn boundary(&self, key: &str, endpoint: &str, prompt: bool) -> Result<bool, String> {
+        let entry = self.entry(key, endpoint)?;
+        let mut state = entry.state.lock().map_err(|e| e.to_string())?;
+        if !state.shell {
+            return Ok(false);
+        }
+        if prompt && state.initial_prompt {
+            state.initial_prompt = false;
+            return Ok(true);
+        }
+        if !prompt && state.replay_start {
+            state.replay_start = false;
+            return Ok(true);
+        }
+        state.initial_prompt = false;
+        state.replay_start = false;
+        let next = Execution::manual();
+        save(&entry.file, &next.committed)?;
+        state.execution.end();
+        state.execution = next;
+        state.epoch = state
+            .epoch
+            .checked_add(1)
+            .ok_or("execution epoch exhausted")?;
+        state.claim = None;
+        Ok(true)
+    }
+
+    pub fn close(&self, key: &str, endpoint: &str) -> Result<bool, String> {
+        let entry = self.entry(key, endpoint)?;
+        entry.stopped.store(true, Ordering::SeqCst);
+        self.entries.lock().map_err(|e| e.to_string())?.remove(key);
+        Ok(true)
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        if let Ok(entries) = self.entries.lock() {
+            for entry in entries.values() {
+                entry.stopped.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+fn save(path: &Path, checkpoint: &Checkpoint) -> Result<(), String> {
+    let parent = path.parent().ok_or("missing checkpoint directory")?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut temp, checkpoint).map_err(|e| e.to_string())?;
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    temp.persist(path).map_err(|e| e.to_string())?;
+    std::fs::File::open(parent)
+        .and_then(|file| file.sync_all())
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Hello {
+    protocol: String,
+    application: String,
+    pid: u32,
+    accept_restore: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Selection {
+    operation: String,
+    revision: u64,
+    descriptor: Option<serde_json::Value>,
+}
+
+fn receive<T: serde::de::DeserializeOwned>(
+    reader: &mut BufReader<UnixStream>,
+) -> Result<T, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(LIMIT)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 >= LIMIT || bytes.last() != Some(&b'\n') {
+        return Err("invalid frame length".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+fn send(stream: &mut UnixStream, value: &serde_json::Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 + 1 >= LIMIT {
+        return Err("response too large".into());
+    }
+    stream
+        .write_all(&bytes)
+        .and_then(|()| stream.write_all(b"\n"))
+        .map_err(|e| e.to_string())
+}
+
+fn configure_stream(stream: &UnixStream) -> Result<u32, String> {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .map_err(|e| e.to_string())?;
+    peer_pid(stream)
+}
+
+fn receive_hello(reader: &mut BufReader<UnixStream>, peer: u32) -> Result<Hello, String> {
+    let hello: Hello = receive(reader)?;
+    if hello.protocol != PROTOCOL
+        || hello.application.is_empty()
+        || hello.application.len() > 128
+        || peer != hello.pid
+    {
+        return Err("invalid protocol or peer identity".into());
+    }
+    Ok(hello)
+}
+
+fn serve(entry: &Entry, stream: UnixStream) -> Result<(), String> {
+    let peer = configure_stream(&stream)?;
+    let mut reader = BufReader::new(stream);
+    let hello = receive_hello(&mut reader, peer)?;
+    // Spawn returns before bind; wait briefly without holding any lifecycle lock.
+    for _ in 0..100 {
+        if entry.state.lock().map_err(|e| e.to_string())?.pid.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let (registration, epoch, offer) = {
+        let mut state = entry.state.lock().map_err(|e| e.to_string())?;
+        let root = state.pid.ok_or("unbound launch")?;
+        if entry.stopped.load(Ordering::SeqCst)
+            || state.claim.is_some()
+            || !belongs(peer, root, state.shell)
+        {
+            return Err("peer is not the current execution owner".into());
+        }
+        let registration = state
+            .execution
+            .register(uuid::Uuid::new_v4())
+            .map_err(str::to_owned)?;
+        let offer = if hello.accept_restore {
+            state
+                .execution
+                .offer(registration)
+                .map_err(str::to_owned)?
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        state.claim = Some(peer);
+        (registration, state.epoch, offer)
+    };
+    let offer = offer
+        .map(|value| serde_json::from_str::<serde_json::Value>(&value))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    send(
+        reader.get_mut(),
+        &serde_json::json!({"protocol": PROTOCOL, "restore": offer}),
+    )?;
+    // Poll readiness rather than timing out an idle application. Frame reads remain bounded.
+    loop {
+        if entry.stopped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if entry.state.lock().map_err(|e| e.to_string())?.epoch != epoch {
+            return Ok(());
+        }
+        let mut poll = libc::pollfd {
+            fd: reader.get_ref().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll references one initialized pollfd for the duration of the call.
+        if reader.buffer().is_empty() && unsafe { libc::poll(&raw mut poll, 1, 100) } == 0 {
+            continue;
+        }
+        let update: Selection = receive(&mut reader)?;
+        if update.operation != "selection" {
+            return Err("unsupported operation".into());
+        }
+        if update.descriptor.as_ref().is_some_and(|value| {
+            value.get("application").and_then(serde_json::Value::as_str)
+                != Some(hello.application.as_str())
+        }) {
+            return Err("application mismatch".into());
+        }
+        let descriptor = update
+            .descriptor
+            .map(|value| serde_json::to_string(&value))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let mut state = entry.state.lock().map_err(|e| e.to_string())?;
+        if state.epoch != epoch
+            || entry.stopped.load(Ordering::SeqCst)
+            || !belongs(peer, state.pid.ok_or("unbound")?, state.shell)
+        {
+            return Err("stale execution".into());
+        }
+        let candidate = state
+            .execution
+            .update(registration, update.revision, descriptor)
+            .map_err(str::to_owned)?;
+        if let Err(error) = save(&entry.file, &candidate) {
+            entry.stopped.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+        state
+            .execution
+            .committed(candidate)
+            .map_err(str::to_owned)?;
+        send(
+            reader.get_mut(),
+            &serde_json::json!({"revision": update.revision}),
+        )?;
+    }
+}
+
+fn belongs(peer: u32, root: u32, shell: bool) -> bool {
+    if !shell {
+        return peer == root;
+    }
+    // Only the shell's immediate child may register, not arbitrary inherited descendants.
+    let output = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &peer.to_string()])
+        .output();
+    output
+        .ok()
+        .filter(|value| value.status.success())
+        .and_then(|value| String::from_utf8(value.stdout).ok())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        == Some(root)
+}
+
+fn peer_pid(stream: &UnixStream) -> Result<u32, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut pid: libc::pid_t = 0;
+        let mut length = u32::try_from(std::mem::size_of_val(&pid)).map_err(|e| e.to_string())?;
+        // SAFETY: buffer and length point to valid initialized storage of the expected size.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&raw mut pid).cast(),
+                &raw mut length,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        u32::try_from(pid).map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length =
+            u32::try_from(std::mem::size_of_val(&credentials)).map_err(|e| e.to_string())?;
+        // SAFETY: credentials and length are valid buffers for SO_PEERCRED.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut credentials).cast(),
+                &raw mut length,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        u32::try_from(credentials.pid).map_err(|e| e.to_string())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = stream;
+        Err("peer PID authentication unsupported".into())
+    }
+}

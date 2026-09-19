@@ -9,11 +9,11 @@ const MAX_DESCRIPTOR: usize = 12_288;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Checkpoint {
-    version: u32,
-    invocation: Uuid,
-    generation: u64,
-    revision: u64,
-    descriptor: Option<String>,
+    pub(crate) version: u32,
+    pub(crate) invocation: Uuid,
+    pub(crate) generation: u64,
+    pub(crate) revision: u64,
+    pub(crate) descriptor: Option<String>,
 }
 
 impl Checkpoint {
@@ -39,7 +39,7 @@ pub struct Registration {
 /// Runtime ownership is deliberately excluded from the durable checkpoint.
 #[derive(Debug)]
 pub struct Execution {
-    committed: Checkpoint,
+    pub(crate) committed: Checkpoint,
     owner: Option<Uuid>,
     restoration: bool,
     ended: bool,

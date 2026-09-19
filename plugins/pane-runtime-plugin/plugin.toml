@@ -1,6 +1,7 @@
 execution_class = "native_fast"
 id = "bmux.pane_runtime"
 name = "bmux Pane Runtime"
+optional_capabilities = ["bmux.application_resurrection.host"]
 owns_namespaces = ["pane-padding"]
 provided_capabilities = [
     "bmux.pane_runtime.read",
@@ -19,6 +20,11 @@ required_capabilities = [
     "bmux.sessions.policy",
 ]
 version = "0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.application_resurrection"
+required    = false
+version_req = ">=0.0.1-alpha.1"
 
 [[dependencies]]
 plugin_id   = "bmux.tabs"

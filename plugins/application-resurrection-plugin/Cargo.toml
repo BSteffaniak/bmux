@@ -16,8 +16,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bmux_application_resurrection_plugin_api = { workspace = true }
 bmux_plugin_sdk                          = { workspace = true }
+libc                                     = { workspace = true }
 serde                                    = { workspace = true, features = ["derive", "std"] }
 serde_json                               = { workspace = true }
+tempfile                                 = { workspace = true }
+tracing                                  = { workspace = true }
 uuid                                     = { workspace = true, features = ["serde", "v4"] }
 
 [features]
