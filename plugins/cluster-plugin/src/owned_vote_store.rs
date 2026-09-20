@@ -47,6 +47,23 @@ impl From<&str> for AuthenticatedAppendError {
     }
 }
 
+struct OutboundAppendBatch {
+    endpoint: String,
+    cluster: String,
+    credential_serial: String,
+    append: AppendRequest,
+}
+
+fn wire_log_identity(
+    id: LogIdentity,
+) -> bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
+    bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
+        term: id.term.0,
+        index: id.index.0,
+        leader: id.leader.as_bytes().to_vec(),
+    }
+}
+
 fn verify_outbound_append(
     local: NodeId,
     request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
@@ -1539,6 +1556,78 @@ impl VoteExecutor {
             .await
     }
 
+    /// Build and send one bounded probe from the current retry position.
+    /// Each call obtains a fresh challenge; no credentials are retained in progress.
+    /// # Errors
+    /// Returns authority, authentication, transport or storage failures. Incompatible
+    /// means the next entry/history requires the staged transfer path.
+    pub async fn replicate_next<C>(
+        &self,
+        caller: &C,
+        peer: NodeId,
+    ) -> Result<(), bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError>
+    where
+        C: crate::ClusterRuntimeOps + bmux_plugin::ServiceCaller + Send + Sync + 'static,
+    {
+        use bmux_cluster_plugin_api::{
+            cluster_consensus_rpc_types::{AppendEntry, AppendRequest as WireRequest, RpcError},
+            cluster_consensus_transfer_types::TransferProof,
+        };
+        let preparation = self
+            .outbound_votes
+            .try_acquire()
+            .map_err(|_| RpcError::CapacityUnavailable)?;
+        let identity =
+            crate::load_or_create_node_identity(caller).map_err(|_| RpcError::Unauthorized)?;
+        let local = *identity.node_id();
+        let batch = self
+            .run(move |gate| gate.store.outbound_batch(gate.leader.as_ref(), local, peer))
+            .await
+            .map_err(vote_rpc_error)??;
+        let proof = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::endpoint::peer_authentication_proof(
+                caller,
+                &batch.endpoint,
+                &local.to_string(),
+                &peer.to_string(),
+            ),
+        )
+        .await
+        .map_err(|_| RpcError::ExecutionFailed)?
+        .map_err(|_| RpcError::Unauthorized)?;
+        let mut request = WireRequest {
+            cluster_id: batch.cluster,
+            sender: local.as_bytes().to_vec(),
+            recipient: peer.as_bytes().to_vec(),
+            request_id: uuid::Uuid::new_v4(),
+            term: batch.append.term.0,
+            previous: batch.append.previous.map(wire_log_identity),
+            entries: batch
+                .append
+                .entries
+                .iter()
+                .map(|entry| {
+                    crate::consensus_storage::encode_owned_entry(entry)
+                        .map(|canonical| AppendEntry::Inline { canonical })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| RpcError::StorageFailure)?,
+            leader_commit: batch.append.leader_commit.map(wire_log_identity),
+            proof: TransferProof {
+                credential_serial: batch.credential_serial,
+                signature: Vec::new(),
+                peer: proof,
+            },
+        };
+        request.proof.signature = identity.sign(
+            &crate::consensus_network::owned_append_signing_payload(&request)
+                .map_err(|_| RpcError::InvalidRequest)?,
+        );
+        drop(preparation);
+        self.replicate_append(caller, local, request).await
+    }
+
     /// Return the current retry position only while durable leader authority
     /// still matches. The transport uses this to construct its next signed probe.
     /// # Errors
@@ -2309,6 +2398,112 @@ impl OwnedVoteStore {
         application_crash("after-commit");
         self.failed = false;
         Ok(replies)
+    }
+
+    fn outbound_batch(
+        &mut self,
+        leader: Option<&crate::consensus_model::LeaderProgress>,
+        local: NodeId,
+        peer: NodeId,
+    ) -> Result<
+        Result<OutboundAppendBatch, bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError>,
+        VoteGateError,
+    > {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
+        let (_, membership) = self.election_context()?;
+        let Some(leader) = leader.filter(|leader| {
+            leader.term == self.state.term
+                && self.state.voted_for == Some(local)
+                && membership.as_ref() == Some(&leader.membership)
+        }) else {
+            return Ok(Err(RpcError::StaleTerm));
+        };
+        let Some(next) = leader.next.get(&peer).copied().filter(|_| peer != local) else {
+            return Ok(Err(RpcError::Unauthorized));
+        };
+        self.failed = true;
+        let result = (|| -> io::Result<_> {
+            let tx = self.database.begin_read().map_err(io::Error::other)?;
+            let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+            let log = tx.open_table(LOG).map_err(io::Error::other)?;
+            let control = meta
+                .get("control")
+                .map_err(io::Error::other)?
+                .ok_or_else(|| invalid("missing control"))?;
+            let state = crate::control_state::ControlState::decode_snapshot(control.value())
+                .map_err(io::Error::other)?;
+            let cluster = state.cluster_id.clone();
+            let endpoint = match owned_vote_endpoint(&state, &cluster, peer) {
+                Ok(endpoint) => endpoint,
+                Err(error) => return Ok(Err(error)),
+            };
+            let Some(member) = state.members.get(&local.to_string()) else {
+                return Ok(Err(RpcError::Unauthorized));
+            };
+            let snapshot = decode_position(
+                meta.get("snapshot")
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| invalid("missing snapshot"))?
+                    .value(),
+            )?;
+            if snapshot.is_some_and(|boundary| next <= boundary.index) {
+                return Ok(Err(RpcError::Incompatible)); // Requires staged snapshot transfer.
+            }
+            let previous = match next.0.checked_sub(1) {
+                None => None,
+                Some(index) if snapshot.is_some_and(|boundary| boundary.index.0 == index) => {
+                    snapshot
+                }
+                Some(index) => {
+                    let bytes = log
+                        .get(index)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| invalid("missing probe predecessor"))?;
+                    Some(
+                        crate::consensus_storage::decode_owned_entry(bytes.value())
+                            .map_err(io::Error::other)?
+                            .identity,
+                    )
+                }
+            };
+            let mut entries = Vec::new();
+            let mut bytes_left = 256 * 1024usize;
+            for item in log.range(next.0..).map_err(io::Error::other)?.take(64) {
+                let (_, bytes) = item.map_err(io::Error::other)?;
+                if bytes.value().len() > bytes_left {
+                    if entries.is_empty() {
+                        return Ok(Err(RpcError::Incompatible));
+                    }
+                    break;
+                }
+                bytes_left -= bytes.value().len();
+                entries.push(
+                    crate::consensus_storage::decode_owned_entry(bytes.value())
+                        .map_err(io::Error::other)?,
+                );
+            }
+            let commit = decode_position(
+                meta.get("commit")
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| invalid("missing commit"))?
+                    .value(),
+            )?;
+            Ok(Ok(OutboundAppendBatch {
+                endpoint,
+                cluster,
+                credential_serial: member.credential_serial.clone(),
+                append: AppendRequest {
+                    term: leader.term,
+                    leader: local,
+                    previous,
+                    entries,
+                    leader_commit: commit,
+                },
+            }))
+        })()
+        .map_err(|_| VoteGateError::StorageFailure)?;
+        self.failed = false;
+        Ok(result)
     }
 
     fn admit_replication(
@@ -3242,6 +3437,59 @@ mod tests {
         }
     }
 
+    fn check_outbound_snapshot_probe(
+        store: &mut OwnedVoteStore,
+        mut leader: crate::consensus_model::LeaderProgress,
+        local: NodeId,
+        peer: NodeId,
+        boundary: LogIdentity,
+    ) {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
+        // Install the sender's public credential for request construction too.
+        let tx = store.database.begin_write().unwrap();
+        {
+            let mut meta = tx.open_table(TABLE).unwrap();
+            let mut state = crate::control_state::ControlState::decode_snapshot(
+                meta.get("control").unwrap().unwrap().value(),
+            )
+            .unwrap();
+            let source = &state.members[&peer.to_string()];
+            let identity = crate::membership::NodeIdentity::new_for_test(1);
+            assert_eq!(*identity.node_id(), local);
+            let member = crate::membership::issue_test_member(
+                &identity,
+                source.cluster_id.parse().unwrap(),
+                &identity,
+                "memory://local",
+                source.capabilities.clone(),
+                crate::now_unix_ms(),
+            );
+            state.members.insert(local.to_string(), member);
+            meta.insert("control", state.encode_snapshot().unwrap().as_slice())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        assert!(matches!(
+            store.outbound_batch(Some(&leader), local, peer).unwrap(),
+            Err(RpcError::Incompatible)
+        ));
+        leader
+            .next
+            .insert(peer, crate::consensus_model::LogIndex(1));
+        let batch = store
+            .outbound_batch(Some(&leader), local, peer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.append.previous, Some(boundary));
+        assert!(batch.append.entries.is_empty());
+        assert_eq!(batch.append.leader_commit, Some(boundary));
+        leader.term = Term(2);
+        assert!(matches!(
+            store.outbound_batch(Some(&leader), local, peer).unwrap(),
+            Err(RpcError::StaleTerm)
+        ));
+    }
+
     #[test]
     fn outbound_append_accepts_only_exact_compacted_boundary() {
         use bmux_cluster_plugin_api::{
@@ -3249,7 +3497,7 @@ mod tests {
             cluster_types::{ClusterConsensusRole, ClusterNodeCapabilities},
         };
         let root = tempfile::tempdir().unwrap();
-        let local = NodeId::from(1);
+        let local = *crate::membership::NodeIdentity::new_for_test(1).node_id();
         let remote = crate::membership::NodeIdentity::new_for_test(2);
         let peer = *remote.node_id();
         let cluster = crate::membership::ClusterId::generate();
@@ -3311,6 +3559,7 @@ mod tests {
             matched: [(local, Some(boundary)), (peer, None)].into(),
             next: [(local, boundary.index), (peer, boundary.index)].into(),
         };
+        check_outbound_snapshot_probe(&mut store, leader.clone(), local, peer, boundary);
         let mut request = append_admission_request(local, peer, cluster_id);
         assert_eq!(
             store
