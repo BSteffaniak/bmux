@@ -47,6 +47,14 @@ impl From<&str> for AuthenticatedAppendError {
     }
 }
 
+/// Outcome of one bounded, caller-driven replication turn. Catch-up is log
+/// replication only, not application completion or a linearizable read barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationTurn {
+    CaughtUp,
+    Yielded,
+}
+
 struct OutboundAppendBatch {
     endpoint: String,
     cluster: String,
@@ -1554,6 +1562,71 @@ impl VoteExecutor {
         .map_err(|_| RpcError::ExecutionFailed)??;
         self.campaign_signed_response(local, &request, &response)
             .await
+    }
+
+    /// Drive at most eight probes in one leadership epoch, yielding between
+    /// attempts. Errors stop the turn; the lifecycle owner schedules later turns.
+    /// Cancellation drops the current probe without recording a match.
+    /// # Errors
+    /// Returns authority, authentication, capacity, transport or storage errors;
+    /// staged-transfer requirements remain explicit rather than being retried.
+    pub async fn replicate_turn<C>(
+        &self,
+        caller: &C,
+        peer: NodeId,
+    ) -> Result<ReplicationTurn, bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError>
+    where
+        C: crate::ClusterRuntimeOps + bmux_plugin::ServiceCaller + Send + Sync + 'static,
+    {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
+        let (term, membership, _) = self.replication_status(peer).await?;
+        for _ in 0..8 {
+            let (current_term, current_membership, _) = self.replication_status(peer).await?;
+            if current_term != term || current_membership != membership {
+                return Err(RpcError::StaleTerm);
+            }
+            // Send even when previously caught up to propagate the commit watermark.
+            self.replicate_next(caller, peer).await?;
+            let (current_term, current_membership, caught_up) =
+                self.replication_status(peer).await?;
+            if current_term != term || current_membership != membership {
+                return Err(RpcError::StaleTerm);
+            }
+            if caught_up {
+                return Ok(ReplicationTurn::CaughtUp);
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(ReplicationTurn::Yielded)
+    }
+
+    async fn replication_status(
+        &self,
+        peer: NodeId,
+    ) -> Result<
+        (Term, Membership, bool),
+        bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
+    > {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
+        self.run(move |gate| {
+            let (last, membership) = gate.store.election_context()?;
+            let Some(leader) = gate.leader.as_ref().filter(|leader| {
+                leader.term == gate.store.state.term
+                    && membership.as_ref() == Some(&leader.membership)
+            }) else {
+                return Ok(Err(RpcError::StaleTerm));
+            };
+            let Some(matched) = leader.matched.get(&peer) else {
+                return Ok(Err(RpcError::Unauthorized));
+            };
+            Ok(Ok((
+                leader.term,
+                leader.membership.clone(),
+                last.is_some() && *matched == last,
+            )))
+        })
+        .await
+        .map_err(vote_rpc_error)?
     }
 
     /// Build and send one bounded probe from the current retry position.
@@ -3992,6 +4065,65 @@ mod tests {
             executor.commit_replicated().await.unwrap(),
             Some(next.entries[0].identity)
         );
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replication_completion_requires_exact_match_and_current_authority() {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
+        let root = tempfile::tempdir().unwrap();
+        let local = NodeId::from(1);
+        let peer = NodeId::from(2);
+        let store = OwnedVoteStore::bootstrap(
+            &root.path().join("authority.redb"),
+            "cluster",
+            local,
+            Membership::new(
+                vec![vec![local]],
+                vec![(local, String::new()), (peer, String::new())],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        assert!(matches!(
+            executor.replication_status(peer).await,
+            Err(RpcError::StaleTerm)
+        ));
+        executor.campaign(local).await.unwrap().unwrap();
+        let initial = executor.initialize_leader().await.unwrap().unwrap();
+        let tip = initial.entries[0].identity;
+        assert!(!executor.replication_status(peer).await.unwrap().2);
+        assert!(matches!(
+            executor.replication_status(NodeId::from(3)).await,
+            Err(RpcError::Unauthorized)
+        ));
+        executor
+            .run(move |gate| {
+                let leader = gate.leader.as_mut().unwrap();
+                // Retry position is not durability evidence.
+                leader.next.insert(peer, tip.index.successor().unwrap());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(!executor.replication_status(peer).await.unwrap().2);
+        executor
+            .run(move |gate| {
+                gate.leader
+                    .as_mut()
+                    .unwrap()
+                    .acknowledge_probe(peer, Some(tip));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(executor.replication_status(peer).await.unwrap().2);
+        executor.campaign(local).await.unwrap().unwrap();
+        assert!(matches!(
+            executor.replication_status(peer).await,
+            Err(RpcError::StaleTerm)
+        ));
         executor.shutdown().await.unwrap();
     }
 
