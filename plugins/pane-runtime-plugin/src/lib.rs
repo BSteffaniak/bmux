@@ -30,6 +30,18 @@ pub struct PaneRuntimePlugin;
 impl RustPlugin for PaneRuntimePlugin {
     type Contract = bmux_pane_runtime_plugin_api::Contract;
 
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        // The spawn-v1 contracts are not advertised until their execution-side
+        // handlers exist. Schema availability alone is not runtime support.
+        let mut services =
+            <Self::Contract as bmux_plugin_sdk::PluginContract>::service_declarations()?;
+        services.retain(|service| {
+            service.capability.as_str()
+                != bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_SPAWN_V1.as_str()
+        });
+        Ok(services)
+    }
+
     fn activate(
         &mut self,
         context: NativeLifecycleContext,

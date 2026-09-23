@@ -41,6 +41,45 @@ const fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{pane_runtime_commands, pane_runtime_state};
+
+    #[test]
+    fn fresh_shell_directory_is_an_explicit_versioned_contract() {
+        use super::pane_runtime_spawn_commands_v1::client::NewSessionRequest;
+        use super::pane_runtime_spawn_v1::InitialShellOptions;
+
+        for cwd in [None, Some("/work/project".to_string())] {
+            let request = NewSessionRequest {
+                name: Some("work".to_string()),
+                options: InitialShellOptions { cwd: cwd.clone() },
+            };
+            let encoded = bmux_codec::to_vec(&request).expect("encode spawn request");
+            let decoded: NewSessionRequest =
+                bmux_codec::from_bytes(&encoded).expect("decode spawn request");
+            assert_eq!(decoded.options.cwd, cwd);
+            assert_eq!(decoded.name, request.name);
+        }
+    }
+
+    #[test]
+    fn directory_observation_preserves_execution_identity_and_provenance() {
+        use super::pane_runtime_spawn_v1::{
+            DirectoryObservation, ObservationMethod, SourceExecution,
+        };
+        let observation = DirectoryObservation {
+            source: SourceExecution {
+                session_id: uuid::Uuid::new_v4(),
+                pane_id: uuid::Uuid::new_v4(),
+                execution_token: uuid::Uuid::new_v4(),
+            },
+            path: "/work/project".to_string(),
+            method: ObservationMethod::Shell,
+        };
+        let encoded = bmux_codec::to_vec(&observation).expect("encode observation");
+        let decoded: DirectoryObservation =
+            bmux_codec::from_bytes(&encoded).expect("decode observation");
+        assert_eq!(decoded, observation);
+    }
+
     #[test]
     fn versioned_capture_preserves_legacy_pin_wire_shape() {
         use super::attach_runtime_state::{HistoryCaptureV1, PaneScrollbackPin};

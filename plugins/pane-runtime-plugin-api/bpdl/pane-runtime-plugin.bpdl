@@ -23,6 +23,74 @@ capability PANE_RUNTIME_WRITE = bmux.pane_runtime.write;
 capability ATTACH_RUNTIME_WRITE = bmux.attach_runtime.write;
 capability ATTACH_RUNTIME_READ = bmux.attach_runtime.read;
 
+// Directory-aware creation is opt-in. Callers must require this interface
+// before mutation; never retry its commands through the legacy creation API.
+capability PANE_RUNTIME_SPAWN_V1 = bmux.pane_runtime.spawn.v1;
+
+@capability(PANE_RUNTIME_SPAWN_V1)
+interface pane-runtime-spawn-v1 {
+    // An execution-host identity, not a client-side filesystem path.
+    // The execution token changes on restart even when pane_id is retained.
+    record source-execution {
+        session_id: uuid,
+        pane_id: uuid,
+        execution_token: uuid,
+    }
+
+    enum observation-method {
+        shell,
+        process,
+    }
+
+    record directory-observation {
+        source: source-execution,
+        path: string,
+        method: observation-method,
+    }
+
+    variant spawn-error {
+        source-unavailable,
+        stale-execution,
+        observation-unavailable,
+        observation-timeout,
+        invalid-directory { path: string, reason: string },
+        unsupported-authority,
+        launch-failed { reason: string },
+        cleanup-failed { reason: string },
+    }
+
+    // None deliberately preserves the runtime's unspecified-CWD behavior.
+    // A supplied path must be absolute and validated on the execution host.
+    // These options apply only to fresh shells, never resurrection snapshots.
+    record initial-shell-options {
+        cwd: string?,
+    }
+
+    // The source must be resolved from caller-local intent before mutation.
+    // This query must not substitute session-global focus or restored metadata.
+    query observe-directory(
+        source: source-execution,
+    ) -> result<directory-observation, spawn-error>;
+
+}
+
+@capability(PANE_RUNTIME_SPAWN_V1)
+interface pane-runtime-spawn-commands-v1 {
+    command new-session(
+        name: string?,
+        options: pane-runtime-spawn-v1.initial-shell-options,
+    ) -> result<pane-runtime-commands.session-ack, pane-runtime-spawn-v1.spawn-error>;
+
+    command split-shell(
+        session_id: uuid,
+        target: uuid,
+        direction: string,
+        ratio_percent: u8,
+        options: pane-runtime-spawn-v1.initial-shell-options,
+    ) -> result<pane-runtime-commands.pane-ack, pane-runtime-spawn-v1.spawn-error>;
+}
+
+
 @capability(PANE_RUNTIME_READ)
 interface pane-runtime-state {
     record pane-summary {

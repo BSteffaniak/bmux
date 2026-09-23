@@ -591,22 +591,15 @@ fn record_selected_context_outcome(context_id: ::uuid::Uuid) {
 }
 
 fn new_session_via_ipc(
-    caller: &impl ServiceCaller,
+    caller: &(impl ServiceCaller + Sync),
     name: Option<String>,
 ) -> Result<SessionAck, NewSessionError> {
-    #[derive(serde::Serialize)]
-    struct Args {
-        name: Option<String>,
-    }
-    let result = caller.call_service::<Args, Result<
-        bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionAck,
-        bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionRuntimeCommandError,
-    >>(
-        bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_WRITE.as_str(),
-        ServiceKind::Command,
-        bmux_pane_runtime_plugin_api::pane_runtime_commands::INTERFACE_ID.as_str(),
-        "new-session-with-runtime",
-        &Args { name: name.clone() },
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        bmux_pane_runtime_plugin_api::pane_runtime_commands::client::new_session_with_runtime(
+            &mut client,
+            name.clone(),
+        ),
     );
     match result {
         Ok(Ok(ack)) => {
