@@ -451,6 +451,11 @@ impl<'a> ModalFrameComponent<'a> {
             id: LayoutId::new(format!("{}.chrome", self.id.as_str())),
             panel,
             title: self.frame.title.as_ref().map(|_| self.title_component()),
+            title_width: self
+                .frame
+                .title
+                .as_ref()
+                .map_or(0, |title| u64::try_from(title.width()).unwrap_or(u64::MAX)),
         };
         let panel = SizeBox::new(panel)
             .id(format!("{}.size", self.id.as_str()))
@@ -477,6 +482,7 @@ struct ModalChrome<'a> {
     id: LayoutId,
     panel: Surface<'a>,
     title: Option<bmux_tui::composition::TextBlock>,
+    title_width: u64,
 }
 
 impl Component for ModalChrome<'_> {
@@ -493,7 +499,7 @@ impl Component for ModalChrome<'_> {
         let size = panel.size;
         let mut children = vec![ChildLayout::new(0, 0, panel)];
         if let Some(title) = &self.title {
-            let width = size.width.saturating_sub(2);
+            let width = size.width.saturating_sub(2).min(self.title_width);
             let height = size.height.min(1);
             children.push(ChildLayout::new(
                 1,
@@ -586,6 +592,83 @@ mod tests {
     use bmux_tui::geometry::{Insets, Point, Rect, Size};
     use bmux_tui::paint::PaintCx;
     use bmux_tui::style::{Color, Style};
+
+    #[test]
+    fn title_preserves_top_border_after_text() {
+        for (title, expected) in [
+            ("Hi", "╭Hi──────╮"),
+            ("界", "╭界──────╮"),
+            ("🙂", "╭🙂──────╮"),
+            ("e\u{301}", "╭e\u{301}───────╮"),
+            ("", "╭────────╮"),
+            ("1234567890", "╭12345678╮"),
+        ] {
+            let frame = ModalFrame::new(
+                ModalSizing::fixed(Size::new(10, 3), Insets::all(0)),
+                ModalTheme::dark(Color::Cyan),
+            )
+            .title(title);
+            let component = ModalFrameComponent::new("modal", frame, TextBlock::new(""));
+            let layout =
+                component.layout(Constraints::tight(Size::new(10, 3)), &mut LayoutCx::new());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
+            component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+            assert_eq!(
+                buffer.row_symbols(0).as_deref(),
+                Some(expected),
+                "{title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn styled_title_preserves_remaining_top_border() {
+        use bmux_tui::text::{Line, Span};
+        let title = Line::from_spans(vec![
+            Span::styled("界", Style::new().fg(Color::Magenta)),
+            Span::styled("🙂", Style::new().fg(Color::Green)),
+        ]);
+        let frame = ModalFrame::new(
+            ModalSizing::fixed(Size::new(10, 3), Insets::all(0)),
+            ModalTheme::dark(Color::Cyan),
+        )
+        .title(title);
+        let component = ModalFrameComponent::new("modal", frame, TextBlock::new(""));
+        let layout = component.layout(Constraints::tight(Size::new(10, 3)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
+        component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("╭界🙂────╮"));
+        assert_eq!(
+            buffer.get(Point::new(1, 0)).expect("CJK title").style.fg,
+            Some(Color::Magenta)
+        );
+        assert_eq!(
+            buffer.get(Point::new(3, 0)).expect("emoji title").style.fg,
+            Some(Color::Green)
+        );
+    }
+
+    #[test]
+    fn short_title_does_not_erase_border_on_tiny_panels() {
+        for width in [0, 1, 2, 3, 4] {
+            let frame = ModalFrame::new(
+                ModalSizing::fixed(Size::new(width, 3), Insets::all(0)),
+                ModalTheme::dark(Color::Cyan),
+            )
+            .title("界 long title");
+            let component = ModalFrameComponent::new("modal", frame, TextBlock::new(""));
+            let layout = component.layout(
+                Constraints::tight(Size::new(width, 3)),
+                &mut LayoutCx::new(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 3));
+            component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+            if width >= 2 {
+                let row = buffer.row_symbols(0).expect("top row");
+                assert!(row.starts_with('╭') && row.ends_with('╮'), "{width}: {row}");
+            }
+        }
+    }
 
     #[test]
     fn component_composes_scrim_surface_and_child() {

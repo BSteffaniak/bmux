@@ -544,7 +544,10 @@ impl Component for PickerFrameComponent<'_> {
                 (self.frame.policy.chrome && self.frame.title.is_some()).then_some(Rect::new(
                     1,
                     0,
-                    local.panel.width.saturating_sub(2),
+                    bmux_tui::text_width::display_width(self.frame.title.unwrap_or_default())
+                        .min(usize::from(local.panel.width.saturating_sub(2)))
+                        .try_into()
+                        .unwrap_or(u16::MAX),
                     1,
                 )),
             ),
@@ -729,6 +732,60 @@ mod tests {
 
     fn resolved_layout(frame: &PickerFrame<'_>, area: Rect) -> super::PickerFrameLayout {
         frame.resolved_layout(area)
+    }
+
+    #[test]
+    fn title_preserves_top_border_after_text() {
+        for (title, expected) in [
+            ("Hi", "┌Hi──────┐"),
+            ("界", "┌界──────┐"),
+            ("🙂", "┌🙂──────┐"),
+            ("e\u{301}", "┌e\u{301}───────┐"),
+            ("", "┌────────┐"),
+            ("1234567890", "┌12345678┐"),
+        ] {
+            let frame = PickerFrame::new().title(title).policy(PickerFramePolicy {
+                min_size: Size::new(10, 3),
+                max_size: Size::new(10, 3),
+                margin: Insets::all(0),
+                ..PickerFramePolicy::palette()
+            });
+            let component = PickerFrameComponent::new("picker", frame, TextBlock::new(""));
+            let layout =
+                component.layout(Constraints::tight(Size::new(10, 3)), &mut LayoutCx::new());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
+            component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+            assert_eq!(
+                buffer.row_symbols(0).as_deref(),
+                Some(expected),
+                "{title:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_titles_preserve_corners() {
+        for width in [0, 1, 2, 3, 4] {
+            let frame = PickerFrame::new()
+                .title("界 long title")
+                .policy(PickerFramePolicy {
+                    min_size: Size::new(width, 3),
+                    max_size: Size::new(width, 3),
+                    margin: Insets::all(0),
+                    ..PickerFramePolicy::palette()
+                });
+            let component = PickerFrameComponent::new("picker", frame, TextBlock::new(""));
+            let layout = component.layout(
+                Constraints::tight(Size::new(width, 3)),
+                &mut LayoutCx::new(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 3));
+            component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+            if width >= 2 {
+                let row = buffer.row_symbols(0).expect("top row");
+                assert!(row.starts_with('┌') && row.ends_with('┐'), "{width}: {row}");
+            }
+        }
     }
 
     #[test]
