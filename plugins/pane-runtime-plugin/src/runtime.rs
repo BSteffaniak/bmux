@@ -389,6 +389,9 @@ async fn shutdown_runtime_handle(removed: RemovedRuntime) {
 }
 
 async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
+    if matches!(&*pane.startup.borrow(), Some(Err(_))) {
+        trace!(pane_id = %pane.meta.id, "cleaning up failed pane startup");
+    }
     if let Some(stop_tx) = pane.stop_tx.take() {
         let _ = stop_tx.send(());
     }
@@ -704,17 +707,29 @@ fn encode_grid_window(
     Ok(encoded)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct PaneResurrectionRuntime {
+    /// Ephemeral process incarnation; never persisted or reused on restart.
+    observation_execution: Uuid,
+    /// Only metadata received from this incarnation, never restored CWD.
+    observed_cwd: Option<String>,
     execution_token: Option<String>,
     active_command: Option<String>,
     active_command_source: Option<PaneCommandSource>,
     last_known_cwd: Option<String>,
 }
 
+impl Default for PaneResurrectionRuntime {
+    fn default() -> Self {
+        Self::from_snapshot(&PaneResurrectionSnapshot::default())
+    }
+}
+
 impl PaneResurrectionRuntime {
     fn from_snapshot(snapshot: &PaneResurrectionSnapshot) -> Self {
         Self {
+            observation_execution: Uuid::new_v4(),
+            observed_cwd: None,
             execution_token: snapshot.execution_token.clone(),
             active_command: snapshot.active_command.clone(),
             active_command_source: snapshot.active_command_source,
@@ -732,6 +747,11 @@ impl PaneResurrectionRuntime {
     }
 
     fn apply_event(&mut self, event: PaneShellMetadataEvent) {
+        // Shell-marker authentication already scopes these events to this PTY.
+        let (PaneShellMetadataEvent::CommandStart { cwd, .. }
+        | PaneShellMetadataEvent::Prompt { cwd }) = &event;
+        self.observed_cwd = Some(cwd.clone());
+        trace!(execution = %self.observation_execution, "observed current execution directory");
         match event {
             PaneShellMetadataEvent::CommandStart { command, cwd } => {
                 self.active_command = Some(command);
@@ -775,6 +795,7 @@ fn apply_shell_metadata_events_and_take_prompt_replay(
 }
 
 struct PaneRuntimeHandle {
+    startup: watch::Receiver<Option<std::result::Result<(), String>>>,
     #[cfg(feature = "image-registry")]
     session_id: SessionId,
     meta: PaneRuntimeMeta,
@@ -4352,6 +4373,64 @@ fn layout_from_panes(panes: &[PaneRuntimeMeta]) -> Option<PaneLayoutNode> {
     Some(root)
 }
 
+fn observe_process_directory(pid: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let pid = i32::try_from(pid).ok()?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+        let size = i32::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>()).ok()?;
+        // SAFETY: info points to writable storage of exactly the supplied size.
+        // proc_pidinfo initializes this fixed-size record on a complete result.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        // SAFETY: the OS returned a complete initialized record above.
+        let info = unsafe { info.assume_init() };
+        let bytes = info
+            .pvi_cdir
+            .vip_path
+            .into_iter()
+            .flatten()
+            .map(|byte| byte.to_ne_bytes()[0])
+            .take_while(|byte| *byte != 0)
+            .collect::<Vec<_>>();
+        String::from_utf8(bytes)
+            .ok()
+            .filter(|path| Path::new(path).is_absolute())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()
+            .and_then(|path| path.into_os_string().into_string().ok())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn validate_initial_shell_options(
+    options: Option<&bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
+) -> Result<()> {
+    if let Some(cwd) = options.and_then(|options| options.cwd.as_deref())
+        && (!Path::new(cwd).is_absolute() || !Path::new(cwd).is_dir())
+    {
+        anyhow::bail!("initial shell directory must be an available absolute directory: {cwd}");
+    }
+    Ok(())
+}
+
 fn pane_launch_spec_from_command(command: PaneLaunchCommand) -> Result<PaneLaunchSpec> {
     if command.program.trim().is_empty() {
         anyhow::bail!("pane launch command program cannot be empty");
@@ -4425,7 +4504,96 @@ impl SessionRuntimeManager {
         }
     }
 
+    fn capture_spawn_source(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> std::result::Result<
+        bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
+        bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
+    > {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{SourceExecution, SpawnError};
+        let pane = self
+            .runtimes
+            .get(&session_id)
+            .and_then(|runtime| runtime.panes.get(&pane_id))
+            .ok_or(SpawnError::SourceUnavailable)?;
+        let observation = pane
+            .resurrection_state
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => SpawnError::Busy,
+                std::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
+            })?;
+        if pane.exited.load(Ordering::SeqCst) {
+            return Err(SpawnError::SourceUnavailable);
+        }
+        Ok(SourceExecution {
+            session_id: session_id.0,
+            pane_id,
+            execution_token: observation.observation_execution,
+        })
+    }
+
+    fn observe_spawn_directory(
+        &self,
+        source: &bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
+    ) -> std::result::Result<
+        bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::DirectoryObservation,
+        bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
+    > {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{
+            DirectoryObservation, ObservationMethod, SpawnError,
+        };
+        let pane = self
+            .runtimes
+            .get(&SessionId(source.session_id))
+            .and_then(|runtime| runtime.panes.get(&source.pane_id))
+            .ok_or(SpawnError::SourceUnavailable)?;
+        let observation = pane
+            .resurrection_state
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => SpawnError::Busy,
+                std::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
+            })?;
+        if observation.observation_execution != source.execution_token {
+            return Err(SpawnError::StaleExecution);
+        }
+        if pane.exited.load(Ordering::SeqCst) {
+            return Err(SpawnError::SourceUnavailable);
+        }
+        let (path, method) = if let Some(path) = observation.observed_cwd.clone() {
+            (path, ObservationMethod::Shell)
+        } else {
+            let pid = *pane.process_id.try_lock().map_err(|_| SpawnError::Busy)?;
+            let path = pid
+                .and_then(observe_process_directory)
+                .ok_or(SpawnError::ObservationUnavailable)?;
+            // The manager lock excludes replacement; the waiter can still mark
+            // this execution exited while the OS query runs.
+            if pane.exited.load(Ordering::SeqCst) {
+                return Err(SpawnError::SourceUnavailable);
+            }
+            (path, ObservationMethod::Process)
+        };
+        Ok(DirectoryObservation {
+            source: source.clone(),
+            path,
+            method,
+        })
+    }
+
     fn start_runtime(&mut self, session_id: SessionId) -> Result<()> {
+        self.start_runtime_with_options(session_id, None)
+    }
+
+    fn start_runtime_with_options(
+        &mut self,
+        session_id: SessionId,
+        options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
+    ) -> Result<()> {
+        validate_initial_shell_options(options.as_ref())?;
         if self.runtimes.contains_key(&session_id) {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
         }
@@ -4438,7 +4606,8 @@ impl SessionRuntimeManager {
             launch: None,
             resurrection: PaneResurrectionSnapshot::default(),
         };
-        let first_pane = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
+        let first_pane =
+            self.spawn_pane_runtime_with_restore(session_id, pane_meta, (24, 80), false, options);
         self.register_pane_input(session_id, &first_pane);
         let mut panes = BTreeMap::new();
         panes.insert(first_pane_id, first_pane);
@@ -4582,6 +4751,7 @@ impl SessionRuntimeManager {
                 pane_meta.clone(),
                 initial_size,
                 true,
+                None,
             );
             let restored_meta = pane.meta.clone();
             self.register_pane_input(session_id, &pane);
@@ -4618,7 +4788,7 @@ impl SessionRuntimeManager {
         pane_meta: PaneRuntimeMeta,
         initial_size: (u16, u16),
     ) -> PaneRuntimeHandle {
-        self.spawn_pane_runtime_with_restore(session_id, pane_meta, initial_size, false)
+        self.spawn_pane_runtime_with_restore(session_id, pane_meta, initial_size, false, None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4628,6 +4798,9 @@ impl SessionRuntimeManager {
         mut pane_meta: PaneRuntimeMeta,
         initial_size: (u16, u16),
         restoring: bool,
+        initial_shell: Option<
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions,
+        >,
     ) -> PaneRuntimeHandle {
         let resolved_launch = resolve_pane_launch(&pane_meta, &self.shell);
         if let Ok(resolved) = &resolved_launch {
@@ -4680,7 +4853,9 @@ impl SessionRuntimeManager {
         let bracketed_paste_supported = self.bracketed_paste_supported;
         let pane_id = pane_meta.id;
         let replay_command = pane_meta.resurrection.active_command.clone();
-        let initial_cwd = pane_meta.resurrection.last_known_cwd.clone();
+        let initial_cwd = initial_shell
+            .and_then(|options| options.cwd)
+            .or_else(|| pane_meta.resurrection.last_known_cwd.clone());
         let pane_exit_tx = self.pane_exit_tx.clone();
         let shell_marker_token = Uuid::new_v4().simple().to_string();
         let shell_integration_root = self
@@ -4753,10 +4928,12 @@ impl SessionRuntimeManager {
         #[cfg(feature = "image-registry")]
         let image_dirty_for_reader = Arc::clone(&image_dirty);
 
+        let (startup_tx, startup) = watch::channel(None);
         let task = tokio::spawn(async move {
             macro_rules! fail_startup {
                 ($reason:expr) => {{
                     let reason = $reason;
+                    startup_tx.send_replace(Some(Err(reason.clone())));
                     mark_pane_startup_failed(
                         session_id,
                         pane_id,
@@ -5240,7 +5417,20 @@ impl SessionRuntimeManager {
                 warn!(%pane_id, "failed spawning pane PTY reader thread");
             }
 
+            let startup_ready = child_waiter.is_some() && reader_thread.is_some();
+            if startup_ready {
+                startup_tx.send_replace(Some(Ok(())));
+            } else {
+                startup_tx.send_replace(Some(Err(
+                    "failed to start pane I/O supervision threads".into()
+                )));
+                let _ = child_killer.kill();
+            }
+
             loop {
+                if !startup_ready {
+                    break;
+                }
                 tokio::select! {
                     _ = &mut stop_rx => {
                         let _ = child_killer.kill();
@@ -5310,6 +5500,7 @@ impl SessionRuntimeManager {
             .get(&(session_id, pane_meta.id))
             .copied();
         PaneRuntimeHandle {
+            startup,
             #[cfg(feature = "image-registry")]
             session_id,
             meta: pane_meta,
@@ -5348,7 +5539,7 @@ impl SessionRuntimeManager {
         target: Option<PaneSelector>,
         direction: PaneSplitDirection,
     ) -> Result<Uuid> {
-        self.create_split_pane(session_id, target, direction, None, None)
+        self.create_split_pane(session_id, target, direction, None, None, None)
     }
 
     fn launch_pane(
@@ -5360,7 +5551,7 @@ impl SessionRuntimeManager {
         command: PaneLaunchCommand,
     ) -> Result<Uuid> {
         let launch = pane_launch_spec_from_command(command)?;
-        self.create_split_pane(session_id, target, direction, name, Some(launch))
+        self.create_split_pane(session_id, target, direction, name, Some(launch), None)
     }
 
     fn create_split_pane(
@@ -5370,15 +5561,15 @@ impl SessionRuntimeManager {
         direction: PaneSplitDirection,
         name: Option<String>,
         launch: Option<PaneLaunchSpec>,
+        initial_shell: Option<
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions,
+        >,
     ) -> Result<Uuid> {
-        // Auto-unzoom on layout mutation.
-        if let Some(session) = self.runtimes.get_mut(&session_id) {
-            session.zoomed_pane_id = None;
-        }
+        validate_initial_shell_options(initial_shell.as_ref())?;
         let (target_pane_id, next_pane_name, shell, client_ids) = {
             let session = self
                 .runtimes
-                .get_mut(&session_id)
+                .get(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
             let target_pane_id =
                 resolve_pane_id_from_selector(session, &target.unwrap_or(PaneSelector::Active))
@@ -5400,6 +5591,16 @@ impl SessionRuntimeManager {
         };
 
         let pane_id = Uuid::new_v4();
+        // Prepare geometry before spawning so a stale target cannot create an
+        // orphan execution or alter focus/zoom. The manager is exclusively held.
+        let mut next_layout = self.runtimes[&session_id].layout_root.clone();
+        if let Some(layout) = &mut next_layout {
+            if !layout.replace_leaf_with_split(target_pane_id, direction, 0.5, pane_id) {
+                anyhow::bail!("failed to apply split to layout tree");
+            }
+        } else {
+            next_layout = Some(PaneLayoutNode::Leaf { pane_id });
+        }
         let pane_meta = PaneRuntimeMeta {
             id: pane_id,
             name: next_pane_name,
@@ -5407,7 +5608,13 @@ impl SessionRuntimeManager {
             launch,
             resurrection: PaneResurrectionSnapshot::default(),
         };
-        let handle = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
+        let handle = self.spawn_pane_runtime_with_restore(
+            session_id,
+            pane_meta,
+            (24, 80),
+            false,
+            initial_shell,
+        );
         self.register_pane_input(session_id, &handle);
         for client_id in client_ids {
             if let Ok(mut output) = handle.output_buffer.lock() {
@@ -5420,15 +5627,8 @@ impl SessionRuntimeManager {
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         session.panes.insert(pane_id, handle);
-        let replaced = if let Some(layout_root) = &mut session.layout_root {
-            layout_root.replace_leaf_with_split(target_pane_id, direction, 0.5, pane_id)
-        } else {
-            session.layout_root = Some(PaneLayoutNode::Leaf { pane_id });
-            true
-        };
-        if !replaced {
-            anyhow::bail!("failed to apply split to layout tree")
-        }
+        session.layout_root = next_layout;
+        session.zoomed_pane_id = None;
         session.focused_pane_id = pane_id;
         self.apply_stored_attach_viewport(session_id);
         Ok(pane_id)
@@ -8980,6 +9180,52 @@ fn encode_captured_image_window(
     serde_json::to_vec(&images).map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)
 }
 
+#[derive(Clone)]
+struct SpawnRuntimeHandle(Arc<Mutex<SessionRuntimeManager>>);
+
+fn spawn_runtime_handle() -> Option<SpawnRuntimeHandle> {
+    bmux_plugin::global_plugin_state_registry()
+        .get::<SpawnRuntimeHandle>()
+        .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()))
+}
+
+pub(crate) fn capture_spawn_source(
+    session_id: Uuid,
+    pane_id: Uuid,
+) -> std::result::Result<
+    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
+    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
+> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
+    let handle = spawn_runtime_handle().ok_or(SpawnError::SourceUnavailable)?;
+    handle
+        .0
+        .try_lock()
+        .map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => SpawnError::Busy,
+            std::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
+        })?
+        .capture_spawn_source(SessionId(session_id), pane_id)
+}
+
+pub(crate) fn observe_spawn_directory(
+    source: &bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
+) -> std::result::Result<
+    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::DirectoryObservation,
+    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
+> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
+    let handle = spawn_runtime_handle().ok_or(SpawnError::SourceUnavailable)?;
+    handle
+        .0
+        .try_lock()
+        .map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => SpawnError::Busy,
+            std::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
+        })?
+        .observe_spawn_directory(source)
+}
+
 fn pane_padding_handle() -> Option<PanePaddingRuntimeHandle> {
     bmux_plugin::global_plugin_state_registry()
         .get::<PanePaddingRuntimeHandle>()
@@ -9586,6 +9832,9 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
         std::sync::RwLock::new(PanePaddingRuntimeHandle(Arc::clone(&manager))),
     ));
 
+    bmux_plugin::global_plugin_state_registry().register::<SpawnRuntimeHandle>(&Arc::new(
+        std::sync::RwLock::new(SpawnRuntimeHandle(Arc::clone(&manager))),
+    ));
     let expiry_manager = Arc::clone(&manager);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(PANE_PADDING_PREVIEW_SWEEP_INTERVAL);
@@ -11229,6 +11478,7 @@ mod tests {
             let _ = stop_rx.await;
         });
         PaneRuntimeHandle {
+            startup: watch::channel(Some(Ok(()))).1,
             #[cfg(feature = "image-registry")]
             session_id: SessionId(Uuid::nil()),
             meta: PaneRuntimeMeta {
@@ -11302,6 +11552,120 @@ mod tests {
             }),
             attach_view_revision: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_split_preserves_focus_zoom_and_execution_count() {
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.zoomed_pane_id = Some(pane_id);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        for target in [Uuid::new_v4(), pane_id] {
+            // The second case has a real pane but stale layout membership.
+            if target == pane_id {
+                manager.runtimes.get_mut(&session_id).unwrap().layout_root =
+                    Some(PaneLayoutNode::Leaf {
+                        pane_id: Uuid::new_v4(),
+                    });
+            }
+            assert!(
+                manager
+                    .split_pane(
+                        session_id,
+                        Some(PaneSelector::ById(target)),
+                        PaneSplitDirection::Horizontal,
+                    )
+                    .is_err()
+            );
+            let runtime = &manager.runtimes[&session_id];
+            assert_eq!(runtime.zoomed_pane_id, Some(pane_id));
+            assert_eq!(runtime.focused_pane_id, pane_id);
+            assert_eq!(runtime.panes.len(), 1);
+            assert!(manager.pane_input_index.read().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_source_capture_is_explicit_live_and_incarnation_scoped() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
+        let session_id = SessionId(Uuid::new_v4());
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[first, second]));
+        let captured = manager.capture_spawn_source(session_id, second).unwrap();
+        {
+            let _held = manager.runtimes[&session_id].panes[&second]
+                .resurrection_state
+                .lock()
+                .unwrap();
+            assert_eq!(
+                manager.capture_spawn_source(session_id, second),
+                Err(SpawnError::Busy)
+            );
+            assert_eq!(
+                manager.observe_spawn_directory(&captured),
+                Err(SpawnError::Busy)
+            );
+        }
+        assert_eq!(captured.pane_id, second);
+        assert_eq!(
+            manager.observe_spawn_directory(&captured),
+            Err(SpawnError::ObservationUnavailable)
+        );
+        {
+            let mut observation = manager.runtimes[&session_id].panes[&second]
+                .resurrection_state
+                .lock()
+                .unwrap();
+            observation.last_known_cwd = Some("/restored-only".into());
+        }
+        assert_eq!(
+            manager.observe_spawn_directory(&captured),
+            Err(SpawnError::ObservationUnavailable)
+        );
+        manager.runtimes[&session_id].panes[&second]
+            .resurrection_state
+            .lock()
+            .unwrap()
+            .apply_event(PaneShellMetadataEvent::Prompt {
+                cwd: "/current".into(),
+            });
+        let observed = manager.observe_spawn_directory(&captured).unwrap();
+        assert_eq!(observed.path, "/current");
+        assert_eq!(observed.source, captured);
+        assert_eq!(
+            observed.method,
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::ObservationMethod::Shell
+        );
+        assert_eq!(manager.runtimes[&session_id].focused_pane_id, first);
+        assert_eq!(
+            manager.capture_spawn_source(session_id, Uuid::new_v4()),
+            Err(SpawnError::SourceUnavailable)
+        );
+        assert_eq!(
+            manager.capture_spawn_source(SessionId(Uuid::new_v4()), second),
+            Err(SpawnError::SourceUnavailable)
+        );
+        manager
+            .runtimes
+            .get_mut(&session_id)
+            .unwrap()
+            .panes
+            .insert(second, dummy_pane(second));
+        let replaced = manager.capture_spawn_source(session_id, second).unwrap();
+        assert_ne!(captured.execution_token, replaced.execution_token);
+        assert_eq!(
+            manager.observe_spawn_directory(&captured),
+            Err(SpawnError::StaleExecution)
+        );
+        manager.runtimes[&session_id].panes[&second]
+            .exited
+            .store(true, Ordering::SeqCst);
+        assert_eq!(
+            manager.capture_spawn_source(session_id, second),
+            Err(SpawnError::SourceUnavailable)
+        );
     }
 
     fn manager_with_runtime(
@@ -14794,12 +15158,38 @@ mod tests {
     }
 
     #[test]
+    fn restored_directory_is_not_a_current_execution_observation() {
+        let snapshot = PaneResurrectionSnapshot {
+            last_known_cwd: Some("/old/directory".into()),
+            ..PaneResurrectionSnapshot::default()
+        };
+        let mut first = PaneResurrectionRuntime::from_snapshot(&snapshot);
+        let replacement = PaneResurrectionRuntime::from_snapshot(&snapshot);
+        assert_ne!(
+            first.observation_execution,
+            replacement.observation_execution
+        );
+        assert_eq!(first.observed_cwd, None);
+        assert_eq!(replacement.observed_cwd, None);
+        assert_eq!(first.to_snapshot(), snapshot);
+        first.apply_event(PaneShellMetadataEvent::Prompt {
+            cwd: "/current".into(),
+        });
+        assert_eq!(first.observed_cwd.as_deref(), Some("/current"));
+        assert_eq!(replacement.observed_cwd, None);
+        let restored = PaneResurrectionRuntime::from_snapshot(&first.to_snapshot());
+        assert_eq!(restored.observed_cwd, None);
+        assert_ne!(restored.observation_execution, first.observation_execution);
+    }
+
+    #[test]
     fn prompt_replay_waits_for_shell_prompt_and_marks_command_active() {
         let mut state = PaneResurrectionRuntime {
             execution_token: None,
             active_command: Some("lazygit".to_string()),
             active_command_source: Some(PaneCommandSource::Verbatim),
             last_known_cwd: Some("/work".to_string()),
+            ..PaneResurrectionRuntime::default()
         };
         let mut pending_replay = Some("lazygit".to_string());
 
@@ -15101,6 +15491,162 @@ mod tests {
                 .to_string()
                 .contains("cwd is unavailable")
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn native_process_directory_observation_matches_current_process() {
+        let observed = observe_process_directory(std::process::id()).unwrap();
+        assert_eq!(
+            Path::new(&observed).canonicalize().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+        assert_eq!(observe_process_directory(u32::MAX), None);
+    }
+
+    #[tokio::test]
+    async fn invalid_initial_directory_does_not_mutate_runtime() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions;
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.zoomed_pane_id = Some(pane_id);
+        let mut manager = manager_with_runtime(session_id, runtime);
+        let directory = tempfile::tempdir().unwrap();
+        for cwd in [
+            "relative".to_string(),
+            directory
+                .path()
+                .join("missing")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            assert!(
+                manager
+                    .start_runtime_with_options(
+                        SessionId(Uuid::new_v4()),
+                        Some(InitialShellOptions {
+                            cwd: Some(cwd.clone())
+                        }),
+                    )
+                    .is_err()
+            );
+            assert!(
+                manager
+                    .create_split_pane(
+                        session_id,
+                        Some(PaneSelector::ById(pane_id)),
+                        PaneSplitDirection::Horizontal,
+                        None,
+                        None,
+                        Some(InitialShellOptions { cwd: Some(cwd) }),
+                    )
+                    .is_err()
+            );
+            assert_eq!(manager.runtimes.len(), 1);
+            let runtime = &manager.runtimes[&session_id];
+            assert_eq!(runtime.panes.len(), 1);
+            assert_eq!(runtime.focused_pane_id, pane_id);
+            assert_eq!(runtime.zoomed_pane_id, Some(pane_id));
+            assert!(manager.pane_input_index.read().unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_shell_options_reach_pty_without_resurrection_metadata() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions;
+        let directory = tempfile::tempdir().unwrap();
+        let session_id = SessionId(Uuid::new_v4());
+        let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
+        let mut manager = SessionRuntimeManager::new(
+            "/bin/sh".into(),
+            "xterm-256color".into(),
+            ProtocolProfile::Bmux,
+            true,
+            None,
+            PanePaddingConfig::default(),
+            pane_exit_tx,
+        );
+        manager
+            .start_runtime_with_options(
+                session_id,
+                Some(InitialShellOptions {
+                    cwd: Some(directory.path().to_string_lossy().into_owned()),
+                }),
+            )
+            .unwrap();
+        let runtime = manager.runtimes.get(&session_id).unwrap();
+        let first = runtime.focused_pane_id;
+        // Exercise the split path too, with a different directory from pane one.
+        let split_directory = tempfile::tempdir().unwrap();
+        let split = manager
+            .create_split_pane(
+                session_id,
+                Some(PaneSelector::ById(first)),
+                PaneSplitDirection::Horizontal,
+                None,
+                None,
+                Some(InitialShellOptions {
+                    cwd: Some(split_directory.path().to_string_lossy().into_owned()),
+                }),
+            )
+            .unwrap();
+        let runtime = manager.runtimes.remove(&session_id).unwrap();
+        let mut panes = runtime.panes;
+        let first_pane = panes.remove(&first).unwrap();
+        let pane = panes.remove(&split).unwrap();
+        let (first_result, split_result) = tokio::join!(
+            reported_shell_directory(&first_pane, directory.path()),
+            reported_shell_directory(&pane, split_directory.path()),
+        );
+        shutdown_pane_handle(first_pane).await;
+        shutdown_pane_handle(pane).await;
+        assert_eq!(
+            first_result.unwrap(),
+            directory.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            split_result.unwrap(),
+            split_directory.path().canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    async fn reported_shell_directory(
+        pane: &PaneRuntimeHandle,
+        directory: &Path,
+    ) -> Result<std::path::PathBuf> {
+        let mut startup = pane.startup.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = startup.borrow_and_update().clone() {
+                    break result.map_err(anyhow::Error::msg);
+                }
+                startup
+                    .changed()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("startup channel closed"))?;
+            }
+        })
+        .await??;
+        assert_eq!(pane.meta.resurrection.last_known_cwd, None);
+        // The shell writes its real working directory, not an echoed argument.
+        pane.input_tx
+            .send(PaneRuntimeCommand::Input(b"pwd -P > actual-cwd\n".to_vec()))
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(directory.join("actual-cwd"))
+                    && !value.trim().is_empty()
+                {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        Ok(std::path::PathBuf::from(result.trim()))
     }
 
     #[tokio::test]

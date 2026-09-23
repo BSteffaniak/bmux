@@ -61,6 +61,29 @@ mod tests {
     }
 
     #[test]
+    fn source_capture_requires_explicit_pane_identity() {
+        use super::pane_runtime_spawn_v1::client::CaptureSourceRequest;
+        #[derive(serde::Serialize)]
+        struct MissingPane {
+            session_id: uuid::Uuid,
+        }
+        let request = CaptureSourceRequest {
+            session_id: uuid::Uuid::new_v4(),
+            pane_id: uuid::Uuid::new_v4(),
+        };
+        let bytes = bmux_codec::to_vec(&request).unwrap();
+        let decoded: CaptureSourceRequest = bmux_codec::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.session_id, request.session_id);
+        assert_eq!(decoded.pane_id, request.pane_id);
+        // There is deliberately no optional/global Active selector on this route.
+        let missing = bmux_codec::to_vec(&MissingPane {
+            session_id: request.session_id,
+        })
+        .unwrap();
+        assert!(bmux_codec::from_bytes::<CaptureSourceRequest>(&missing).is_err());
+    }
+
+    #[test]
     fn directory_observation_preserves_execution_identity_and_provenance() {
         use super::pane_runtime_spawn_v1::{
             DirectoryObservation, ObservationMethod, SourceExecution,

@@ -53,6 +53,8 @@ interface pane-runtime-spawn-v1 {
         stale-execution,
         observation-unavailable,
         observation-timeout,
+        busy,
+        denied { reason: string },
         invalid-directory { path: string, reason: string },
         unsupported-authority,
         launch-failed { reason: string },
@@ -65,6 +67,13 @@ interface pane-runtime-spawn-v1 {
     record initial-shell-options {
         cwd: string?,
     }
+
+    // Explicit pane identity is required; caller-local focus is resolved by
+    // the owning product plugin, never substituted by this execution service.
+    query capture-source(
+        session_id: uuid,
+        pane_id: uuid,
+    ) -> result<source-execution, spawn-error>;
 
     // The source must be resolved from caller-local intent before mutation.
     // This query must not substitute session-global focus or restored metadata.

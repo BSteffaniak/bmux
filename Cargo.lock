@@ -1936,6 +1936,7 @@ dependencies = [
  "bmux_tabs_plugin_api",
  "bmux_terminal_grid",
  "bmux_terminal_protocol",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",

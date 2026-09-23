@@ -22,6 +22,7 @@ pub mod attach_state;
 pub mod padding;
 pub mod pane_commands;
 pub mod pane_state;
+mod spawn;
 
 /// Route an inbound typed service call to the correct handler.
 #[allow(
@@ -31,6 +32,12 @@ pub mod pane_state;
 )]
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
+        "pane-runtime-spawn-v1", "capture-source" => |req: bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::client::CaptureSourceRequest, ctx| {
+            Ok::<_, ServiceResponse>(spawn::authorize_read(ctx, req.session_id).and_then(|()| crate::runtime::capture_spawn_source(req.session_id, req.pane_id)))
+        },
+        "pane-runtime-spawn-v1", "observe-directory" => |req: bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::client::ObserveDirectoryRequest, ctx| {
+            Ok::<_, ServiceResponse>(spawn::authorize_read(ctx, req.source.session_id).and_then(|()| crate::runtime::observe_spawn_directory(&req.source)))
+        },
         // pane-runtime-state queries.
         "pane-runtime-state", "pane-padding" => |req: padding::PanePaddingArgs, _ctx| {
             Ok::<_, ServiceResponse>(padding::get(&req))

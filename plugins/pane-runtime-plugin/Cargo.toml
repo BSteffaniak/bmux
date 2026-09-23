@@ -75,5 +75,8 @@ image-registry = [
 ]
 static-bundled = []
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

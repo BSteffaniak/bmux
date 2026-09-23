@@ -3,6 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 mod arrangements;
+mod cwd;
 mod storage_migration;
 
 use api_contexts_state::{ContextSelector, ContextSummary};
@@ -1138,6 +1139,8 @@ impl RustPlugin for TabsPlugin {
     type Contract = bmux_tabs_plugin_api::Contract;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        cwd::CwdSettings::parse(context.settings.as_ref())
+            .map_err(PluginCommandError::invalid_arguments)?;
         storage_migration::migrate(std::path::Path::new(&context.connection.data_dir))
             .map_err(PluginCommandError::failed)?;
         arrangements::activate(&context).map_err(PluginCommandError::failed)?;
