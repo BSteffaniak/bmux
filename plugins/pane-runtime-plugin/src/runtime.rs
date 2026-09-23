@@ -794,6 +794,12 @@ fn apply_shell_metadata_events_and_take_prompt_replay(
     replay_command
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SpawnDirectoryProbe {
+    Shell(String),
+    Process(u32),
+}
+
 struct PaneRuntimeHandle {
     startup: watch::Receiver<Option<std::result::Result<(), String>>>,
     #[cfg(feature = "image-registry")]
@@ -4535,16 +4541,14 @@ impl SessionRuntimeManager {
         })
     }
 
-    fn observe_spawn_directory(
+    fn prepare_spawn_directory_probe(
         &self,
         source: &bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
     ) -> std::result::Result<
-        bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::DirectoryObservation,
+        SpawnDirectoryProbe,
         bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
     > {
-        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{
-            DirectoryObservation, ObservationMethod, SpawnError,
-        };
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
         let pane = self
             .runtimes
             .get(&SessionId(source.session_id))
@@ -4563,25 +4567,13 @@ impl SessionRuntimeManager {
         if pane.exited.load(Ordering::SeqCst) {
             return Err(SpawnError::SourceUnavailable);
         }
-        let (path, method) = if let Some(path) = observation.observed_cwd.clone() {
-            (path, ObservationMethod::Shell)
+        if let Some(path) = observation.observed_cwd.clone() {
+            Ok(SpawnDirectoryProbe::Shell(path))
         } else {
             let pid = *pane.process_id.try_lock().map_err(|_| SpawnError::Busy)?;
-            let path = pid
-                .and_then(observe_process_directory)
-                .ok_or(SpawnError::ObservationUnavailable)?;
-            // The manager lock excludes replacement; the waiter can still mark
-            // this execution exited while the OS query runs.
-            if pane.exited.load(Ordering::SeqCst) {
-                return Err(SpawnError::SourceUnavailable);
-            }
-            (path, ObservationMethod::Process)
-        };
-        Ok(DirectoryObservation {
-            source: source.clone(),
-            path,
-            method,
-        })
+            pid.map(SpawnDirectoryProbe::Process)
+                .ok_or(SpawnError::ObservationUnavailable)
+        }
     }
 
     fn start_runtime(&mut self, session_id: SessionId) -> Result<()> {
@@ -9214,16 +9206,103 @@ pub(crate) fn observe_spawn_directory(
     bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::DirectoryObservation,
     bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
 > {
+    let handle = spawn_runtime_handle().ok_or(
+        bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::SourceUnavailable,
+    )?;
+    observe_spawn_directory_with(&handle.0, source, |pid| {
+        bounded_directory_probe(&DIRECTORY_PROBES, Duration::from_millis(250), move || {
+            observe_process_directory(pid)
+        })
+    })
+}
+
+// Timed-out OS calls retain their admission slot until they actually finish.
+// There is no queue: a stalled filesystem cannot accumulate detached workers.
+static DIRECTORY_PROBES: AtomicUsize = AtomicUsize::new(0);
+const MAX_DIRECTORY_PROBES: usize = 4;
+
+fn bounded_directory_probe(
+    active: &'static AtomicUsize,
+    timeout: Duration,
+    probe: impl FnOnce() -> Option<String> + Send + 'static,
+) -> std::result::Result<
+    Option<String>,
+    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
+> {
     use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
-    let handle = spawn_runtime_handle().ok_or(SpawnError::SourceUnavailable)?;
-    handle
-        .0
-        .try_lock()
-        .map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => SpawnError::Busy,
-            std::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
-        })?
-        .observe_spawn_directory(source)
+    struct Permit(&'static AtomicUsize);
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    active
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            (count < MAX_DIRECTORY_PROBES).then_some(count + 1)
+        })
+        .map_err(|_| SpawnError::Busy)?;
+    let permit = Permit(active);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("bmux-cwd-probe".into())
+        .spawn(move || {
+            let _permit = permit;
+            let result = probe();
+            let _ = sender.send(result);
+        })
+        .map_err(|_| SpawnError::ObservationUnavailable)?;
+    receiver.recv_timeout(timeout).map_err(|error| match error {
+        std::sync::mpsc::RecvTimeoutError::Timeout => SpawnError::ObservationTimeout,
+        std::sync::mpsc::RecvTimeoutError::Disconnected => SpawnError::ObservationUnavailable,
+    })
+}
+
+fn observe_spawn_directory_with(
+    manager: &std::sync::Mutex<SessionRuntimeManager>,
+    source: &bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
+    probe: impl FnOnce(
+        u32,
+    ) -> std::result::Result<
+        Option<String>,
+        bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
+    >,
+) -> std::result::Result<
+    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::DirectoryObservation,
+    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
+> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{
+        DirectoryObservation, ObservationMethod, SpawnError,
+    };
+    let prepare = || {
+        manager
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => SpawnError::Busy,
+                std::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
+            })?
+            .prepare_spawn_directory_probe(source)
+    };
+    let (path, method) = match prepare()? {
+        SpawnDirectoryProbe::Shell(path) => (path, ObservationMethod::Shell),
+        SpawnDirectoryProbe::Process(pid) => {
+            // No manager, metadata or PID lock may span native I/O. Revalidate
+            // the captured execution after the query; replacement can race it.
+            let path = probe(pid);
+            match prepare()? {
+                SpawnDirectoryProbe::Shell(path) => (path, ObservationMethod::Shell),
+                SpawnDirectoryProbe::Process(current_pid) if current_pid == pid => (
+                    path?.ok_or(SpawnError::ObservationUnavailable)?,
+                    ObservationMethod::Process,
+                ),
+                SpawnDirectoryProbe::Process(_) => return Err(SpawnError::StaleExecution),
+            }
+        }
+    };
+    Ok(DirectoryObservation {
+        source: source.clone(),
+        path,
+        method,
+    })
 }
 
 fn pane_padding_handle() -> Option<PanePaddingRuntimeHandle> {
@@ -11604,13 +11683,13 @@ mod tests {
                 Err(SpawnError::Busy)
             );
             assert_eq!(
-                manager.observe_spawn_directory(&captured),
+                manager.prepare_spawn_directory_probe(&captured),
                 Err(SpawnError::Busy)
             );
         }
         assert_eq!(captured.pane_id, second);
         assert_eq!(
-            manager.observe_spawn_directory(&captured),
+            manager.prepare_spawn_directory_probe(&captured),
             Err(SpawnError::ObservationUnavailable)
         );
         {
@@ -11621,7 +11700,7 @@ mod tests {
             observation.last_known_cwd = Some("/restored-only".into());
         }
         assert_eq!(
-            manager.observe_spawn_directory(&captured),
+            manager.prepare_spawn_directory_probe(&captured),
             Err(SpawnError::ObservationUnavailable)
         );
         manager.runtimes[&session_id].panes[&second]
@@ -11631,13 +11710,8 @@ mod tests {
             .apply_event(PaneShellMetadataEvent::Prompt {
                 cwd: "/current".into(),
             });
-        let observed = manager.observe_spawn_directory(&captured).unwrap();
-        assert_eq!(observed.path, "/current");
-        assert_eq!(observed.source, captured);
-        assert_eq!(
-            observed.method,
-            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::ObservationMethod::Shell
-        );
+        let observed = manager.prepare_spawn_directory_probe(&captured).unwrap();
+        assert_eq!(observed, SpawnDirectoryProbe::Shell("/current".into()));
         assert_eq!(manager.runtimes[&session_id].focused_pane_id, first);
         assert_eq!(
             manager.capture_spawn_source(session_id, Uuid::new_v4()),
@@ -11656,7 +11730,7 @@ mod tests {
         let replaced = manager.capture_spawn_source(session_id, second).unwrap();
         assert_ne!(captured.execution_token, replaced.execution_token);
         assert_eq!(
-            manager.observe_spawn_directory(&captured),
+            manager.prepare_spawn_directory_probe(&captured),
             Err(SpawnError::StaleExecution)
         );
         manager.runtimes[&session_id].panes[&second]
@@ -11666,6 +11740,83 @@ mod tests {
             manager.capture_spawn_source(session_id, second),
             Err(SpawnError::SourceUnavailable)
         );
+    }
+
+    #[test]
+    fn directory_probe_deadline_retains_admission_until_worker_finishes() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
+        static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+        let (release, blocked) = std::sync::mpsc::channel();
+        assert_eq!(
+            bounded_directory_probe(&ACTIVE, Duration::ZERO, move || {
+                blocked.recv().unwrap();
+                Some("/late".into())
+            }),
+            Err(SpawnError::ObservationTimeout)
+        );
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while ACTIVE.load(Ordering::SeqCst) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker leaked admission"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            bounded_directory_probe(&ACTIVE, Duration::from_secs(2), || Some("/ready".into())),
+            Ok(Some("/ready".into()))
+        );
+    }
+
+    #[test]
+    fn directory_probe_rejects_saturated_admission_without_running_query() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
+        static ACTIVE: AtomicUsize = AtomicUsize::new(MAX_DIRECTORY_PROBES);
+        assert_eq!(
+            bounded_directory_probe(&ACTIVE, Duration::from_secs(1), || panic!("must not run")),
+            Err(SpawnError::Busy)
+        );
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), MAX_DIRECTORY_PROBES);
+    }
+
+    #[tokio::test]
+    async fn native_directory_probe_releases_locks_and_rejects_replacement() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
+        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let manager = std::sync::Mutex::new(manager_with_runtime(
+            session_id,
+            runtime_with_panes(&[pane_id]),
+        ));
+        let source = {
+            let guard = manager.lock().unwrap();
+            *guard.runtimes[&session_id].panes[&pane_id]
+                .process_id
+                .lock()
+                .unwrap() = Some(123);
+            guard.capture_spawn_source(session_id, pane_id).unwrap()
+        };
+        let result = observe_spawn_directory_with(&manager, &source, |pid| {
+            assert_eq!(pid, 123);
+            let mut guard = manager
+                .try_lock()
+                .expect("native query must not hold manager");
+            {
+                let pane = &guard.runtimes[&session_id].panes[&pane_id];
+                let _metadata = pane.resurrection_state.try_lock().unwrap();
+                let _pid = pane.process_id.try_lock().unwrap();
+            }
+            guard
+                .runtimes
+                .get_mut(&session_id)
+                .unwrap()
+                .panes
+                .insert(pane_id, dummy_pane(pane_id));
+            Ok(Some("/old-execution".into()))
+        });
+        assert_eq!(result, Err(SpawnError::StaleExecution));
     }
 
     fn manager_with_runtime(
