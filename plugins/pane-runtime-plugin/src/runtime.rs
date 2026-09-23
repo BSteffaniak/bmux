@@ -496,11 +496,21 @@ fn mark_pane_startup_failed(
     mark_snapshot_dirty_flag();
 }
 
-struct StartupChild(Option<Box<dyn portable_pty::Child + Send + Sync>>);
+struct StartupChild {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    runtime: tokio::runtime::Handle,
+}
 
 impl StartupChild {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self {
+            child: Some(child),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
     fn take(&mut self) -> Box<dyn portable_pty::Child + Send + Sync> {
-        self.0
+        self.child
             .take()
             .expect("startup child ownership transferred once")
     }
@@ -509,22 +519,23 @@ impl StartupChild {
 impl std::ops::Deref for StartupChild {
     type Target = dyn portable_pty::Child + Send + Sync;
     fn deref(&self) -> &Self::Target {
-        self.0.as_deref().expect("startup child is owned")
+        self.child.as_deref().expect("startup child is owned")
     }
 }
 
 impl std::ops::DerefMut for StartupChild {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_deref_mut().expect("startup child is owned")
+        self.child.as_deref_mut().expect("startup child is owned")
     }
 }
 
 impl Drop for StartupChild {
     fn drop(&mut self) {
-        if let Some(child) = self.0.take() {
+        if let Some(child) = self.child.take() {
             // The startup task may be aborted while awaiting native metadata,
             // or its waiter-thread closure may be dropped on thread failure.
-            drop(cleanup_failed_startup_child(
+            drop(cleanup_failed_startup_child_on(
+                &self.runtime,
                 child,
                 "startup child owner dropped".into(),
             ));
@@ -533,18 +544,28 @@ impl Drop for StartupChild {
 }
 
 fn cleanup_failed_startup_child(
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
     failure: String,
 ) -> impl std::future::Future<Output = String> {
+    cleanup_failed_startup_child_on(&tokio::runtime::Handle::current(), child, failure)
+}
+
+fn cleanup_failed_startup_child_on(
+    runtime: &tokio::runtime::Handle,
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    failure: String,
+) -> impl std::future::Future<Output = String> + use<> {
     // Transfer ownership before returning the waiter. Dropping the caller's
     // future must not drop the only reaper for this newly spawned process.
     let fallback = failure.clone();
-    let cleanup = tokio::spawn(async move {
-        let reason = reap_failed_startup_child(child.as_mut(), failure).await;
-        if reason.contains("; child cleanup") {
-            warn!(%reason, "failed startup child cleanup requires recovery");
+    let cleanup = runtime.spawn(async move {
+        match reap_failed_startup_child(child.as_mut()).await {
+            Ok(()) => failure,
+            Err(error) => {
+                warn!(%error, "failed startup child cleanup requires recovery");
+                format!("{failure}; child cleanup failed: {error}")
+            }
         }
-        reason
     });
     async move {
         match cleanup.await {
@@ -556,22 +577,30 @@ fn cleanup_failed_startup_child(
 
 async fn reap_failed_startup_child(
     child: &mut (dyn portable_pty::Child + Send + Sync),
-    failure: String,
-) -> String {
+) -> Result<(), String> {
     let kill_error = child.kill().err();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    poll_failed_startup_child(
+        || child.try_wait().map(|status| status.is_some()),
+        kill_error,
+        Duration::from_secs(2),
+    )
+    .await
+}
+
+async fn poll_failed_startup_child(
+    mut poll: impl FnMut() -> std::io::Result<bool>,
+    kill_error: Option<std::io::Error>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return failure,
-            Err(error) => {
-                return format!(
-                    "{failure}; child cleanup wait failed: {error}; kill error: {kill_error:?}"
-                );
-            }
-            Ok(None) => {}
+        match poll() {
+            Ok(true) => return Ok(()),
+            Err(error) => return Err(format!("wait failed: {error}; kill error: {kill_error:?}")),
+            Ok(false) => {}
         }
         if tokio::time::Instant::now() >= deadline {
-            return format!("{failure}; child cleanup timed out; kill error: {kill_error:?}");
+            return Err(format!("timed out; kill error: {kill_error:?}"));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -619,6 +648,37 @@ struct PaneInputHandle {
     session_id: SessionId,
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
     exited: Arc<AtomicBool>,
+}
+
+struct PreparedFreshRuntime {
+    runtime: Option<SessionRuntimeHandle>,
+    launch: Option<oneshot::Sender<()>>,
+}
+
+impl PreparedFreshRuntime {
+    fn take(mut self) -> Result<SessionRuntimeHandle> {
+        if let Some(launch) = self.launch.take() {
+            launch.send(()).map_err(|()| {
+                anyhow::anyhow!("prepared runtime startup task exited before launch")
+            })?;
+        }
+        Ok(self
+            .runtime
+            .take()
+            .expect("prepared runtime transferred once"))
+    }
+}
+
+impl Drop for PreparedFreshRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            for pane in runtime.panes.values_mut() {
+                if let Some(stop) = pane.stop_tx.take() {
+                    let _ = stop.send(());
+                }
+            }
+        }
+    }
 }
 
 struct SessionRuntimeHandle {
@@ -4466,6 +4526,17 @@ struct ProcessStartIdentity(u64, u64);
 
 static PROCESS_IDENTITY_PROBES: AtomicUsize = AtomicUsize::new(0);
 
+async fn startup_identity_or_stop(
+    identity: impl std::future::Future<Output = Option<ProcessStartIdentity>>,
+    stop: &mut oneshot::Receiver<()>,
+) -> Result<Option<ProcessStartIdentity>, ()> {
+    tokio::select! {
+        biased;
+        _ = stop => Err(()),
+        identity = identity => Ok(identity),
+    }
+}
+
 async fn bounded_process_start_identity(pid: u32) -> Option<ProcessStartIdentity> {
     bounded_start_identity_probe(move || process_start_identity_for_pid(pid)).await
 }
@@ -4777,6 +4848,21 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
     ) -> Result<()> {
+        let runtime = self.prepare_fresh_runtime(session_id, options)?.take()?;
+        for pane in runtime.panes.values() {
+            self.register_pane_input(session_id, pane);
+        }
+        self.runtimes.insert(session_id, runtime);
+        Ok(())
+    }
+
+    // Preparation deliberately does not register input or publish the runtime
+    // in the manager. Background-event gating is a separate transaction step.
+    fn prepare_fresh_runtime(
+        &self,
+        session_id: SessionId,
+        options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
+    ) -> Result<PreparedFreshRuntime> {
         validate_initial_shell_options(options.as_ref())?;
         if self.runtimes.contains_key(&session_id) {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
@@ -4790,15 +4876,21 @@ impl SessionRuntimeManager {
             launch: None,
             resurrection: PaneResurrectionSnapshot::default(),
         };
-        let first_pane =
-            self.spawn_pane_runtime_with_restore(session_id, pane_meta, (24, 80), false, options);
-        self.register_pane_input(session_id, &first_pane);
+        let (launch, permit) = oneshot::channel();
+        let first_pane = self.spawn_pane_runtime_gated(
+            session_id,
+            pane_meta,
+            (24, 80),
+            false,
+            options,
+            Some(permit),
+        );
         let mut panes = BTreeMap::new();
         panes.insert(first_pane_id, first_pane);
 
-        self.runtimes.insert(
-            session_id,
-            SessionRuntimeHandle {
+        Ok(PreparedFreshRuntime {
+            launch: Some(launch),
+            runtime: Some(SessionRuntimeHandle {
                 panes,
                 layout_root: Some(PaneLayoutNode::Leaf {
                     pane_id: first_pane_id,
@@ -4811,9 +4903,8 @@ impl SessionRuntimeManager {
                 next_scrollback_pin_id: 1,
                 attach_viewport: None,
                 attach_view_revision: 0,
-            },
-        );
-        Ok(())
+            }),
+        })
     }
 
     // Restore validation, initial geometry, pane spawning, and final invariant
@@ -4975,8 +5066,30 @@ impl SessionRuntimeManager {
         self.spawn_pane_runtime_with_restore(session_id, pane_meta, initial_size, false, None)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn spawn_pane_runtime_with_restore(
+        &self,
+        session_id: SessionId,
+        pane_meta: PaneRuntimeMeta,
+        initial_size: (u16, u16),
+        restoring: bool,
+        initial_shell: Option<
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions,
+        >,
+    ) -> PaneRuntimeHandle {
+        self.spawn_pane_runtime_gated(
+            session_id,
+            pane_meta,
+            initial_size,
+            restoring,
+            initial_shell,
+            None,
+        )
+    }
+
+    // The launch permit is owned by fresh preparation; existing restore and
+    // split paths start immediately. Keep startup ordering in one state machine.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn spawn_pane_runtime_gated(
         &self,
         session_id: SessionId,
         mut pane_meta: PaneRuntimeMeta,
@@ -4985,6 +5098,7 @@ impl SessionRuntimeManager {
         initial_shell: Option<
             bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions,
         >,
+        launch_permit: Option<oneshot::Receiver<()>>,
     ) -> PaneRuntimeHandle {
         let resolved_launch = resolve_pane_launch(&pane_meta, &self.shell);
         if let Ok(resolved) = &resolved_launch {
@@ -5116,6 +5230,13 @@ impl SessionRuntimeManager {
 
         let (startup_tx, startup) = watch::channel(None);
         let task = tokio::spawn(async move {
+            if let Some(permit) = launch_permit {
+                tokio::select! {
+                    biased;
+                    _ = &mut stop_rx => return,
+                    result = permit => if result.is_err() { return; },
+                }
+            }
             macro_rules! fail_startup {
                 ($reason:expr) => {{
                     let reason = $reason;
@@ -5237,13 +5358,13 @@ impl SessionRuntimeManager {
             if let Some(resume) = &application_resume {
                 command.env("APPLICATION_RESURRECTION_HOST", &resume.endpoint);
             }
-            let mut child = StartupChild(Some(match pty_pair.slave.spawn_command(command) {
+            let mut child = StartupChild::new(match pty_pair.slave.spawn_command(command) {
                 Ok(child) => child,
                 Err(error) => {
                     fail_startup!(format!("failed to spawn {failed_spawn_label}: {error}"));
                     return;
                 }
-            }));
+            });
             if let Some(resume) = &application_resume {
                 let result = child
                     .process_id()
@@ -5260,9 +5381,25 @@ impl SessionRuntimeManager {
                     return;
                 }
             }
-            let start_identity = match child.process_id() {
-                Some(pid) => bounded_process_start_identity(pid).await,
-                None => None,
+            let start_identity = startup_identity_or_stop(
+                async {
+                    match child.process_id() {
+                        Some(pid) => bounded_process_start_identity(pid).await,
+                        None => None,
+                    }
+                },
+                &mut stop_rx,
+            )
+            .await;
+            let Ok(start_identity) = start_identity else {
+                let reason =
+                    cleanup_failed_startup_child(child.take(), "pane startup cancelled".into())
+                        .await;
+                if let Some(resume) = &application_resume {
+                    resume.close();
+                }
+                fail_startup!(reason);
+                return;
             };
             if let Ok(mut identity) = process_start_identity_for_task.lock() {
                 *identity = start_identity;
@@ -5336,7 +5473,10 @@ impl SessionRuntimeManager {
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn(move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
-                    let wait_result = child.take().wait();
+                    let wait_result = child.wait();
+                    if wait_result.is_ok() {
+                        drop(child.take());
+                    }
                     if let Some(resume) = application_resume_for_waiter { resume.close(); }
                     exited_for_waiter.store(true, Ordering::SeqCst);
                     if let Ok(mut reason) = exit_reason_for_waiter.lock()
@@ -11962,6 +12102,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn startup_stop_wins_over_ready_or_pending_identity() {
+        let (send, mut stop) = oneshot::channel();
+        send.send(()).unwrap();
+        assert_eq!(
+            startup_identity_or_stop(async { Some(ProcessStartIdentity(1, 0)) }, &mut stop).await,
+            Err(())
+        );
+        let (send, mut stop) = oneshot::channel();
+        drop(send);
+        assert_eq!(
+            startup_identity_or_stop(std::future::pending(), &mut stop).await,
+            Err(())
+        );
+        let (_send, mut stop) = oneshot::channel();
+        assert_eq!(
+            startup_identity_or_stop(async { None }, &mut stop).await,
+            Ok(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_startup_cleanup_reports_wait_error_and_timeout() {
+        let wait = poll_failed_startup_child(
+            || Err(std::io::Error::other("injected wait failure")),
+            Some(std::io::Error::other("injected kill failure")),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert!(wait.contains("injected wait failure"));
+        assert!(wait.contains("injected kill failure"));
+        let timeout = poll_failed_startup_child(|| Ok(false), None, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(timeout.contains("timed out"));
+        assert_eq!(
+            poll_failed_startup_child(
+                || Ok(true),
+                Some(std::io::Error::other("already exited")),
+                Duration::ZERO
+            )
+            .await,
+            Ok(())
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_startup_cleanup_reaps_spawned_child() {
@@ -12028,7 +12215,7 @@ mod tests {
         let child = pair.slave.spawn_command(command).unwrap();
         let pid = child.process_id().unwrap();
         let identity = process_start_identity_for_pid(pid).unwrap();
-        let guard = StartupChild(Some(child));
+        let guard = StartupChild::new(child);
         let (started, ready) = oneshot::channel();
         let task = tokio::spawn(async move {
             let _guard = guard;
@@ -12043,6 +12230,34 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "aborted child was not reaped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_child_drop_on_plain_thread_uses_owning_runtime() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "exec sleep 60"]);
+        let child = pair.slave.spawn_command(command).unwrap();
+        let pid = child.process_id().unwrap();
+        let identity = process_start_identity_for_pid(pid).unwrap();
+        let guard = StartupChild::new(child);
+        std::thread::spawn(move || drop(guard)).join().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while process_start_identity_for_pid(pid) == Some(identity) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "child was not reaped"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -16003,6 +16218,116 @@ mod tests {
             std::env::current_dir().unwrap().canonicalize().unwrap()
         );
         assert_eq!(observe_process_directory(u32::MAX), None);
+    }
+
+    #[tokio::test]
+    async fn prepared_runtime_rejects_lost_launch_receiver() {
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let task = runtime.panes[&pane_id].task.abort_handle();
+        let (launch, receiver) = oneshot::channel();
+        drop(receiver);
+        let prepared = PreparedFreshRuntime {
+            runtime: Some(runtime),
+            launch: Some(launch),
+        };
+        let Err(error) = prepared.take() else {
+            panic!("dead startup must not transfer ownership");
+        };
+        assert!(error.to_string().contains("exited before launch"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn abandoned_prepared_runtime_stops_all_owned_tasks() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[first, second]);
+        let finished = runtime
+            .panes
+            .values()
+            .map(|pane| pane.task.abort_handle())
+            .collect::<Vec<_>>();
+        drop(PreparedFreshRuntime {
+            runtime: Some(runtime),
+            launch: None,
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while finished.iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all prepared tasks must stop when ownership is abandoned");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandoning_preparation_never_launches_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("launched");
+        let shell = directory.path().join("test-shell");
+        std::fs::write(&shell, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let existing = SessionId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(existing, runtime_with_panes(&[Uuid::new_v4()]));
+        manager.shell = shell.to_string_lossy().into_owned();
+        let prepared = manager
+            .prepare_fresh_runtime(SessionId(Uuid::new_v4()), None)
+            .unwrap();
+        let tasks = prepared
+            .runtime
+            .as_ref()
+            .unwrap()
+            .panes
+            .values()
+            .map(|pane| pane.task.abort_handle())
+            .collect::<Vec<_>>();
+        tokio::task::yield_now().await;
+        assert!(!marker.exists());
+        drop(prepared);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tasks.iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !marker.exists(),
+            "abandoned preparation must never launch its shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn preparing_fresh_runtime_does_not_register_input_or_manager_state() {
+        let existing = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let manager = manager_with_runtime(existing, runtime_with_panes(&[pane_id]));
+        let created = SessionId(Uuid::new_v4());
+        let prepared = manager.prepare_fresh_runtime(created, None).unwrap();
+        tokio::task::yield_now().await;
+        let pending = prepared.runtime.as_ref().unwrap();
+        for pane in pending.panes.values() {
+            assert!(pane.startup.borrow().is_none());
+            assert!(pane.process_id.lock().unwrap().is_none());
+        }
+        assert_eq!(manager.runtimes.len(), 1);
+        assert!(!manager.runtimes.contains_key(&created));
+        assert!(manager.pane_input_index.read().unwrap().is_empty());
+        assert_eq!(manager.runtimes[&existing].focused_pane_id, pane_id);
+        shutdown_runtime_handle(RemovedRuntime {
+            session_id: created,
+            handle: prepared.take().unwrap(),
+        })
+        .await;
     }
 
     #[tokio::test]

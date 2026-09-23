@@ -49,21 +49,47 @@ pub fn authorize_read(ctx: &NativeServiceContext, session_id: Uuid) -> Result<()
             None,
         ),
     )
-    .map_err(|error| denied(format!("directory policy check failed: {error}")))?;
-    if response.allowed {
+    .map_err(|error| format!("directory policy check failed: {error}"));
+    enforce_read_policy(response.map(|response| (response.allowed, response.reason)))
+}
+
+fn enforce_read_policy(response: Result<(bool, Option<String>), String>) -> Result<(), SpawnError> {
+    let (allowed, reason) = response.map_err(|reason| SpawnError::Denied { reason })?;
+    if allowed {
         Ok(())
     } else {
-        Err(denied(
-            response
-                .reason
-                .unwrap_or_else(|| "directory access denied".into()),
-        ))
+        Err(SpawnError::Denied {
+            reason: reason.unwrap_or_else(|| "directory access denied".into()),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn policy_denial_and_service_failure_never_become_local_fallback() {
+        assert_eq!(enforce_read_policy(Ok((true, None))), Ok(()));
+        for (response, expected) in [
+            (
+                Ok((false, Some("explicit denial".into()))),
+                "explicit denial",
+            ),
+            (Ok((false, None)), "directory access denied"),
+            (
+                Err("policy service unavailable".into()),
+                "policy service unavailable",
+            ),
+        ] {
+            assert_eq!(
+                enforce_read_policy(response),
+                Err(SpawnError::Denied {
+                    reason: expected.into()
+                })
+            );
+        }
+    }
 
     #[test]
     fn local_fallback_only_applies_to_missing_permissions() {

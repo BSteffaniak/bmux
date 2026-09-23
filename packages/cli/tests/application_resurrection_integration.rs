@@ -13,7 +13,9 @@ async fn wait_for(path: &std::path::Path, expected: &str, server: &support::Serv
         }
         assert!(
             Instant::now() < deadline,
-            "missing {expected}: {}",
+            "missing {expected}; handshake path={}; contents={:?}; server output: {}",
+            path.display(),
+            std::fs::read_to_string(path),
             server.server_output()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -131,6 +133,33 @@ while True: time.sleep(1)
         .unwrap();
     }
     wait_for(&result, "committed", &server).await;
+    if shell {
+        // Application selection commits over a different socket from shell
+        // metadata. Do not snapshot until both authorities observed the launch.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let panes = bmux_pane_runtime_plugin_api::pane_runtime_state::client::list_panes(
+                &mut connection,
+                Some(session.session_id),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if panes.panes.iter().any(|pane| {
+                pane.active_command
+                    .as_deref()
+                    .is_some_and(|command| command.contains(&script.to_string_lossy().to_string()))
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shell launch metadata missing before snapshot: {panes:?}; {}",
+                server.server_output()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
     drop(connection);
     server.stop();
     server.start();
