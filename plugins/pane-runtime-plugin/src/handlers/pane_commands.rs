@@ -1112,10 +1112,11 @@ pub fn new_session_with_runtime(
         .map_err(|error| failed_session(format!("failed creating session: {error:#}")))?;
 
     if let Err(error) = runtime_handle.0.start_runtime(session_id) {
-        let _ = session_handle.0.remove_session(session_id);
-        return Err(failed_session(format!(
-            "failed creating session runtime: {error:#}"
-        )));
+        return Err(runtime_creation_failure(
+            session_id,
+            &error,
+            session_handle.0.remove_session(session_id),
+        ));
     }
 
     // NOTE: this handler deliberately does NOT create a context for the
@@ -1132,6 +1133,22 @@ pub fn new_session_with_runtime(
     Ok(SessionAck {
         session_id: session_id.0,
     })
+}
+
+fn runtime_creation_failure(
+    session_id: SessionId,
+    startup_error: &anyhow::Error,
+    rollback: Result<(), impl std::fmt::Display>,
+) -> SessionRuntimeCommandError {
+    let reason = match rollback {
+        Ok(()) => format!("failed creating session runtime: {startup_error:#}"),
+        Err(cleanup_error) => format!(
+            "failed creating session runtime: {startup_error:#}; \
+             failed rolling back newly created session {}: {cleanup_error}",
+            session_id.0
+        ),
+    };
+    failed_session(reason)
 }
 
 pub fn kill_session_runtime(
@@ -1196,4 +1213,41 @@ pub fn restore_session_runtime() -> Result<SessionAck, SessionRuntimeCommandErro
         "restore-session-runtime is driven by the snapshot orchestrator on startup; \
          clients should not invoke it directly",
     ))
+}
+
+#[cfg(test)]
+mod creation_failure_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_failure_preserves_both_errors_and_resource_identity() {
+        let session_id = SessionId(Uuid::new_v4());
+        let error = runtime_creation_failure(
+            session_id,
+            &anyhow::anyhow!("runtime unavailable"),
+            Err("storage unavailable"),
+        );
+        let SessionRuntimeCommandError::Failed { reason } = error else {
+            panic!("expected explicit failure");
+        };
+        assert!(reason.contains("runtime unavailable"));
+        assert!(reason.contains("storage unavailable"));
+        assert!(reason.contains(&session_id.0.to_string()));
+    }
+
+    #[test]
+    fn successful_rollback_does_not_claim_cleanup_failed() {
+        let error = runtime_creation_failure(
+            SessionId(Uuid::new_v4()),
+            &anyhow::anyhow!("runtime unavailable"),
+            Ok::<(), String>(()),
+        );
+        let SessionRuntimeCommandError::Failed { reason } = error else {
+            panic!("expected startup failure");
+        };
+        assert_eq!(
+            reason,
+            "failed creating session runtime: runtime unavailable"
+        );
+    }
 }

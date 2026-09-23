@@ -496,6 +496,87 @@ fn mark_pane_startup_failed(
     mark_snapshot_dirty_flag();
 }
 
+struct StartupChild(Option<Box<dyn portable_pty::Child + Send + Sync>>);
+
+impl StartupChild {
+    fn take(&mut self) -> Box<dyn portable_pty::Child + Send + Sync> {
+        self.0
+            .take()
+            .expect("startup child ownership transferred once")
+    }
+}
+
+impl std::ops::Deref for StartupChild {
+    type Target = dyn portable_pty::Child + Send + Sync;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().expect("startup child is owned")
+    }
+}
+
+impl std::ops::DerefMut for StartupChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_deref_mut().expect("startup child is owned")
+    }
+}
+
+impl Drop for StartupChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.take() {
+            // The startup task may be aborted while awaiting native metadata,
+            // or its waiter-thread closure may be dropped on thread failure.
+            drop(cleanup_failed_startup_child(
+                child,
+                "startup child owner dropped".into(),
+            ));
+        }
+    }
+}
+
+fn cleanup_failed_startup_child(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    failure: String,
+) -> impl std::future::Future<Output = String> {
+    // Transfer ownership before returning the waiter. Dropping the caller's
+    // future must not drop the only reaper for this newly spawned process.
+    let fallback = failure.clone();
+    let cleanup = tokio::spawn(async move {
+        let reason = reap_failed_startup_child(child.as_mut(), failure).await;
+        if reason.contains("; child cleanup") {
+            warn!(%reason, "failed startup child cleanup requires recovery");
+        }
+        reason
+    });
+    async move {
+        match cleanup.await {
+            Ok(reason) => reason,
+            Err(error) => format!("{fallback}; child cleanup task failed: {error}"),
+        }
+    }
+}
+
+async fn reap_failed_startup_child(
+    child: &mut (dyn portable_pty::Child + Send + Sync),
+    failure: String,
+) -> String {
+    let kill_error = child.kill().err();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return failure,
+            Err(error) => {
+                return format!(
+                    "{failure}; child cleanup wait failed: {error}; kill error: {kill_error:?}"
+                );
+            }
+            Ok(None) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return format!("{failure}; child cleanup timed out; kill error: {kill_error:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn format_pane_exit_reason(status: &portable_pty::ExitStatus) -> String {
     if let Some(signal) = status.signal() {
         return format!("process terminated by signal {signal}");
@@ -797,7 +878,7 @@ fn apply_shell_metadata_events_and_take_prompt_replay(
 #[derive(Debug, PartialEq, Eq)]
 enum SpawnDirectoryProbe {
     Shell(String),
-    Process(u32),
+    Process(u32, ProcessStartIdentity),
 }
 
 struct PaneRuntimeHandle {
@@ -805,6 +886,7 @@ struct PaneRuntimeHandle {
     #[cfg(feature = "image-registry")]
     session_id: SessionId,
     meta: PaneRuntimeMeta,
+    process_start_identity: Arc<std::sync::Mutex<Option<ProcessStartIdentity>>>,
     process_id: Arc<std::sync::Mutex<Option<u32>>>,
     process_group_id: Arc<std::sync::Mutex<Option<i32>>>,
     resurrection_state: Arc<std::sync::Mutex<PaneResurrectionRuntime>>,
@@ -4379,6 +4461,111 @@ fn layout_from_panes(panes: &[PaneRuntimeMeta]) -> Option<PaneLayoutNode> {
     Some(root)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessStartIdentity(u64, u64);
+
+static PROCESS_IDENTITY_PROBES: AtomicUsize = AtomicUsize::new(0);
+
+async fn bounded_process_start_identity(pid: u32) -> Option<ProcessStartIdentity> {
+    bounded_start_identity_probe(move || process_start_identity_for_pid(pid)).await
+}
+
+async fn bounded_start_identity_probe(
+    probe: impl FnOnce() -> Option<ProcessStartIdentity> + Send + 'static,
+) -> Option<ProcessStartIdentity> {
+    struct Permit;
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            PROCESS_IDENTITY_PROBES.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    PROCESS_IDENTITY_PROBES
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            (count < 4).then_some(count + 1)
+        })
+        .ok()?;
+    let permit = Permit;
+    let (sender, receiver) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("bmux-process-identity".into())
+        .spawn(move || {
+            let _permit = permit;
+            let result = probe();
+            let _ = sender.send(result);
+        })
+        .ok()?;
+    // Dropping this future abandons the result, not the admission permit.
+    // A stalled native query continues to occupy one of the four slots.
+    tokio::time::timeout(Duration::from_millis(250), receiver)
+        .await
+        .ok()?
+        .ok()?
+}
+
+fn process_start_identity_for_pid(pid: u32) -> Option<ProcessStartIdentity> {
+    #[cfg(target_os = "macos")]
+    {
+        let pid = i32::try_from(pid).ok()?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        // SAFETY: the writable buffer has exactly the advertised record size.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        // SAFETY: proc_pidinfo returned the complete initialized record.
+        let info = unsafe { info.assume_init() };
+        Some(ProcessStartIdentity(
+            info.pbi_start_tvsec,
+            info.pbi_start_tvusec,
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        let mut stat = String::new();
+        std::fs::File::open(format!("/proc/{pid}/stat"))
+            .ok()?
+            .take(8192)
+            .read_to_string(&mut stat)
+            .ok()?;
+        parse_linux_process_start(&stat)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_process_start(stat: &str) -> Option<ProcessStartIdentity> {
+    // comm is parenthesized and may itself contain spaces and parentheses.
+    // The suffix begins at field 3; starttime is field 22.
+    let (_, suffix) = stat.rsplit_once(')')?;
+    let ticks = suffix.split_whitespace().nth(19)?.parse().ok()?;
+    Some(ProcessStartIdentity(ticks, 0))
+}
+
+fn observe_process_directory_for_identity(
+    pid: u32,
+    expected: ProcessStartIdentity,
+) -> Option<String> {
+    if process_start_identity_for_pid(pid)? != expected {
+        return None;
+    }
+    let directory = observe_process_directory(pid)?;
+    (process_start_identity_for_pid(pid)? == expected).then_some(directory)
+}
+
 fn observe_process_directory(pid: u32) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -4571,7 +4758,12 @@ impl SessionRuntimeManager {
             Ok(SpawnDirectoryProbe::Shell(path))
         } else {
             let pid = *pane.process_id.try_lock().map_err(|_| SpawnError::Busy)?;
-            pid.map(SpawnDirectoryProbe::Process)
+            let identity = *pane
+                .process_start_identity
+                .try_lock()
+                .map_err(|_| SpawnError::Busy)?;
+            pid.zip(identity)
+                .map(|(pid, identity)| SpawnDirectoryProbe::Process(pid, identity))
                 .ok_or(SpawnError::ObservationUnavailable)
         }
     }
@@ -4855,6 +5047,8 @@ impl SessionRuntimeManager {
             .as_ref()
             .map(|root| root.join(&shell_marker_token));
         let output_buffer_for_reader = Arc::clone(&output_buffer);
+        let process_start_identity = Arc::new(std::sync::Mutex::new(None));
+        let process_start_identity_for_task = Arc::clone(&process_start_identity);
         let process_id = Arc::new(std::sync::Mutex::new(None));
         let process_id_for_task = Arc::clone(&process_id);
         let process_group_id = Arc::new(std::sync::Mutex::new(None));
@@ -5043,24 +5237,35 @@ impl SessionRuntimeManager {
             if let Some(resume) = &application_resume {
                 command.env("APPLICATION_RESURRECTION_HOST", &resume.endpoint);
             }
-            let mut child = match pty_pair.slave.spawn_command(command) {
+            let mut child = StartupChild(Some(match pty_pair.slave.spawn_command(command) {
                 Ok(child) => child,
                 Err(error) => {
                     fail_startup!(format!("failed to spawn {failed_spawn_label}: {error}"));
                     return;
                 }
-            };
+            }));
             if let Some(resume) = &application_resume {
                 let result = child
                     .process_id()
                     .ok_or_else(|| "spawned process has no PID".to_owned())
                     .and_then(|pid| resume.bind(pid));
                 if let Err(error) = result {
-                    let _ = child.kill();
+                    let reason = cleanup_failed_startup_child(
+                        child.take(),
+                        format!("application resurrection bind failed: {error}"),
+                    )
+                    .await;
                     resume.close();
-                    fail_startup!(format!("application resurrection bind failed: {error}"));
+                    fail_startup!(reason);
                     return;
                 }
+            }
+            let start_identity = match child.process_id() {
+                Some(pid) => bounded_process_start_identity(pid).await,
+                None => None,
+            };
+            if let Ok(mut identity) = process_start_identity_for_task.lock() {
+                *identity = start_identity;
             }
             if let Ok(mut pid) = process_id_for_task.lock() {
                 *pid = child.process_id();
@@ -5078,16 +5283,24 @@ impl SessionRuntimeManager {
             let mut reader = match master.try_clone_reader() {
                 Ok(reader) => reader,
                 Err(error) => {
-                    fail_startup!(format!("failed to open PTY reader: {error}"));
-                    let _ = child.kill();
+                    let reason = cleanup_failed_startup_child(
+                        child.take(),
+                        format!("failed to open PTY reader: {error}"),
+                    )
+                    .await;
+                    fail_startup!(reason);
                     return;
                 }
             };
             let writer = match master.take_writer() {
                 Ok(writer) => writer,
                 Err(error) => {
-                    fail_startup!(format!("failed to open PTY writer: {error}"));
-                    let _ = child.kill();
+                    let reason = cleanup_failed_startup_child(
+                        child.take(),
+                        format!("failed to open PTY writer: {error}"),
+                    )
+                    .await;
+                    fail_startup!(reason);
                     return;
                 }
             };
@@ -5123,7 +5336,7 @@ impl SessionRuntimeManager {
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn(move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
-                    let wait_result = child.wait();
+                    let wait_result = child.take().wait();
                     if let Some(resume) = application_resume_for_waiter { resume.close(); }
                     exited_for_waiter.store(true, Ordering::SeqCst);
                     if let Ok(mut reason) = exit_reason_for_waiter.lock()
@@ -5496,6 +5709,7 @@ impl SessionRuntimeManager {
             #[cfg(feature = "image-registry")]
             session_id,
             meta: pane_meta,
+            process_start_identity,
             process_id,
             process_group_id,
             resurrection_state,
@@ -9209,9 +9423,9 @@ pub(crate) fn observe_spawn_directory(
     let handle = spawn_runtime_handle().ok_or(
         bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::SourceUnavailable,
     )?;
-    observe_spawn_directory_with(&handle.0, source, |pid| {
+    observe_spawn_directory_with(&handle.0, source, |pid, identity| {
         bounded_directory_probe(&DIRECTORY_PROBES, Duration::from_millis(250), move || {
-            observe_process_directory(pid)
+            observe_process_directory_for_identity(pid, identity)
         })
     })
 }
@@ -9262,6 +9476,7 @@ fn observe_spawn_directory_with(
     source: &bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
     probe: impl FnOnce(
         u32,
+        ProcessStartIdentity,
     ) -> std::result::Result<
         Option<String>,
         bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
@@ -9284,17 +9499,21 @@ fn observe_spawn_directory_with(
     };
     let (path, method) = match prepare()? {
         SpawnDirectoryProbe::Shell(path) => (path, ObservationMethod::Shell),
-        SpawnDirectoryProbe::Process(pid) => {
+        SpawnDirectoryProbe::Process(pid, identity) => {
             // No manager, metadata or PID lock may span native I/O. Revalidate
             // the captured execution after the query; replacement can race it.
-            let path = probe(pid);
+            let path = probe(pid, identity);
             match prepare()? {
                 SpawnDirectoryProbe::Shell(path) => (path, ObservationMethod::Shell),
-                SpawnDirectoryProbe::Process(current_pid) if current_pid == pid => (
-                    path?.ok_or(SpawnError::ObservationUnavailable)?,
-                    ObservationMethod::Process,
-                ),
-                SpawnDirectoryProbe::Process(_) => return Err(SpawnError::StaleExecution),
+                SpawnDirectoryProbe::Process(current_pid, current_identity)
+                    if current_pid == pid && current_identity == identity =>
+                {
+                    (
+                        path?.ok_or(SpawnError::ObservationUnavailable)?,
+                        ObservationMethod::Process,
+                    )
+                }
+                SpawnDirectoryProbe::Process(_, _) => return Err(SpawnError::StaleExecution),
             }
         }
     };
@@ -11567,6 +11786,7 @@ mod tests {
                 launch: None,
                 resurrection: PaneResurrectionSnapshot::default(),
             },
+            process_start_identity: Arc::new(std::sync::Mutex::new(None)),
             process_id: Arc::new(std::sync::Mutex::new(None)),
             process_group_id: Arc::new(std::sync::Mutex::new(None)),
             resurrection_state: Arc::new(std::sync::Mutex::new(PaneResurrectionRuntime::default())),
@@ -11742,6 +11962,132 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_startup_cleanup_reaps_spawned_child() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "exec sleep 60"]);
+        let child = pair.slave.spawn_command(command).unwrap();
+        let pid = child.process_id().unwrap();
+        let reason = cleanup_failed_startup_child(child, "injected startup failure".into()).await;
+        assert_eq!(reason, "injected startup failure");
+        assert!(process_start_identity_for_pid(pid).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_startup_cleanup_survives_dropped_waiter() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "exec sleep 60"]);
+        let child = pair.slave.spawn_command(command).unwrap();
+        let pid = child.process_id().unwrap();
+        let identity = process_start_identity_for_pid(pid).unwrap();
+        drop(cleanup_failed_startup_child(
+            child,
+            "cancelled request".into(),
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while process_start_identity_for_pid(pid) == Some(identity) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "child was not reaped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborting_startup_owner_reaps_child() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "exec sleep 60"]);
+        let child = pair.slave.spawn_command(command).unwrap();
+        let pid = child.process_id().unwrap();
+        let identity = process_start_identity_for_pid(pid).unwrap();
+        let guard = StartupChild(Some(child));
+        let (started, ready) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while process_start_identity_for_pid(pid) == Some(identity) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "aborted child was not reaped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_identity_probe_does_not_block_async_runtime() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (started, ready) = oneshot::channel();
+        let query = tokio::spawn(bounded_start_identity_probe(move || {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+            Some(ProcessStartIdentity(42, 0))
+        }));
+        // The only runtime thread must remain available while native work blocks.
+        ready.await.unwrap();
+        release.send(()).unwrap();
+        assert_eq!(query.await.unwrap(), Some(ProcessStartIdentity(42, 0)));
+    }
+
+    #[test]
+    fn native_directory_observation_rejects_wrong_process_start_identity() {
+        let pid = std::process::id();
+        let identity = process_start_identity_for_pid(pid).unwrap();
+        assert!(observe_process_directory_for_identity(pid, identity).is_some());
+        assert!(
+            observe_process_directory_for_identity(
+                pid,
+                ProcessStartIdentity(identity.0.wrapping_add(1), identity.1)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn linux_process_start_parser_handles_parenthesized_names() {
+        let stat = format!("123 (name (with spaces)) S {} 98765 0", "0 ".repeat(18));
+        assert_eq!(
+            parse_linux_process_start(&stat),
+            Some(ProcessStartIdentity(98765, 0))
+        );
+        assert_eq!(parse_linux_process_start("broken"), None);
+        assert_eq!(parse_linux_process_start("123 (name) S 0"), None);
+    }
+
     #[test]
     fn directory_probe_deadline_retains_admission_until_worker_finishes() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
@@ -11796,9 +12142,13 @@ mod tests {
                 .process_id
                 .lock()
                 .unwrap() = Some(123);
+            *guard.runtimes[&session_id].panes[&pane_id]
+                .process_start_identity
+                .lock()
+                .unwrap() = Some(ProcessStartIdentity(1, 0));
             guard.capture_spawn_source(session_id, pane_id).unwrap()
         };
-        let result = observe_spawn_directory_with(&manager, &source, |pid| {
+        let result = observe_spawn_directory_with(&manager, &source, |pid, _identity| {
             assert_eq!(pid, 123);
             let mut guard = manager
                 .try_lock()
