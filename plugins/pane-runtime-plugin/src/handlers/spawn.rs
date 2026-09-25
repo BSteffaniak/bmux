@@ -4,6 +4,25 @@ use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::ClientId;
 use uuid::Uuid;
 
+pub(super) fn home_directory() -> Result<String, SpawnError> {
+    validate_home_directory(std::env::home_dir())
+}
+
+fn validate_home_directory(home: Option<std::path::PathBuf>) -> Result<String, SpawnError> {
+    let home = home.ok_or(SpawnError::SourceUnavailable)?;
+    let path = home.to_str().ok_or_else(|| SpawnError::InvalidDirectory {
+        path: home.to_string_lossy().into_owned(),
+        reason: "execution home directory is not UTF-8".into(),
+    })?;
+    if !home.is_absolute() || !home.is_dir() {
+        return Err(SpawnError::InvalidDirectory {
+            path: path.into(),
+            reason: "execution home must be an available absolute directory".into(),
+        });
+    }
+    Ok(path.into())
+}
+
 fn check_read_identity(
     permissions_enabled: bool,
     caller: Option<Uuid>,
@@ -75,6 +94,27 @@ fn enforce_read_policy(response: Result<(bool, Option<String>), String>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_home_requires_an_available_absolute_utf8_directory() {
+        assert_eq!(
+            validate_home_directory(None),
+            Err(SpawnError::SourceUnavailable)
+        );
+        assert!(matches!(
+            validate_home_directory(Some("relative-home".into())),
+            Err(SpawnError::InvalidDirectory { .. })
+        ));
+        let root = std::env::temp_dir();
+        assert_eq!(
+            validate_home_directory(Some(root.clone())).unwrap(),
+            root.to_str().unwrap()
+        );
+        assert!(matches!(
+            validate_home_directory(Some(root.join(Uuid::new_v4().to_string()))),
+            Err(SpawnError::InvalidDirectory { .. })
+        ));
+    }
 
     #[test]
     fn policy_denial_and_service_failure_never_become_local_fallback() {

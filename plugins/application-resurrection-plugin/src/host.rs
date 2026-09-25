@@ -34,14 +34,27 @@ struct Entry {
     state: Mutex<State>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommandPhase {
+    AwaitingBoundary,
+    Active,
+}
+
 struct State {
     execution: Execution,
     pid: Option<u32>,
     shell: bool,
     initial_prompt: bool,
     replay_start: bool,
+    command_phase: CommandPhase,
     epoch: u64,
     claim: Option<u32>,
+}
+
+impl State {
+    fn registration_ready(&self) -> bool {
+        self.pid.is_some() && self.command_phase == CommandPhase::Active
+    }
 }
 
 impl Host {
@@ -137,6 +150,11 @@ impl Host {
                 shell,
                 initial_prompt: shell,
                 replay_start: shell && replay,
+                command_phase: if shell {
+                    CommandPhase::AwaitingBoundary
+                } else {
+                    CommandPhase::Active
+                },
                 epoch: 0,
                 claim: None,
             }),
@@ -220,9 +238,15 @@ impl Host {
             return Ok((false, state.execution.committed.invocation.to_string()));
         }
         if prompt && state.initial_prompt {
+            state.command_phase = CommandPhase::AwaitingBoundary;
             state.initial_prompt = false;
             return Ok((true, state.execution.committed.invocation.to_string()));
         }
+        state.command_phase = if prompt {
+            CommandPhase::AwaitingBoundary
+        } else {
+            CommandPhase::Active
+        };
         if !prompt && state.replay_start {
             state.replay_start = false;
             return Ok((true, state.execution.committed.invocation.to_string()));
@@ -374,21 +398,36 @@ fn receive_hello(reader: &mut BufReader<UnixStream>, peer: u32) -> Result<Hello,
     Ok(hello)
 }
 
+fn wait_for_command_boundary(entry: &Entry) -> Result<(), String> {
+    // Bind and shell metadata arrive independently of the application socket.
+    // Acknowledge no application state until the shell's command boundary has
+    // established its invocation; otherwise a delayed boundary erases that state.
+    for _ in 0..100 {
+        let ready = {
+            let state = entry.state.lock().map_err(|e| e.to_string())?;
+            state.registration_ready()
+        };
+        if ready {
+            break;
+        }
+        if entry.stopped.load(Ordering::SeqCst) {
+            return Err("launch stopped before command boundary".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 fn serve(entry: &Entry, stream: UnixStream) -> Result<(), String> {
     let peer = configure_stream(&stream)?;
     let mut reader = BufReader::new(stream);
     let hello = receive_hello(&mut reader, peer)?;
-    // Spawn returns before bind; wait briefly without holding any lifecycle lock.
-    for _ in 0..100 {
-        if entry.state.lock().map_err(|e| e.to_string())?.pid.is_some() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    wait_for_command_boundary(entry)?;
     let (registration, epoch, offer) = {
         let mut state = entry.state.lock().map_err(|e| e.to_string())?;
         let root = state.pid.ok_or("unbound launch")?;
         if entry.stopped.load(Ordering::SeqCst)
+            || state.command_phase != CommandPhase::Active
             || state.claim.is_some()
             || !belongs(peer, root, state.shell)
         {

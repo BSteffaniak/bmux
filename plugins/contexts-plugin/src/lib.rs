@@ -438,6 +438,9 @@ impl RustPlugin for ContextsPlugin {
                 current_context_local(ctx, ctx.caller_client_id)
                     .map_err(|e| ServiceResponse::error("current_failed", e))
             },
+            "contexts-spawn-v1", "create-context" => |req: bmux_contexts_plugin_api::contexts_spawn_v1::client::CreateContextRequest, ctx| {
+                Ok::<_, ServiceResponse>(create_context_with_options(ctx, ctx.caller_client_id, req.name, req.attributes, Some(req.options)))
+            },
             "contexts-commands", "create-context" => |req: CreateContextArgs, ctx| {
                 Ok::<Result<ContextAck, CreateContextError>, ServiceResponse>(
                     create_context_local(ctx, ctx.caller_client_id, req.name, req.attributes)
@@ -486,6 +489,10 @@ impl RustPlugin for ContextsPlugin {
         let activation: Arc<dyn ContextsActivationV1Service + Send + Sync> =
             Arc::new(ContextsCommandsHandle::new(caller.clone()));
         let _ = contexts_activation_v1::register_provider(registry, activation);
+        let spawn: Arc<
+            dyn bmux_contexts_plugin_api::contexts_spawn_v1::ContextsSpawnV1Service + Send + Sync,
+        > = Arc::new(ContextsCommandsHandle::new(Arc::clone(&caller)));
+        let _ = bmux_contexts_plugin_api::contexts_spawn_v1::register_provider(registry, spawn);
         let commands: Arc<dyn ContextsCommandsService + Send + Sync> =
             Arc::new(ContextsCommandsHandle::new(caller));
         let _ = contexts_commands::register_provider(registry, commands);
@@ -612,7 +619,17 @@ fn create_context_local(
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<::uuid::Uuid>,
     name: Option<String>,
+    attributes: BTreeMap<String, String>,
+) -> Result<ContextAck, CreateContextError> {
+    create_context_with_options(caller, caller_client_id, name, attributes, None)
+}
+
+fn create_context_with_options(
+    caller: &(impl ServiceCaller + Sync),
+    caller_client_id: Option<::uuid::Uuid>,
+    name: Option<String>,
     mut attributes: BTreeMap<String, String>,
+    options: Option<bmux_contexts_plugin_api::contexts_spawn_v1::InitialShellOptions>,
 ) -> Result<ContextAck, CreateContextError> {
     attributes
         .entry("workspace".to_string())
@@ -636,18 +653,44 @@ fn create_context_local(
     // a session runtime for this context. We go via typed dispatch so
     // contexts-plugin doesn't know (or care) which plugin implements
     // `sessions-commands`.
-    let session_id = create_session_via_sessions_plugin(caller, name.clone())?;
+    let fresh_creation = options.is_some();
+    let session_id = if let Some(options) = options {
+        let mut client = dispatch_client(caller);
+        let ack = bmux_plugin::block_on_typed_dispatch(
+            bmux_sessions_plugin_api::sessions_spawn_v1::client::new_session(
+                &mut client,
+                name.clone(),
+                bmux_sessions_plugin_api::sessions_spawn_v1::InitialShellOptions {
+                    cwd: options.cwd,
+                },
+            ),
+        )
+        .map_err(|error| CreateContextError::Failed {
+            reason: error.to_string(),
+        })?
+        .map_err(|error| CreateContextError::Failed {
+            reason: format!("{error:?}"),
+        })?;
+        SessionId(ack.id)
+    } else {
+        create_session_via_sessions_plugin(caller, name.clone())?
+    };
+
+    // Fresh creation must not publish a context whose execution could not be
+    // selected. The legacy interface retains its historical best-effort behavior.
+    if fresh_creation {
+        require_created_session_selection(try_select_session_via_sessions_plugin(
+            caller, session_id,
+        ))
+        .map_err(|reason| {
+            compensate_created_session(caller, session_id, CreateContextError::Failed { reason })
+        })?;
+    }
 
     // Local state mutation: construct the context, bind it to the
     // freshly-created session, and emit the lifecycle event.
-    let (context_summary, bind_result) =
-        mutate_state_create(client_id, name.clone(), attributes, session_id)?;
-
-    if let Err(reason) = bind_result {
-        return Err(CreateContextError::Failed {
-            reason: reason.to_string(),
-        });
-    }
+    let context_summary = mutate_state_create(client_id, name.clone(), attributes, session_id)
+        .map_err(|error| compensate_created_session(caller, session_id, error))?;
 
     // Cross-plugin orchestration: atomic create-and-select. The
     // sessions-plugin tracks each client's selected session
@@ -655,7 +698,7 @@ fn create_context_local(
     // there too. Without this, followers / multi-client attach views
     // can see the new context in listings but cannot retarget to its
     // pane runtime.
-    if let Err(reason) = select_session_via_sessions_plugin(caller, session_id) {
+    if !fresh_creation && let Err(reason) = select_session_via_sessions_plugin(caller, session_id) {
         // Session select is best-effort; failing should not unwind
         // the context creation. Log through the host so the error is
         // observable without corrupting a TUI.
@@ -708,26 +751,34 @@ fn create_context_local(
     })
 }
 
-#[allow(clippy::significant_drop_tightening)]
+// Only call with the session allocated by this creation attempt, never a
+// caller-supplied or previously bound execution.
+fn compensate_created_session(
+    caller: &(impl ServiceCaller + Sync),
+    session_id: SessionId,
+    original: CreateContextError,
+) -> CreateContextError {
+    match kill_session_via_sessions_plugin(caller, session_id) {
+        Ok(()) => original,
+        Err(cleanup) => CreateContextError::Failed {
+            reason: format!("{original:?}; created-session cleanup failed: {cleanup}"),
+        },
+    }
+}
+
 fn mutate_state_create(
     client_id: ClientId,
     name: Option<String>,
     attributes: BTreeMap<String, String>,
     session_id: SessionId,
-) -> Result<
-    (
-        PrimitiveContextSummary,
-        core::result::Result<(), &'static str>,
-    ),
-    CreateContextError,
-> {
+) -> Result<PrimitiveContextSummary, CreateContextError> {
     let state = local_state().map_err(|reason| CreateContextError::Failed { reason })?;
     let mut guard = state.write().map_err(|_| CreateContextError::Failed {
         reason: "context state lock poisoned".to_string(),
     })?;
-    let context = guard.create(client_id, name, attributes);
-    let bind_result = guard.bind_session(context.id, session_id);
-    Ok((context, bind_result))
+    let context = guard.create_bound(client_id, name, attributes, session_id);
+    drop(guard);
+    Ok(context)
 }
 
 #[instrument(
@@ -1312,6 +1363,14 @@ fn bind_context_session_for_select_repair(
         })
 }
 
+fn require_created_session_selection(result: Result<bool, String>) -> Result<(), String> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("newly created session disappeared before selection".into()),
+        Err(reason) => Err(reason),
+    }
+}
+
 fn select_session_via_sessions_plugin(
     caller: &(impl ServiceCaller + Sync),
     session_id: SessionId,
@@ -1411,6 +1470,21 @@ impl ContextsActivationV1Service for ContextsCommandsHandle {
     }
 }
 
+impl bmux_contexts_plugin_api::contexts_spawn_v1::ContextsSpawnV1Service
+    for ContextsCommandsHandle
+{
+    fn create_context<'a>(
+        &'a self,
+        name: Option<String>,
+        attributes: BTreeMap<String, String>,
+        options: bmux_contexts_plugin_api::contexts_spawn_v1::InitialShellOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<ContextAck, CreateContextError>> + Send + 'a>> {
+        Box::pin(async move {
+            create_context_with_options(self.caller.as_ref(), None, name, attributes, Some(options))
+        })
+    }
+}
+
 impl ContextsCommandsService for ContextsCommandsHandle {
     fn create_context<'a>(
         &'a self,
@@ -1503,6 +1577,120 @@ bmux_plugin_sdk::export_plugin!(ContextsPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
+    struct FailedFreshSelection {
+        session: Uuid,
+        cleanup: std::sync::Mutex<Vec<Uuid>>,
+    }
+
+    impl ServiceCaller for FailedFreshSelection {
+        fn execute_kernel_request(
+            &self,
+            _: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            panic!("fresh creation must use generated services")
+        }
+
+        fn call_service_raw(
+            &self,
+            _: &str,
+            _: ServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            use bmux_sessions_plugin_api::{sessions_commands, sessions_spawn_v1};
+            match (interface, operation) {
+                ("sessions-spawn-v1", "new-session") => {
+                    let request: sessions_spawn_v1::client::NewSessionRequest =
+                        bmux_plugin_sdk::decode_service_message(&payload)?;
+                    assert_eq!(request.options.cwd.as_deref(), Some("/execution/project"));
+                    bmux_plugin_sdk::encode_service_message(&Ok::<
+                        _,
+                        sessions_commands::NewSessionError,
+                    >(
+                        sessions_commands::SessionAck { id: self.session },
+                    ))
+                }
+                ("sessions-commands", "select-session") => {
+                    let request: sessions_commands::client::SelectSessionRequest =
+                        bmux_plugin_sdk::decode_service_message(&payload)?;
+                    assert_eq!(request.selector.id, Some(self.session));
+                    bmux_plugin_sdk::encode_service_message(
+                        &Err::<sessions_commands::SessionAck, _>(
+                            sessions_commands::SelectSessionError::NotFound,
+                        ),
+                    )
+                }
+                ("sessions-commands", "kill-session") => {
+                    let request: sessions_commands::client::KillSessionRequest =
+                        bmux_plugin_sdk::decode_service_message(&payload)?;
+                    assert_eq!(request.selector.id, Some(self.session));
+                    self.cleanup.lock().unwrap().push(self.session);
+                    bmux_plugin_sdk::encode_service_message(
+                        &Err::<sessions_commands::SessionAck, _>(
+                            sessions_commands::KillSessionError::NotFound,
+                        ),
+                    )
+                }
+                _ => panic!("unexpected service {interface}/{operation}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_context_missing_selection_compensates_exact_new_session_before_state_mutation() {
+        let caller = FailedFreshSelection {
+            session: Uuid::new_v4(),
+            cleanup: std::sync::Mutex::new(Vec::new()),
+        };
+        let error = create_context_with_options(
+            &caller,
+            Some(Uuid::new_v4()),
+            None,
+            BTreeMap::new(),
+            Some(
+                bmux_contexts_plugin_api::contexts_spawn_v1::InitialShellOptions {
+                    cwd: Some("/execution/project".into()),
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, CreateContextError::Failed { reason } if reason.contains("disappeared"))
+        );
+        assert_eq!(*caller.cleanup.lock().unwrap(), vec![caller.session]);
+    }
+
+    #[test]
+    fn fresh_creation_requires_positive_selection_acknowledgement() {
+        assert!(super::require_created_session_selection(Ok(true)).is_ok());
+        assert!(
+            super::require_created_session_selection(Ok(false))
+                .unwrap_err()
+                .contains("disappeared")
+        );
+        assert_eq!(
+            super::require_created_session_selection(Err("denied".into())),
+            Err("denied".into())
+        );
+    }
+
+    #[test]
+    fn created_bound_context_has_one_coherent_session_identity() {
+        let mut state = super::ContextState::default();
+        let client = super::ClientId(uuid::Uuid::new_v4());
+        let session = super::SessionId(uuid::Uuid::new_v4());
+        let context = state.create_bound(client, None, std::collections::BTreeMap::new(), session);
+        assert_eq!(state.session_by_context.get(&context.id), Some(&session));
+        assert_eq!(
+            context
+                .attributes
+                .get(bmux_context_state::CONTEXT_SESSION_ID_ATTRIBUTE),
+            Some(&session.0.to_string())
+        );
+        assert_eq!(state.current_for_client(client).unwrap().id, context.id);
+    }
+
     use super::*;
     use bmux_plugin_sdk::{ServiceKind as SdkServiceKind, encode_service_message};
     use std::collections::BTreeMap;

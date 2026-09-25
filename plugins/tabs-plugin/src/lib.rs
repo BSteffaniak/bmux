@@ -1216,7 +1216,7 @@ impl RustPlugin for TabsPlugin {
                 Ok::<_, ServiceResponse>(active_tab_panes(ctx))
             },
             "tabs-commands", "new-tab" => |req: NewTabArgs, ctx| {
-                Ok::<_, ServiceResponse>(create_tab(ctx, &self.runtime_state, req.name)
+                Ok::<_, ServiceResponse>(create_tab_with_settings(ctx, &self.runtime_state, req.name, ctx.settings.as_ref())
                     .map_err(|reason| TabError::Failed { reason }))
             },
             "tabs-commands", "rename-tab" => |req: RenameTabArgs, ctx| {
@@ -1844,7 +1844,12 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
     match context.command.as_str() {
         "new-tab" => {
             let name = option_value(&context.arguments, "name");
-            let ack = create_tab(context, &plugin.runtime_state, name)?;
+            let ack = create_tab_with_settings(
+                context,
+                &plugin.runtime_state,
+                name,
+                context.settings.as_ref(),
+            )?;
             record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(context_id) = ack.id {
                 println!("created tab context: {context_id}");
@@ -2434,11 +2439,22 @@ fn active_workspace_attribute(caller: &(impl ServiceCaller + Sync)) -> String {
     )
 }
 
+#[cfg(test)]
 fn create_tab(
     caller: &(impl HostRuntimeApi + Sync),
     runtime_state: &TabRuntimeStateHandle,
     name: Option<String>,
 ) -> Result<TabAck, String> {
+    create_tab_with_settings(caller, runtime_state, name, None)
+}
+
+fn create_tab_with_settings(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &TabRuntimeStateHandle,
+    name: Option<String>,
+    settings: Option<&toml::Value>,
+) -> Result<TabAck, String> {
+    let policy = cwd::CwdSettings::parse(settings)?.new_tab;
     let contexts = list_contexts_in_active_workspace(caller)?;
     seed_known_contexts(runtime_state, &contexts);
     let resolved_name = name.or_else(|| Some(next_default_tab_name_for_contexts(&contexts)));
@@ -2448,7 +2464,32 @@ fn create_tab(
             .flatten();
     let mut attributes = BTreeMap::new();
     attributes.insert("workspace".to_string(), active_workspace_attribute(caller));
-    let context = create_context(caller, resolved_name, attributes)?;
+    let context = if policy == cwd::DirectoryPolicy::RuntimeDefault {
+        create_context(caller, resolved_name, attributes)?
+    } else {
+        // Without a captured attachment-local pane, source-pane must take its
+        // configured fallback, never borrow another attachment's global focus.
+        let session_id = resolve_session_id(caller, None)?;
+        let options = cwd::resolve_split_options(caller, &policy, session_id, None)?;
+        let mut client = dispatch_client(caller);
+        let ack = bmux_plugin::block_on_typed_dispatch(
+            bmux_contexts_plugin_api::contexts_spawn_v1::client::create_context(
+                &mut client,
+                resolved_name.clone(),
+                attributes.clone(),
+                bmux_contexts_plugin_api::contexts_spawn_v1::InitialShellOptions {
+                    cwd: options.cwd,
+                },
+            ),
+        )
+        .map_err(|error| typed_service_error("contexts-spawn-v1/create-context", error))?
+        .map_err(|error| format!("fresh context creation failed: {error:?}"))?;
+        ContextSummary {
+            id: ack.id,
+            name: resolved_name,
+            attributes,
+        }
+    };
     let context_id = context.id;
     cache_known_context(runtime_state, context_id, context.name.clone());
     append_context_to_workspace_order(caller, context_workspace_id(&context), context_id)?;
@@ -3891,8 +3932,13 @@ impl TabsCommandsService for TabsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<TabAck, TabError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            create_tab(&*caller, &self.shared.runtime_state, name)
-                .map_err(|reason| TabError::Failed { reason })
+            create_tab_with_settings(
+                &*caller,
+                &self.shared.runtime_state,
+                name,
+                self.shared.settings.as_ref(),
+            )
+            .map_err(|reason| TabError::Failed { reason })
         })
     }
 

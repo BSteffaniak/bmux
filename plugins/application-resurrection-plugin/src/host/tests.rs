@@ -48,6 +48,25 @@ fn socket_persists_restores_and_manual_launch_does_not_resume() {
 }
 
 #[test]
+fn shell_registration_waits_for_command_boundary_even_after_bind() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = Host::new(directory.path().to_owned()).unwrap();
+    let key = uuid::Uuid::new_v4().to_string();
+    let endpoint = host.prepare(&key, false, true, false).unwrap();
+    host.bind(&key, &endpoint, std::process::id()).unwrap();
+    let entry = host.entry(&key, &endpoint).unwrap();
+    assert!(!entry.state.lock().unwrap().registration_ready());
+    host.boundary(&key, &endpoint, false).unwrap(); // startup hook
+    assert!(!entry.state.lock().unwrap().registration_ready());
+    host.boundary(&key, &endpoint, true).unwrap(); // initial prompt
+    assert!(!entry.state.lock().unwrap().registration_ready());
+    host.boundary(&key, &endpoint, false).unwrap(); // actual invocation
+    assert!(entry.state.lock().unwrap().registration_ready());
+    host.boundary(&key, &endpoint, true).unwrap(); // command completed
+    assert!(!entry.state.lock().unwrap().registration_ready());
+}
+
+#[test]
 fn shell_replay_retains_only_initial_prompt_and_command() {
     let directory = tempfile::tempdir().unwrap();
     let host = Host::new(directory.path().to_owned()).unwrap();

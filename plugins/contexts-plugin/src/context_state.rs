@@ -85,6 +85,24 @@ impl ContextState {
         Self::to_summary(&context)
     }
 
+    /// Create and bind under the caller's state write lock. The new context
+    /// cannot disappear between insertion and binding.
+    pub fn create_bound(
+        &mut self,
+        client_id: ClientId,
+        name: Option<String>,
+        mut attributes: BTreeMap<String, String>,
+        session_id: SessionId,
+    ) -> ContextSummary {
+        attributes.insert(
+            CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
+            session_id.0.to_string(),
+        );
+        let context = self.create(client_id, name, attributes);
+        self.session_by_context.insert(context.id, session_id);
+        context
+    }
+
     /// Summary of the client's currently selected context, falling back
     /// to the most-recently-used context if the client's selection is
     /// missing.

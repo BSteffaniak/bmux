@@ -48,6 +48,9 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
               .map_err(crate::runtime::spawn_wire_error);
             Ok::<_, ServiceResponse>(result)
         },
+        "pane-runtime-spawn-v1", "home-directory" => |req: bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::client::HomeDirectoryRequest, ctx| {
+            Ok::<_, ServiceResponse>(spawn::authorize_read(ctx, req.session_id).and_then(|()| spawn::home_directory()))
+        },
         "pane-runtime-spawn-v1", "capture-source" => |req: bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::client::CaptureSourceRequest, ctx| {
             Ok::<_, ServiceResponse>(spawn::authorize_read(ctx, req.session_id).and_then(|()| crate::runtime::capture_spawn_source(req.session_id, req.pane_id)))
         },

@@ -76,9 +76,7 @@ pub fn resolve_split_options(
     let cwd = match policy {
         DirectoryPolicy::RuntimeDefault => None,
         DirectoryPolicy::Path { path } => Some(path.clone()),
-        DirectoryPolicy::Home => {
-            return Err("execution-authority home resolution is not available".into());
-        }
+        DirectoryPolicy::Home => Some(resolve_home(caller, session_id)?),
         DirectoryPolicy::SourcePane { fallback } => {
             let observation = target
                 .map(|pane_id| {
@@ -110,15 +108,26 @@ pub fn resolve_split_options(
                     | SpawnError::ObservationTimeout,
                 )) => match fallback {
                     DirectoryFallback::RuntimeDefault => None,
-                    DirectoryFallback::Home => {
-                        return Err("execution-authority home fallback is not available".into());
-                    }
+                    DirectoryFallback::Home => Some(resolve_home(caller, session_id)?),
                 },
                 Some(Err(error)) => return Err(format!("source directory failed: {error:?}")),
             }
         }
     };
     Ok(InitialShellOptions { cwd })
+}
+
+fn resolve_home(
+    caller: &(impl ServiceCaller + Sync),
+    session_id: uuid::Uuid,
+) -> Result<String, String> {
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller);
+    bmux_plugin::block_on_typed_dispatch(pane_runtime_spawn_v1::client::home_directory(
+        &mut client,
+        session_id,
+    ))
+    .map_err(|error| format!("execution home service failed: {error}"))?
+    .map_err(|error| format!("execution home unavailable: {error:?}"))
 }
 
 impl DirectoryPolicy {
@@ -185,12 +194,50 @@ mod tests {
         );
     }
 
+    struct HomeAuthority;
+    impl ServiceCaller for HomeAuthority {
+        fn execute_kernel_request(
+            &self,
+            _: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            panic!("home must use generated transport")
+        }
+        fn call_service_raw(
+            &self,
+            capability: &str,
+            _: bmux_plugin_sdk::ServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            assert_eq!(capability, "bmux.pane_runtime.spawn.v1");
+            assert_eq!(interface, "pane-runtime-spawn-v1");
+            assert_eq!(operation, "home-directory");
+            let request: pane_runtime_spawn_v1::client::HomeDirectoryRequest =
+                bmux_plugin_sdk::decode_service_message(&payload)?;
+            assert_eq!(request.session_id, uuid::Uuid::nil());
+            bmux_plugin_sdk::encode_service_message(&Ok::<String, SpawnError>(
+                "/execution-authority/home".into(),
+            ))
+        }
+    }
+
     #[test]
-    fn unsupported_home_does_not_silently_use_runtime_default() {
-        assert!(
-            resolve_split_options(&NoCalls, &DirectoryPolicy::Home, uuid::Uuid::nil(), None)
-                .is_err()
-        );
+    fn home_and_headless_home_fallback_use_execution_authority() {
+        for policy in [
+            DirectoryPolicy::Home,
+            DirectoryPolicy::SourcePane {
+                fallback: DirectoryFallback::Home,
+            },
+        ] {
+            assert_eq!(
+                resolve_split_options(&HomeAuthority, &policy, uuid::Uuid::nil(), None)
+                    .unwrap()
+                    .cwd
+                    .as_deref(),
+                Some("/execution-authority/home")
+            );
+        }
     }
 
     fn parse(value: &str) -> Result<CwdSettings, String> {

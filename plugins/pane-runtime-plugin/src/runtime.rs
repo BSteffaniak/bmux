@@ -388,6 +388,30 @@ async fn shutdown_runtime_handle(removed: RemovedRuntime) {
     }
 }
 
+async fn join_supervision_threads(
+    threads: [Option<std::thread::JoinHandle<()>>; 2],
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while threads.iter().flatten().any(|thread| !thread.is_finished()) {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("pane supervision threads did not exit before cleanup deadline".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // is_finished guarantees these joins cannot wait for live OS work. Join
+    // every handle, even when one panicked, before acknowledging teardown.
+    let mut panicked = false;
+    for thread in threads.into_iter().flatten() {
+        panicked |= thread.join().is_err();
+    }
+    if panicked {
+        Err("pane supervision thread panicked".into())
+    } else {
+        Ok(())
+    }
+}
+
 async fn stop_unpublished_pane(pane: &mut PaneRuntimeHandle) -> Result<()> {
     pane.publication.decide(false);
     if let Some(stop) = pane.stop_tx.take() {
@@ -397,7 +421,11 @@ async fn stop_unpublished_pane(pane: &mut PaneRuntimeHandle) -> Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("unpublished pane cleanup timed out"))?
         .map_err(|error| anyhow::anyhow!("unpublished pane task cleanup failed: {error}"))?;
-    Ok(())
+    pane.cleanup
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| Err("pane cleanup ended without process/thread acknowledgement".into()))
+        .map_err(anyhow::Error::msg)
 }
 
 async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
@@ -1051,6 +1079,7 @@ enum SpawnDirectoryProbe {
 
 struct PaneRuntimeHandle {
     publication: Arc<StartupPublication>,
+    cleanup: watch::Receiver<Option<std::result::Result<(), String>>>,
     startup: watch::Receiver<Option<std::result::Result<(), String>>>,
     #[cfg(feature = "image-registry")]
     session_id: SessionId,
@@ -5374,18 +5403,25 @@ impl SessionRuntimeManager {
         let image_dirty_for_reader = Arc::clone(&image_dirty);
 
         let (startup_tx, startup) = watch::channel(None);
+        let (cleanup_tx, cleanup) = watch::channel(None);
         let task = tokio::spawn(async move {
             let _publication_guard = PendingPublicationGuard(Arc::clone(&publication_for_task));
             if let Some(permit) = launch_permit {
                 tokio::select! {
                     biased;
-                    _ = &mut stop_rx => return,
-                    result = permit => if result.is_err() { return; },
+                    _ = &mut stop_rx => { cleanup_tx.send_replace(Some(Ok(()))); return; },
+                    result = permit => if result.is_err() { cleanup_tx.send_replace(Some(Ok(()))); return; },
                 }
             }
+            let mut child_spawned = false;
             macro_rules! fail_startup {
                 ($reason:expr) => {{
                     let reason = $reason;
+                    // Before spawn there is no process or supervision thread to
+                    // reap. Later failures must supply their actual cleanup result.
+                    if !child_spawned {
+                        cleanup_tx.send_replace(Some(Ok(())));
+                    }
                     startup_tx.send_replace(Some(Err(reason.clone())));
                     mark_pane_startup_failed(
                         session_id,
@@ -5511,6 +5547,7 @@ impl SessionRuntimeManager {
                     return;
                 }
             });
+            child_spawned = true;
             if let Some(resume) = &application_resume {
                 let result = child
                     .process_id()
@@ -5975,32 +6012,14 @@ impl SessionRuntimeManager {
                 }
             }
 
-            // Do not synchronously join the OS reader/waiter threads from the
-            // async runtime task. On shutdown the reader can remain blocked in
-            // a PTY read until all handles are dropped; joining it here before
-            // the task returns can deadlock pane/session teardown and starve
-            // unrelated attach service requests. Dropping the handles detaches
-            // the threads; they exit once the PTY/process closes.
             drop(writer);
             drop(master);
-            drop(child_waiter);
-            drop(reader_thread);
-            let waiter_done_for_diagnostic = Arc::clone(&child_waiter_done);
-            let reader_done_for_diagnostic = Arc::clone(&reader_thread_done);
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                let waiter_done = waiter_done_for_diagnostic.load(Ordering::SeqCst);
-                let reader_done = reader_done_for_diagnostic.load(Ordering::SeqCst);
-                if !waiter_done || !reader_done {
-                    warn!(
-                        %pane_id,
-                        waiter_done,
-                        reader_done,
-                        active_blocking_threads = PANE_BLOCKING_THREAD_COUNT.load(Ordering::SeqCst),
-                        "pane blocking thread cleanup still pending 5s after runtime task shutdown",
-                    );
-                }
-            });
+            // Never occupy a blocking-pool worker with an unbounded join.
+            // A timeout is an explicit failure, not acknowledged restoration.
+            let cleanup_result =
+                join_supervision_threads([child_waiter, reader_thread], Duration::from_secs(4))
+                    .await;
+            cleanup_tx.send_replace(Some(cleanup_result));
             exited_for_task.store(true, Ordering::SeqCst);
         });
 
@@ -6011,6 +6030,7 @@ impl SessionRuntimeManager {
         PaneRuntimeHandle {
             publication,
             startup,
+            cleanup,
             #[cfg(feature = "image-registry")]
             session_id,
             meta: pane_meta,
@@ -10825,6 +10845,39 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn supervision_join_reports_live_thread_deadline_without_blocking_executor() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let _ = blocked.recv();
+            let _ = done.send(());
+        });
+        let result =
+            super::join_supervision_threads([Some(thread), None], std::time::Duration::ZERO).await;
+        assert!(result.unwrap_err().contains("deadline"));
+        release.send(()).unwrap();
+        finished.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervision_join_acknowledges_completion_and_reports_panics() {
+        let thread = std::thread::spawn(|| {});
+        super::join_supervision_threads([Some(thread), None], std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let thread = std::thread::spawn(|| panic!("supervision failure"));
+        assert!(
+            super::join_supervision_threads(
+                [Some(thread), None],
+                std::time::Duration::from_secs(2)
+            )
+            .await
+            .unwrap_err()
+            .contains("panicked")
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -12446,6 +12499,7 @@ mod tests {
         PaneRuntimeHandle {
             publication: Arc::new(StartupPublication::default()),
             startup: watch::channel(Some(Ok(()))).1,
+            cleanup: watch::channel(Some(Ok(()))).1,
             #[cfg(feature = "image-registry")]
             session_id: SessionId(Uuid::nil()),
             meta: PaneRuntimeMeta {

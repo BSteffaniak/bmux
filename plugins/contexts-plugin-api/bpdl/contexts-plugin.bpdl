@@ -14,6 +14,19 @@ plugin bmux.contexts version 1;
 capability CONTEXTS_READ = bmux.contexts.read;
 capability CONTEXTS_WRITE = bmux.contexts.write;
 
+// Fresh-shell options are explicit; older creation contracts retain their meaning.
+@capability(CONTEXTS_WRITE)
+interface contexts-spawn-v1 {
+    record initial-shell-options {
+        cwd: string?,
+    }
+    command create-context(
+        name: string?,
+        attributes: map<string, string>,
+        options: initial-shell-options,
+    ) -> result<contexts-commands.context-ack, contexts-commands.create-context-error>;
+}
+
 // Caller-local transient visit history, newest first. Unsupported providers
 // reject this interface rather than silently substituting shared MRU order.
 @capability(CONTEXTS_READ)

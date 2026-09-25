@@ -68,6 +68,10 @@ interface pane-runtime-spawn-v1 {
         cwd: string?,
     }
 
+    // Resolve on the execution authority, never from the invoking client's HOME.
+    // Session authorization is required even though this query does not mutate.
+    query home-directory(session_id: uuid) -> result<string, spawn-error>;
+
     // Explicit pane identity is required; caller-local focus is resolved by
     // the owning product plugin, never substituted by this execution service.
     query capture-source(
