@@ -385,11 +385,22 @@ fn split_pane(
     settings: Option<&toml::Value>,
 ) -> Result<api_pane_runtime_commands::PaneAck, String> {
     let policy = cwd::CwdSettings::parse(settings)?.new_pane;
+    split_pane_with_policy(caller, session, target, direction, ratio_pct, &policy)
+}
+
+fn split_pane_with_policy(
+    caller: &(impl ServiceCaller + Sync),
+    session: Option<&Selector>,
+    target: Option<&Selector>,
+    direction: PaneDirection,
+    ratio_pct: Option<u32>,
+    policy: &cwd::DirectoryPolicy,
+) -> Result<api_pane_runtime_commands::PaneAck, String> {
     let session_id = resolve_session_id(caller, session)?;
     let target = resolve_target_pane_id(caller, session_id, target)?;
     let ratio = ratio_pct.unwrap_or(50).clamp(10, 90) as u8;
     let mut client = dispatch_client(caller);
-    let ack = if policy == cwd::DirectoryPolicy::RuntimeDefault {
+    let ack = if *policy == cwd::DirectoryPolicy::RuntimeDefault {
         bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::split_pane(
             &mut client,
             session_id,
@@ -400,7 +411,7 @@ fn split_pane(
         .map_err(|err| typed_service_error("pane-runtime-commands/split-pane", err))?
         .map_err(|err| format!("split-pane failed: {err:?}"))?
     } else {
-        let options = cwd::resolve_split_options(caller, &policy, session_id, target)?;
+        let options = cwd::resolve_split_options(caller, policy, session_id, target)?;
         let target = target.ok_or_else(|| {
             "directory-aware split requires an explicit attachment-local target".to_string()
         })?;
@@ -1844,12 +1855,27 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
     match context.command.as_str() {
         "new-tab" => {
             let name = option_value(&context.arguments, "name");
-            let ack = create_tab_with_settings(
-                context,
-                &plugin.runtime_state,
-                name,
-                context.settings.as_ref(),
-            )?;
+            let source = if let Some(pane) = option_value(&context.arguments, "source-pane") {
+                let pane = Uuid::parse_str(&pane)
+                    .map_err(|error| format!("invalid source-pane: {error}"))?;
+                let session = option_value(&context.arguments, "source-session")
+                    .ok_or_else(|| "source-pane requires source-session".to_string())?;
+                let session = Uuid::parse_str(&session)
+                    .map_err(|error| format!("invalid source-session: {error}"))?;
+                Some((session, pane))
+            } else {
+                if option_value(&context.arguments, "source-session").is_some() {
+                    return Err("source-session requires source-pane".into());
+                }
+                None
+            };
+            let policy = if let Some(path) = option_value(&context.arguments, "cwd") {
+                cwd::DirectoryPolicy::explicit_path(path)?
+            } else {
+                cwd::CwdSettings::parse(context.settings.as_ref())?.new_tab
+            };
+            let ack =
+                create_tab_with_policy(context, &plugin.runtime_state, name, &policy, source)?;
             record_selected_context_outcome(&ack);
             if emit_to_stdout && let Some(context_id) = ack.id {
                 println!("created tab context: {context_id}");
@@ -2105,13 +2131,32 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             let direction = option_value(&context.arguments, "direction")
                 .ok_or_else(|| "--direction is required".to_string())?;
             let direction = parse_pane_direction_arg(&direction)?;
-            split_pane(
+            let session = option_value(&context.arguments, "session")
+                .map(|value| {
+                    Uuid::parse_str(&value)
+                        .map(selector_by_id)
+                        .map_err(|error| format!("invalid session UUID: {error}"))
+                })
+                .transpose()?;
+            let target = option_value(&context.arguments, "pane-id")
+                .map(|value| {
+                    Uuid::parse_str(&value)
+                        .map(selector_by_id)
+                        .map_err(|error| format!("invalid pane UUID: {error}"))
+                })
+                .transpose()?;
+            let policy = if let Some(path) = option_value(&context.arguments, "cwd") {
+                cwd::DirectoryPolicy::explicit_path(path)?
+            } else {
+                cwd::CwdSettings::parse(context.settings.as_ref())?.new_pane
+            };
+            split_pane_with_policy(
                 context,
-                None,
-                None,
+                session.as_ref(),
+                target.as_ref(),
                 direction,
                 None,
-                context.settings.as_ref(),
+                &policy,
             )?;
             Ok(())
         }
@@ -2455,6 +2500,16 @@ fn create_tab_with_settings(
     settings: Option<&toml::Value>,
 ) -> Result<TabAck, String> {
     let policy = cwd::CwdSettings::parse(settings)?.new_tab;
+    create_tab_with_policy(caller, runtime_state, name, &policy, None)
+}
+
+fn create_tab_with_policy(
+    caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &TabRuntimeStateHandle,
+    name: Option<String>,
+    policy: &cwd::DirectoryPolicy,
+    source: Option<(Uuid, Uuid)>,
+) -> Result<TabAck, String> {
     let contexts = list_contexts_in_active_workspace(caller)?;
     seed_known_contexts(runtime_state, &contexts);
     let resolved_name = name.or_else(|| Some(next_default_tab_name_for_contexts(&contexts)));
@@ -2464,13 +2519,16 @@ fn create_tab_with_settings(
             .flatten();
     let mut attributes = BTreeMap::new();
     attributes.insert("workspace".to_string(), active_workspace_attribute(caller));
-    let context = if policy == cwd::DirectoryPolicy::RuntimeDefault {
+    let context = if *policy == cwd::DirectoryPolicy::RuntimeDefault {
         create_context(caller, resolved_name, attributes)?
     } else {
         // Without a captured attachment-local pane, source-pane must take its
         // configured fallback, never borrow another attachment's global focus.
-        let session_id = resolve_session_id(caller, None)?;
-        let options = cwd::resolve_split_options(caller, &policy, session_id, None)?;
+        let options = if let Some((session, pane)) = source {
+            cwd::resolve_split_options(caller, policy, session, Some(pane))?
+        } else {
+            cwd::resolve_without_source(caller, policy, || resolve_session_id(caller, None))?
+        };
         let mut client = dispatch_client(caller);
         let ack = bmux_plugin::block_on_typed_dispatch(
             bmux_contexts_plugin_api::contexts_spawn_v1::client::create_context(

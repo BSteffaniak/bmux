@@ -97,6 +97,24 @@ summary       = "Create a workspace tab"
 
 [[commands.arguments]]
 kind       = "string"
+long       = "source-pane"
+name       = "source-pane"
+value_name = "UUID"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "source-session"
+name       = "source-session"
+value_name = "UUID"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cwd"
+name       = "cwd"
+value_name = "ABSOLUTE_DIRECTORY"
+
+[[commands.arguments]]
+kind       = "string"
 long       = "session"
 name       = "session"
 short      = "s"
@@ -345,6 +363,18 @@ expose_in_cli = true
 name          = "split-pane"
 path          = ["split-pane"]
 summary       = "Split the active pane"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "pane-id"
+name       = "pane-id"
+value_name = "UUID"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cwd"
+name       = "cwd"
+value_name = "ABSOLUTE_DIRECTORY"
 
 [[commands.arguments]]
 kind       = "choice"

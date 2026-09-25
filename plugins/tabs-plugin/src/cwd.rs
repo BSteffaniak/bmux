@@ -117,6 +117,28 @@ pub fn resolve_split_options(
     Ok(InitialShellOptions { cwd })
 }
 
+/// Resolve policies when no attachment-local source was captured. Only home
+/// resolution needs a session authorization context; fixed paths and the runtime
+/// default must remain usable without an existing execution.
+pub fn resolve_without_source(
+    caller: &(impl ServiceCaller + Sync),
+    policy: &DirectoryPolicy,
+    session: impl FnOnce() -> Result<uuid::Uuid, String>,
+) -> Result<InitialShellOptions, String> {
+    let cwd = match policy {
+        DirectoryPolicy::Path { path } => Some(path.clone()),
+        DirectoryPolicy::RuntimeDefault
+        | DirectoryPolicy::SourcePane {
+            fallback: DirectoryFallback::RuntimeDefault,
+        } => None,
+        DirectoryPolicy::Home
+        | DirectoryPolicy::SourcePane {
+            fallback: DirectoryFallback::Home,
+        } => Some(resolve_home(caller, session()?)?),
+    };
+    Ok(InitialShellOptions { cwd })
+}
+
 fn resolve_home(
     caller: &(impl ServiceCaller + Sync),
     session_id: uuid::Uuid,
@@ -131,6 +153,12 @@ fn resolve_home(
 }
 
 impl DirectoryPolicy {
+    pub fn explicit_path(path: String) -> Result<Self, String> {
+        let policy = Self::Path { path };
+        policy.validate("explicit")?;
+        Ok(policy)
+    }
+
     fn validate(&self, operation: &str) -> Result<(), String> {
         if let Self::Path { path } = self
             && (!Path::new(path).is_absolute() || path.contains('\0'))
@@ -146,6 +174,43 @@ impl DirectoryPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_independent_policies_do_not_require_an_existing_session() {
+        for (policy, expected) in [
+            (
+                DirectoryPolicy::Path {
+                    path: "/execution/project".into(),
+                },
+                Some("/execution/project"),
+            ),
+            (DirectoryPolicy::RuntimeDefault, None),
+            (
+                DirectoryPolicy::SourcePane {
+                    fallback: DirectoryFallback::RuntimeDefault,
+                },
+                None,
+            ),
+        ] {
+            let options = resolve_without_source(&NoCalls, &policy, || {
+                panic!("must not resolve an unrelated session")
+            })
+            .unwrap();
+            assert_eq!(options.cwd.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn explicit_directory_rejects_invalid_paths_without_local_existence_check() {
+        assert!(DirectoryPolicy::explicit_path("relative".into()).is_err());
+        assert!(DirectoryPolicy::explicit_path("/invalid\0path".into()).is_err());
+        assert_eq!(
+            DirectoryPolicy::explicit_path("/execution-only/path".into()).unwrap(),
+            DirectoryPolicy::Path {
+                path: "/execution-only/path".into()
+            }
+        );
+    }
 
     struct NoCalls;
 
