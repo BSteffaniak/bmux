@@ -3,6 +3,8 @@
 //! Parsing does not touch the filesystem: paths belong to the execution host.
 //! Runtime resolution and explicit command overrides are separate operations.
 
+use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{self, InitialShellOptions, SpawnError};
+use bmux_plugin::ServiceCaller;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -64,6 +66,61 @@ impl CwdSettings {
     }
 }
 
+/// Resolve only the explicitly captured source; never consult runtime-global focus.
+pub fn resolve_split_options(
+    caller: &(impl ServiceCaller + Sync),
+    policy: &DirectoryPolicy,
+    session_id: uuid::Uuid,
+    target: Option<uuid::Uuid>,
+) -> Result<InitialShellOptions, String> {
+    let cwd = match policy {
+        DirectoryPolicy::RuntimeDefault => None,
+        DirectoryPolicy::Path { path } => Some(path.clone()),
+        DirectoryPolicy::Home => {
+            return Err("execution-authority home resolution is not available".into());
+        }
+        DirectoryPolicy::SourcePane { fallback } => {
+            let observation = target
+                .map(|pane_id| {
+                    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller);
+                    let source = bmux_plugin::block_on_typed_dispatch(
+                        pane_runtime_spawn_v1::client::capture_source(
+                            &mut client,
+                            session_id,
+                            pane_id,
+                        ),
+                    )
+                    .map_err(|error| format!("capture source service failed: {error}"))?;
+                    match source {
+                        Ok(source) => bmux_plugin::block_on_typed_dispatch(
+                            pane_runtime_spawn_v1::client::observe_directory(&mut client, source),
+                        )
+                        .map_err(|error| format!("observe directory service failed: {error}")),
+                        Err(error) => Ok(Err(error)),
+                    }
+                })
+                .transpose()?;
+            match observation {
+                Some(Ok(observation)) => Some(observation.path),
+                None
+                | Some(Err(
+                    SpawnError::SourceUnavailable
+                    | SpawnError::StaleExecution
+                    | SpawnError::ObservationUnavailable
+                    | SpawnError::ObservationTimeout,
+                )) => match fallback {
+                    DirectoryFallback::RuntimeDefault => None,
+                    DirectoryFallback::Home => {
+                        return Err("execution-authority home fallback is not available".into());
+                    }
+                },
+                Some(Err(error)) => return Err(format!("source directory failed: {error:?}")),
+            }
+        }
+    };
+    Ok(InitialShellOptions { cwd })
+}
+
 impl DirectoryPolicy {
     fn validate(&self, operation: &str) -> Result<(), String> {
         if let Self::Path { path } = self
@@ -80,6 +137,61 @@ impl DirectoryPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoCalls;
+
+    impl ServiceCaller for NoCalls {
+        fn execute_kernel_request(
+            &self,
+            _request: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            panic!("directory policy must not bypass generated services")
+        }
+
+        fn call_service_raw(
+            &self,
+            _capability: &str,
+            _kind: bmux_plugin_sdk::ServiceKind,
+            _interface: &str,
+            _operation: &str,
+            _payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            panic!("no source must not query global focus or mutate resources")
+        }
+    }
+
+    #[test]
+    fn headless_source_falls_back_without_querying_global_focus() {
+        let policy = DirectoryPolicy::SourcePane {
+            fallback: DirectoryFallback::RuntimeDefault,
+        };
+        assert_eq!(
+            resolve_split_options(&NoCalls, &policy, uuid::Uuid::nil(), None)
+                .unwrap()
+                .cwd,
+            None
+        );
+    }
+
+    #[test]
+    fn fixed_directory_is_forwarded_without_local_filesystem_lookup() {
+        let path = "/execution-host-only/project".to_string();
+        let policy = DirectoryPolicy::Path { path: path.clone() };
+        assert_eq!(
+            resolve_split_options(&NoCalls, &policy, uuid::Uuid::nil(), None)
+                .unwrap()
+                .cwd,
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn unsupported_home_does_not_silently_use_runtime_default() {
+        assert!(
+            resolve_split_options(&NoCalls, &DirectoryPolicy::Home, uuid::Uuid::nil(), None)
+                .is_err()
+        );
+    }
 
     fn parse(value: &str) -> Result<CwdSettings, String> {
         CwdSettings::parse(Some(&toml::from_str::<toml::Value>(value).unwrap()))

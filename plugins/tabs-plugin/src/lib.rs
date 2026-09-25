@@ -382,12 +382,14 @@ fn split_pane(
     target: Option<&Selector>,
     direction: PaneDirection,
     ratio_pct: Option<u32>,
+    settings: Option<&toml::Value>,
 ) -> Result<api_pane_runtime_commands::PaneAck, String> {
+    let policy = cwd::CwdSettings::parse(settings)?.new_pane;
     let session_id = resolve_session_id(caller, session)?;
     let target = resolve_target_pane_id(caller, session_id, target)?;
     let ratio = ratio_pct.unwrap_or(50).clamp(10, 90) as u8;
     let mut client = dispatch_client(caller);
-    let result =
+    let ack = if policy == cwd::DirectoryPolicy::RuntimeDefault {
         bmux_plugin::block_on_typed_dispatch(api_pane_runtime_commands::client::split_pane(
             &mut client,
             session_id,
@@ -395,8 +397,26 @@ fn split_pane(
             pane_direction_name(direction).to_string(),
             ratio,
         ))
-        .map_err(|err| typed_service_error("pane-runtime-commands/split-pane", err))?;
-    let ack = result.map_err(|err| format!("split-pane failed: {err:?}"))?;
+        .map_err(|err| typed_service_error("pane-runtime-commands/split-pane", err))?
+        .map_err(|err| format!("split-pane failed: {err:?}"))?
+    } else {
+        let options = cwd::resolve_split_options(caller, &policy, session_id, target)?;
+        let target = target.ok_or_else(|| {
+            "directory-aware split requires an explicit attachment-local target".to_string()
+        })?;
+        bmux_plugin::block_on_typed_dispatch(
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::split_shell(
+                &mut client,
+                session_id,
+                target,
+                pane_direction_name(direction).to_string(),
+                ratio,
+                options,
+            ),
+        )
+        .map_err(|err| typed_service_error("pane-runtime-spawn-commands-v1/split-shell", err))?
+        .map_err(|err| format!("split-shell failed: {err:?}"))?
+    };
     emit_pane_event(bmux_tabs_plugin_api::tabs_events::PaneEvent::Opened {
         pane_id: ack.pane_id,
         session_id: ack.session_id,
@@ -1272,7 +1292,7 @@ impl RustPlugin for TabsPlugin {
                     .map_err(|e| ServiceResponse::error("focus_failed", e))
             },
             "tabs-commands", "split-pane" => |req: SplitPaneArgs, ctx| {
-                split_pane(ctx, req.session.as_ref(), req.target.as_ref(), req.direction, req.ratio_pct)
+                split_pane(ctx, req.session.as_ref(), req.target.as_ref(), req.direction, req.ratio_pct, ctx.settings.as_ref())
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
                     .map_err(|e| ServiceResponse::error("split_failed", e))
             },
@@ -1318,6 +1338,7 @@ impl RustPlugin for TabsPlugin {
         let result = self.activate(context.clone())?;
         let shared = TabsSharedState {
             caller: Arc::new(TypedServiceCaller::from_lifecycle_context(&context)),
+            settings: context.settings.clone(),
             last_selected_by_client: self.last_selected_by_client.clone(),
             runtime_state: self.runtime_state.clone(),
         };
@@ -1381,6 +1402,7 @@ impl RustPlugin for TabsPlugin {
         // consistent between transports.
         let shared = TabsSharedState {
             caller: Arc::new(TypedServiceCaller::from_registration_context(&context)),
+            settings: context.plugin_settings_map.get("bmux.tabs").cloned(),
             last_selected_by_client: self.last_selected_by_client.clone(),
             runtime_state: self.runtime_state.clone(),
         };
@@ -2078,7 +2100,14 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             let direction = option_value(&context.arguments, "direction")
                 .ok_or_else(|| "--direction is required".to_string())?;
             let direction = parse_pane_direction_arg(&direction)?;
-            split_pane(context, None, None, direction, None)?;
+            split_pane(
+                context,
+                None,
+                None,
+                direction,
+                None,
+                context.settings.as_ref(),
+            )?;
             Ok(())
         }
         "resize-pane" => {
@@ -3322,6 +3351,7 @@ fn encode_stored_tab_order_lines(order_ids: &[Uuid]) -> Vec<u8> {
 /// encoded dispatch path.
 #[derive(Clone)]
 struct TabsSharedState {
+    settings: Option<toml::Value>,
     caller: Arc<TypedServiceCaller>,
     last_selected_by_client: LastSelectedByClient,
     runtime_state: TabRuntimeStateHandle,
@@ -3487,6 +3517,7 @@ impl TabsCommandsService for TabsCommandsHandle {
                 target.as_ref(),
                 direction,
                 ratio_pct,
+                self.shared.settings.as_ref(),
             )
             .map(|response| PaneAck {
                 ok: true,
