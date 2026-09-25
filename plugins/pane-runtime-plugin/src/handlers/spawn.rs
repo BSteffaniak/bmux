@@ -17,6 +17,14 @@ fn check_read_identity(
 }
 
 pub fn authorize_read(ctx: &NativeServiceContext, session_id: Uuid) -> Result<(), SpawnError> {
+    authorize_session(ctx, session_id, "read")
+}
+
+pub(super) fn authorize_session(
+    ctx: &NativeServiceContext,
+    session_id: Uuid,
+    action: &str,
+) -> Result<(), SpawnError> {
     // Local single-user fallback is tied to plugin absence, never an error
     // substring or a failed policy request. Federated services must retain
     // their own authenticated authority checks before reaching local execution.
@@ -43,7 +51,7 @@ pub fn authorize_read(ctx: &NativeServiceContext, session_id: Uuid) -> Result<()
             None,
             client_id,
             principal,
-            "read".into(),
+            action.into(),
             None,
             None,
             None,
@@ -77,6 +85,10 @@ mod tests {
                 "explicit denial",
             ),
             (Ok((false, None)), "directory access denied"),
+            (
+                Err("unsupported policy operation".into()),
+                "unsupported policy operation",
+            ),
             (
                 Err("policy service unavailable".into()),
                 "policy service unavailable",

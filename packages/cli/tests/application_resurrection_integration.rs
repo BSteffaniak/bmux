@@ -58,6 +58,8 @@ welcome = json.loads(f.readline())
 with open(sys.argv[1], 'a') as out: out.write(json.dumps(welcome)+'\n')
 send(dict(operation='selection',revision=1,descriptor=dict(application='test',session='saved-selection')))
 ack = json.loads(f.readline())
+if ack != {'revision': 1}:
+    raise RuntimeError('selection was not acknowledged: ' + repr(ack))
 with open(sys.argv[1], 'a') as out: out.write('committed\n')
 while True: time.sleep(1)
 "#).unwrap();

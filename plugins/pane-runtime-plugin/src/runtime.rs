@@ -388,7 +388,20 @@ async fn shutdown_runtime_handle(removed: RemovedRuntime) {
     }
 }
 
+async fn stop_unpublished_pane(pane: &mut PaneRuntimeHandle) -> Result<()> {
+    pane.publication.decide(false);
+    if let Some(stop) = pane.stop_tx.take() {
+        let _ = stop.send(());
+    }
+    tokio::time::timeout(Duration::from_secs(5), &mut pane.task)
+        .await
+        .map_err(|_| anyhow::anyhow!("unpublished pane cleanup timed out"))?
+        .map_err(|error| anyhow::anyhow!("unpublished pane task cleanup failed: {error}"))?;
+    Ok(())
+}
+
 async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
+    pane.publication.decide(false);
     if matches!(&*pane.startup.borrow(), Some(Err(_))) {
         trace!(pane_id = %pane.meta.id, "cleaning up failed pane startup");
     }
@@ -650,18 +663,112 @@ struct PaneInputHandle {
     exited: Arc<AtomicBool>,
 }
 
+/// A fresh runtime's OS threads may start before its manager entry exists.
+/// Hold their externally visible effects until commit; abandonment wakes them
+/// without publishing anything. Legacy/restored runtimes start committed.
+#[derive(Default)]
+struct StartupPublication {
+    decision: Mutex<Option<bool>>,
+    changed: std::sync::Condvar,
+}
+
+impl StartupPublication {
+    fn decide(&self, committed: bool) {
+        let mut decision = self
+            .decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if decision.is_none() {
+            *decision = Some(committed);
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait(&self) -> bool {
+        let decision = self
+            .decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let decision = self
+            .changed
+            .wait_while(decision, |decision| decision.is_none())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *decision == Some(true)
+    }
+}
+
+struct PendingPublicationGuard(Arc<StartupPublication>);
+
+impl Drop for PendingPublicationGuard {
+    fn drop(&mut self) {
+        self.0.decide(false);
+    }
+}
+
+struct PreparedSplit {
+    pane: Option<PaneRuntimeHandle>,
+    launch: Option<oneshot::Sender<()>>,
+    target: Uuid,
+    target_execution: Uuid,
+}
+
+impl Drop for PreparedSplit {
+    fn drop(&mut self) {
+        if let Some(pane) = self.pane.as_mut() {
+            pane.publication.decide(false);
+            if let Some(stop) = pane.stop_tx.take() {
+                let _ = stop.send(());
+            }
+        }
+    }
+}
+
 struct PreparedFreshRuntime {
     runtime: Option<SessionRuntimeHandle>,
     launch: Option<oneshot::Sender<()>>,
 }
 
 impl PreparedFreshRuntime {
-    fn take(mut self) -> Result<SessionRuntimeHandle> {
+    fn launch(&mut self) -> Result<()> {
         if let Some(launch) = self.launch.take() {
             launch.send(()).map_err(|()| {
                 anyhow::anyhow!("prepared runtime startup task exited before launch")
             })?;
         }
+        Ok(())
+    }
+
+    async fn wait_until_ready(&mut self) -> Result<()> {
+        self.launch()?;
+        for pane in self
+            .runtime
+            .as_ref()
+            .expect("prepared runtime still owns startup")
+            .panes
+            .values()
+        {
+            let mut startup = pane.startup.clone();
+            loop {
+                if let Some(result) = startup.borrow_and_update().clone() {
+                    result.map_err(anyhow::Error::msg)?;
+                    break;
+                }
+                startup
+                    .changed()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("pane startup ended without readiness"))?;
+            }
+            anyhow::ensure!(
+                !pane.exited.load(Ordering::SeqCst),
+                "pane exited before startup commit"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn take(mut self) -> Result<SessionRuntimeHandle> {
+        self.launch()?;
         Ok(self
             .runtime
             .take()
@@ -673,6 +780,7 @@ impl Drop for PreparedFreshRuntime {
     fn drop(&mut self) {
         if let Some(runtime) = self.runtime.as_mut() {
             for pane in runtime.panes.values_mut() {
+                pane.publication.decide(false);
                 if let Some(stop) = pane.stop_tx.take() {
                     let _ = stop.send(());
                 }
@@ -942,6 +1050,7 @@ enum SpawnDirectoryProbe {
 }
 
 struct PaneRuntimeHandle {
+    publication: Arc<StartupPublication>,
     startup: watch::Receiver<Option<std::result::Result<(), String>>>,
     #[cfg(feature = "image-registry")]
     session_id: SessionId,
@@ -2258,7 +2367,8 @@ if [[ -z "${__BMUX_RESURRECTION_HOOK_INSTALLED:-}" ]]; then
     printf '\033]633;bmux;prompt;%s\007' "$cwd_b64"
   }
 
-  __BMUX_READY_FOR_CMD=1
+  __BMUX_READY_FOR_CMD=0
+  __BMUX_ORIGINAL_PROMPT_COMMAND="${PROMPT_COMMAND:-}"
 
   __bmux_preexec_trap() {
     [[ -n "${__BMUX_EMIT_GUARD:-}" ]] && return
@@ -2285,17 +2395,18 @@ if [[ -z "${__BMUX_RESURRECTION_HOOK_INSTALLED:-}" ]]; then
   __bmux_precmd_hook() {
     [[ -n "${__BMUX_EMIT_GUARD:-}" ]] && return
     __BMUX_EMIT_GUARD=1
+    # Keep DEBUG disarmed for the entire inherited prompt command, not only
+    # our marker. Otherwise prompt work consumes the next command boundary.
+    if [[ -n "$__BMUX_ORIGINAL_PROMPT_COMMAND" ]]; then
+      eval "$__BMUX_ORIGINAL_PROMPT_COMMAND"
+    fi
     __bmux_emit_prompt "$PWD"
     __BMUX_READY_FOR_CMD=1
     __BMUX_EMIT_GUARD=
   }
 
   trap '__bmux_preexec_trap' DEBUG
-  if [[ -n "${PROMPT_COMMAND:-}" ]]; then
-    PROMPT_COMMAND="__bmux_precmd_hook;${PROMPT_COMMAND}"
-  else
-    PROMPT_COMMAND="__bmux_precmd_hook"
-  fi
+  PROMPT_COMMAND="__bmux_precmd_hook"
 fi
 "#
 }
@@ -4839,10 +4950,36 @@ impl SessionRuntimeManager {
         }
     }
 
-    fn start_runtime(&mut self, session_id: SessionId) -> Result<()> {
-        self.start_runtime_with_options(session_id, None)
+    fn commit_fresh_runtime(
+        &mut self,
+        session_id: SessionId,
+        prepared: &mut PreparedFreshRuntime,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.runtimes.contains_key(&session_id),
+            "runtime already exists for session {}",
+            session_id.0
+        );
+        let pending = prepared.runtime.as_ref().expect("uncommitted runtime");
+        for pane in pending.panes.values() {
+            anyhow::ensure!(
+                matches!(&*pane.startup.borrow(), Some(Ok(())))
+                    && !pane.exited.load(Ordering::SeqCst),
+                "pane is not ready for startup commit"
+            );
+        }
+        let runtime = prepared.runtime.take().expect("ready runtime ownership");
+        for pane in runtime.panes.values() {
+            self.register_pane_input(session_id, pane);
+        }
+        self.runtimes.insert(session_id, runtime);
+        for pane in self.runtimes[&session_id].panes.values() {
+            pane.publication.decide(true);
+        }
+        Ok(())
     }
 
+    #[cfg(test)]
     fn start_runtime_with_options(
         &mut self,
         session_id: SessionId,
@@ -4853,6 +4990,9 @@ impl SessionRuntimeManager {
             self.register_pane_input(session_id, pane);
         }
         self.runtimes.insert(session_id, runtime);
+        for pane in self.runtimes[&session_id].panes.values() {
+            pane.publication.decide(true);
+        }
         Ok(())
     }
 
@@ -5100,6 +5240,11 @@ impl SessionRuntimeManager {
         >,
         launch_permit: Option<oneshot::Receiver<()>>,
     ) -> PaneRuntimeHandle {
+        let publication = Arc::new(StartupPublication::default());
+        if launch_permit.is_none() {
+            publication.decide(true);
+        }
+        let publication_for_task = Arc::clone(&publication);
         let resolved_launch = resolve_pane_launch(&pane_meta, &self.shell);
         if let Ok(resolved) = &resolved_launch {
             if resolved.shell != pane_meta.shell {
@@ -5230,6 +5375,7 @@ impl SessionRuntimeManager {
 
         let (startup_tx, startup) = watch::channel(None);
         let task = tokio::spawn(async move {
+            let _publication_guard = PendingPublicationGuard(Arc::clone(&publication_for_task));
             if let Some(permit) = launch_permit {
                 tokio::select! {
                     biased;
@@ -5469,6 +5615,7 @@ impl SessionRuntimeManager {
             let application_resume_for_waiter = application_resume.clone();
             let child_waiter_done = Arc::new(AtomicBool::new(false));
             let child_waiter_done_for_thread = Arc::clone(&child_waiter_done);
+            let publication_for_waiter = Arc::clone(&publication_for_task);
             let child_waiter = std::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn(move || {
@@ -5490,6 +5637,11 @@ impl SessionRuntimeManager {
                     if let Ok(mut resurrection) = resurrection_state_for_waiter.lock() {
                         resurrection.active_command = None;
                         resurrection.active_command_source = None;
+                    }
+                    if !publication_for_waiter.wait() {
+                        let _ = child_exit_tx.send(());
+                        child_waiter_done_for_thread.store(true, Ordering::SeqCst);
+                        return;
                     }
                     push_pane_runtime_notice(
                         session_id,
@@ -5516,10 +5668,19 @@ impl SessionRuntimeManager {
             let writer_for_reader = Arc::clone(&writer);
             let reader_thread_done = Arc::new(AtomicBool::new(false));
             let reader_thread_done_for_thread = Arc::clone(&reader_thread_done);
+            let publication_for_reader = Arc::clone(&publication_for_task);
+            // Fence checkpoint writers before terminating the shell. Its final
+            // prompt/output can otherwise reset the saved invocation after the
+            // server has finalized the restoration snapshot.
+            let application_resume_for_shutdown = application_resume.clone();
             let reader_thread = std::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}"))
                 .spawn(move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "reader");
+                    if !publication_for_reader.wait() {
+                        reader_thread_done_for_thread.store(true, Ordering::SeqCst);
+                        return;
+                    }
                     let mut buffer = [0_u8; 8192];
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile)
                         .with_bracketed_paste_support(bracketed_paste_supported);
@@ -5778,6 +5939,9 @@ impl SessionRuntimeManager {
                 }
                 tokio::select! {
                     _ = &mut stop_rx => {
+                        if let Some(resume) = &application_resume_for_shutdown {
+                            resume.close();
+                        }
                         let _ = child_killer.kill();
                         break;
                     }
@@ -5845,6 +6009,7 @@ impl SessionRuntimeManager {
             .get(&(session_id, pane_meta.id))
             .copied();
         PaneRuntimeHandle {
+            publication,
             startup,
             #[cfg(feature = "image-registry")]
             session_id,
@@ -5879,6 +6044,115 @@ impl SessionRuntimeManager {
         }
     }
 
+    fn prepare_split(
+        &self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        direction: PaneSplitDirection,
+        options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
+    ) -> Result<PreparedSplit> {
+        validate_initial_shell_options(options.as_ref())?;
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("session runtime unavailable"))?;
+        let target =
+            resolve_pane_id_from_selector(session, &target.unwrap_or(PaneSelector::Active))
+                .ok_or_else(|| anyhow::anyhow!("split target unavailable"))?;
+        let source = session
+            .panes
+            .get(&target)
+            .ok_or_else(|| anyhow::anyhow!("split target unavailable"))?;
+        let target_execution = source
+            .resurrection_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("split target metadata poisoned"))?
+            .observation_execution;
+        let prefix = match direction {
+            PaneSplitDirection::Vertical => "v",
+            PaneSplitDirection::Horizontal => "h",
+        };
+        let (launch, permit) = oneshot::channel();
+        let pane = self.spawn_pane_runtime_gated(
+            session_id,
+            PaneRuntimeMeta {
+                id: Uuid::new_v4(),
+                name: Some(format!("{prefix}-pane-{}", session.panes.len() + 1)),
+                shell: source.meta.shell.clone(),
+                launch: None,
+                resurrection: PaneResurrectionSnapshot::default(),
+            },
+            (24, 80),
+            false,
+            options,
+            Some(permit),
+        );
+        Ok(PreparedSplit {
+            pane: Some(pane),
+            launch: Some(launch),
+            target,
+            target_execution,
+        })
+    }
+
+    fn commit_split(
+        &mut self,
+        session_id: SessionId,
+        prepared: &mut PreparedSplit,
+        direction: PaneSplitDirection,
+        ratio: f32,
+    ) -> Result<Uuid> {
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("split session disappeared"))?;
+        let source = session
+            .panes
+            .get(&prepared.target)
+            .ok_or_else(|| anyhow::anyhow!("split target disappeared"))?;
+        anyhow::ensure!(
+            source
+                .resurrection_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("split target metadata poisoned"))?
+                .observation_execution
+                == prepared.target_execution,
+            "split target execution changed"
+        );
+        let pane = prepared.pane.as_ref().expect("prepared split owns pane");
+        anyhow::ensure!(
+            matches!(&*pane.startup.borrow(), Some(Ok(()))) && !pane.exited.load(Ordering::SeqCst),
+            "split startup unavailable"
+        );
+        let pane_id = pane.meta.id;
+        let mut layout = session.layout_root.clone();
+        if let Some(layout) = &mut layout {
+            anyhow::ensure!(
+                layout.replace_leaf_with_split(prepared.target, direction, ratio, pane_id),
+                "split target layout changed"
+            );
+        } else {
+            anyhow::bail!("split layout unavailable");
+        }
+        let pane = prepared.pane.take().expect("prepared split owns pane");
+        for client in &session.attached_clients {
+            if let Ok(mut output) = pane.output_buffer.lock() {
+                output.register_client_at_tail(*client);
+            }
+        }
+        session.panes.insert(pane_id, pane);
+        session.layout_root = layout;
+        session.zoomed_pane_id = None;
+        session.focused_pane_id = pane_id;
+        self.register_pane_input(session_id, &self.runtimes[&session_id].panes[&pane_id]);
+        self.runtimes[&session_id].panes[&pane_id]
+            .publication
+            .decide(true);
+        self.apply_stored_attach_viewport(session_id);
+        Ok(pane_id)
+    }
+
+    #[cfg(test)]
     fn split_pane(
         &mut self,
         session_id: SessionId,
@@ -7406,6 +7680,137 @@ struct ServerSessionRuntimeAdapter {
 }
 
 impl ServerSessionRuntimeAdapter {
+    fn split_fresh_shell(
+        &self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        direction: PaneSplitDirection,
+        options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
+        ratio: f32,
+        authorize: impl Fn() -> Result<()>,
+    ) -> Result<Uuid> {
+        let runtime = tokio::runtime::Handle::try_current()?;
+        anyhow::ensure!(
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+            "synchronous split requires the server's multi-thread runtime"
+        );
+        authorize()?;
+        let mut prepared = self
+            .with_lock(|m| m.prepare_split(session_id, target, direction, options))
+            .ok_or_else(Self::lock_poisoned_anyhow)??;
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                let readiness = async {
+                    prepared
+                        .launch
+                        .take()
+                        .expect("split launch")
+                        .send(())
+                        .map_err(|()| anyhow::anyhow!("split startup task ended"))?;
+                    let mut startup = prepared.pane.as_ref().expect("split owner").startup.clone();
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            if let Some(result) = startup.borrow_and_update().clone() {
+                                return result.map_err(anyhow::Error::msg);
+                            }
+                            startup
+                                .changed()
+                                .await
+                                .map_err(|_| anyhow::anyhow!("split startup ended"))?;
+                        }
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("split startup timed out"))??;
+                    authorize()?;
+                    self.with_lock(|m| m.commit_split(session_id, &mut prepared, direction, ratio))
+                        .ok_or_else(Self::lock_poisoned_anyhow)?
+                }
+                .await;
+                if let Err(error) = readiness {
+                    stop_unpublished_pane(prepared.pane.as_mut().expect("rejected split owner"))
+                        .await
+                        .map_err(|cleanup| spawn_failure(
+                            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::CleanupFailed {
+                                reason: format!("{error}; {cleanup}"),
+                            }
+                        ))?;
+                    return Err(error);
+                }
+                readiness
+            })
+        })
+    }
+
+    async fn start_fresh_runtime(&self, session_id: SessionId) -> Result<()> {
+        self.start_fresh_runtime_with_options(session_id, None, || Ok(()))
+            .await
+    }
+
+    async fn start_fresh_runtime_with_options(
+        &self,
+        session_id: SessionId,
+        options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
+        authorize: impl Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.start_fresh_runtime_transaction(session_id, options, authorize, || Ok(()))
+            .await
+    }
+
+    async fn start_fresh_runtime_transaction(
+        &self,
+        session_id: SessionId,
+        options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
+        authorize: impl Fn() -> Result<()>,
+        publish: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        authorize()?;
+        let mut prepared = self
+            .with_lock(|manager| manager.prepare_fresh_runtime(session_id, options))
+            .ok_or_else(Self::lock_poisoned_anyhow)??;
+        // Startup must be driven without holding the manager: readers and
+        // unrelated service requests need to make progress while the PTY starts.
+        let startup = tokio::time::timeout(Duration::from_secs(10), prepared.wait_until_ready())
+            .await
+            .map_err(|_| anyhow::anyhow!("pane startup readiness timed out"))
+            .and_then(std::convert::identity);
+        if let Err(error) = startup {
+            let mut cleanup_errors = Vec::new();
+            for pane in prepared
+                .runtime
+                .as_mut()
+                .expect("startup owner")
+                .panes
+                .values_mut()
+            {
+                if let Err(cleanup) = stop_unpublished_pane(pane).await {
+                    cleanup_errors.push(cleanup.to_string());
+                }
+            }
+            anyhow::bail!("{error}; cleanup errors: {cleanup_errors:?}");
+        }
+        let commit = authorize().and_then(|()| {
+            publish()?;
+            self.with_lock(|manager| manager.commit_fresh_runtime(session_id, &mut prepared))
+                .ok_or_else(Self::lock_poisoned_anyhow)
+                .and_then(std::convert::identity)
+        });
+        if let Err(error) = commit {
+            for pane in prepared
+                .runtime
+                .as_mut()
+                .expect("rejected commit owner")
+                .panes
+                .values_mut()
+            {
+                stop_unpublished_pane(pane)
+                    .await
+                    .map_err(|cleanup| anyhow::anyhow!("{error}; {cleanup}"))?;
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn new(inner: Arc<Mutex<SessionRuntimeManager>>) -> Self {
         let (pane_input_index, client_write_permissions, retained_pin_bytes) =
             inner.lock().map_or_else(
@@ -7564,8 +7969,12 @@ impl ServerSessionRuntimeAdapter {
 
 impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeAdapter {
     fn start_runtime(&self, session_id: SessionId) -> anyhow::Result<()> {
-        self.with_lock(|m| m.start_runtime(session_id))
-            .ok_or_else(Self::lock_poisoned_anyhow)?
+        let runtime = tokio::runtime::Handle::try_current()?;
+        anyhow::ensure!(
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+            "synchronous runtime creation requires the server's multi-thread runtime"
+        );
+        tokio::task::block_in_place(|| runtime.block_on(self.start_fresh_runtime(session_id)))
     }
 
     fn restore_runtime(
@@ -7614,8 +8023,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         target: Option<PaneSelector>,
         direction: PaneSplitDirection,
     ) -> anyhow::Result<Uuid> {
-        self.with_lock(|m| m.split_pane(session_id, target, direction))
-            .ok_or_else(Self::lock_poisoned_anyhow)?
+        self.split_fresh_shell(session_id, target, direction, None, 0.5, || Ok(()))
     }
 
     fn launch_pane(
@@ -9528,6 +9936,126 @@ fn encode_captured_image_window(
 
 #[derive(Clone)]
 struct SpawnRuntimeHandle(Arc<Mutex<SessionRuntimeManager>>);
+
+#[derive(Debug)]
+struct SpawnFailure(bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError);
+
+impl std::fmt::Display for SpawnFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:?}", self.0)
+    }
+}
+
+impl std::error::Error for SpawnFailure {}
+
+pub(crate) fn spawn_failure(
+    error: bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
+) -> anyhow::Error {
+    anyhow::Error::new(SpawnFailure(error))
+}
+
+pub(crate) fn spawn_wire_error(
+    error: anyhow::Error,
+) -> bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError {
+    use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
+    match error.downcast::<SpawnFailure>() {
+        Ok(error) => error.0,
+        Err(error) => SpawnError::LaunchFailed {
+            reason: error.to_string(),
+        },
+    }
+}
+
+pub(crate) fn new_session_v1(
+    request: bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::NewSessionRequest,
+    authorize: impl Fn(Uuid) -> Result<()>,
+) -> Result<Uuid> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
+    let session = bmux_session_models::Session::new(request.name);
+    let id = session.id;
+    authorize(id.0)?;
+    validate_initial_shell_options(Some(&request.options)).map_err(|error| {
+        spawn_failure(SpawnError::InvalidDirectory {
+            path: request.options.cwd.clone().unwrap_or_default(),
+            reason: error.to_string(),
+        })
+    })?;
+    let handle =
+        spawn_runtime_handle().ok_or_else(|| spawn_failure(SpawnError::SourceUnavailable))?;
+    let sessions = bmux_plugin::global_plugin_state_registry()
+        .get::<bmux_session_state::SessionManagerHandle>()
+        .and_then(|entry| entry.read().ok().map(|guard| guard.clone()))
+        .ok_or_else(|| spawn_failure(SpawnError::SourceUnavailable))?;
+    let runtime = tokio::runtime::Handle::try_current()?;
+    anyhow::ensure!(
+        runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+        "new-session requires multi-thread runtime"
+    );
+    let inserted = std::cell::Cell::new(false);
+    let adapter = ServerSessionRuntimeAdapter::new(handle.0);
+    let result = tokio::task::block_in_place(|| {
+        runtime.block_on(adapter.start_fresh_runtime_transaction(
+            id,
+            Some(request.options),
+            || authorize(id.0),
+            || {
+                sessions.0.insert_session(session)?;
+                inserted.set(true);
+                Ok(())
+            },
+        ))
+    });
+    if let Err(error) = result {
+        if inserted.get() {
+            sessions.0.remove_session(id).map_err(|cleanup| {
+                spawn_failure(SpawnError::CleanupFailed {
+                    reason: format!("{error}; session rollback failed: {cleanup}"),
+                })
+            })?;
+        }
+        return Err(error);
+    }
+    Ok(id.0)
+}
+
+pub(crate) fn split_shell_v1(
+    request: bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::SplitShellRequest,
+    authorize: impl Fn() -> Result<()>,
+) -> Result<Uuid> {
+    let direction = match request.direction.as_str() {
+        "horizontal" => PaneSplitDirection::Horizontal,
+        "vertical" => PaneSplitDirection::Vertical,
+        _ => anyhow::bail!("unsupported split direction"),
+    };
+    anyhow::ensure!(
+        (10..=90).contains(&request.ratio_percent),
+        "split ratio must be 10..90"
+    );
+    // Path validation observes execution-host state. Denied callers must not
+    // learn path existence or runtime availability through validation errors.
+    authorize()?;
+    validate_initial_shell_options(Some(&request.options)).map_err(|error| {
+        spawn_failure(
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::InvalidDirectory {
+                path: request.options.cwd.clone().unwrap_or_default(),
+                reason: error.to_string(),
+            },
+        )
+    })?;
+    let handle = spawn_runtime_handle().ok_or_else(|| {
+        spawn_failure(
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::SourceUnavailable,
+        )
+    })?;
+    ServerSessionRuntimeAdapter::new(handle.0).split_fresh_shell(
+        SessionId(request.session_id),
+        Some(PaneSelector::ById(request.target)),
+        direction,
+        Some(request.options),
+        f32::from(request.ratio_percent) / 100.0,
+        authorize,
+    )
+}
 
 fn spawn_runtime_handle() -> Option<SpawnRuntimeHandle> {
     bmux_plugin::global_plugin_state_registry()
@@ -11916,6 +12444,7 @@ mod tests {
             let _ = stop_rx.await;
         });
         PaneRuntimeHandle {
+            publication: Arc::new(StartupPublication::default()),
             startup: watch::channel(Some(Ok(()))).1,
             #[cfg(feature = "image-registry")]
             session_id: SessionId(Uuid::nil()),
@@ -15955,6 +16484,27 @@ mod tests {
     }
 
     #[test]
+    fn bash_prompt_work_does_not_consume_user_command_boundary() {
+        let script = shell_integration_bash_rcfile()
+            .replace("if [[ -f \"${HOME}/.bashrc\" ]]; then", "if false; then");
+        let output = std::process::Command::new("/bin/bash")
+            .args(["--noprofile", "--norc", "-c"])
+            .arg(format!(
+                "PROMPT_COMMAND=:\n{script}\neval \"$PROMPT_COMMAND\"\nprintf actual\n"
+            ))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.matches("633;bmux;start;").count(), 1, "{text:?}");
+        assert!(
+            text.contains("633;bmux;start;cHJpbnRmIGFjdHVhbA==;"),
+            "{text:?}"
+        );
+        assert_eq!(text.matches("633;bmux;prompt;").count(), 1);
+    }
+
+    #[test]
     fn nu_shell_integration_wraps_prompt_command_for_prompt_marker() {
         let config = shell_integration_nu_config();
 
@@ -16220,6 +16770,193 @@ mod tests {
         assert_eq!(observe_process_directory(u32::MAX), None);
     }
 
+    #[test]
+    fn versioned_split_denial_precedes_directory_validation() {
+        use bmux_pane_runtime_plugin_api::{
+            pane_runtime_spawn_commands_v1::client::SplitShellRequest,
+            pane_runtime_spawn_v1::{InitialShellOptions, SpawnError},
+        };
+        let request = SplitShellRequest {
+            session_id: Uuid::new_v4(),
+            target: Uuid::new_v4(),
+            direction: "horizontal".into(),
+            ratio_percent: 50,
+            options: InitialShellOptions {
+                cwd: Some("relative-invalid-path".into()),
+            },
+        };
+        let result = split_shell_v1(request, || {
+            Err(spawn_failure(SpawnError::Denied {
+                reason: "not authorized".into(),
+            }))
+        });
+        assert_eq!(
+            spawn_wire_error(result.unwrap_err()),
+            SpawnError::Denied {
+                reason: "not authorized".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn spawn_errors_preserve_typed_denial_directory_and_cleanup() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
+        for error in [
+            SpawnError::Denied {
+                reason: "policy denied".into(),
+            },
+            SpawnError::InvalidDirectory {
+                path: "/missing".into(),
+                reason: "missing".into(),
+            },
+            SpawnError::CleanupFailed {
+                reason: "task failed".into(),
+            },
+            SpawnError::SourceUnavailable,
+        ] {
+            assert_eq!(spawn_wire_error(spawn_failure(error.clone())), error);
+        }
+        assert!(matches!(
+            spawn_wire_error(anyhow::anyhow!("launch failed")),
+            SpawnError::LaunchFailed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unpublished_cleanup_waits_for_task_and_reports_panics() {
+        let mut pane = dummy_pane(Uuid::new_v4());
+        stop_unpublished_pane(&mut pane).await.unwrap();
+        assert!(pane.task.is_finished());
+        assert!(!pane.publication.wait());
+
+        let mut pane = dummy_pane(Uuid::new_v4());
+        pane.task.abort();
+        pane.task = tokio::spawn(async { panic!("injected cleanup failure") });
+        let error = stop_unpublished_pane(&mut pane).await.unwrap_err();
+        assert!(error.to_string().contains("task cleanup failed"));
+    }
+
+    #[tokio::test]
+    async fn split_commit_rejects_replaced_target_before_publication() {
+        let session_id = SessionId(Uuid::new_v4());
+        let target = Uuid::new_v4();
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[target]));
+        let mut prepared = manager
+            .prepare_split(session_id, None, PaneSplitDirection::Horizontal, None)
+            .unwrap();
+        manager.runtimes[&session_id].panes[&target]
+            .resurrection_state
+            .lock()
+            .unwrap()
+            .observation_execution = Uuid::new_v4();
+        let error = manager
+            .commit_split(
+                session_id,
+                &mut prepared,
+                PaneSplitDirection::Horizontal,
+                0.5,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("execution changed"));
+        let pane = prepared.pane.as_mut().unwrap();
+        stop_unpublished_pane(pane).await.unwrap();
+        assert!(pane.task.is_finished());
+        assert_eq!(manager.runtimes[&session_id].panes.len(), 1);
+        assert_eq!(manager.runtimes[&session_id].focused_pane_id, target);
+        assert!(manager.pane_input_index.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_publication_abandonment_cannot_be_reactivated() {
+        let publication = StartupPublication::default();
+        publication.decide(false);
+        publication.decide(true);
+        assert!(!publication.wait());
+    }
+
+    #[test]
+    fn startup_publication_waits_for_commit() {
+        let publication = Arc::new(StartupPublication::default());
+        let waiter = Arc::clone(&publication);
+        let (result, receive) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || result.send(waiter.wait()).unwrap());
+        assert!(receive.try_recv().is_err());
+        publication.decide(true);
+        assert!(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+        thread.join().unwrap();
+        publication.decide(false);
+        assert!(publication.wait());
+    }
+
+    #[tokio::test]
+    async fn failed_startup_watch_prevents_readiness() {
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        let (ready, receiver) = watch::channel(Some(Err("injected startup failure".into())));
+        runtime.panes.get_mut(&pane_id).unwrap().startup = receiver;
+        let mut prepared = PreparedFreshRuntime {
+            runtime: Some(runtime),
+            launch: None,
+        };
+        let error = prepared.wait_until_ready().await.unwrap_err();
+        assert_eq!(error.to_string(), "injected startup failure");
+        assert!(prepared.runtime.is_some());
+        drop(ready);
+        drop(prepared);
+    }
+
+    #[tokio::test]
+    async fn readiness_wait_retains_ownership_until_commit() {
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        let (ready, receiver) = watch::channel(None);
+        runtime.panes.get_mut(&pane_id).unwrap().startup = receiver;
+        let mut prepared = PreparedFreshRuntime {
+            runtime: Some(runtime),
+            launch: None,
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), prepared.wait_until_ready())
+                .await
+                .is_err()
+        );
+        assert!(prepared.runtime.is_some());
+        ready.send_replace(Some(Ok(())));
+        prepared.wait_until_ready().await.unwrap();
+        assert!(prepared.runtime.is_some());
+        shutdown_runtime_handle(RemovedRuntime {
+            session_id: SessionId(Uuid::new_v4()),
+            handle: prepared.take().unwrap(),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_unready_runtime_without_publication() {
+        let existing = SessionId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut manager = manager_with_runtime(existing, runtime_with_panes(&[pane_id]));
+        let created = SessionId(Uuid::new_v4());
+        let mut prepared = manager.prepare_fresh_runtime(created, None).unwrap();
+        assert!(
+            manager
+                .commit_fresh_runtime(created, &mut prepared)
+                .is_err()
+        );
+        let pane = prepared
+            .runtime
+            .as_mut()
+            .unwrap()
+            .panes
+            .values_mut()
+            .next()
+            .unwrap();
+        stop_unpublished_pane(pane).await.unwrap();
+        assert!(pane.task.is_finished());
+        assert!(!manager.runtimes.contains_key(&created));
+        assert!(manager.pane_input_index.read().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn prepared_runtime_rejects_lost_launch_receiver() {
         let pane_id = Uuid::new_v4();
@@ -16436,6 +17173,161 @@ mod tests {
             split_result.unwrap(),
             split_directory.path().canonicalize().unwrap()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fresh_split_workflow_checks_authority_again_and_starts_in_requested_directory() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{
+            InitialShellOptions, SpawnError,
+        };
+        let session = SessionId(Uuid::new_v4());
+        let target = Uuid::new_v4();
+        let manager = manager_with_runtime(session, runtime_with_panes(&[target]));
+        let adapter = ServerSessionRuntimeAdapter::new(Arc::new(Mutex::new(manager)));
+        let directory = tempfile::tempdir().unwrap();
+        let checks = AtomicUsize::new(0);
+        let denied = adapter.split_fresh_shell(
+            session,
+            Some(PaneSelector::ById(target)),
+            PaneSplitDirection::Horizontal,
+            Some(InitialShellOptions {
+                cwd: Some(directory.path().to_string_lossy().into_owned()),
+            }),
+            0.4,
+            || {
+                if checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err(spawn_failure(SpawnError::Denied {
+                        reason: "revoked during startup".into(),
+                    }))
+                }
+            },
+        );
+        assert!(matches!(
+            spawn_wire_error(denied.unwrap_err()),
+            SpawnError::Denied { .. }
+        ));
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            adapter.inner.lock().unwrap().runtimes[&session].panes.len(),
+            1
+        );
+        assert!(adapter.pane_input_index.read().unwrap().is_empty());
+
+        let pane_id = adapter
+            .split_fresh_shell(
+                session,
+                Some(PaneSelector::ById(target)),
+                PaneSplitDirection::Horizontal,
+                Some(InitialShellOptions {
+                    cwd: Some(directory.path().to_string_lossy().into_owned()),
+                }),
+                0.4,
+                || Ok(()),
+            )
+            .unwrap();
+        let runtime = adapter
+            .inner
+            .lock()
+            .unwrap()
+            .runtimes
+            .remove(&session)
+            .unwrap();
+        let mut panes = runtime.panes;
+        let pane = panes.remove(&pane_id).unwrap();
+        let reported = reported_shell_directory(&pane, directory.path()).await;
+        shutdown_pane_handle(pane).await;
+        for pane in panes.into_values() {
+            shutdown_pane_handle(pane).await;
+        }
+        assert_eq!(reported.unwrap(), directory.path().canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_session_roster_failure_never_publishes_runtime() {
+        let existing = SessionId(Uuid::new_v4());
+        let target = Uuid::new_v4();
+        let manager = manager_with_runtime(existing, runtime_with_panes(&[target]));
+        let adapter = ServerSessionRuntimeAdapter::new(Arc::new(Mutex::new(manager)));
+        let created = SessionId(Uuid::new_v4());
+        let checks = AtomicUsize::new(0);
+        let published = AtomicBool::new(false);
+        let result = adapter
+            .start_fresh_runtime_transaction(
+                created,
+                None,
+                || {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                || {
+                    assert_eq!(checks.load(Ordering::SeqCst), 2);
+                    assert!(
+                        !adapter
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .runtimes
+                            .contains_key(&created)
+                    );
+                    assert!(adapter.pane_input_index.read().unwrap().is_empty());
+                    published.store(true, Ordering::SeqCst);
+                    anyhow::bail!("injected roster persistence failure")
+                },
+            )
+            .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("roster persistence failure")
+        );
+        assert!(published.load(Ordering::SeqCst));
+        let manager = adapter.inner.lock().unwrap();
+        assert!(!manager.runtimes.contains_key(&created));
+        assert_eq!(manager.runtimes.len(), 1);
+        assert!(manager.pane_input_index.read().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_session_options_reach_shell_and_recheck_authority() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions;
+        let existing = SessionId(Uuid::new_v4());
+        let target = Uuid::new_v4();
+        let manager = manager_with_runtime(existing, runtime_with_panes(&[target]));
+        let adapter = ServerSessionRuntimeAdapter::new(Arc::new(Mutex::new(manager)));
+        let session = SessionId(Uuid::new_v4());
+        let directory = tempfile::tempdir().unwrap();
+        let checks = AtomicUsize::new(0);
+        adapter
+            .start_fresh_runtime_with_options(
+                session,
+                Some(InitialShellOptions {
+                    cwd: Some(directory.path().to_string_lossy().into_owned()),
+                }),
+                || {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        let runtime = adapter
+            .inner
+            .lock()
+            .unwrap()
+            .runtimes
+            .remove(&session)
+            .unwrap();
+        let pane = runtime.panes.into_values().next().unwrap();
+        let reported = reported_shell_directory(&pane, directory.path()).await;
+        shutdown_pane_handle(pane).await;
+        assert_eq!(reported.unwrap(), directory.path().canonicalize().unwrap());
     }
 
     #[cfg(unix)]

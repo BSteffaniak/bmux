@@ -32,6 +32,22 @@ mod spawn;
 )]
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
+        "pane-runtime-spawn-commands-v1", "new-session" => |req: bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::NewSessionRequest, ctx| {
+            let result = crate::runtime::new_session_v1(req, |session_id| {
+                spawn::authorize_session(ctx, session_id, "session.create").map_err(crate::runtime::spawn_failure)
+            }).map(|session_id| bmux_pane_runtime_plugin_api::pane_runtime_commands::SessionAck { session_id })
+              .map_err(crate::runtime::spawn_wire_error);
+            Ok::<_, ServiceResponse>(result)
+        },
+        "pane-runtime-spawn-commands-v1", "split-shell" => |req: bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::SplitShellRequest, ctx| {
+            let session_id = req.session_id;
+            let result = crate::runtime::split_shell_v1(req, || {
+                spawn::authorize_session(ctx, session_id, "pane.split")
+                    .map_err(crate::runtime::spawn_failure)
+            }).map(|pane_id| bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneAck { session_id, pane_id })
+              .map_err(crate::runtime::spawn_wire_error);
+            Ok::<_, ServiceResponse>(result)
+        },
         "pane-runtime-spawn-v1", "capture-source" => |req: bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::client::CaptureSourceRequest, ctx| {
             Ok::<_, ServiceResponse>(spawn::authorize_read(ctx, req.session_id).and_then(|()| crate::runtime::capture_spawn_source(req.session_id, req.pane_id)))
         },

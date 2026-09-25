@@ -2,7 +2,11 @@ execution_class = "native_fast"
 id = "bmux.sessions"
 name = "bmux Sessions"
 owns_namespaces = ["new-session"]
-provided_capabilities = ["bmux.sessions.read", "bmux.sessions.write"]
+provided_capabilities = [
+    "bmux.sessions.read",
+    "bmux.sessions.write",
+    "bmux.sessions.spawn.v1",
+]
 provided_features = ["bmux.sessions"]
 required_capabilities = [
     "bmux.attach_runtime.write",
@@ -26,6 +30,11 @@ kind         = "command"
 capability   = "bmux.sessions.read"
 interface_id = "sessions-events"
 kind         = "event"
+
+[[services]]
+capability   = "bmux.sessions.spawn.v1"
+interface_id = "sessions-spawn-v1"
+kind         = "command"
 
 [[event_publications]]
 delivery                     = "broadcast"

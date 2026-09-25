@@ -2361,6 +2361,7 @@ dependencies = [
  "bmux_clients_plugin_api",
  "bmux_context_state",
  "bmux_contexts_plugin_api",
+ "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",

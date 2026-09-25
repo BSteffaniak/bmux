@@ -11,6 +11,18 @@ plugin bmux.sessions version 1;
 
 capability SESSIONS_READ = bmux.sessions.read;
 capability SESSIONS_WRITE = bmux.sessions.write;
+capability SESSIONS_SPAWN_V1 = bmux.sessions.spawn.v1;
+
+@capability(SESSIONS_SPAWN_V1)
+interface sessions-spawn-v1 {
+    record initial-shell-options {
+        cwd: string?,
+    }
+
+    // Explicit fresh-shell options; legacy new-session retains its meaning.
+    command new-session(name: string?, options: initial-shell-options)
+        -> result<sessions-commands.session-ack, sessions-commands.new-session-error>;
+}
 
 @capability(SESSIONS_READ)
 interface sessions-state {

@@ -381,6 +381,9 @@ impl RustPlugin for SessionsPlugin {
                 get_session_local(&req.selector)
                     .map_err(|e| ServiceResponse::error("get_failed", e))
             },
+            "sessions-spawn-v1", "new-session" => |req: bmux_sessions_plugin_api::sessions_spawn_v1::client::NewSessionRequest, ctx| {
+                Ok::<_, ServiceResponse>(new_session_with_options(ctx, req.name, req.options))
+            },
             "sessions-commands", "new-session" => |req: NewSessionArgs, ctx| {
                 Ok::<Result<SessionAck, NewSessionError>, ServiceResponse>(
                     new_session_via_ipc(ctx, req.name)
@@ -421,8 +424,12 @@ impl RustPlugin for SessionsPlugin {
         let _ = sessions_state::register_provider(registry, state);
 
         let commands: Arc<dyn SessionsCommandsService + Send + Sync> =
-            Arc::new(SessionsCommandsHandle::new(caller));
+            Arc::new(SessionsCommandsHandle::new(Arc::clone(&caller)));
         let _ = sessions_commands::register_provider(registry, commands);
+        let spawn: Arc<
+            dyn bmux_sessions_plugin_api::sessions_spawn_v1::SessionsSpawnV1Service + Send + Sync,
+        > = Arc::new(SessionsCommandsHandle::new(caller));
+        let _ = bmux_sessions_plugin_api::sessions_spawn_v1::register_provider(registry, spawn);
     }
 }
 
@@ -588,6 +595,35 @@ fn record_selected_context_outcome(context_id: ::uuid::Uuid) {
         COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY,
         serde_json::json!(context_id),
     );
+}
+
+fn new_session_with_options(
+    caller: &(impl ServiceCaller + Sync),
+    name: Option<String>,
+    options: bmux_sessions_plugin_api::sessions_spawn_v1::InitialShellOptions,
+) -> Result<SessionAck, NewSessionError> {
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(
+        bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::new_session(
+            &mut client,
+            name.clone(),
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions {
+                cwd: options.cwd,
+            },
+        ),
+    )
+    .map_err(|error| NewSessionError::Failed {
+        reason: error.to_string(),
+    })?
+    .map_err(|error| NewSessionError::Failed {
+        reason: format!("{error:?}"),
+    })?;
+    let session_id = result.session_id;
+    let _ = global_event_bus().emit(
+        &sessions_events::EVENT_KIND,
+        SessionEvent::Created { session_id, name },
+    );
+    Ok(SessionAck { id: session_id })
 }
 
 fn new_session_via_ipc(
@@ -888,6 +924,18 @@ impl SessionsCommandsHandle {
     }
 }
 
+impl bmux_sessions_plugin_api::sessions_spawn_v1::SessionsSpawnV1Service
+    for SessionsCommandsHandle
+{
+    fn new_session<'a>(
+        &'a self,
+        name: Option<String>,
+        options: bmux_sessions_plugin_api::sessions_spawn_v1::InitialShellOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionAck, NewSessionError>> + Send + 'a>> {
+        Box::pin(async move { new_session_with_options(self.caller.as_ref(), name, options) })
+    }
+}
+
 impl SessionsCommandsService for SessionsCommandsHandle {
     fn new_session<'a>(
         &'a self,
@@ -999,6 +1047,53 @@ mod tests {
             error,
             SelectSessionError::Denied { reason } if reason.contains("blocked")
         ));
+    }
+
+    #[test]
+    fn fresh_session_forwards_generated_options_without_legacy_fallback() {
+        struct UnavailableSpawn;
+        impl ServiceCaller for UnavailableSpawn {
+            fn call_service_raw(
+                &self,
+                capability: &str,
+                _kind: bmux_plugin_sdk::ServiceKind,
+                interface: &str,
+                operation: &str,
+                payload: Vec<u8>,
+            ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+                assert_eq!(capability, "bmux.pane_runtime.spawn.v1");
+                assert_eq!(interface, "pane-runtime-spawn-commands-v1");
+                assert_eq!(operation, "new-session");
+                let request: bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::NewSessionRequest =
+                    bmux_plugin_sdk::decode_service_message(&payload)?;
+                assert_eq!(request.name.as_deref(), Some("fresh"));
+                assert_eq!(
+                    request.options.cwd.as_deref(),
+                    Some("/execution-host/project")
+                );
+                Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                    details: "spawn capability unavailable".into(),
+                })
+            }
+
+            fn execute_kernel_request(
+                &self,
+                _request: bmux_ipc::Request,
+            ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+                panic!("fresh creation must not bypass generated service transport")
+            }
+        }
+        let error = new_session_with_options(
+            &UnavailableSpawn,
+            Some("fresh".into()),
+            bmux_sessions_plugin_api::sessions_spawn_v1::InitialShellOptions {
+                cwd: Some("/execution-host/project".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, NewSessionError::Failed { reason } if reason.contains("spawn capability unavailable"))
+        );
     }
 
     #[test]

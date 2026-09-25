@@ -258,60 +258,22 @@ fn failed_session(reason: impl Into<String>) -> SessionRuntimeCommandError {
     }
 }
 
-/// Wire shape matching server's `SessionPolicyCheckRequest`.
-/// Perform the `bmux.sessions.policy / session-policy-state / check`
-/// policy query for a mutating pane/session operation. Returns `Ok(())`
-/// when the policy allows the operation (or no policy provider is
-/// registered), or a `PaneCommandError::Denied` when the policy
-/// responds with `allowed = false`.
+/// Enforce the operation-specific policy at the execution owner. Only an
+/// absent permissions plugin enables the local single-user fallback.
 fn ensure_session_mutation_allowed(
     ctx: &bmux_plugin_sdk::NativeServiceContext,
     session_id: SessionId,
     action: &str,
 ) -> Result<(), PaneCommandError> {
-    let client_id = ctx
-        .caller_client_id
-        .ok_or_else(|| failed_command("policy check requires a caller client id"))?;
-    let principal_id = bmux_plugin::global_plugin_state_registry()
-        .get::<bmux_client_state::ClientPrincipalHandle>()
-        .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
-        .and_then(|handle| handle.0.get(bmux_session_models::ClientId(client_id)))
-        .unwrap_or_else(Uuid::nil);
-
-    // The policy service may not be registered in tests or headless
-    // tooling. Treat a missing provider as "allowed" (matches server's
-    // legacy behavior where `check_session_policy` returns `None` when
-    // no resolver is installed).
-    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(ctx);
-    match bmux_plugin::block_on_typed_dispatch(
-        bmux_permissions_plugin_api::session_policy_state::client::check(
-            &mut client,
-            session_id.0,
-            None,
-            client_id,
-            principal_id,
-            action.to_string(),
-            None,
-            None,
-            None,
-        ),
-    ) {
-        Ok(response) => {
-            if response.allowed {
-                Ok(())
-            } else {
-                Err(PaneCommandError::Denied {
-                    reason: response
-                        .reason
-                        .unwrap_or_else(|| "session policy denied for this operation".to_string()),
-                })
+    super::spawn::authorize_session(ctx, session_id.0, action).map_err(|error| {
+        let reason = match error {
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::Denied { reason } => {
+                reason
             }
-        }
-        Err(err) if err.to_string().contains("unsupported") => Ok(()),
-        Err(err) => Err(failed_command(format!(
-            "session policy check failed: {err}"
-        ))),
-    }
+            other => format!("session policy check failed: {other:?}"),
+        };
+        PaneCommandError::Denied { reason }
+    })
 }
 
 fn parse_split_direction(raw: &str) -> Result<PaneSplitDirection, PaneCommandError> {
