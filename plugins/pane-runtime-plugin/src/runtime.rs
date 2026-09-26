@@ -579,39 +579,68 @@ impl Drop for StartupChild {
                 &self.runtime,
                 child,
                 "startup child owner dropped".into(),
+                None,
             ));
         }
     }
 }
 
+#[cfg(test)]
 fn cleanup_failed_startup_child(
     child: Box<dyn portable_pty::Child + Send + Sync>,
     failure: String,
 ) -> impl std::future::Future<Output = String> {
-    cleanup_failed_startup_child_on(&tokio::runtime::Handle::current(), child, failure)
+    let cleanup =
+        cleanup_failed_startup_child_on(&tokio::runtime::Handle::current(), child, failure, None);
+    async move { cleanup.await.0 }
+}
+
+fn cleanup_failed_startup_child_acknowledged(
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    failure: String,
+    acknowledgement: &watch::Sender<Option<std::result::Result<(), String>>>,
+) -> impl std::future::Future<Output = String> + use<> {
+    let cleanup = cleanup_failed_startup_child_on(
+        &tokio::runtime::Handle::current(),
+        child,
+        failure,
+        Some(acknowledgement.clone()),
+    );
+    async move { cleanup.await.0 }
 }
 
 fn cleanup_failed_startup_child_on(
     runtime: &tokio::runtime::Handle,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     failure: String,
-) -> impl std::future::Future<Output = String> + use<> {
+    acknowledgement: Option<watch::Sender<Option<std::result::Result<(), String>>>>,
+) -> impl std::future::Future<Output = (String, Result<(), String>)> + use<> {
     // Transfer ownership before returning the waiter. Dropping the caller's
     // future must not drop the only reaper for this newly spawned process.
     let fallback = failure.clone();
     let cleanup = runtime.spawn(async move {
-        match reap_failed_startup_child(child.as_mut()).await {
-            Ok(()) => failure,
+        let result = reap_failed_startup_child(child.as_mut()).await;
+        if let Some(acknowledgement) = acknowledgement {
+            acknowledgement.send_replace(Some(result.clone()));
+        }
+        match result {
+            Ok(()) => (failure, Ok(())),
             Err(error) => {
                 warn!(%error, "failed startup child cleanup requires recovery");
-                format!("{failure}; child cleanup failed: {error}")
+                (
+                    format!("{failure}; child cleanup failed: {error}"),
+                    Err(error),
+                )
             }
         }
     });
     async move {
         match cleanup.await {
             Ok(reason) => reason,
-            Err(error) => format!("{fallback}; child cleanup task failed: {error}"),
+            Err(error) => (
+                format!("{fallback}; child cleanup task failed: {error}"),
+                Err(error.to_string()),
+            ),
         }
     }
 }
@@ -5554,9 +5583,10 @@ impl SessionRuntimeManager {
                     .ok_or_else(|| "spawned process has no PID".to_owned())
                     .and_then(|pid| resume.bind(pid));
                 if let Err(error) = result {
-                    let reason = cleanup_failed_startup_child(
+                    let reason = cleanup_failed_startup_child_acknowledged(
                         child.take(),
                         format!("application resurrection bind failed: {error}"),
+                        &cleanup_tx,
                     )
                     .await;
                     resume.close();
@@ -5575,9 +5605,12 @@ impl SessionRuntimeManager {
             )
             .await;
             let Ok(start_identity) = start_identity else {
-                let reason =
-                    cleanup_failed_startup_child(child.take(), "pane startup cancelled".into())
-                        .await;
+                let reason = cleanup_failed_startup_child_acknowledged(
+                    child.take(),
+                    "pane startup cancelled".into(),
+                    &cleanup_tx,
+                )
+                .await;
                 if let Some(resume) = &application_resume {
                     resume.close();
                 }
@@ -5603,9 +5636,10 @@ impl SessionRuntimeManager {
             let mut reader = match master.try_clone_reader() {
                 Ok(reader) => reader,
                 Err(error) => {
-                    let reason = cleanup_failed_startup_child(
+                    let reason = cleanup_failed_startup_child_acknowledged(
                         child.take(),
                         format!("failed to open PTY reader: {error}"),
+                        &cleanup_tx,
                     )
                     .await;
                     fail_startup!(reason);
@@ -5615,9 +5649,10 @@ impl SessionRuntimeManager {
             let writer = match master.take_writer() {
                 Ok(writer) => writer,
                 Err(error) => {
-                    let reason = cleanup_failed_startup_child(
+                    let reason = cleanup_failed_startup_child_acknowledged(
                         child.take(),
                         format!("failed to open PTY writer: {error}"),
+                        &cleanup_tx,
                     )
                     .await;
                     fail_startup!(reason);
@@ -6130,6 +6165,10 @@ impl SessionRuntimeManager {
             .panes
             .get(&prepared.target)
             .ok_or_else(|| anyhow::anyhow!("split target disappeared"))?;
+        anyhow::ensure!(
+            !source.exited.load(Ordering::SeqCst),
+            "split target execution exited"
+        );
         anyhow::ensure!(
             source
                 .resurrection_state
@@ -7806,7 +7845,7 @@ impl ServerSessionRuntimeAdapter {
                     cleanup_errors.push(cleanup.to_string());
                 }
             }
-            anyhow::bail!("{error}; cleanup errors: {cleanup_errors:?}");
+            return Err(spawn_error_after_cleanup(error, cleanup_errors));
         }
         let commit = authorize().and_then(|()| {
             publish()?;
@@ -7815,6 +7854,7 @@ impl ServerSessionRuntimeAdapter {
                 .and_then(std::convert::identity)
         });
         if let Err(error) = commit {
+            let mut cleanup_errors = Vec::new();
             for pane in prepared
                 .runtime
                 .as_mut()
@@ -7822,11 +7862,11 @@ impl ServerSessionRuntimeAdapter {
                 .panes
                 .values_mut()
             {
-                stop_unpublished_pane(pane)
-                    .await
-                    .map_err(|cleanup| anyhow::anyhow!("{error}; {cleanup}"))?;
+                if let Err(cleanup) = stop_unpublished_pane(pane).await {
+                    cleanup_errors.push(cleanup.to_string());
+                }
             }
-            return Err(error);
+            return Err(spawn_error_after_cleanup(error, cleanup_errors));
         }
         Ok(())
     }
@@ -9968,6 +10008,27 @@ impl std::fmt::Display for SpawnFailure {
 
 impl std::error::Error for SpawnFailure {}
 
+fn spawn_error_after_cleanup(error: anyhow::Error, cleanup_errors: Vec<String>) -> anyhow::Error {
+    if cleanup_errors.is_empty() {
+        error
+    } else {
+        let cleanup = cleanup_errors
+            .into_iter()
+            .fold(String::new(), |mut message, failure| {
+                if !message.is_empty() {
+                    message.push_str("; ");
+                }
+                message.push_str(&failure);
+                message
+            });
+        spawn_failure(
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::CleanupFailed {
+                reason: format!("{error}; cleanup errors: {cleanup}"),
+            },
+        )
+    }
+}
+
 pub(crate) fn spawn_failure(
     error: bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
 ) -> anyhow::Error {
@@ -10845,6 +10906,22 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spawn_cleanup_preserves_typed_denial_and_reports_cleanup_failure() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
+        let denied = || {
+            super::spawn_failure(SpawnError::Denied {
+                reason: "revoked".into(),
+            })
+        };
+        assert!(
+            matches!(super::spawn_wire_error(super::spawn_error_after_cleanup(denied(), Vec::new())), SpawnError::Denied { reason } if reason == "revoked")
+        );
+        assert!(
+            matches!(super::spawn_wire_error(super::spawn_error_after_cleanup(denied(), vec!["reader still live".into()])), SpawnError::CleanupFailed { reason } if reason.contains("revoked") && reason.contains("reader still live"))
+        );
+    }
+
     #[tokio::test]
     async fn supervision_join_reports_live_thread_deadline_without_blocking_executor() {
         let (release, blocked) = std::sync::mpsc::channel();
@@ -12768,10 +12845,17 @@ mod tests {
         let child = pair.slave.spawn_command(command).unwrap();
         let pid = child.process_id().unwrap();
         let identity = process_start_identity_for_pid(pid).unwrap();
-        drop(cleanup_failed_startup_child(
+        let (acknowledgement, mut cleanup) = watch::channel(None);
+        drop(cleanup_failed_startup_child_acknowledged(
             child,
             "cancelled request".into(),
+            &acknowledgement,
         ));
+        tokio::time::timeout(Duration::from_secs(3), cleanup.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*cleanup.borrow(), Some(Ok(())));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while process_start_identity_for_pid(pid) == Some(identity) {
             assert!(
@@ -16915,6 +16999,34 @@ mod tests {
         let pane = prepared.pane.as_mut().unwrap();
         stop_unpublished_pane(pane).await.unwrap();
         assert!(pane.task.is_finished());
+        assert_eq!(manager.runtimes[&session_id].panes.len(), 1);
+        assert_eq!(manager.runtimes[&session_id].focused_pane_id, target);
+        assert!(manager.pane_input_index.read().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn split_commit_rejects_exited_target_without_publishing_new_pane() {
+        let session_id = SessionId(Uuid::new_v4());
+        let target = Uuid::new_v4();
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[target]));
+        let mut prepared = manager
+            .prepare_split(session_id, None, PaneSplitDirection::Horizontal, None)
+            .unwrap();
+        manager.runtimes[&session_id].panes[&target]
+            .exited
+            .store(true, Ordering::SeqCst);
+        let error = manager
+            .commit_split(
+                session_id,
+                &mut prepared,
+                PaneSplitDirection::Horizontal,
+                0.5,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("execution exited"));
+        stop_unpublished_pane(prepared.pane.as_mut().unwrap())
+            .await
+            .unwrap();
         assert_eq!(manager.runtimes[&session_id].panes.len(), 1);
         assert_eq!(manager.runtimes[&session_id].focused_pane_id, target);
         assert!(manager.pane_input_index.read().unwrap().is_empty());

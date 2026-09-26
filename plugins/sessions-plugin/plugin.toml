@@ -1,6 +1,7 @@
 execution_class = "native_fast"
 id = "bmux.sessions"
 name = "bmux Sessions"
+optional_capabilities = ["bmux.pane_runtime.spawn.v1"]
 owns_namespaces = ["new-session"]
 provided_capabilities = [
     "bmux.sessions.read",

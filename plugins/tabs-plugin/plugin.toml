@@ -1,6 +1,7 @@
 execution_class = "native_fast"
 id = "bmux.tabs"
 name = "bmux Tabs"
+optional_capabilities = ["bmux.pane_runtime.spawn.v1"]
 owns_namespaces = [
     "tab",
     "new-tab",

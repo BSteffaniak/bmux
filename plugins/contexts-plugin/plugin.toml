@@ -1,6 +1,7 @@
 execution_class       = "native_fast"
 id                    = "bmux.contexts"
 name                  = "bmux Contexts"
+optional_capabilities = ["bmux.sessions.spawn.v1"]
 owns_namespaces       = []
 provided_capabilities = ["bmux.contexts.read", "bmux.contexts.write"]
 provided_features     = ["bmux.contexts"]

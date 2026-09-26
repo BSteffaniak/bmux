@@ -39,6 +39,19 @@ pub fn authorize_read(ctx: &NativeServiceContext, session_id: Uuid) -> Result<()
     authorize_session(ctx, session_id, "read")
 }
 
+pub(super) fn authorize_creation(
+    ctx: &NativeServiceContext,
+    session_id: Uuid,
+    action: &str,
+) -> Result<(), SpawnError> {
+    if ctx.cancellation.is_cancelled() {
+        return Err(SpawnError::LaunchFailed {
+            reason: "creation request cancelled".into(),
+        });
+    }
+    authorize_session(ctx, session_id, action)
+}
+
 pub(super) fn authorize_session(
     ctx: &NativeServiceContext,
     session_id: Uuid,

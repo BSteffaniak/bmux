@@ -2133,9 +2133,11 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             let direction = parse_pane_direction_arg(&direction)?;
             let session = option_value(&context.arguments, "session")
                 .map(|value| {
-                    Uuid::parse_str(&value)
-                        .map(selector_by_id)
-                        .map_err(|error| format!("invalid session UUID: {error}"))
+                    parse_selector(&value).map(|selector| Selector {
+                        id: selector.id,
+                        name: selector.name,
+                        index: None,
+                    })
                 })
                 .transpose()?;
             let target = option_value(&context.arguments, "pane-id")
@@ -6410,6 +6412,32 @@ mod tests {
         let ack = result.expect("new-tab should succeed");
         assert!(ack.ok);
         assert!(ack.id.is_some());
+    }
+
+    #[test]
+    fn invoke_service_new_tab_directory_requires_spawn_service_without_legacy_fallback() {
+        let _router = install_context_test_router(false, false);
+        let plugin = TabsPlugin::default();
+        let mut context = service_test_context(
+            "tabs-commands",
+            "new-tab",
+            encode_service_message(&NewTabArgs {
+                name: Some("directory-aware".into()),
+            })
+            .unwrap(),
+            "bmux.tabs.write",
+            ServiceKind::Command,
+        );
+        context.settings = Some(
+            toml::from_str("[cwd.new_tab]\nsource = 'path'\npath = '/execution/project'\n")
+                .unwrap(),
+        );
+        let response = plugin.invoke_service(context);
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result: Result<TabAck, TabError> = decode_service_message(&response.payload).unwrap();
+        assert!(
+            matches!(result, Err(TabError::Failed { reason }) if reason.contains("contexts-spawn-v1"))
+        );
     }
 
     #[test]
