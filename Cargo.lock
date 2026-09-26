@@ -1842,6 +1842,7 @@ dependencies = [
  "bmux_codec",
  "bmux_performance_state",
  "bmux_recording_protocol",
+ "libc",
  "lz4_flex",
  "serde",
  "serde_json",

@@ -2981,7 +2981,7 @@ mod tests {
         assert!(tx.is_closed());
         assert_eq!(pool.available_permits(), 1);
         drop((reader, peer, listener));
-        std::fs::remove_file(path).unwrap();
+        assert!(!path.exists(), "listener removes its endpoint");
     }
 
     #[tokio::test]

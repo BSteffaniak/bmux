@@ -21,6 +21,9 @@ tokio                      = { workspace = true, features = ["io-util", "macros"
 uuid                       = { workspace = true, features = ["serde", "std", "v4"] }
 zstd                       = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [features]
 # Default features
 default = []

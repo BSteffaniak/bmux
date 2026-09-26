@@ -22,6 +22,30 @@ use tokio::net::windows::named_pipe::{
 #[derive(Debug)]
 pub struct LocalIpcListener {
     inner: ListenerInner,
+    #[cfg(unix)]
+    owner_pid: u32,
+    #[cfg(unix)]
+    endpoint_identity: (std::path::PathBuf, u64, u64),
+}
+
+impl Drop for LocalIpcListener {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.owner_pid == std::process::id() {
+            use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+            let (path, device, inode) = &self.endpoint_identity;
+            if let Ok(metadata) = std::fs::symlink_metadata(path)
+                && metadata.file_type().is_socket()
+                && metadata.dev() == *device
+                && metadata.ino() == *inode
+            {
+                // Do not remove a replacement endpoint or follow a symlink.
+                // Removing our name stops new connections even if a forked
+                // child temporarily retains the listening descriptor.
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -92,10 +116,15 @@ impl LocalIpcListener {
         #[cfg(unix)]
         {
             if let IpcEndpoint::UnixSocket(path) = endpoint {
+                use std::os::unix::fs::MetadataExt as _;
                 prepare_unix_socket_path(path)?;
                 let listener = tokio::net::UnixListener::bind(path)?;
+                let path = std::path::absolute(path)?;
+                let metadata = std::fs::symlink_metadata(&path)?;
                 return Ok(Self {
                     inner: ListenerInner::Unix(listener),
+                    owner_pid: std::process::id(),
+                    endpoint_identity: (path, metadata.dev(), metadata.ino()),
                 });
             }
         }
@@ -751,6 +780,39 @@ mod tests {
     use super::{IpcTransportError, LocalIpcListener, LocalIpcStream};
     use crate::{Envelope, EnvelopeKind, IpcEndpoint, Request, decode, encode};
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_listener_stops_connections_with_duplicate_descriptor() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+        let socket_path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let endpoint = IpcEndpoint::unix_socket(&socket_path);
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        let super::ListenerInner::Unix(socket) = &listener.inner;
+        // SAFETY: dup creates a separately owned descriptor for this live socket.
+        let duplicate = unsafe { libc::dup(socket.as_raw_fd()) };
+        assert!(duplicate >= 0);
+        let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+        drop(listener);
+        let connected = LocalIpcStream::connect(&endpoint).await.is_ok();
+        drop(duplicate);
+        assert!(!socket_path.exists());
+        assert!(!connected, "dropped listener still accepts connections");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn old_listener_drop_preserves_replacement_endpoint() {
+        let path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
+        let endpoint = IpcEndpoint::unix_socket(&path);
+        let old = LocalIpcListener::bind(&endpoint).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let replacement = LocalIpcListener::bind(&endpoint).unwrap();
+        drop(old);
+        assert!(LocalIpcStream::connect(&endpoint).await.is_ok());
+        drop(replacement);
+        assert!(!path.exists());
+    }
 
     #[cfg(unix)]
     #[tokio::test]
