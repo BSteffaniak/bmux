@@ -502,7 +502,7 @@ fn new_workspace_for_client(
     client_id: Uuid,
 ) -> Result<WorkspaceAck, WorkspaceCommandError> {
     let state = state().map_err(|reason| WorkspaceCommandError::Failed { reason })?;
-    let (record, records) = {
+    let record = {
         let mut guard = state.write().map_err(|_| WorkspaceCommandError::Failed {
             reason: "workspace state lock poisoned".to_string(),
         })?;
@@ -511,10 +511,10 @@ fn new_workspace_for_client(
             id: Uuid::new_v4(),
             name,
         };
-        guard.records.push(record.clone());
-        (record, guard.records.clone())
+        persist_new_workspace(caller, &mut guard, record.clone())?;
+        drop(guard);
+        record
     };
-    save_catalog(caller, &records)?;
     let _ = global_event_bus().emit(
         &workspaces_events::EVENT_KIND,
         WorkspaceEvent::Created {
@@ -940,6 +940,18 @@ fn load_catalog(caller: &impl HostRuntimeApi) -> Result<Vec<WorkspaceRecord>, St
     )
 }
 
+fn persist_new_workspace(
+    caller: &impl HostRuntimeApi,
+    state: &mut WorkspaceState,
+    record: WorkspaceRecord,
+) -> Result<(), WorkspaceCommandError> {
+    let mut proposed = state.records.clone();
+    proposed.push(record);
+    save_catalog(caller, &proposed)?;
+    state.records = proposed;
+    Ok(())
+}
+
 fn save_catalog(
     caller: &impl HostRuntimeApi,
     records: &[WorkspaceRecord],
@@ -1242,6 +1254,45 @@ bmux_plugin_sdk::export_plugin!(WorkspacesPlugin, include_str!("../plugin.toml")
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn catalog_write_failure_does_not_publish_new_workspace() {
+        struct FailingStorage;
+        impl bmux_plugin::ServiceCaller for FailingStorage {
+            fn execute_kernel_request(
+                &self,
+                _request: bmux_ipc::Request,
+            ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+                panic!("catalog persistence must not invoke kernel execution")
+            }
+
+            fn call_service_raw(
+                &self,
+                _capability: &str,
+                _kind: bmux_plugin_sdk::ServiceKind,
+                _interface: &str,
+                _operation: &str,
+                _payload: Vec<u8>,
+            ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+                Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                    details: "injected storage failure".into(),
+                })
+            }
+        }
+        let mut state = super::WorkspaceState::default();
+        state.ensure_default();
+        let result = super::persist_new_workspace(
+            &FailingStorage,
+            &mut state,
+            super::WorkspaceRecord {
+                id: uuid::Uuid::new_v4(),
+                name: "new".into(),
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(state.records.len(), 1);
+        assert!(state.records[0].id.is_nil());
+        assert!(state.active_by_client.is_empty());
+    }
     #[test]
     fn manifest_declares_tab_placement_capability() {
         use bmux_plugin_sdk::TypedServiceEndpoint;

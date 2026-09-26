@@ -29,6 +29,8 @@ use crate::loader::{call_service_raw, execute_kernel_request};
 #[derive(Debug, Clone)]
 pub struct TypedServiceCaller {
     plugin_id: String,
+    caller_client_id: Option<uuid::Uuid>,
+    cancellation: Option<bmux_plugin_sdk::CancellationToken>,
     required_capabilities: Vec<String>,
     provided_capabilities: Vec<String>,
     services: Vec<RegisteredService>,
@@ -48,6 +50,8 @@ impl TypedServiceCaller {
     pub fn from_registration_context(context: &TypedServiceRegistrationContext<'_>) -> Self {
         Self {
             plugin_id: context.plugin_id.to_string(),
+            caller_client_id: None,
+            cancellation: None,
             required_capabilities: context.required_capabilities.to_vec(),
             provided_capabilities: context.provided_capabilities.to_vec(),
             services: context.services.to_vec(),
@@ -65,6 +69,8 @@ impl TypedServiceCaller {
     #[must_use]
     pub fn from_lifecycle_context(context: &bmux_plugin_sdk::NativeLifecycleContext) -> Self {
         Self {
+            caller_client_id: None,
+            cancellation: None,
             plugin_id: context.plugin_id.clone(),
             required_capabilities: context.required_capabilities.clone(),
             provided_capabilities: context.provided_capabilities.clone(),
@@ -83,6 +89,8 @@ impl TypedServiceCaller {
     #[must_use]
     pub fn from_command_context(context: &bmux_plugin_sdk::NativeCommandContext) -> Self {
         Self {
+            caller_client_id: context.caller_client_id,
+            cancellation: None,
             plugin_id: context.plugin_id.clone(),
             required_capabilities: context.required_capabilities.clone(),
             provided_capabilities: context.provided_capabilities.clone(),
@@ -101,6 +109,8 @@ impl TypedServiceCaller {
     #[must_use]
     pub fn from_service_context(context: &bmux_plugin_sdk::NativeServiceContext) -> Self {
         Self {
+            caller_client_id: context.caller_client_id,
+            cancellation: Some(context.cancellation.clone()),
             plugin_id: context.plugin_id.clone(),
             required_capabilities: context.required_capabilities.clone(),
             provided_capabilities: context.provided_capabilities.clone(),
@@ -113,6 +123,20 @@ impl TypedServiceCaller {
             host_kernel_bridge: context.host_kernel_bridge,
             plugin_settings_map: context.plugin_settings_map.clone(),
         }
+    }
+
+    /// Reject side effects from a cancelled captured invocation.
+    fn check_cancellation(&self) -> Result<()> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(bmux_plugin_sdk::CancellationToken::is_cancelled)
+        {
+            return Err(PluginError::ServiceProtocol {
+                details: "captured service invocation cancelled before dispatch".into(),
+            });
+        }
+        Ok(())
     }
 
     /// Return the plugin id this caller identifies as.
@@ -131,9 +155,10 @@ impl ServiceCaller for TypedServiceCaller {
         operation: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
+        self.check_cancellation()?;
         call_service_raw(
             &self.plugin_id,
-            None,
+            self.caller_client_id,
             &self.required_capabilities,
             &self.provided_capabilities,
             &self.services,
@@ -144,6 +169,7 @@ impl ServiceCaller for TypedServiceCaller {
             &self.connection,
             self.host_kernel_bridge,
             &self.plugin_settings_map,
+            self.cancellation.as_ref(),
             capability,
             kind,
             interface_id,
@@ -156,6 +182,7 @@ impl ServiceCaller for TypedServiceCaller {
         &self,
         request: bmux_ipc::Request,
     ) -> Result<bmux_ipc::ResponsePayload> {
+        self.check_cancellation()?;
         let bridge = self
             .host_kernel_bridge
             .ok_or(PluginError::UnsupportedHostOperation {

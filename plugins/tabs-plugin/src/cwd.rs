@@ -5,7 +5,7 @@
 
 use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{self, InitialShellOptions, SpawnError};
 use bmux_plugin::ServiceCaller;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Default, Deserialize, PartialEq, Eq)]
@@ -17,7 +17,7 @@ pub struct CwdSettings {
     pub new_tab: DirectoryPolicy,
 }
 
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "source", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DirectoryPolicy {
     #[default]
@@ -31,7 +31,7 @@ pub enum DirectoryPolicy {
     },
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DirectoryFallback {
     Home,
@@ -139,6 +139,30 @@ pub fn resolve_without_source(
     Ok(InitialShellOptions { cwd })
 }
 
+/// Explain through the same read-only resolver used by creation. This does not
+/// claim that a resolved path has passed execution-side startup validation.
+pub fn explain(
+    caller: &(impl ServiceCaller + Sync),
+    operation: &str,
+    policy: &DirectoryPolicy,
+    source: Option<(uuid::Uuid, uuid::Uuid)>,
+    session: impl FnOnce() -> Result<uuid::Uuid, String>,
+) -> serde_json::Value {
+    let result = if let Some((session_id, pane_id)) = source {
+        resolve_split_options(caller, policy, session_id, Some(pane_id))
+    } else {
+        resolve_without_source(caller, policy, session)
+    };
+    serde_json::json!({
+        "operation": operation,
+        "policy": policy,
+        "source": source.map(|(session, pane)| serde_json::json!({"session_id": session, "pane_id": pane})),
+        "cwd": result.as_ref().ok().and_then(|options| options.cwd.as_deref()),
+        "error": result.err(),
+        "creation_validated": false,
+    })
+}
+
 fn resolve_home(
     caller: &(impl ServiceCaller + Sync),
     session_id: uuid::Uuid,
@@ -174,6 +198,24 @@ impl DirectoryPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explanation_reuses_headless_resolution_without_side_effects() {
+        let report = explain(
+            &NoCalls,
+            "pane",
+            &DirectoryPolicy::SourcePane {
+                fallback: DirectoryFallback::RuntimeDefault,
+            },
+            None,
+            || panic!("headless runtime fallback needs no selection query"),
+        );
+        assert!(report["cwd"].is_null());
+        assert!(report["error"].is_null());
+        assert_eq!(report["creation_validated"], false);
+        assert_eq!(report["policy"]["source"], "source-pane");
+        assert_eq!(report["policy"]["fallback"], "runtime-default");
+    }
 
     #[test]
     fn source_independent_policies_do_not_require_an_existing_session() {

@@ -388,6 +388,16 @@ fn split_pane(
     split_pane_with_policy(caller, session, target, direction, ratio_pct, &policy)
 }
 
+fn validate_directory_split_target(selector: Option<&Selector>) -> Result<(), String> {
+    let Some(selector) = selector else {
+        return Err("directory-aware split requires an explicit attachment-local target".into());
+    };
+    if selector.name.is_some() || selector.id.is_some() == selector.index.is_some() {
+        return Err("directory-aware split requires exactly one target id or index".into());
+    }
+    Ok(())
+}
+
 fn split_pane_with_policy(
     caller: &(impl ServiceCaller + Sync),
     session: Option<&Selector>,
@@ -396,6 +406,9 @@ fn split_pane_with_policy(
     ratio_pct: Option<u32>,
     policy: &cwd::DirectoryPolicy,
 ) -> Result<api_pane_runtime_commands::PaneAck, String> {
+    if *policy != cwd::DirectoryPolicy::RuntimeDefault {
+        validate_directory_split_target(target)?;
+    }
     let session_id = resolve_session_id(caller, session)?;
     let target = resolve_target_pane_id(caller, session_id, target)?;
     let ratio = ratio_pct.unwrap_or(50).clamp(10, 90) as u8;
@@ -411,10 +424,10 @@ fn split_pane_with_policy(
         .map_err(|err| typed_service_error("pane-runtime-commands/split-pane", err))?
         .map_err(|err| format!("split-pane failed: {err:?}"))?
     } else {
-        let options = cwd::resolve_split_options(caller, policy, session_id, target)?;
         let target = target.ok_or_else(|| {
             "directory-aware split requires an explicit attachment-local target".to_string()
         })?;
+        let options = cwd::resolve_split_options(caller, policy, session_id, Some(target))?;
         bmux_plugin::block_on_typed_dispatch(
             bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::split_shell(
                 &mut client,
@@ -1303,9 +1316,11 @@ impl RustPlugin for TabsPlugin {
                     .map_err(|e| ServiceResponse::error("focus_failed", e))
             },
             "tabs-commands", "split-pane" => |req: SplitPaneArgs, ctx| {
-                split_pane(ctx, req.session.as_ref(), req.target.as_ref(), req.direction, req.ratio_pct, ctx.settings.as_ref())
-                    .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
-                    .map_err(|e| ServiceResponse::error("split_failed", e))
+                let result: Result<PaneAck, bmux_tabs_plugin_api::tabs_commands::PaneMutationError> =
+                    split_pane(ctx, req.session.as_ref(), req.target.as_ref(), req.direction, req.ratio_pct, ctx.settings.as_ref())
+                        .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
+                        .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason });
+                Ok::<_, ServiceResponse>(result)
             },
             "tabs-commands", "launch-pane" => |req: LaunchPaneArgs, ctx| {
                 launch_pane(ctx, req.session.as_ref(), req.target.as_ref(), LaunchPaneRequest {
@@ -1853,6 +1868,38 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
         bmux_plugin_sdk::NativeCommandInvocationSource::Cli
     );
     match context.command.as_str() {
+        "explain-spawn-directory" => {
+            let operation = option_value(&context.arguments, "operation")
+                .ok_or_else(|| "--operation pane|tab is required".to_string())?;
+            let settings = cwd::CwdSettings::parse(context.settings.as_ref())?;
+            let policy = match operation.as_str() {
+                "pane" => settings.new_pane,
+                "tab" => settings.new_tab,
+                _ => return Err("--operation must be pane or tab".into()),
+            };
+            let policy = option_value(&context.arguments, "cwd")
+                .map(cwd::DirectoryPolicy::explicit_path)
+                .transpose()?
+                .unwrap_or(policy);
+            let source = match (
+                option_value(&context.arguments, "source-session"),
+                option_value(&context.arguments, "source-pane"),
+            ) {
+                (None, None) => None,
+                (Some(session), Some(pane)) => Some((
+                    Uuid::parse_str(&session).map_err(|error| error.to_string())?,
+                    Uuid::parse_str(&pane).map_err(|error| error.to_string())?,
+                )),
+                _ => return Err("source-session and source-pane must be supplied together".into()),
+            };
+            let report = cwd::explain(context, &operation, &policy, source, || {
+                resolve_session_id(context, None)
+            });
+            if emit_to_stdout {
+                println!("{report}");
+            }
+            Ok(())
+        }
         "new-tab" => {
             let name = option_value(&context.arguments, "name");
             let source = if let Some(pane) = option_value(&context.arguments, "source-pane") {
@@ -5755,6 +5802,81 @@ mod tests {
         let resolved_id = resolve_context_selector_id(&host, context_selector_by_id(alpha_id))
             .expect("resolve by id should succeed");
         assert_eq!(resolved_id, alpha_id);
+    }
+
+    #[test]
+    fn explicit_invalid_pane_selector_never_becomes_active_target() {
+        let host = MockHost::with_sessions(Vec::new());
+        let session = Uuid::new_v4();
+        assert_eq!(resolve_target_pane_id(&host, session, None).unwrap(), None);
+        for selector in [
+            Selector {
+                id: None,
+                name: None,
+                index: None,
+            },
+            Selector {
+                id: None,
+                name: Some("missing".into()),
+                index: None,
+            },
+            Selector {
+                id: Some(Uuid::new_v4()),
+                name: None,
+                index: Some(0),
+            },
+        ] {
+            assert!(validate_directory_split_target(Some(&selector)).is_err());
+        }
+        let id = Uuid::new_v4();
+        let empty = Selector {
+            id: None,
+            name: None,
+            index: None,
+        };
+        assert_eq!(
+            resolve_target_pane_id(&host, session, Some(&empty)).unwrap(),
+            None
+        );
+        let legacy = Selector {
+            id: Some(id),
+            name: None,
+            index: Some(0),
+        };
+        assert_eq!(
+            resolve_target_pane_id(&host, session, Some(&legacy)).unwrap(),
+            Some(id)
+        );
+        assert_eq!(
+            resolve_target_pane_id(&host, session, Some(&selector_by_id(id))).unwrap(),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn directory_aware_split_requires_target_before_resolving_directory() {
+        let host = MockHost::with_sessions(Vec::new());
+        let session = selector_by_id(Uuid::new_v4());
+        for policy in [
+            cwd::DirectoryPolicy::Home,
+            cwd::DirectoryPolicy::SourcePane {
+                fallback: cwd::DirectoryFallback::Home,
+            },
+        ] {
+            let error = split_pane_with_policy(
+                &host,
+                Some(&session),
+                None,
+                PaneDirection::Horizontal,
+                None,
+                &policy,
+            )
+            .expect_err("missing attachment-local target must fail before service lookup");
+            assert_eq!(
+                error,
+                "directory-aware split requires an explicit attachment-local target"
+            );
+        }
     }
 
     #[test]

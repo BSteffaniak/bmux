@@ -389,7 +389,7 @@ async fn shutdown_runtime_handle(removed: RemovedRuntime) {
 }
 
 async fn join_supervision_threads(
-    threads: [Option<std::thread::JoinHandle<()>>; 2],
+    threads: &mut [Option<std::thread::JoinHandle<()>>; 2],
     timeout: Duration,
 ) -> std::result::Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -402,7 +402,7 @@ async fn join_supervision_threads(
     // is_finished guarantees these joins cannot wait for live OS work. Join
     // every handle, even when one panicked, before acknowledging teardown.
     let mut panicked = false;
-    for thread in threads.into_iter().flatten() {
+    for thread in threads.iter_mut().filter_map(Option::take) {
         panicked |= thread.join().is_err();
     }
     if panicked {
@@ -627,6 +627,18 @@ fn cleanup_failed_startup_child_on(
             Ok(()) => (failure, Ok(())),
             Err(error) => {
                 warn!(%error, "failed startup child cleanup requires recovery");
+                // Keep the child owned after the acknowledged deadline failure.
+                // The requesting startup task remains alive, retaining its
+                // preparation admission while the reaper waits for real exit.
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) | Err(_) => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                }
+                warn!(%error, "failed startup child eventually reaped after cleanup failure");
                 (
                     format!("{failure}; child cleanup failed: {error}"),
                     Err(error),
@@ -762,25 +774,77 @@ impl Drop for PendingPublicationGuard {
     }
 }
 
+struct PreparedCleanup {
+    runtime: tokio::runtime::Handle,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl PreparedCleanup {
+    fn reserve() -> Result<Arc<Self>> {
+        static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        Self::reserve_from(Arc::clone(
+            SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(64))),
+        ))
+    }
+
+    fn reserve_from(slots: Arc<tokio::sync::Semaphore>) -> Result<Arc<Self>> {
+        let runtime = tokio::runtime::Handle::try_current()?;
+        let permit = slots.try_acquire_owned().map_err(|_| {
+            spawn_failure(bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::Busy)
+        })?;
+        Ok(Arc::new(Self {
+            runtime,
+            _permit: permit,
+        }))
+    }
+}
+
 struct PreparedSplit {
+    cleanup: Arc<PreparedCleanup>,
     pane: Option<PaneRuntimeHandle>,
     launch: Option<oneshot::Sender<()>>,
     target: Uuid,
     target_execution: Uuid,
 }
 
+fn supervise_unpublished_cleanup(mut pane: PaneRuntimeHandle, cleanup: Arc<PreparedCleanup>) {
+    pane.publication.decide(false);
+    if let Some(stop) = pane.stop_tx.take() {
+        let _ = stop.send(());
+    }
+    if pane.task.is_finished() {
+        if !matches!(&*pane.cleanup.borrow(), Some(Ok(()))) {
+            warn!(pane_id = %pane.meta.id, cleanup = ?*pane.cleanup.borrow(), "unpublished cleanup did not acknowledge success");
+        }
+        return;
+    }
+    // The reservation captures the preparation runtime and holds admission
+    // through late cleanup, even if the request owner is dropped elsewhere.
+    let runtime = cleanup.runtime.clone();
+    runtime.spawn(async move {
+        let _cleanup = cleanup;
+        if let Err(error) = stop_unpublished_pane(&mut pane).await {
+            warn!(pane_id = %pane.meta.id, %error, "unpublished cleanup requires recovery");
+            // A deadline is not permission to forget a still-running teardown.
+            // Keep ownership until it settles; never report timeout as success.
+            if !pane.task.is_finished() {
+                let result = (&mut pane.task).await;
+                warn!(pane_id = %pane.meta.id, ?result, cleanup = ?*pane.cleanup.borrow(), "late unpublished cleanup settled");
+            }
+        }
+    });
+}
+
 impl Drop for PreparedSplit {
     fn drop(&mut self) {
-        if let Some(pane) = self.pane.as_mut() {
-            pane.publication.decide(false);
-            if let Some(stop) = pane.stop_tx.take() {
-                let _ = stop.send(());
-            }
+        if let Some(pane) = self.pane.take() {
+            supervise_unpublished_cleanup(pane, Arc::clone(&self.cleanup));
         }
     }
 }
 
 struct PreparedFreshRuntime {
+    cleanup: Arc<PreparedCleanup>,
     runtime: Option<SessionRuntimeHandle>,
     launch: Option<oneshot::Sender<()>>,
 }
@@ -835,12 +899,9 @@ impl PreparedFreshRuntime {
 
 impl Drop for PreparedFreshRuntime {
     fn drop(&mut self) {
-        if let Some(runtime) = self.runtime.as_mut() {
-            for pane in runtime.panes.values_mut() {
-                pane.publication.decide(false);
-                if let Some(stop) = pane.stop_tx.take() {
-                    let _ = stop.send(());
-                }
+        if let Some(runtime) = self.runtime.take() {
+            for pane in runtime.panes.into_values() {
+                supervise_unpublished_cleanup(pane, Arc::clone(&self.cleanup));
             }
         }
     }
@@ -4695,6 +4756,10 @@ struct ProcessStartIdentity(u64, u64);
 
 static PROCESS_IDENTITY_PROBES: AtomicUsize = AtomicUsize::new(0);
 
+fn startup_stop_requested(stop: &mut oneshot::Receiver<()>) -> bool {
+    !matches!(stop.try_recv(), Err(oneshot::error::TryRecvError::Empty))
+}
+
 async fn startup_identity_or_stop(
     identity: impl std::future::Future<Output = Option<ProcessStartIdentity>>,
     stop: &mut oneshot::Receiver<()>,
@@ -5012,6 +5077,7 @@ impl SessionRuntimeManager {
         &mut self,
         session_id: SessionId,
         prepared: &mut PreparedFreshRuntime,
+        publish: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         anyhow::ensure!(
             !self.runtimes.contains_key(&session_id),
@@ -5026,6 +5092,10 @@ impl SessionRuntimeManager {
                 "pane is not ready for startup commit"
             );
         }
+        // Validate before publishing the roster, under the same manager lock.
+        // After publication there must be no fallible runtime validation that
+        // can reject a session observers have already seen.
+        publish()?;
         let runtime = prepared.runtime.take().expect("ready runtime ownership");
         for pane in runtime.panes.values() {
             self.register_pane_input(session_id, pane);
@@ -5066,6 +5136,7 @@ impl SessionRuntimeManager {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
         }
 
+        let cleanup = PreparedCleanup::reserve()?;
         let first_pane_id = Uuid::new_v4();
         let pane_meta = PaneRuntimeMeta {
             id: first_pane_id,
@@ -5087,6 +5158,7 @@ impl SessionRuntimeManager {
         panes.insert(first_pane_id, first_pane);
 
         Ok(PreparedFreshRuntime {
+            cleanup,
             launch: Some(launch),
             runtime: Some(SessionRuntimeHandle {
                 panes,
@@ -5568,6 +5640,15 @@ impl SessionRuntimeManager {
             command.env_remove("APPLICATION_RESURRECTION_HOST");
             if let Some(resume) = &application_resume {
                 command.env("APPLICATION_RESURRECTION_HOST", &resume.endpoint);
+            }
+            // PTY allocation and command preparation may have overlapped an
+            // abandoned request. Check again at the process side-effect boundary.
+            if startup_stop_requested(&mut stop_rx) {
+                if let Some(resume) = &application_resume {
+                    resume.close();
+                }
+                fail_startup!("pane startup cancelled before spawn".to_string());
+                return;
             }
             let mut child = StartupChild::new(match pty_pair.slave.spawn_command(command) {
                 Ok(child) => child,
@@ -6051,10 +6132,20 @@ impl SessionRuntimeManager {
             drop(master);
             // Never occupy a blocking-pool worker with an unbounded join.
             // A timeout is an explicit failure, not acknowledged restoration.
+            let mut threads = [child_waiter, reader_thread];
             let cleanup_result =
-                join_supervision_threads([child_waiter, reader_thread], Duration::from_secs(4))
-                    .await;
+                join_supervision_threads(&mut threads, Duration::from_secs(4)).await;
             cleanup_tx.send_replace(Some(cleanup_result));
+            // Deadline failure is already visible. Keep the handles and the
+            // owning task alive so unpublished cleanup retains its admission
+            // reservation until all OS work actually finishes.
+            if threads.iter().any(Option::is_some) {
+                while threads.iter().flatten().any(|thread| !thread.is_finished()) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let late = join_supervision_threads(&mut threads, Duration::ZERO).await;
+                warn!(%pane_id, ?late, "supervision threads settled after cleanup failure");
+            }
             exited_for_task.store(true, Ordering::SeqCst);
         });
 
@@ -6123,6 +6214,7 @@ impl SessionRuntimeManager {
             .lock()
             .map_err(|_| anyhow::anyhow!("split target metadata poisoned"))?
             .observation_execution;
+        let cleanup = PreparedCleanup::reserve()?;
         let prefix = match direction {
             PaneSplitDirection::Vertical => "v",
             PaneSplitDirection::Horizontal => "h",
@@ -6143,6 +6235,7 @@ impl SessionRuntimeManager {
             Some(permit),
         );
         Ok(PreparedSplit {
+            cleanup,
             pane: Some(pane),
             launch: Some(launch),
             target,
@@ -7848,10 +7941,11 @@ impl ServerSessionRuntimeAdapter {
             return Err(spawn_error_after_cleanup(error, cleanup_errors));
         }
         let commit = authorize().and_then(|()| {
-            publish()?;
-            self.with_lock(|manager| manager.commit_fresh_runtime(session_id, &mut prepared))
-                .ok_or_else(Self::lock_poisoned_anyhow)
-                .and_then(std::convert::identity)
+            self.with_lock(|manager| {
+                manager.commit_fresh_runtime(session_id, &mut prepared, publish)
+            })
+            .ok_or_else(Self::lock_poisoned_anyhow)
+            .and_then(std::convert::identity)
         });
         if let Err(error) = commit {
             let mut cleanup_errors = Vec::new();
@@ -10930,23 +11024,34 @@ mod tests {
             let _ = blocked.recv();
             let _ = done.send(());
         });
-        let result =
-            super::join_supervision_threads([Some(thread), None], std::time::Duration::ZERO).await;
+        let mut threads = [Some(thread), None];
+        let result = super::join_supervision_threads(&mut threads, std::time::Duration::ZERO).await;
         assert!(result.unwrap_err().contains("deadline"));
+        assert!(
+            threads[0].is_some(),
+            "deadline must retain the live OS handle"
+        );
         release.send(()).unwrap();
         finished.await.unwrap();
+        super::join_supervision_threads(&mut threads, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(threads.iter().all(Option::is_none));
     }
 
     #[tokio::test]
     async fn supervision_join_acknowledges_completion_and_reports_panics() {
         let thread = std::thread::spawn(|| {});
-        super::join_supervision_threads([Some(thread), None], std::time::Duration::from_secs(2))
-            .await
-            .unwrap();
+        super::join_supervision_threads(
+            &mut [Some(thread), None],
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         let thread = std::thread::spawn(|| panic!("supervision failure"));
         assert!(
             super::join_supervision_threads(
-                [Some(thread), None],
+                &mut [Some(thread), None],
                 std::time::Duration::from_secs(2)
             )
             .await
@@ -17061,6 +17166,7 @@ mod tests {
         let (ready, receiver) = watch::channel(Some(Err("injected startup failure".into())));
         runtime.panes.get_mut(&pane_id).unwrap().startup = receiver;
         let mut prepared = PreparedFreshRuntime {
+            cleanup: PreparedCleanup::reserve().unwrap(),
             runtime: Some(runtime),
             launch: None,
         };
@@ -17078,6 +17184,7 @@ mod tests {
         let (ready, receiver) = watch::channel(None);
         runtime.panes.get_mut(&pane_id).unwrap().startup = receiver;
         let mut prepared = PreparedFreshRuntime {
+            cleanup: PreparedCleanup::reserve().unwrap(),
             runtime: Some(runtime),
             launch: None,
         };
@@ -17097,6 +17204,136 @@ mod tests {
         .await;
     }
 
+    #[derive(Debug, Clone)]
+    struct DelayedCleanupChild {
+        exited: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for DelayedCleanupChild {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl portable_pty::ChildKiller for DelayedCleanupChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl portable_pty::Child for DelayedCleanupChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(self
+                .exited
+                .load(Ordering::SeqCst)
+                .then(|| portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            panic!("cleanup must poll without blocking the executor")
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_child_deadline_retains_owner_until_late_exit() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let child = Box::new(DelayedCleanupChild {
+            exited: Arc::clone(&exited),
+            dropped: Arc::clone(&dropped),
+        });
+        let (ack, mut observation) = watch::channel(None);
+        let waiter = cleanup_failed_startup_child_on(
+            &tokio::runtime::Handle::current(),
+            child,
+            "injected startup failure".into(),
+            Some(ack),
+        );
+        tokio::time::timeout(Duration::from_secs(5), observation.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(observation.borrow().as_ref().unwrap().is_err());
+        assert!(!dropped.load(Ordering::SeqCst));
+        exited.store(true, Ordering::SeqCst);
+        let (reason, result) = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap();
+        assert!(reason.contains("child cleanup failed"));
+        assert!(result.is_err(), "late exit must not erase deadline failure");
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(observation.borrow().as_ref().unwrap().is_err());
+    }
+
+    #[test]
+    fn startup_stop_check_distinguishes_pending_cancelled_and_abandoned() {
+        let (stop, mut receiver) = oneshot::channel();
+        assert!(!startup_stop_requested(&mut receiver));
+        stop.send(()).unwrap();
+        assert!(startup_stop_requested(&mut receiver));
+        let (stop, mut receiver) = oneshot::channel::<()>();
+        drop(stop);
+        assert!(startup_stop_requested(&mut receiver));
+    }
+
+    #[tokio::test]
+    async fn prepared_cleanup_reservation_bounds_admission_and_releases_on_drop() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let reservation = PreparedCleanup::reserve_from(Arc::clone(&slots)).unwrap();
+        assert!(PreparedCleanup::reserve_from(Arc::clone(&slots)).is_err());
+        let cleanup_owner = Arc::clone(&reservation);
+        drop(reservation);
+        assert_eq!(slots.available_permits(), 0);
+        drop(cleanup_owner);
+        assert_eq!(slots.available_permits(), 1);
+        assert!(PreparedCleanup::reserve_from(slots).is_ok());
+    }
+
+    #[tokio::test]
+    async fn dropped_prepared_runtime_retains_cleanup_acknowledgement() {
+        let existing = SessionId(Uuid::new_v4());
+        let manager = manager_with_runtime(existing, runtime_with_panes(&[Uuid::new_v4()]));
+        let prepared = manager
+            .prepare_fresh_runtime(SessionId(Uuid::new_v4()), None)
+            .unwrap();
+        let mut cleanup = prepared
+            .runtime
+            .as_ref()
+            .unwrap()
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .cleanup
+            .clone();
+        drop(prepared);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(result) = cleanup.borrow_and_update().clone() {
+                    result.expect("unlaunched resource cleanup must be acknowledged");
+                    break;
+                }
+                cleanup.changed().await.expect("cleanup owner retained");
+            }
+        })
+        .await
+        .expect("cleanup must complete after request owner is dropped");
+    }
+
     #[tokio::test]
     async fn commit_rejects_unready_runtime_without_publication() {
         let existing = SessionId(Uuid::new_v4());
@@ -17106,7 +17343,9 @@ mod tests {
         let mut prepared = manager.prepare_fresh_runtime(created, None).unwrap();
         assert!(
             manager
-                .commit_fresh_runtime(created, &mut prepared)
+                .commit_fresh_runtime(created, &mut prepared, || {
+                    panic!("unready runtime must not publish its roster")
+                })
                 .is_err()
         );
         let pane = prepared
@@ -17131,6 +17370,7 @@ mod tests {
         let (launch, receiver) = oneshot::channel();
         drop(receiver);
         let prepared = PreparedFreshRuntime {
+            cleanup: PreparedCleanup::reserve().unwrap(),
             runtime: Some(runtime),
             launch: Some(launch),
         };
@@ -17158,6 +17398,7 @@ mod tests {
             .map(|pane| pane.task.abort_handle())
             .collect::<Vec<_>>();
         drop(PreparedFreshRuntime {
+            cleanup: PreparedCleanup::reserve().unwrap(),
             runtime: Some(runtime),
             launch: None,
         });
@@ -17431,14 +17672,9 @@ mod tests {
                 },
                 || {
                     assert_eq!(checks.load(Ordering::SeqCst), 2);
-                    assert!(
-                        !adapter
-                            .inner
-                            .lock()
-                            .unwrap()
-                            .runtimes
-                            .contains_key(&created)
-                    );
+                    // The callback runs with the manager held after commit
+                    // validation; it must not re-enter the manager.
+                    assert!(adapter.inner.try_lock().is_err());
                     assert!(adapter.pane_input_index.read().unwrap().is_empty());
                     published.store(true, Ordering::SeqCst);
                     anyhow::bail!("injected roster persistence failure")

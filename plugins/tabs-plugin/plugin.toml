@@ -5,6 +5,7 @@ optional_capabilities = ["bmux.pane_runtime.spawn.v1"]
 owns_namespaces = [
     "tab",
     "new-tab",
+    "explain-spawn-directory",
     "rename-tab",
     "rename-tab-by-id",
     "list-tabs",
@@ -88,6 +89,36 @@ kind         = "event"
 delivery                     = "state"
 forward_to_streaming_clients = true
 kind                         = "bmux.tabs/tabs-list"
+
+[[commands]]
+expose_in_cli = true
+name          = "explain-spawn-directory"
+path          = ["explain-spawn-directory"]
+summary       = "Explain pane/tab directory resolution without creating resources"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "operation"
+name       = "operation"
+value_name = "pane|tab"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "source-session"
+name       = "source-session"
+value_name = "UUID"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "source-pane"
+name       = "source-pane"
+value_name = "UUID"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "cwd"
+name       = "cwd"
+value_name = "ABSOLUTE_DIRECTORY"
 
 [[commands]]
 aliases       = [["tab", "new"]]

@@ -896,6 +896,7 @@ impl ServiceCaller for NativeCommandContext {
             &self.connection,
             self.host_kernel_bridge,
             &self.plugin_settings_map,
+            None,
             capability,
             kind,
             interface_id,
@@ -934,6 +935,7 @@ impl ServiceCaller for NativeLifecycleContext {
             &self.connection,
             self.host_kernel_bridge,
             &self.plugin_settings_map,
+            None,
             capability,
             kind,
             interface_id,
@@ -959,6 +961,11 @@ impl ServiceCaller for NativeServiceContext {
         operation: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
+        if self.cancellation.is_cancelled() {
+            return Err(PluginError::ServiceProtocol {
+                details: "service invocation cancelled before nested dispatch".into(),
+            });
+        }
         call_service_raw(
             &self.plugin_id,
             self.caller_client_id,
@@ -972,6 +979,7 @@ impl ServiceCaller for NativeServiceContext {
             &self.connection,
             self.host_kernel_bridge,
             &self.plugin_settings_map,
+            Some(&self.cancellation),
             capability,
             kind,
             interface_id,
@@ -984,6 +992,11 @@ impl ServiceCaller for NativeServiceContext {
         &self,
         request: bmux_ipc::Request,
     ) -> Result<bmux_ipc::ResponsePayload> {
+        if self.cancellation.is_cancelled() {
+            return Err(PluginError::ServiceProtocol {
+                details: "service invocation cancelled before kernel dispatch".into(),
+            });
+        }
         execute_kernel_request(self.host_kernel_bridge, request)
     }
 }
@@ -1018,6 +1031,7 @@ pub fn call_service_raw(
     connection: &HostConnectionInfo,
     host_kernel_bridge: Option<HostKernelBridge>,
     plugin_settings_map: &BTreeMap<String, toml::Value>,
+    cancellation: Option<&bmux_plugin_sdk::CancellationToken>,
     capability: &str,
     kind: ServiceKind,
     interface_id: &str,
@@ -1070,8 +1084,10 @@ pub fn call_service_raw(
                 && service.interface_id == interface_id
         })
         .cloned()
-        .ok_or(PluginError::UnsupportedHostOperation {
-            operation: "call_service",
+        .ok_or_else(|| PluginError::ServiceProtocol {
+            details: format!(
+                "no advertised {kind:?} service for capability '{capability}' and interface '{interface_id}'; requested operation '{operation}' was not dispatched"
+            ),
         })?;
 
     if matches!(service.provider, bmux_plugin_sdk::ProviderId::Host) {
@@ -1193,7 +1209,7 @@ pub fn call_service_raw(
             .cloned(),
         plugin_settings_map: plugin_settings_map.clone(),
         caller_client_id,
-        cancellation: bmux_plugin_sdk::CancellationToken::default(),
+        cancellation: cancellation.cloned().unwrap_or_default(),
         host_kernel_bridge,
     })?;
 
@@ -3570,6 +3586,50 @@ minimum = "1.0"
         }
     }
 
+    #[test]
+    fn cancelled_service_context_rejects_nested_dispatch_before_routing() {
+        use crate::ServiceCaller;
+        let mut context = native_test_service_context(Vec::new());
+        context.cancellation.cancel();
+        let error = context
+            .call_service_raw(
+                "test.capability",
+                bmux_plugin_sdk::ServiceKind::Command,
+                "test-command/v1",
+                "create",
+                Vec::new(),
+            )
+            .expect_err("cancelled parent must not dispatch child work");
+        assert!(
+            error
+                .to_string()
+                .contains("cancelled before nested dispatch")
+        );
+    }
+
+    #[test]
+    fn cancelled_service_context_rejects_kernel_dispatch_before_bridge_lookup() {
+        use crate::ServiceCaller;
+        let mut context = native_test_service_context(Vec::new());
+        context.cancellation.cancel();
+        let captured = crate::TypedServiceCaller::from_service_context(&context);
+        assert!(
+            captured
+                .execute_kernel_request(bmux_ipc::Request::Ping)
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled before dispatch")
+        );
+        let error = context
+            .execute_kernel_request(bmux_ipc::Request::Ping)
+            .expect_err("cancelled invocation must not enter the kernel bridge");
+        assert!(
+            error
+                .to_string()
+                .contains("cancelled before kernel dispatch")
+        );
+    }
+
     fn native_test_service_context(payload: Vec<u8>) -> NativeServiceContext {
         NativeServiceContext {
             plugin_id: "test.plugin".to_string(),
@@ -4062,7 +4122,12 @@ minimum = "1.0"
                 Vec::new(),
             )
             .expect_err("missing service registration should fail");
-        assert!(error.to_string().contains("call_service"));
+        let super::PluginError::ServiceProtocol { details } = error else {
+            panic!("expected service availability error: {error}");
+        };
+        assert!(details.contains("no advertised Query service"));
+        assert!(details.contains("permissions-state"));
+        assert!(details.contains("was not dispatched"));
     }
 
     #[test]
@@ -4112,6 +4177,30 @@ minimum = "1.0"
             invocation_source: bmux_plugin_sdk::NativeCommandInvocationSource::Unknown,
             host_kernel_bridge: None,
         };
+
+        // A declared capability is not evidence that a particular interface
+        // version or service kind is implemented. Reject before host dispatch.
+        for (kind, interface) in [
+            (bmux_plugin_sdk::ServiceKind::Query, "config-query/v2"),
+            (bmux_plugin_sdk::ServiceKind::Command, "config-query/v1"),
+        ] {
+            let error = context
+                .call_service_raw(
+                    "bmux.config.read",
+                    kind,
+                    interface,
+                    "plugin_settings",
+                    Vec::new(),
+                )
+                .expect_err("unadvertised service must not dispatch");
+            let super::PluginError::ServiceProtocol { details } = error else {
+                panic!("expected explicit service availability error: {error}");
+            };
+            assert!(details.contains("no advertised"));
+            assert!(details.contains("bmux.config.read"));
+            assert!(details.contains(interface));
+            assert!(details.contains("was not dispatched"));
+        }
 
         let response = context
             .call_service_raw(

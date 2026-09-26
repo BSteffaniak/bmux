@@ -11794,12 +11794,16 @@ async fn create_new_window_and_retarget(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
-    let ack: bmux_tabs_plugin_api::tabs_commands::TabAck = invoke_windows_command(
-        client,
-        "new-tab",
-        &tabs_commands::client::NewTabRequest { name: None },
-    )
-    .await?;
+    let ack = tabs_commands::client::new_tab(client, None)
+        .await
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("new-tab transport failed: {error}"),
+        })?
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("new-tab failed: {error:?}"),
+        })?;
     let context_id = ack
         .id
         .as_deref()
@@ -11816,17 +11820,22 @@ async fn split_new_pane_then_close_old(
     pane_id: Uuid,
     session_id: Uuid,
 ) -> std::result::Result<(), ClientError> {
-    let _ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command(
+    tabs_commands::client::split_pane(
         client,
-        "split-pane",
-        &tabs_commands::client::SplitPaneRequest {
-            session: Some(ipc_to_windows_selector(SessionSelector::ById(session_id))),
-            target: Some(pane_id_windows_selector(pane_id)),
-            direction: tabs_commands::PaneDirection::Horizontal,
-            ratio_pct: None,
-        },
+        Some(ipc_to_windows_selector(SessionSelector::ById(session_id))),
+        Some(pane_id_windows_selector(pane_id)),
+        tabs_commands::PaneDirection::Horizontal,
+        None,
     )
-    .await?;
+    .await
+    .map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("split-pane transport failed: {error}"),
+    })?
+    .map_err(|error| ClientError::ServerError {
+        code: bmux_ipc::ErrorCode::Internal,
+        message: format!("split-pane failed: {error:?}"),
+    })?;
     close_pane_by_id_for_prompt(client, pane_id).await
 }
 

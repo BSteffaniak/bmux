@@ -1785,12 +1785,10 @@ async fn run_known_attach_plugin_command_playbook(
     match command_name {
         "new-tab" => {
             let name = args.first().cloned();
-            let _ack: bmux_tabs_plugin_api::tabs_commands::TabAck = invoke_windows_command_bmux(
-                client,
-                "new-tab",
-                &tabs_commands::client::NewTabRequest { name },
-            )
-            .await?;
+            tabs_commands::client::new_tab(client, name)
+                .await
+                .map_err(|error| anyhow::anyhow!("new-tab transport failed: {error}"))?
+                .map_err(|error| anyhow::anyhow!("new-tab failed: {error:?}"))?;
             Ok(Some(PluginCliCommandResponse::new(0)))
         }
         "next-tab" => {
@@ -3700,18 +3698,16 @@ pub(super) async fn execute_step(
                 SplitDirection::Vertical => PaneSplitDirection::Vertical,
                 SplitDirection::Horizontal => PaneSplitDirection::Horizontal,
             };
-            let ack: bmux_tabs_plugin_api::tabs_commands::PaneAck = invoke_windows_command_bmux(
+            let ack = tabs_commands::client::split_pane(
                 client,
-                "split-pane",
-                &tabs_commands::client::SplitPaneRequest {
-                    session: Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
-                    target: None,
-                    direction: ipc_split_to_windows_direction(ipc_dir),
-                    ratio_pct: None,
-                },
+                Some(ipc_to_windows_selector(SessionSelector::ById(sid))),
+                None,
+                ipc_split_to_windows_direction(ipc_dir),
+                None,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("split-pane failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("split-pane transport failed: {e}"))?
+            .map_err(|e| anyhow::anyhow!("split-pane failed: {e:?}"))?;
             let pane_id = ack
                 .pane_id
                 .ok_or_else(|| anyhow::anyhow!("split-pane returned no pane id"))?;
