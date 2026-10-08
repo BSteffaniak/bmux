@@ -1537,8 +1537,10 @@ async fn handle_connection(
                     envelope.request_id,
                     ErrorCode::InvalidRequest,
                     format!("failed parsing request: {error:#}"),
+                    &mut connection_shutdown,
+                    Duration::from_secs(5),
                     negotiated_frame_codec.as_deref(),
-                )?;
+                ).await?;
                 continue;
             }
         };
@@ -1600,12 +1602,23 @@ async fn handle_connection(
             }
         };
         let response_send_started = Instant::now();
+        // ServerStop has already requested shutdown. Its acknowledgement must
+        // still be queued (with the same finite capacity deadline), rather than
+        // cancelled by the shutdown it initiated.
+        let (_ack_shutdown_tx, mut ack_shutdown_rx) = watch::channel(false);
+        let response_shutdown = if matches!(response, Response::Ok(ResponsePayload::ServerStopping)) {
+            &mut ack_shutdown_rx
+        } else {
+            &mut connection_shutdown
+        };
         let response_send_timing = match send_response_via_channel(
             &frame_tx,
             envelope.request_id,
             &response,
+            response_shutdown,
+            Duration::from_secs(5),
             negotiated_frame_codec.as_deref(),
-        ) {
+        ).await {
             Ok(timing) => timing,
             Err(err) if is_frame_too_large_error(&err) => {
                 warn!(
@@ -1618,11 +1631,17 @@ async fn handle_connection(
                     envelope.request_id,
                     ErrorCode::Internal,
                     "response too large".to_string(),
+                    &mut connection_shutdown,
+                    Duration::from_secs(5),
                     negotiated_frame_codec.as_deref(),
-                )?;
+                ).await?;
                 IpcResponseSendTiming::default()
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                warn!(client_id = %client_id.0, request_id = envelope.request_id,
+                    error = %err, "response delivery failed; closing connection");
+                return Err(err);
+            }
         };
         let response_send_us = response_send_started.elapsed().as_micros();
         emit_phase_timing(
@@ -1849,11 +1868,19 @@ async fn write_queued_frames(
     while let Some(frame) = frames.recv().await {
         // A timeout may leave a partial frame on the wire. Close the transport
         // and discard the queue; never resume or retry this frame.
-        if !matches!(
-            tokio::time::timeout(deadline, writer.write_raw_frame(&frame)).await,
-            Ok(Ok(()))
-        ) {
-            break;
+        match tokio::time::timeout(deadline, writer.write_raw_frame(&frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                warn!(%error, "transport writer failed; closing connection");
+                break;
+            }
+            Err(_) => {
+                warn!(
+                    deadline_ms = deadline.as_millis(),
+                    "transport writer deadline exceeded; closing connection"
+                );
+                break;
+            }
         }
     }
 }
@@ -2851,15 +2878,26 @@ async fn send_response(
         .context("failed sending response envelope")
 }
 
-fn send_error_via_channel(
+async fn send_error_via_channel(
     frame_tx: &mpsc::Sender<Vec<u8>>,
     request_id: u64,
     code: ErrorCode,
     message: String,
+    shutdown: &mut watch::Receiver<bool>,
+    deadline: Duration,
     frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
 ) -> Result<()> {
     let response = Response::Err(ErrorResponse { code, message });
-    send_response_via_channel(frame_tx, request_id, &response, frame_codec).map(|_| ())
+    send_response_via_channel(
+        frame_tx,
+        request_id,
+        &response,
+        shutdown,
+        deadline,
+        frame_codec,
+    )
+    .await
+    .map(|_| ())
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2869,10 +2907,12 @@ struct IpcResponseSendTiming {
     writer_queue: u128,
 }
 
-fn send_response_via_channel(
+async fn send_response_via_channel(
     frame_tx: &mpsc::Sender<Vec<u8>>,
     request_id: u64,
     response: &Response,
+    shutdown: &mut watch::Receiver<bool>,
+    deadline: Duration,
     frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
 ) -> Result<IpcResponseSendTiming> {
     let response_encode_started = Instant::now();
@@ -2888,9 +2928,28 @@ fn send_response_via_channel(
     };
     let frame_encode_us = frame_encode_started.elapsed().as_micros();
     let queue_started = Instant::now();
-    frame_tx
-        .try_send(frame)
-        .map_err(|_| anyhow::anyhow!("writer channel full or closed"))?;
+    // Reserve before enqueueing: cancellation/timeout must not publish a frame.
+    // Each connection has one serial response producer, so waiting retains at
+    // most one extra bounded frame rather than spawning unbounded send tasks.
+    let permit = tokio::select! {
+        biased;
+        () = async {
+            loop {
+                if *shutdown.borrow_and_update() {
+                    break;
+                }
+                if shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+        } => anyhow::bail!("response delivery cancelled by server shutdown"),
+        result = tokio::time::timeout(deadline, frame_tx.reserve()) => {
+            result
+                .context("response writer queue capacity deadline exceeded")?
+                .map_err(|_| anyhow::anyhow!("response writer queue closed"))?
+        }
+    };
+    permit.send(frame);
     Ok(IpcResponseSendTiming {
         response_encode: response_encode_us,
         frame_encode: frame_encode_us,
@@ -3039,17 +3098,131 @@ mod tests {
         assert!(weak.upgrade().is_none());
     }
 
-    #[test]
-    fn response_queue_rejects_overflow_and_recovers_after_drain() {
-        let (tx, mut rx) = mpsc::channel(1);
+    #[tokio::test]
+    async fn response_queue_waits_for_slow_consumer_and_preserves_burst_order() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
         let response = Response::Err(ErrorResponse {
             code: ErrorCode::InvalidRequest,
             message: "test".to_string(),
         });
-        assert!(send_response_via_channel(&tx, 1, &response, None).is_ok());
-        assert!(send_response_via_channel(&tx, 2, &response, None).is_err());
-        assert!(rx.try_recv().is_ok());
-        assert!(send_response_via_channel(&tx, 3, &response, None).is_ok());
+        for request_id in 0..16 {
+            send_response_via_channel(
+                &tx,
+                request_id,
+                &response,
+                &mut shutdown,
+                Duration::from_secs(1),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let pending = send_response_via_channel(
+            &tx,
+            16,
+            &response,
+            &mut shutdown,
+            Duration::from_secs(1),
+            None,
+        );
+        tokio::pin!(pending);
+        // Poll the send while full; it must wait rather than disconnect.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
+        );
+        let first = rx.recv().await.unwrap();
+        assert_eq!(
+            bmux_ipc::frame::decode_frame_exact(&first)
+                .unwrap()
+                .request_id,
+            0
+        );
+        pending.await.unwrap();
+        for request_id in 1..17 {
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(
+                bmux_ipc::frame::decode_frame_exact(&frame)
+                    .unwrap()
+                    .request_id,
+                request_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn response_queue_deadline_cancellation_and_closure_are_distinct() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (shutdown_tx, mut shutdown) = watch::channel(false);
+        let response = Response::Err(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "test".to_string(),
+        });
+        send_response_via_channel(
+            &tx,
+            1,
+            &response,
+            &mut shutdown,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+        let error = send_response_via_channel(
+            &tx,
+            2,
+            &response,
+            &mut shutdown,
+            Duration::from_millis(1),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("capacity deadline exceeded"));
+        assert_eq!(rx.len(), 1, "timed out response must not be enqueued");
+        shutdown_tx.send(true).unwrap();
+        let error = send_response_via_channel(
+            &tx,
+            3,
+            &response,
+            &mut shutdown,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(rx.len(), 1);
+        rx.recv().await.unwrap();
+        let error = send_response_via_channel(
+            &tx,
+            4,
+            &response,
+            &mut shutdown,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("cancelled"),
+            "shutdown wins even with available capacity"
+        );
+        shutdown_tx.send(false).unwrap();
+        drop(rx);
+        let error = send_response_via_channel(
+            &tx,
+            5,
+            &response,
+            &mut shutdown,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("queue closed"));
     }
 
     #[test]
