@@ -381,6 +381,9 @@ impl RustPlugin for SessionsPlugin {
                 get_session_local(&req.selector)
                     .map_err(|e| ServiceResponse::error("get_failed", e))
             },
+            "sessions-program-v1", "new-program-session" => |req: bmux_sessions_plugin_api::sessions_program_v1::client::NewProgramSessionRequest, ctx| {
+                Ok::<_, ServiceResponse>(new_program_session(ctx, req.name, req.options))
+            },
             "sessions-spawn-v1", "new-session" => |req: bmux_sessions_plugin_api::sessions_spawn_v1::client::NewSessionRequest, ctx| {
                 Ok::<_, ServiceResponse>(new_session_with_options(ctx, req.name, req.options))
             },
@@ -595,6 +598,56 @@ fn record_selected_context_outcome(context_id: ::uuid::Uuid) {
         COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY,
         serde_json::json!(context_id),
     );
+}
+
+fn new_program_session(
+    caller: &(impl ServiceCaller + Sync),
+    name: Option<String>,
+    options: bmux_sessions_plugin_api::sessions_program_v1::ProgramOptions,
+) -> Result<
+    bmux_sessions_plugin_api::sessions_program_v1::ExecutionRef,
+    bmux_sessions_plugin_api::sessions_program_v1::ProgramError,
+> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_execution_v1 as execution;
+    use bmux_sessions_plugin_api::sessions_program_v1::{ExecutionRef, ProgramError};
+    let mut client = dispatch_client(caller);
+    let result = bmux_plugin::block_on_typed_dispatch(execution::client::new_program_session(
+        &mut client,
+        name.clone(),
+        execution::ProgramOptions {
+            program: options.program,
+            args: options.args,
+            cwd: options.cwd,
+            env: options.env,
+            cols: options.cols,
+            rows: options.rows,
+        },
+    ))
+    .map_err(|error| ProgramError::LaunchFailed {
+        reason: error.to_string(),
+    })?
+    .map_err(|error| match error {
+        execution::ExecutionError::Unavailable => ProgramError::Unavailable,
+        execution::ExecutionError::Denied { reason } => ProgramError::Denied { reason },
+        execution::ExecutionError::InvalidOptions { reason } => {
+            ProgramError::InvalidOptions { reason }
+        }
+        other => ProgramError::LaunchFailed {
+            reason: format!("{other:?}"),
+        },
+    })?;
+    let _ = global_event_bus().emit(
+        &sessions_events::EVENT_KIND,
+        SessionEvent::Created {
+            session_id: result.session_id,
+            name,
+        },
+    );
+    Ok(ExecutionRef {
+        session_id: result.session_id,
+        pane_id: result.pane_id,
+        execution_token: result.execution_token,
+    })
 }
 
 fn new_session_with_options(

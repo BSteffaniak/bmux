@@ -1,9 +1,13 @@
 execution_class = "native_fast"
 id = "bmux.sessions"
 name = "bmux Sessions"
-optional_capabilities = ["bmux.pane_runtime.spawn.v1"]
+optional_capabilities = [
+    "bmux.pane_runtime.spawn.v1",
+    "bmux.pane_runtime.execution.v1",
+]
 owns_namespaces = ["new-session"]
 provided_capabilities = [
+    "bmux.sessions.program.v1",
     "bmux.sessions.read",
     "bmux.sessions.write",
     "bmux.sessions.spawn.v1",
@@ -16,6 +20,11 @@ required_capabilities = [
     "bmux.pane_runtime.write",
 ]
 version = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.sessions.program.v1"
+interface_id = "sessions-program-v1"
+kind         = "command"
 
 [[services]]
 capability   = "bmux.sessions.read"

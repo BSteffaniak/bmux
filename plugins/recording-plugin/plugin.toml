@@ -1,12 +1,15 @@
-execution_class       = "native_fast"
-id                    = "bmux.recording"
-name                  = "bmux Recording"
-owns_namespaces       = ["recording"]
-owns_paths            = [["server", "recording"], ["playbook", "from-recording"]]
+execution_class = "native_fast"
+id = "bmux.recording"
+name = "bmux Recording"
+owns_namespaces = ["recording"]
+owns_paths = [["server", "recording"], ["playbook", "from-recording"]]
 provided_capabilities = ["bmux.recording.read", "bmux.recording.write"]
-provided_features     = ["bmux.recording"]
-required_capabilities = []
-version               = "0.0.1-alpha.0"
+provided_features = ["bmux.recording", "bmux.recording.process.v1"]
+required_capabilities = [
+    "bmux.sessions.program.v1",
+    "bmux.pane_runtime.execution.v1",
+]
+version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.recording.read"
@@ -257,6 +260,254 @@ expose_in_cli = true
 name          = "recording-prune"
 path          = ["recording", "prune"]
 summary       = "Delete completed recordings older than retention"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[services]]
+capability   = "bmux.recording.write"
+interface_id = "recording-process-v1"
+kind         = "command"
+
+[[commands]]
+description = """Isolated recorded program start.
+
+Flags and direct argv syntax:
+  bmux recording process start [--profile functional|full|visual] [--viewport WxH] [--cwd DIR] [--env KEY=VALUE]... [--idempotency-key UUID] [--json] -- PROGRAM ARGS
+
+Agent example:
+  bmux recording process start --json --profile functional --viewport 80x24 -- /bin/echo hello
+
+Security: the plugin creates a private dedicated server; never targets live BMUX. Input, environment and artifacts may contain secrets. Direct argv after -- is preserved literally; no implicit shell evaluation. Disconnect does not terminate work. Finish refuses running work without --terminate. --cleanup-server requires finalized capture; offline evidence remains readable. Reuse the same --idempotency-key to retry start/send; ambiguous outcomes refuse duplicate effects.
+
+JSON: structured stdout only; diagnostics stderr. Exit 0 success, 1 failure, 124 wait timeout; run returns the child exit code (capped at 255). Durations accept milliseconds, 100ms or 10s. Read cursor is a raw-output byte offset; complete requires process output drain and capture queue visibility. Artifacts require a fresh output directory. GIF is canonical raw-event terminal-parser reconstruction, not polling or exact image protocol fidelity.
+"""
+expose_in_cli = true
+name = "recording-process-start"
+path = ["recording", "process", "start"]
+summary = "Isolated recorded program start; use --help for flags, examples and security"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+description = """Isolated recorded program run.
+
+Flags and direct argv syntax:
+  bmux recording process run [--profile functional|full|visual] [--viewport WxH] [--cwd DIR] [--env KEY=VALUE]... [--idempotency-key UUID] [--json] -- PROGRAM ARGS
+
+Agent example:
+  bmux recording process run --json -- /bin/sh -c 'printf hello; exit 7'
+
+Security: the plugin creates a private dedicated server; never targets live BMUX. Input, environment and artifacts may contain secrets. Direct argv after -- is preserved literally; no implicit shell evaluation. Disconnect does not terminate work. Finish refuses running work without --terminate. --cleanup-server requires finalized capture; offline evidence remains readable. Reuse the same --idempotency-key to retry start/send; ambiguous outcomes refuse duplicate effects.
+
+JSON: structured stdout only; diagnostics stderr. Exit 0 success, 1 failure, 124 wait timeout; run returns the child exit code (capped at 255). Durations accept milliseconds, 100ms or 10s. Read cursor is a raw-output byte offset; complete requires process output drain and capture queue visibility. Artifacts require a fresh output directory. GIF is canonical raw-event terminal-parser reconstruction, not polling or exact image protocol fidelity.
+"""
+expose_in_cli = true
+name = "recording-process-run"
+path = ["recording", "process", "run"]
+summary = "Isolated recorded program run; use --help for flags, examples and security"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+description = """Isolated recorded program status.
+
+Flags and direct argv syntax:
+  bmux recording process status RUN_ID [--json]
+
+Agent example:
+  bmux recording process status RUN_ID --json
+
+Security: the plugin creates a private dedicated server; never targets live BMUX. Input, environment and artifacts may contain secrets. Direct argv after -- is preserved literally; no implicit shell evaluation. Disconnect does not terminate work. Finish refuses running work without --terminate. --cleanup-server requires finalized capture; offline evidence remains readable. Reuse the same --idempotency-key to retry start/send; ambiguous outcomes refuse duplicate effects.
+
+JSON: structured stdout only; diagnostics stderr. Exit 0 success, 1 failure, 124 wait timeout; run returns the child exit code (capped at 255). Durations accept milliseconds, 100ms or 10s. Read cursor is a raw-output byte offset; complete requires process output drain and capture queue visibility. Artifacts require a fresh output directory. GIF is canonical raw-event terminal-parser reconstruction, not polling or exact image protocol fidelity.
+"""
+expose_in_cli = true
+name = "recording-process-status"
+path = ["recording", "process", "status"]
+summary = "Isolated recorded program status; use --help for flags, examples and security"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+description = """Isolated recorded program read.
+
+Flags and direct argv syntax:
+  bmux recording process read RUN_ID [--since BYTE_CURSOR] [--max-bytes 1..1048576] [--json]
+
+Agent example:
+  bmux recording process read RUN_ID --since 0 --max-bytes 65536 --json
+
+Security: the plugin creates a private dedicated server; never targets live BMUX. Input, environment and artifacts may contain secrets. Direct argv after -- is preserved literally; no implicit shell evaluation. Disconnect does not terminate work. Finish refuses running work without --terminate. --cleanup-server requires finalized capture; offline evidence remains readable. Reuse the same --idempotency-key to retry start/send; ambiguous outcomes refuse duplicate effects.
+
+JSON: structured stdout only; diagnostics stderr. Exit 0 success, 1 failure, 124 wait timeout; run returns the child exit code (capped at 255). Durations accept milliseconds, 100ms or 10s. Read cursor is a raw-output byte offset; complete requires process output drain and capture queue visibility. Artifacts require a fresh output directory. GIF is canonical raw-event terminal-parser reconstruction, not polling or exact image protocol fidelity.
+"""
+expose_in_cli = true
+name = "recording-process-read"
+path = ["recording", "process", "read"]
+summary = "Isolated recorded program read; use --help for flags, examples and security"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+description = """Isolated recorded program screen.
+
+Flags and direct argv syntax:
+  bmux recording process screen RUN_ID [--json]
+
+Agent example:
+  bmux recording process screen RUN_ID --json
+
+Security: the plugin creates a private dedicated server; never targets live BMUX. Input, environment and artifacts may contain secrets. Direct argv after -- is preserved literally; no implicit shell evaluation. Disconnect does not terminate work. Finish refuses running work without --terminate. --cleanup-server requires finalized capture; offline evidence remains readable. Reuse the same --idempotency-key to retry start/send; ambiguous outcomes refuse duplicate effects.
+
+JSON: structured stdout only; diagnostics stderr. Exit 0 success, 1 failure, 124 wait timeout; run returns the child exit code (capped at 255). Durations accept milliseconds, 100ms or 10s. Read cursor is a raw-output byte offset; complete requires process output drain and capture queue visibility. Artifacts require a fresh output directory. GIF is canonical raw-event terminal-parser reconstruction, not polling or exact image protocol fidelity.
+"""
+expose_in_cli = true
+name = "recording-process-screen"
+path = ["recording", "process", "screen"]
+summary = "Isolated recorded program screen; use --help for flags, examples and security"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+description = """Isolated recorded program send.
+
+Flags and direct argv syntax:
+  bmux recording process send RUN_ID (--text TEXT | --key Enter|Tab|Escape|Ctrl-C|Ctrl-D|Backspace|Up|Down|Left|Right | --stdin) [--idempotency-key UUID] [--json]
+
+Agent example:
+  bmux recording process send RUN_ID --text hello --idempotency-key 00000000-0000-0000-0000-000000000001 --json
+
+Security: the plugin creates a private dedicated server; never targets live BMUX. Input, environment and artifacts may contain secrets. Direct argv after -- is preserved literally; no implicit shell evaluation. Disconnect does not terminate work. Finish refuses running work without --terminate. --cleanup-server requires finalized capture; offline evidence remains readable. Reuse the same --idempotency-key to retry start/send; ambiguous outcomes refuse duplicate effects.
+
+JSON: structured stdout only; diagnostics stderr. Exit 0 success, 1 failure, 124 wait timeout; run returns the child exit code (capped at 255). Durations accept milliseconds, 100ms or 10s. Read cursor is a raw-output byte offset; complete requires process output drain and capture queue visibility. Artifacts require a fresh output directory. GIF is canonical raw-event terminal-parser reconstruction, not polling or exact image protocol fidelity.
+"""
+expose_in_cli = true
+name = "recording-process-send"
+path = ["recording", "process", "send"]
+summary = "Isolated recorded program send; use --help for flags, examples and security"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+description = """Isolated recorded program wait.
+
+Flags and direct argv syntax:
+  bmux recording process wait RUN_ID [--exit | --screen-contains TEXT] [--timeout DURATION] [--json]
+
+Agent example:
+  bmux recording process wait RUN_ID --screen-contains Ready --timeout 10s --json
+
+Security: the plugin creates a private dedicated server; never targets live BMUX. Input, environment and artifacts may contain secrets. Direct argv after -- is preserved literally; no implicit shell evaluation. Disconnect does not terminate work. Finish refuses running work without --terminate. --cleanup-server requires finalized capture; offline evidence remains readable. Reuse the same --idempotency-key to retry start/send; ambiguous outcomes refuse duplicate effects.
+
+JSON: structured stdout only; diagnostics stderr. Exit 0 success, 1 failure, 124 wait timeout; run returns the child exit code (capped at 255). Durations accept milliseconds, 100ms or 10s. Read cursor is a raw-output byte offset; complete requires process output drain and capture queue visibility. Artifacts require a fresh output directory. GIF is canonical raw-event terminal-parser reconstruction, not polling or exact image protocol fidelity.
+"""
+expose_in_cli = true
+name = "recording-process-wait"
+path = ["recording", "process", "wait"]
+summary = "Isolated recorded program wait; use --help for flags, examples and security"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+description = """Isolated recorded program terminate.
+
+Flags and direct argv syntax:
+  bmux recording process terminate RUN_ID [--grace-period DURATION] [--json]
+
+Agent example:
+  bmux recording process terminate RUN_ID --grace-period 1s --json
+
+Security: the plugin creates a private dedicated server; never targets live BMUX. Input, environment and artifacts may contain secrets. Direct argv after -- is preserved literally; no implicit shell evaluation. Disconnect does not terminate work. Finish refuses running work without --terminate. --cleanup-server requires finalized capture; offline evidence remains readable. Reuse the same --idempotency-key to retry start/send; ambiguous outcomes refuse duplicate effects.
+
+JSON: structured stdout only; diagnostics stderr. Exit 0 success, 1 failure, 124 wait timeout; run returns the child exit code (capped at 255). Durations accept milliseconds, 100ms or 10s. Read cursor is a raw-output byte offset; complete requires process output drain and capture queue visibility. Artifacts require a fresh output directory. GIF is canonical raw-event terminal-parser reconstruction, not polling or exact image protocol fidelity.
+"""
+expose_in_cli = true
+name = "recording-process-terminate"
+path = ["recording", "process", "terminate"]
+summary = "Isolated recorded program terminate; use --help for flags, examples and security"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+description = """Isolated recorded program finish.
+
+Flags and direct argv syntax:
+  bmux recording process finish RUN_ID [--terminate] [--cleanup-server] [--expected-revision N] [--export text|raw|events|gif]... [--output NEW_DIR] [--json]
+
+Agent example:
+  bmux recording process finish RUN_ID --cleanup-server --export raw --export gif --output ./evidence --json
+
+Security: the plugin creates a private dedicated server; never targets live BMUX. Input, environment and artifacts may contain secrets. Direct argv after -- is preserved literally; no implicit shell evaluation. Disconnect does not terminate work. Finish refuses running work without --terminate. --cleanup-server requires finalized capture; offline evidence remains readable. Reuse the same --idempotency-key to retry start/send; ambiguous outcomes refuse duplicate effects.
+
+JSON: structured stdout only; diagnostics stderr. Exit 0 success, 1 failure, 124 wait timeout; run returns the child exit code (capped at 255). Durations accept milliseconds, 100ms or 10s. Read cursor is a raw-output byte offset; complete requires process output drain and capture queue visibility. Artifacts require a fresh output directory. GIF is canonical raw-event terminal-parser reconstruction, not polling or exact image protocol fidelity.
+"""
+expose_in_cli = true
+name = "recording-process-finish"
+path = ["recording", "process", "finish"]
+summary = "Isolated recorded program finish; use --help for flags, examples and security"
 
 [[commands.arguments]]
 allow_hyphen_values = true

@@ -16,8 +16,15 @@
 #![allow(clippy::module_name_repetitions)]
 
 mod commands;
+mod durable;
 mod export;
 mod from_recording;
+mod process_artifacts;
+mod process_bootstrap;
+mod process_commands;
+mod process_display;
+mod process_runtime;
+mod process_store;
 pub mod recording_runtime;
 pub use recording_runtime::{
     RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, execute_recording_cut,
@@ -245,6 +252,9 @@ impl RustPlugin for RecordingPlugin {
         &mut self,
         context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        if context.command.starts_with("recording-process-") {
+            return Ok(process_commands::run(&context));
+        }
         if should_queue_recording_cut_for_non_cli(&context) {
             return run_recording_cut_command_queued(&context);
         }
@@ -255,7 +265,34 @@ impl RustPlugin for RecordingPlugin {
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        use bmux_recording_plugin_api::recording_process_v1::{
+            self as process, RecordingProcessV1Service,
+        };
         bmux_plugin_sdk::route_service!(context, {
+            "recording-process-v1", "start" => |req: process::client::StartRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.start(req.options, req.runtime_root).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v1", "status" => |req: process::client::StatusRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.status(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v1", "read" => |req: process::client::ReadRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.read(req.run_id, req.since, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v1", "screen" => |req: process::client::ScreenRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.screen(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v1", "send" => |req: process::client::SendRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.send(req.run_id, req.data, req.mutation_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v1", "wait" => |req: process::client::WaitRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.wait(req.run_id, req.timeout_ms).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v1", "terminate" => |req: process::client::TerminateRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.terminate(req.run_id, req.grace_ms).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-v1", "finish" => |req: process::client::FinishRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.finish(req.run_id, req.expected_revision, req.terminate_running).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
             "recording-state", "status" => |_req: (), _ctx| {
                 Ok::<recording_types::RecordingStatus, ServiceResponse>(recording_status_generated())
             },
@@ -328,11 +365,44 @@ impl RustPlugin for RecordingPlugin {
 
     fn register_typed_services(
         &self,
-        _context: TypedServiceRegistrationContext<'_>,
-        _registry: &mut TypedServiceRegistry,
+        context: TypedServiceRegistrationContext<'_>,
+        registry: &mut TypedServiceRegistry,
     ) {
-        // No typed Arc<dyn Trait> surface today — recording operations
-        // dispatch exclusively through the byte-service path.
+        let Some(config) = config_handle() else {
+            return;
+        };
+        let Ok(config) = config.read() else {
+            return;
+        };
+        // Explicit plugin configuration establishes opt-in. Never infer isolation
+        // from an arbitrary caller-supplied path or mutate a normal user runtime.
+        let configured = context
+            .plugin_settings_map
+            .get("bmux.recording")
+            .and_then(|settings| settings.get("process-runtime-root"))
+            .and_then(|value| value.as_str());
+        let isolated = configured.is_some_and(|root| root == context.connection.runtime_dir);
+        let service = Arc::new(process_runtime::ProcessService::new(
+            Arc::new(bmux_plugin::TypedServiceCaller::from_registration_context(
+                &context,
+            )),
+            config.recordings_dir.clone(),
+            std::path::Path::new(&context.connection.runtime_dir)
+                .parent()
+                .map_or_else(
+                    || context.connection.runtime_dir.clone(),
+                    |path| path.to_string_lossy().into_owned(),
+                ),
+            isolated,
+        ));
+        process_runtime::register(Arc::clone(&service));
+        let provider: Arc<
+            dyn bmux_recording_plugin_api::recording_process_v1::RecordingProcessV1Service
+                + Send
+                + Sync,
+        > = service;
+        let _ =
+            bmux_recording_plugin_api::recording_process_v1::register_provider(registry, provider);
     }
 }
 

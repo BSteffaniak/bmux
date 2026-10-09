@@ -18,15 +18,77 @@
 
 plugin bmux.pane_runtime version 1;
 
+capability PANE_RUNTIME_EXECUTION_V1 = bmux.pane_runtime.execution.v1;
 capability PANE_RUNTIME_READ = bmux.pane_runtime.read;
 capability PANE_RUNTIME_WRITE = bmux.pane_runtime.write;
 capability ATTACH_RUNTIME_WRITE = bmux.attach_runtime.write;
 capability ATTACH_RUNTIME_READ = bmux.attach_runtime.read;
-
-// Directory-aware creation is opt-in. Callers must require this interface
-// before mutation; never retry its commands through the legacy creation API.
 capability PANE_RUNTIME_SPAWN_V1 = bmux.pane_runtime.spawn.v1;
 
+// Exact execution controls. A replacement never inherits the old token.
+@capability(PANE_RUNTIME_EXECUTION_V1)
+interface pane-runtime-execution-v1 {
+    record program-options {
+        program: string,
+        args: list<string>,
+        cwd: string?,
+        env: map<string, string>,
+        cols: u16,
+        rows: u16,
+    }
+    record execution-ref {
+        session_id: uuid,
+        pane_id: uuid,
+        execution_token: uuid,
+    }
+    enum execution-phase { running, exited, failed }
+    record execution-status {
+        execution: execution-ref,
+        phase: execution-phase,
+        exit_code: u32?,
+        signal: string?,
+        output_drained: bool,
+        output_watermark: u64,
+        error: string?,
+    }
+    variant execution-error {
+        unavailable,
+        not-found,
+        stale-execution,
+        denied { reason: string },
+        invalid-options { reason: string },
+        launch-failed { reason: string },
+        operation-failed { reason: string },
+    }
+    command new-program-session(name: string?, options: program-options)
+        -> result<execution-ref, execution-error>;
+    record execution-screen {
+        execution: execution-ref,
+        output_watermark: u64,
+        cols: u16,
+        rows: u16,
+        cursor_col: u16,
+        cursor_row: u16,
+        cursor_visible: bool,
+        text: string,
+        // JSON GridSnapshot in the existing bmux_terminal_grid wire format.
+        encoded_grid: bytes,
+    }
+    command screen(execution: execution-ref) -> result<execution-screen, execution-error>;
+    command status(execution: execution-ref) -> result<execution-status, execution-error>;
+    // Acknowledges queue admission, not child consumption. Payloads are bounded.
+    command send(execution: execution-ref, data: bytes) -> result<unit, execution-error>;
+    command resize(execution: execution-ref, cols: u16, rows: u16)
+        -> result<unit, execution-error>;
+    // TERM followed by KILL after grace_ms; returns current state, not a drain promise.
+    command terminate(execution: execution-ref, grace_ms: u32)
+        -> result<execution-status, execution-error>;
+    // Bounded wait for exit AND PTY drain. Timeout returns current status unchanged.
+    command wait(execution: execution-ref, timeout_ms: u32)
+        -> result<execution-status, execution-error>;
+}
+
+// Directory-aware creation is opt-in. Legacy contracts retain their meaning.
 @capability(PANE_RUNTIME_SPAWN_V1)
 interface pane-runtime-spawn-v1 {
     // An execution-host identity, not a client-side filesystem path.

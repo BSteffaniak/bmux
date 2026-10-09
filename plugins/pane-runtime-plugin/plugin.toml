@@ -4,6 +4,7 @@ name = "bmux Pane Runtime"
 optional_capabilities = ["bmux.application_resurrection.host"]
 owns_namespaces = ["pane-padding"]
 provided_capabilities = [
+    "bmux.pane_runtime.execution.v1",
     "bmux.pane_runtime.read",
     "bmux.pane_runtime.write",
     "bmux.attach_runtime.read",
@@ -34,6 +35,11 @@ version_req = ">=0.0.1-alpha.0"
 [[dependencies]]
 plugin_id   = "bmux.sessions"
 version_req = ">=0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.pane_runtime.execution.v1"
+interface_id = "pane-runtime-execution-v1"
+kind         = "command"
 
 [[services]]
 capability   = "bmux.pane_runtime.read"

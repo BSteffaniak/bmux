@@ -410,8 +410,8 @@ fn load_display_track_events(
     let result = read_frames(&bytes)
         .map_err(|e| anyhow::anyhow!("failed parsing display track {}: {e}", path.display()))?;
     if result.bytes_remaining > 0 {
-        tracing::warn!(
-            "display track {}: {} trailing bytes could not be parsed (truncated?)",
+        anyhow::bail!(
+            "display track {} is incomplete: {} trailing bytes; refusing partial export",
             path.display(),
             result.bytes_remaining
         );
@@ -1468,13 +1468,24 @@ fn export_recording_gif(
             .saturating_add(1);
         base.min(u64::from(u32::MAX)) as u32
     };
-    let target_frames =
-        max_frames.map_or(max_timeline_frames, |limit| limit.min(max_timeline_frames));
+    // Include the exact retained end boundary when it lies between regular
+    // samples. Otherwise trailing output (including an entire short execution)
+    // would never be applied. Do not round the recording's close time forward.
+    let final_boundary =
+        considered_event_count > 0 && !end_scaled_ns.is_multiple_of(frame_interval_ns.max(1));
+    let complete_timeline_frames = max_timeline_frames.saturating_add(u32::from(final_boundary));
+    let target_frames = max_frames.map_or(complete_timeline_frames, |limit| {
+        limit.min(complete_timeline_frames)
+    });
 
     let mut event_index = 0_usize;
     for frame_idx in 0..target_frames {
         profiler.record_frame_considered();
-        let frame_time_ns = u64::from(frame_idx).saturating_mul(frame_interval_ns);
+        let frame_time_ns = if final_boundary && frame_idx == max_timeline_frames {
+            end_scaled_ns
+        } else {
+            u64::from(frame_idx).saturating_mul(frame_interval_ns)
+        };
         let apply_started_at = profiler.stage_started();
         let mut frame_had_display_change = false;
         while event_index < considered_event_count {
@@ -1585,7 +1596,23 @@ fn export_recording_gif(
 
         let frame_span =
             previous_emit_frame_idx.map_or(1, |previous| frame_idx.saturating_sub(previous).max(1));
-        let delay_cs = gif_delay_clock.delay_for_frame_span(frame_span);
+        let delay_cs = if final_boundary && frame_idx == max_timeline_frames {
+            // This extra sample is not another full FPS interval. GIF delays
+            // have centisecond precision; retain that precision without adding
+            // a synthetic close interval to the source timeline.
+            let previous_ns = previous_emit_frame_idx.map_or(0, |previous| {
+                u64::from(previous).saturating_mul(frame_interval_ns)
+            });
+            u16::try_from(
+                end_scaled_ns
+                    .saturating_sub(previous_ns)
+                    .saturating_div(10_000_000)
+                    .min(u64::from(u16::MAX)),
+            )
+            .unwrap_or(u16::MAX)
+        } else {
+            gif_delay_clock.delay_for_frame_span(frame_span)
+        };
         let render_started_at = profiler.stage_started();
         let mut pixels = if render_options.mode == RecordingRenderMode::Font {
             if let Some(renderer) = resvg_renderer.as_mut() {
@@ -2020,6 +2047,9 @@ fn estimate_export_progress(
         end_scaled_ns
             .saturating_div(frame_interval_ns.max(1))
             .saturating_add(1)
+            .saturating_add(u64::from(
+                !end_scaled_ns.is_multiple_of(frame_interval_ns.max(1)),
+            ))
             .min(u64::from(u32::MAX)) as u32
     };
     let estimated_emitted_frames =
@@ -3528,6 +3558,140 @@ fn xterm_256_palette() -> [(u8, u8, u8); 256] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn decoded_final_gif(events: &[DisplayTrackEnvelope]) -> Vec<u8> {
+        let directory = std::env::temp_dir().join(format!("bmux-gif-boundary-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("test directory");
+        std::fs::write(
+            directory.join("manifest.json"),
+            format!(r#"{{"summary":{{"format_version":{RECORDING_FORMAT_VERSION}}}}}"#),
+        )
+        .expect("test manifest");
+        let mut bytes = Vec::new();
+        for event in events {
+            bmux_recording_protocol::write_frame(&mut bytes, event).expect("encode display frame");
+        }
+        std::fs::write(display_track_path(&directory, Uuid::nil()), bytes).expect("test track");
+        let output = directory.join("output.gif");
+        export_recording_gif_for_recording_dir(
+            &directory,
+            Uuid::nil(),
+            output.to_str().expect("UTF-8 path"),
+            10,
+        )
+        .expect("export test GIF");
+        let mut options = gif::DecodeOptions::new();
+        options.set_color_output(gif::ColorOutput::RGBA);
+        let mut decoder = options
+            .read_info(std::fs::File::open(&output).expect("GIF file"))
+            .expect("decode GIF header");
+        let mut final_pixels = None;
+        while let Some(frame) = decoder.read_next_frame().expect("decode GIF frame") {
+            final_pixels = Some(frame.buffer.to_vec());
+        }
+        drop(decoder);
+        std::fs::remove_dir_all(directory).expect("test cleanup");
+        final_pixels.expect("GIF must contain a frame")
+    }
+
+    fn boundary_track(output_ns: u64, close_ns: u64) -> Vec<DisplayTrackEnvelope> {
+        vec![
+            DisplayTrackEnvelope {
+                mono_ns: 0,
+                event: DisplayTrackEvent::Resize { cols: 2, rows: 1 },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: 0,
+                event: DisplayTrackEvent::FrameBytes {
+                    data: b"\x1b[?25l\x1b[44m\x1b[2J".to_vec(),
+                },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: output_ns,
+                event: DisplayTrackEvent::FrameBytes {
+                    data: b"\x1b[41m\x1b[2J".to_vec(),
+                },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: close_ns,
+                event: DisplayTrackEvent::StreamClosed,
+            },
+        ]
+    }
+
+    #[test]
+    fn short_track_gif_includes_output_after_zero_sample() {
+        let expected = decoded_final_gif(&boundary_track(0, 0));
+        let mut initial = boundary_track(0, 0);
+        initial.remove(2);
+        assert_ne!(
+            decoded_final_gif(&initial),
+            expected,
+            "fixture colors must differ"
+        );
+        let actual = decoded_final_gif(&boundary_track(20_000_000, 40_000_000));
+        assert_eq!(
+            actual, expected,
+            "final decoded frame must include short-lived output"
+        );
+    }
+
+    #[test]
+    fn gif_includes_output_after_last_regular_sample() {
+        let expected = decoded_final_gif(&boundary_track(0, 0));
+        let actual = decoded_final_gif(&boundary_track(120_000_000, 150_000_000));
+        assert_eq!(
+            actual, expected,
+            "final decoded frame must include trailing output"
+        );
+    }
+
+    #[test]
+    fn truncated_display_track_rejects_gif_before_output_creation() {
+        let recording_dir = std::env::temp_dir().join(format!(
+            "bmux-recording-plugin-truncated-export-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir(&recording_dir).expect("recording dir should be created");
+        std::fs::write(
+            recording_dir.join("manifest.json"),
+            format!(r#"{{"summary":{{"format_version":{RECORDING_FORMAT_VERSION}}}}}"#),
+        )
+        .expect("manifest should be written");
+        let client_id = Uuid::new_v4();
+        let track_path = display_track_path(&recording_dir, client_id);
+        let event = DisplayTrackEnvelope {
+            mono_ns: 1,
+            event: DisplayTrackEvent::Resize { cols: 80, rows: 24 },
+        };
+        let mut complete = Vec::new();
+        bmux_recording_protocol::write_frame(&mut complete, &event)
+            .expect("complete frame should encode");
+        std::fs::write(&track_path, &complete).expect("complete track should be written");
+        assert_eq!(
+            load_display_track_events(&recording_dir, client_id)
+                .expect("complete track should load"),
+            vec![event.clone()]
+        );
+        let mut next = Vec::new();
+        bmux_recording_protocol::write_frame(&mut next, &event).expect("next frame should encode");
+        let output = recording_dir.join("output.gif");
+        for partial in [&next[..2], &next[..next.len() - 1]] {
+            let mut truncated = complete.clone();
+            truncated.extend_from_slice(partial);
+            std::fs::write(&track_path, truncated).expect("truncated track should be written");
+            let error = export_recording_gif_for_recording_dir(
+                &recording_dir,
+                Uuid::new_v4(),
+                output.to_str().expect("test output path should be UTF-8"),
+                10,
+            )
+            .expect_err("partial prefix or payload must reject GIF export");
+            assert!(error.to_string().contains("refusing partial export"));
+            assert!(!output.exists(), "rejected export must not create a GIF");
+        }
+        std::fs::remove_dir_all(&recording_dir).expect("test recording should be removed");
+    }
 
     #[test]
     fn ensure_supported_manifest_reads_nested_summary_format_version() {

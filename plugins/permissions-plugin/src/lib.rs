@@ -991,13 +991,19 @@ fn evaluate_role_action(role: &str, action: &str) -> SessionPolicyCheckResponse 
     }
 }
 
+// `session.create` authorizes creation of a new session and its initial
+// execution before spawn. Like `context.create`, it is a mutation (owner/writer),
+// not read access or session administration. Only explicitly modeled actions
+// belong here; unknown strings must remain Unknown for role-based evaluation.
 fn classify_action(action: &str) -> PolicyActionKind {
     let normalized = action.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "admin" | "session.kill" => PolicyActionKind::Admin,
-        "mutation" | "attach.input" | "session.select" | "pane.split" | "pane.focus"
-        | "pane.direct_input" | "pane.resize" | "pane.close" | "follow" | "unfollow"
-        | "context.create" | "context.select" | "context.close" => PolicyActionKind::Mutation,
+        "mutation" | "attach.input" | "session.create" | "session.select" | "pane.split"
+        | "pane.focus" | "pane.direct_input" | "pane.resize" | "pane.close" | "follow"
+        | "unfollow" | "context.create" | "context.select" | "context.close" => {
+            PolicyActionKind::Mutation
+        }
         "read" | "list" | "status" | "context.list" => PolicyActionKind::Read,
         _ => PolicyActionKind::Unknown,
     }
@@ -2147,6 +2153,27 @@ mod tests {
             .error
             .expect("expected unsupported operation error");
         assert_eq!(error.code, "unsupported_service_operation");
+    }
+
+    #[test]
+    fn session_creation_uses_mutation_role_policy() {
+        assert_eq!(
+            classify_action("session.create"),
+            PolicyActionKind::Mutation
+        );
+        for (role, allowed) in [("owner", true), ("writer", true), ("observer", false)] {
+            let decision = evaluate_role_action(role, "session.create");
+            assert_eq!(decision.allowed, allowed, "creation decision for {role}");
+            assert_eq!(decision.reason.is_some(), !allowed);
+            assert_eq!(
+                decision.allowed,
+                evaluate_role_action(role, "context.create").allowed,
+                "session and context creation must share mutation semantics"
+            );
+            assert!(!evaluate_role_action(role, "session.create.arbitrary").allowed);
+            assert!(!evaluate_role_action(role, "unknown-action").allowed);
+        }
+        assert!(!evaluate_role_action("unknown-role", "session.create").allowed);
     }
 
     #[test]

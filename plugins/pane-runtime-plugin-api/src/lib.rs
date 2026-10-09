@@ -45,6 +45,24 @@ mod tests {
     use super::{pane_runtime_commands, pane_runtime_state};
 
     #[test]
+    fn program_execution_contract_keeps_literal_binary_input_and_identity() {
+        use super::pane_runtime_execution_v1::{ExecutionRef, client::SendRequest};
+        let execution = ExecutionRef {
+            session_id: uuid::Uuid::new_v4(),
+            pane_id: uuid::Uuid::new_v4(),
+            execution_token: uuid::Uuid::new_v4(),
+        };
+        let request = SendRequest {
+            execution: execution.clone(),
+            data: vec![0, 255, 10],
+        };
+        let encoded = bmux_codec::to_vec(&request).unwrap();
+        let decoded: SendRequest = bmux_codec::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.execution, execution);
+        assert_eq!(decoded.data, request.data);
+    }
+
+    #[test]
     fn fresh_shell_directory_is_an_explicit_versioned_contract() {
         use super::pane_runtime_spawn_commands_v1::client::NewSessionRequest;
         use super::pane_runtime_spawn_v1::InitialShellOptions;

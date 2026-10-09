@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +22,8 @@ type RecordingEventEnvelope = ProtocolRecordingEventEnvelope<bmux_ipc::Event, bm
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const DEFAULT_ROLLING_SEGMENT_MAX_AGE_SECS: u64 = 2;
+const RECORDING_QUEUE_CAPACITY: usize = 64;
+const MAX_RECORDING_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct RecordingRuntime {
@@ -31,6 +33,7 @@ pub struct RecordingRuntime {
     retention_days: u64,
     rolling_window_secs: Option<u64>,
     rolling_segment_max_age_secs: Option<u64>,
+    process_capture: bool,
 }
 
 #[derive(Debug)]
@@ -59,14 +62,15 @@ struct ActiveRecording {
     seq: AtomicU64,
     event_count: Arc<AtomicU64>,
     payload_bytes: Arc<AtomicU64>,
-    sender: mpsc::Sender<RecordingEventEnvelope>,
+    sender: mpsc::SyncSender<RecordingEventEnvelope>,
+    capture_failed: Arc<AtomicBool>,
     writer: Option<thread::JoinHandle<Result<RecordingSummary>>>,
     path: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Manifest {
-    summary: RecordingSummary,
+pub(crate) struct Manifest {
+    pub(crate) summary: RecordingSummary,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +98,7 @@ impl RecordingRuntime {
             retention_days,
             rolling_window_secs: None,
             rolling_segment_max_age_secs: None,
+            process_capture: false,
         }
     }
 
@@ -110,7 +115,12 @@ impl RecordingRuntime {
             retention_days: 0,
             rolling_window_secs: Some(rolling_window_secs),
             rolling_segment_max_age_secs: Some(DEFAULT_ROLLING_SEGMENT_MAX_AGE_SECS),
+            process_capture: false,
         }
+    }
+
+    pub(crate) fn enable_process_capture(&mut self) {
+        self.process_capture = true;
     }
 
     /// Start a new recording session.
@@ -144,6 +154,7 @@ impl RecordingRuntime {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed creating recording dir {}", dir.display()))?;
 
+        std::fs::File::open(&self.root_dir)?.sync_all()?;
         let manifest_path = dir.join(MANIFEST_FILE_NAME);
         let summary = RecordingSummary {
             id,
@@ -163,13 +174,19 @@ impl RecordingRuntime {
         };
         write_manifest(&manifest_path, &summary)?;
 
-        let (tx, rx) = mpsc::channel::<RecordingEventEnvelope>();
+        let (tx, rx) = mpsc::sync_channel::<RecordingEventEnvelope>(RECORDING_QUEUE_CAPACITY);
+        let capture_failed = Arc::new(AtomicBool::new(false));
+        let writer_capture_failed = Arc::clone(&capture_failed);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let event_count = Arc::new(AtomicU64::new(0));
         let payload_bytes = Arc::new(AtomicU64::new(0));
         let event_count_thread = Arc::clone(&event_count);
         let payload_bytes_thread = Arc::clone(&payload_bytes);
         let summary_for_thread = summary.clone();
         let segment_mb = self.segment_mb;
+        if self.process_capture {
+            crate::durable::write_atomic(&dir.join("process-capture"), b"1")?;
+        }
         let recording_dir = dir.clone();
         let rolling_window_secs = self.rolling_window_secs;
         let rolling_segment_max_age_secs = self.rolling_segment_max_age_secs;
@@ -187,9 +204,15 @@ impl RecordingRuntime {
                     segment_mb,
                     rolling_window_secs,
                     rolling_segment_max_age_secs,
+                    &writer_capture_failed,
+                    &ready_tx,
                 )
             })
             .context("failed to spawn recording writer thread")?;
+
+        ready_rx
+            .recv()
+            .context("recording writer failed before capture became ready")??;
 
         self.active = Some(ActiveRecording {
             id,
@@ -204,6 +227,7 @@ impl RecordingRuntime {
             event_count,
             payload_bytes,
             sender: tx,
+            capture_failed,
             writer: Some(writer),
             path: dir,
         });
@@ -401,10 +425,22 @@ impl RecordingRuntime {
             kind,
             payload,
         };
-        active
-            .sender
-            .send(envelope)
-            .map_err(|_| anyhow::anyhow!("recording writer is not accepting events"))?;
+        if active.capture_failed.load(Ordering::SeqCst) {
+            anyhow::bail!("recording capture previously failed; output is incomplete");
+        }
+        let encoded_size = bmux_codec::to_vec(&envelope)
+            .context("failed encoding bounded recording event")?
+            .len();
+        if encoded_size > usize::try_from(MAX_RECORDING_PAYLOAD_BYTES)? {
+            active.capture_failed.store(true, Ordering::SeqCst);
+            anyhow::bail!("recording event exceeds bounded capture payload limit");
+        }
+        // The independent writer never takes the runtime lock. Blocking here
+        // applies bounded backpressure rather than silently dropping output.
+        if let Err(error) = active.sender.send(envelope) {
+            active.capture_failed.store(true, Ordering::SeqCst);
+            anyhow::bail!("recording capture queue unavailable: {error}; output is incomplete");
+        }
         Ok(true)
     }
 
@@ -605,6 +641,8 @@ fn writer_loop(
     segment_mb: usize,
     rolling_window_secs: Option<u64>,
     rolling_segment_max_age_secs: Option<u64>,
+    capture_failed: &AtomicBool,
+    ready: &mpsc::SyncSender<Result<()>>,
 ) -> Result<RecordingSummary> {
     let segment_limit_bytes = (segment_mb as u64) * 1024 * 1024;
     let rolling_window_ms = rolling_window_secs.map(|secs| secs.saturating_mul(1000));
@@ -617,11 +655,7 @@ fn writer_loop(
 
     let mut segment_name = format!("events_{segment_index}.bin");
     let segment_path = recording_dir.join(&segment_name);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&segment_path)
-        .with_context(|| format!("failed opening segment file {}", segment_path.display()))?;
+    let (file, mut raw) = prepare_writer_files(recording_dir, &segment_path, ready)?;
     let mut writer = BufWriter::new(file);
     summary.segments = vec![segment_name.clone()];
 
@@ -630,6 +664,7 @@ fn writer_loop(
             Ok(event) => {
                 write_frame(&mut writer, &event)
                     .map_err(|e| anyhow::anyhow!("recording write_frame failed: {e}"))?;
+                append_live_output(raw.as_mut(), &event)?;
                 let payload_sz = payload_size(&event.payload);
                 event_count.fetch_add(1, Ordering::SeqCst);
                 payload_bytes.fetch_add(payload_sz, Ordering::SeqCst);
@@ -642,6 +677,7 @@ fn writer_loop(
                 // Periodic flush + manifest update.
                 if event.seq % 128 == 0 {
                     writer.flush()?;
+                    writer.get_ref().sync_all()?;
                     summary.event_count = event_count.load(Ordering::SeqCst);
                     summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
                     write_manifest(manifest_path, &summary)?;
@@ -657,6 +693,7 @@ fn writer_loop(
 
                 if rotate_by_size || rotate_by_age {
                     writer.flush()?;
+                    writer.get_ref().sync_all()?;
                     drop(writer);
 
                     closed_segments.push_back((segment_name.clone(), event.wall_epoch_ms));
@@ -696,30 +733,134 @@ fn writer_loop(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(window_ms) = rolling_window_ms {
-                    writer.flush()?;
-                    prune_closed_segments(
-                        recording_dir,
-                        &mut summary,
-                        &mut closed_segments,
-                        epoch_millis_now(),
-                        window_ms,
-                    )?;
-                    write_manifest(manifest_path, &summary)?;
-                }
+                flush_idle_writer(
+                    &mut writer,
+                    recording_dir,
+                    manifest_path,
+                    &mut summary,
+                    &mut closed_segments,
+                    rolling_window_ms,
+                )?;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    // Final flush and manifest update.
+    finalize_writer(
+        &mut writer,
+        raw.as_mut(),
+        capture_failed,
+        &mut summary,
+        (event_count, payload_bytes),
+        recording_dir,
+        manifest_path,
+    )?;
+    Ok(summary)
+}
+
+fn append_live_output(
+    raw: Option<&mut BufWriter<std::fs::File>>,
+    event: &RecordingEventEnvelope,
+) -> Result<()> {
+    if event.kind == RecordingEventKind::PaneOutputRaw
+        && let RecordingPayload::Bytes { data } = &event.payload
+        && let Some(raw) = raw
+    {
+        raw.write_all(data)?;
+        raw.flush()?;
+    }
+    Ok(())
+}
+
+fn flush_idle_writer(
+    writer: &mut BufWriter<std::fs::File>,
+    recording_dir: &Path,
+    manifest_path: &Path,
+    summary: &mut RecordingSummary,
+    closed_segments: &mut VecDeque<(String, u64)>,
+    rolling_window_ms: Option<u64>,
+) -> Result<()> {
+    // Headless readers must observe low-volume startup output too.
     writer.flush()?;
-    summary.event_count = event_count.load(Ordering::SeqCst);
-    summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
+    writer.get_ref().sync_all()?;
+    if let Some(window_ms) = rolling_window_ms {
+        prune_closed_segments(
+            recording_dir,
+            summary,
+            closed_segments,
+            epoch_millis_now(),
+            window_ms,
+        )?;
+        write_manifest(manifest_path, summary)?;
+    }
+    Ok(())
+}
+
+fn finalize_writer(
+    writer: &mut BufWriter<std::fs::File>,
+    raw: Option<&mut BufWriter<std::fs::File>>,
+    capture_failed: &AtomicBool,
+    summary: &mut RecordingSummary,
+    counters: (&AtomicU64, &AtomicU64),
+    recording_dir: &Path,
+    manifest_path: &Path,
+) -> Result<()> {
+    if let Some(raw) = raw {
+        raw.flush()?;
+        raw.get_ref().sync_all()?;
+    }
+    // Final flush and manifest update. Never mark an incomplete capture finalized.
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    if capture_failed.load(Ordering::SeqCst) {
+        anyhow::bail!("recording capture failed; refusing successful finalization");
+    }
+    summary.event_count = counters.0.load(Ordering::SeqCst);
+    summary.payload_bytes = counters.1.load(Ordering::SeqCst);
     summary.total_segment_bytes = compute_total_segment_bytes(recording_dir, &summary.segments);
     summary.ended_epoch_ms = Some(epoch_millis_now());
-    write_manifest(manifest_path, &summary)?;
-    Ok(summary)
+    write_manifest(manifest_path, summary)?;
+    Ok(())
+}
+
+fn prepare_writer_files(
+    recording_dir: &Path,
+    segment_path: &Path,
+    ready: &mpsc::SyncSender<Result<()>>,
+) -> Result<(std::fs::File, Option<BufWriter<std::fs::File>>)> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(segment_path)
+        .and_then(|file| {
+            file.sync_all()?;
+            std::fs::File::open(recording_dir)?.sync_all()?;
+            Ok(file)
+        });
+    let raw = if recording_dir.join("process-capture").try_exists()? {
+        Some(BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(recording_dir.join("output.live"))?,
+        ))
+    } else {
+        None
+    };
+    let file = match file {
+        Ok(file) => {
+            ready
+                .send(Ok(()))
+                .context("capture readiness receiver closed")?;
+            file
+        }
+        Err(error) => {
+            let message = format!("failed opening segment {}: {error}", segment_path.display());
+            let _ = ready.send(Err(anyhow::anyhow!(message.clone())));
+            anyhow::bail!(message);
+        }
+    };
+    Ok((file, raw))
 }
 
 fn prune_closed_segments(
@@ -1156,7 +1297,7 @@ fn write_manifest(path: &Path, summary: &RecordingSummary) -> Result<()> {
         summary: summary.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&payload)?;
-    std::fs::write(path, bytes)
+    crate::durable::write_atomic(path, &bytes)
         .with_context(|| format!("failed writing recording manifest {}", path.display()))
 }
 
@@ -1278,6 +1419,53 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bmux-recording-test-{nanos}"));
         fs::create_dir_all(&dir).expect("temp dir should be created");
         dir
+    }
+
+    #[test]
+    fn oversized_capture_cannot_finalize_as_success() {
+        let root = temp_dir();
+        let mut runtime = RecordingRuntime::new(root.clone(), 8, 1);
+        runtime
+            .start(
+                None,
+                false,
+                None,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .unwrap();
+        let result = runtime.record(
+            RecordingEventKind::PaneOutputRaw,
+            RecordingPayload::Bytes {
+                data: vec![0; 4 * 1024 * 1024 + 1],
+            },
+            RecordMeta {
+                session_id: None,
+                pane_id: None,
+                client_id: None,
+            },
+        );
+        assert!(result.is_err());
+        assert!(runtime.stop(None).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capture_ready_means_segment_exists_before_return() {
+        let root = temp_dir();
+        let mut runtime = RecordingRuntime::new(root.clone(), 8, 1);
+        let summary = runtime
+            .start(
+                None,
+                false,
+                None,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .unwrap();
+        assert!(Path::new(&summary.path).join("events_0.bin").is_file());
+        runtime.stop(None).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn write_display_track(path: &Path, frames: &[DisplayTrackEnvelope]) {

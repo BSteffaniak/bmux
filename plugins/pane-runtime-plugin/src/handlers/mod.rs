@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod attach_commands;
 pub mod attach_state;
+mod execution;
 pub mod padding;
 pub mod pane_commands;
 pub mod pane_state;
@@ -32,6 +33,30 @@ mod spawn;
 )]
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
+        "pane-runtime-execution-v1", "new-program-session" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::client::NewProgramSessionRequest, ctx| {
+            let spawn_context = ctx.clone();
+            Ok::<_, ServiceResponse>(crate::runtime::execution::create(req.name, req.options, move |id| {
+                spawn::authorize_creation(&spawn_context, id, "session.create").map_err(crate::runtime::spawn_failure)
+            }))
+        },
+        "pane-runtime-execution-v1", "screen" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::client::ScreenRequest, ctx| {
+            Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::screen(&req.execution)))
+        },
+        "pane-runtime-execution-v1", "status" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::client::StatusRequest, ctx| {
+            Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::status(&req.execution)))
+        },
+        "pane-runtime-execution-v1", "send" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::client::SendRequest, ctx| {
+            Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "pane.direct_input").and_then(|()| crate::runtime::execution::send(&req.execution, req.data)))
+        },
+        "pane-runtime-execution-v1", "resize" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::client::ResizeRequest, ctx| {
+            Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "pane.resize").and_then(|()| crate::runtime::execution::resize(&req.execution, req.cols, req.rows)))
+        },
+        "pane-runtime-execution-v1", "wait" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::client::WaitRequest, ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::execution::wait(&req.execution, req.timeout_ms, || execution::authorize(ctx, &req.execution, "read")))
+        },
+        "pane-runtime-execution-v1", "terminate" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::client::TerminateRequest, ctx| {
+            Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "pane.close").and_then(|()| crate::runtime::execution::terminate(&req.execution, req.grace_ms, || execution::authorize(ctx, &req.execution, "pane.close"))))
+        },
         "pane-runtime-spawn-commands-v1", "new-session" => |req: bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::NewSessionRequest, ctx| {
             let result = crate::runtime::new_session_v1(req, |session_id| {
                 spawn::authorize_creation(ctx, session_id, "session.create").map_err(crate::runtime::spawn_failure)

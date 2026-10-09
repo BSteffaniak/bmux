@@ -1,0 +1,97 @@
+//! Bounded raw capture, independent of publication and terminal projection.
+use std::io::{self, Read};
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::thread::JoinHandle;
+
+pub(super) struct StartupReader {
+    receiver: Receiver<io::Result<Vec<u8>>>,
+    pending: Vec<u8>,
+    offset: usize,
+}
+
+impl Read for StartupReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        if self.offset == self.pending.len() {
+            self.pending = match self.receiver.recv() {
+                Ok(chunk) => chunk?,
+                Err(_) => return Ok(0),
+            };
+            self.offset = 0;
+        }
+        let count = output.len().min(self.pending.len() - self.offset);
+        output[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+
+pub(super) fn start(mut raw: Box<dyn Read + Send>) -> io::Result<(StartupReader, JoinHandle<()>)> {
+    // At most 32 * 8192 raw bytes queued; saturation backpressures the PTY.
+    let (sender, receiver) = sync_channel(32);
+    let thread = std::thread::Builder::new()
+        .name("bmux-pty-startup-capture".into())
+        .spawn(move || {
+            let mut buffer = [0; 8192];
+            loop {
+                let chunk = raw.read(&mut buffer).map(|count| buffer[..count].to_vec());
+                let done = chunk.as_ref().is_err() || chunk.as_ref().is_ok_and(Vec::is_empty);
+                if sender.send(chunk).is_err() || done {
+                    break;
+                }
+            }
+        })?;
+    Ok((
+        StartupReader {
+            receiver,
+            pending: Vec::new(),
+            offset: 0,
+        },
+        thread,
+    ))
+}
+
+pub(super) async fn acknowledge_cleanup(
+    thread: JoinHandle<()>,
+    cleanup: &tokio::sync::watch::Sender<Option<Result<(), String>>>,
+    previous: Option<Result<(), String>>,
+    reason: String,
+) -> String {
+    let mut threads = [Some(thread)];
+    let capture_result =
+        super::join_supervision_threads(&mut threads, std::time::Duration::from_secs(4)).await;
+    let result = match (previous.unwrap_or(Ok(())), capture_result) {
+        (Ok(()), capture) => capture,
+        (Err(process), Ok(())) => Err(process),
+        (Err(process), Err(capture)) => Err(format!("{process}; {capture}")),
+    };
+    let reason = match &result {
+        Ok(()) => reason,
+        Err(error) => format!("{reason}; startup capture cleanup failed: {error}"),
+    };
+    cleanup.send_replace(Some(result));
+    // Retain thread ownership after an explicit timeout until it really settles.
+    while threads.iter().flatten().any(|thread| !thread.is_finished()) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let _ = super::join_supervision_threads(&mut threads, std::time::Duration::ZERO).await;
+    reason
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    #[test]
+    fn immediate_bytes_survive_delayed_publication() {
+        let bytes = b"literal;$(no-shell)".to_vec();
+        let (mut reader, capture) =
+            super::start(Box::new(std::io::Cursor::new(bytes.clone()))).unwrap();
+        capture.join().unwrap();
+        let mut captured = Vec::new();
+        reader.read_to_end(&mut captured).unwrap();
+        assert_eq!(captured, bytes);
+    }
+}

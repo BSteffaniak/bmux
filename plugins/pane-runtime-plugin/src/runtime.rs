@@ -1,5 +1,8 @@
 //! Concrete pane runtime implementation owned by the pane-runtime plugin.
 
+pub(crate) mod execution;
+mod startup_capture;
+
 use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::{
     AttachFocusTarget, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
@@ -389,7 +392,7 @@ async fn shutdown_runtime_handle(removed: RemovedRuntime) {
 }
 
 async fn join_supervision_threads(
-    threads: &mut [Option<std::thread::JoinHandle<()>>; 2],
+    threads: &mut [Option<std::thread::JoinHandle<()>>],
     timeout: Duration,
 ) -> std::result::Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -882,7 +885,7 @@ impl PreparedFreshRuntime {
                     .map_err(|_| anyhow::anyhow!("pane startup ended without readiness"))?;
             }
             anyhow::ensure!(
-                !pane.exited.load(Ordering::SeqCst),
+                !pane.exited.load(Ordering::SeqCst) || pane.meta.launch.is_some(),
                 "pane exited before startup commit"
             );
         }
@@ -1193,6 +1196,7 @@ enum SpawnDirectoryProbe {
 }
 
 struct PaneRuntimeHandle {
+    execution: Arc<execution::ExecutionCapture>,
     publication: Arc<StartupPublication>,
     cleanup: watch::Receiver<Option<std::result::Result<(), String>>>,
     startup: watch::Receiver<Option<std::result::Result<(), String>>>,
@@ -1237,8 +1241,17 @@ struct PaneRuntimeHandle {
 }
 
 enum PaneRuntimeCommand {
+    GuardedInput(Vec<u8>, tokio::sync::OwnedSemaphorePermit),
+    GuardedResize {
+        rows: u16,
+        cols: u16,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    },
     Input(Vec<u8>),
-    Resize { rows: u16, cols: u16 },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2932,6 +2945,15 @@ impl PaneRuntimeHandle {
     }
 
     fn resize_pty(&self, rows: u16, cols: u16) {
+        self.resize_pty_admitted(rows, cols, None);
+    }
+
+    fn resize_pty_admitted(
+        &self,
+        rows: u16,
+        cols: u16,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         // Serialize geometry publication with the reader's entire output chunk.
         // The reader acquires size before image state, grid, and output.
         let Ok(mut last) = self.last_requested_size.lock() else {
@@ -3010,9 +3032,15 @@ impl PaneRuntimeHandle {
         }
         tracker.resize(rows, cols);
         *last = (rows, cols);
-        let _ = self
-            .input_tx
-            .send(PaneRuntimeCommand::Resize { rows, cols });
+        let command = match permit {
+            Some(permit) => PaneRuntimeCommand::GuardedResize {
+                rows,
+                cols,
+                _permit: permit,
+            },
+            None => PaneRuntimeCommand::Resize { rows, cols },
+        };
+        let _ = self.input_tx.send(command);
         #[cfg(feature = "image-registry")]
         drop(images);
         drop(tracker);
@@ -5116,7 +5144,7 @@ impl SessionRuntimeManager {
         for pane in pending.panes.values() {
             anyhow::ensure!(
                 matches!(&*pane.startup.borrow(), Some(Ok(())))
-                    && !pane.exited.load(Ordering::SeqCst),
+                    && (!pane.exited.load(Ordering::SeqCst) || pane.meta.launch.is_some()),
                 "pane is not ready for startup commit"
             );
         }
@@ -5159,6 +5187,16 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
     ) -> Result<PreparedFreshRuntime> {
+        self.prepare_fresh_program_runtime(session_id, options, None, (24, 80))
+    }
+
+    fn prepare_fresh_program_runtime(
+        &self,
+        session_id: SessionId,
+        options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
+        launch: Option<PaneLaunchSpec>,
+        size: (u16, u16),
+    ) -> Result<PreparedFreshRuntime> {
         validate_initial_shell_options(options.as_ref())?;
         if self.runtimes.contains_key(&session_id) {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
@@ -5166,22 +5204,27 @@ impl SessionRuntimeManager {
 
         let cleanup = PreparedCleanup::reserve()?;
         let first_pane_id = Uuid::new_v4();
+        let managed_program = launch.is_some();
         let pane_meta = PaneRuntimeMeta {
             id: first_pane_id,
             name: Some("pane-1".to_string()),
             shell: self.shell.clone(),
-            launch: None,
+            launch,
             resurrection: PaneResurrectionSnapshot::default(),
         };
         let (launch, permit) = oneshot::channel();
         let first_pane = self.spawn_pane_runtime_gated(
             session_id,
             pane_meta,
-            (24, 80),
+            size,
             false,
             options,
             Some(permit),
         );
+        first_pane
+            .execution
+            .managed_program
+            .store(managed_program, Ordering::SeqCst);
         let mut panes = BTreeMap::new();
         panes.insert(first_pane_id, first_pane);
 
@@ -5398,6 +5441,11 @@ impl SessionRuntimeManager {
         >,
         launch_permit: Option<oneshot::Receiver<()>>,
     ) -> PaneRuntimeHandle {
+        let program_execution = pane_meta.launch.is_some();
+        let execution = Arc::new(execution::ExecutionCapture::default());
+        let execution_for_reader = Arc::clone(&execution);
+        let execution_for_waiter = Arc::clone(&execution);
+        let execution_for_task = Arc::clone(&execution);
         let publication = Arc::new(StartupPublication::default());
         if launch_permit.is_none() {
             publication.decide(true);
@@ -5587,11 +5635,13 @@ impl SessionRuntimeManager {
                 }
             };
 
-            let application_resume = if launch.is_none()
-                && !matches!(
-                    shell_kind_for_path(&shell),
-                    ShellKind::Bash | ShellKind::Zsh | ShellKind::Fish | ShellKind::Nu
-                ) {
+            let managed_program = execution_for_task.managed_program.load(Ordering::SeqCst);
+            let application_resume = if managed_program
+                || (launch.is_none()
+                    && !matches!(
+                        shell_kind_for_path(&shell),
+                        ShellKind::Bash | ShellKind::Zsh | ShellKind::Fish | ShellKind::Nu
+                    )) {
                 None
             } else {
                 match crate::application_resurrection::prepare(
@@ -5679,10 +5729,53 @@ impl SessionRuntimeManager {
                 fail_startup!("pane startup cancelled before spawn".to_string());
                 return;
             }
+            let spawn_authorization = Arc::clone(&execution_for_task);
+            let authorization =
+                tokio::task::spawn_blocking(move || spawn_authorization.authorize_spawn())
+                    .await
+                    .map_err(|error| anyhow::anyhow!("spawn authorization worker failed: {error}"))
+                    .and_then(std::convert::identity);
+            if let Err(error) = authorization {
+                fail_startup!(format!("execution spawn authorization rejected: {error}"));
+                return;
+            }
+            if startup_stop_requested(&mut stop_rx) {
+                fail_startup!("pane startup cancelled during authorization".to_string());
+                return;
+            }
+            let raw_reader = match pty_pair.master.try_clone_reader() {
+                Ok(reader) => reader,
+                Err(error) => {
+                    fail_startup!(format!("failed to install PTY capture: {error}"));
+                    return;
+                }
+            };
+            let (mut reader, capture_thread) = match startup_capture::start(raw_reader) {
+                Ok(capture) => capture,
+                Err(error) => {
+                    fail_startup!(format!("failed to start PTY capture: {error}"));
+                    return;
+                }
+            };
+            macro_rules! fail_captured_startup {
+                ($reason:expr, $previous:expr) => {{
+                    let reason = $reason;
+                    let previous = $previous;
+                    drop(reader);
+                    drop(pty_pair);
+                    let reason = startup_capture::acknowledge_cleanup(capture_thread, &cleanup_tx, previous, reason).await;
+                    child_spawned = true; // Capture cleanup has supplied the actual acknowledgement.
+                    fail_startup!(reason);
+                }};
+            }
+            let (startup_cleanup_tx, _) = watch::channel(None);
             let mut child = StartupChild::new(match pty_pair.slave.spawn_command(command) {
                 Ok(child) => child,
                 Err(error) => {
-                    fail_startup!(format!("failed to spawn {failed_spawn_label}: {error}"));
+                    fail_captured_startup!(
+                        format!("failed to spawn {failed_spawn_label}: {error}"),
+                        Some(Ok(()))
+                    );
                     return;
                 }
             });
@@ -5696,11 +5789,11 @@ impl SessionRuntimeManager {
                     let reason = cleanup_failed_startup_child_acknowledged(
                         child.take(),
                         format!("application resurrection bind failed: {error}"),
-                        &cleanup_tx,
+                        &startup_cleanup_tx,
                     )
                     .await;
                     resume.close();
-                    fail_startup!(reason);
+                    fail_captured_startup!(reason, startup_cleanup_tx.borrow().clone());
                     return;
                 }
             }
@@ -5718,13 +5811,13 @@ impl SessionRuntimeManager {
                 let reason = cleanup_failed_startup_child_acknowledged(
                     child.take(),
                     "pane startup cancelled".into(),
-                    &cleanup_tx,
+                    &startup_cleanup_tx,
                 )
                 .await;
                 if let Some(resume) = &application_resume {
                     resume.close();
                 }
-                fail_startup!(reason);
+                fail_captured_startup!(reason, startup_cleanup_tx.borrow().clone());
                 return;
             };
             if let Ok(mut identity) = process_start_identity_for_task.lock() {
@@ -5743,26 +5836,23 @@ impl SessionRuntimeManager {
 
             let master = pty_pair.master;
 
-            let mut reader = match master.try_clone_reader() {
-                Ok(reader) => reader,
-                Err(error) => {
-                    let reason = cleanup_failed_startup_child_acknowledged(
-                        child.take(),
-                        format!("failed to open PTY reader: {error}"),
-                        &cleanup_tx,
-                    )
-                    .await;
-                    fail_startup!(reason);
-                    return;
-                }
-            };
             let writer = match master.take_writer() {
                 Ok(writer) => writer,
                 Err(error) => {
                     let reason = cleanup_failed_startup_child_acknowledged(
                         child.take(),
                         format!("failed to open PTY writer: {error}"),
+                        &startup_cleanup_tx,
+                    )
+                    .await;
+                    drop(reader);
+                    drop(master);
+                    let previous = startup_cleanup_tx.borrow().clone();
+                    let reason = startup_capture::acknowledge_cleanup(
+                        capture_thread,
                         &cleanup_tx,
+                        previous,
+                        reason,
                     )
                     .await;
                     fail_startup!(reason);
@@ -5770,6 +5860,10 @@ impl SessionRuntimeManager {
                 }
             };
             let writer = Arc::new(std::sync::Mutex::new(writer));
+            *execution_for_task
+                .master
+                .lock()
+                .expect("new execution master lock") = Some(master);
 
             if launch.is_none()
                 && let Some(command_text) = replay_command.as_deref()
@@ -5812,6 +5906,7 @@ impl SessionRuntimeManager {
                             resurrection.active_command_source = None;
                         }
                     }
+                    execution_for_waiter.record_exit(&wait_result);
                     exited_for_waiter.store(true, Ordering::SeqCst);
                     if let Ok(mut reason) = exit_reason_for_waiter.lock()
                         && reason.is_none()
@@ -5826,6 +5921,7 @@ impl SessionRuntimeManager {
                         child_waiter_done_for_thread.store(true, Ordering::SeqCst);
                         return;
                     }
+                    if !program_execution {
                     push_pane_runtime_notice(
                         session_id,
                         pane_id,
@@ -5834,6 +5930,7 @@ impl SessionRuntimeManager {
                         &output_dirty_for_waiter,
                         "\r\n[bmux] pane process exited; layout preserved. Use restart pane or close pane.\r\n",
                     );
+                    }
                     let _ = pane_exit_tx.send(PaneExitEvent {
                         session_id,
                         pane_id,
@@ -5883,9 +5980,31 @@ impl SessionRuntimeManager {
                         );
 
                     loop {
+                        #[cfg(test)]
+                        if execution_for_reader.inject_reader_failure.load(Ordering::SeqCst) {
+                            execution_for_reader.record_error("injected PTY reader failure".into());
+                            break;
+                        }
                         match reader.read(&mut buffer) {
-                            Ok(0) | Err(_) => break,
+                            Ok(0) => {
+                                execution_for_reader.output_drained.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            Err(error) => {
+                                // Unix PTY masters report EIO when the last slave closes.
+                                if error.raw_os_error() == Some(5) {
+                                    execution_for_reader.output_drained.store(true, Ordering::SeqCst);
+                                } else {
+                                    execution_for_reader.record_error(format!("PTY read failed: {error}"));
+                                }
+                                break;
+                            }
                             Ok(bytes_read) => {
+                                // This watermark describes raw PTY capture, independently
+                                // of optional recording sinks or projection processing.
+                                execution_for_reader.output_watermark.fetch_add(
+                                    u64::try_from(bytes_read).unwrap_or(u64::MAX), Ordering::SeqCst,
+                                );
                                 let (capture_output, capture_reply) = capture_handshake.process(&buffer[..bytes_read], pane_id);
                                 if !capture_reply.is_empty() {
                                     if let Ok(mut writer) = writer_for_reader.lock() {
@@ -5893,6 +6012,11 @@ impl SessionRuntimeManager {
                                     } else { break; }
                                 }
                                 let chunk = capture_output.as_slice();
+                                record_to_all_runtimes(
+                                    RecordingEventKind::PaneOutputRaw,
+                                    RecordingPayload::Bytes { data: chunk.to_vec() },
+                                    RecordMeta { session_id: Some(session_id.0), pane_id: Some(pane_id), client_id: None },
+                                );
                                 // Keep resize requests out until both image state
                                 // and the shared grid have consumed this chunk.
                                 let Ok(requested_size) = last_requested_size_for_reader.lock() else {
@@ -6070,17 +6194,6 @@ impl SessionRuntimeManager {
                                         pane_id,
                                     });
                                 }
-                                record_to_all_runtimes(
-                                    RecordingEventKind::PaneOutputRaw,
-                                    RecordingPayload::Bytes {
-                                        data: chunk.to_vec(),
-                                    },
-                                    RecordMeta {
-                                        session_id: Some(session_id.0),
-                                        pane_id: Some(pane_id),
-                                        client_id: None,
-                                    },
-                                );
                                 #[cfg(feature = "image-registry")]
                                 let reply = image_protocol_reply;
                                 if !reply.is_empty() {
@@ -6107,6 +6220,9 @@ impl SessionRuntimeManager {
                             }
                         }
                     }
+                    if !execution_for_reader.output_drained.load(Ordering::SeqCst) {
+                        execution_for_reader.record_error("PTY reader stopped before EOF".into());
+                    }
                     reader_thread_done_for_thread.store(true, Ordering::SeqCst);
                 })
                 .ok();
@@ -6130,10 +6246,22 @@ impl SessionRuntimeManager {
                     break;
                 }
                 tokio::select! {
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if reader_thread_done.load(Ordering::SeqCst) && !execution_for_task.output_drained.load(Ordering::SeqCst) {
+                            if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
+                                execution_for_task.record_cleanup_error(format!("reader-failure group cleanup failed: {error}"));
+                            }
+                            let _ = child_killer.kill();
+                            break;
+                        }
+                    }
                     _ = &mut stop_rx => {
                         if let Ok(mut state) = resurrection_state_for_shutdown.lock() {
                             state.close_launch();
                             state.frozen = true;
+                        }
+                        if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
+                            execution_for_task.record_cleanup_error(format!("group stop failed: {error}"));
                         }
                         let _ = child_killer.kill();
                         break;
@@ -6144,6 +6272,13 @@ impl SessionRuntimeManager {
                         }
                     }
                     input = input_rx.recv() => {
+                        let (input, _permit) = match input {
+                            Some(PaneRuntimeCommand::GuardedInput(bytes, permit)) =>
+                                (Some(PaneRuntimeCommand::Input(bytes)), Some(permit)),
+                            Some(PaneRuntimeCommand::GuardedResize { rows, cols, _permit: permit }) =>
+                                (Some(PaneRuntimeCommand::Resize { rows, cols }), Some(permit)),
+                            other => (other, None),
+                        };
                         match input {
                             Some(PaneRuntimeCommand::Input(bytes)) => {
                                 if let Ok(mut writer) = writer.lock()
@@ -6151,30 +6286,78 @@ impl SessionRuntimeManager {
                                 {
                                     let _ = writer.flush();
                                 } else {
+                                    execution_for_task.record_error("PTY input write failed".into());
+                                    let _ = child_killer.kill();
                                     break;
                                 }
                             }
                             Some(PaneRuntimeCommand::Resize { rows, cols }) => {
-                                let _ = master.resize(PtySize {
-                                    rows,
-                                    cols,
-                                    pixel_width: 0,
-                                    pixel_height: 0,
-                                });
+                                let resize = execution_for_task.master.lock().ok().and_then(|master| master.as_ref().map(|master| master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })));
+                                if !matches!(resize, Some(Ok(()))) {
+                                    execution_for_task.record_error("PTY resize failed".into());
+                                }
                             }
+                            Some(PaneRuntimeCommand::GuardedInput(..) | PaneRuntimeCommand::GuardedResize { .. }) => unreachable!("guarded command normalized"),
                             None => break,
                         }
                     }
                 }
             }
 
+            // A program's exit is not EOF: preserve the master while the
+            // reader drains buffered bytes and descendants still hold the slave.
+            if program_execution && startup_ready {
+                while !reader_thread_done.load(Ordering::SeqCst) {
+                    if !execution_for_task.output_drained.load(Ordering::SeqCst)
+                        && execution_for_task
+                            .outcome
+                            .lock()
+                            .ok()
+                            .is_some_and(|outcome| outcome.2.is_some())
+                    {
+                        if let Err(error) =
+                            execution_for_task.signal_owned_group(execution::GROUP_KILL)
+                        {
+                            execution_for_task.record_cleanup_error(format!(
+                                "failed-reader group cleanup failed: {error}"
+                            ));
+                        }
+                        let _ = child_killer.kill();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if !execution_for_task.output_drained.load(Ordering::SeqCst) {
+                    if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL)
+                    {
+                        execution_for_task.record_cleanup_error(format!(
+                            "reader-failure group cleanup failed: {error}"
+                        ));
+                    }
+                    let _ = child_killer.kill();
+                }
+            }
             drop(writer);
-            drop(master);
+            // Retain the master until supervision settles; exact controls can
+            // terminate descendants even after the direct child was reaped.
+            if execution_for_task.output_drained.load(Ordering::SeqCst) && !program_execution {
+                execution_for_task
+                    .master
+                    .lock()
+                    .expect("master lock")
+                    .take();
+            }
             // Never occupy a blocking-pool worker with an unbounded join.
             // A timeout is an explicit failure, not acknowledged restoration.
-            let mut threads = [child_waiter, reader_thread];
+            let mut threads = [child_waiter, reader_thread, Some(capture_thread)];
             let cleanup_result =
                 join_supervision_threads(&mut threads, Duration::from_secs(4)).await;
+            let cleanup_result = cleanup_result.and_then(|()| {
+                if execution_for_task.cleanup_failed.load(Ordering::SeqCst) {
+                    Err("execution group cleanup failed; recovery required".into())
+                } else {
+                    Ok(())
+                }
+            });
             cleanup_tx.send_replace(Some(cleanup_result));
             // Deadline failure is already visible. Keep the handles and the
             // owning task alive so unpublished cleanup retains its admission
@@ -6194,6 +6377,7 @@ impl SessionRuntimeManager {
             .get(&(session_id, pane_meta.id))
             .copied();
         PaneRuntimeHandle {
+            execution,
             publication,
             startup,
             cleanup,
@@ -10154,7 +10338,7 @@ fn encode_captured_image_window(
 }
 
 #[derive(Clone)]
-struct SpawnRuntimeHandle(Arc<Mutex<SessionRuntimeManager>>);
+struct SpawnRuntimeHandle(Arc<Mutex<SessionRuntimeManager>>, tokio::runtime::Handle);
 
 #[derive(Debug)]
 struct SpawnFailure(bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError);
@@ -11060,7 +11244,10 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
     ));
 
     bmux_plugin::global_plugin_state_registry().register::<SpawnRuntimeHandle>(&Arc::new(
-        std::sync::RwLock::new(SpawnRuntimeHandle(Arc::clone(&manager))),
+        std::sync::RwLock::new(SpawnRuntimeHandle(
+            Arc::clone(&manager),
+            tokio::runtime::Handle::current(),
+        )),
     ));
     let expiry_manager = Arc::clone(&manager);
     tokio::spawn(async move {
@@ -11118,6 +11305,234 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn program_first_pane_captures_fast_literal_argv_and_drains() {
+        let session_id = SessionId(Uuid::new_v4());
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let mut manager = SessionRuntimeManager::new(
+            "/bin/sh".into(),
+            "xterm-256color".into(),
+            protocol_profile_for_term("xterm-256color"),
+            true,
+            None,
+            PanePaddingConfig::default(),
+            exit_tx,
+        );
+        let mut prepared = manager
+            .prepare_fresh_program_runtime(
+                session_id,
+                None,
+                Some(PaneLaunchSpec {
+                    program: "/usr/bin/printf".into(),
+                    args: vec!["%s".into(), "literal;$(no-shell)".into()],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                }),
+                (17, 73),
+            )
+            .unwrap();
+        prepared.wait_until_ready().await.unwrap();
+        manager
+            .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
+            .unwrap();
+        let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pane.execution.output_drained.load(Ordering::SeqCst)
+                || !pane.exited.load(Ordering::SeqCst)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pane.execution.output_watermark.load(Ordering::SeqCst), 19);
+        assert_eq!(pane.execution.outcome.lock().unwrap().0, Some(0));
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (17, 73));
+        assert!(pane.meta.launch.is_some());
+    }
+
+    struct ExecutionTestCleanup(Arc<execution::ExecutionCapture>);
+    impl Drop for ExecutionTestCleanup {
+        fn drop(&mut self) {
+            if let Err(error) = self.0.signal_owned_group(execution::GROUP_KILL) {
+                eprintln!("test process cleanup requires recovery: {error}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    struct WitnessProcessCleanup {
+        pid: u32,
+        identity: ProcessStartIdentity,
+    }
+    #[cfg(unix)]
+    impl Drop for WitnessProcessCleanup {
+        fn drop(&mut self) {
+            if process_start_identity_for_pid(self.pid) == Some(self.identity)
+                && let Ok(pid) = i32::try_from(self.pid)
+            {
+                // SAFETY: test-owned witness PID is checked against its start identity.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_pty_group_survives_leader_then_is_killed() {
+        let session_id = SessionId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
+        manager.runtimes.clear();
+        let witness = tempfile::tempdir().unwrap();
+        let mut prepared = manager.prepare_fresh_program_runtime(session_id, None, Some(PaneLaunchSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), r#"trap '' HUP TERM
+/bin/sh -c 'trap "" HUP TERM; printf "%s" "$$" > "$1/descendant.pid"; touch "$1/ready"; while :; do sleep 1; done' fixture "$1" < /dev/tty > /dev/tty 2>&1 &
+while [ ! -f "$1/ready" ]; do sleep 0.01; done
+exit 0"#.into(), "fixture".into(), witness.path().to_string_lossy().into_owned()],
+            cwd: None, env: BTreeMap::new(),
+        }), (24, 80)).unwrap();
+        let _cleanup = ExecutionTestCleanup(Arc::clone(
+            &prepared
+                .runtime
+                .as_ref()
+                .unwrap()
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .execution,
+        ));
+        prepared.wait_until_ready().await.unwrap();
+        manager
+            .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
+            .unwrap();
+        let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pane.exited.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let descendant: u32 = std::fs::read_to_string(witness.path().join("descendant.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let identity = process_start_identity_for_pid(descendant)
+            .expect("descendant must remain live after leader exit");
+        let _witness_cleanup = WitnessProcessCleanup {
+            pid: descendant,
+            identity,
+        };
+        let descendant_group =
+            resolve_process_group_id_for_pid(descendant).expect("descendant group");
+        assert_eq!(
+            Some(descendant_group),
+            *pane.process_group_id.lock().unwrap()
+        );
+        // TERM must not kill the witness: traps were installed before ready.
+        assert!(pane.execution.signal_owned_group(libc::SIGTERM).unwrap());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
+        assert!(!pane.execution.output_drained.load(Ordering::SeqCst));
+        assert!(pane.execution.signal_owned_group(libc::SIGKILL).unwrap());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(&*pane.cleanup.borrow(), Some(Ok(()))) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(pane.execution.output_drained.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while process_start_identity_for_pid(descendant) == Some(identity) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant must be reaped after owned group kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn injected_reader_failure_cleans_live_process_and_acknowledges_threads() {
+        let session_id = SessionId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
+        manager.runtimes.clear();
+        let mut prepared = manager
+            .prepare_fresh_program_runtime(
+                session_id,
+                None,
+                Some(PaneLaunchSpec {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "while :; do printf x; sleep 0.05; done".into()],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                }),
+                (24, 80),
+            )
+            .unwrap();
+        let _cleanup = ExecutionTestCleanup(Arc::clone(
+            &prepared
+                .runtime
+                .as_ref()
+                .unwrap()
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .execution,
+        ));
+        prepared
+            .runtime
+            .as_ref()
+            .unwrap()
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .execution
+            .inject_reader_failure
+            .store(true, Ordering::SeqCst);
+        prepared.wait_until_ready().await.unwrap();
+        manager
+            .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
+            .unwrap();
+        let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pane.cleanup.borrow().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reader cleanup acknowledgement timed out");
+        let cleanup = pane
+            .cleanup
+            .borrow()
+            .clone()
+            .expect("cleanup acknowledgement");
+        assert!(
+            cleanup.is_ok(),
+            "reader cleanup explicitly failed: {cleanup:?}; outcome: {:?}",
+            pane.execution.outcome.lock().unwrap()
+        );
+        assert!(pane.exited.load(Ordering::SeqCst));
+        assert!(!pane.execution.output_drained.load(Ordering::SeqCst));
+        assert!(
+            pane.execution
+                .outcome
+                .lock()
+                .unwrap()
+                .2
+                .as_ref()
+                .unwrap()
+                .contains("injected")
+        );
+    }
+
     #[test]
     fn spawn_cleanup_preserves_typed_denial_and_reports_cleanup_failure() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
@@ -12859,6 +13274,7 @@ mod tests {
             let _ = stop_rx.await;
         });
         PaneRuntimeHandle {
+            execution: Arc::new(execution::ExecutionCapture::default()),
             publication: Arc::new(StartupPublication::default()),
             startup: watch::channel(Some(Ok(()))).1,
             cleanup: watch::channel(Some(Ok(()))).1,
@@ -17905,10 +18321,11 @@ mod tests {
                 }
             },
         );
-        assert!(matches!(
-            spawn_wire_error(denied.unwrap_err()),
-            SpawnError::Denied { .. }
-        ));
+        let denied = spawn_wire_error(denied.unwrap_err());
+        assert!(
+            matches!(denied, SpawnError::Denied { .. }),
+            "unexpected split rejection: {denied:?}"
+        );
         assert_eq!(checks.load(Ordering::SeqCst), 2);
         assert_eq!(
             adapter.inner.lock().unwrap().runtimes[&session].panes.len(),

@@ -31,7 +31,7 @@ const PANE_RUNTIME_PLUGIN_SNAPSHOT_ID: PluginEventKind =
 
 /// Current schema version for pane-runtime snapshots. Bump on any
 /// breaking change to [`PaneRuntimeSnapshotV1`] or its descendants.
-const PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION: u32 = 2;
+const PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION: u32 = 3;
 
 /// Combined pane-runtime snapshot — one entry per session.
 ///
@@ -71,9 +71,19 @@ pub struct PaneRuntimeSessionSnapshotV1 {
     pub floating_surfaces: Vec<PaneRuntimeSnapshotV1FloatingSurface>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionResumePolicy {
+    #[default]
+    Resumable,
+    Nonresumable,
+}
+
 /// Per-pane record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneRuntimeSnapshotV1Pane {
+    #[serde(default)]
+    pub resume_policy: ExecutionResumePolicy,
     #[serde(default)]
     pub execution_token: Option<String>,
     pub id: Uuid,
@@ -216,6 +226,7 @@ impl PaneRuntimeStateful {
 /// Walk the registered session-runtime handle and produce a real
 /// pane-runtime payload for persistence.
 fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
+    let managed_programs = crate::runtime::execution::managed_program_ids()?;
     let sessions = session_handle().0.list_sessions();
     let runtime_manager = session_runtime_handle();
     let padding_overrides = bmux_plugin::global_plugin_state_registry()
@@ -243,6 +254,11 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
                     .and_then(|identity| identity.process_group_id);
 
                 PaneRuntimeSnapshotV1Pane {
+                    resume_policy: if managed_programs.contains(&pane.id) {
+                        ExecutionResumePolicy::Nonresumable
+                    } else {
+                        ExecutionResumePolicy::Resumable
+                    },
                     execution_token: pane.resurrection.execution_token,
                     id: pane.id,
                     name: pane.name,
@@ -304,7 +320,23 @@ fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
 /// sessions-plugin participant's responsibility, restored earlier in
 /// the envelope iteration), reconstruct the pane runtime via
 /// `SessionRuntimeManager::restore_runtime`.
+fn validate_resume_policy(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<()> {
+    if let Some(pane) = payload
+        .sessions
+        .iter()
+        .flat_map(|session| &session.panes)
+        .find(|pane| pane.resume_policy == ExecutionResumePolicy::Nonresumable)
+    {
+        anyhow::bail!(
+            "execution {} is nonresumable; original process authority was lost; explicit recovery required (argv will not be replayed)",
+            pane.id
+        );
+    }
+    Ok(())
+}
+
 fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<()> {
+    validate_resume_policy(payload)?;
     let session_manager = session_handle();
     let runtime_manager = session_runtime_handle();
     let padding_handle = bmux_plugin::global_plugin_state_registry()
@@ -470,11 +502,11 @@ impl StatefulPlugin for PaneRuntimeStateful {
 fn decode_pane_runtime_snapshot(
     snapshot: &StatefulPluginSnapshot,
 ) -> StatefulPluginResult<PaneRuntimeSnapshotV1> {
-    if ![1, PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION].contains(&snapshot.version) {
+    if ![1, 2, PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION].contains(&snapshot.version) {
         return Err(StatefulPluginError::UnsupportedVersion {
             plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
             version: snapshot.version,
-            expected: vec![1, PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION],
+            expected: vec![1, 2, PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION],
         });
     }
     let bytes = if snapshot.version == 1 {
@@ -556,8 +588,8 @@ mod tests {
     }
 
     #[test]
-    fn current_snapshot_version_is_two() {
-        assert_eq!(PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION, 2);
+    fn current_snapshot_version_is_three() {
+        assert_eq!(PANE_RUNTIME_PLUGIN_SNAPSHOT_VERSION, 3);
     }
 
     #[test]
@@ -601,6 +633,7 @@ mod tests {
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
                 session_id,
                 panes: vec![PaneRuntimeSnapshotV1Pane {
+                    resume_policy: super::ExecutionResumePolicy::Resumable,
                     execution_token: None,
                     id: pane_id,
                     name: Some("editor".into()),
@@ -681,6 +714,7 @@ mod tests {
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
                 session_id,
                 panes: vec![PaneRuntimeSnapshotV1Pane {
+                    resume_policy: super::ExecutionResumePolicy::Resumable,
                     execution_token: None,
                     id: pane_id,
                     name: Some("remote-a".into()),
@@ -737,6 +771,7 @@ mod tests {
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
                 session_id,
                 panes: vec![PaneRuntimeSnapshotV1Pane {
+                    resume_policy: super::ExecutionResumePolicy::Resumable,
                     execution_token: None,
                     id: pane_id,
                     name: Some("pane-1".into()),
@@ -797,9 +832,26 @@ mod tests {
     }
 
     #[test]
+    fn nonresumable_restore_rejects_before_any_argv_launch() {
+        let pane_id = Uuid::new_v4();
+        let payload: super::PaneRuntimeSnapshotV1 = serde_json::from_value(serde_json::json!({
+            "sessions": [{ "session_id": Uuid::new_v4(), "panes": [{
+                "id": pane_id, "shell": "/bin/sh", "resume_policy": "nonresumable",
+                "launch_command": { "program": "/usr/bin/touch", "args": ["must-not-replay"] }
+            }]}]
+        }))
+        .unwrap();
+        // No manager is needed: validation precedes all restore side effects.
+        let error = super::apply_pane_runtime_payload(&payload).unwrap_err();
+        assert!(error.to_string().contains("nonresumable"));
+        assert!(error.to_string().contains(&pane_id.to_string()));
+    }
+
+    #[test]
     fn schema_omits_absent_padding_override_and_decodes_it_as_none() {
         let pane_id = Uuid::new_v4();
         let pane = PaneRuntimeSnapshotV1Pane {
+            resume_policy: super::ExecutionResumePolicy::Resumable,
             execution_token: None,
             id: pane_id,
             name: None,

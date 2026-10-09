@@ -5,6 +5,69 @@ plugin bmux.recording version 1;
 capability RECORDING_READ = bmux.recording.read;
 capability RECORDING_WRITE = bmux.recording.write;
 
+// Process authority is local to the dedicated, isolated runtime. A run ID is
+// never interpreted as a live user-runtime execution.
+@capability(RECORDING_WRITE)
+interface recording-process-v1 {
+    record program-options {
+        program: string,
+        args: list<string>,
+        cwd: string?,
+        env: map<string, string>,
+        cols: u16,
+        rows: u16,
+        profile: recording-types.recording-profile,
+    }
+    record execution-ref {
+        session_id: uuid,
+        pane_id: uuid,
+        execution_token: uuid,
+    }
+    enum run-phase { starting, running, exited, failed, finalized }
+    record run-status {
+        schema_version: u32,
+        run_id: uuid,
+        revision: u64,
+        recording_id: uuid,
+        execution: execution-ref?,
+        runtime_root: string,
+        phase: run-phase,
+        exit_code: u32?,
+        output_drained: bool,
+        output_watermark: u64,
+        capture_finalized: bool,
+        errors: list<string>,
+    }
+    record output-read {
+        run_id: uuid,
+        since: u64,
+        next_cursor: u64,
+        data: bytes,
+        complete: bool,
+    }
+    variant process-error {
+        not-found,
+        invalid-options { reason: string },
+        unavailable { reason: string },
+        stale-revision,
+        still-running,
+        capture-failed { reason: string },
+        operation-failed { reason: string },
+    }
+    // Start is admitted only on a dedicated empty runtime, after capture readiness.
+    command start(options: program-options, runtime_root: string)
+        -> result<run-status, process-error>;
+    command status(run_id: uuid) -> result<run-status, process-error>;
+    command read(run_id: uuid, since: u64, max_bytes: u32)
+        -> result<output-read, process-error>;
+    command screen(run_id: uuid) -> result<string, process-error>;
+    command send(run_id: uuid, data: bytes, mutation_id: uuid) -> result<unit, process-error>;
+    command wait(run_id: uuid, timeout_ms: u32) -> result<run-status, process-error>;
+    command terminate(run_id: uuid, grace_ms: u32) -> result<run-status, process-error>;
+    command finish(run_id: uuid, expected_revision: u64, terminate_running: bool)
+        -> result<run-status, process-error>;
+}
+
 interface recording-types {
     enum recording-profile {
         full,

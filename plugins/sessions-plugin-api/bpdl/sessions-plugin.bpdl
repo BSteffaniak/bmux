@@ -9,9 +9,35 @@
 
 plugin bmux.sessions version 1;
 
+capability SESSIONS_PROGRAM_V1 = bmux.sessions.program.v1;
 capability SESSIONS_READ = bmux.sessions.read;
 capability SESSIONS_WRITE = bmux.sessions.write;
 capability SESSIONS_SPAWN_V1 = bmux.sessions.spawn.v1;
+
+@capability(SESSIONS_PROGRAM_V1)
+interface sessions-program-v1 {
+    record program-options {
+        program: string,
+        args: list<string>,
+        cwd: string?,
+        env: map<string, string>,
+        cols: u16,
+        rows: u16,
+    }
+    record execution-ref {
+        session_id: uuid,
+        pane_id: uuid,
+        execution_token: uuid,
+    }
+    variant program-error {
+        unavailable,
+        denied { reason: string },
+        invalid-options { reason: string },
+        launch-failed { reason: string },
+    }
+    command new-program-session(name: string?, options: program-options)
+        -> result<execution-ref, program-error>;
+}
 
 @capability(SESSIONS_SPAWN_V1)
 interface sessions-spawn-v1 {

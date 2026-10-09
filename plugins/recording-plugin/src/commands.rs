@@ -1222,7 +1222,7 @@ fn all_recording_event_kinds() -> Vec<RecordingEventKind> {
     ]
 }
 
-fn default_event_kinds_for_profile(
+pub(crate) fn default_event_kinds_for_profile(
     profile: recording_types::RecordingProfile,
     capture_input: bool,
 ) -> Vec<recording_types::RecordingEventKind> {
