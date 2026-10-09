@@ -167,6 +167,15 @@ pub struct RecordingPlugin;
 impl RustPlugin for RecordingPlugin {
     type Contract = bmux_recording_plugin_api::Contract;
 
+    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        let mut services =
+            <Self::Contract as bmux_plugin_sdk::PluginContract>::service_declarations()?;
+        // Schema availability is not runtime support. Keep recovery unexported
+        // until durable handlers and their required authority are coherent.
+        services.retain(|service| service.interface_id != "recording-process-recovery-v2");
+        Ok(services)
+    }
+
     fn activate(
         &mut self,
         _context: NativeLifecycleContext,

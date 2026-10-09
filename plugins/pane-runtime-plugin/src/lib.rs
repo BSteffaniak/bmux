@@ -16,6 +16,7 @@ use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use std::collections::BTreeMap;
 
 mod application_resurrection;
+mod atomic_state;
 mod capture_handshake;
 mod commands;
 mod handlers;
@@ -25,6 +26,26 @@ mod private_input;
 mod runtime;
 mod snapshot;
 mod snapshot_v1_migration;
+mod supervisor_protocol;
+
+#[cfg(test)]
+mod contract_tests {
+    #[test]
+    fn unfinished_execution_contract_is_not_discoverable() {
+        use bmux_plugin_sdk::RustPlugin;
+        let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        assert!(
+            services
+                .iter()
+                .all(|service| service.capability.as_str() != "bmux.pane_runtime.execution.v2")
+        );
+        assert!(
+            services
+                .iter()
+                .any(|service| service.capability.as_str() == "bmux.pane_runtime.execution.v1")
+        );
+    }
+}
 
 #[derive(Default)]
 pub struct PaneRuntimePlugin;
@@ -33,13 +54,16 @@ impl RustPlugin for PaneRuntimePlugin {
     type Contract = bmux_pane_runtime_plugin_api::Contract;
 
     fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        // The spawn-v1 contracts are not advertised until their execution-side
-        // handlers exist. Schema availability alone is not runtime support.
+        // Modeled contracts do not imply runtime support: keep incomplete
+        // spawn-v1 and execution-v2 services out of runtime discovery.
         let mut services =
             <Self::Contract as bmux_plugin_sdk::PluginContract>::service_declarations()?;
         services.retain(|service| {
-            service.capability.as_str()
-                != bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_SPAWN_V1.as_str()
+            let capability = service.capability.as_str();
+            capability != bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_SPAWN_V1.as_str()
+                && capability
+                    != bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_EXECUTION_V2
+                        .as_str()
         });
         Ok(services)
     }
@@ -49,6 +73,8 @@ impl RustPlugin for PaneRuntimePlugin {
         context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
         application_resurrection::activate(&context);
+        runtime::supervisor::activate(&context);
+        runtime::reservations::activate(&context);
         // Register the focus-state channel so subscribers (e.g.
         // the decoration plugin) can observe the focused pane per
         // session. Seeded empty — `publish_focus_state_snapshot`

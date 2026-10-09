@@ -11,23 +11,32 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-anyhow                    = { workspace = true, features = ["std"] }
-bmux_codec                = { workspace = true }
-bmux_ipc                  = { workspace = true }
-bmux_plugin_schema_macros = { workspace = true }
-bmux_plugin_sdk           = { workspace = true }
-bmux_recording_protocol   = { workspace = true }
-bmux_recording_runtime    = { workspace = true }
-serde                     = { workspace = true, features = ["derive", "std"] }
-serde_json                = { workspace = true, features = ["std"] }
-tracing                   = { workspace = true, features = ["std"] }
-uuid                      = { workspace = true, features = ["serde", "std", "v4"] }
+anyhow     = { workspace = true, features = ["std"] }
+bmux_codec = { workspace = true }
+# BPDL imports emit fully qualified references to the pane contract crate.
+bmux_ipc                     = { workspace = true }
+bmux_pane_runtime_plugin_api = { workspace = true }
+bmux_plugin_schema_macros    = { workspace = true }
+bmux_plugin_sdk              = { workspace = true }
+bmux_recording_protocol      = { workspace = true }
+bmux_recording_runtime       = { workspace = true }
+serde                        = { workspace = true, features = ["derive", "std"] }
+serde_json                   = { workspace = true, features = ["std"] }
+tracing                      = { workspace = true, features = ["std"] }
+uuid                         = { workspace = true, features = ["serde", "std", "v4"] }
 
 [package.metadata.cargo-machete]
 # These deps are consumed by code generated from the BPDL schema via the
 # `bmux_plugin_schema_macros::schema!` proc macro; cargo-machete cannot see
 # into proc-macro-generated source.
-ignored = ["bmux_codec", "bmux_ipc", "bmux_plugin_sdk", "serde", "uuid"]
+ignored = [
+    "bmux_codec",
+    "bmux_ipc",
+    "bmux_plugin_sdk",
+    # BPDL pane.* imports generate fully qualified pane-runtime v2 contract
+    # references through schema!; cargo-machete cannot trace that expansion.
+    "bmux_pane_runtime_plugin_api",
+]
 
 [features]
 default          = []

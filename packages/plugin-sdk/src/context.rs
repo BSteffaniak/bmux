@@ -116,6 +116,15 @@ pub struct ActiveKeybinding {
     pub action: String,
 }
 
+/// Verified auxiliary artifact observation. The checksum identifies the exact
+/// bytes inspected by the host, not a trusted signing identity or launch lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedAuxiliaryExecutable {
+    pub path: String,
+    pub protocol_version: u32,
+    pub artifact_sha256: String,
+}
+
 /// Context passed to [`RustPlugin::activate`] and [`RustPlugin::deactivate`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeLifecycleContext {
@@ -155,6 +164,56 @@ pub struct NativeLifecycleContext {
     /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,
+    /// Negotiated native ABI 1.1 owner-local artifact observations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub auxiliary_executables: BTreeMap<String, ResolvedAuxiliaryExecutable>,
+    /// Missing/invalid artifacts do not disable baseline activation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub auxiliary_executable_errors: BTreeMap<String, String>,
+}
+
+/// Exact native ABI 1.0 lifecycle wire snapshot. Keep its field order and
+/// adapters frozen; additions to `NativeLifecycleContext` must not alter this.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeLifecycleContextV1 {
+    pub plugin_id: String,
+    pub required_capabilities: Vec<String>,
+    pub provided_capabilities: Vec<String>,
+    pub services: Vec<RegisteredService>,
+    pub available_capabilities: Vec<String>,
+    pub enabled_plugins: Vec<String>,
+    pub plugin_search_roots: Vec<String>,
+    pub registered_plugins: Vec<RegisteredPluginInfo>,
+    pub host: HostMetadata,
+    pub connection: HostConnectionInfo,
+    #[serde(default, with = "toml_value_option")]
+    pub settings: Option<toml::Value>,
+    #[serde(default, with = "toml_value_map")]
+    pub plugin_settings_map: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub host_kernel_bridge: Option<HostKernelBridge>,
+}
+
+impl NativeLifecycleContext {
+    /// Explicit frozen snapshot for lifecycle dispatch to native ABI 1.0.
+    #[must_use]
+    pub fn legacy_wire_snapshot(&self) -> NativeLifecycleContextV1 {
+        NativeLifecycleContextV1 {
+            plugin_id: self.plugin_id.clone(),
+            required_capabilities: self.required_capabilities.clone(),
+            provided_capabilities: self.provided_capabilities.clone(),
+            services: self.services.clone(),
+            available_capabilities: self.available_capabilities.clone(),
+            enabled_plugins: self.enabled_plugins.clone(),
+            plugin_search_roots: self.plugin_search_roots.clone(),
+            registered_plugins: self.registered_plugins.clone(),
+            host: self.host.clone(),
+            connection: self.connection.clone(),
+            settings: self.settings.clone(),
+            plugin_settings_map: self.plugin_settings_map.clone(),
+            host_kernel_bridge: self.host_kernel_bridge,
+        }
+    }
 }
 
 /// Context passed to [`RustPlugin::run_command`].

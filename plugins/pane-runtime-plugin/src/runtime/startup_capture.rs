@@ -3,6 +3,41 @@ use std::io::{self, Read};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::JoinHandle;
 
+pub(super) struct CaptureOwner {
+    thread: Option<JoinHandle<()>>,
+    runtime: tokio::runtime::Handle,
+}
+impl CaptureOwner {
+    pub(super) fn new(thread: JoinHandle<()>) -> Self {
+        Self {
+            thread: Some(thread),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+    pub(super) fn take(&mut self) -> JoinHandle<()> {
+        self.thread.take().expect("capture thread owner")
+    }
+}
+impl Drop for CaptureOwner {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            // Cancellation transfers ownership to the persistent runtime rather
+            // than detaching the blocking thread or claiming completed cleanup.
+            self.runtime.spawn(async move {
+                let mut threads = [Some(thread)];
+                while threads.iter().flatten().any(|thread| !thread.is_finished()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if let Err(error) =
+                    super::join_supervision_threads(&mut threads, std::time::Duration::ZERO).await
+                {
+                    tracing::error!(%error, "cancelled startup capture cleanup failed");
+                }
+            });
+        }
+    }
+}
+
 pub(super) struct StartupReader {
     receiver: Receiver<io::Result<Vec<u8>>>,
     pending: Vec<u8>,
@@ -38,6 +73,9 @@ pub(super) fn start(mut raw: Box<dyn Read + Send>) -> io::Result<(StartupReader,
             loop {
                 let chunk = raw.read(&mut buffer).map(|count| buffer[..count].to_vec());
                 let done = chunk.as_ref().is_err() || chunk.as_ref().is_ok_and(Vec::is_empty);
+                if done {
+                    tracing::debug!(eof = chunk.as_ref().is_ok_and(Vec::is_empty), error = ?chunk.as_ref().err(), "startup raw capture reached terminal read boundary");
+                }
                 if sender.send(chunk).is_err() || done {
                     break;
                 }

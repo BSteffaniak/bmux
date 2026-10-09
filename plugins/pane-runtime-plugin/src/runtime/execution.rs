@@ -19,6 +19,7 @@ pub(super) const GROUP_KILL: i32 = 9;
 type SpawnAuthorization = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
 
 pub(super) struct ExecutionCapture {
+    pub(super) supervisor: Mutex<Option<Arc<super::supervisor::SupervisorControl>>>,
     pub(super) spawn_authorization: Mutex<Option<SpawnAuthorization>>,
     pub(super) group_kill_issued: AtomicBool,
     pub(super) cleanup_failed: AtomicBool,
@@ -35,6 +36,7 @@ pub(super) struct ExecutionCapture {
 impl Default for ExecutionCapture {
     fn default() -> Self {
         Self {
+            supervisor: Mutex::new(None),
             spawn_authorization: Mutex::new(None),
             group_kill_issued: AtomicBool::new(false),
             cleanup_failed: AtomicBool::new(false),
@@ -64,6 +66,26 @@ impl ExecutionCapture {
     }
 
     pub(super) fn signal_owned_group(&self, signal: i32) -> anyhow::Result<bool> {
+        if let Some(supervisor) = self
+            .supervisor
+            .lock()
+            .map_err(|_| anyhow::anyhow!("supervisor control lock poisoned"))?
+            .clone()
+        {
+            let operation = if signal == GROUP_KILL {
+                crate::supervisor_protocol::Operation::Sweep {
+                    mutation_id: "00000000-0000-4000-8000-000000000002".into(),
+                }
+            } else if signal == libc::SIGTERM {
+                crate::supervisor_protocol::Operation::Term {
+                    mutation_id: "00000000-0000-4000-8000-000000000001".into(),
+                }
+            } else {
+                anyhow::bail!("unsupported supervisor signal")
+            };
+            supervisor.request(operation)?;
+            return Ok(true);
+        }
         #[cfg(unix)]
         {
             if signal == GROUP_KILL && self.group_kill_issued.load(Ordering::SeqCst) {
@@ -190,6 +212,15 @@ fn with_pane<T>(
 pub(crate) fn status(reference: &ExecutionRef) -> Result<ExecutionStatus, ExecutionError> {
     with_pane(reference, |pane| {
         let outcome = pane.execution.outcome.lock().map_err(failed)?;
+        tracing::debug!(
+            execution_token = %reference.execution_token,
+            exit_code = ?outcome.0,
+            signal = ?outcome.1,
+            exited = pane.exited.load(Ordering::SeqCst),
+            output_drained = pane.execution.output_drained.load(Ordering::SeqCst),
+            output_watermark = pane.execution.output_watermark.load(Ordering::SeqCst),
+            "execution status snapshot"
+        );
         Ok(ExecutionStatus {
             execution: reference.clone(),
             phase: if outcome.2.is_some() {
@@ -508,8 +539,10 @@ pub(crate) fn wait(
     // must keep progressing even when several clients wait concurrently.
     let poll = || {
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        tracing::debug!(execution_token = %reference.execution_token, "execution wait poll entered");
         loop {
             authorize()?;
+            tracing::trace!(execution_token = %reference.execution_token, "execution wait authorization completed");
             let current = status(reference)?;
             if current.error.is_some()
                 || (!matches!(current.phase, ExecutionPhase::Running) && current.output_drained)

@@ -1,7 +1,9 @@
 //! Concrete pane runtime implementation owned by the pane-runtime plugin.
 
 pub(crate) mod execution;
+pub(crate) mod reservations;
 mod startup_capture;
+pub(crate) mod supervisor;
 
 use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::{
@@ -846,6 +848,11 @@ impl Drop for PreparedSplit {
             supervise_unpublished_cleanup(pane, Arc::clone(&self.cleanup));
         }
     }
+}
+
+enum ExecutionExitNotice {
+    TargetExited,
+    OwnerExited,
 }
 
 struct PreparedFreshRuntime {
@@ -5669,6 +5676,7 @@ impl SessionRuntimeManager {
                 mark_snapshot_dirty_flag();
             }
             let mut replay_on_prompt = false;
+            let mut supervisor_control: Option<Arc<supervisor::SupervisorControl>> = None;
             let (mut command, failed_spawn_label) = if let Some(launch) = launch.as_ref() {
                 if let Err(error) = validate_explicit_launch(launch) {
                     fail_startup!(error.to_string());
@@ -5686,7 +5694,25 @@ impl SessionRuntimeManager {
                 if let Some(cwd) = launch.cwd.as_deref().or(initial_cwd.as_deref()) {
                     command.cwd(cwd);
                 }
-                (command, format!("command '{}'", launch.program))
+                if managed_program {
+                    let token = resurrection_state_for_reader
+                        .lock()
+                        .expect("execution identity lock")
+                        .observation_execution;
+                    let (control, mut helper) = match supervisor::SupervisorControl::prepare(token)
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            fail_startup!(format!("supervisor preparation failed: {error}"));
+                            return;
+                        }
+                    };
+                    configure_pane_terminal_env(&mut helper, &pane_term, pane_image_protocol);
+                    supervisor_control = Some(Arc::new(control));
+                    (helper, "execution supervisor".to_string())
+                } else {
+                    (command, format!("command '{}'", launch.program))
+                }
             } else {
                 let mut command = CommandBuilder::new(&shell);
                 configure_pane_terminal_env(&mut command, &pane_term, pane_image_protocol);
@@ -5757,13 +5783,14 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
+            let mut capture_owner = startup_capture::CaptureOwner::new(capture_thread);
             macro_rules! fail_captured_startup {
                 ($reason:expr, $previous:expr) => {{
                     let reason = $reason;
                     let previous = $previous;
                     drop(reader);
                     drop(pty_pair);
-                    let reason = startup_capture::acknowledge_cleanup(capture_thread, &cleanup_tx, previous, reason).await;
+                    let reason = startup_capture::acknowledge_cleanup(capture_owner.take(), &cleanup_tx, previous, reason).await;
                     child_spawned = true; // Capture cleanup has supplied the actual acknowledgement.
                     fail_startup!(reason);
                 }};
@@ -5780,6 +5807,26 @@ impl SessionRuntimeManager {
                 }
             });
             child_spawned = true;
+            if let Some(control) = &supervisor_control {
+                let launch = launch.as_ref().expect("supervised launch options");
+                if let Err(error) = control
+                    .start(launch, || execution_for_task.authorize_spawn())
+                    .await
+                {
+                    let reason = cleanup_failed_startup_child_acknowledged(
+                        child.take(),
+                        format!("supervisor target startup failed: {error}"),
+                        &startup_cleanup_tx,
+                    )
+                    .await;
+                    fail_captured_startup!(reason, startup_cleanup_tx.borrow().clone());
+                    return;
+                }
+                *execution_for_task
+                    .supervisor
+                    .lock()
+                    .expect("supervisor control lock") = Some(Arc::clone(control));
+            }
             if let Some(resume) = &application_resume {
                 let result = child
                     .process_id()
@@ -5849,7 +5896,7 @@ impl SessionRuntimeManager {
                     drop(master);
                     let previous = startup_cleanup_tx.borrow().clone();
                     let reason = startup_capture::acknowledge_cleanup(
-                        capture_thread,
+                        capture_owner.take(),
                         &cleanup_tx,
                         previous,
                         reason,
@@ -5881,7 +5928,8 @@ impl SessionRuntimeManager {
                 }
             }
 
-            let (child_exit_tx, mut child_exit_rx) = mpsc::unbounded_channel::<()>();
+            let (child_exit_tx, mut child_exit_rx) =
+                mpsc::unbounded_channel::<ExecutionExitNotice>();
             let exited_for_waiter = Arc::clone(&exited_for_task);
             let exit_reason_for_waiter = Arc::clone(&exit_reason_for_task);
             let output_buffer_for_waiter = Arc::clone(&output_buffer_for_reader);
@@ -5895,6 +5943,23 @@ impl SessionRuntimeManager {
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn(move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
+                    if let Some(control) = &supervisor_control {
+                        loop {
+                            match control.request(crate::supervisor_protocol::Operation::Status) {
+                                Ok(status) if status.exit_code.is_some() || status.exit_signal.is_some() => {
+                                    if let Ok(mut outcome) = execution_for_waiter.outcome.lock() {
+                                        outcome.0 = status.exit_code.and_then(|code| u32::try_from(code).ok());
+                                        outcome.1 = status.exit_signal.map(|signal| signal.to_string());
+                                    }
+                                    exited_for_waiter.store(true, Ordering::SeqCst);
+                                    let _ = child_exit_tx.send(ExecutionExitNotice::TargetExited);
+                                    break;
+                                }
+                                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+                                Err(error) => { execution_for_waiter.record_error(format!("supervisor outcome unavailable: {error}")); break; }
+                            }
+                        }
+                    }
                     let wait_result = child.wait();
                     if wait_result.is_ok() {
                         drop(child.take());
@@ -5906,7 +5971,9 @@ impl SessionRuntimeManager {
                             resurrection.active_command_source = None;
                         }
                     }
-                    execution_for_waiter.record_exit(&wait_result);
+                    if supervisor_control.is_none() {
+                        execution_for_waiter.record_exit(&wait_result);
+                    }
                     exited_for_waiter.store(true, Ordering::SeqCst);
                     if let Ok(mut reason) = exit_reason_for_waiter.lock()
                         && reason.is_none()
@@ -5917,7 +5984,7 @@ impl SessionRuntimeManager {
                         });
                     }
                     if !publication_for_waiter.wait() {
-                        let _ = child_exit_tx.send(());
+                        let _ = child_exit_tx.send(ExecutionExitNotice::OwnerExited);
                         child_waiter_done_for_thread.store(true, Ordering::SeqCst);
                         return;
                     }
@@ -5931,11 +5998,13 @@ impl SessionRuntimeManager {
                         "\r\n[bmux] pane process exited; layout preserved. Use restart pane or close pane.\r\n",
                     );
                     }
+                    if !program_execution {
                     let _ = pane_exit_tx.send(PaneExitEvent {
                         session_id,
                         pane_id,
                     });
-                    let _ = child_exit_tx.send(());
+                    }
+                    let _ = child_exit_tx.send(ExecutionExitNotice::OwnerExited);
                     child_waiter_done_for_thread.store(true, Ordering::SeqCst);
                 })
                 .ok();
@@ -5961,6 +6030,7 @@ impl SessionRuntimeManager {
                         reader_thread_done_for_thread.store(true, Ordering::SeqCst);
                         return;
                     }
+                    tracing::debug!(pane_id = %pane_id, "execution reader publication released");
                     let mut buffer = [0_u8; 8192];
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile)
                         .with_bracketed_paste_support(bracketed_paste_supported);
@@ -6267,8 +6337,12 @@ impl SessionRuntimeManager {
                         break;
                     }
                     child_exit = child_exit_rx.recv() => {
-                        if child_exit.is_some() {
-                            break;
+                        match child_exit {
+                            Some(ExecutionExitNotice::TargetExited) => {
+                                // Capture can drain independently while the execution
+                                // authority and its reaper remain alive for explicit sweep.
+                            }
+                            Some(ExecutionExitNotice::OwnerExited) | None => break,
                         }
                     }
                     input = input_rx.recv() => {
@@ -6348,7 +6422,7 @@ impl SessionRuntimeManager {
             }
             // Never occupy a blocking-pool worker with an unbounded join.
             // A timeout is an explicit failure, not acknowledged restoration.
-            let mut threads = [child_waiter, reader_thread, Some(capture_thread)];
+            let mut threads = [child_waiter, reader_thread, Some(capture_owner.take())];
             let cleanup_result =
                 join_supervision_threads(&mut threads, Duration::from_secs(4)).await;
             let cleanup_result = cleanup_result.and_then(|()| {
@@ -11307,6 +11381,8 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
 mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn program_first_pane_captures_fast_literal_argv_and_drains() {
+        supervisor::install_test_artifact()
+            .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
@@ -11336,6 +11412,7 @@ mod tests {
             .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
             .unwrap();
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
+        let _cleanup = ExecutionTestCleanup(Arc::clone(&pane.execution));
         tokio::time::timeout(Duration::from_secs(5), async {
             while !pane.execution.output_drained.load(Ordering::SeqCst)
                 || !pane.exited.load(Ordering::SeqCst)
@@ -11382,6 +11459,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn owned_pty_group_survives_leader_then_is_killed() {
+        supervisor::install_test_artifact()
+            .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
         manager.runtimes.clear();
@@ -11459,6 +11538,8 @@ exit 0"#.into(), "fixture".into(), witness.path().to_string_lossy().into_owned()
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn injected_reader_failure_cleans_live_process_and_acknowledges_threads() {
+        supervisor::install_test_artifact()
+            .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
         manager.runtimes.clear();

@@ -1,4 +1,6 @@
 name: bmux
+# Auxiliary entries and artifact hashes are appended by the manifest-driven
+# scripts/release/auxiliary-executables.py nfpm step; do not enumerate helpers here.
 arch: ${ARCH}
 platform: linux
 version: ${VERSION}

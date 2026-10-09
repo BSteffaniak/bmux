@@ -45,9 +45,114 @@ gpgcheck=1
 ## npm packages
 
 - Main packages: `bmux`, `@bmux/cli`
-- Platform packages: `@bmux/<platform>`
+- Platform packages: `@bmux/<platform>`; each Unix package contains the CLI and
+  all manifest-declared executable siblings plus `artifacts.json`.
 
 See `npm/` and `.github/workflows/release-npm.yml`.
+
+## Auxiliary executable release contract
+
+Plugins declare executable artifacts in top-level `[[auxiliary_executables]]`
+entries in `plugins/*/plugin.toml`. The generic declaration fields are `id`,
+`cargo_package`, `cargo_binary`, `relative_path`, and positive `protocol_version`.
+IDs and destination names are validated; destination paths are single safe
+basenames, never traversal paths. Duplicate destinations fail the release.
+The pane plugin owns `bmux-pane-execution-supervisor`; release infrastructure does
+not special-case its domain or protocol.
+
+`scripts/release/auxiliary-executables.py` discovers these manifests, builds each
+specified Cargo binary for the release target, and stages the exact build outputs
+alongside BMUX. It does not resolve a binary from PATH, a previous installation,
+or a mutable default target directory. Callers pass the artifact directory
+explicitly. Native developer builds must use the Nix-selected `CARGO_TARGET_DIR`;
+release CI uses its pinned native target toolchain.
+
+```sh
+python3 scripts/release/auxiliary-executables.py build --target "$TARGET"
+python3 scripts/release/auxiliary-executables.py stage --target "$TARGET" \
+  --artifact-dir "$CARGO_TARGET_DIR/$TARGET/release" --destination "$STAGE"
+```
+
+Do not run these build commands when another coordinator owns build outputs.
+Staging requires an empty directory and all required regular executable artifacts;
+missing artifacts fail rather than producing a nominally complete package.
+`artifacts.json` records target, exact relative paths, byte lengths, SHA-256 hashes,
+and owner/declaration/protocol metadata. Its hashes establish artifact identity,
+not publisher authentication; verify the release archive's trusted checksum or
+signature before installation.
+
+Release archives include the complete stage. Linux deb/rpm configurations are
+rendered from their stable/nightly templates with the same generic declarations:
+executables install beside `/usr/bin/bmux`; inventory installs under
+`/usr/share/bmux/artifacts.json`. npm platform artifacts are transferred through
+`scripts/release/install-artifacts.py`, which verifies the inventory before any
+copy. Unix npm packages keep auxiliaries beside the package's actual BMUX binary.
+The launcher must execute that exact installed path, not a PATH substitute.
+
+Auxiliary execution is supported here only for Linux and macOS release targets.
+Windows archives/npm packages contain `bmux.exe` and an inventory explicitly
+listing declared auxiliaries as unavailable. No supervisor stub is built or
+advertised as Windows support. Unsupported platforms must return explicit feature
+unavailability; baseline BMUX operation remains independent of the helper.
+
+### Explicit installation and slots
+
+For an extracted, authenticated archive, install the entire verified inventory:
+
+```sh
+python3 scripts/release/install-artifacts.py /absolute/extracted/archive /absolute/install/bin
+```
+
+Slot versions must not share a physical helper directory. Install into a fresh
+version-specific directory and give the CLI an explicit slot basename:
+
+```sh
+python3 scripts/release/install-artifacts.py /absolute/extracted/archive \
+  /absolute/bmux-slots/stable-version/bin --binary-name bmux-stable
+```
+
+Set the slot manifest's `binary` to that exact installed `bmux-stable` path.
+Helpers retain their manifest basenames in that same directory. Do not copy only
+the CLI into a shared `/usr/local/bin`, rename a helper to another slot's helper,
+or replace a running slot's files. `installation.json` records the renamed CLI;
+`artifacts.json` retains the original release identity. This script does not
+rewrite slot configuration, start/stop servers, or change runtime endpoints.
+The host resolver must select only the verified sibling of the selected executable
+and reject absent/incompatible artifacts instead of falling back to PATH.
+
+**Curl installation:** `/install` verifies the archive's `SHA256SUMS` entry,
+rejects traversal, links, special files, duplicate/unlisted members and oversized
+archives before extraction, and verifies every inventory length/hash including
+`install-artifacts.py` before executing it. Python 3 is required. Both checksum
+and archive are obtained over the configured HTTPS publisher channel; checksums
+are not an independent signature/trust root.
+
+The packaged installer publishes all validated siblings into an immutable
+`$BMUX_INSTALL_PREFIX/lib/bmux/versions/<version>-<target>` directory (default
+prefix `/usr/local`), syncs it, then atomically replaces `bin/bmux` with a symlink
+to that version's CLI. Running older binaries retain their complete sibling
+installation; no CLI/helper pair is overwritten sequentially. Concurrent
+publishers fail via an exclusive install lock. Existing immutable versions are
+refused rather than changed. Old versions are retained, not automatically deleted.
+Legacy archives without an inventory are explicitly refused with a manual-install
+message; they are not silently represented as auxiliary-capable installations.
+
+Existing npm launcher fallback behavior still needs separate review: packaging
+complete platform files does not authorize falling back to an unrelated PATH
+installation.
+
+### No-build packaging validation
+
+```sh
+python3 scripts/release/test-auxiliary-executables.py
+python3 scripts/release/test-installer.py
+```
+
+Fixtures exercise Unix/Windows contents, artifact hashes, corruption rejection,
+slot sibling layout, unsafe paths, and generated Linux package entries without
+building Rust, contacting endpoints, or publishing packages. Full release builds,
+archive/deb/rpm inspection and installed-runtime validation remain coordinator/CI
+responsibilities.
 
 ## Channel manifests
 

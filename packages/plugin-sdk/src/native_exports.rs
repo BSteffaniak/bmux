@@ -1125,6 +1125,8 @@ mod concurrent_tests {
 
     fn lifecycle_context() -> NativeLifecycleContext {
         NativeLifecycleContext {
+            auxiliary_executables: BTreeMap::new(),
+            auxiliary_executable_errors: BTreeMap::new(),
             plugin_id: "test.concurrent".to_string(),
             host: HostMetadata {
                 product_name: "bmux-test".to_string(),

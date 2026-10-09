@@ -74,9 +74,10 @@ pub use context::{
     CORE_CLI_COMMAND_RUN_PATH_OPERATION_V1, CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1,
     CoreCliCommandRequest, CoreCliCommandResponse, HostKernelBridge, HostKernelBridgeRequest,
     HostKernelBridgeResponse, NativeCommandContext, NativeCommandInvocationSource,
-    NativeLifecycleContext, NativeServiceContext, NativeStreamingServiceContext,
-    PLUGIN_CLI_BRIDGE_MAGIC_V1, PluginCliCommandRequest, PluginCliCommandResponse,
-    RegisteredPluginInfo, SERVICE_ERROR_CANCELLED, decode_host_kernel_bridge_cli_command_payload,
+    NativeLifecycleContext, NativeLifecycleContextV1, NativeServiceContext,
+    NativeStreamingServiceContext, PLUGIN_CLI_BRIDGE_MAGIC_V1, PluginCliCommandRequest,
+    PluginCliCommandResponse, RegisteredPluginInfo, ResolvedAuxiliaryExecutable,
+    SERVICE_ERROR_CANCELLED, decode_host_kernel_bridge_cli_command_payload,
     decode_host_kernel_bridge_plugin_command_payload,
     encode_host_kernel_bridge_cli_command_payload,
     encode_host_kernel_bridge_plugin_command_payload,
@@ -162,7 +163,7 @@ pub use action_dispatch::ActionDispatchRequest;
 pub const CURRENT_PLUGIN_API_VERSION: ApiVersion = ApiVersion::new(1, 0);
 
 /// Stable native entrypoint ABI version exposed by this crate.
-pub const CURRENT_PLUGIN_ABI_VERSION: ApiVersion = ApiVersion::new(1, 0);
+pub const CURRENT_PLUGIN_ABI_VERSION: ApiVersion = ApiVersion::new(1, 1);
 
 /// Default exported symbol that a native plugin should expose.
 pub const DEFAULT_NATIVE_ENTRY_SYMBOL: &str = "bmux_plugin_entry_v1";

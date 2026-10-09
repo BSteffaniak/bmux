@@ -33,6 +33,12 @@ use bmux_recording_protocol as protocol;
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/recording-plugin.bpdl",
+    imports: {
+        pane: {
+            source: "../pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl",
+            crate_path: ::bmux_pane_runtime_plugin_api,
+        },
+    },
 }
 
 impl From<recording_types::RecordingProfile> for protocol::RecordingProfile {

@@ -1,3 +1,6 @@
+#[path = "auxiliary.rs"]
+mod auxiliary;
+
 use crate::{
     CapabilityProvider, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
     DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
@@ -1742,6 +1745,66 @@ pub struct LoadedPlugin {
 }
 
 impl LoadedPlugin {
+    fn resolved_lifecycle_context(
+        &self,
+        context: &NativeLifecycleContext,
+    ) -> Result<NativeLifecycleContext> {
+        let mut context = context.clone();
+        context.auxiliary_executables.clear();
+        context.auxiliary_executable_errors.clear();
+        let manifest = &self.registered.manifest;
+        manifest.validate_auxiliary_executables()?;
+        if manifest.auxiliary_executables.is_empty() {
+            return Ok(context);
+        }
+        let required = bmux_plugin_sdk::ApiVersion::new(1, 1);
+        if context.host.plugin_abi_version.major != 1 || context.host.plugin_abi_version < required
+        {
+            return Err(PluginError::ServiceProtocol {
+                details: "auxiliary lifecycle metadata requires negotiated host native ABI 1.1"
+                    .into(),
+            });
+        }
+        let base = if matches!(self.backend, PluginBackend::Static(_)) {
+            std::env::current_exe()
+                .and_then(|path| path.canonicalize())
+                .map_err(|error| error.to_string())
+                .and_then(|path| {
+                    path.parent()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "canonical host executable has no parent".into())
+                })
+        } else {
+            self.registered
+                .manifest_path
+                .parent()
+                .filter(|path| path.is_absolute())
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    "auxiliary package manifest has no absolute authoritative root".into()
+                })
+        };
+        for declaration in &manifest.auxiliary_executables {
+            let resolved = base
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|base| auxiliary::resolve(base, declaration));
+            match resolved {
+                Ok(value) => {
+                    context
+                        .auxiliary_executables
+                        .insert(declaration.id.clone(), value);
+                }
+                Err(error) => {
+                    context
+                        .auxiliary_executable_errors
+                        .insert(declaration.id.clone(), error);
+                }
+            }
+        }
+        Ok(context)
+    }
+
     const fn backend_kind(&self) -> &'static str {
         match &self.backend {
             PluginBackend::Static(_) => "static",
@@ -2125,6 +2188,7 @@ impl LoadedPlugin {
         context: &NativeLifecycleContext,
         async_handle: bmux_plugin_sdk::HostAsyncHandle,
     ) -> Result<i32> {
+        let context = self.resolved_lifecycle_context(context)?;
         if let PluginBackend::Static(vtable) = &self.backend {
             let mut scope =
                 self.background_tasks
@@ -2140,10 +2204,8 @@ impl LoadedPlugin {
             let tasks = bmux_plugin_runtime::background::BackgroundTasks::new();
             *scope = Some(tasks.clone());
             drop(scope);
-            let status = (vtable.activate_with_async)(
-                context.clone(),
-                async_handle.with_background_tasks(tasks),
-            );
+            let status =
+                (vtable.activate_with_async)(context, async_handle.with_background_tasks(tasks));
             if status != 0 {
                 return Err(PluginError::ServiceProtocol {
                     details: format!("plugin activation failed with status {status}"),
@@ -2151,7 +2213,7 @@ impl LoadedPlugin {
             }
             Ok(status)
         } else {
-            self.activate(context)
+            self.activate(&context)
         }
     }
 
@@ -2537,10 +2599,15 @@ impl LoadedPlugin {
     fn run_lifecycle_symbol(&self, symbol: &str, context: &NativeLifecycleContext) -> Result<i32> {
         let total_started = Instant::now();
         let encode_started = Instant::now();
-        let payload = encode_service_message(context).map_err(|_| {
-            PluginError::InvalidNativeLifecycleInput {
-                plugin_id: self.declaration.id.as_str().to_string(),
-            }
+        let context = self.resolved_lifecycle_context(context)?;
+        let legacy = self.declaration.native_abi.minimum < bmux_plugin_sdk::ApiVersion::new(1, 1);
+        let payload_result = if legacy {
+            encode_service_message(&context.legacy_wire_snapshot())
+        } else {
+            encode_service_message(&context)
+        };
+        let payload = payload_result.map_err(|_| PluginError::InvalidNativeLifecycleInput {
+            plugin_id: self.declaration.id.as_str().to_string(),
         })?;
         let encode_us = encode_started.elapsed().as_micros();
 
@@ -2579,7 +2646,7 @@ impl LoadedPlugin {
                     invocation_id,
                     plugin_id: self.declaration.id.as_str().to_string(),
                     symbol: symbol.to_string(),
-                    context: context.clone(),
+                    context,
                 };
                 let empty_argv: Vec<String> = Vec::new();
                 let (response, status) = self.invoke_process(runtime, &empty_argv, &request)?;
@@ -3995,6 +4062,8 @@ minimum = "1.0"
     #[test]
     fn lifecycle_context_serializes_settings_and_host() {
         let context = NativeLifecycleContext {
+            auxiliary_executables: BTreeMap::new(),
+            auxiliary_executable_errors: BTreeMap::new(),
             plugin_id: "test.plugin".to_string(),
             required_capabilities: Vec::new(),
             provided_capabilities: Vec::new(),
@@ -4025,6 +4094,48 @@ minimum = "1.0"
         assert!(json.contains("test.plugin"));
         assert!(json.contains("bmux"));
         assert!(json.contains("enabled"));
+        let frozen = context.legacy_wire_snapshot();
+        let payload = encode_service_message(&frozen).expect("legacy payload should encode");
+        let legacy: bmux_plugin_sdk::NativeLifecycleContextV1 =
+            decode_service_message(&payload).expect("frozen legacy consumer should decode");
+        assert_eq!(legacy, frozen);
+        // The frozen adapter also preserves positional encoding used by legacy
+        // fixtures; it never inserts the new maps before existing fields.
+        let positional =
+            bmux_ipc::encode(&frozen).expect("legacy positional snapshot should encode");
+        let positional_legacy: bmux_plugin_sdk::NativeLifecycleContextV1 =
+            bmux_ipc::decode(&positional).expect("legacy positional snapshot should decode");
+        assert_eq!(positional_legacy, frozen);
+        let modern: NativeLifecycleContext = decode_service_message(&payload)
+            .expect("modern consumer should accept legacy typed fields with empty maps");
+        assert_eq!(modern, context);
+        let mut modern = modern;
+        modern.auxiliary_executables.insert(
+            "worker".into(),
+            bmux_plugin_sdk::ResolvedAuxiliaryExecutable {
+                path: "/owned/package/worker".into(),
+                protocol_version: 1,
+                artifact_sha256: "a".repeat(64),
+            },
+        );
+        modern
+            .auxiliary_executable_errors
+            .insert("optional-worker".into(), "unavailable".into());
+        assert_eq!(
+            encode_service_message(&modern.legacy_wire_snapshot())
+                .expect("legacy snapshot should encode"),
+            payload,
+            "ABI 1.0 payload must be byte-identical despite new lifecycle metadata"
+        );
+        // New metadata is only dispatched after selecting ABI 1.1; legacy
+        // snapshot equality above is checked with identical host metadata.
+        modern.host.plugin_abi_version = ApiVersion::new(1, 1);
+        let modern_payload = encode_service_message(&modern).expect("ABI 1.1 should encode");
+        assert_eq!(
+            decode_service_message::<NativeLifecycleContext>(&modern_payload)
+                .expect("ABI 1.1 should roundtrip"),
+            modern
+        );
     }
 
     #[test]

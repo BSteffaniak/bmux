@@ -481,6 +481,33 @@ fn read_all(env: &RecordingEnv, id: &str) -> Vec<u8> {
 }
 
 #[test]
+fn finite_launch_status_before_wait_reports_drain() {
+    let env = RecordingEnv::new();
+    let id = env.start("stty -opost\nprintf FINITE\nexit 7\n", &[]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut timeline = Vec::new();
+    loop {
+        let status = env.json(&["recording", "process", "status", "--json", &id]);
+        timeline.push(status.clone());
+        if status["output_drained"].as_bool() == Some(true) {
+            assert_eq!(status["exit_code"].as_u64(), Some(7), "{timeline:?}");
+            assert_ne!(status["phase"].as_str(), Some("running"), "{timeline:?}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status-before-wait timeline: {timeline:?}"
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+    eprintln!("status-before-wait timeline: {timeline:?}");
+    assert_eq!(read_all(&env, &id), b"FINITE");
+    let status = env.wait_exit(&id);
+    assert_eq!(status["exit_code"].as_u64(), Some(7));
+    env.finish(&id, "finite-status", &["raw"]);
+}
+
+#[test]
 fn immediate_exit_and_startup_burst_are_not_lost() {
     for iteration in 0..4 {
         let env = RecordingEnv::new();

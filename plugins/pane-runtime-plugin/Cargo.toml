@@ -13,6 +13,10 @@ version     = { workspace = true }
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "bmux-pane-execution-supervisor"
+path = "src/bin/execution_supervisor.rs"
+
 [dependencies]
 anyhow = { workspace = true, features = ["std"] }
 bmux_application_resurrection_plugin_api = { workspace = true }
@@ -43,6 +47,8 @@ bmux_terminal_protocol = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",
     "rt",
@@ -77,6 +83,3 @@ static-bundled = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

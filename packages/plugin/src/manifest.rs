@@ -71,8 +71,23 @@ pub struct PluginManifestExtension {
     pub payload: Vec<u8>,
 }
 
+/// One owner-scoped executable distributed with a plugin. Resolution never
+/// searches PATH, the working directory, or plugin discovery roots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuxiliaryExecutableDeclaration {
+    pub id: String,
+    pub cargo_package: String,
+    pub cargo_binary: String,
+    pub relative_path: String,
+    pub protocol_version: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifest {
+    /// Requires explicit native ABI 1.1 opt-in. IDs are local to this owner.
+    #[serde(default)]
+    pub auxiliary_executables: Vec<AuxiliaryExecutableDeclaration>,
     pub id: String,
     pub name: String,
     pub version: String,
@@ -161,7 +176,9 @@ impl PluginManifest {
     ///
     /// Returns an error when the manifest cannot be parsed.
     pub fn from_toml_str(value: &str) -> Result<Self> {
-        Ok(toml::from_str(value)?)
+        let manifest: Self = toml::from_str(value)?;
+        manifest.validate_auxiliary_executables()?;
+        Ok(manifest)
     }
 
     /// # Errors
@@ -258,7 +275,40 @@ impl PluginManifest {
         }
     }
 
+    pub(crate) fn validate_auxiliary_executables(&self) -> Result<()> {
+        let mut ids = BTreeSet::new();
+        for executable in &self.auxiliary_executables {
+            if !safe_auxiliary_name(&executable.id)
+                || !safe_auxiliary_name(&executable.relative_path)
+                || !safe_auxiliary_name(&executable.cargo_package)
+                || !safe_auxiliary_name(&executable.cargo_binary)
+                || executable.protocol_version == 0
+                || !ids.insert(&executable.id)
+            {
+                return Err(PluginError::ServiceProtocol {
+                    details: format!(
+                        "plugin '{}' has invalid or duplicate auxiliary executable '{}'",
+                        self.id, executable.id
+                    ),
+                });
+            }
+        }
+        if !self.auxiliary_executables.is_empty() {
+            let range = self
+                .native_abi
+                .to_version_range()
+                .map_err(|details| PluginError::ServiceProtocol { details })?;
+            if range.minimum.major != 1 || range.minimum < ApiVersion::new(1, 1) {
+                return Err(PluginError::ServiceProtocol {
+                    details: "auxiliary executables require explicit native_abi minimum 1.1".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn validate_extensions(&self) -> Result<()> {
+        self.validate_auxiliary_executables()?;
         for extension in &self.extensions {
             if !extension_point_id_is_valid(&extension.extension_point) {
                 return Err(PluginError::ServiceProtocol {
@@ -270,6 +320,73 @@ impl PluginManifest {
             }
         }
         Ok(())
+    }
+}
+
+pub fn safe_auxiliary_name(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+#[cfg(test)]
+mod auxiliary_manifest_tests {
+    use super::*;
+
+    fn source(owner: &str, minimum: &str, id: &str, path: &str) -> String {
+        format!(
+            r#"id = "{owner}"
+name = "Test"
+version = "1.0.0"
+[native_abi]
+minimum = "{minimum}"
+[[auxiliary_executables]]
+id = "{id}"
+cargo_package = "example"
+cargo_binary = "worker"
+relative_path = "{path}"
+protocol_version = 1
+"#
+        )
+    }
+
+    #[test]
+    fn auxiliary_declarations_are_versioned_and_owner_scoped() {
+        let first =
+            PluginManifest::from_toml_str(&source("example.first", "1.1", "worker", "worker"))
+                .unwrap();
+        let second =
+            PluginManifest::from_toml_str(&source("example.second", "1.1", "worker", "worker"))
+                .unwrap();
+        assert_eq!(first.auxiliary_executables, second.auxiliary_executables);
+        assert!(
+            PluginManifest::from_toml_str(&source("example.first", "1.0", "worker", "worker"))
+                .is_err()
+        );
+        for path in [
+            "../worker",
+            "/worker",
+            "nested/worker",
+            "..",
+            "worker\\\\escape",
+        ] {
+            assert!(
+                PluginManifest::from_toml_str(&source("example.first", "1.1", "worker", path))
+                    .is_err()
+            );
+        }
+        let duplicate = format!(
+            "{}\n[[auxiliary_executables]]\nid = \"worker\"\ncargo_package = \"example\"\ncargo_binary = \"other\"\nrelative_path = \"other\"\nprotocol_version = 1\n",
+            source("example.first", "1.1", "worker", "worker")
+        );
+        assert!(PluginManifest::from_toml_str(&duplicate).is_err());
+        assert!(
+            PluginManifest::from_toml_str(&source("example.first", "1.1", "../worker", "worker"))
+                .is_err()
+        );
     }
 }
 

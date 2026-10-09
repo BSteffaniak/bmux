@@ -1079,6 +1079,8 @@ pub(super) fn plugin_lifecycle_context(
 ) -> NativeLifecycleContext {
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeLifecycleContext {
+        auxiliary_executables: BTreeMap::default(),
+        auxiliary_executable_errors: BTreeMap::default(),
         plugin_id: declaration.id.as_str().to_string(),
         required_capabilities: declaration
             .required_capabilities

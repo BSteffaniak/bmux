@@ -33,6 +33,11 @@ mod spawn;
 )]
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
+        "pane-runtime-execution-v2", "reserve" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v2::client::ReserveRequest, ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::reservations::reserve(req.launch_mutation_id, req.options, req.policy, |id| {
+                spawn::authorize_creation(ctx, id, "session.create").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v2::RecoveryError::Denied { reason: format!("{error:?}") })
+            }))
+        },
         "pane-runtime-execution-v1", "new-program-session" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::client::NewProgramSessionRequest, ctx| {
             let spawn_context = ctx.clone();
             Ok::<_, ServiceResponse>(crate::runtime::execution::create(req.name, req.options, move |id| {

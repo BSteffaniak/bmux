@@ -6349,6 +6349,8 @@ operation = "reset"
 
     fn lifecycle_context(settings: Option<toml::Value>) -> NativeLifecycleContext {
         NativeLifecycleContext {
+            auxiliary_executables: BTreeMap::new(),
+            auxiliary_executable_errors: BTreeMap::new(),
             plugin_id: "bmux.theme".to_string(),
             required_capabilities: vec![
                 "bmux.storage".to_string(),

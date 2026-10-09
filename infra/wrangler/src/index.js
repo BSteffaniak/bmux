@@ -63,6 +63,10 @@ async function resolveChannelMetadata(host, channel, env) {
 }
 
 function installScript(host, channel, version) {
+  if (!/^[A-Za-z0-9.-]+$/.test(host) || !CHANNEL_SET.has(channel) ||
+      !/^[A-Za-z0-9][A-Za-z0-9_.+-]*$/.test(version)) {
+    throw new Error("Unsafe install metadata");
+  }
   return `#!/usr/bin/env sh
 set -eu
 
@@ -103,22 +107,68 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "Downloading $URL"
 curl -fsSL "$URL" -o "$TMPDIR/bmux.tar.gz"
-tar -xzf "$TMPDIR/bmux.tar.gz" -C "$TMPDIR"
-
-BIN=""
-if [ -f "$TMPDIR/bmux" ]; then
-  BIN="$TMPDIR/bmux"
-elif [ -f "$TMPDIR/bmux.exe" ]; then
-  BIN="$TMPDIR/bmux.exe"
-fi
-
-if [ -z "$BIN" ]; then
-  echo "bmux binary not found in archive"
-  exit 1
-fi
-
-install -m 755 "$BIN" /usr/local/bin/bmux
-echo "Installed bmux to /usr/local/bin/bmux"
+curl -fsSL "https://$HOST/$CHANNEL/artifacts/$VERSION/SHA256SUMS" -o "$TMPDIR/SHA256SUMS"
+command -v python3 >/dev/null 2>&1 || { echo 'Python 3 is required for verified installation' >&2; exit 1; }
+python3 - "$TMPDIR" "$FILE" "$TARGET" <<'PY'
+import hashlib, json, pathlib, re, tarfile, sys
+root, filename, target = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+checksums = []
+for line in (root / 'SHA256SUMS').read_text().splitlines():
+    fields = line.split()
+    if len(fields) == 2 and fields[1].lstrip('*') == filename:
+        checksums.append(fields[0])
+if len(checksums) != 1 or not re.fullmatch('[0-9a-f]{64}', checksums[0]):
+    raise SystemExit('Missing or ambiguous archive checksum')
+archive = root / 'bmux.tar.gz'
+if hashlib.sha256(archive.read_bytes()).hexdigest() != checksums[0]:
+    raise SystemExit('Archive checksum mismatch')
+output = root / 'verified'
+output.mkdir(mode=0o700)
+with tarfile.open(archive, 'r:gz') as tar:
+    members = {}
+    total = 0
+    for member in tar:
+        name = member.name
+        if name in ('.', './') and member.isdir():
+            continue
+        if name.startswith('./'):
+            name = name[2:]
+        if not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]*', name) or not member.isfile():
+            raise SystemExit('Unsafe archive member: ' + member.name)
+        if name in members or member.size < 0 or member.size > 1024 * 1024 * 1024:
+            raise SystemExit('Duplicate or oversized archive member')
+        total += member.size
+        if total > 2 * 1024 * 1024 * 1024 or len(members) >= 128:
+            raise SystemExit('Archive budget exceeded')
+        members[name] = member
+    if 'artifacts.json' not in members:
+        raise SystemExit('Legacy inventory-less archive refused: install manually; no auxiliary support is claimed')
+    if members['artifacts.json'].size > 1024 * 1024:
+        raise SystemExit('Inventory too large')
+    inventory = json.load(tar.extractfile(members['artifacts.json']))
+    if inventory.get('schema_version') != 1 or inventory.get('target') != target:
+        raise SystemExit('Unsupported inventory schema or wrong target')
+    expected = {'artifacts.json'}
+    for item in inventory['artifacts']:
+        name = item['relative_path']
+        if name in expected or name not in members:
+            raise SystemExit('Duplicate or missing inventory artifact')
+        expected.add(name)
+        member = members[name]
+        if member.size != item['bytes']:
+            raise SystemExit('Artifact length mismatch')
+        data = tar.extractfile(member).read()
+        if hashlib.sha256(data).hexdigest() != item['sha256']:
+            raise SystemExit('Artifact hash mismatch: ' + name)
+        (output / name).write_bytes(data)
+    if set(members) != expected or not {'bmux', 'install-artifacts.py'}.issubset(expected):
+        raise SystemExit('Archive inventory incomplete or contains unlisted files')
+    (output / 'artifacts.json').write_text(json.dumps(inventory))
+PY
+PREFIX="\${BMUX_INSTALL_PREFIX:-/usr/local}"
+python3 "$TMPDIR/verified/install-artifacts.py" "$TMPDIR/verified" "$PREFIX" --activate-version "$VERSION-$TARGET"
+echo "Installed verified BMUX version at $PREFIX/lib/bmux/versions/$VERSION-$TARGET"
+echo "Activated $PREFIX/bin/bmux; prior versions remain intact"
 `;
 }
 
@@ -139,6 +189,8 @@ async function serveStatic(pathname, env) {
 
   return new Response(object.body, { headers });
 }
+
+export { installScript };
 
 export default {
   async fetch(request, env) {
