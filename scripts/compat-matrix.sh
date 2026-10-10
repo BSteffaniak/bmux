@@ -10,12 +10,15 @@ TRACE_LIMIT="${BMUX_COMPAT_TRACE_LIMIT:-500}"
 BMUX_BIN="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/bmux"
 SCENARIO_FILTER="all"
 CASE_TIMEOUT_SECS="${BMUX_COMPAT_CASE_TIMEOUT_SECS:-12}"
+EXPLICIT_BINARY=0
+KEEP_TMP="${BMUX_KEEP_COMPAT_TMP:-0}"
 
 usage() {
   cat <<'EOF'
 Usage: ./scripts/compat-matrix.sh [--scenario fish|vim|fzf|less|all]
 
 Options:
+  --binary <path>    Explicit coordinator-built binary (absolute regular file; skips build)
   --scenario <name>   Run a single scenario (fish, vim, fzf, less) or all (default)
   --timeout-secs <n>  Per-case marker wait timeout in seconds (default: $BMUX_COMPAT_CASE_TIMEOUT_SECS or 12)
   -h, --help          Show this help message
@@ -29,6 +32,15 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --binary)
+      if [[ $# -lt 2 || "$2" != /* || ! -f "$2" || -L "$2" || ! -x "$2" ]]; then
+        echo "error: --binary requires an absolute executable regular file, not a symlink" >&2
+        exit 1
+      fi
+      BMUX_BIN="$2"
+      EXPLICIT_BINARY=1
+      shift 2
+      ;;
     --scenario)
       if [[ $# -lt 2 ]]; then
         echo "error: --scenario requires a value" >&2
@@ -78,13 +90,17 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! cargo build -q -p bmux_cli >/dev/null 2>&1; then
+if [[ "$EXPLICIT_BINARY" == "0" ]] && ! cargo build -q -p bmux_cli >/dev/null 2>&1; then
   echo "error: failed to build bmux_cli before matrix run" >&2
   exit 1
 fi
 
 cleanup() {
-  if [[ "${BMUX_KEEP_COMPAT_TMP:-0}" == "1" ]]; then
+  # Only the endpoint under this fixture's isolated root is eligible for stop.
+  if [[ -n "$CONFIG_FILE" ]]; then
+    "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE" server stop >/dev/null 2>&1 || true
+  fi
+  if [[ "$KEEP_TMP" == "1" ]]; then
     echo "keeping compatibility temp dir: $WORK_DIR"
     return
   fi
@@ -92,12 +108,32 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Never inherit a user's config, target, slot, attachment or runtime selectors.
+# Read only names, never print inherited values (which may be credentials).
+# Nix bashInteractive/minimal builds need not include the compgen builtin.
+while IFS= read -r key; do
+  unset "$key"
+done < <(python3 -c 'import os; print("\n".join(k for k in os.environ if k.startswith("BMUX_")))')
 mkdir -p "$HOME_DIR"
 export HOME="$HOME_DIR"
 export XDG_CONFIG_HOME="$HOME_DIR/.config"
 export XDG_DATA_HOME="$HOME_DIR/.local/share"
 export XDG_RUNTIME_DIR="$WORK_DIR/runtime"
-mkdir -p "$XDG_CONFIG_HOME/bmux" "$XDG_DATA_HOME/bmux" "$XDG_RUNTIME_DIR"
+export XDG_STATE_HOME="$WORK_DIR/state"
+export XDG_CACHE_HOME="$WORK_DIR/cache"
+export TMPDIR="$WORK_DIR/tmp"
+export BMUX_NO_BASE_CONFIG=1
+export BMUX_RUNTIME_NAME=default
+export BMUX_TARGET=local
+export BMUX_CONFIG_DIR="$WORK_DIR/config"
+export BMUX_RUNTIME_DIR="$XDG_RUNTIME_DIR"
+export BMUX_DATA_DIR="$XDG_DATA_HOME/bmux"
+export BMUX_STATE_DIR="$XDG_STATE_HOME"
+export BMUX_LOG_DIR="$WORK_DIR/logs"
+export BMUX_RECORDINGS_DIR="$WORK_DIR/recordings"
+mkdir -p "$XDG_CONFIG_HOME/bmux" "$XDG_DATA_HOME/bmux" "$XDG_RUNTIME_DIR" \
+  "$XDG_STATE_HOME" "$XDG_CACHE_HOME" "$TMPDIR" "$BMUX_CONFIG_DIR" \
+  "$BMUX_LOG_DIR" "$BMUX_RECORDINGS_DIR"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   CONFIG_FILE="$HOME_DIR/Library/Application Support/bmux/bmux.toml"
@@ -182,7 +218,7 @@ profile_for_effective_term() {
 }
 
 doctor_trace_json() {
-  "$BMUX_BIN" terminal doctor --json --trace --trace-limit "$TRACE_LIMIT"
+  "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE" terminal doctor --json --trace --trace-limit "$TRACE_LIMIT"
 }
 
 emit_quit_when_marker_or_timeout() {
@@ -260,8 +296,10 @@ EOF
 #!/usr/bin/env bash
 printf "__SCENARIO_fzf__\\n"
 printf '\\033]10;?\\033\\\\\\033P+q5443;636f\\033\\\\'
-printf "alpha\\nbeta\\ngamma\\n" | "$shell_bin" --filter a >/dev/null 2>&1 || true
-printf "alpha\\nbeta\\ngamma\\n" | "$shell_bin" --filter alpha >"$fzf_output_file" 2>/dev/null || true
+printf "alpha\\nbeta\\ngamma\\n" | "$shell_bin" --filter a >/dev/null 2>"$WORK_DIR/fzf.stderr"
+printf 'filter_a=%s\\n' "\$?" >"$WORK_DIR/fzf.status"
+printf "alpha\\nbeta\\ngamma\\n" | "$shell_bin" --filter alpha >"$fzf_output_file" 2>>"$WORK_DIR/fzf.stderr"
+printf 'filter_alpha=%s\\n' "\$?" >>"$WORK_DIR/fzf.status"
 if [[ -f "$fzf_output_file" ]] && rg -q "^alpha$" "$fzf_output_file"; then
   printf "__FZF_SELECT_OK__\\n"
   printf "ok" >"$flow_ok_file"
@@ -306,23 +344,24 @@ run_case() {
   wrapper="$(make_shell_wrapper "$scenario" "$shell_bin")"
   write_config "$pane_term" "$wrapper"
 
-  rm -f "$flow_ok_file" "$vim_output_file" "$fzf_output_file" "$less_input_file"
+  rm -f "$flow_ok_file" "$vim_output_file" "$fzf_output_file" "$less_input_file" \
+    "$WORK_DIR/fzf.stderr" "$WORK_DIR/fzf.status"
   rm -f "$timeout_file"
 
-  "$BMUX_BIN" server stop >/dev/null 2>&1 || true
+  "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE" server stop >/dev/null 2>&1 || true
   rm -rf "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME/bmux"
   mkdir -p "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME/bmux"
 
   local status="PASS"
   local notes="ok"
 
-  local -a pty_command=(script -q "$log_file" "$BMUX_BIN")
+  local -a pty_command=(script -q "$log_file" "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE")
   if [[ "$(uname -s)" != "Darwin" ]]; then
     local binary_command
-    printf -v binary_command '%q' "$BMUX_BIN"
+    printf -v binary_command '%q ' "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE"
     pty_command=(script -q -e -c "$binary_command" "$log_file")
   fi
-  if ! "${pty_command[@]}" < <(emit_quit_when_marker_or_timeout "$flow_ok_file" "$CASE_TIMEOUT_SECS" "$timeout_file") >/dev/null 2>&1; then
+  if ! "${pty_command[@]}" < <(emit_quit_when_marker_or_timeout "$flow_ok_file" "$CASE_TIMEOUT_SECS" "$timeout_file") >"$WORK_DIR/${scenario}-${profile_name}.attach.log" 2>&1; then
     status="FAIL"
     notes="bmux command failed"
   fi
@@ -336,6 +375,11 @@ run_case() {
     if ! doctor_trace_json >"$trace_json_file"; then
       status="FAIL"
       notes="terminal doctor trace failed"
+    elif ! jq -e 'type == "object"' "$trace_json_file" >/dev/null; then
+      status="FAIL"
+      notes="terminal doctor emitted invalid JSON"
+      echo "terminal doctor stdout (bounded diagnostic):" >&2
+      head -c 4096 "$trace_json_file" >&2
     fi
   fi
 
@@ -419,6 +463,17 @@ run_case() {
   # NOTE: server-backed attach path currently validates protocol behavior
   # through scenario flow success, TERM/profile outputs, and warning checks.
 
+  if [[ "$status" == "FAIL" ]]; then
+    echo "case failed: $scenario/$profile_name ($notes); diagnostics: $log_file, $WORK_DIR/${scenario}-${profile_name}.attach.log" >&2
+    if [[ "$scenario" == "fzf" ]]; then
+      for suffix in status stderr; do
+        if [[ -f "$WORK_DIR/fzf.$suffix" ]]; then
+          echo "fzf $suffix:" >&2
+          head -c 4096 "$WORK_DIR/fzf.$suffix" >&2
+        fi
+      done
+    fi
+  fi
   printf "%s\t%s\t%s\t%s\n" "$scenario" "$profile_name" "$status" "$notes" >>"$RESULTS_FILE"
 }
 

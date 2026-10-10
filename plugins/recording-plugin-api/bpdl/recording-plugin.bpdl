@@ -6,6 +6,7 @@ import pane = bmux.pane_runtime;
 
 capability RECORDING_READ = bmux.recording.read;
 capability RECORDING_WRITE = bmux.recording.write;
+capability RECORDING_PROCESS_V3 = bmux.recording.process.v3;
 
 // Process authority is local to the dedicated, isolated runtime. A run ID is
 // never interpreted as a live user-runtime execution.
@@ -114,6 +115,22 @@ interface recording-process-recovery-v2 {
         -> result<recovery-status, pane.recovery-error>;
     command retire(run_id: uuid, retirement_mutation_id: uuid, expected_revision: u64)
         -> result<pane.retirement-receipt, pane.recovery-error>;
+}
+
+// Native conventional terminal lifetime. No durable daemon-recovery capability
+// is advertised by this interface; lost execution authority returns an error.
+@capability(RECORDING_PROCESS_V3)
+interface recording-process-terminal-v3 {
+    enum lifetime-policy { conventional-terminal-session }
+    command start(options: recording-process-v1.program-options, runtime_root: string, policy: lifetime-policy)
+        -> result<recording-process-v1.run-status, recording-process-v1.process-error>;
+    command status(run_id: uuid) -> result<recording-process-v1.run-status, recording-process-v1.process-error>;
+    command read(run_id: uuid, since: u64, max_bytes: u32) -> result<recording-process-v1.output-read, recording-process-v1.process-error>;
+    command screen(run_id: uuid) -> result<string, recording-process-v1.process-error>;
+    command send(run_id: uuid, data: bytes, mutation_id: uuid) -> result<unit, recording-process-v1.process-error>;
+    command wait(run_id: uuid, timeout_ms: u32) -> result<recording-process-v1.run-status, recording-process-v1.process-error>;
+    command terminate(run_id: uuid, grace_ms: u32) -> result<recording-process-v1.run-status, recording-process-v1.process-error>;
+    command finish(run_id: uuid, expected_revision: u64, terminate_running: bool) -> result<recording-process-v1.run-status, recording-process-v1.process-error>;
 }
 
 interface recording-types {

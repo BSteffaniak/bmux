@@ -1788,7 +1788,7 @@ impl LoadedPlugin {
             let resolved = base
                 .as_ref()
                 .map_err(Clone::clone)
-                .and_then(|base| auxiliary::resolve(base, declaration));
+                .and_then(|base| auxiliary::resolve(base, declaration, &manifest.id));
             match resolved {
                 Ok(value) => {
                     context

@@ -25,6 +25,7 @@ struct MutationRecord {
     receipt: Option<serde_json::Value>,
 }
 
+#[derive(Clone)]
 pub(crate) struct RecoveryStore {
     root: PathBuf,
 }
@@ -138,10 +139,17 @@ impl RecoveryStore {
             std::fs::metadata(&path)?.len() <= 512 * 1024,
             "capture batch exceeds bound"
         );
-        Ok(Some(
-            serde_json::from_slice(&std::fs::read(path)?)
-                .context("corrupt committed capture batch")?,
-        ))
+        let batch: pane::CaptureBatch = serde_json::from_slice(&std::fs::read(path)?)
+            .context("corrupt committed capture batch")?;
+        ensure!(
+            serde_json::to_vec(&batch.cursor)? == serde_json::to_vec(cursor)?,
+            "committed batch identity mismatch"
+        );
+        ensure!(
+            batch.data.len() <= MAX_BATCH_BYTES,
+            "committed capture batch exceeds bound"
+        );
+        Ok(Some(batch))
     }
 
     pub(crate) fn commit_batch(
@@ -357,6 +365,130 @@ mod tests {
         );
         original.options.args.push("conflict".into());
         assert!(reopened.admit(&original).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn committed_batch_survives_cursor_commit_interruption_without_replacement() {
+        let root = std::env::temp_dir().join(format!("bmux-recovery-batch-{}", Uuid::new_v4()));
+        let store = RecoveryStore::new(&root).unwrap();
+        let mut value = record();
+        let execution = pane::ExecutionRef {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            execution_token: Uuid::new_v4(),
+        };
+        let cursor = pane::CaptureCursor {
+            execution,
+            spool_generation: Uuid::new_v4(),
+            offset: 0,
+        };
+        value.status.cursor = Some(cursor.clone());
+        let mut value = store.admit(&value).unwrap();
+        let mut continuation = cursor.clone();
+        continuation.offset = 4;
+        let batch = pane::CaptureBatch {
+            cursor: cursor.clone(),
+            continuation,
+            data: vec![0, 255, 1, 2],
+            complete: true,
+        };
+        // Simulate a crash immediately after the immutable batch commit.
+        crate::durable::write_atomic(
+            &store.batch_path(value.status.run_id, &cursor),
+            &serde_json::to_vec(&batch).unwrap(),
+        )
+        .unwrap();
+        let reopened = RecoveryStore::new(&root).unwrap();
+        let committed = reopened
+            .committed_batch(value.status.run_id, &cursor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.data, batch.data);
+        reopened.commit_batch(&mut value, &committed).unwrap();
+        assert_eq!(
+            reopened
+                .load(value.status.run_id)
+                .unwrap()
+                .status
+                .cursor
+                .unwrap()
+                .offset,
+            4
+        );
+        let mut conflicting = batch.clone();
+        conflicting.data[0] = 99;
+        value.status.cursor = Some(cursor);
+        assert!(reopened.commit_batch(&mut value, &conflicting).is_err());
+        assert_eq!(
+            reopened
+                .committed_batch(value.status.run_id, &batch.cursor)
+                .unwrap()
+                .unwrap()
+                .data,
+            batch.data
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn input_intent_and_receipt_survive_restart_and_reject_conflicting_reuse() {
+        let root = std::env::temp_dir().join(format!("bmux-recovery-input-{}", Uuid::new_v4()));
+        let store = RecoveryStore::new(&root).unwrap();
+        let value = record();
+        store.admit(&value).unwrap();
+        let id = Uuid::new_v4();
+        let request = serde_json::json!({"data":[0,255]});
+        assert!(
+            store
+                .admit_mutation(value.status.run_id, id, "input", &request, 10)
+                .unwrap()
+                .is_none()
+        );
+        let reopened = RecoveryStore::new(&root).unwrap();
+        assert!(
+            reopened
+                .admit_mutation(value.status.run_id, id, "input", &request, 10)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .admit_mutation(
+                    value.status.run_id,
+                    id,
+                    "input",
+                    &serde_json::json!({"data":[1]}),
+                    10
+                )
+                .is_err()
+        );
+        let receipt = serde_json::json!({"completed":true});
+        reopened
+            .complete_mutation(value.status.run_id, id, "input", receipt.clone())
+            .unwrap();
+        assert_eq!(
+            store
+                .admit_mutation(value.status.run_id, id, "input", &request, 10)
+                .unwrap(),
+            Some(receipt.clone())
+        );
+        assert!(
+            store
+                .complete_mutation(
+                    value.status.run_id,
+                    id,
+                    "input",
+                    serde_json::json!({"completed":false})
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .admit_mutation(value.status.run_id, id, "input", &request, 10)
+                .unwrap(),
+            Some(receipt)
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

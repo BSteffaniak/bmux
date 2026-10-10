@@ -3,8 +3,18 @@ id = "bmux.recording"
 name = "bmux Recording"
 owns_namespaces = ["recording"]
 owns_paths = [["server", "recording"], ["playbook", "from-recording"]]
-provided_capabilities = ["bmux.recording.read", "bmux.recording.write"]
-provided_features = ["bmux.recording", "bmux.recording.process.v1"]
+provided_capabilities = [
+    "bmux.recording.read",
+    "bmux.recording.write",
+    "bmux.recording.process.v3",
+]
+provided_features = [
+    "bmux.recording",
+    "bmux.recording.process.v1",
+    "bmux.recording.process.terminal.v3",
+]
+# Explicit native terminal calls may use v3 without making it a v1 prerequisite.
+optional_capabilities = ["bmux.pane_runtime.execution.v3"]
 required_capabilities = [
     "bmux.sessions.program.v1",
     "bmux.pane_runtime.execution.v1",
@@ -19,6 +29,11 @@ kind         = "query"
 [[services]]
 capability   = "bmux.recording.write"
 interface_id = "recording-commands"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.recording.process.v3"
+interface_id = "recording-process-terminal-v3"
 kind         = "command"
 
 [[event_publications]]

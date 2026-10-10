@@ -4,6 +4,7 @@ pub(crate) mod execution;
 pub(crate) mod reservations;
 mod startup_capture;
 pub(crate) mod supervisor;
+pub(crate) mod terminal_session;
 
 use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::{
@@ -5699,8 +5700,13 @@ impl SessionRuntimeManager {
                         .lock()
                         .expect("execution identity lock")
                         .observation_execution;
-                    let (control, mut helper) = match supervisor::SupervisorControl::prepare(token)
-                    {
+                    let conventional_session = execution_for_task
+                        .conventional_session
+                        .load(Ordering::SeqCst);
+                    let (control, mut helper) = match supervisor::SupervisorControl::prepare_mode(
+                        token,
+                        conventional_session,
+                    ) {
                         Ok(value) => value,
                         Err(error) => {
                             fail_startup!(format!("supervisor preparation failed: {error}"));
@@ -5796,7 +5802,24 @@ impl SessionRuntimeManager {
                 }};
             }
             let (startup_cleanup_tx, _) = watch::channel(None);
-            let mut child = StartupChild::new(match pty_pair.slave.spawn_command(command) {
+            let conventional_session = execution_for_task
+                .conventional_session
+                .load(Ordering::SeqCst);
+            let spawned = if conventional_session {
+                pty_pair
+                    .master
+                    .tty_name()
+                    .ok_or_else(|| anyhow::anyhow!("terminal slave path unavailable"))
+                    .and_then(|slave| {
+                        supervisor_control
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("guardian control missing"))?
+                            .spawn_guardian(&slave)
+                    })
+            } else {
+                pty_pair.slave.spawn_command(command)
+            };
+            let mut child = StartupChild::new(match spawned {
                 Ok(child) => child,
                 Err(error) => {
                     fail_captured_startup!(
@@ -5950,16 +5973,43 @@ impl SessionRuntimeManager {
                 .spawn(move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
                     if let Some(control) = &supervisor_control {
+                        let mut exit_announced = false;
                         loop {
-                            match control.request(crate::supervisor_protocol::Operation::Status) {
+                            // Serialize polling with acknowledged sweep/retirement.
+                            // A local control clone could connect just before Sweep
+                            // closes the server, then block on its five-second read
+                            // timeout past the four-second supervision deadline.
+                            let status = {
+                                let authority = execution_for_waiter.supervisor.lock();
+                                if execution_for_waiter.group_kill_issued.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                match authority {
+                                    Ok(authority) => authority.as_ref().unwrap_or(control)
+                                        .request(crate::supervisor_protocol::Operation::Status),
+                                    Err(error) => Err(anyhow::anyhow!(error.to_string())),
+                                }
+                            };
+                            match status {
                                 Ok(status) if status.exit_code.is_some() || status.exit_signal.is_some() => {
                                     if let Ok(mut outcome) = execution_for_waiter.outcome.lock() {
                                         outcome.0 = status.exit_code.and_then(|code| u32::try_from(code).ok());
                                         outcome.1 = status.exit_signal.map(|signal| signal.to_string());
                                     }
                                     exited_for_waiter.store(true, Ordering::SeqCst);
-                                    let _ = child_exit_tx.send(ExecutionExitNotice::TargetExited);
-                                    break;
+                                    if !exit_announced {
+                                        let _ = child_exit_tx.send(ExecutionExitNotice::TargetExited);
+                                        exit_announced = true;
+                                    }
+                                    if execution_for_waiter.conventional_session.load(Ordering::SeqCst) {
+                                        if status.terminal_session_ended == Some(true) {
+                                            execution_for_waiter.terminal_session_ended.store(true, Ordering::SeqCst);
+                                            break;
+                                        }
+                                        std::thread::sleep(Duration::from_millis(10));
+                                    } else {
+                                        break;
+                                    }
                                 }
                                 Ok(_) => std::thread::sleep(Duration::from_millis(10)),
                                 Err(error) => {
@@ -5976,7 +6026,30 @@ impl SessionRuntimeManager {
                             }
                         }
                     }
-                    let wait_result = child.wait();
+                    let wait_result = if supervisor_control.is_some() {
+                        loop {
+                            match child.try_wait() {
+                                Ok(Some(status)) => break Ok(status),
+                                Err(error) => break Err(error),
+                                Ok(None) => {
+                                    if execution_for_waiter.group_kill_issued.load(Ordering::SeqCst)
+                                        || execution_for_waiter.terminal_owner_retired.load(Ordering::SeqCst)
+                                    {
+                                        // ChildKiller::clone_killer uses SIGHUP on Unix,
+                                        // which the helper intentionally ignores. The
+                                        // waiter owns the unreaped direct Child: retire
+                                        // it via Child::kill only after authority ack.
+                                        if let Err(error) = child.kill() {
+                                            break Err(error);
+                                        }
+                                    }
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                            }
+                        }
+                    } else {
+                        child.wait()
+                    };
                     if wait_result.is_ok() {
                         drop(child.take());
                     }
@@ -6338,6 +6411,24 @@ impl SessionRuntimeManager {
                 }
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if execution_for_task.conventional_session.load(Ordering::SeqCst)
+                            && execution_for_task.terminal_session_ended.load(Ordering::SeqCst)
+                            && execution_for_task.output_drained.load(Ordering::SeqCst) {
+                            let retired = execution_for_task.supervisor.lock().ok().and_then(|control| control.as_ref().map(|control| control.request(crate::supervisor_protocol::Operation::RetireOwner { mutation_id: "00000000-0000-4000-8000-000000000003".into() })));
+                            let retirement_error = match retired {
+                                Some(Ok(response)) => response.error,
+                                Some(Err(error)) => Some(error.to_string()),
+                                None => Some("terminal-owner control unavailable".into()),
+                            };
+                            if let Some(error) = retirement_error {
+                                execution_for_task.record_cleanup_error(format!("terminal-owner retirement failed: {error}"));
+                                // Preserve the pinned guardian for explicit recovery.
+                                continue;
+                            }
+                            execution_for_task.terminal_owner_retired.store(true, Ordering::SeqCst);
+                            let _ = child_killer.kill();
+                            break;
+                        }
                         if reader_thread_done.load(Ordering::SeqCst) && !execution_for_task.output_drained.load(Ordering::SeqCst) {
                             if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
                                 execution_for_task.record_cleanup_error(format!("reader-failure group cleanup failed: {error}"));
@@ -11456,6 +11547,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conventional_session_drains_startup_backpressure_and_retires_owner() {
+        supervisor::install_test_artifact()
+            .expect("explicit coordinator-built supervisor artifact");
+        let session_id = SessionId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
+        manager.runtimes.clear();
+        // More than the startup capture queue: publication must unblock capture
+        // without mistaking leader exit for EOF or dropping the buffered tail.
+        let mut prepared = manager
+            .prepare_fresh_program_runtime(
+                session_id,
+                None,
+                Some(PaneLaunchSpec {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "dd if=/dev/zero bs=8192 count=40 2>/dev/null; printf tail".into(),
+                    ],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                }),
+                (24, 80),
+            )
+            .unwrap();
+        let execution = Arc::clone(
+            &prepared
+                .runtime
+                .as_ref()
+                .unwrap()
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .execution,
+        );
+        execution.conventional_session.store(true, Ordering::SeqCst);
+        let _cleanup = ExecutionTestCleanup(Arc::clone(&execution));
+        prepared.wait_until_ready().await.unwrap();
+        manager
+            .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
+            .unwrap();
+        let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
+        assert!(execution.supervisor.lock().unwrap().is_some());
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while !execution.output_drained.load(Ordering::SeqCst)
+                || !pane.exited.load(Ordering::SeqCst)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "supervised output must reach real EOF before sweep: exited={} drained={} watermark={} outcome={:?}",
+            pane.exited.load(Ordering::SeqCst),
+            execution.output_drained.load(Ordering::SeqCst),
+            execution.output_watermark.load(Ordering::SeqCst),
+            execution.outcome.lock().unwrap()
+        );
+        assert_eq!(
+            execution.output_watermark.load(Ordering::SeqCst),
+            40 * 8192 + 4
+        );
+        assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
+        assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pane.cleanup.borrow().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(execution.terminal_session_ended.load(Ordering::SeqCst));
+        // Natural terminal retirement must not claim a descendant group sweep.
+        assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervised_fast_exit_drains_startup_backpressure_before_retirement() {
         supervisor::install_test_artifact()
             .expect("explicit coordinator-built supervisor artifact");
@@ -11499,7 +11668,7 @@ mod tests {
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
         assert!(execution.supervisor.lock().unwrap().is_some());
         let drained = tokio::time::timeout(Duration::from_secs(5), async {
-            while !execution.output_drained.load(Ordering::SeqCst)
+            while execution.output_watermark.load(Ordering::SeqCst) != 40 * 8192 + 4
                 || !pane.exited.load(Ordering::SeqCst)
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -11508,7 +11677,7 @@ mod tests {
         .await;
         assert!(
             drained.is_ok(),
-            "supervised output must reach real EOF before sweep: exited={} drained={} watermark={} outcome={:?}",
+            "legacy capture must retain every byte and target outcome before explicit sweep: exited={} drained={} watermark={} outcome={:?}",
             pane.exited.load(Ordering::SeqCst),
             execution.output_drained.load(Ordering::SeqCst),
             execution.output_watermark.load(Ordering::SeqCst),
@@ -11519,9 +11688,25 @@ mod tests {
             40 * 8192 + 4
         );
         assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
+        assert!(!execution.output_drained.load(Ordering::SeqCst));
         assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
         assert!(execution.signal_owned_group(execution::GROUP_KILL).unwrap());
         assert!(!execution.signal_owned_group(execution::GROUP_KILL).unwrap());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !execution.output_drained.load(Ordering::SeqCst)
+                || pane.cleanup.borrow().is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("authorized sweep must release real EOF and acknowledge supervision");
+        assert_eq!(
+            execution.output_watermark.load(Ordering::SeqCst),
+            40 * 8192 + 4
+        );
+        assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
+        assert!(pane.cleanup.borrow().as_ref().unwrap().is_ok());
         tokio::time::timeout(Duration::from_secs(5), async {
             while pane.cleanup.borrow().is_none() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -11537,6 +11722,9 @@ mod tests {
     struct ExecutionTestCleanup(Arc<execution::ExecutionCapture>);
     impl Drop for ExecutionTestCleanup {
         fn drop(&mut self) {
+            if self.0.terminal_owner_retired.load(Ordering::SeqCst) {
+                return;
+            }
             if let Err(error) = self.0.signal_owned_group(execution::GROUP_KILL) {
                 eprintln!("test process cleanup requires recovery: {error}");
             }
@@ -15417,6 +15605,7 @@ exit 0"#.into(), "fixture".into(), witness.path().to_string_lossy().into_owned()
         );
     }
 
+    #[cfg(feature = "image-registry")]
     async fn assert_anchored_history_image_recovery(
         dispatch: &mut HistoryDispatch,
         session: SessionId,
@@ -15473,6 +15662,7 @@ exit 0"#.into(), "fixture".into(), witness.path().to_string_lossy().into_owned()
         );
     }
 
+    #[cfg(feature = "image-registry")]
     async fn assert_history_image_window_replacement(
         dispatch: &mut HistoryDispatch,
         session: SessionId,

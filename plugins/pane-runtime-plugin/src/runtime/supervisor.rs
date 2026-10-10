@@ -78,11 +78,19 @@ pub(super) struct SupervisorControl {
     directory: PathBuf,
     token: String,
     authentication: String,
+    version: u32,
+    artifact: PathBuf,
 }
 impl SupervisorControl {
-    pub(super) fn prepare(
+    pub(super) fn prepare_mode(
         token: uuid::Uuid,
+        terminal_session: bool,
     ) -> anyhow::Result<(Self, portable_pty::CommandBuilder)> {
+        let version = if terminal_session {
+            protocol::TERMINAL_SESSION_VERSION
+        } else {
+            protocol::VERSION
+        };
         let installation = INSTALLATION
             .get_or_init(|| Mutex::new(None))
             .lock()
@@ -117,7 +125,7 @@ impl SupervisorControl {
         }
         let authentication = uuid::Uuid::new_v4().to_string();
         let bootstrap = Bootstrap {
-            version: protocol::VERSION,
+            version,
             execution_token: token.to_string(),
             authentication: authentication.clone(),
         };
@@ -137,7 +145,7 @@ impl SupervisorControl {
         crate::atomic_state::commit(
             &locator,
             &serde_json::json!({
-                "version": protocol::VERSION, "execution_token": token,
+                "version": version, "execution_token": token,
                 "endpoint": directory.join("control.sock"), "bootstrap": path,
                 "artifact_sha256": installation.hash,
             }),
@@ -154,9 +162,31 @@ impl SupervisorControl {
                 directory,
                 token: token.to_string(),
                 authentication,
+                version,
+                artifact: installation.path.clone(),
             },
             command,
         ))
+    }
+
+    pub(super) fn spawn_guardian(
+        &self,
+        slave: &std::path::Path,
+    ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+        anyhow::ensure!(
+            self.version == protocol::TERMINAL_SESSION_VERSION,
+            "guardian requires explicit terminal-session protocol"
+        );
+        let child = std::process::Command::new(&self.artifact)
+            .arg("--guardian-terminal-session-v3")
+            .arg(self.directory.join("bootstrap.json"))
+            .arg(self.directory.join("control.sock"))
+            .arg(slave)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        Ok(Box::new(child))
     }
 
     #[cfg(unix)]
@@ -173,7 +203,7 @@ impl SupervisorControl {
         protocol::write_frame(
             &mut socket,
             &Request {
-                version: protocol::VERSION,
+                version: self.version,
                 execution_token: self.token.clone(),
                 authentication: self.authentication.clone(),
                 operation,
@@ -181,7 +211,7 @@ impl SupervisorControl {
         )?;
         let response: Response = protocol::read_frame(&mut socket)?;
         anyhow::ensure!(
-            response.version == protocol::VERSION && response.execution_token == self.token,
+            response.version == self.version && response.execution_token == self.token,
             "supervisor response identity mismatch"
         );
         anyhow::ensure!(

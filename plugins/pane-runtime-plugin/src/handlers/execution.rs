@@ -2,7 +2,7 @@
 use bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::{ExecutionError, ExecutionRef};
 use bmux_plugin_sdk::NativeServiceContext;
 
-pub(super) fn authorize(
+pub(crate) fn authorize(
     ctx: &NativeServiceContext,
     execution: &ExecutionRef,
     action: &str,

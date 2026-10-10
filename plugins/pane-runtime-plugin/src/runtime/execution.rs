@@ -24,6 +24,9 @@ pub(super) struct ExecutionCapture {
     pub(super) group_kill_issued: AtomicBool,
     pub(super) cleanup_failed: AtomicBool,
     pub(super) managed_program: AtomicBool,
+    pub(super) conventional_session: AtomicBool,
+    pub(super) terminal_session_ended: AtomicBool,
+    pub(super) terminal_owner_retired: AtomicBool,
     #[cfg(test)]
     pub(super) inject_reader_failure: AtomicBool,
     pub(super) master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -41,6 +44,9 @@ impl Default for ExecutionCapture {
             group_kill_issued: AtomicBool::new(false),
             cleanup_failed: AtomicBool::new(false),
             managed_program: AtomicBool::new(false),
+            conventional_session: AtomicBool::new(false),
+            terminal_session_ended: AtomicBool::new(false),
+            terminal_owner_retired: AtomicBool::new(false),
             #[cfg(test)]
             inject_reader_failure: AtomicBool::new(false),
             master: Mutex::new(None),
@@ -205,7 +211,7 @@ fn validate_token(actual: uuid::Uuid, reference: &ExecutionRef) -> Result<(), Ex
     Ok(())
 }
 
-fn with_pane<T>(
+pub(super) fn with_pane<T>(
     reference: &ExecutionRef,
     action: impl FnOnce(&PaneRuntimeHandle) -> Result<T, ExecutionError>,
 ) -> Result<T, ExecutionError> {
@@ -344,6 +350,15 @@ pub(crate) fn create(
     options: ProgramOptions,
     authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
 ) -> Result<ExecutionRef, ExecutionError> {
+    new_program_session_mode(name, options, false, authorize)
+}
+
+pub(crate) fn new_program_session_mode(
+    name: Option<String>,
+    options: ProgramOptions,
+    conventional_session: bool,
+    authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
+) -> Result<ExecutionRef, ExecutionError> {
     let authorize = Arc::new(authorize);
     let session = bmux_session_models::Session::new(name);
     let id = session.id;
@@ -382,6 +397,9 @@ pub(crate) fn create(
             .panes
             .values()
         {
+            pane.execution
+                .conventional_session
+                .store(conventional_session, Ordering::SeqCst);
             let spawn_authorize = Arc::clone(&authorize);
             *pane.execution.spawn_authorization.lock().map_err(failed)? =
                 Some(Arc::new(move || spawn_authorize(id.0)));

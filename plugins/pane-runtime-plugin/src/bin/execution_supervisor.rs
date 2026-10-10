@@ -7,6 +7,10 @@ mod protocol;
 mod receipts;
 
 #[cfg(unix)]
+#[path = "execution_supervisor/session_guardian.rs"]
+mod session_guardian;
+
+#[cfg(unix)]
 mod unix {
     use super::protocol::{self, Bootstrap, Operation, Request, Response};
     use std::io::Write;
@@ -60,6 +64,8 @@ mod unix {
                 exit_code: self.outcome.and_then(|status| status.code()),
                 exit_signal: self.outcome.and_then(|status| status.signal()),
                 group_consumed: self.consumed,
+                terminal_session_ended: None,
+                cleanup_error: None,
                 error: None,
             })
         }
@@ -118,7 +124,8 @@ mod unix {
             let mutation = match &request.operation {
                 Operation::Start { mutation_id, .. }
                 | Operation::Term { mutation_id }
-                | Operation::Sweep { mutation_id } => Some(mutation_id.clone()),
+                | Operation::Sweep { mutation_id }
+                | Operation::RetireOwner { mutation_id } => Some(mutation_id.clone()),
                 Operation::Hello | Operation::Status => None,
             };
             let fingerprint =
@@ -207,6 +214,11 @@ mod unix {
                         self.start = Some(encoded);
                     }
                 }
+                Operation::RetireOwner { .. } => {
+                    return Err(std::io::Error::other(
+                        "terminal owner retirement requires protocol v3",
+                    ));
+                }
                 Operation::Term { .. } => self.signal(libc::SIGTERM)?,
                 Operation::Sweep { .. } => {
                     self.signal(libc::SIGKILL)?;
@@ -222,7 +234,7 @@ mod unix {
         }
     }
 
-    fn private_peer(socket: &std::os::unix::net::UnixStream) -> std::io::Result<()> {
+    pub(super) fn private_peer(socket: &std::os::unix::net::UnixStream) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
         #[cfg(target_os = "macos")]
         {
@@ -398,6 +410,8 @@ mod unix {
                     exit_code: None,
                     exit_signal: None,
                     group_consumed: false,
+                    terminal_session_ended: None,
+                    cleanup_error: None,
                     error: Some(error.to_string()),
                 },
             };
@@ -412,9 +426,20 @@ mod unix {
 
 fn main() {
     #[cfg(unix)]
-    if unix::run().is_err() {
-        // Do not contaminate the target's raw terminal capture with helper logs.
-        std::process::exit(1);
+    {
+        let args: Vec<_> = std::env::args().collect();
+        let result = match args.get(1).map(String::as_str) {
+            Some("--terminal-owner") if args.len() == 4 => {
+                session_guardian::owner(&args[2], &args[3])
+            }
+            Some("--guardian-terminal-session-v3") if args.len() == 5 => {
+                session_guardian::run(&args[2], &args[3], &args[4])
+            }
+            _ => unix::run(),
+        };
+        if result.is_err() {
+            std::process::exit(1);
+        }
     }
     #[cfg(not(unix))]
     {

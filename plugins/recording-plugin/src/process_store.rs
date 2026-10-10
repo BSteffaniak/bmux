@@ -9,8 +9,18 @@ pub(crate) struct ProcessStore {
 }
 
 impl ProcessStore {
+    #[cfg(test)]
     pub(crate) fn new(recordings_root: &Path) -> Result<Self> {
-        let root = recordings_root.join("process-runs-v1");
+        Self::for_contract(recordings_root, 1)
+    }
+
+    pub(crate) fn for_contract(recordings_root: &Path, version: u32) -> Result<Self> {
+        ensure!(matches!(version, 1 | 3), "unsupported process contract");
+        let root = recordings_root.join(if version == 1 {
+            "process-runs-v1"
+        } else {
+            "process-v3/native"
+        });
         crate::durable::private_directory(&root)?;
         std::fs::File::open(recordings_root)?.sync_all()?;
         Ok(Self { root })

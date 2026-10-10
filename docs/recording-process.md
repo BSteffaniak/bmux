@@ -143,6 +143,73 @@ not permission to overwrite it. Retrying export must not relaunch the program or
 change the recorded outcome. Verify supported formats/profile combinations and
 read all reported artifact paths rather than guessing them.
 
+## Native terminal-session lifetime decision
+
+The accepted direction is a separately negotiated conventional terminal-session
+contract. It is not a reinterpretation of `recording-process-v1` or the existing
+preserve-descendants execution policy. The new contract is under implementation;
+examples above still describe v1. The opt-in CLI selection is the paired
+`--contract-version 3 --lifetime terminal-session` flags on `start` or `run`.
+Its native service is `recording-process-terminal-v3`; it remains subject to
+end-to-end validation and does not advertise durable daemon recovery.
+
+For this selection, JSON wraps the operation result in an explicit envelope:
+
+```json
+{"contract":{"interface":"recording-process-terminal-v3","lifecycle":"conventional-terminal-session","status_schema_version":1},"result":{}}
+```
+
+`result` retains the existing operation's modeled field shape and schema version.
+The default v1 commands still return their existing bare JSON. Capture readiness
+(`output_drained`) does not claim descendant cleanup: native readiness requires
+session end, complete capture, and the actual raw capture boundary. An incomplete
+or recovery-required native status returns an explicit error.
+
+Native launch persists its key, selected contract, and isolated runtime locator
+before invoking execution. An ambiguous response is not retried as a fresh launch
+and does not implicitly terminate possibly running work. The error identifies the
+retained key, exact runtime root, and `launch-KEY-runtime.json` recovery record;
+known run identity is retained when available. These records support explicit
+investigation, not an advertised automatic daemon-recovery capability. Original
+recording sinks preserve uninterrupted capture timing; raw-only recovered bytes
+must not be presented as recovered original event timing or full telemetry.
+
+Execution authority, terminal lifetime, capture, and finalization are separate
+plugin-owned responsibilities:
+
+- A control guardian retains authenticated execution identity, mutation receipts,
+  reconnect authority, and its precisely fenced signal scope outside the
+  controlling-terminal session.
+- A designated terminal owner defines that session's lifetime. At session end,
+  normal OS hangup/revocation semantics apply. BMUX does not thereby gain
+  authority to kill unrelated or escaped processes; continued access to the ended
+  terminal is not guaranteed by this new contract.
+- Capture retains the master reader and durably records actual kernel bytes.
+  Target exit, terminal-owner exit, an empty group, and a timeout are not
+  substitutes for a capture boundary or proof of byte completeness.
+- Finalization requires the target outcome, acknowledged capture boundary, and
+  required durable recording commit. Execution cleanup remains a separate outcome.
+  Lost or uncertain capture stays explicitly incomplete.
+
+On native macOS, opening `/dev/tty` can retain a hidden controlling-terminal vnode
+reference until session-leader exit, after ordinary slave descriptors close.
+Keeping the terminal owner alive solely for fencing can therefore prevent EOF.
+Conversely, retiring it can revoke descriptors held by escaped descendants or
+queued descriptor transfers. Process/descriptor snapshots cannot prove atomic
+holder quiescence.
+
+The new contract permits conventional session-end effects on future terminal use;
+it does **not** permit silently discarding already-written bytes or reporting
+truncated evidence complete. Buffered-output preservation must pass owned burst,
+small unread-tail, and backpressure tests. Failure to establish safe draining
+requires an incomplete/recovery outcome rather than forced success. Legacy
+semantics stay separately supported without target-exit-based automatic retirement.
+
+There is no implicit pipe substitution or guest execution. Native executables,
+query/reply behavior, job control, resizing, retry identity, and isolation remain
+acceptance requirements. Changed capabilities must be selected explicitly and
+unsupported versions rejected before launch.
+
 ## Isolated automation
 
 Never run acceptance tests against an ordinary user endpoint. Use the current

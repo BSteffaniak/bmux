@@ -1,4 +1,7 @@
-//! Real CLI acceptance tests. Never use an installed binary or a user's runtime.
+//! Real CLI acceptance tests. Never use a PATH binary or a user's runtime.
+//! Defaults to CARGO_BIN_EXE_bmux; installed acceptance requires both
+//! BMUX_RECORDING_TEST_BINARY and BMUX_RECORDING_TEST_INSTALL_ROOT, pointing
+//! inside an explicitly owned staged/relocated installation.
 //! The coordinator builds/validates this target; this fixture never invokes Cargo.
 //! CLI JSON assertions follow process_commands.rs and recording-process-v1.
 //! Start must automatically bootstrap an owned isolated runtime; this fixture never
@@ -17,6 +20,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 struct RecordingEnv {
     root: PathBuf,
+    binary: PathBuf,
     runs: std::cell::RefCell<Vec<String>>,
     command_sequence: std::cell::Cell<u64>,
 }
@@ -41,18 +45,49 @@ impl RecordingEnv {
         fs::write(root.join("config/bmux.toml"), "").expect("write empty isolated config");
         Self {
             root,
+            binary: acceptance_binary(),
             runs: std::cell::RefCell::new(Vec::new()),
             command_sequence: std::cell::Cell::new(0),
         }
     }
 
-    fn command(&self, args: &[&str]) -> Command {
-        let binary = PathBuf::from(env!("CARGO_BIN_EXE_bmux"));
+    /// Copy only the flat, coordinator-installed payload, then relocate it before
+    /// any launch. Never mutate the coordinator's stage or selected installation.
+    fn relocated_installation() -> Self {
         assert!(
-            binary.is_absolute(),
-            "Cargo must supply an explicit local binary"
+            std::env::var_os("BMUX_RECORDING_TEST_BINARY").is_some(),
+            "installed test requires an explicit binary"
         );
-        let mut command = Command::new(binary);
+        assert!(
+            std::env::var_os("BMUX_RECORDING_TEST_INSTALL_ROOT").is_some(),
+            "installed test requires an owned installation root"
+        );
+        let mut env = Self::new();
+        let source = env.binary.parent().expect("installation directory");
+        let inventory: Value = serde_json::from_slice(
+            &fs::read(source.join("artifacts.json")).expect("committed install inventory"),
+        )
+        .expect("inventory JSON");
+        assert_eq!(inventory["schema_version"].as_u64(), Some(1));
+        let copied = env.root.join("installed-before-relocation");
+        fs::create_dir(&copied).expect("owned install copy");
+        for entry in fs::read_dir(source).expect("flat installed payload") {
+            let entry = entry.expect("installed member");
+            assert!(
+                entry.file_type().expect("installed member type").is_file(),
+                "installed acceptance requires a flat regular-file payload"
+            );
+            fs::copy(entry.path(), copied.join(entry.file_name()))
+                .expect("copy owned installed artifact");
+        }
+        let relocated = env.root.join("relocated-installation");
+        fs::rename(copied, &relocated).expect("relocate owned installation");
+        env.binary = relocated.join(env.binary.file_name().expect("installed binary name"));
+        env
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(&self.binary);
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("BMUX_") {
                 command.env_remove(key);
@@ -145,6 +180,10 @@ impl RecordingEnv {
     }
 
     fn start(&self, script: &str, extra_args: &[&str]) -> String {
+        self.start_profile(script, extra_args, "functional")
+    }
+
+    fn start_profile(&self, script: &str, extra_args: &[&str], profile: &str) -> String {
         let path = self.script("program.sh", script);
         let cwd = self.root.to_str().expect("test root UTF-8");
         let mut args = vec![
@@ -153,7 +192,7 @@ impl RecordingEnv {
             "start",
             "--json",
             "--profile",
-            "functional",
+            profile,
             "--viewport",
             "100x30",
             "--cwd",
@@ -233,6 +272,21 @@ impl RecordingEnv {
             0o700
         );
         id
+    }
+
+    fn wait_leader_exit(&self, id: &str, expected_code: u64) -> Value {
+        // Read-only observation: never terminate implicitly when polling status.
+        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        loop {
+            let status = self.json(&["recording", "process", "status", id, "--json"]);
+            if status["phase"].as_str() == Some("exited") {
+                assert_eq!(status["exit_code"].as_u64(), Some(expected_code));
+                assert_eq!(status["capture_finalized"].as_bool(), Some(false));
+                return status;
+            }
+            assert!(Instant::now() < deadline, "leader did not exit: {status}");
+            thread::sleep(POLL_INTERVAL);
+        }
     }
 
     fn wait_exit(&self, id: &str) -> Value {
@@ -324,6 +378,44 @@ impl Drop for RecordingEnv {
                 self.root.display()
             );
         }
+    }
+}
+
+fn acceptance_binary() -> PathBuf {
+    let selected = std::env::var_os("BMUX_RECORDING_TEST_BINARY");
+    let root = std::env::var_os("BMUX_RECORDING_TEST_INSTALL_ROOT");
+    match (selected, root) {
+        (None, None) => {
+            let binary = PathBuf::from(env!("CARGO_BIN_EXE_bmux"));
+            assert!(binary.is_absolute(), "Cargo must supply an absolute binary");
+            binary
+        }
+        (Some(binary), Some(root)) => {
+            let binary = PathBuf::from(binary);
+            let root = PathBuf::from(root);
+            assert!(binary.is_absolute() && root.is_absolute());
+            assert!(
+                fs::symlink_metadata(&binary)
+                    .expect("owned installed binary metadata")
+                    .file_type()
+                    .is_file(),
+                "installed binary must be a regular file, not a symlink"
+            );
+            let root = root.canonicalize().expect("owned installation root");
+            let binary = binary.canonicalize().expect("owned installed binary");
+            assert!(
+                binary.starts_with(&root) && binary != root,
+                "selected binary escaped the explicit owned installation"
+            );
+            assert!(
+                root != Path::new("/")
+                    && root != Path::new("/usr")
+                    && root != Path::new("/usr/local"),
+                "installation root must be an owned test stage, not a system prefix"
+            );
+            binary
+        }
+        _ => panic!("installed acceptance requires both binary and owned installation root"),
     }
 }
 
@@ -481,6 +573,682 @@ fn read_all(env: &RecordingEnv, id: &str) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
+fn relocated_installed_payload_runs_with_committed_supervisor_inventory() {
+    let env = RecordingEnv::relocated_installation();
+    let id = env.start("stty -opost\nprintf INSTALLED_RELOCATED\n", &[]);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // This export test explicitly disposes only its exited legacy execution.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
+    assert_eq!(status["exit_code"].as_u64(), Some(0));
+    assert_eq!(read_all(&env, &id), b"INSTALLED_RELOCATED");
+    let artifacts = env.finish(&id, "installed-export", &["raw"]);
+    assert_eq!(
+        fs::read(artifacts.join("output.pty")).expect("installed raw"),
+        b"INSTALLED_RELOCATED"
+    );
+}
+
+#[test]
+#[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
+fn relocated_installed_native_terminal_contract_exports_and_remains_offline() {
+    let env = RecordingEnv::relocated_installation();
+    let script = env.script(
+        "installed-native.sh",
+        "stty -opost\nprintf '\\033[41mINSTALLED_NATIVE\\033[0m'\nexit 7\n",
+    );
+    let output = env.run(&[
+        "recording",
+        "process",
+        "run",
+        "--contract-version",
+        "3",
+        "--lifetime",
+        "terminal-session",
+        "--profile",
+        "full",
+        "--viewport",
+        "100x30",
+        "--cwd",
+        env.root.to_str().expect("owned cwd"),
+        "--json",
+        "--",
+        "/bin/sh",
+        script.to_str().expect("owned script"),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "installed native foreground outcome"
+    );
+    let status = native_result(&output);
+    let id = env.track_run(&status);
+    assert_eq!(status["exit_code"].as_u64(), Some(7));
+    assert_eq!(status["output_drained"].as_bool(), Some(true));
+    assert_eq!(status["capture_finalized"].as_bool(), Some(true));
+    let destination = env.root.join("installed-native-exports");
+    let finished = env.run(&[
+        "recording",
+        "process",
+        "finish",
+        &id,
+        "--export",
+        "raw",
+        "--export",
+        "text",
+        "--export",
+        "events",
+        "--export",
+        "gif",
+        "--output",
+        destination.to_str().expect("destination"),
+        "--cleanup-server",
+        "--json",
+    ]);
+    assert_success(&finished);
+    assert_eq!(
+        native_result(&finished)["status"]["run_id"].as_str(),
+        Some(id.as_str())
+    );
+    assert_eq!(
+        fs::read(destination.join("output.pty")).expect("installed native raw"),
+        b"\x1b[41mINSTALLED_NATIVE\x1b[0m"
+    );
+    assert!(
+        fs::read_to_string(destination.join("output.txt"))
+            .expect("installed native text")
+            .contains("INSTALLED_NATIVE")
+    );
+    let events =
+        fs::read_to_string(destination.join("events.jsonl")).expect("installed native events");
+    assert!(
+        events
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("event JSON"))
+            .any(|event| event["kind"] == "pane_output_raw")
+    );
+    assert!(gif_dominant_colors(&destination.join("output.gif")).contains(&0));
+    let offline = env.run(&["recording", "process", "status", &id, "--json"]);
+    assert_success(&offline);
+    assert_eq!(
+        native_result(&offline)["recording_id"],
+        status["recording_id"]
+    );
+}
+
+fn assert_installed_launch_rejected(env: &RecordingEnv) {
+    let marker = env.root.join("must-not-launch");
+    let script = env.script("rejected-program.sh", "printf launched > must-not-launch\n");
+    let output = env.run(&[
+        "recording",
+        "process",
+        "start",
+        "--json",
+        "--cwd",
+        env.root.to_str().expect("owned cwd"),
+        "--",
+        "/bin/sh",
+        script.to_str().expect("owned script"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "invalid installed helper was admitted"
+    );
+    let diagnostics = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostics.contains("auxiliary")
+            || diagnostics.contains("supervisor")
+            || diagnostics.contains("inventory"),
+        "failure was not attributed to installed helper authority: {diagnostics}"
+    );
+    assert!(
+        !marker.exists(),
+        "program launched before installed helper rejection"
+    );
+    assert!(
+        !diagnostics.contains("dedicated runtime cleanup failed"),
+        "owned failed launch did not clean up: {diagnostics}"
+    );
+}
+
+#[test]
+#[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
+fn installed_missing_and_same_length_tampered_helpers_reject_before_launch() {
+    for tampered in [false, true] {
+        let env = RecordingEnv::relocated_installation();
+        let directory = env.binary.parent().expect("relocated root");
+        let inventory = fs::read(directory.join("artifacts.json")).expect("retained inventory");
+        let helper = directory.join("bmux-pane-execution-supervisor");
+        if tampered {
+            let mut bytes = fs::read(&helper).expect("installed real supervisor");
+            assert!(!bytes.is_empty());
+            // Preserve length, path, permissions and inventory. Hash must detect
+            // replacement before a tampered Mach-O/ELF reaches execution.
+            let last = bytes.last_mut().expect("helper byte");
+            *last ^= 1;
+            fs::write(helper, bytes).expect("tamper only owned copied helper");
+        } else {
+            fs::rename(helper, env.root.join("withheld-supervisor"))
+                .expect("withhold owned helper");
+        }
+        assert_installed_launch_rejected(&env);
+        assert_eq!(
+            fs::read(directory.join("artifacts.json")).expect("inventory after rejection"),
+            inventory
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires explicit installed payload and real different-slot BMUX_RECORDING_TEST_FOREIGN_SUPERVISOR"]
+fn installed_different_slot_helper_rejects_against_untouched_inventory() {
+    let foreign = PathBuf::from(
+        std::env::var_os("BMUX_RECORDING_TEST_FOREIGN_SUPERVISOR")
+            .expect("explicit coordinator-supplied different-slot supervisor"),
+    );
+    assert!(foreign.is_absolute());
+    assert!(
+        fs::symlink_metadata(&foreign)
+            .expect("foreign helper metadata")
+            .file_type()
+            .is_file()
+    );
+    let foreign = foreign.canonicalize().expect("foreign helper path");
+    let env = RecordingEnv::relocated_installation();
+    let directory = env.binary.parent().expect("relocated root");
+    assert!(
+        !foreign.starts_with(directory),
+        "foreign helper must originate outside selected installation"
+    );
+    let inventory = fs::read(directory.join("artifacts.json")).expect("retained inventory");
+    let helper = directory.join("bmux-pane-execution-supervisor");
+    assert_ne!(
+        fs::read(&foreign).expect("real foreign helper"),
+        fs::read(&helper).expect("selected helper"),
+        "byte-identical helper cannot demonstrate wrong-artifact rejection"
+    );
+    fs::copy(foreign, helper).expect("replace only owned helper with real foreign artifact");
+    assert_installed_launch_rejected(&env);
+    assert_eq!(
+        fs::read(directory.join("artifacts.json")).expect("inventory after rejection"),
+        inventory
+    );
+}
+
+#[test]
+#[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
+fn installed_wrong_owner_unsupported_or_corrupt_inventory_rejects_before_launch() {
+    for case in ["wrong-owner", "unsupported-schema", "corrupt"] {
+        let env = RecordingEnv::relocated_installation();
+        let path = env
+            .binary
+            .parent()
+            .expect("relocated root")
+            .join("artifacts.json");
+        let original = fs::read(&path).expect("real installed inventory");
+        let mut inventory: Value = serde_json::from_slice(&original).expect("inventory JSON");
+        match case {
+            "wrong-owner" => {
+                let artifact = inventory["artifacts"]
+                    .as_array_mut()
+                    .expect("artifacts")
+                    .iter_mut()
+                    .find(|artifact| artifact["relative_path"] == "bmux-pane-execution-supervisor")
+                    .expect("committed supervisor");
+                artifact["declaration"]["owner"] = Value::String("foreign.owner".into());
+                fs::write(
+                    &path,
+                    serde_json::to_vec(&inventory).expect("mutated inventory JSON"),
+                )
+                .expect("mutate owned owner");
+            }
+            "unsupported-schema" => {
+                inventory["schema_version"] = Value::from(99);
+                fs::write(
+                    &path,
+                    serde_json::to_vec(&inventory).expect("mutated inventory JSON"),
+                )
+                .expect("mutate owned schema");
+            }
+            "corrupt" => fs::write(&path, b"{invalid").expect("corrupt owned inventory"),
+            _ => unreachable!(),
+        }
+        assert_installed_launch_rejected(&env);
+    }
+}
+
+fn native_result(output: &Output) -> Value {
+    let value = parse_json(output);
+    assert_eq!(value["schema_version"].as_u64(), Some(1));
+    assert_eq!(
+        value["contract"],
+        serde_json::json!({
+            "interface": "recording-process-terminal-v3",
+            "lifecycle": "conventional-terminal-session",
+            "status_schema_version": 1,
+        })
+    );
+    value
+        .get("result")
+        .expect("explicit native result envelope")
+        .clone()
+}
+
+#[test]
+fn native_terminal_profiles_use_explicit_contract_and_complete_capture() {
+    for profile in ["full", "functional", "visual"] {
+        let env = RecordingEnv::new();
+        let script = env.script("native-input.sh", "stty -echo -opost\nprintf 'Ready>'\nIFS= read -r line\nprintf '\\033[41mReply:%s\\033[0m' \"$line\"\nexit 7\n");
+        let start = env.run(&[
+            "recording",
+            "process",
+            "start",
+            "--contract-version",
+            "3",
+            "--lifetime",
+            "terminal-session",
+            "--profile",
+            profile,
+            "--viewport",
+            "100x30",
+            "--cwd",
+            env.root.to_str().expect("cwd"),
+            "--json",
+            "--",
+            "/bin/sh",
+            script.to_str().expect("script"),
+        ]);
+        assert_success(&start);
+        let status = native_result(&start);
+        assert_eq!(status["schema_version"].as_u64(), Some(1));
+        let id = env.track_run(&status);
+        let ready = env.run(&[
+            "recording",
+            "process",
+            "wait",
+            &id,
+            "--screen-contains",
+            "Ready>",
+            "--timeout",
+            "10s",
+            "--json",
+        ]);
+        assert_success(&ready);
+        assert_eq!(native_result(&ready)["matched"].as_bool(), Some(true));
+        let input = env.run_with_input(
+            &["recording", "process", "send", &id, "--stdin", "--json"],
+            Some("héllo".as_bytes()),
+        );
+        assert_success(&input);
+        assert_eq!(native_result(&input)["accepted_bytes"].as_u64(), Some(6));
+        let key = env.run(&[
+            "recording",
+            "process",
+            "send",
+            &id,
+            "--key",
+            "Enter",
+            "--json",
+        ]);
+        assert_success(&key);
+        assert_eq!(native_result(&key)["accepted_bytes"].as_u64(), Some(1));
+        let waited = env.run(&[
+            "recording",
+            "process",
+            "wait",
+            &id,
+            "--exit",
+            "--timeout",
+            "10s",
+            "--json",
+        ]);
+        assert_success(&waited);
+        let status = native_result(&waited);
+        assert_eq!(status["exit_code"].as_u64(), Some(7));
+        // Capture readiness does not assert descendant cleanup or daemon recovery.
+        assert_eq!(status["output_drained"].as_bool(), Some(true));
+        let expected = "Ready>\x1b[41mReply:héllo\x1b[0m".as_bytes();
+        assert_eq!(
+            status["output_watermark"].as_u64(),
+            Some(u64::try_from(expected.len()).expect("watermark"))
+        );
+        let read = env.run(&[
+            "recording",
+            "process",
+            "read",
+            &id,
+            "--since",
+            "0",
+            "--max-bytes",
+            "16384",
+            "--json",
+        ]);
+        assert_success(&read);
+        let read = native_result(&read);
+        assert_eq!(read["complete"].as_bool(), Some(true));
+        let bytes: Vec<u8> = read["data"]
+            .as_array()
+            .expect("read bytes")
+            .iter()
+            .map(|byte| u8::try_from(byte.as_u64().expect("byte")).expect("bounded byte"))
+            .collect();
+        assert_eq!(bytes, expected);
+        let destination = env.root.join("native-exports");
+        let finished = env.run(&[
+            "recording",
+            "process",
+            "finish",
+            &id,
+            "--export",
+            "raw",
+            "--export",
+            "text",
+            "--export",
+            "events",
+            "--export",
+            "gif",
+            "--output",
+            destination.to_str().expect("destination"),
+            "--json",
+        ]);
+        assert_success(&finished);
+        let finished = native_result(&finished);
+        assert_eq!(
+            finished["status"]["capture_finalized"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(finished["status"]["run_id"].as_str(), Some(id.as_str()));
+        assert_eq!(
+            fs::read(destination.join("output.pty")).expect("native raw"),
+            expected
+        );
+        assert!(
+            fs::read_to_string(destination.join("output.txt"))
+                .expect("native text")
+                .contains("Reply:héllo")
+        );
+        let events = fs::read_to_string(destination.join("events.jsonl")).expect("native events");
+        let events: Vec<Value> = events
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event JSON"))
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["kind"] == "pane_output_raw")
+        );
+        assert_eq!(
+            events.iter().any(|event| event["kind"] == "pane_input_raw"),
+            profile != "visual"
+        );
+        assert!(
+            gif_dominant_colors(&destination.join("output.gif")).contains(&0),
+            "native final red reply lost"
+        );
+        let cleanup = env.run(&[
+            "recording",
+            "process",
+            "finish",
+            &id,
+            "--cleanup-server",
+            "--json",
+        ]);
+        assert_success(&cleanup);
+        assert_eq!(
+            native_result(&cleanup)["capture_finalized"].as_bool(),
+            Some(true)
+        );
+        let offline = env.run(&["recording", "process", "status", &id, "--json"]);
+        assert_success(&offline);
+        assert_eq!(
+            native_result(&offline)["run_id"].as_str(),
+            Some(id.as_str())
+        );
+    }
+}
+
+#[test]
+fn legacy_profiles_preserve_output_and_input_capture_policy() {
+    for profile in ["full", "functional", "visual"] {
+        let env = RecordingEnv::new();
+        let id = env.start_profile(
+            "stty -echo -opost\nprintf 'Ready>'\nIFS= read -r line\nprintf '\\033[41mReply:%s\\033[0m' \"$line\"\n",
+            &[],
+            profile,
+        );
+        env.json(&[
+            "recording",
+            "process",
+            "wait",
+            &id,
+            "--screen-contains",
+            "Ready>",
+            "--timeout",
+            "10s",
+            "--json",
+        ]);
+        assert_success(&env.run_with_input(
+            &["recording", "process", "send", &id, "--stdin", "--json"],
+            Some("héllo".as_bytes()),
+        ));
+        env.json(&[
+            "recording",
+            "process",
+            "send",
+            &id,
+            "--key",
+            "Enter",
+            "--json",
+        ]);
+        let before_disposal = env.wait_leader_exit(&id, 0);
+        // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+        env.json(&[
+            "recording",
+            "process",
+            "terminate",
+            &id,
+            "--grace-period",
+            "1s",
+            "--json",
+        ]);
+        let status = env.wait_exit(&id);
+        assert_eq!(status["execution"], before_disposal["execution"]);
+        assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+        assert_eq!(
+            status["output_watermark"],
+            before_disposal["output_watermark"]
+        );
+        assert_eq!(status["schema_version"].as_u64(), Some(1));
+        assert_eq!(status["exit_code"].as_u64(), Some(0));
+        let expected = "Ready>\x1b[41mReply:héllo\x1b[0m".as_bytes();
+        assert_eq!(read_all(&env, &id), expected);
+        let artifacts = env.finish(&id, "profile-exports", &["raw", "text", "events", "gif"]);
+        assert_eq!(
+            fs::read(artifacts.join("output.pty")).expect("profile raw"),
+            expected
+        );
+        assert!(
+            fs::read_to_string(artifacts.join("output.txt"))
+                .expect("profile text")
+                .contains("Reply:héllo")
+        );
+        let events = fs::read_to_string(artifacts.join("events.jsonl")).expect("profile events");
+        let events: Vec<Value> = events
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("event JSON"))
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| event["kind"] == "pane_output_raw")
+        );
+        assert_eq!(
+            events.iter().any(|event| event["kind"] == "pane_input_raw"),
+            profile != "visual"
+        );
+        assert!(
+            gif_dominant_colors(&artifacts.join("output.gif")).contains(&0),
+            "profile GIF lost final red reply"
+        );
+    }
+}
+
+#[test]
+fn stale_finish_revision_does_not_finalize_or_publish() {
+    let env = RecordingEnv::new();
+    let id = env.start("stty -opost\nprintf STALE\n", &[]);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
+    let stale = status["revision"]
+        .as_u64()
+        .expect("revision")
+        .saturating_sub(1)
+        .to_string();
+    let destination = env.root.join("stale-export");
+    let refused = env.run(&[
+        "recording",
+        "process",
+        "finish",
+        &id,
+        "--expected-revision",
+        &stale,
+        "--export",
+        "raw",
+        "--output",
+        destination.to_str().expect("destination"),
+        "--json",
+    ]);
+    assert!(!refused.status.success());
+    assert!(
+        parse_json(&refused)["error"]
+            .as_str()
+            .expect("revision error")
+            .contains("revision")
+    );
+    assert!(!destination.exists(), "stale mutation published artifacts");
+    let pending = env.json(&["recording", "process", "status", &id, "--json"]);
+    assert_eq!(pending["capture_finalized"].as_bool(), Some(false));
+    assert_eq!(pending["execution"], status["execution"]);
+    assert_eq!(read_all(&env, &id), b"STALE");
+    env.finish(&id, "valid-export", &["raw"]);
+}
+
+#[test]
+fn whole_frame_loss_never_publishes_or_overwrites_live_capture() {
+    let env = RecordingEnv::new();
+    let id = env.start(
+        "stty -opost\nprintf FRAME_ONE\nsleep 0.2\nprintf FRAME_TWO\n",
+        &[],
+    );
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
+    let expected = read_all(&env, &id);
+    let directory = PathBuf::from(status["runtime_root"].as_str().expect("runtime root"))
+        .join("state/recordings")
+        .join(status["recording_id"].as_str().expect("recording id"));
+    env.json(&["recording", "process", "finish", &id, "--json"]);
+    let manifest = fs::read(directory.join("manifest.json")).expect("committed manifest");
+    let decoded: Value = serde_json::from_slice(&manifest).expect("manifest JSON");
+    let segment = directory.join(
+        decoded["summary"]["segments"][0]
+            .as_str()
+            .expect("canonical segment"),
+    );
+    let canonical = fs::read(&segment).expect("canonical frames");
+    let mut offset = 0;
+    let mut last = 0;
+    while offset < canonical.len() {
+        last = offset;
+        let prefix: [u8; 4] = canonical[offset..offset + 4]
+            .try_into()
+            .expect("frame prefix");
+        offset += 4 + usize::try_from(u32::from_le_bytes(prefix)).expect("frame size");
+        assert!(offset <= canonical.len(), "fixture had partial frame");
+    }
+    assert!(last > 0, "fixture needs multiple canonical frames");
+    fs::write(&segment, &canonical[..last]).expect("remove one entire owned frame");
+    let destination = env.root.join("lost-frame-export");
+    let refused = env.run(&[
+        "recording",
+        "process",
+        "finish",
+        &id,
+        "--export",
+        "raw",
+        "--output",
+        destination.to_str().expect("destination"),
+        "--json",
+    ]);
+    assert!(!refused.status.success(), "whole-frame loss was accepted");
+    assert!(!destination.exists(), "partial evidence was published");
+    assert_eq!(
+        fs::read(directory.join("manifest.json")).expect("manifest after refusal"),
+        manifest
+    );
+    assert_eq!(
+        fs::read(directory.join("output.live")).expect("live capture after refusal"),
+        expected
+    );
+    fs::write(segment, canonical).expect("restore owned canonical evidence");
+    let artifacts = env.finish(&id, "repaired-frames", &["raw"]);
+    assert_eq!(
+        fs::read(artifacts.join("output.pty")).expect("repaired raw"),
+        expected
+    );
+}
+
+#[test]
 fn finite_launch_status_before_wait_reports_drain() {
     let env = RecordingEnv::new();
     let id = env.start("stty -opost\nprintf FINITE\ni=0\nwhile [ \"$i\" -lt 4096 ]; do printf '0123456789abcdef'; i=$((i+1)); done\nprintf LAST\nexit 7\n", &[]);
@@ -522,10 +1290,54 @@ fn immediate_exit_and_startup_burst_are_not_lost() {
     for iteration in 0..4 {
         let env = RecordingEnv::new();
         let id = env.start("stty -opost\nprintf FIRST\ni=0\nwhile [ \"$i\" -lt 4096 ]; do printf '0123456789abcdef'; i=$((i+1)); done\nprintf LAST\nexit 7\n", &[]);
+        let expected = format!("FIRST{}LAST", "0123456789abcdef".repeat(4096)).into_bytes();
+        let before_disposal = env.wait_leader_exit(&id, 7);
+        // Leader exit can precede reading its final queued output. Observe the
+        // known complete fixture watermark before explicitly disposing the owner.
+        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        let before_disposal = loop {
+            let observed = env.json(&["recording", "process", "status", &id, "--json"]);
+            assert_eq!(observed["execution"], before_disposal["execution"]);
+            assert_eq!(observed["exit_code"].as_u64(), Some(7));
+            assert!(
+                !observed["capture_finalized"]
+                    .as_bool()
+                    .expect("capture state")
+            );
+            let watermark = observed["output_watermark"].as_u64().expect("watermark");
+            let expected_watermark = u64::try_from(expected.len()).expect("fixture length");
+            assert!(
+                watermark <= expected_watermark,
+                "unexpected extra startup output"
+            );
+            if watermark == expected_watermark {
+                break observed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "startup capture missing suffix: {observed}"
+            );
+            thread::sleep(POLL_INTERVAL);
+        };
+        // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+        env.json(&[
+            "recording",
+            "process",
+            "terminate",
+            &id,
+            "--grace-period",
+            "1s",
+            "--json",
+        ]);
         let status = env.wait_exit(&id);
+        assert_eq!(status["execution"], before_disposal["execution"]);
+        assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+        assert_eq!(
+            status["output_watermark"],
+            before_disposal["output_watermark"]
+        );
         assert_eq!(status["exit_code"].as_u64(), Some(7));
         assert_eq!(status["output_drained"].as_bool(), Some(true));
-        let expected = format!("FIRST{}LAST", "0123456789abcdef".repeat(4096)).into_bytes();
         assert_eq!(read_all(&env, &id), expected, "burst iteration {iteration}");
         let path = env.finish(&id, "exports", &["raw", "text", "events"]);
         assert_eq!(
@@ -548,7 +1360,24 @@ fn argv_environment_and_working_directory_are_literal() {
         "stty -opost\nprintf '%s\\n%s\\n%s' \"$1\" \"$BMUX_TEST_VALUE\" \"$PWD\"\n",
         &[literal],
     );
-    env.wait_exit(&id);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     let expected = format!("{literal}\nliteral\n{}", env.root.display()).into_bytes();
     assert_eq!(read_all(&env, &id), expected);
     assert!(
@@ -645,7 +1474,24 @@ fn interactive_send_wait_timeout_and_finish_refusal() {
         Some(b"second\n"),
     );
     assert_success(&stdin);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
     let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     assert_eq!(status["exit_code"].as_u64(), Some(0));
     let bytes = read_all(&env, &id);
     assert!(
@@ -702,7 +1548,24 @@ fn raw_bytes_transcript_and_export_retries_preserve_evidence() {
         "stty -opost\nprintf '\\033[31mé界é🙂\\033[0m\\nabc\\rXY\\nA\\000B\\n'\n",
         &[],
     );
-    env.wait_exit(&id);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     let expected = "\u{1b}[31mé界é🙂\u{1b}[0m\nabc\rXY\nA\0B\n".as_bytes();
     assert_eq!(read_all(&env, &id), expected);
     let blocker = env.root.join("not-a-directory");
@@ -759,7 +1622,24 @@ fn raw_bytes_transcript_and_export_retries_preserve_evidence() {
 fn unknown_ids_and_invalid_cursors_never_fall_back_to_another_runtime() {
     let first = RecordingEnv::new();
     let id = first.start("stty -opost\nprintf evidence\n", &[]);
-    first.wait_exit(&id);
+    let before_disposal = first.wait_leader_exit(&id, 0);
+    // Explicitly dispose the first fixture's exited execution, never the second runtime.
+    first.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = first.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     let other = RecordingEnv::new();
     for verb in ["status", "read", "screen", "terminate", "finish"] {
         let output = other.run(&["recording", "process", verb, &id, "--json"]);
@@ -848,7 +1728,24 @@ fn gif_export_decodes_every_frame_and_animates() {
         "Enter",
         "--json",
     ]);
-    env.wait_exit(&id);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     let path = env.finish(&id, "gif-export", &["gif"]);
     let gifs: Vec<_> = fs::read_dir(&path)
         .expect("export directory")
@@ -1058,7 +1955,24 @@ fn durable_start_and_send_retries_do_not_duplicate_effects() {
         "two\n",
         "--json",
     ]);
-    env.wait_exit(&id);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     assert_eq!(read_all(&env, &id), b"Ready>FIRST:one\nSECOND:two");
     assert_eq!(
         fs::read(env.root.join("launch-count")).expect("one launch"),
@@ -1074,7 +1988,24 @@ fn finalized_evidence_remains_available_after_explicit_server_cleanup() {
         "stty -opost\nprintf '\\033[2J\\033[HOFFLINE_EVIDENCE'\n",
         &[],
     );
-    env.wait_exit(&id);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     let before = read_all(&env, &id);
     let screen = env.json(&["recording", "process", "screen", &id, "--json"]);
     let first = env.finish(&id, "online", &["raw", "text", "events", "gif"]);
@@ -1123,7 +2054,24 @@ fn immediate_output_is_replayed_into_gif_without_screen_polling() {
         "stty -opost\nprintf '\\033[2J\\033[H\\033[41m          \\033[0m'\n",
         &[],
     );
-    env.wait_exit(&id);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     let artifacts = env.finish(&id, "immediate-gif", &["gif"]);
     let mut options = gif::DecodeOptions::new();
     options.set_color_output(gif::ColorOutput::RGBA);
@@ -1156,7 +2104,24 @@ fn animated_gif_preserves_ordered_output_and_final_exit_frame() {
     // frame exits immediately and must survive drain without screen polling.
     let script = "stty -opost\nprintf '\\033[2J\\033[H\\033[41mRED\\033[0m'\nsleep 0.3\nprintf '\\033[2J\\033[H\\033[42mGREEN\\033[0m'\nsleep 0.3\nprintf '\\033[2J\\033[H\\033[44mBLUE\\033[0m'\n";
     let id = env.start(script, &[]);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
     let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     assert_eq!(status["output_drained"].as_bool(), Some(true));
     let expected = b"\x1b[2J\x1b[H\x1b[41mRED\x1b[0m\x1b[2J\x1b[H\x1b[42mGREEN\x1b[0m\x1b[2J\x1b[H\x1b[44mBLUE\x1b[0m";
     assert_eq!(read_all(&env, &id), expected);
@@ -1225,7 +2190,24 @@ fn gif_dominant_colors(path: &Path) -> Vec<usize> {
 fn incomplete_capture_refuses_finalization_and_retries_without_relaunch() {
     let env = RecordingEnv::new();
     let id = env.start("stty -opost\nprintf EXACT_CAPTURE\n", &[]);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
     let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     let expected = read_all(&env, &id);
     assert_eq!(expected, b"EXACT_CAPTURE");
     let directory = PathBuf::from(status["runtime_root"].as_str().expect("owned root"))
@@ -1302,7 +2284,24 @@ fn exit_wait_longer_than_default_transport_timeout_returns_run_status() {
         "DONE\n",
         "--json",
     ]);
-    env.wait_exit(&id);
+    let before_disposal = env.wait_leader_exit(&id, 0);
+    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
+    env.json(&[
+        "recording",
+        "process",
+        "terminate",
+        &id,
+        "--grace-period",
+        "1s",
+        "--json",
+    ]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["execution"], before_disposal["execution"]);
+    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
+    assert_eq!(
+        status["output_watermark"],
+        before_disposal["output_watermark"]
+    );
     assert_eq!(read_all(&env, &id), b"Ready>DONE");
     env.finish(&id, "long-wait", &["raw"]);
 }
@@ -1334,6 +2333,45 @@ fn exit_wait_beyond_five_seconds_returns_complete_evidence() {
         fs::read(env.root.join("long-wait-launches")).expect("one launch"),
         b"launch"
     );
+}
+
+#[test]
+fn nonzero_foreground_same_key_retry_retains_exit_and_one_launch() {
+    let env = RecordingEnv::new();
+    let script = env.script(
+        "nonzero-retry.sh",
+        "stty -opost\nprintf launch >> nonzero-launches\nprintf NONZERO\nexit 7\n",
+    );
+    let key = uuid::Uuid::new_v4().to_string();
+    let args = [
+        "recording",
+        "process",
+        "run",
+        "--json",
+        "--idempotency-key",
+        &key,
+        "--cwd",
+        env.root.to_str().expect("cwd"),
+        "--",
+        "/bin/sh",
+        script.to_str().expect("script"),
+    ];
+    let first = env.run(&args);
+    assert_eq!(first.status.code(), Some(7));
+    let first = parse_json(&first);
+    let id = env.track_run(&first);
+    let retry = env.run(&args);
+    assert_eq!(retry.status.code(), Some(7), "retry lost child exit code");
+    let retry = parse_json(&retry);
+    assert_eq!(retry["run_id"], first["run_id"]);
+    assert_eq!(retry["recording_id"], first["recording_id"]);
+    assert_eq!(retry["exit_code"].as_u64(), Some(7));
+    assert_eq!(retry["capture_finalized"].as_bool(), Some(true));
+    assert_eq!(
+        fs::read(env.root.join("nonzero-launches")).expect("launch count"),
+        b"launch"
+    );
+    assert_eq!(read_all(&env, &id), b"NONZERO");
 }
 
 #[test]

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 pub const VERSION: u32 = 1;
+pub const TERMINAL_SESSION_VERSION: u32 = 3;
 pub const MAX_FRAME: usize = 262_144;
 
 #[derive(Deserialize, Serialize)]
@@ -39,6 +40,10 @@ pub enum Operation {
     Sweep {
         mutation_id: String,
     },
+    // V3 only: release a reaped terminal-session owner, not descendant cleanup.
+    RetireOwner {
+        mutation_id: String,
+    },
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -49,6 +54,10 @@ pub struct Response {
     pub exit_code: Option<i32>,
     pub exit_signal: Option<i32>,
     pub group_consumed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_session_ended: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_error: Option<String>,
     pub error: Option<String>,
 }
 

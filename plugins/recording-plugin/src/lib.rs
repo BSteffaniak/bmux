@@ -273,11 +273,39 @@ impl RustPlugin for RecordingPlugin {
         commands::run_recording_command(&context)
     }
 
+    // Keep generated interface routing together so each operation retains one
+    // auditable typed dispatch boundary; splitting the route obscures fallback.
+    #[allow(clippy::too_many_lines)]
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        use bmux_recording_plugin_api::recording_process_terminal_v3 as terminal;
         use bmux_recording_plugin_api::recording_process_v1::{
             self as process, RecordingProcessV1Service,
         };
         bmux_plugin_sdk::route_service!(context, {
+            "recording-process-terminal-v3", "start" => |req: terminal::client::StartRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { terminal::RecordingProcessTerminalV3Service::start(service.as_ref(), req.options, req.runtime_root, req.policy).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-terminal-v3", "status" => |req: terminal::client::StatusRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { terminal::RecordingProcessTerminalV3Service::status(service.as_ref(), req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-terminal-v3", "read" => |req: terminal::client::ReadRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { terminal::RecordingProcessTerminalV3Service::read(service.as_ref(), req.run_id, req.since, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-terminal-v3", "screen" => |req: terminal::client::ScreenRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { terminal::RecordingProcessTerminalV3Service::screen(service.as_ref(), req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-terminal-v3", "send" => |req: terminal::client::SendRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { terminal::RecordingProcessTerminalV3Service::send(service.as_ref(), req.run_id, req.data, req.mutation_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-terminal-v3", "wait" => |req: terminal::client::WaitRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { terminal::RecordingProcessTerminalV3Service::wait(service.as_ref(), req.run_id, req.timeout_ms).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-terminal-v3", "terminate" => |req: terminal::client::TerminateRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { terminal::RecordingProcessTerminalV3Service::terminate(service.as_ref(), req.run_id, req.grace_ms).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-terminal-v3", "finish" => |req: terminal::client::FinishRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { terminal::RecordingProcessTerminalV3Service::finish(service.as_ref(), req.run_id, req.expected_revision, req.terminate_running).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
             "recording-process-v1", "start" => |req: process::client::StartRequest, ctx| {
                 process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.start(req.options, req.runtime_root).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
             },
@@ -404,6 +432,27 @@ impl RustPlugin for RecordingPlugin {
                 ),
             isolated,
         ));
+        let terminal_service = Arc::new(
+            process_runtime::ProcessService::new(
+                Arc::new(bmux_plugin::TypedServiceCaller::from_registration_context(
+                    &context,
+                )),
+                config.recordings_dir.clone(),
+                std::path::Path::new(&context.connection.runtime_dir)
+                    .parent()
+                    .map_or_else(
+                        || context.connection.runtime_dir.clone(),
+                        |path| path.to_string_lossy().into_owned(),
+                    ),
+                isolated,
+            )
+            .terminal(),
+        );
+        process_runtime::register_terminal(Arc::clone(&terminal_service));
+        let provider: Arc<dyn bmux_recording_plugin_api::recording_process_terminal_v3::RecordingProcessTerminalV3Service + Send + Sync> = terminal_service;
+        let _ = bmux_recording_plugin_api::recording_process_terminal_v3::register_provider(
+            registry, provider,
+        );
         process_runtime::register(Arc::clone(&service));
         let provider: Arc<
             dyn bmux_recording_plugin_api::recording_process_v1::RecordingProcessV1Service

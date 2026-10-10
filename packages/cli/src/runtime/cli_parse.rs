@@ -310,10 +310,30 @@ pub(super) fn parse_runtime_cli_with_registry(
     if !core_builtins_only {
         let (path, leaf_matches) = plugin_commands::selected_subcommand_path(&matches);
         if let Some(resolved) = command_registry.resolve_exact_path(&path) {
-            let arguments = PluginCommandRegistry::normalize_arguments_from_matches(
-                &resolved.schema,
-                leaf_matches,
-            );
+            // Existing host leaves can be proxied by plugins with a trailing
+            // argument contract. Their host ArgMatches do not contain that
+            // contract's IDs. Preserve the validated raw leaf arguments instead
+            // of silently dropping flags after a leading global option.
+            let arguments = leading_global_prefix_len(argv)
+                .and_then(|start| {
+                    argv[start..]
+                        .iter()
+                        .map(|arg| arg.to_str().map(ToString::to_string))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .and_then(|raw| command_registry.resolve(&raw))
+                .filter(|raw| {
+                    raw.plugin_id == resolved.plugin_id && raw.command_name == resolved.command_name
+                })
+                .map_or_else(
+                    || {
+                        PluginCommandRegistry::normalize_arguments_from_matches(
+                            &resolved.schema,
+                            leaf_matches,
+                        )
+                    },
+                    |raw| raw.arguments,
+                );
             return Ok(ParsedRuntimeCli::Plugin {
                 log_level,
                 plugin_id: resolved.plugin_id,
@@ -333,6 +353,85 @@ pub(super) fn parse_runtime_cli_with_registry(
         verbose,
         config_overrides,
     })
+}
+
+/// Locate the selected path after validated leading host options. Unknown or
+/// variadic options deliberately retain the `ArgMatches` fallback.
+fn leading_global_prefix_len(argv: &[std::ffi::OsString]) -> Option<usize> {
+    let root = Cli::command();
+    let mut index = 1;
+    while let Some(value) = argv.get(index) {
+        let value = value.to_str()?;
+        if !value.starts_with('-') {
+            return Some(index);
+        }
+        let (flag, inline) = value
+            .split_once('=')
+            .map_or((value, false), |(flag, _)| (flag, true));
+        let argument = root.get_arguments().find(|argument| {
+            argument
+                .get_long()
+                .is_some_and(|long| flag.strip_prefix("--") == Some(long))
+                || argument
+                    .get_short()
+                    .is_some_and(|short| flag == format!("-{short}"))
+        })?;
+        let arity = argument.get_num_args().unwrap_or_else(|| {
+            if argument.get_action().takes_values() {
+                clap::builder::ValueRange::new(1)
+            } else {
+                clap::builder::ValueRange::new(0)
+            }
+        });
+        if arity.min_values() != arity.max_values() || arity.max_values() > 1 {
+            return None;
+        }
+        index += 1 + usize::from(!inline && arity.max_values() == 1);
+    }
+    None
+}
+
+#[cfg(test)]
+mod proxy_argument_tests {
+    use super::*;
+
+    #[test]
+    fn leading_globals_preserve_host_leaf_proxy_flags() {
+        let mut registry = PluginRegistry::new();
+        registry.register_bundled_manifest(
+            "id='fixture.proxy'\nname='Proxy'\nversion='1.0.0'\nowns_namespaces=['terminal']\n[[commands]]\nname='terminal-doctor'\nsummary='Proxy diagnostic'\npath=['terminal','doctor']\nexpose_in_cli=true\n[[commands.arguments]]\nname='args'\nkind='string'\nposition=0\nmultiple=true\ntrailing_var_arg=true\nallow_hyphen_values=true\n",
+        ).unwrap();
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("fixture.proxy".into());
+        let argv = [
+            "bmux",
+            "--runtime",
+            "default",
+            "--target",
+            "local",
+            "--config",
+            "/tmp/owned.toml",
+            "terminal",
+            "doctor",
+            "--json",
+            "--trace",
+        ]
+        .map(std::ffi::OsString::from);
+        let parsed = parse_runtime_cli_with_registry(
+            &argv,
+            &config,
+            &registry,
+            None,
+            ConfigLoadOverrides::default(),
+        )
+        .unwrap();
+        match parsed {
+            ParsedRuntimeCli::Plugin { arguments, .. } => {
+                assert_eq!(arguments, ["--json", "--trace"]);
+            }
+            other => panic!("expected proxy, got {other:?}"),
+        }
+    }
 }
 
 fn emit_parse_with_registry_phase_timing(

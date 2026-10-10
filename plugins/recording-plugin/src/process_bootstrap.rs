@@ -19,11 +19,99 @@ pub(crate) struct Locator {
     schema_version: u32,
     run_id: Uuid,
     pub(crate) root: PathBuf,
+    #[serde(
+        default = "legacy_contract",
+        skip_serializing_if = "is_legacy_contract"
+    )]
+    contract_version: u32,
+}
+fn legacy_contract() -> u32 {
+    1
+}
+// Serde's skip_serializing_if callback requires a borrowed field, even for u32.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_legacy_contract(value: &u32) -> bool {
+    *value == 1
+}
+
+pub(crate) struct ProcessClient {
+    pub(crate) inner: BmuxClient,
+    pub(crate) terminal: bool,
+}
+impl std::ops::Deref for ProcessClient {
+    type Target = BmuxClient;
+    fn deref(&self) -> &BmuxClient {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for ProcessClient {
+    fn deref_mut(&mut self) -> &mut BmuxClient {
+        &mut self.inner
+    }
+}
+impl bmux_plugin_sdk::TypedDispatchClient for ProcessClient {
+    async fn invoke_service_raw(
+        &mut self,
+        capability: &str,
+        kind: bmux_ipc::InvokeServiceKind,
+        interface: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+        if self.terminal && interface == "recording-process-v1" {
+            use bmux_recording_plugin_api::{
+                recording_process_terminal_v3 as new, recording_process_v1 as old,
+            };
+            let payload = if operation == "start" {
+                let request: old::client::StartRequest =
+                    bmux_plugin_sdk::decode_service_message(&payload).map_err(|error| {
+                        bmux_plugin_sdk::TypedDispatchClientError::transport(
+                            interface,
+                            operation,
+                            error.to_string(),
+                        )
+                    })?;
+                bmux_plugin_sdk::encode_service_message(&new::client::StartRequest {
+                    options: request.options,
+                    runtime_root: request.runtime_root,
+                    policy: new::LifetimePolicy::ConventionalTerminalSession,
+                })
+                .map_err(|error| {
+                    bmux_plugin_sdk::TypedDispatchClientError::transport(
+                        interface,
+                        operation,
+                        error.to_string(),
+                    )
+                })?
+            } else {
+                payload
+            };
+            bmux_plugin_sdk::TypedDispatchClient::invoke_service_raw(
+                &mut self.inner,
+                "bmux.recording.process.v3",
+                kind,
+                "recording-process-terminal-v3",
+                operation,
+                payload,
+            )
+            .await
+        } else {
+            bmux_plugin_sdk::TypedDispatchClient::invoke_service_raw(
+                &mut self.inner,
+                capability,
+                kind,
+                interface,
+                operation,
+                payload,
+            )
+            .await
+        }
+    }
 }
 
 pub(crate) struct DedicatedRuntime {
     pub(crate) root: PathBuf,
-    pub(crate) client: BmuxClient,
+    pub(crate) client: ProcessClient,
     pub(crate) armed: bool,
 }
 
@@ -115,7 +203,10 @@ pub(crate) async fn bootstrap(context: &NativeCommandContext) -> Result<Dedicate
             Ok(client) => {
                 return Ok(DedicatedRuntime {
                     root,
-                    client,
+                    client: ProcessClient {
+                        inner: client,
+                        terminal: false,
+                    },
                     armed: true,
                 });
             }
@@ -201,12 +292,18 @@ fn isolated_config(context: &NativeCommandContext, paths: &ConfigPaths) -> Resul
     Ok(config)
 }
 
-pub(crate) fn remember(context: &NativeCommandContext, id: Uuid, root: &Path) -> Result<()> {
+pub(crate) fn remember(
+    context: &NativeCommandContext,
+    id: Uuid,
+    root: &Path,
+    contract_version: u32,
+) -> Result<()> {
     let index = index_root(context);
     let value = Locator {
         schema_version: 1,
         run_id: id,
         root: root.to_path_buf(),
+        contract_version,
     };
     crate::durable::write_atomic(
         &index.join(format!("{id}.json")),
@@ -246,9 +343,24 @@ pub(crate) async fn resolve(context: &NativeCommandContext, id: Uuid) -> Result<
     .await?;
     Ok(DedicatedRuntime {
         root,
-        client,
+        client: ProcessClient {
+            inner: client,
+            terminal: contract_version(context, id)? == 3,
+        },
         armed: false,
     })
+}
+
+pub(crate) fn contract_version(context: &NativeCommandContext, id: Uuid) -> Result<u32> {
+    let path = index_root(context).join(format!("{id}.json"));
+    let locator: Locator = serde_json::from_slice(&std::fs::read(path)?)?;
+    ensure!(
+        locator.schema_version == 1
+            && locator.run_id == id
+            && matches!(locator.contract_version, 1 | 3),
+        "invalid or unsupported run locator contract"
+    );
+    Ok(locator.contract_version)
 }
 
 pub(crate) fn recording_root(runtime: &DedicatedRuntime) -> PathBuf {
@@ -288,7 +400,11 @@ pub(crate) fn offline(
         "invalid dedicated offline locator"
     );
     let recordings = root.join("state/recordings");
-    let status = crate::process_store::ProcessStore::new(&recordings)?.load(id)?;
+    let status = crate::process_store::ProcessStore::for_contract(
+        &recordings,
+        contract_version(context, id)?,
+    )?
+    .load(id)?;
     ensure!(
         std::fs::canonicalize(&status.runtime_root)? == root,
         "offline runtime identity mismatch"
@@ -314,6 +430,40 @@ pub(crate) fn launch_receipt(
         "launch outcome ambiguous; refusing duplicate launch",
     )?))
 }
+pub(crate) fn retain_launch_root(
+    context: &NativeCommandContext,
+    key: Uuid,
+    root: &Path,
+) -> Result<PathBuf> {
+    let path = index_root(context).join(format!("launch-{key}-runtime.json"));
+    crate::durable::write_atomic(
+        &path,
+        &serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,"launch_mutation_id":key,"runtime_root":root,
+            "contract":"recording-process-terminal-v3","recovery_required":true,
+            "automatic_relaunch":false,"automatic_cleanup":false
+        }))?,
+    )?;
+    Ok(path)
+}
+
+pub(crate) fn record_native_launch_identity(
+    path: &Path,
+    key: Uuid,
+    root: &Path,
+    id: Uuid,
+    recovery_required: bool,
+) -> Result<()> {
+    crate::durable::write_atomic(
+        path,
+        &serde_json::to_vec(&serde_json::json!({
+            "schema_version":1,"launch_mutation_id":key,"runtime_root":root,"run_id":id,
+            "contract":"recording-process-terminal-v3","recovery_required":recovery_required,
+            "automatic_relaunch":false,"automatic_cleanup":false
+        }))?,
+    )
+}
+
 pub(crate) fn record_launch(
     context: &NativeCommandContext,
     key: Uuid,
@@ -412,4 +562,26 @@ fn fingerprint(args: &[String]) -> Result<String> {
         write!(&mut encoded, "{byte:02x}")?;
     }
     Ok(encoded)
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    #[test]
+    fn locator_contract_commits_with_identity_and_legacy_defaults_are_preserved() {
+        let id = Uuid::new_v4();
+        let legacy = serde_json::json!({"schema_version":1,"run_id":id,"root":"/tmp/owned"});
+        let old: Locator = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(old.contract_version, 1);
+        assert_eq!(serde_json::to_value(&old).unwrap(), legacy);
+        let native = Locator {
+            schema_version: 1,
+            run_id: id,
+            root: PathBuf::from("/tmp/owned"),
+            contract_version: 3,
+        };
+        let value = serde_json::to_value(&native).unwrap();
+        assert_eq!(value["contract_version"], 3);
+        assert_eq!(serde_json::from_value::<Locator>(value).unwrap().run_id, id);
+    }
 }

@@ -14,6 +14,8 @@ pub(crate) struct RecoveryService {
     caller: Arc<TypedServiceCaller>,
     store: RecoveryStore,
     runtime_root: String,
+    mutation: Arc<tokio::sync::Mutex<()>>,
+    isolated: bool,
 }
 
 impl RecoveryService {
@@ -21,12 +23,27 @@ impl RecoveryService {
         caller: Arc<TypedServiceCaller>,
         root: PathBuf,
         runtime_root: String,
+        isolated: bool,
     ) -> Result<Self> {
+        ensure!(
+            isolated,
+            "recovery requires an explicitly dedicated isolated runtime"
+        );
         Ok(Self {
             caller,
             store: RecoveryStore::new(&root)?,
             runtime_root,
+            mutation: Arc::new(tokio::sync::Mutex::new(())),
+            isolated,
         })
+    }
+
+    async fn guard(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        ensure!(
+            self.isolated,
+            "recovery requires an explicitly dedicated isolated runtime"
+        );
+        Ok(self.mutation.lock().await)
     }
 
     pub(crate) async fn start(
@@ -36,6 +53,7 @@ impl RecoveryService {
         options: process::ProgramOptions,
         runtime_root: String,
     ) -> Result<recovery::RecoveryStatus> {
+        let _guard = self.guard().await?;
         ensure!(
             runtime_root == self.runtime_root,
             "isolated runtime locator mismatch"
@@ -110,6 +128,7 @@ impl RecoveryService {
     }
 
     pub(crate) async fn reconcile(&self, run_id: Uuid) -> Result<recovery::RecoveryStatus> {
+        let _guard = self.guard().await?;
         Ok(self
             .reconcile_record(self.store.load(run_id)?)
             .await?
@@ -150,6 +169,7 @@ impl RecoveryService {
         run_id: Uuid,
         max_bytes: u32,
     ) -> Result<recovery::RecoveryStatus> {
+        let _guard = self.guard().await?;
         ensure!(
             (1..=65_536).contains(&max_bytes),
             "capture read exceeds bound"
@@ -218,6 +238,7 @@ impl RecoveryService {
         mutation_id: Uuid,
         data: Vec<u8>,
     ) -> Result<pane::InputReceipt> {
+        let _guard = self.guard().await?;
         ensure!(data.len() <= 65_536, "input exceeds admission bound");
         let execution = self.execution(run_id)?;
         let request = serde_json::json!({"execution":execution,"data":data});
@@ -259,6 +280,7 @@ impl RecoveryService {
         run_id: Uuid,
         mutation_id: Uuid,
     ) -> Result<pane::InputReceipt> {
+        let _guard = self.guard().await?;
         let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
         pane::client::input_receipt(&mut client, self.execution(run_id)?, mutation_id)
             .await?
@@ -274,6 +296,7 @@ impl RecoveryService {
         input_mutation_id: Option<Uuid>,
         grace_ms: u32,
     ) -> Result<pane::ResolutionReceipt> {
+        let _guard = self.guard().await?;
         let execution = self.execution(run_id)?;
         let request = serde_json::json!({"execution":execution,"expected_revision":expected_revision,
             "action":action,"input_mutation_id":input_mutation_id,"grace_ms":grace_ms});
@@ -310,6 +333,7 @@ impl RecoveryService {
         mutation_id: Uuid,
         expected_revision: u64,
     ) -> Result<pane::RetirementReceipt> {
+        let _guard = self.guard().await?;
         let record = self.store.load(run_id)?;
         RecoveryStore::require_finalizable(&record)?;
         let execution = self.execution(run_id)?;
@@ -335,6 +359,7 @@ impl RecoveryService {
     }
 
     pub(crate) async fn finish(&self, run_id: Uuid) -> Result<recovery::RecoveryStatus> {
+        let _guard = self.guard().await?;
         let mut record = self.reconcile_record(self.store.load(run_id)?).await?;
         RecoveryStore::require_finalizable(&record)?;
         let expected = record.status.revision;

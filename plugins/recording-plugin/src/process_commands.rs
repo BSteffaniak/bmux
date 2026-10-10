@@ -51,6 +51,31 @@ async fn execute(
     operation: &str,
 ) -> Result<(serde_json::Value, i32)> {
     let args = Arguments::parse(&context.arguments)?;
+    let contract = if matches!(operation, "start" | "run") {
+        selected_contract(operation, &args)?
+    } else {
+        crate::process_bootstrap::contract_version(context, args.id()?)?
+    };
+    let (value, code) = execute_inner(context, operation).await?;
+    Ok((contract_envelope(contract, value), code))
+}
+
+fn contract_envelope(contract: u32, value: serde_json::Value) -> serde_json::Value {
+    if contract == 3 {
+        serde_json::json!({"schema_version":1,"contract":{"interface":"recording-process-terminal-v3","lifecycle":"conventional-terminal-session","status_schema_version":1},"result":value})
+    } else {
+        value
+    }
+}
+
+async fn execute_inner(
+    context: &NativeCommandContext,
+    operation: &str,
+) -> Result<(serde_json::Value, i32)> {
+    let mut args = Arguments::parse(&context.arguments)?;
+    let version = selected_contract(operation, &args)?;
+    args.options.remove("contract-version");
+    args.options.remove("lifetime");
     validate_operation(operation, &args)?;
     if !matches!(operation, "start" | "run")
         && let Some((root, status)) = crate::process_bootstrap::offline(context, args.id()?)?
@@ -74,7 +99,11 @@ async fn execute(
                 .await?
                 .map_err(|error| anyhow::anyhow!("status: {error:?}"))?;
             if operation == "run" {
-                return complete_run(&mut existing.client, status).await;
+                return if existing.client.terminal {
+                    complete_native_run(&mut existing.client, status).await
+                } else {
+                    complete_run(&mut existing.client, status).await
+                };
             }
             return completed_command(operation, status);
         }
@@ -98,6 +127,7 @@ async fn execute(
     } else {
         crate::process_bootstrap::resolve(context, args.id()?).await?
     };
+    dedicated.client.terminal |= version == 3;
     match operation {
         "start" | "run" => {
             command_start(context, operation, &args, &mut dedicated, launch_key).await
@@ -121,24 +151,62 @@ async fn command_start(
     launch_key: Uuid,
 ) -> Result<(serde_json::Value, i32)> {
     let runtime_root = dedicated.root.to_string_lossy().into_owned();
+    let options = program_options(args)?;
+    let retained = if dedicated.client.terminal {
+        let path =
+            crate::process_bootstrap::retain_launch_root(context, launch_key, &dedicated.root)?;
+        dedicated.armed = false;
+        Some(path)
+    } else {
+        None
+    };
     let client = &mut dedicated.client;
     let value = {
-        let options = program_options(args)?;
         let root = runtime_root.clone();
         let status = process::client::start(&mut *client, options, root)
-            .await?
-            .map_err(|error| anyhow::anyhow!("start failed: {error:?}"))?;
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))
+            .and_then(|result| result.map_err(|error| anyhow::anyhow!("start failed: {error:?}")))
+            .map_err(|error| if let Some(path) = &retained {
+                anyhow::anyhow!("launch outcome unresolved: {error}; recovery_required=true; launch_mutation_id={launch_key}; retained_runtime_root={runtime_root}; recovery_record={}; refusing relaunch or implicit cleanup", path.display())
+            } else { error })?;
         let indexed = (|| -> Result<()> {
-            crate::process_bootstrap::remember(context, status.run_id, &dedicated.root)?;
+            if let Some(path) = &retained {
+                crate::process_bootstrap::record_native_launch_identity(
+                    path,
+                    launch_key,
+                    &dedicated.root,
+                    status.run_id,
+                    true,
+                )?;
+            }
+            crate::process_bootstrap::remember(
+                context,
+                status.run_id,
+                &dedicated.root,
+                if client.terminal { 3 } else { 1 },
+            )?;
             crate::process_bootstrap::record_launch(
                 context,
                 launch_key,
                 &context.arguments,
                 Some(status.run_id),
             )?;
+            if let Some(path) = &retained {
+                crate::process_bootstrap::record_native_launch_identity(
+                    path,
+                    launch_key,
+                    &dedicated.root,
+                    status.run_id,
+                    false,
+                )?;
+            }
             Ok(())
         })();
         if let Err(error) = indexed {
+            if let Some(path) = &retained {
+                return Err(error.context(format!("metadata publication incomplete; recovery_required=true; launch_mutation_id={launch_key}; run_id={}; retained_runtime_root={runtime_root}; recovery_record={}; refusing implicit termination", status.run_id, path.display())));
+            }
             let cleanup = process::client::terminate(&mut *client, status.run_id, 0).await;
             return Err(error.context(format!("metadata failure; process cleanup: {cleanup:?}")));
         }
@@ -149,11 +217,51 @@ async fn command_start(
             return Ok((serde_json::to_value(status)?, 1));
         }
         if operation == "run" {
-            return complete_run(client, status).await;
+            return if client.terminal {
+                complete_native_run(client, status).await
+            } else {
+                complete_run(client, status).await
+            };
         }
         serde_json::to_value(status)?
     };
     Ok((value, 0))
+}
+
+fn selected_contract(operation: &str, args: &Arguments) -> Result<u32> {
+    let version = args.one("contract-version")?;
+    let lifetime = args.one("lifetime")?;
+    if version.is_none() && lifetime.is_none() {
+        return Ok(1);
+    }
+    ensure!(
+        matches!(operation, "start" | "run"),
+        "contract selection is only allowed on start/run; later operations use durable run identity"
+    );
+    ensure!(
+        version == Some("3") && lifetime == Some("terminal-session"),
+        "explicit --contract-version 3 and --lifetime terminal-session are both required"
+    );
+    Ok(3)
+}
+
+async fn complete_native_run(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    mut status: process::RunStatus,
+) -> Result<(serde_json::Value, i32)> {
+    // Native foreground completion joins the same run until the terminal session
+    // has ended and canonical capture is ready; leader exit alone is insufficient.
+    while !status.output_drained && !status.capture_finalized {
+        ensure!(
+            status.errors.is_empty(),
+            "native capture incomplete: {:?}",
+            status.errors
+        );
+        status = process::client::wait(client, status.run_id, 1000)
+            .await?
+            .map_err(|error| anyhow::anyhow!("native wait failed: {error:?}"))?;
+    }
+    complete_run(client, status).await
 }
 
 async fn complete_run(
@@ -707,7 +815,7 @@ fn viewport(value: &str) -> Result<(u16, u16)> {
 fn help(operation: &str) {
     let (flags, example) = match operation {
         "start" | "run" => (
-            "[--profile functional|full|visual] [--viewport WxH] [--cwd DIR] [--env KEY=VALUE] [--idempotency-key UUID] [--json] -- PROGRAM ARGS",
+            "[--profile functional|full|visual] [--viewport WxH] [--cwd DIR] [--env KEY=VALUE] [--idempotency-key UUID] [--contract-version 3 --lifetime terminal-session] [--json] -- PROGRAM ARGS",
             "--profile functional --viewport 80x24 -- /bin/echo hello",
         ),
         "status" | "screen" => (
@@ -744,6 +852,39 @@ fn help(operation: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_contract_envelope_preserves_legacy_status_schema() {
+        let value = serde_json::json!({"schema_version":1,"output_drained":true});
+        assert_eq!(contract_envelope(1, value.clone()), value);
+        let wrapped = contract_envelope(3, value.clone());
+        assert_eq!(wrapped["schema_version"], 1);
+        assert_eq!(wrapped["result"], value);
+        assert_eq!(
+            wrapped["contract"]["interface"],
+            "recording-process-terminal-v3"
+        );
+        assert_eq!(wrapped["contract"]["status_schema_version"], 1);
+    }
+
+    #[test]
+    fn native_contract_requires_both_explicit_selectors() {
+        let paired = Arguments::parse(&[
+            "--contract-version".into(),
+            "3".into(),
+            "--lifetime".into(),
+            "terminal-session".into(),
+        ])
+        .unwrap();
+        assert_eq!(selected_contract("start", &paired).unwrap(), 3);
+        let one = Arguments::parse(&["--contract-version".into(), "3".into()]).unwrap();
+        assert!(selected_contract("start", &one).is_err());
+        assert!(selected_contract("status", &paired).is_err());
+        assert_eq!(
+            selected_contract("start", &Arguments::parse(&[]).unwrap()).unwrap(),
+            1
+        );
+    }
     fn run_status(phase: process::RunPhase, finalized: bool) -> process::RunStatus {
         process::RunStatus {
             schema_version: 1,
@@ -846,6 +987,61 @@ mod tests {
             .block_on(complete_run(&mut client, finalized))
             .unwrap();
         assert_eq!(client.operations, ["wait", "finish"]);
+    }
+
+    #[test]
+    fn native_foreground_retry_waits_for_capture_after_leader_exit_without_launching() {
+        let mut status = run_status(process::RunPhase::Exited, false);
+        status.exit_code = Some(7);
+        let mut client = RunRetryClient {
+            status: status.clone(),
+            operations: Vec::new(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (value, code) = runtime
+            .block_on(complete_native_run(&mut client, status))
+            .unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(value["run_id"], serde_json::json!(client.status.run_id));
+        assert_eq!(client.operations, ["wait", "finish"]);
+        let finalized = client.status.clone();
+        runtime
+            .block_on(complete_native_run(&mut client, finalized))
+            .unwrap();
+        assert_eq!(client.operations, ["wait", "finish"]);
+    }
+
+    #[test]
+    fn new_contract_selection_is_explicit_and_v1_default_is_unchanged() {
+        let parse = |values: &[&str]| {
+            Arguments::parse(&values.iter().map(|v| (*v).into()).collect::<Vec<_>>()).unwrap()
+        };
+        assert_eq!(selected_contract("start", &parse(&[])).unwrap(), 1);
+        assert_eq!(
+            selected_contract(
+                "run",
+                &parse(&["--contract-version", "3", "--lifetime", "terminal-session"])
+            )
+            .unwrap(),
+            3
+        );
+        for flags in [
+            &["--contract-version", "3"][..],
+            &["--lifetime", "terminal-session"][..],
+            &["--contract-version", "2", "--lifetime", "terminal-session"][..],
+        ] {
+            assert!(selected_contract("start", &parse(flags)).is_err());
+        }
+        assert!(
+            selected_contract(
+                "status",
+                &parse(&["--contract-version", "3", "--lifetime", "terminal-session"])
+            )
+            .is_err()
+        );
     }
 
     #[test]

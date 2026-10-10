@@ -20,6 +20,7 @@ plugin bmux.pane_runtime version 1;
 
 capability PANE_RUNTIME_EXECUTION_V1 = bmux.pane_runtime.execution.v1;
 capability PANE_RUNTIME_EXECUTION_V2 = bmux.pane_runtime.execution.v2;
+capability PANE_RUNTIME_EXECUTION_V3 = bmux.pane_runtime.execution.v3;
 capability PANE_RUNTIME_READ = bmux.pane_runtime.read;
 capability PANE_RUNTIME_WRITE = bmux.pane_runtime.write;
 capability ATTACH_RUNTIME_WRITE = bmux.attach_runtime.write;
@@ -87,6 +88,190 @@ interface pane-runtime-execution-v1 {
     // Bounded wait for exit AND PTY drain. Timeout returns current status unchanged.
     command wait(execution: execution-ref, timeout_ms: u32)
         -> result<execution-status, execution-error>;
+}
+
+// Explicit conventional terminal-session lifetime. Never reinterpret v1/v2.
+@capability(PANE_RUNTIME_EXECUTION_V3)
+interface pane-runtime-execution-v3 {
+    record terminal-program-options {
+        program: string,
+        args: list<string>,
+        cwd: string?,
+        env: map<string, string>,
+        cols: u16,
+        rows: u16,
+    }
+    record terminal-execution-ref {
+        session_id: uuid,
+        pane_id: uuid,
+        execution_token: uuid,
+    }
+    enum terminal-lifecycle { conventional-terminal-session }
+    enum terminal-session-end { active, draining, ended, recovery-required }
+    enum terminal-capture-integrity { capturing, complete, incomplete }
+    enum terminal-execution-phase { running, exited, failed }
+    record terminal-execution-status {
+        execution: terminal-execution-ref,
+        lifecycle: terminal-lifecycle,
+        phase: terminal-execution-phase,
+        session_end: terminal-session-end,
+        terminal_session_ended: bool,
+        capture_integrity: terminal-capture-integrity,
+        exit_code: u32?,
+        signal: string?,
+        output_drained: bool,
+        output_watermark: u64,
+        cleanup_complete: bool,
+        error: string?,
+    }
+    variant terminal-execution-error {
+        unavailable,
+        not-found,
+        stale-execution,
+        denied { reason: string },
+        invalid-options { reason: string },
+        launch-failed { reason: string },
+        operation-failed { reason: string },
+    }
+    record terminal-execution-screen {
+        execution: terminal-execution-ref,
+        output_watermark: u64,
+        cols: u16,
+        rows: u16,
+        cursor_col: u16,
+        cursor_row: u16,
+        cursor_visible: bool,
+        text: string,
+        encoded_grid: bytes,
+    }
+    // Target exit starts drain; owner retirement performs conventional OS hangup.
+    // Detached holders are not individually killed, but late terminal I/O may fail.
+    command new-program-session(name: string?, options: terminal-program-options, lifecycle: terminal-lifecycle)
+        -> result<terminal-execution-ref, terminal-execution-error>;
+    command status(execution: terminal-execution-ref) -> result<terminal-execution-status, terminal-execution-error>;
+    command screen(execution: terminal-execution-ref) -> result<terminal-execution-screen, terminal-execution-error>;
+    command send(execution: terminal-execution-ref, data: bytes) -> result<unit, terminal-execution-error>;
+    command resize(execution: terminal-execution-ref, cols: u16, rows: u16) -> result<unit, terminal-execution-error>;
+    command terminate(execution: terminal-execution-ref, grace_ms: u32) -> result<terminal-execution-status, terminal-execution-error>;
+    command wait(execution: terminal-execution-ref, timeout_ms: u32) -> result<terminal-execution-status, terminal-execution-error>;
+    record terminal-capture-cursor {
+        execution: terminal-execution-ref,
+        spool_generation: uuid,
+        offset: u64,
+    }
+    enum terminal-launch-phase { reserved, launching, running, exited, uncertain, failed, retired }
+    enum terminal-input-phase { accepted, writing, completed, uncertain, rejected }
+    enum terminal-resolution-action { cancel-unstarted, terminate-owned-execution, acknowledge-uncertain-input }
+    variant terminal-recovery-error {
+        denied { reason: string },
+        unavailable { reason: string },
+        invalid-options { reason: string },
+        conflict { reason: string },
+        not-found { reason: string },
+        capacity { reason: string },
+        revision-conflict { actual_revision: u64 },
+        recovery-required { reason: string },
+        operation-failed { reason: string },
+    }
+    record terminal-launch-reservation {
+        execution: terminal-execution-ref,
+        launch_mutation_id: uuid,
+        revision: u64,
+        options: terminal-program-options,
+        policy: terminal-lifecycle,
+        initial_cursor: terminal-capture-cursor,
+    }
+    record terminal-launch-receipt {
+        reservation: terminal-launch-reservation,
+        phase: terminal-launch-phase,
+        revision: u64,
+        exit_code: u32?,
+        exit_signal: string?,
+        cleanup_complete: bool,
+        error: string?,
+    }
+    record terminal-input-receipt {
+        execution: terminal-execution-ref,
+        input_mutation_id: uuid,
+        revision: u64,
+        phase: terminal-input-phase,
+        admitted_bytes: u64,
+        // Completed means write+flush acknowledged, never child consumption.
+        acknowledged_bytes: u64,
+        error: string?,
+    }
+    record terminal-supervisor-locator {
+        execution: terminal-execution-ref,
+        protocol_version: u32,
+        artifact_sha256: string,
+        endpoint: string,
+        // Not a credential; reconnect independently authenticates runtime owner.
+        generation: u64,
+    }
+    record terminal-reconciliation {
+        launch: terminal-launch-receipt,
+        supervisor: terminal-supervisor-locator?,
+        // True only when the canonical raw stream has reached EOF without a gap.
+        capture_complete: bool,
+        oldest_cursor: terminal-capture-cursor,
+        continuation_cursor: terminal-capture-cursor,
+        recovery_required: bool,
+        session_end: terminal-session-end,
+        terminal_session_ended: bool,
+        capture_integrity: terminal-capture-integrity,
+        // Raw recovery alone does not restore original recording timestamps/events.
+        timing_complete: bool,
+    }
+    record terminal-resolution-receipt {
+        execution: terminal-execution-ref,
+        resolution_mutation_id: uuid,
+        revision: u64,
+        action: terminal-resolution-action,
+        input_mutation_id: uuid?,
+        cleanup_complete: bool,
+        recovery_required: bool,
+        error: string?,
+    }
+    record terminal-retirement-receipt {
+        execution: terminal-execution-ref,
+        retirement_mutation_id: uuid,
+        revision: u64,
+        retired: bool,
+    }
+    record terminal-capture-batch {
+        cursor: terminal-capture-cursor,
+        continuation: terminal-capture-cursor,
+        data: bytes,
+        // Caught up to the response watermark, not process EOF.
+        complete: bool,
+    }
+    record terminal-capture-gap {
+        requested: terminal-capture-cursor,
+        oldest: terminal-capture-cursor,
+        continuation: terminal-capture-cursor,
+        reason: string,
+        // Missing snapshot is an explicit unavailable repair, never empty state.
+        encoded_grid: bytes?,
+        snapshot_cursor: terminal-capture-cursor?,
+    }
+    variant terminal-capture-response { batch { value: terminal-capture-batch }, gap { value: terminal-capture-gap } }
+    // Receipts persist until explicit retirement. Capacity rejects new admission.
+    command reserve(launch_mutation_id: uuid, options: terminal-program-options, policy: terminal-lifecycle)
+        -> result<terminal-launch-reservation, terminal-recovery-error>;
+    command launch(reservation: terminal-launch-reservation) -> result<terminal-launch-receipt, terminal-recovery-error>;
+    command reconcile(execution: terminal-execution-ref) -> result<terminal-reconciliation, terminal-recovery-error>;
+    command send-admitted(execution: terminal-execution-ref, input_mutation_id: uuid, data: bytes)
+        -> result<terminal-input-receipt, terminal-recovery-error>;
+    command input-receipt(execution: terminal-execution-ref, input_mutation_id: uuid)
+        -> result<terminal-input-receipt, terminal-recovery-error>;
+    command resolve(execution: terminal-execution-ref, resolution_mutation_id: uuid,
+        expected_revision: u64, action: terminal-resolution-action, input_mutation_id: uuid?, grace_ms: u32)
+        -> result<terminal-resolution-receipt, terminal-recovery-error>;
+    command capture-resume(cursor: terminal-capture-cursor, max_bytes: u32)
+        -> result<terminal-capture-response, terminal-recovery-error>;
+    // Retirement requires authoritative completed cleanup and resolved uncertainty.
+    command retire(execution: terminal-execution-ref, retirement_mutation_id: uuid, expected_revision: u64)
+        -> result<terminal-retirement-receipt, terminal-recovery-error>;
 }
 
 // Durable admission and recovery are explicitly negotiated; v1 is unchanged.
