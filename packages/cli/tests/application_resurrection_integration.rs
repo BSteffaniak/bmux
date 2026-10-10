@@ -24,19 +24,33 @@ async fn wait_for(path: &std::path::Path, expected: &str, server: &support::Serv
 
 #[tokio::test]
 async fn application_session_survives_real_daemon_restart() {
-    round_trip(false).await;
+    round_trip(false, "/bin/bash").await;
 }
 
 #[tokio::test]
 async fn shell_application_session_survives_real_daemon_restart() {
-    round_trip(true).await;
+    round_trip(true, "/bin/bash").await;
 }
 
-async fn round_trip(shell: bool) {
+#[tokio::test]
+async fn nushell_application_session_survives_real_daemon_restart() {
+    let resolved = std::process::Command::new("which")
+        .arg("nu")
+        .output()
+        .unwrap();
+    if !resolved.status.success() {
+        eprintln!("Nushell restart coverage skipped: nu is not installed");
+        return;
+    }
+    let nu = String::from_utf8(resolved.stdout).unwrap();
+    round_trip(true, nu.trim()).await;
+}
+
+async fn round_trip(shell: bool, shell_program: &str) {
     let mut server = support::ServerEnv::new("application-resurrection");
-    server.write_config(
-        "[general]\ndefault_shell = '/bin/bash'\n[behavior]\nrestore_last_layout = true\n",
-    );
+    server.write_config(&format!(
+        "[general]\ndefault_shell = '{shell_program}'\n[behavior]\nrestore_last_layout = true\n",
+    ));
     let python = std::process::Command::new("which")
         .arg("python3")
         .output()
@@ -105,7 +119,12 @@ while True: time.sleep(1)
             session.session_id,
             pane,
             format!(
-                "'{}' '{}' '{}'\n",
+                "{}'{}' '{}' '{}'\n",
+                if shell_program.ends_with("/nu") {
+                    "^"
+                } else {
+                    ""
+                },
                 python,
                 script.display(),
                 result.display()
@@ -174,6 +193,7 @@ while True: time.sleep(1)
             &script,
             &result,
             &server,
+            shell_program.ends_with("/nu"),
         )
         .await;
     }
@@ -187,6 +207,7 @@ async fn manual_launch_after_restore(
     script: &std::path::Path,
     result: &std::path::Path,
     server: &support::ServerEnv,
+    nushell: bool,
 ) {
     use bmux_pane_runtime_plugin_api::attach_runtime_commands::{self, client as attach};
     use bmux_pane_runtime_plugin_api::pane_runtime_state::client as state;
@@ -240,7 +261,8 @@ async fn manual_launch_after_restore(
         session,
         pane,
         format!(
-            "'{python}' '{}' '{}'\n",
+            "{}'{python}' '{}' '{}'\n",
+            if nushell { "^" } else { "" },
             script.display(),
             manual_result.display()
         )

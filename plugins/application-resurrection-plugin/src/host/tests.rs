@@ -232,6 +232,39 @@ fn versioned_socket_reopens_latest_session_after_host_shutdown() {
 }
 
 #[test]
+fn closed_endpoint_cannot_replace_final_invocation() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = Host::new(directory.path().to_owned()).unwrap();
+    let key = uuid::Uuid::new_v4().to_string();
+    let launch = host
+        .prepare_checked(&key, false, true, false, IdentityCheck::Expected(None))
+        .unwrap();
+    host.boundary_identity(&key, &launch.endpoint, true)
+        .unwrap();
+    let invocation = host
+        .boundary_identity(&key, &launch.endpoint, false)
+        .unwrap();
+    host.close(&key, &launch.endpoint).unwrap();
+    let file = directory.path().join(format!("{key}.json"));
+    let final_checkpoint = std::fs::read(&file).unwrap();
+    assert!(
+        host.boundary_identity(&key, &launch.endpoint, true)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&file).unwrap(), final_checkpoint);
+    let restored = host
+        .prepare_checked(
+            &key,
+            true,
+            true,
+            true,
+            IdentityCheck::Expected(Some(&invocation)),
+        )
+        .unwrap();
+    assert_eq!(restored.invocation, invocation);
+}
+
+#[test]
 fn versioned_prepare_rejects_checkpoint_from_another_invocation() {
     let directory = tempfile::tempdir().unwrap();
     let host = Host::new(directory.path().to_owned()).unwrap();

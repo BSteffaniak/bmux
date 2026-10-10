@@ -1078,6 +1078,8 @@ fn encode_grid_window(
 
 #[derive(Debug, Clone)]
 struct PaneResurrectionRuntime {
+    frozen: bool,
+    launch: Option<crate::application_resurrection::Launch>,
     /// Ephemeral process incarnation; never persisted or reused on restart.
     observation_execution: Uuid,
     /// Only metadata received from this incarnation, never restored CWD.
@@ -1097,12 +1099,29 @@ impl Default for PaneResurrectionRuntime {
 impl PaneResurrectionRuntime {
     fn from_snapshot(snapshot: &PaneResurrectionSnapshot) -> Self {
         Self {
+            frozen: false,
+            launch: None,
             observation_execution: Uuid::new_v4(),
             observed_cwd: None,
             execution_token: snapshot.execution_token.clone(),
             active_command: snapshot.active_command.clone(),
             active_command_source: snapshot.active_command_source,
             last_known_cwd: snapshot.last_known_cwd.clone(),
+        }
+    }
+
+    fn freeze(&mut self) -> anyhow::Result<()> {
+        if let Some(launch) = &self.launch {
+            launch.close_checked().map_err(anyhow::Error::msg)?;
+            self.launch = None;
+        }
+        self.frozen = true;
+        Ok(())
+    }
+
+    fn close_launch(&mut self) {
+        if let Some(launch) = self.launch.take() {
+            launch.close();
         }
     }
 
@@ -1116,6 +1135,9 @@ impl PaneResurrectionRuntime {
     }
 
     fn apply_event(&mut self, event: PaneShellMetadataEvent) {
+        if self.frozen {
+            return;
+        }
         // Shell-marker authentication already scopes these events to this PTY.
         let (PaneShellMetadataEvent::CommandStart { cwd, .. }
         | PaneShellMetadataEvent::Prompt { cwd }) = &event;
@@ -1152,6 +1174,7 @@ fn apply_shell_metadata_events_and_take_prompt_replay(
         let is_prompt = matches!(event, PaneShellMetadataEvent::Prompt { .. });
         state.apply_event(event);
         if is_prompt
+            && !state.frozen
             && replay_command.is_none()
             && let Some(command) = pending_replay_command.take()
         {
@@ -2678,32 +2701,19 @@ def __bmux_emit_start [command: string, cwd: string] {
   print --no-newline (__bmux_marker "start" [$command $cwd])
 }
 
-def __bmux_prompt_marker [cwd: string] {
-  __bmux_marker "prompt" [$cwd]
-}
-
-def __bmux_render_prompt_command [value] {
-  let kind = ($value | describe)
-  if ($kind | str starts-with "closure") {
-    do $value
-  } else if $kind == "nothing" {
-    ""
-  } else {
-    $value | into string
-  }
+def __bmux_emit_prompt [cwd: string] {
+  print --no-newline (__bmux_marker "prompt" [$cwd])
 }
 
 let __bmux_pre_execution_hooks = (__bmux_hook_list ($env.config | get -o hooks.pre_execution))
-let __bmux_original_prompt_command = ($env | get -o PROMPT_COMMAND)
-
-$env.PROMPT_COMMAND = {||
-  let marker = (__bmux_prompt_marker ($env.PWD | into string))
-  let prompt = (__bmux_render_prompt_command $__bmux_original_prompt_command)
-  $"($marker)($prompt)"
-}
+let __bmux_pre_prompt_hooks = (__bmux_hook_list ($env.config | get -o hooks.pre_prompt))
 
 $env.config = (
   $env.config
+  | upsert hooks.pre_prompt (
+      $__bmux_pre_prompt_hooks
+      | append {|| __bmux_emit_prompt ($env.PWD | into string) }
+    )
   | upsert hooks.pre_execution (
       $__bmux_pre_execution_hooks
       | append {||
@@ -5594,6 +5604,7 @@ impl SessionRuntimeManager {
             };
             if let Some(resume) = &application_resume {
                 if let Ok(mut state) = resurrection_state_for_reader.lock() {
+                    state.launch = Some(resume.clone());
                     state.execution_token = Some(resume.invocation.clone());
                 }
                 mark_snapshot_dirty_flag();
@@ -5774,7 +5785,6 @@ impl SessionRuntimeManager {
             let terminal_grid_for_waiter = Arc::clone(&terminal_grid_for_reader);
             let output_dirty_for_waiter = Arc::clone(&output_dirty_for_reader);
             let resurrection_state_for_waiter = Arc::clone(&resurrection_state_for_waiter_seed);
-            let application_resume_for_waiter = application_resume.clone();
             let child_waiter_done = Arc::new(AtomicBool::new(false));
             let child_waiter_done_for_thread = Arc::clone(&child_waiter_done);
             let publication_for_waiter = Arc::clone(&publication_for_task);
@@ -5786,7 +5796,13 @@ impl SessionRuntimeManager {
                     if wait_result.is_ok() {
                         drop(child.take());
                     }
-                    if let Some(resume) = application_resume_for_waiter { resume.close(); }
+                    if let Ok(mut resurrection) = resurrection_state_for_waiter.lock() {
+                        resurrection.close_launch();
+                        if !resurrection.frozen {
+                            resurrection.active_command = None;
+                            resurrection.active_command_source = None;
+                        }
+                    }
                     exited_for_waiter.store(true, Ordering::SeqCst);
                     if let Ok(mut reason) = exit_reason_for_waiter.lock()
                         && reason.is_none()
@@ -5795,10 +5811,6 @@ impl SessionRuntimeManager {
                             Ok(status) => format_pane_exit_reason(&status),
                             Err(error) => format!("process wait failed: {error}"),
                         });
-                    }
-                    if let Ok(mut resurrection) = resurrection_state_for_waiter.lock() {
-                        resurrection.active_command = None;
-                        resurrection.active_command_source = None;
                     }
                     if !publication_for_waiter.wait() {
                         let _ = child_exit_tx.send(());
@@ -5834,7 +5846,7 @@ impl SessionRuntimeManager {
             // Fence checkpoint writers before terminating the shell. Its final
             // prompt/output can otherwise reset the saved invocation after the
             // server has finalized the restoration snapshot.
-            let application_resume_for_shutdown = application_resume.clone();
+            let resurrection_state_for_shutdown = Arc::clone(&resurrection_state_for_reader);
             let reader_thread = std::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}"))
                 .spawn(move || {
@@ -5983,13 +5995,15 @@ impl SessionRuntimeManager {
                                     if let Ok(mut resurrection_state) =
                                         resurrection_state_for_reader.lock()
                                     {
-                                        if let Some(resume) = &application_resume {
+                                        if let Some(resume) = resurrection_state.launch.clone()
+                                            && !resurrection_state.frozen
+                                        {
                                             for event in &metadata.events {
                                                 match resume.boundary(matches!(event, PaneShellMetadataEvent::Prompt { .. })) {
                                                     Ok(identity) => resurrection_state.execution_token = Some(identity),
                                                     Err(error) => {
                                                         warn!(%error, "resurrection lifecycle update failed");
-                                                        resume.close();
+                                                        resurrection_state.close_launch();
                                                     }
                                                 }
                                             }
@@ -6101,8 +6115,9 @@ impl SessionRuntimeManager {
                 }
                 tokio::select! {
                     _ = &mut stop_rx => {
-                        if let Some(resume) = &application_resume_for_shutdown {
-                            resume.close();
+                        if let Ok(mut state) = resurrection_state_for_shutdown.lock() {
+                            state.close_launch();
+                            state.frozen = true;
                         }
                         let _ = child_killer.kill();
                         break;
@@ -9716,7 +9731,8 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 .lock()
                 .map_err(|_| anyhow::anyhow!("resurrection state lock poisoned"))?;
 
-            if !pane.exited.load(Ordering::SeqCst)
+            if !resurrection_runtime.frozen
+                && !pane.exited.load(Ordering::SeqCst)
                 && resurrection_runtime.active_command_source != Some(PaneCommandSource::Verbatim)
             {
                 match inspect_process_group_command_and_cwd(
@@ -11032,7 +11048,35 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
         process_pane_exit_events(exit_manager, pane_exit_rx, shutdown_rx).await;
     });
 
-    crate::snapshot::PaneRuntimeStateful::register();
+    crate::snapshot::PaneRuntimeStateful::register(move || {
+        let states = {
+            let manager = manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("runtime lock poisoned"))?;
+            manager
+                .runtimes
+                .values()
+                .flat_map(|runtime| {
+                    runtime
+                        .panes
+                        .values()
+                        .map(|pane| Arc::clone(&pane.resurrection_state))
+                })
+                .collect::<Vec<_>>()
+        };
+        for state in states {
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))?;
+            if state.frozen {
+                continue;
+            }
+            // The metadata reader holds this same lock across boundary commit and
+            // identity publication. Closing drains descriptor writers as well.
+            state.freeze()?;
+        }
+        Ok(())
+    });
 }
 
 #[cfg(test)]
@@ -13253,6 +13297,36 @@ mod tests {
             Ok(Some("/old-execution".into()))
         });
         assert_eq!(result, Err(SpawnError::StaleExecution));
+    }
+
+    #[test]
+    fn frozen_resurrection_ignores_late_shell_boundaries_and_replay() {
+        let mut state = PaneResurrectionRuntime::from_snapshot(&PaneResurrectionSnapshot {
+            execution_token: Some("saved-invocation".into()),
+            active_command: Some("application".into()),
+            active_command_source: Some(PaneCommandSource::Verbatim),
+            last_known_cwd: Some("/saved".into()),
+        });
+        state.freeze().unwrap();
+        let mut pending = Some("must-not-replay".into());
+        let replay = apply_shell_metadata_events_and_take_prompt_replay(
+            &mut state,
+            &mut pending,
+            [
+                PaneShellMetadataEvent::Prompt {
+                    cwd: "/late".into(),
+                },
+                PaneShellMetadataEvent::CommandStart {
+                    command: "other".into(),
+                    cwd: "/late".into(),
+                },
+            ],
+        );
+        assert!(replay.is_none());
+        assert_eq!(pending.as_deref(), Some("must-not-replay"));
+        assert_eq!(state.execution_token.as_deref(), Some("saved-invocation"));
+        assert_eq!(state.active_command.as_deref(), Some("application"));
+        assert_eq!(state.last_known_cwd.as_deref(), Some("/saved"));
     }
 
     fn manager_with_runtime(
@@ -16855,13 +16929,14 @@ mod tests {
     }
 
     #[test]
-    fn nu_shell_integration_wraps_prompt_command_for_prompt_marker() {
+    fn nu_shell_integration_uses_once_per_command_prompt_hook() {
         let config = shell_integration_nu_config();
 
-        assert!(config.contains("$env.PROMPT_COMMAND = {||"));
-        assert!(config.contains("__bmux_original_prompt_command"));
-        assert!(config.contains("__bmux_prompt_marker"));
-        assert!(!config.contains("hooks.pre_prompt"));
+        assert!(config.contains("__bmux_pre_prompt_hooks"));
+        assert!(config.contains("__bmux_emit_prompt"));
+        assert!(config.contains("upsert hooks.pre_prompt"));
+        // Prompt rendering can happen repeatedly without a command boundary.
+        assert!(!config.contains("$env.PROMPT_COMMAND ="));
     }
 
     #[test]

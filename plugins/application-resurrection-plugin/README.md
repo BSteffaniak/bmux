@@ -23,7 +23,15 @@ application session IDs or execute commands from descriptors.
 
 ## Recovery and validation
 
-Pane snapshots retain an opaque invocation identity. The v2 launch contract rejects
+Pane snapshots retain an opaque invocation identity. Before final snapshot
+collection, the snapshot orchestrator quiesces every participant through the generic
+`StatefulPlugin::prepare_final_snapshot` hook. The pane-runtime participant drains
+application checkpoint writers while holding the shell-metadata lock and freezes
+its recovery metadata; late prompts, command markers, process exit, and process
+inspection cannot change the captured invocation. Normal saves do not freeze live
+state. A quiescence failure preserves the previous snapshot.
+
+The v2 launch contract rejects
 missing or mismatched referenced checkpoints rather than adopting another command's
 state. Shell metadata and identity transitions share a lock during snapshot capture.
 Interrupted transitions can therefore produce an explicit recovery error, not an

@@ -106,6 +106,19 @@ pub trait StatefulPlugin: Send + Sync {
         Vec::new()
     }
 
+    /// Quiesce durable writers before final snapshot collection.
+    ///
+    /// Called once on shutdown, before any participant is captured. Implementations
+    /// must drain in-flight writes and prevent later teardown from changing recovery
+    /// state. Ordinary saves do not call this hook.
+    ///
+    /// # Errors
+    /// Return an error if recovery state cannot be frozen; the previous snapshot
+    /// must remain untouched.
+    fn prepare_final_snapshot(&self) -> StatefulPluginResult<()> {
+        Ok(())
+    }
+
     /// Produce a snapshot of the plugin's current state.
     ///
     /// # Errors

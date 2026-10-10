@@ -345,6 +345,19 @@ impl SnapshotOrchestrator for BmuxSnapshotOrchestrator {
         }
         // Seal even on failure: teardown must never replace the last good file.
         *finalized = true;
+        {
+            let registry = self.stateful_registry.read().map_err(|_| {
+                SnapshotOrchestratorError::Other("stateful registry lock poisoned".into())
+            })?;
+            for handle in registry.as_slice() {
+                handle.as_dyn().prepare_final_snapshot().map_err(|error| {
+                    SnapshotOrchestratorError::Participant {
+                        plugin: handle.as_dyn().id().as_str().to_string(),
+                        details: StatefulErrorDisplay(&error).to_string(),
+                    }
+                })?;
+            }
+        }
         self.save_locked()
     }
     async fn restore_if_present(&self) -> SnapshotOrchestratorResult<Option<RestoreSummary>> {
@@ -865,6 +878,61 @@ mod tests {
         assert!(orchestrator.finalize().is_err());
         assert!(orchestrator.save_now_blocking().unwrap().is_none());
         assert!(orchestrator.finalize().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn finalization_quiesces_every_participant_before_capture() {
+        struct Participant {
+            id: &'static str,
+            frozen: Arc<std::sync::atomic::AtomicUsize>,
+            fail: bool,
+        }
+        impl StatefulPlugin for Participant {
+            fn id(&self) -> PluginEventKind {
+                PluginEventKind::from_static(self.id)
+            }
+            fn prepare_final_snapshot(&self) -> StatefulPluginResult<()> {
+                self.frozen
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.fail {
+                    return Err(StatefulPluginError::SnapshotFailed {
+                        plugin: self.id.into(),
+                        details: "injected freeze failure".into(),
+                    });
+                }
+                Ok(())
+            }
+            fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
+                assert_eq!(self.frozen.load(std::sync::atomic::Ordering::SeqCst), 2);
+                Ok(StatefulPluginSnapshot::new(self.id(), 1, vec![]))
+            }
+        }
+        for fail in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(DEFAULT_SNAPSHOT_FILENAME);
+            let frozen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut registry = StatefulPluginRegistry::new();
+            for id in ["test.first", "test.second"] {
+                registry.push(StatefulPluginHandle::new(Participant {
+                    id,
+                    frozen: Arc::clone(&frozen),
+                    fail: fail && id == "test.second",
+                }));
+            }
+            let orchestrator = BmuxSnapshotOrchestrator::new(
+                Some(path.clone()),
+                Arc::new(SnapshotDirtyFlag::new()),
+                Arc::new(RwLock::new(registry)),
+            );
+            orchestrator.restore_if_present().await.unwrap();
+            std::fs::write(&path, b"last good snapshot").unwrap();
+            assert_eq!(orchestrator.finalize().is_err(), fail);
+            if fail {
+                assert_eq!(std::fs::read(&path).unwrap(), b"last good snapshot");
+            }
+            assert!(orchestrator.finalize().unwrap().is_none());
+            assert_eq!(frozen.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
     }
 
     #[tokio::test]

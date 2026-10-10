@@ -186,15 +186,19 @@ fn layout_from_snapshot(node: &PaneRuntimeSnapshotV1Layout) -> PaneLayoutNode {
 
 /// Stateful-plugin participant that marshals the pane-runtime plugin's
 /// runtime into a [`PaneRuntimeSnapshotV1`].
-pub struct PaneRuntimeStateful;
+pub struct PaneRuntimeStateful {
+    freeze: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+}
 
 impl PaneRuntimeStateful {
     /// Register a `StatefulPluginHandle` wrapping this participant in
     /// the process-wide stateful-plugin registry (creating the
     /// registry slot if absent). Intended to be called once from
     /// pane-runtime plugin activation after the manager has been constructed.
-    pub fn register() {
-        let participant = Self;
+    pub fn register(freeze: impl Fn() -> anyhow::Result<()> + Send + Sync + 'static) {
+        let participant = Self {
+            freeze: Box::new(freeze),
+        };
         let handle = StatefulPluginHandle::new(participant);
         let registry = bmux_plugin::global_plugin_state_registry();
         let stateful_registry = bmux_snapshot_runtime::get_or_init_stateful_registry(
@@ -412,6 +416,13 @@ fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result
 }
 
 impl StatefulPlugin for PaneRuntimeStateful {
+    fn prepare_final_snapshot(&self) -> StatefulPluginResult<()> {
+        (self.freeze)().map_err(|error| StatefulPluginError::SnapshotFailed {
+            plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
+            details: format!("{error:#}"),
+        })
+    }
+
     fn id(&self) -> PluginEventKind {
         PANE_RUNTIME_PLUGIN_SNAPSHOT_ID
     }

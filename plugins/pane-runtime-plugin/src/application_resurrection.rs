@@ -54,6 +54,15 @@ pub fn prepare(
     }))
 }
 
+impl std::fmt::Debug for Launch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Launch")
+            .field("invocation", &self.invocation)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Launch {
     pub fn bind(&self, pid: u32) -> Result<(), String> {
         let mut dispatch = ServiceCallerDispatchClient::new(self.caller.as_ref());
@@ -80,6 +89,18 @@ impl Launch {
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("{e:?}"))
     }
+    pub fn close_checked(&self) -> Result<(), String> {
+        let mut dispatch = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        block_on_typed_dispatch(client::close(
+            &mut dispatch,
+            self.key.clone(),
+            self.endpoint.clone(),
+        ))
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:?}"))?;
+        Ok(())
+    }
+
     pub fn close(&self) {
         let mut dispatch = ServiceCallerDispatchClient::new(self.caller.as_ref());
         if let Err(error) = block_on_typed_dispatch(client::close(
