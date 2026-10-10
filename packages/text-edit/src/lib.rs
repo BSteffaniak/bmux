@@ -7,6 +7,11 @@
 #[cfg(feature = "keyboard")]
 pub mod keyboard;
 
+pub(crate) mod history;
+pub use history::{
+    MAX_HISTORY_BYTES, MAX_HISTORY_ENTRIES, TextEditState, TextEditTransactionError,
+};
+
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -98,6 +103,7 @@ pub struct LineViewport {
 
 /// Policy for classifying word boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum WordBoundaryPolicy {
     /// Treat whitespace and punctuation as separators.
     #[default]
@@ -253,6 +259,8 @@ pub struct TextEditBuffer {
     selection_anchor: Option<usize>,
     desired_visual_col: Option<usize>,
     word_boundary_policy: WordBoundaryPolicy,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    history: history::EditHistory,
 }
 
 impl TextEditBuffer {
@@ -265,6 +273,7 @@ impl TextEditBuffer {
             selection_anchor: None,
             desired_visual_col: None,
             word_boundary_policy: WordBoundaryPolicy::Punctuation,
+            history: history::EditHistory::new(),
         }
     }
 
@@ -279,6 +288,7 @@ impl TextEditBuffer {
             selection_anchor: None,
             desired_visual_col: None,
             word_boundary_policy: WordBoundaryPolicy::Punctuation,
+            history: history::EditHistory::new(),
         }
     }
 
@@ -319,6 +329,10 @@ impl TextEditBuffer {
 
     /// Clear all text and reset the cursor.
     pub fn clear(&mut self) {
+        self.record_edit(Self::clear_unrecorded);
+    }
+
+    fn clear_unrecorded(&mut self) {
         self.text.clear();
         self.cursor = 0;
         self.selection_anchor = None;
@@ -327,7 +341,11 @@ impl TextEditBuffer {
 
     /// Insert one character at the cursor.
     pub fn insert_char(&mut self, ch: char) {
-        let _ = self.delete_selection();
+        self.record_edit(|editor| editor.insert_char_unrecorded(ch));
+    }
+
+    fn insert_char_unrecorded(&mut self, ch: char) {
+        let _ = self.delete_selection_unrecorded();
         self.text.insert(self.cursor, ch);
         self.cursor = self.cursor.saturating_add(ch.len_utf8());
         self.desired_visual_col = None;
@@ -335,7 +353,11 @@ impl TextEditBuffer {
 
     /// Insert a string at the cursor.
     pub fn insert_str(&mut self, value: &str) {
-        let _ = self.delete_selection();
+        self.record_edit(|editor| editor.insert_str_unrecorded(value));
+    }
+
+    fn insert_str_unrecorded(&mut self, value: &str) {
+        let _ = self.delete_selection_unrecorded();
         self.text.insert_str(self.cursor, value);
         self.cursor = self.cursor.saturating_add(value.len());
         self.desired_visual_col = None;
@@ -351,7 +373,11 @@ impl TextEditBuffer {
     /// Carriage-return line endings are canonicalized to line-feed hard line
     /// breaks because this editor stores hard line breaks as `\n` internally.
     pub fn paste(&mut self, value: &str) {
-        let _ = self.delete_selection();
+        self.record_edit(|editor| editor.paste_unrecorded(value));
+    }
+
+    fn paste_unrecorded(&mut self, value: &str) {
+        let _ = self.delete_selection_unrecorded();
         let mut normalized = String::with_capacity(value.len());
         let mut chars = value.chars().peekable();
         while let Some(ch) = chars.next() {
@@ -371,7 +397,11 @@ impl TextEditBuffer {
 
     /// Delete the grapheme before the cursor.
     pub fn delete_backward(&mut self) {
-        if self.delete_selection() {
+        self.record_edit(Self::delete_backward_unrecorded);
+    }
+
+    fn delete_backward_unrecorded(&mut self) {
+        if self.delete_selection_unrecorded() {
             return;
         }
         if let Some(start) = previous_grapheme_boundary(&self.text, self.cursor) {
@@ -382,7 +412,11 @@ impl TextEditBuffer {
 
     /// Delete the grapheme at the cursor.
     pub fn delete_forward(&mut self) {
-        if self.delete_selection() {
+        self.record_edit(Self::delete_forward_unrecorded);
+    }
+
+    fn delete_forward_unrecorded(&mut self) {
+        if self.delete_selection_unrecorded() {
             return;
         }
         if let Some(end) = next_grapheme_boundary(&self.text, self.cursor) {
@@ -423,6 +457,10 @@ impl TextEditBuffer {
 
     /// Delete the active selection.
     pub fn delete_selection(&mut self) -> bool {
+        self.record_edit(Self::delete_selection_unrecorded)
+    }
+
+    fn delete_selection_unrecorded(&mut self) -> bool {
         let Some(selection) = self.selection() else {
             self.selection_anchor = None;
             return false;
@@ -444,12 +482,16 @@ impl TextEditBuffer {
 
     /// Delete text according to `delete`.
     pub fn delete(&mut self, delete: TextDelete) {
-        if self.delete_selection() {
+        self.record_edit(|editor| editor.delete_unrecorded(delete));
+    }
+
+    fn delete_unrecorded(&mut self, delete: TextDelete) {
+        if self.delete_selection_unrecorded() {
             return;
         }
         match delete {
-            TextDelete::Backward => self.delete_backward(),
-            TextDelete::Forward => self.delete_forward(),
+            TextDelete::Backward => self.delete_backward_unrecorded(),
+            TextDelete::Forward => self.delete_forward_unrecorded(),
             TextDelete::WordBackward => {
                 self.delete_range(
                     previous_word_boundary(&self.text, self.cursor, self.word_boundary_policy),

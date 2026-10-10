@@ -119,3 +119,84 @@ component authors and is not prelude-exported. `TextInputState` owns the edit bu
 selection, pointer gesture, and viewport offset; `TextInputPolicy` owns keyboard, mouse, edge, and
 outer-selection behavior. Component-owned optional dependencies—including terminal-grid and Unicode
 helpers—remain isolated behind component features and the repository feature-matrix guard.
+
+## Text-input undo/redo bindings
+
+With the `text-input` feature, `TextInputControl` delegates history to its
+`bmux_text_edit::TextEditBuffer`; it does not maintain a separate undo engine.
+Default history bindings are ctrl-Z/super-Z for undo and ctrl-shift-Z,
+super-shift-Z or ctrl-Y for redo. These operate only when the terminal reports
+those exact key strokes. A recognized action with no history returns
+`TextInputOutcome::Redraw` without modifying text or falling through to another
+shortcut. `policy.keyboard.enabled = false` disables keyboard handling, including
+history actions supplied by an adapter.
+
+`TextInputHistoryBindings` contains borrowed `undo` and `redo` key lists. Supply
+resolved application configuration through `with_history_bindings` on either
+`TextInputControl` or `TextInputComponent`. Explicit lists replace defaults;
+empty lists independently disable an action, and `disabled()` disables both.
+A stroke appearing in both lists resolves to no history action. Ordinary text
+editing continues through the configured text keymap.
+
+```rust
+use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_text_edit::TextEditBuffer;
+use bmux_tui_components::text_input::{
+    TextInputControl, TextInputHistoryBindings, TextInputOutcome,
+    TextInputPolicy, TextInputState,
+};
+
+let policy = TextInputPolicy::chat_composer();
+let undo_keys = [KeyStroke::simple(KeyCode::F(7))];
+let control = TextInputControl::new(&policy).with_history_bindings(
+    TextInputHistoryBindings { undo: &undo_keys, redo: &[] },
+);
+let mut state = TextInputState::new(TextEditBuffer::from_text("before"));
+state.buffer_mut().insert_str(" after");
+assert_eq!(control.handle_key(&mut state, undo_keys[0]), TextInputOutcome::Edited);
+assert_eq!(state.buffer().text(), "before");
+// Redo remains available in the editor, but has no keyboard binding here.
+assert!(state.buffer().can_redo());
+```
+
+Applications with an existing semantic keymap can instead call
+`handle_key_with_history_action(state, stroke, action)`, where `action` is
+`Option<TextInputHistoryAction>` (`Undo` or `Redo`). This result is authoritative:
+`None` bypasses all history bindings, including defaults, rather than falling
+back to a hardcoded ctrl-Z handler. Other editing still uses the ordinary text
+keymap; `None` is not a blanket instruction to ignore the key.
+
+```rust
+use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+use bmux_text_edit::TextEditBuffer;
+use bmux_tui_components::text_input::{
+    TextInputControl, TextInputHistoryAction, TextInputOutcome,
+    TextInputPolicy, TextInputState,
+};
+
+let policy = TextInputPolicy::chat_composer();
+let control = TextInputControl::new(&policy);
+let mut state = TextInputState::new(TextEditBuffer::from_text("before"));
+state.buffer_mut().insert_str(" after");
+let stroke = KeyStroke::with_modifiers(
+    KeyCode::Char('z'), Modifiers { ctrl: true, ..Modifiers::NONE },
+);
+// A disabled/unmapped semantic result does not trigger default undo.
+assert_eq!(
+    control.handle_key_with_history_action(&mut state, stroke, None),
+    TextInputOutcome::Ignored,
+);
+assert_eq!(state.buffer().text(), "before after");
+assert_eq!(
+    control.handle_key_with_history_action(
+        &mut state, stroke, Some(TextInputHistoryAction::Undo),
+    ),
+    TextInputOutcome::Edited,
+);
+```
+
+Keep binding slices alive as long as the control/component borrows them. Resolve
+remapping, explicit disablement and application shortcut precedence before
+passing the semantic action; do not call the default history handler afterward.
+Undo storage bounds, oversized-edit clearing and serde omission are documented
+in the `bmux_text_edit` README.

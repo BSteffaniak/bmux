@@ -197,6 +197,7 @@ pub struct TextInputComponent<'policy, 'state> {
     id: LayoutId,
     state: &'state RefCell<TextInputState>,
     policy: &'policy TextInputPolicy,
+    history_bindings: TextInputHistoryBindings<'policy>,
     style: Style,
     selection_style: Style,
     placeholder: Option<&'policy str>,
@@ -217,6 +218,7 @@ impl<'policy, 'state> TextInputComponent<'policy, 'state> {
             id: id.into(),
             state,
             policy,
+            history_bindings: TextInputHistoryBindings::standard(),
             style: Style::new(),
             selection_style: Style::new().add_modifier(bmux_tui::style::Modifier::REVERSED),
             placeholder: None,
@@ -224,6 +226,16 @@ impl<'policy, 'state> TextInputComponent<'policy, 'state> {
             focused: false,
             disabled: false,
         }
+    }
+
+    /// Replace history defaults with authoritative remapped or disabled bindings.
+    #[must_use]
+    pub const fn with_history_bindings(
+        mut self,
+        bindings: TextInputHistoryBindings<'policy>,
+    ) -> Self {
+        self.history_bindings = bindings;
+        self
     }
 
     /// Set rendered text style.
@@ -376,7 +388,10 @@ impl Component for TextInputComponent<'_, '_> {
             ),
             self.policy,
         );
-        match TextInputControl::new(self.policy).handle_event(&mut state, event) {
+        match TextInputControl::new(self.policy)
+            .with_history_bindings(self.history_bindings)
+            .handle_event(&mut state, event)
+        {
             TextInputOutcome::Ignored => EventOutcome::Ignored,
             TextInputOutcome::Edited
             | TextInputOutcome::Redraw
@@ -387,17 +402,130 @@ impl Component for TextInputComponent<'_, '_> {
     }
 }
 
+/// Semantic editor history operation resolved by a caller-owned keymap adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextInputHistoryAction {
+    /// Restore the preceding edit state.
+    Undo,
+    /// Restore the most recently undone edit state.
+    Redo,
+}
+
+const DEFAULT_UNDO_KEYS: &[KeyStroke] = &[
+    KeyStroke::with_modifiers(
+        KeyCode::Char('z'),
+        Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        },
+    ),
+    KeyStroke::with_modifiers(
+        KeyCode::Char('z'),
+        Modifiers {
+            super_key: true,
+            ..Modifiers::NONE
+        },
+    ),
+];
+const DEFAULT_REDO_KEYS: &[KeyStroke] = &[
+    KeyStroke::with_modifiers(
+        KeyCode::Char('z'),
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::NONE
+        },
+    ),
+    KeyStroke::with_modifiers(
+        KeyCode::Char('z'),
+        Modifiers {
+            super_key: true,
+            shift: true,
+            ..Modifiers::NONE
+        },
+    ),
+    KeyStroke::with_modifiers(
+        KeyCode::Char('y'),
+        Modifiers {
+            ctrl: true,
+            ..Modifiers::NONE
+        },
+    ),
+];
+
+/// Authoritative history bindings supplied by the application's generic keymap.
+///
+/// Empty lists independently disable each action. No default fallback is applied
+/// to explicitly supplied lists. A stroke present in both lists fails closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextInputHistoryBindings<'keys> {
+    /// Undo strokes, or an empty slice to disable undo.
+    pub undo: &'keys [KeyStroke],
+    /// Redo strokes, or an empty slice to disable redo.
+    pub redo: &'keys [KeyStroke],
+}
+
+impl Default for TextInputHistoryBindings<'_> {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+impl TextInputHistoryBindings<'_> {
+    /// Conventional ctrl/super-Z undo, ctrl/super-shift-Z and ctrl-Y redo.
+    #[must_use]
+    pub const fn standard() -> Self {
+        Self {
+            undo: DEFAULT_UNDO_KEYS,
+            redo: DEFAULT_REDO_KEYS,
+        }
+    }
+
+    /// Disable both actions without disabling ordinary keyboard editing.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            undo: &[],
+            redo: &[],
+        }
+    }
+
+    /// Resolve exactly one action; conflicting or absent bindings return `None`.
+    #[must_use]
+    pub fn action_for_key(self, stroke: KeyStroke) -> Option<TextInputHistoryAction> {
+        match (self.undo.contains(&stroke), self.redo.contains(&stroke)) {
+            (true, false) => Some(TextInputHistoryAction::Undo),
+            (false, true) => Some(TextInputHistoryAction::Redo),
+            _ => None,
+        }
+    }
+}
+
 /// Stateless text-input event controller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextInputControl<'policy> {
     policy: &'policy TextInputPolicy,
+    history_bindings: TextInputHistoryBindings<'policy>,
 }
 
 impl<'policy> TextInputControl<'policy> {
     /// Create a control using `policy`.
     #[must_use]
     pub const fn new(policy: &'policy TextInputPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            history_bindings: TextInputHistoryBindings::standard(),
+        }
+    }
+
+    /// Replace history defaults with authoritative remapped or disabled bindings.
+    #[must_use]
+    pub const fn with_history_bindings(
+        mut self,
+        bindings: TextInputHistoryBindings<'policy>,
+    ) -> Self {
+        self.history_bindings = bindings;
+        self
     }
 
     /// Return the configured policy.
@@ -436,8 +564,38 @@ impl<'policy> TextInputControl<'policy> {
 
     /// Handle one keyboard stroke.
     pub fn handle_key(&self, state: &mut TextInputState, stroke: KeyStroke) -> TextInputOutcome {
+        self.handle_key_with_history_action(
+            state,
+            stroke,
+            self.history_bindings.action_for_key(stroke),
+        )
+    }
+
+    /// Handle a stroke with the authoritative history result from a semantic adapter.
+    ///
+    /// `None` suppresses all default history bindings, while ordinary editing still
+    /// uses the configured text keymap. Disabled keyboard policy overrides actions.
+    pub fn handle_key_with_history_action(
+        &self,
+        state: &mut TextInputState,
+        stroke: KeyStroke,
+        history_action: Option<TextInputHistoryAction>,
+    ) -> TextInputOutcome {
         if !self.policy.keyboard.enabled {
             return TextInputOutcome::Ignored;
+        }
+        if let Some(action) = history_action {
+            let changed = match action {
+                TextInputHistoryAction::Undo => state.buffer_mut().undo(),
+                TextInputHistoryAction::Redo => state.buffer_mut().redo(),
+            };
+            if changed {
+                state.sync_scroll_to_cursor(self.policy);
+                return TextInputOutcome::Edited;
+            }
+            // Recognized empty-stack commands must not become inserted text or
+            // leak into unrelated application shortcuts.
+            return TextInputOutcome::Redraw;
         }
         if let Some(outcome) = self.handle_enter(state, stroke) {
             return outcome;
@@ -1199,6 +1357,212 @@ mod tests {
     use bmux_tui::frame::Frame;
     use bmux_tui::geometry::{Point, Size};
     use bmux_tui::paint::{LocalRect, PaintCx};
+
+    #[test]
+    fn undo_redo_controls_restore_atomic_edits_and_consume_empty_history() {
+        let policy = TextInputPolicy::chat_composer();
+        let control = TextInputControl::new(&policy);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("é token"));
+        let before = state.buffer().edit_state();
+        state
+            .buffer_mut()
+            .replace_byte_range(&before, 3..8, "🦀", 7, None)
+            .unwrap();
+        let after = state.buffer().edit_state();
+        let undo = KeyStroke::with_modifiers(
+            KeyCode::Char('z'),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        );
+        let redo = KeyStroke::with_modifiers(
+            KeyCode::Char('z'),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(
+            control.handle_key(&mut state, undo),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(state.buffer().edit_state(), before);
+        assert_eq!(
+            control.handle_key(&mut state, undo),
+            TextInputOutcome::Redraw
+        );
+        assert_eq!(state.buffer().edit_state(), before);
+        assert_eq!(
+            control.handle_key(&mut state, redo),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(state.buffer().edit_state(), after);
+        let super_undo = KeyStroke::with_modifiers(
+            KeyCode::Char('z'),
+            Modifiers {
+                super_key: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(
+            control.handle_key(&mut state, super_undo),
+            TextInputOutcome::Edited
+        );
+        let ctrl_y = KeyStroke::with_modifiers(
+            KeyCode::Char('y'),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(
+            control.handle_key(&mut state, ctrl_y),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(state.buffer().edit_state(), after);
+        assert!(
+            TextInputHistoryBindings::standard()
+                .action_for_key(KeyStroke::with_modifiers(
+                    KeyCode::Char('z'),
+                    Modifiers {
+                        ctrl: true,
+                        alt: true,
+                        ..Modifiers::NONE
+                    }
+                ))
+                .is_none()
+        );
+        let mut disabled = policy;
+        disabled.keyboard.enabled = false;
+        assert_eq!(
+            TextInputControl::new(&disabled).handle_key(&mut state, undo),
+            TextInputOutcome::Ignored
+        );
+    }
+
+    #[test]
+    fn history_bindings_remap_disable_and_semantic_adapter_are_authoritative() {
+        let policy = TextInputPolicy::chat_composer();
+        let undo_keys = [key(KeyCode::F(7))];
+        let redo_keys = [key(KeyCode::F(8))];
+        let bindings = TextInputHistoryBindings {
+            undo: &undo_keys,
+            redo: &redo_keys,
+        };
+        let control = TextInputControl::new(&policy).with_history_bindings(bindings);
+        let mut state = TextInputState::new(TextEditBuffer::from_text("a"));
+        state.buffer_mut().insert_str("b");
+        let default_undo = KeyStroke::with_modifiers(
+            KeyCode::Char('z'),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(
+            control.handle_key(&mut state, default_undo),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(state.buffer().text(), "ab");
+        assert_eq!(
+            control.handle_key(&mut state, undo_keys[0]),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(state.buffer().text(), "a");
+        assert_eq!(
+            control.handle_key(&mut state, undo_keys[0]),
+            TextInputOutcome::Redraw
+        );
+        let undo_disabled =
+            TextInputControl::new(&policy).with_history_bindings(TextInputHistoryBindings {
+                undo: &[],
+                redo: &redo_keys,
+            });
+        assert_eq!(
+            undo_disabled.handle_key(&mut state, default_undo),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(
+            undo_disabled.handle_key(&mut state, redo_keys[0]),
+            TextInputOutcome::Edited
+        );
+        let redo_disabled =
+            TextInputControl::new(&policy).with_history_bindings(TextInputHistoryBindings {
+                undo: &undo_keys,
+                redo: &[],
+            });
+        redo_disabled.handle_key(&mut state, undo_keys[0]);
+        assert_eq!(
+            redo_disabled.handle_key(&mut state, redo_keys[0]),
+            TextInputOutcome::Ignored
+        );
+        assert!(state.buffer().can_redo());
+        let disabled = TextInputControl::new(&policy)
+            .with_history_bindings(TextInputHistoryBindings::disabled());
+        assert_eq!(
+            disabled.handle_key(&mut state, default_undo),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(
+            disabled.handle_key_with_history_action(
+                &mut state,
+                redo_keys[0],
+                Some(TextInputHistoryAction::Redo)
+            ),
+            TextInputOutcome::Edited
+        );
+        assert_eq!(
+            TextInputControl::new(&policy).handle_key_with_history_action(
+                &mut state,
+                default_undo,
+                None
+            ),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(state.buffer().text(), "ab");
+        let conflicts = TextInputHistoryBindings {
+            undo: &undo_keys,
+            redo: &undo_keys,
+        };
+        assert!(conflicts.action_for_key(undo_keys[0]).is_none());
+        let mut keyboard_disabled = policy;
+        keyboard_disabled.keyboard.enabled = false;
+        assert_eq!(
+            TextInputControl::new(&keyboard_disabled).handle_key_with_history_action(
+                &mut state,
+                undo_keys[0],
+                Some(TextInputHistoryAction::Undo)
+            ),
+            TextInputOutcome::Ignored
+        );
+        assert_eq!(state.buffer().text(), "ab");
+    }
+
+    #[test]
+    fn component_uses_authoritative_disabled_history_bindings() {
+        let policy = TextInputPolicy::chat_composer();
+        let state = RefCell::new(TextInputState::new(TextEditBuffer::from_text("a")));
+        state.borrow_mut().buffer_mut().insert_str("b");
+        let component = TextInputComponent::new("editor", &state, &policy)
+            .with_history_bindings(TextInputHistoryBindings::disabled())
+            .focused(true);
+        let layout = LayoutNode::leaf("editor".into(), LogicalSize::new(8, 1));
+        let event = Event::Key(KeyStroke::with_modifiers(
+            KeyCode::Char('z'),
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+        ));
+        assert_eq!(
+            component.event(&event, &layout, &mut EventCx::new(&layout)),
+            EventOutcome::Ignored
+        );
+        assert_eq!(state.borrow().buffer().text(), "ab");
+        assert!(state.borrow().buffer().can_undo());
+    }
 
     fn key(key: KeyCode) -> KeyStroke {
         KeyStroke::simple(key)

@@ -2555,6 +2555,7 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "bmux_keyboard",
  "serde",
+ "serde_json",
  "unicode-segmentation",
  "unicode-width",
 ]

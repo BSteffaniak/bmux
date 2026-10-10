@@ -6,6 +6,12 @@ use bmux_tui::style::Style;
 
 /// Translate pointer input without treating a clipped edge as the control origin.
 /// Outside-clip releases still reach controls to cancel pointer capture.
+#[cfg(any(
+    feature = "menu",
+    feature = "selectable-list",
+    feature = "text-view",
+    test,
+))]
 pub(crate) fn local_control_event(
     event: &bmux_tui::event::Event,
     cx: &bmux_tui::component::EventCx<'_>,
