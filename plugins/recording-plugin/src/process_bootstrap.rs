@@ -10,6 +10,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+// v1 waits may run for 30 seconds; leave bounded transport headroom without
+// changing the caller's default configuration or durable principal identity.
+const PROCESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Locator {
     schema_version: u32,
@@ -101,7 +105,13 @@ pub(crate) async fn bootstrap(context: &NativeCommandContext) -> Result<Dedicate
     }
     let started = Instant::now();
     loop {
-        match BmuxClient::connect_with_paths(&paths, "recording-process").await {
+        match BmuxClient::connect_with_paths_and_timeout(
+            &paths,
+            "recording-process",
+            PROCESS_REQUEST_TIMEOUT,
+        )
+        .await
+        {
             Ok(client) => {
                 return Ok(DedicatedRuntime {
                     root,
@@ -228,7 +238,12 @@ pub(crate) async fn resolve(context: &NativeCommandContext, id: Uuid) -> Result<
             .is_some_and(|name| name.starts_with("bmux-recorded-")),
         "invalid dedicated runtime locator"
     );
-    let client = BmuxClient::connect_with_paths(&paths(&root), "recording-process").await?;
+    let client = BmuxClient::connect_with_paths_and_timeout(
+        &paths(&root),
+        "recording-process",
+        PROCESS_REQUEST_TIMEOUT,
+    )
+    .await?;
     Ok(DedicatedRuntime {
         root,
         client,

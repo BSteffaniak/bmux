@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -483,7 +483,8 @@ fn read_all(env: &RecordingEnv, id: &str) -> Vec<u8> {
 #[test]
 fn finite_launch_status_before_wait_reports_drain() {
     let env = RecordingEnv::new();
-    let id = env.start("stty -opost\nprintf FINITE\nexit 7\n", &[]);
+    let id = env.start("stty -opost\nprintf FINITE\ni=0\nwhile [ \"$i\" -lt 4096 ]; do printf '0123456789abcdef'; i=$((i+1)); done\nprintf LAST\nexit 7\n", &[]);
+    let expected = format!("FINITE{}LAST", "0123456789abcdef".repeat(4096)).into_bytes();
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut timeline = Vec::new();
     loop {
@@ -501,10 +502,19 @@ fn finite_launch_status_before_wait_reports_drain() {
         thread::sleep(POLL_INTERVAL);
     }
     eprintln!("status-before-wait timeline: {timeline:?}");
-    assert_eq!(read_all(&env, &id), b"FINITE");
+    let captured = read_all(&env, &id);
+    assert_eq!(captured, expected);
     let status = env.wait_exit(&id);
     assert_eq!(status["exit_code"].as_u64(), Some(7));
-    env.finish(&id, "finite-status", &["raw"]);
+    assert_eq!(
+        status["output_watermark"].as_u64(),
+        Some(expected.len() as u64)
+    );
+    let path = env.finish(&id, "finite-status", &["raw"]);
+    assert_eq!(
+        fs::read(path.join("output.pty")).expect("raw artifact"),
+        expected
+    );
 }
 
 #[test]
@@ -1126,6 +1136,193 @@ fn immediate_output_is_replayed_into_gif_without_screen_polling() {
     assert!(
         has_red_output,
         "immediate colored output lost before canonical GIF replay"
+    );
+}
+
+#[test]
+fn animated_gif_preserves_ordered_output_and_final_exit_frame() {
+    let env = RecordingEnv::new();
+    // Deliberately separated source frames exercise animation, while the last
+    // frame exits immediately and must survive drain without screen polling.
+    let script = "stty -opost\nprintf '\\033[2J\\033[H\\033[41mRED\\033[0m'\nsleep 0.3\nprintf '\\033[2J\\033[H\\033[42mGREEN\\033[0m'\nsleep 0.3\nprintf '\\033[2J\\033[H\\033[44mBLUE\\033[0m'\n";
+    let id = env.start(script, &[]);
+    let status = env.wait_exit(&id);
+    assert_eq!(status["output_drained"].as_bool(), Some(true));
+    let expected = b"\x1b[2J\x1b[H\x1b[41mRED\x1b[0m\x1b[2J\x1b[H\x1b[42mGREEN\x1b[0m\x1b[2J\x1b[H\x1b[44mBLUE\x1b[0m";
+    assert_eq!(read_all(&env, &id), expected);
+    let artifacts = env.finish(&id, "animation", &["raw", "gif"]);
+    assert_eq!(
+        fs::read(artifacts.join("output.pty")).expect("raw animation"),
+        expected
+    );
+    let colors = gif_dominant_colors(&artifacts.join("output.gif"));
+    let mut ordered = Vec::new();
+    for color in colors {
+        if ordered.last() != Some(&color) {
+            ordered.push(color);
+        }
+    }
+    assert_eq!(
+        ordered,
+        [0, 1, 2],
+        "lost or reordered animated source frames"
+    );
+    let retried = env.finish(&id, "animation-retry", &["raw", "gif"]);
+    assert_eq!(
+        fs::read(retried.join("output.pty")).expect("retry raw"),
+        expected
+    );
+    assert_eq!(
+        gif_dominant_colors(&retried.join("output.gif")),
+        gif_dominant_colors(&artifacts.join("output.gif")),
+        "finalization retry changed animation"
+    );
+}
+
+fn gif_dominant_colors(path: &Path) -> Vec<usize> {
+    let mut options = gif::DecodeOptions::new();
+    options.set_color_output(gif::ColorOutput::RGBA);
+    let mut decoder = options
+        .read_info(File::open(path).expect("animation GIF"))
+        .expect("GIF decoder");
+    let mut colors = Vec::new();
+    let mut frames = 0;
+    while let Some(frame) = decoder.read_next_frame().expect("decode animation frame") {
+        frames += 1;
+        assert!(frames <= 1000, "unbounded animation");
+        let mut counts = [0_usize; 3];
+        for pixel in frame.buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0) {
+            for channel in 0..3 {
+                if pixel[channel] > 80
+                    && u16::from(pixel[channel]) > u16::from(pixel[(channel + 1) % 3]) * 2
+                    && u16::from(pixel[channel]) > u16::from(pixel[(channel + 2) % 3]) * 2
+                {
+                    counts[channel] += 1;
+                }
+            }
+        }
+        if let Some((channel, _)) = counts.iter().enumerate().max_by_key(|(_, count)| *count)
+            && counts[channel] > 0
+        {
+            colors.push(channel);
+        }
+    }
+    assert!(frames > 0, "empty animation");
+    colors
+}
+
+#[test]
+fn incomplete_capture_refuses_finalization_and_retries_without_relaunch() {
+    let env = RecordingEnv::new();
+    let id = env.start("stty -opost\nprintf EXACT_CAPTURE\n", &[]);
+    let status = env.wait_exit(&id);
+    let expected = read_all(&env, &id);
+    assert_eq!(expected, b"EXACT_CAPTURE");
+    let directory = PathBuf::from(status["runtime_root"].as_str().expect("owned root"))
+        .join("state/recordings")
+        .join(status["recording_id"].as_str().expect("recording id"));
+    // Corrupt only this fixture's derived live file after the writer caught up.
+    // A drained execution must not mask a missing canonical capture suffix.
+    fs::write(directory.join("output.live"), b"EXACT").expect("inject capture gap");
+    let refused = env.run(&["recording", "process", "finish", &id, "--json"]);
+    assert!(
+        !refused.status.success(),
+        "gap was acknowledged as complete"
+    );
+    assert!(
+        parse_json(&refused)["error"]
+            .as_str()
+            .expect("explicit gap error")
+            .contains("output watermark")
+    );
+    let pending = env.json(&["recording", "process", "status", &id, "--json"]);
+    assert_eq!(pending["capture_finalized"].as_bool(), Some(false));
+    assert_eq!(pending["execution"], status["execution"]);
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(directory.join("manifest.json")).expect("stopped writer manifest"),
+    )
+    .expect("manifest JSON");
+    assert!(!manifest["summary"]["ended_epoch_ms"].is_null());
+    // Simulate recovery of the derived file from retained canonical segments.
+    // The stopped writer must not be restarted or the process relaunched.
+    fs::write(directory.join("output.live"), &expected).expect("repair fixture live file");
+    let artifacts = env.finish(&id, "recovered-capture", &["raw"]);
+    assert_eq!(
+        fs::read(artifacts.join("output.pty")).expect("canonical raw"),
+        expected
+    );
+    let finalized = env.json(&["recording", "process", "status", &id, "--json"]);
+    assert_eq!(finalized["execution"], status["execution"]);
+    assert_eq!(finalized["recording_id"], status["recording_id"]);
+}
+
+#[test]
+fn exit_wait_longer_than_default_transport_timeout_returns_run_status() {
+    let env = RecordingEnv::new();
+    let id = env.start(
+        "stty -echo -opost\nprintf 'Ready>'\nIFS= read -r line\nprintf '%s' \"$line\"\n",
+        &[],
+    );
+    let started = Instant::now();
+    let output = env.run(&[
+        "recording",
+        "process",
+        "wait",
+        &id,
+        "--exit",
+        "--timeout",
+        "6s",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(124), "{output:?}");
+    let status = parse_json(&output);
+    assert_eq!(status["run_id"].as_str(), Some(id.as_str()));
+    assert_eq!(status["phase"].as_str(), Some("running"));
+    assert_eq!(status["output_drained"].as_bool(), Some(false));
+    assert!(started.elapsed() >= Duration::from_secs(6));
+    let ready = env.json(&["recording", "process", "read", &id, "--json"]);
+    assert_eq!(ready["data"], serde_json::json!(b"Ready>".to_vec()));
+    assert_eq!(ready["complete"].as_bool(), Some(false));
+    env.json(&[
+        "recording",
+        "process",
+        "send",
+        &id,
+        "--text",
+        "DONE\n",
+        "--json",
+    ]);
+    env.wait_exit(&id);
+    assert_eq!(read_all(&env, &id), b"Ready>DONE");
+    env.finish(&id, "long-wait", &["raw"]);
+}
+
+#[test]
+fn exit_wait_beyond_five_seconds_returns_complete_evidence() {
+    let env = RecordingEnv::new();
+    // Start sleeping only after launch returns, so startup latency cannot
+    // accidentally make this a sub-five-second service invocation.
+    let id = env.start(
+        "stty -echo -opost\nprintf launch >> long-wait-launches\nprintf BEGIN\nwhile [ ! -f long-wait-gate ]; do sleep 0.01; done\nsleep 7\nprintf END\nexit 7\n",
+        &[],
+    );
+    let started = Instant::now();
+    fs::write(env.root.join("long-wait-gate"), b"ready").expect("release owned program");
+    let status = env.wait_exit(&id);
+    assert!(started.elapsed() >= Duration::from_secs(7));
+    assert_eq!(status["run_id"].as_str(), Some(id.as_str()));
+    assert_eq!(status["exit_code"].as_u64(), Some(7));
+    assert_eq!(status["output_drained"].as_bool(), Some(true));
+    assert_eq!(status["output_watermark"].as_u64(), Some(8));
+    assert_eq!(read_all(&env, &id), b"BEGINEND");
+    let artifacts = env.finish(&id, "completed-long-wait", &["raw"]);
+    assert_eq!(
+        fs::read(artifacts.join("output.pty")).expect("raw output"),
+        b"BEGINEND"
+    );
+    assert_eq!(
+        fs::read(env.root.join("long-wait-launches")).expect("one launch"),
+        b"launch"
     );
 }
 

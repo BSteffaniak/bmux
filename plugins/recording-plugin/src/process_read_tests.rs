@@ -52,6 +52,13 @@ mod tests {
         assert!(next.complete);
         assert!(read_output(&root, &value, 5, 8).is_err());
         assert!(read_output(&root, &value, 0, 0).is_err());
+        // A drained execution watermark is exact, not a lower bound that
+        // permits unrelated or corrupt suffix bytes to appear complete.
+        std::fs::write(root.join("output.live"), [0, 255, 1, 2, 3]).unwrap();
+        assert!(read_output(&root, &value, 0, 8).is_err());
+        // A pending writer suffix is explicitly incomplete until caught up.
+        std::fs::write(root.join("output.live"), [0, 255]).unwrap();
+        assert!(!read_output(&root, &value, 0, 8).unwrap().complete);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

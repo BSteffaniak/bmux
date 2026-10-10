@@ -308,6 +308,11 @@ impl ProcessService {
             !matches!(status.phase, pane::ExecutionPhase::Running) && status.output_drained,
             "process exit and capture drain are not yet complete"
         );
+        ensure!(
+            status.error.is_none(),
+            "execution capture failed: {:?}",
+            status.error
+        );
         let final_screen = pane::client::screen(&mut client, execution(&initial)?)
             .await?
             .map_err(|error| anyhow::anyhow!("final screen failed: {error:?}"))?;
@@ -330,7 +335,13 @@ impl ProcessService {
             store.replace(expected, &mut value)?;
             return Err(error);
         }
-        let directory = self.root.join(value.recording_id.to_string());
+        // A drained PTY is not proof that canonical capture persisted every byte.
+        // Stop joins the writer; compare its committed output with runtime authority
+        // before acknowledging finalization, including interruption-recovery retries.
+        ensure!(
+            std::fs::metadata(directory.join("output.live"))?.len() == status.output_watermark,
+            "canonical capture does not match drained execution output watermark"
+        );
         crate::durable::write_atomic(&directory.join("screen.txt"), final_screen.text.as_bytes())?;
         value.phase = process::RunPhase::Finalized;
         value.exit_code = status.exit_code;
@@ -540,6 +551,10 @@ pub(crate) fn read_output(
     );
     let mut file = std::fs::File::open(directory.join("output.live"))?;
     let end = file.metadata()?.len();
+    ensure!(
+        !status.output_drained || end <= status.output_watermark,
+        "capture exceeds drained execution output watermark"
+    );
     ensure!(since <= end, "cursor beyond captured output");
     file.seek(SeekFrom::Start(since))?;
     let count = u64::from(max_bytes).min(end - since);

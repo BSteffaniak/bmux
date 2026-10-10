@@ -307,6 +307,20 @@ impl BmuxClient {
         client_name: impl Into<String>,
     ) -> Result<Self> {
         let timeout = Duration::from_millis(BmuxConfig::load()?.general.server_timeout.max(1));
+        Self::connect_with_paths_and_timeout(paths, client_name, timeout).await
+    }
+
+    /// Connect using the provided endpoint paths and an explicit transport timeout.
+    /// Principal identity remains durable and scoped to those paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if identity loading, connection, or handshake fails.
+    pub async fn connect_with_paths_and_timeout(
+        paths: &ConfigPaths,
+        client_name: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self> {
         let endpoint = endpoint_from_paths(paths);
         let principal_id = load_or_create_principal_id(paths)?;
         Self::connect_with_principal(&endpoint, timeout, client_name, principal_id).await

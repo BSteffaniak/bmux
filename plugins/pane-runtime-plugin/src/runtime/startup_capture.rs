@@ -71,9 +71,14 @@ pub(super) fn start(mut raw: Box<dyn Read + Send>) -> io::Result<(StartupReader,
         .spawn(move || {
             let mut buffer = [0; 8192];
             loop {
-                let chunk = raw.read(&mut buffer).map(|count| buffer[..count].to_vec());
+                let chunk = match raw.read(&mut buffer) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => result.map(|count| buffer[..count].to_vec()),
+                };
                 let done = chunk.as_ref().is_err() || chunk.as_ref().is_ok_and(Vec::is_empty);
                 if done {
+                    #[cfg(test)]
+                    eprintln!("startup raw capture boundary: eof={} error={:?}", chunk.as_ref().is_ok_and(Vec::is_empty), chunk.as_ref().err());
                     tracing::debug!(eof = chunk.as_ref().is_ok_and(Vec::is_empty), error = ?chunk.as_ref().err(), "startup raw capture reached terminal read boundary");
                 }
                 if sender.send(chunk).is_err() || done {
@@ -121,6 +126,54 @@ pub(super) async fn acknowledge_cleanup(
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+
+    #[test]
+    fn interrupted_read_retries_without_losing_bytes_or_inventing_eof() {
+        struct InterruptedOnce {
+            interrupted: bool,
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+        impl Read for InterruptedOnce {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.bytes.read(output)
+            }
+        }
+        let expected = vec![42; 40 * 8192];
+        let (mut reader, capture) = super::start(Box::new(InterruptedOnce {
+            interrupted: false,
+            bytes: std::io::Cursor::new(expected.clone()),
+        }))
+        .unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        capture.join().unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reader_error_is_preserved_after_captured_prefix() {
+        struct FailingReader(bool);
+        impl Read for FailingReader {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("capture fixture failure"));
+                }
+                self.0 = true;
+                output[..4].copy_from_slice(b"tail");
+                Ok(4)
+            }
+        }
+        let (mut reader, capture) = super::start(Box::new(FailingReader(false))).unwrap();
+        let mut actual = Vec::new();
+        let error = reader.read_to_end(&mut actual).unwrap_err();
+        capture.join().unwrap();
+        assert_eq!(actual, b"tail");
+        assert_eq!(error.to_string(), "capture fixture failure");
+    }
 
     #[test]
     fn immediate_bytes_survive_delayed_publication() {

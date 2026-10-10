@@ -5874,9 +5874,15 @@ impl SessionRuntimeManager {
                 *pid = child.process_id();
             }
             if let Ok(mut pgid) = process_group_id_for_task.lock() {
-                *pgid = child
-                    .process_id()
-                    .and_then(resolve_process_group_id_for_pid);
+                *pgid = if supervisor_control.is_some() {
+                    // The helper's session-leader PID is not the owned target
+                    // group. Startup acknowledged tcsetpgrp before this lookup.
+                    pty_pair.master.process_group_leader()
+                } else {
+                    child
+                        .process_id()
+                        .and_then(resolve_process_group_id_for_pid)
+                };
             }
             let mut child_killer = child.clone_killer();
             drop(pty_pair.slave);
@@ -5956,7 +5962,17 @@ impl SessionRuntimeManager {
                                     break;
                                 }
                                 Ok(_) => std::thread::sleep(Duration::from_millis(10)),
-                                Err(error) => { execution_for_waiter.record_error(format!("supervisor outcome unavailable: {error}")); break; }
+                                Err(error) => {
+                                    // Sweep acknowledges/reaps the target before
+                                    // retiring the socket. Synchronize with that
+                                    // fence instead of misreporting retirement as
+                                    // lost execution authority.
+                                    let retired = execution_for_waiter.supervisor.lock().is_ok_and(|_control| execution_for_waiter.group_kill_issued.load(Ordering::SeqCst));
+                                    if !retired {
+                                        execution_for_waiter.record_error(format!("supervisor outcome unavailable: {error}"));
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
@@ -6308,6 +6324,11 @@ impl SessionRuntimeManager {
                 startup_tx.send_replace(Some(Err(
                     "failed to start pane I/O supervision threads".into()
                 )));
+                if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
+                    execution_for_task.record_cleanup_error(format!(
+                        "startup-thread group cleanup failed: {error}"
+                    ));
+                }
                 let _ = child_killer.kill();
             }
 
@@ -6361,6 +6382,12 @@ impl SessionRuntimeManager {
                                     let _ = writer.flush();
                                 } else {
                                     execution_for_task.record_error("PTY input write failed".into());
+                                    // Sweep while the live PTY/supervisor still
+                                    // supplies group authority; killing its leader
+                                    // first can strand descendants on direct paths.
+                                    if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
+                                        execution_for_task.record_cleanup_error(format!("input-failure group cleanup failed: {error}"));
+                                    }
                                     let _ = child_killer.kill();
                                     break;
                                 }
@@ -11428,6 +11455,85 @@ mod tests {
         assert!(pane.meta.launch.is_some());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervised_fast_exit_drains_startup_backpressure_before_retirement() {
+        supervisor::install_test_artifact()
+            .expect("explicit coordinator-built supervisor artifact");
+        let session_id = SessionId(Uuid::new_v4());
+        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
+        manager.runtimes.clear();
+        // More than the startup capture queue: publication must unblock capture
+        // without mistaking leader exit for EOF or dropping the buffered tail.
+        let mut prepared = manager
+            .prepare_fresh_program_runtime(
+                session_id,
+                None,
+                Some(PaneLaunchSpec {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "dd if=/dev/zero bs=8192 count=40 2>/dev/null; printf tail".into(),
+                    ],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                }),
+                (24, 80),
+            )
+            .unwrap();
+        let execution = Arc::clone(
+            &prepared
+                .runtime
+                .as_ref()
+                .unwrap()
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .execution,
+        );
+        let _cleanup = ExecutionTestCleanup(Arc::clone(&execution));
+        prepared.wait_until_ready().await.unwrap();
+        manager
+            .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
+            .unwrap();
+        let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
+        assert!(execution.supervisor.lock().unwrap().is_some());
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while !execution.output_drained.load(Ordering::SeqCst)
+                || !pane.exited.load(Ordering::SeqCst)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "supervised output must reach real EOF before sweep: exited={} drained={} watermark={} outcome={:?}",
+            pane.exited.load(Ordering::SeqCst),
+            execution.output_drained.load(Ordering::SeqCst),
+            execution.output_watermark.load(Ordering::SeqCst),
+            execution.outcome.lock().unwrap()
+        );
+        assert_eq!(
+            execution.output_watermark.load(Ordering::SeqCst),
+            40 * 8192 + 4
+        );
+        assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
+        assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
+        assert!(execution.signal_owned_group(execution::GROUP_KILL).unwrap());
+        assert!(!execution.signal_owned_group(execution::GROUP_KILL).unwrap());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pane.cleanup.borrow().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("supervised cleanup acknowledgement");
+        assert_eq!(*pane.cleanup.borrow(), Some(Ok(())));
+        assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
+        assert!(execution.outcome.lock().unwrap().2.is_none());
+    }
+
     struct ExecutionTestCleanup(Arc<execution::ExecutionCapture>);
     impl Drop for ExecutionTestCleanup {
         fn drop(&mut self) {
@@ -11518,6 +11624,9 @@ exit 0"#.into(), "fixture".into(), witness.path().to_string_lossy().into_owned()
         assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
         assert!(!pane.execution.output_drained.load(Ordering::SeqCst));
         assert!(pane.execution.signal_owned_group(libc::SIGKILL).unwrap());
+        // Successful retirement is fenced locally: the helper may already be
+        // gone, but a second cleanup must not reconnect or signal a reused PGID.
+        assert!(!pane.execution.signal_owned_group(libc::SIGKILL).unwrap());
         tokio::time::timeout(Duration::from_secs(5), async {
             while !matches!(&*pane.cleanup.borrow(), Some(Ok(()))) {
                 tokio::time::sleep(Duration::from_millis(10)).await;

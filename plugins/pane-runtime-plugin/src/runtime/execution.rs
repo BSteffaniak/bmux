@@ -66,12 +66,16 @@ impl ExecutionCapture {
     }
 
     pub(super) fn signal_owned_group(&self, signal: i32) -> anyhow::Result<bool> {
-        if let Some(supervisor) = self
+        // Serialize controls through their acknowledged consumption fence, so
+        // concurrent cleanup callers cannot send Sweep after helper retirement.
+        let supervisor_guard = self
             .supervisor
             .lock()
-            .map_err(|_| anyhow::anyhow!("supervisor control lock poisoned"))?
-            .clone()
-        {
+            .map_err(|_| anyhow::anyhow!("supervisor control lock poisoned"))?;
+        if let Some(supervisor) = supervisor_guard.as_ref() {
+            if self.group_kill_issued.load(Ordering::SeqCst) {
+                return Ok(false);
+            }
             let operation = if signal == GROUP_KILL {
                 crate::supervisor_protocol::Operation::Sweep {
                     mutation_id: "00000000-0000-4000-8000-000000000002".into(),
@@ -83,7 +87,19 @@ impl ExecutionCapture {
             } else {
                 anyhow::bail!("unsupported supervisor signal")
             };
-            supervisor.request(operation)?;
+            let response = supervisor.request(operation)?;
+            if signal == GROUP_KILL {
+                anyhow::ensure!(response.group_consumed, "supervisor sweep not acknowledged");
+                // Fence only an acknowledged sweep. Failed/uncertain requests
+                // retain their mutation identity and remain retryable.
+                // Preserve the authoritative target outcome even if sweep wins
+                // the race with the waiter polling its natural exit.
+                if let Ok(mut outcome) = self.outcome.lock() {
+                    outcome.0 = response.exit_code.and_then(|code| u32::try_from(code).ok());
+                    outcome.1 = response.exit_signal.map(|signal| signal.to_string());
+                }
+                self.group_kill_issued.store(true, Ordering::SeqCst);
+            }
             return Ok(true);
         }
         #[cfg(unix)]
