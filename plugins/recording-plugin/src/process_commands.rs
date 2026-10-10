@@ -67,13 +67,16 @@ async fn execute(
             crate::process_bootstrap::launch_receipt(context, launch_key, &context.arguments)?
         {
             if let Some((_, status)) = crate::process_bootstrap::offline(context, id)? {
-                return Ok((serde_json::to_value(status)?, 0));
+                return completed_command(operation, status);
             }
             let mut existing = crate::process_bootstrap::resolve(context, id).await?;
             let status = process::client::status(&mut existing.client, id)
                 .await?
                 .map_err(|error| anyhow::anyhow!("status: {error:?}"))?;
-            return Ok((serde_json::to_value(status)?, 0));
+            if operation == "run" {
+                return complete_run(&mut existing.client, status).await;
+            }
+            return completed_command(operation, status);
         }
         crate::process_bootstrap::record_launch(context, launch_key, &context.arguments, None)?;
     }
@@ -146,31 +149,51 @@ async fn command_start(
             return Ok((serde_json::to_value(status)?, 1));
         }
         if operation == "run" {
-            // Bounded polling; an agent disconnect never requests termination.
-            let mut status = status;
-            loop {
-                if !matches!(
-                    status.phase,
-                    process::RunPhase::Running | process::RunPhase::Starting
-                ) {
-                    break;
-                }
-                status = process::client::wait(&mut *client, status.run_id, 1000)
-                    .await?
-                    .map_err(|error| anyhow::anyhow!("wait failed: {error:?}"))?;
-            }
-            let status =
-                process::client::finish(&mut *client, status.run_id, status.revision, false)
-                    .await?
-                    .map_err(|error| anyhow::anyhow!("finish failed: {error:?}"))?;
-            let code = status
-                .exit_code
-                .map_or(1, |code| i32::try_from(code.min(255)).unwrap_or(1));
-            return Ok((serde_json::to_value(status)?, code));
+            return complete_run(client, status).await;
         }
         serde_json::to_value(status)?
     };
     Ok((value, 0))
+}
+
+async fn complete_run(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    mut status: process::RunStatus,
+) -> Result<(serde_json::Value, i32)> {
+    // Initial launch and matching retries join the same execution authority.
+    // Disconnect never requests termination or admits another launch.
+    while matches!(
+        status.phase,
+        process::RunPhase::Running | process::RunPhase::Starting
+    ) {
+        status = process::client::wait(client, status.run_id, 1000)
+            .await?
+            .map_err(|error| anyhow::anyhow!("wait failed: {error:?}"))?;
+    }
+    if !status.capture_finalized {
+        status = process::client::finish(client, status.run_id, status.revision, false)
+            .await?
+            .map_err(|error| anyhow::anyhow!("finish failed: {error:?}"))?;
+    }
+    completed_command("run", status)
+}
+
+fn completed_command(
+    operation: &str,
+    status: process::RunStatus,
+) -> Result<(serde_json::Value, i32)> {
+    let code = if operation == "run" {
+        ensure!(
+            status.capture_finalized,
+            "foreground run capture is not finalized"
+        );
+        status
+            .exit_code
+            .map_or(1, |code| i32::try_from(code.min(255)).unwrap_or(1))
+    } else {
+        0
+    };
+    Ok((serde_json::to_value(status)?, code))
 }
 
 fn program_options(args: &Arguments) -> Result<process::ProgramOptions> {
@@ -721,6 +744,110 @@ fn help(operation: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn run_status(phase: process::RunPhase, finalized: bool) -> process::RunStatus {
+        process::RunStatus {
+            schema_version: 1,
+            run_id: Uuid::new_v4(),
+            revision: 3,
+            recording_id: Uuid::new_v4(),
+            execution: None,
+            runtime_root: "/owned".into(),
+            phase,
+            exit_code: Some(7),
+            output_drained: finalized,
+            output_watermark: 4,
+            capture_finalized: finalized,
+            errors: vec![],
+        }
+    }
+
+    #[test]
+    fn completed_run_retry_preserves_nonzero_exit_and_identity() {
+        let status = run_status(process::RunPhase::Finalized, true);
+        let (first, code) = completed_command("run", status.clone()).unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(
+            completed_command("run", status.clone()).unwrap(),
+            (first, 7)
+        );
+        assert_eq!(completed_command("start", status).unwrap().1, 0);
+        assert!(completed_command("run", run_status(process::RunPhase::Running, false)).is_err());
+    }
+
+    struct RunRetryClient {
+        status: process::RunStatus,
+        operations: Vec<String>,
+    }
+    impl bmux_plugin_sdk::TypedDispatchClient for RunRetryClient {
+        async fn invoke_service_raw(
+            &mut self,
+            _capability: &str,
+            _kind: bmux_ipc::InvokeServiceKind,
+            _interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            let run_id = match operation {
+                "wait" => {
+                    bmux_plugin_sdk::decode_service_message::<process::client::WaitRequest>(
+                        &payload,
+                    )
+                    .unwrap()
+                    .run_id
+                }
+                "finish" => {
+                    bmux_plugin_sdk::decode_service_message::<process::client::FinishRequest>(
+                        &payload,
+                    )
+                    .unwrap()
+                    .run_id
+                }
+                _ => panic!("retry must not launch: {operation}"),
+            };
+            assert_eq!(run_id, self.status.run_id);
+            self.operations.push(operation.into());
+            match operation {
+                "wait" => {
+                    self.status.phase = process::RunPhase::Exited;
+                    self.status.output_drained = true;
+                }
+                "finish" => {
+                    self.status.phase = process::RunPhase::Finalized;
+                    self.status.capture_finalized = true;
+                }
+                _ => panic!("retry must not launch: {operation}"),
+            }
+            Ok(
+                bmux_plugin_sdk::encode_service_message(&Ok::<_, process::ProcessError>(
+                    self.status.clone(),
+                ))
+                .unwrap(),
+            )
+        }
+    }
+
+    #[test]
+    fn running_retry_waits_and_finalizes_once_without_launching() {
+        let status = run_status(process::RunPhase::Running, false);
+        let mut client = RunRetryClient {
+            status: status.clone(),
+            operations: vec![],
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (value, code) = runtime.block_on(complete_run(&mut client, status)).unwrap();
+        assert_eq!(code, 7);
+        assert_eq!(value["run_id"], serde_json::json!(client.status.run_id));
+        assert_eq!(client.operations, ["wait", "finish"]);
+        let finalized = client.status.clone();
+        runtime
+            .block_on(complete_run(&mut client, finalized))
+            .unwrap();
+        assert_eq!(client.operations, ["wait", "finish"]);
+    }
+
     #[test]
     fn direct_argv_preserves_options_and_spaces() {
         let args = Arguments::parse(&[

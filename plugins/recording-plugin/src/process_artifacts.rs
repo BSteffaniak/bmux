@@ -189,6 +189,7 @@ fn export_segments(
     let mut transcripts = BTreeMap::<Option<Uuid>, Transcript>::new();
     let mut seen_segments = HashSet::new();
     let mut count = 0_u64;
+    let mut segment_bytes = 0_u64;
     for segment in &summary.segments {
         validate_segment(segment)?;
         ensure!(
@@ -201,9 +202,12 @@ fn export_segments(
             "segment must be a regular file: {}",
             path.display()
         );
-        let mut reader = BufReader::new(
-            File::open(&path).with_context(|| format!("opening segment {}", path.display()))?,
-        );
+        let file =
+            File::open(&path).with_context(|| format!("opening segment {}", path.display()))?;
+        segment_bytes = segment_bytes
+            .checked_add(file.metadata()?.len())
+            .context("segment byte count overflow")?;
+        let mut reader = BufReader::new(file);
         while let Some(event) = read_event(&mut reader, options.max_frame_bytes)? {
             count = count.checked_add(1).context("event count overflow")?;
             ensure!(
@@ -241,10 +245,27 @@ fn export_segments(
             transcript.feed(data, text)?;
         }
     }
+    verify_canonical_totals(summary, count, segment_bytes)?;
     for transcript in transcripts.values_mut() {
         transcript.finish(text)?;
     }
     Ok(report)
+}
+
+pub(crate) fn verify_canonical_totals(
+    summary: &RecordingSummary,
+    events: u64,
+    bytes: u64,
+) -> Result<()> {
+    ensure!(
+        events == summary.event_count,
+        "canonical event count does not match committed manifest"
+    );
+    ensure!(
+        bytes == summary.total_segment_bytes,
+        "canonical segment byte count does not match committed manifest"
+    );
+    Ok(())
 }
 
 fn validate_options(options: &ProcessArtifactOptions) -> Result<()> {
@@ -567,7 +588,7 @@ mod tests {
 
     fn fixture(events: &[ProcessRecordingEvent]) -> Result<(Staging, RecordingSummary)> {
         let dir = Staging::create(&std::env::temp_dir())?;
-        let summary = RecordingSummary {
+        let mut summary = RecordingSummary {
             id: Uuid::new_v4(),
             name: None,
             format_version: RECORDING_FORMAT_VERSION,
@@ -587,11 +608,50 @@ mod tests {
         for event in events {
             write_frame(&mut segment, event).map_err(|error| anyhow::anyhow!(error.to_string()))?;
         }
+        summary.total_segment_bytes = segment.metadata()?.len();
         fs::write(
             dir.path.join("manifest.json"),
             serde_json::to_vec(&serde_json::json!({"summary": summary}))?,
         )?;
         Ok((dir, summary))
+    }
+
+    #[test]
+    fn whole_event_loss_and_manifest_mismatches_never_publish() -> Result<()> {
+        let session = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let events = [
+            event(1, session, pane, b"FIRST"),
+            event(2, session, pane, b"LAST"),
+        ];
+        for corruption in 0..3 {
+            let (source, mut summary) = fixture(&events)?;
+            match corruption {
+                0 => {
+                    let mut file = File::create(source.path.join("events_0.bin"))?;
+                    write_frame(&mut file, &events[0])
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                }
+                1 => summary.event_count += 1,
+                _ => summary.total_segment_bytes += 1,
+            }
+            fs::write(
+                source.path.join("manifest.json"),
+                serde_json::to_vec(&serde_json::json!({"summary":summary}))?,
+            )?;
+            let output = source.path.join("rejected");
+            assert!(
+                export_process_artifacts(
+                    &source.path,
+                    &output,
+                    &ProcessArtifactOptions::default(),
+                    None
+                )
+                .is_err()
+            );
+            assert!(!output.exists());
+        }
+        Ok(())
     }
 
     #[test]

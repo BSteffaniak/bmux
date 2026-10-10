@@ -922,20 +922,24 @@ fn gif_export_decodes_every_frame_and_animates() {
 #[test]
 fn foreground_run_reports_nonzero_child_exit_structurally() {
     let env = RecordingEnv::new();
-    let output = env.run(&[
+    let script = env.script("nonzero-retry.sh", "printf nonzero; exit 7\n");
+    let key = uuid::Uuid::new_v4().to_string();
+    let args = [
         "recording",
         "process",
         "run",
         "--json",
+        "--idempotency-key",
+        &key,
         "--profile",
         "functional",
         "--viewport",
         "100x30",
         "--",
         "/bin/sh",
-        "-c",
-        "printf nonzero; exit 7",
-    ]);
+        script.to_str().expect("script"),
+    ];
+    let output = env.run(&args);
     assert_eq!(
         output.status.code(),
         Some(7),
@@ -946,6 +950,12 @@ fn foreground_run_reports_nonzero_child_exit_structurally() {
     assert_eq!(value["exit_code"].as_u64(), Some(7));
     assert_eq!(value["output_drained"].as_bool(), Some(true));
     assert_eq!(read_all(&env, &id), b"nonzero");
+    let retry = env.run(&args);
+    assert_eq!(retry.status.code(), Some(7), "retry preserves child exit");
+    let retried = parse_json(&retry);
+    assert_eq!(retried["run_id"], value["run_id"]);
+    assert_eq!(retried["recording_id"], value["recording_id"]);
+    assert_eq!(retried["capture_finalized"].as_bool(), Some(true));
 }
 
 #[test]

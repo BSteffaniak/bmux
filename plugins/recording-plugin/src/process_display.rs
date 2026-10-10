@@ -25,8 +25,15 @@ pub(crate) fn replay(directory: &Path, recording_id: Uuid, cols: u16, rows: u16)
         manifest.summary.segments.len() <= 4096,
         "replay segment limit exceeded"
     );
+    ensure!(
+        manifest.summary.format_version == bmux_recording_protocol::RECORDING_FORMAT_VERSION,
+        "unsupported canonical recording version"
+    );
     let mut events = 0_u64;
+    let mut segment_bytes = 0_u64;
+    let mut seen = std::collections::HashSet::new();
     for segment in &manifest.summary.segments {
+        ensure!(seen.insert(segment), "duplicate canonical segment");
         ensure!(
             std::path::Path::new(segment).components().count() == 1
                 && segment.starts_with("events_")
@@ -38,7 +45,15 @@ pub(crate) fn replay(directory: &Path, recording_id: Uuid, cols: u16, rows: u16)
             "invalid canonical segment locator"
         );
         let path = directory.join(segment);
-        let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+        ensure!(
+            std::fs::symlink_metadata(&path)?.file_type().is_file(),
+            "canonical segment must be a regular file"
+        );
+        let file = std::fs::File::open(path)?;
+        segment_bytes = segment_bytes
+            .checked_add(file.metadata()?.len())
+            .context("segment byte count overflow")?;
+        let mut reader = std::io::BufReader::new(file);
         loop {
             let Some(event) = read_replay_event(&mut reader)? else {
                 break;
@@ -73,6 +88,7 @@ pub(crate) fn replay(directory: &Path, recording_id: Uuid, cols: u16, rows: u16)
             }
         }
     }
+    crate::process_artifacts::verify_canonical_totals(&manifest.summary, events, segment_bytes)?;
     let text = bmux_terminal_grid::visible_text_trimmed(stream.grid(), 0, usize::from(rows));
     publish_replay(
         directory,
@@ -130,6 +146,21 @@ fn publish_replay(
     canonical_raw: &[u8],
     text: &str,
 ) -> Result<()> {
+    let live = directory.join("output.live");
+    if live.try_exists()? {
+        let file = std::fs::File::open(&live)?;
+        ensure!(
+            file.metadata()?.len() == u64::try_from(canonical_raw.len())?,
+            "canonical replay length differs from retained live evidence"
+        );
+        let mut retained = Vec::new();
+        file.take(u64::try_from(canonical_raw.len())?.saturating_add(1))
+            .read_to_end(&mut retained)?;
+        ensure!(
+            retained == canonical_raw,
+            "canonical replay differs from retained live evidence"
+        );
+    }
     frame(
         output,
         &DisplayTrackEnvelope {
