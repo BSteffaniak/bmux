@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "xtask",
     "examples/hello-plugin",
     "examples/native-plugin",
     "examples/prompt-showcase",

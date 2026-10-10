@@ -102,71 +102,57 @@ fi
 FILE="bmux-$VERSION-$TARGET.tar.gz"
 URL="https://$HOST/$CHANNEL/artifacts/$VERSION/$FILE"
 
+umask 077
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
+trap 'exit 1' HUP INT TERM
+
+fail() { echo "$*" >&2; exit 1; }
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    fail 'A SHA-256 utility (sha256sum or shasum) is required'
+  fi
+}
 
 echo "Downloading $URL"
-curl -fsSL "$URL" -o "$TMPDIR/bmux.tar.gz"
-curl -fsSL "https://$HOST/$CHANNEL/artifacts/$VERSION/SHA256SUMS" -o "$TMPDIR/SHA256SUMS"
-command -v python3 >/dev/null 2>&1 || { echo 'Python 3 is required for verified installation' >&2; exit 1; }
-python3 - "$TMPDIR" "$FILE" "$TARGET" <<'PY'
-import hashlib, json, pathlib, re, tarfile, sys
-root, filename, target = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
-checksums = []
-for line in (root / 'SHA256SUMS').read_text().splitlines():
-    fields = line.split()
-    if len(fields) == 2 and fields[1].lstrip('*') == filename:
-        checksums.append(fields[0])
-if len(checksums) != 1 or not re.fullmatch('[0-9a-f]{64}', checksums[0]):
-    raise SystemExit('Missing or ambiguous archive checksum')
-archive = root / 'bmux.tar.gz'
-if hashlib.sha256(archive.read_bytes()).hexdigest() != checksums[0]:
-    raise SystemExit('Archive checksum mismatch')
-output = root / 'verified'
-output.mkdir(mode=0o700)
-with tarfile.open(archive, 'r:gz') as tar:
-    members = {}
-    total = 0
-    for member in tar:
-        name = member.name
-        if name in ('.', './') and member.isdir():
-            continue
-        if name.startswith('./'):
-            name = name[2:]
-        if not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]*', name) or not member.isfile():
-            raise SystemExit('Unsafe archive member: ' + member.name)
-        if name in members or member.size < 0 or member.size > 1024 * 1024 * 1024:
-            raise SystemExit('Duplicate or oversized archive member')
-        total += member.size
-        if total > 2 * 1024 * 1024 * 1024 or len(members) >= 128:
-            raise SystemExit('Archive budget exceeded')
-        members[name] = member
-    if 'artifacts.json' not in members:
-        raise SystemExit('Legacy inventory-less archive refused: install manually; no auxiliary support is claimed')
-    if members['artifacts.json'].size > 1024 * 1024:
-        raise SystemExit('Inventory too large')
-    inventory = json.load(tar.extractfile(members['artifacts.json']))
-    if inventory.get('schema_version') != 1 or inventory.get('target') != target:
-        raise SystemExit('Unsupported inventory schema or wrong target')
-    expected = {'artifacts.json'}
-    for item in inventory['artifacts']:
-        name = item['relative_path']
-        if name in expected or name not in members:
-            raise SystemExit('Duplicate or missing inventory artifact')
-        expected.add(name)
-        member = members[name]
-        if member.size != item['bytes']:
-            raise SystemExit('Artifact length mismatch')
-        data = tar.extractfile(member).read()
-        if hashlib.sha256(data).hexdigest() != item['sha256']:
-            raise SystemExit('Artifact hash mismatch: ' + name)
-        (output / name).write_bytes(data)
-    if set(members) != expected or not {'bmux', 'install-artifacts.py'}.issubset(expected):
-        raise SystemExit('Archive inventory incomplete or contains unlisted files')
-    (output / 'artifacts.json').write_text(json.dumps(inventory))
-PY
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --max-filesize 1073741824 "$URL" -o "$TMPDIR/bmux.tar.gz"
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --max-filesize 1048576 "https://$HOST/$CHANNEL/artifacts/$VERSION/SHA256SUMS" -o "$TMPDIR/SHA256SUMS"
+EXPECTED="$(awk -v file="$FILE" '
+  NF == 2 { name = $2; sub(/^\\*/, "", name); if (name == file) { count++; hash = $1 } }
+  END { if (count != 1 || length(hash) != 64 || hash ~ /[^0-9a-f]/) exit 1; print hash }
+' "$TMPDIR/SHA256SUMS")" || fail 'Missing or ambiguous archive checksum'
+ACTUAL="$(sha256 "$TMPDIR/bmux.tar.gz")"
+[ "$ACTUAL" = "$EXPECTED" ] || fail 'Archive checksum mismatch'
+
+# Only inspect the authenticated archive. Reject all non-flat names and duplicate
+# members before extraction; no links, special files, or nested paths are allowed.
+tar -tzf "$TMPDIR/bmux.tar.gz" > "$TMPDIR/members"
+awk '
+  $0 == "." || $0 == "./" { if (root++) exit 1; next }
+  { name = $0; sub(/^\\.\\//, "", name)
+    if (name !~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/ || seen[name]++ || ++count > 128) exit 1 }
+  END { if (!seen["artifacts.json"] || !seen["bmux"] || !seen["bmux-install"]) exit 1 }
+' "$TMPDIR/members" || fail 'Unsafe, duplicate, or legacy archive member'
+# GNU and BSD tar verbose listings differ in owner columns. Both identify type
+# in column one; size is column three (GNU) or five (BSD, numeric link count).
+LC_ALL=C tar -tvzf "$TMPDIR/bmux.tar.gz" > "$TMPDIR/types"
+awk '
+  substr($1, 1, 1) == "d" { if ($NF != "." && $NF != "./") exit 1; next }
+  { if (substr($1, 1, 1) != "-") exit 1
+    size = ($2 ~ /^[0-9]+$/) ? $5 : $3
+    if (size !~ /^[0-9]+$/ || size > 1073741824 || (total += size) > 2147483648) exit 1 }
+' "$TMPDIR/types" || fail 'Unsafe archive type or size'
+mkdir "$TMPDIR/verified"
+tar -xzf "$TMPDIR/bmux.tar.gz" -C "$TMPDIR/verified"
 PREFIX="\${BMUX_INSTALL_PREFIX:-/usr/local}"
-python3 "$TMPDIR/verified/install-artifacts.py" "$TMPDIR/verified" "$PREFIX" --activate-version "$VERSION-$TARGET"
+# This release-target executable is built from the repository-owned Rust xtask,
+# authenticated by the archive checksum; it validates the complete inventory.
+chmod 700 "$TMPDIR/verified/bmux-install"
+"$TMPDIR/verified/bmux-install" install "$TMPDIR/verified" --prefix "$PREFIX" --version "$VERSION-$TARGET"
 echo "Installed verified BMUX version at $PREFIX/lib/bmux/versions/$VERSION-$TARGET"
 echo "Activated $PREFIX/bin/bmux; prior versions remain intact"
 `;

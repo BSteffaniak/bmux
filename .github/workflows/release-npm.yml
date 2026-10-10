@@ -59,10 +59,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -91,13 +87,13 @@ jobs:
       - name: Build CLI binary
         run: cargo build --release --target ${{ matrix.target }} -p bmux_cli
 
-      - name: Build declared auxiliary executables
+      - name: Build declared auxiliary executables and release installer
         shell: bash
-        run: python3 scripts/release/auxiliary-executables.py build --target '${{ matrix.target }}'
+        run: cargo xtask auxiliary build --target '${{ matrix.target }}'
 
       - name: Stage distribution
         shell: bash
-        run: python3 scripts/release/auxiliary-executables.py stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination dist
+        run: cargo xtask auxiliary stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination dist
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
@@ -113,9 +109,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      # Installation validates cross-target files using the host xtask, never
+      # by executing a downloaded target CLI or installer.
+      - name: Install host Rust for packaging
+        uses: dtolnay/rust-toolchain@master
         with:
-          python-version: '3.13'
+          toolchain: ${{ needs.rust-version.outputs.version }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -145,7 +144,7 @@ jobs:
       - name: Place binaries into npm packages
         run: |
           for pkg in darwin-arm64 darwin-x64 linux-arm64 linux-x64 linux-x64-musl win32-x64; do
-            python3 scripts/release/install-artifacts.py "artifacts/binary-${pkg}" "./npm/${pkg}"
+            cargo xtask install "artifacts/binary-${pkg}" "./npm/${pkg}"
           done
 
       - name: Update npm versions

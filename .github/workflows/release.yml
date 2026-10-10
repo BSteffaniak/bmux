@@ -79,10 +79,6 @@ jobs:
           toolchain: ${{ needs.rust-version.outputs.version }}
           targets: ${{ matrix.target }}
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -98,15 +94,15 @@ jobs:
       - name: Build bmux CLI
         run: cargo build --release --target ${{ matrix.target }} -p bmux_cli
 
-      - name: Build declared auxiliary executables
+      - name: Build declared auxiliary executables and release installer
         shell: bash
-        run: python3 scripts/release/auxiliary-executables.py build --target '${{ matrix.target }}'
+        run: cargo xtask auxiliary build --target '${{ matrix.target }}'
 
       - name: Prepare archive
         shell: bash
         run: |
           VERSION="${{ steps.meta.outputs.version }}"
-          python3 scripts/release/auxiliary-executables.py stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination dist
+          cargo xtask auxiliary stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination dist
           tar -czf "bmux-${VERSION}-${{ matrix.target }}.tar.gz" -C dist .
 
       - name: Upload release archives
@@ -173,10 +169,6 @@ jobs:
           mkdir -p ~/.cargo
           printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> ~/.cargo/config.toml
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
       - name: Install nfpm
         run: |
           curl -fsSL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_Linux_x86_64.tar.gz | tar -xz
@@ -185,12 +177,12 @@ jobs:
       - name: Build bmux binary
         run: cargo build --release --target ${{ matrix.target }} -p bmux_cli
 
-      - name: Build declared auxiliary executables
-        run: python3 scripts/release/auxiliary-executables.py build --target '${{ matrix.target }}'
+      - name: Build declared auxiliary executables and release installer
+        run: cargo xtask auxiliary build --target '${{ matrix.target }}'
 
       - name: Stage distribution
         shell: bash
-        run: python3 scripts/release/auxiliary-executables.py stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination 'dist/${{ matrix.target }}'
+        run: cargo xtask auxiliary stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination 'dist/${{ matrix.target }}'
 
       - name: Build deb package
         shell: bash
@@ -199,7 +191,7 @@ jobs:
           export TARGET="${{ matrix.target }}"
           export ARCH="${{ matrix.arch }}"
           CFG="packaging/nfpm/${{ steps.meta.outputs.channel }}.yaml"
-          python3 scripts/release/auxiliary-executables.py nfpm --target "$TARGET" --config "$CFG" --destination /tmp/bmux-deb.yaml
+          cargo xtask auxiliary nfpm --target "$TARGET" --config "$CFG" --destination /tmp/bmux-deb.yaml
           nfpm package --packager deb --target "out/${{ steps.meta.outputs.channel }}/artifacts" --config /tmp/bmux-deb.yaml
 
       - name: Build rpm package
@@ -209,7 +201,7 @@ jobs:
           export TARGET="${{ matrix.target }}"
           export ARCH="${{ matrix.rpm_arch }}"
           CFG="packaging/nfpm/${{ steps.meta.outputs.channel }}.yaml"
-          python3 scripts/release/auxiliary-executables.py nfpm --target "$TARGET" --config "$CFG" --destination /tmp/bmux-rpm.yaml
+          cargo xtask auxiliary nfpm --target "$TARGET" --config "$CFG" --destination /tmp/bmux-rpm.yaml
           nfpm package --packager rpm --target "out/${{ steps.meta.outputs.channel }}/artifacts" --config /tmp/bmux-rpm.yaml
 
       - name: Upload Linux packages
