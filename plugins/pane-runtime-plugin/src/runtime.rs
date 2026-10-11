@@ -2641,7 +2641,8 @@ if not set -q __bmux_resurrection_hook_installed
   set -g __bmux_resurrection_hook_installed 1
 
   function __bmux_b64 --argument-names value
-    printf '%s' "$value" | base64 | string replace -ra '\n|\r' ''
+    # Fish command substitutions preserve wrapped lines as separate list items.
+    printf '%s' "$value" | base64 | string replace -ra '\n|\r' '' | string join ''
   end
 
   function __bmux_emit_start --argument-names cmd cwd
@@ -16763,6 +16764,45 @@ mod tests {
 
         assert_eq!(inspection.command.as_deref(), Some("opencode run"));
         assert_eq!(inspection.cwd.as_deref(), Some("/work/project"));
+    }
+
+    #[test]
+    fn fish_shell_metadata_preserves_long_commands_and_directories() {
+        let directory = tempfile::Builder::new()
+            .prefix(&"fish-metadata-".repeat(8))
+            .tempdir()
+            .unwrap();
+        let cwd = directory.path().to_string_lossy().into_owned();
+        let command = format!("printf {}", "resurrection".repeat(12));
+        let token = "long-fields-token";
+        let config = shell_integration_fish_config().replace(
+            BMUX_SHELL_METADATA_PREFIX,
+            &format!("{BMUX_SHELL_METADATA_PREFIX}{token};"),
+        );
+        let output = std::process::Command::new("fish")
+            .args(["--no-config", "-c"])
+            .arg(format!(
+                "{config}\nemit fish_prompt\nemit fish_preexec '{command}'\n"
+            ))
+            .env("BMUX_ORIG_XDG_CONFIG_HOME", directory.path())
+            .env("XDG_CONFIG_HOME", directory.path())
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let mut parser = PaneShellMetadataParser {
+            token: Some(token.into()),
+            ..Default::default()
+        };
+        let metadata = parser.process_chunk(&output.stdout);
+        assert_eq!(
+            metadata.events,
+            vec![
+                PaneShellMetadataEvent::Prompt { cwd: cwd.clone() },
+                PaneShellMetadataEvent::CommandStart { command, cwd },
+            ]
+        );
+        assert!(metadata.filtered.is_empty());
     }
 
     #[test]

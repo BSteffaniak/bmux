@@ -48,6 +48,20 @@ async fn shell_application_session_survives_real_daemon_restart() {
 }
 
 #[tokio::test]
+async fn fish_application_session_survives_real_daemon_restart() {
+    let resolved = std::process::Command::new("which")
+        .arg("fish")
+        .output()
+        .expect("resolve fish from PATH");
+    assert!(
+        resolved.status.success(),
+        "fish required for restart coverage"
+    );
+    let fish = String::from_utf8(resolved.stdout).unwrap();
+    round_trip(true, fish.trim()).await;
+}
+
+#[tokio::test]
 async fn nushell_application_session_survives_real_daemon_restart() {
     let resolved = std::process::Command::new("which")
         .arg("nu")
