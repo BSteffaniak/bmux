@@ -2632,6 +2632,14 @@ if test -z "$__bmux_orig_xdg"
   set __bmux_orig_xdg "$HOME/.config"
 end
 
+# The private XDG directory is only for loading this integration file. Restore
+# the user directory before their config or child applications observe it.
+if test -n "$BMUX_ORIG_XDG_CONFIG_HOME"
+  set -gx XDG_CONFIG_HOME "$BMUX_ORIG_XDG_CONFIG_HOME"
+else
+  set -e XDG_CONFIG_HOME
+end
+
 set -l __bmux_orig_fish_config "$__bmux_orig_xdg/fish/config.fish"
 if test -f "$__bmux_orig_fish_config"
   source "$__bmux_orig_fish_config"
@@ -16764,6 +16772,41 @@ mod tests {
 
         assert_eq!(inspection.command.as_deref(), Some("opencode run"));
         assert_eq!(inspection.cwd.as_deref(), Some("/work/project"));
+    }
+
+    #[test]
+    fn fish_integration_restores_config_home_for_config_and_children() {
+        let directory = tempfile::tempdir().unwrap();
+        let fish_dir = directory.path().join("fish");
+        std::fs::create_dir(&fish_dir).unwrap();
+        std::fs::write(
+            fish_dir.join("config.fish"),
+            "test \"$XDG_CONFIG_HOME\" = \"$BMUX_ORIG_XDG_CONFIG_HOME\"; or exit 42\n",
+        )
+        .unwrap();
+        for original in [Some(directory.path()), None] {
+            let mut child = std::process::Command::new("fish");
+            child
+                .args(["--no-config", "-c"])
+                .arg(format!(
+                    "{}\nsh -c 'printf %s \"${{XDG_CONFIG_HOME-unset}}\"'",
+                    shell_integration_fish_config()
+                ))
+                .env("XDG_CONFIG_HOME", "/tmp/bmux-private-xdg")
+                .env_remove("BMUX_ORIG_XDG_CONFIG_HOME");
+            if let Some(path) = original {
+                child.env("BMUX_ORIG_XDG_CONFIG_HOME", path);
+            } else {
+                child.env("HOME", directory.path().join("no-user-config"));
+            }
+            let output = child.output().unwrap();
+            assert!(output.status.success(), "{:?}", output.stderr);
+            let expected = original.map_or_else(
+                || "unset".into(),
+                |path| path.to_string_lossy().into_owned(),
+            );
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        }
     }
 
     #[test]
