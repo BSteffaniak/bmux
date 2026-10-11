@@ -29,6 +29,8 @@ pub mod inline;
 pub mod input;
 pub mod interaction;
 pub mod layout;
+#[cfg(target_os = "linux")]
+pub mod linux_input;
 pub mod measured_list;
 pub mod paint;
 pub mod selection;

@@ -81,5 +81,5 @@ image-registry = [
 ]
 static-bundled = []
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

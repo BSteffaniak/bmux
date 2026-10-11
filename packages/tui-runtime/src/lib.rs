@@ -19,7 +19,11 @@ pub mod ids;
 pub mod image_terminal_presenter;
 #[cfg(feature = "crossterm")]
 pub mod input;
+#[cfg(feature = "crossterm")]
+pub mod input_drain;
 pub mod invalidation;
+#[cfg(all(target_os = "linux", feature = "crossterm"))]
+pub mod linux_capture;
 mod mailbox;
 pub mod presenter;
 #[cfg(feature = "crossterm")]

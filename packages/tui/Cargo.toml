@@ -19,6 +19,9 @@ unicode-segmentation = { workspace = true }
 unicode-width        = { workspace = true }
 zeroize              = { workspace = true, features = ["alloc"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [features]
 crossterm = [
     "dep:crossterm",

@@ -2598,6 +2598,7 @@ dependencies = [
  "bmux_text_edit",
  "crossterm",
  "futures-util",
+ "libc",
  "unicode-segmentation",
  "unicode-width",
  "zeroize",
