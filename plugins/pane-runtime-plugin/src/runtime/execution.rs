@@ -1,7 +1,9 @@
 //! Exact, generation-guarded program execution on the existing PTY runtime.
 use super::{PaneRuntimeCommand, PaneRuntimeHandle, spawn_runtime_handle};
-use bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::{
-    ExecutionError, ExecutionPhase, ExecutionRef, ExecutionScreen, ExecutionStatus, ProgramOptions,
+use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
+    TerminalExecutionError as ExecutionError, TerminalExecutionPhase as ExecutionPhase,
+    TerminalExecutionRef as ExecutionRef, TerminalExecutionScreen as ExecutionScreen,
+    TerminalExecutionStatus as ExecutionStatus, TerminalProgramOptions as ProgramOptions,
 };
 use bmux_session_models::SessionId;
 use std::sync::{
@@ -22,13 +24,14 @@ pub(super) struct ExecutionCapture {
     pub(super) supervisor: Mutex<Option<Arc<super::supervisor::SupervisorControl>>>,
     pub(super) spawn_authorization: Mutex<Option<SpawnAuthorization>>,
     pub(super) group_kill_issued: AtomicBool,
+    pub(super) target_stop_issued: AtomicBool,
     pub(super) cleanup_failed: AtomicBool,
     pub(super) managed_program: AtomicBool,
-    pub(super) conventional_session: AtomicBool,
     pub(super) terminal_session_ended: AtomicBool,
     pub(super) terminal_owner_retired: AtomicBool,
     #[cfg(test)]
     pub(super) inject_reader_failure: AtomicBool,
+    pub(super) durable_capture: Mutex<Option<super::durable_capture::DurableCapture>>,
     pub(super) master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
     pub(super) output_drained: AtomicBool,
     pub(super) output_watermark: AtomicU64,
@@ -42,13 +45,14 @@ impl Default for ExecutionCapture {
             supervisor: Mutex::new(None),
             spawn_authorization: Mutex::new(None),
             group_kill_issued: AtomicBool::new(false),
+            target_stop_issued: AtomicBool::new(false),
             cleanup_failed: AtomicBool::new(false),
             managed_program: AtomicBool::new(false),
-            conventional_session: AtomicBool::new(false),
             terminal_session_ended: AtomicBool::new(false),
             terminal_owner_retired: AtomicBool::new(false),
             #[cfg(test)]
             inject_reader_failure: AtomicBool::new(false),
+            durable_capture: Mutex::new(None),
             master: Mutex::new(None),
             output_drained: AtomicBool::new(false),
             output_watermark: AtomicU64::new(0),
@@ -79,7 +83,10 @@ impl ExecutionCapture {
             .lock()
             .map_err(|_| anyhow::anyhow!("supervisor control lock poisoned"))?;
         if let Some(supervisor) = supervisor_guard.as_ref() {
-            if self.group_kill_issued.load(Ordering::SeqCst) {
+            if self.terminal_owner_retired.load(Ordering::SeqCst)
+                || self.group_kill_issued.load(Ordering::SeqCst)
+                || self.target_stop_issued.load(Ordering::SeqCst)
+            {
                 return Ok(false);
             }
             let operation = if signal == GROUP_KILL {
@@ -95,7 +102,10 @@ impl ExecutionCapture {
             };
             let response = supervisor.request(operation)?;
             if signal == GROUP_KILL {
-                anyhow::ensure!(response.group_consumed, "supervisor sweep not acknowledged");
+                anyhow::ensure!(
+                    response.group_consumed || response.target_terminated,
+                    "owned target termination not acknowledged"
+                );
                 // Fence only an acknowledged sweep. Failed/uncertain requests
                 // retain their mutation identity and remain retryable.
                 // Preserve the authoritative target outcome even if sweep wins
@@ -104,7 +114,24 @@ impl ExecutionCapture {
                     outcome.0 = response.exit_code.and_then(|code| u32::try_from(code).ok());
                     outcome.1 = response.exit_signal.map(|signal| signal.to_string());
                 }
-                self.group_kill_issued.store(true, Ordering::SeqCst);
+                if response.target_terminated && response.terminal_session_ended == Some(true) {
+                    self.terminal_session_ended.store(true, Ordering::SeqCst);
+                    let retired =
+                        supervisor.request(crate::supervisor_protocol::Operation::RetireOwner {
+                            mutation_id: "00000000-0000-4000-8000-000000000003".into(),
+                        })?;
+                    anyhow::ensure!(
+                        retired.error.is_none(),
+                        "terminal owner retirement rejected"
+                    );
+                    self.terminal_owner_retired.store(true, Ordering::SeqCst);
+                }
+                // Publish stop fences only after the retirement receipt; waiter
+                // consumes these without the control lock to reap the guardian.
+                self.target_stop_issued
+                    .store(response.target_terminated, Ordering::SeqCst);
+                self.group_kill_issued
+                    .store(response.group_consumed, Ordering::SeqCst);
             }
             return Ok(true);
         }
@@ -244,6 +271,20 @@ pub(crate) fn status(reference: &ExecutionRef) -> Result<ExecutionStatus, Execut
             "execution status snapshot"
         );
         Ok(ExecutionStatus {
+            lifecycle: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalLifecycle::ConventionalTerminalSession,
+            session_end: if pane.execution.terminal_session_ended.load(Ordering::SeqCst) {
+                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalSessionEnd::Ended
+            } else if outcome.2.is_some() {
+                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalSessionEnd::RecoveryRequired
+            } else if pane.exited.load(Ordering::SeqCst) {
+                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalSessionEnd::Draining
+            } else { bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalSessionEnd::Active },
+            terminal_session_ended: pane.execution.terminal_session_ended.load(Ordering::SeqCst),
+            capture_integrity: if pane.execution.output_drained.load(Ordering::SeqCst) {
+                bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalCaptureIntegrity::Complete
+            } else if outcome.2.is_some() { bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalCaptureIntegrity::Incomplete
+            } else { bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalCaptureIntegrity::Capturing },
+            cleanup_complete: pane.execution.group_kill_issued.load(Ordering::SeqCst) && !pane.execution.cleanup_failed.load(Ordering::SeqCst) && matches!(&*pane.cleanup.borrow(), Some(Ok(()))),
             execution: reference.clone(),
             phase: if outcome.2.is_some() {
                 ExecutionPhase::Failed
@@ -350,17 +391,47 @@ pub(crate) fn create(
     options: ProgramOptions,
     authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
 ) -> Result<ExecutionRef, ExecutionError> {
-    new_program_session_mode(name, options, false, authorize)
+    let authorize = Arc::new(authorize);
+    // Authorization precedes observing the durable store/runtime installation.
+    authorize(uuid::Uuid::new_v4()).map_err(|error| ExecutionError::Denied {
+        reason: error.to_string(),
+    })?;
+    let reservation = super::reservations::reserve(uuid::Uuid::new_v4(), options, |id| {
+        authorize(id).map_err(|error| {
+            bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied {
+                reason: error.to_string(),
+            }
+        })
+    })
+    .map_err(|error| match error {
+        bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason } => ExecutionError::Denied { reason },
+        error => failed(format!("{error:?}")),
+    })?;
+    let launch_authorize = Arc::clone(&authorize);
+    // Name is presentation only; durable admission owns the identity.
+    let receipt =
+        super::reservations::launch_named(&reservation, name, move |id| launch_authorize(id))
+            .map_err(|error| failed(format!("{error:?}")))?;
+    if receipt.error.is_some() {
+        return Err(failed(format!(
+            "launch requires reconciliation: {:?}",
+            receipt.error
+        )));
+    }
+    Ok(receipt.reservation.execution)
 }
 
-pub(crate) fn new_program_session_mode(
+pub(super) fn create_reserved(
     name: Option<String>,
     options: ProgramOptions,
-    conventional_session: bool,
+    reserved: Option<&ExecutionRef>,
     authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
 ) -> Result<ExecutionRef, ExecutionError> {
     let authorize = Arc::new(authorize);
-    let session = bmux_session_models::Session::new(name);
+    let mut session = bmux_session_models::Session::new(name);
+    if let Some(reference) = &reserved {
+        session.id = SessionId(reference.session_id);
+    }
     let id = session.id;
     authorize(id.0).map_err(|error| ExecutionError::Denied {
         reason: error.to_string(),
@@ -378,7 +449,7 @@ pub(crate) fn new_program_session_mode(
             .0
             .lock()
             .map_err(failed)?
-            .prepare_fresh_program_runtime(
+            .prepare_reserved_program_runtime(
                 id,
                 None,
                 Some(super::PaneLaunchSpec {
@@ -388,8 +459,10 @@ pub(crate) fn new_program_session_mode(
                     env: options.env,
                 }),
                 (options.rows, options.cols),
+                reserved,
             )
             .map_err(failed)?;
+        install_reserved_capture(&prepared, reserved)?;
         for pane in prepared
             .runtime
             .as_ref()
@@ -397,9 +470,6 @@ pub(crate) fn new_program_session_mode(
             .panes
             .values()
         {
-            pane.execution
-                .conventional_session
-                .store(conventional_session, Ordering::SeqCst);
             let spawn_authorize = Arc::clone(&authorize);
             *pane.execution.spawn_authorization.lock().map_err(failed)? =
                 Some(Arc::new(move || spawn_authorize(id.0)));
@@ -657,6 +727,48 @@ fn await_cleanup_acknowledgement(
             }
             None => std::thread::sleep(Duration::from_millis(10)),
         }
+    }
+    Ok(())
+}
+
+pub(super) fn send_acknowledged(
+    reference: &ExecutionRef,
+    data: Vec<u8>,
+) -> Result<(), ExecutionError> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    with_pane(reference, |pane| {
+        if pane.exited.load(Ordering::SeqCst) {
+            return Err(failed("execution exited before input admission"));
+        }
+        let permit = Arc::clone(&pane.execution.admission)
+            .try_acquire_owned()
+            .map_err(failed)?;
+        pane.input_tx
+            .send(PaneRuntimeCommand::AdmittedInput(data, sender, permit))
+            .map_err(failed)
+    })?;
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(failed)?
+        .map_err(failed)
+}
+
+fn install_reserved_capture(
+    prepared: &super::PreparedFreshRuntime,
+    reserved: Option<&ExecutionRef>,
+) -> Result<(), ExecutionError> {
+    if let Some(reference) = reserved {
+        let capture = super::reservations::create_capture(reference)
+            .map_err(|error| failed(format!("{error:?}")))?;
+        let pane = prepared
+            .runtime
+            .as_ref()
+            .expect("prepared runtime")
+            .panes
+            .values()
+            .next()
+            .expect("prepared pane");
+        *pane.execution.durable_capture.lock().map_err(failed)? = Some(capture);
     }
     Ok(())
 }

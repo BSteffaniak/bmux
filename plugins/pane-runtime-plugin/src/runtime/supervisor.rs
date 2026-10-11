@@ -46,25 +46,53 @@ pub(crate) fn activate(context: &bmux_plugin_sdk::NativeLifecycleContext) {
 #[cfg(test)]
 pub(super) fn install_test_artifact() -> anyhow::Result<()> {
     static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
-    let path = PathBuf::from(std::env::var("BMUX_TEST_SUPERVISOR_PATH")?);
-    let hash = std::env::var("BMUX_TEST_SUPERVISOR_SHA256")?;
-    anyhow::ensure!(path.is_absolute(), "test supervisor path must be absolute");
-    let mut digest = String::with_capacity(64);
-    for byte in Sha256::digest(std::fs::read(&path)?) {
-        write!(&mut digest, "{byte:02x}")?;
+    static ARTIFACT: OnceLock<(PathBuf, String)> = OnceLock::new();
+    static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+    let _fixture_guard = FIXTURE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("fixture lock poisoned"))?;
+    if ARTIFACT.get().is_none() {
+        // Cargo builds this binary because tests/execution_helper_artifact.rs
+        // references CARGO_BIN_EXE. Resolve only our test profile, never PATH.
+        let executable = std::env::current_exe()?;
+        let profile = executable
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("Cargo test profile directory unavailable"))?;
+        let source = profile.join("bmux-pane-execution-supervisor");
+        let bytes = std::fs::read(&source)?;
+        let root = ROOT.get_or_init(|| tempfile::tempdir().expect("owned helper fixture root"));
+        let path = root.path().join("execution-supervisor");
+        // Per-process immutable snapshot protects tests from later builds.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o700);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut hash = String::with_capacity(64);
+        for byte in Sha256::digest(std::fs::read(&path)?) {
+            write!(&mut hash, "{byte:02x}")?;
+        }
+        let _ = ARTIFACT.set((path, hash));
     }
-    anyhow::ensure!(hash == digest, "test supervisor artifact hash mismatch");
-    if ROOT.get().is_none() {
-        let root = tempfile::tempdir()?;
-        let _ = ROOT.set(root);
-    }
+    let (path, hash) = ARTIFACT.get().expect("fixture snapshot initialized");
     *INSTALLATION
         .get_or_init(|| Mutex::new(None))
         .lock()
         .map_err(|_| anyhow::anyhow!("supervisor installation lock poisoned"))? =
         Some(Installation {
-            path,
-            hash,
+            path: path.clone(),
+            hash: hash.clone(),
             root: ROOT
                 .get()
                 .expect("test artifact root initialized")
@@ -82,15 +110,12 @@ pub(super) struct SupervisorControl {
     artifact: PathBuf,
 }
 impl SupervisorControl {
-    pub(super) fn prepare_mode(
+    pub(super) fn prepare(
         token: uuid::Uuid,
-        terminal_session: bool,
     ) -> anyhow::Result<(Self, portable_pty::CommandBuilder)> {
-        let version = if terminal_session {
-            protocol::TERMINAL_SESSION_VERSION
-        } else {
-            protocol::VERSION
-        };
+        #[cfg(test)]
+        install_test_artifact()?;
+        let version = protocol::VERSION;
         let installation = INSTALLATION
             .get_or_init(|| Mutex::new(None))
             .lock()
@@ -154,7 +179,7 @@ impl SupervisorControl {
         // retirement, not this stack frame, owns eventual removal.
         let _retained_directory = endpoint_directory.keep();
         let mut command = portable_pty::CommandBuilder::new(&installation.path);
-        command.arg("--serve");
+        command.arg("--guardian-terminal-session-v4");
         command.arg(path);
         command.arg(directory.join("control.sock"));
         Ok((
@@ -174,11 +199,11 @@ impl SupervisorControl {
         slave: &std::path::Path,
     ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
         anyhow::ensure!(
-            self.version == protocol::TERMINAL_SESSION_VERSION,
+            self.version == protocol::VERSION,
             "guardian requires explicit terminal-session protocol"
         );
         let child = std::process::Command::new(&self.artifact)
-            .arg("--guardian-terminal-session-v3")
+            .arg("--guardian-terminal-session-v4")
             .arg(self.directory.join("bootstrap.json"))
             .arg(self.directory.join("control.sock"))
             .arg(slave)
@@ -231,8 +256,11 @@ impl SupervisorControl {
         &self,
         launch: &super::PaneLaunchSpec,
         authorize: impl Fn() -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    ) -> anyhow::Result<Option<u32>> {
+        // Process activation on a loaded host (including immutable helper
+        // verification) needs its own bounded startup budget. Keep this below
+        // the public command deadline; expiration never authorizes a relaunch.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut last_error;
         loop {
             match self.request(Operation::Hello) {
@@ -253,6 +281,18 @@ impl SupervisorControl {
             cwd: launch.cwd.clone(),
             env: launch.env.clone(),
         })?;
-        Ok(())
+        // Readiness comes from the actual owner, not the guardian process PID.
+        // Fast-exit/spawn failure may settle without a target: retain that outcome.
+        loop {
+            let status = self.request(Operation::Status)?;
+            if status.target_pid.is_some() || status.terminal_session_ended == Some(true) {
+                return Ok(status.target_pid);
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "target readiness deadline exceeded; launch must not be repeated"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 }

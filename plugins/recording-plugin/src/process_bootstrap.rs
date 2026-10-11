@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-// v1 waits may run for 30 seconds; leave bounded transport headroom without
+// Process waits may run for 30 seconds; leave bounded transport headroom without
 // changing the caller's default configuration or durable principal identity.
 const PROCESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 
@@ -19,104 +19,16 @@ pub(crate) struct Locator {
     schema_version: u32,
     run_id: Uuid,
     pub(crate) root: PathBuf,
-    #[serde(
-        default = "legacy_contract",
-        skip_serializing_if = "is_legacy_contract"
-    )]
-    contract_version: u32,
-}
-fn legacy_contract() -> u32 {
-    1
-}
-// Serde's skip_serializing_if callback requires a borrowed field, even for u32.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_legacy_contract(value: &u32) -> bool {
-    *value == 1
-}
-
-pub(crate) struct ProcessClient {
-    pub(crate) inner: BmuxClient,
-    pub(crate) terminal: bool,
-}
-impl std::ops::Deref for ProcessClient {
-    type Target = BmuxClient;
-    fn deref(&self) -> &BmuxClient {
-        &self.inner
-    }
-}
-impl std::ops::DerefMut for ProcessClient {
-    fn deref_mut(&mut self) -> &mut BmuxClient {
-        &mut self.inner
-    }
-}
-impl bmux_plugin_sdk::TypedDispatchClient for ProcessClient {
-    async fn invoke_service_raw(
-        &mut self,
-        capability: &str,
-        kind: bmux_ipc::InvokeServiceKind,
-        interface: &str,
-        operation: &str,
-        payload: Vec<u8>,
-    ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
-        if self.terminal && interface == "recording-process-v1" {
-            use bmux_recording_plugin_api::{
-                recording_process_terminal_v3 as new, recording_process_v1 as old,
-            };
-            let payload = if operation == "start" {
-                let request: old::client::StartRequest =
-                    bmux_plugin_sdk::decode_service_message(&payload).map_err(|error| {
-                        bmux_plugin_sdk::TypedDispatchClientError::transport(
-                            interface,
-                            operation,
-                            error.to_string(),
-                        )
-                    })?;
-                bmux_plugin_sdk::encode_service_message(&new::client::StartRequest {
-                    options: request.options,
-                    runtime_root: request.runtime_root,
-                    policy: new::LifetimePolicy::ConventionalTerminalSession,
-                })
-                .map_err(|error| {
-                    bmux_plugin_sdk::TypedDispatchClientError::transport(
-                        interface,
-                        operation,
-                        error.to_string(),
-                    )
-                })?
-            } else {
-                payload
-            };
-            bmux_plugin_sdk::TypedDispatchClient::invoke_service_raw(
-                &mut self.inner,
-                "bmux.recording.process.v3",
-                kind,
-                "recording-process-terminal-v3",
-                operation,
-                payload,
-            )
-            .await
-        } else {
-            bmux_plugin_sdk::TypedDispatchClient::invoke_service_raw(
-                &mut self.inner,
-                capability,
-                kind,
-                interface,
-                operation,
-                payload,
-            )
-            .await
-        }
-    }
 }
 
 pub(crate) struct DedicatedRuntime {
     pub(crate) root: PathBuf,
-    pub(crate) client: ProcessClient,
+    pub(crate) client: BmuxClient,
     pub(crate) armed: bool,
 }
 
 fn index_root(context: &NativeCommandContext) -> PathBuf {
-    Path::new(&context.connection.data_dir).join("recording-process-v1")
+    Path::new(&context.connection.data_dir).join("recording-process-v4")
 }
 fn paths(root: &Path) -> ConfigPaths {
     ConfigPaths::new(
@@ -125,6 +37,100 @@ fn paths(root: &Path) -> ConfigPaths {
         root.join("data"),
         root.join("state"),
     )
+}
+
+fn configure_isolated_slot(command: &mut Command, root: &Path, executable: &Path) -> Result<()> {
+    let name = executable
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("bmux-"));
+    if let Some(name) = name {
+        ensure!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'),
+            "invalid installed slot name"
+        );
+        let quoted = |path: &Path| serde_json::to_string(&path.to_string_lossy());
+        let manifest = root.join("config/slots.toml");
+        let contents = format!(
+            "[slots.{name}]\nbinary = {}\ninherit_base = false\nconfig_dir = {}\nruntime_dir = {}\ndata_dir = {}\nstate_dir = {}\nlog_dir = {}\n",
+            quoted(executable)?,
+            quoted(&root.join("config"))?,
+            quoted(&root.join("runtime"))?,
+            quoted(&root.join("data"))?,
+            quoted(&root.join("state"))?,
+            quoted(&root.join("logs"))?
+        );
+        if manifest.try_exists()? {
+            ensure!(
+                std::fs::read_to_string(&manifest)? == contents,
+                "isolated slot declaration changed"
+            );
+        } else {
+            crate::durable::write_atomic(&manifest, contents.as_bytes())?;
+        }
+        command
+            .env("BMUX_SLOT_NAME", name)
+            .env("BMUX_SLOTS_MANIFEST", manifest);
+    }
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct RuntimeIdentity {
+    schema_version: u32,
+    executable: PathBuf,
+    executable_sha256: String,
+    config_sha256: String,
+}
+fn file_hash(path: &Path) -> Result<String> {
+    use std::fmt::Write;
+    let digest = Sha256::digest(std::fs::read(path)?);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}")?;
+    }
+    Ok(encoded)
+}
+fn start_owned(root: &Path, executable: &Path) -> Result<std::process::Output> {
+    let paths = paths(root);
+    ensure!(executable.is_absolute(), "BMUX executable is not absolute");
+    let mut command = Command::new(executable);
+    command.env_clear();
+    configure_isolated_slot(&mut command, root, executable)?;
+    command.env(
+        "PATH",
+        std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+    );
+    command
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", &paths.config_dir)
+        .env("XDG_DATA_HOME", &paths.data_dir)
+        .env("XDG_STATE_HOME", &paths.state_dir)
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("XDG_RUNTIME_DIR", &paths.runtime_dir)
+        .env("TMPDIR", root.join("tmp"))
+        .env("BMUX_CONFIG_DIR", &paths.config_dir)
+        .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
+        .env("BMUX_DATA_DIR", &paths.data_dir)
+        .env("BMUX_STATE_DIR", &paths.state_dir)
+        .env("BMUX_LOG_DIR", root.join("logs"))
+        .env("BMUX_RECORDINGS_DIR", paths.state_dir.join("recordings"))
+        .env("BMUX_NO_BASE_CONFIG", "1")
+        .env("BMUX_RUNTIME_NAME", "default")
+        .env("BMUX_TARGET", "local")
+        .current_dir(root)
+        .args(["--runtime", "default", "--target", "local", "--config"])
+        .arg(root.join("config/bmux.toml"))
+        .args(["server", "start", "--daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command
+        .output()
+        .context("starting dedicated recorded-program server")
 }
 
 pub(crate) async fn bootstrap(context: &NativeCommandContext) -> Result<DedicatedRuntime> {
@@ -149,41 +155,18 @@ pub(crate) async fn bootstrap(context: &NativeCommandContext) -> Result<Dedicate
     let config = isolated_config(context, &paths)?;
     let config_file = paths.config_dir.join("bmux.toml");
     crate::durable::write_atomic(&config_file, config.as_bytes())?;
-    let executable = std::env::current_exe().context("locating current BMUX executable")?;
-    ensure!(executable.is_absolute(), "BMUX executable is not absolute");
-    let mut command = Command::new(executable);
-    command.env_clear();
-    command.env(
-        "PATH",
-        std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
-    );
-    command
-        .env("HOME", root.join("home"))
-        .env("XDG_CONFIG_HOME", &paths.config_dir)
-        .env("XDG_DATA_HOME", &paths.data_dir)
-        .env("XDG_STATE_HOME", &paths.state_dir)
-        .env("XDG_CACHE_HOME", root.join("cache"))
-        .env("XDG_RUNTIME_DIR", &paths.runtime_dir)
-        .env("TMPDIR", root.join("tmp"))
-        .env("BMUX_CONFIG_DIR", &paths.config_dir)
-        .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
-        .env("BMUX_DATA_DIR", &paths.data_dir)
-        .env("BMUX_STATE_DIR", &paths.state_dir)
-        .env("BMUX_LOG_DIR", root.join("logs"))
-        .env("BMUX_RECORDINGS_DIR", paths.state_dir.join("recordings"))
-        .env("BMUX_NO_BASE_CONFIG", "1")
-        .env("BMUX_RUNTIME_NAME", "default")
-        .env("BMUX_TARGET", "local")
-        .current_dir(&root)
-        .args(["--runtime", "default", "--target", "local", "--config"])
-        .arg(&config_file)
-        .args(["server", "start", "--daemon"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let output = command
-        .output()
-        .context("starting dedicated recorded-program server")?;
+    let executable = std::fs::canonicalize(std::env::current_exe()?)?;
+    let identity = RuntimeIdentity {
+        schema_version: 4,
+        executable: executable.clone(),
+        executable_sha256: file_hash(&executable)?,
+        config_sha256: file_hash(&config_file)?,
+    };
+    crate::durable::write_atomic(
+        &root.join("runtime-identity.json"),
+        &serde_json::to_vec(&identity)?,
+    )?;
+    let output = start_owned(&root, &executable)?;
     if !output.status.success() {
         let cleanup = stop_owned(&root);
         anyhow::bail!(
@@ -203,10 +186,7 @@ pub(crate) async fn bootstrap(context: &NativeCommandContext) -> Result<Dedicate
             Ok(client) => {
                 return Ok(DedicatedRuntime {
                     root,
-                    client: ProcessClient {
-                        inner: client,
-                        terminal: false,
-                    },
+                    client,
                     armed: true,
                 });
             }
@@ -292,18 +272,12 @@ fn isolated_config(context: &NativeCommandContext, paths: &ConfigPaths) -> Resul
     Ok(config)
 }
 
-pub(crate) fn remember(
-    context: &NativeCommandContext,
-    id: Uuid,
-    root: &Path,
-    contract_version: u32,
-) -> Result<()> {
+pub(crate) fn remember(context: &NativeCommandContext, id: Uuid, root: &Path) -> Result<()> {
     let index = index_root(context);
     let value = Locator {
-        schema_version: 1,
+        schema_version: 4,
         run_id: id,
         root: root.to_path_buf(),
-        contract_version,
     };
     crate::durable::write_atomic(
         &index.join(format!("{id}.json")),
@@ -315,7 +289,7 @@ pub(crate) async fn resolve(context: &NativeCommandContext, id: Uuid) -> Result<
     let index = index_root(context);
     let value: Locator = serde_json::from_slice(&std::fs::read(index.join(format!("{id}.json")))?)?;
     ensure!(
-        value.schema_version == 1 && value.run_id == id,
+        value.schema_version == 4 && value.run_id == id,
         "invalid or unsupported process locator"
     );
     let base = if cfg!(unix) {
@@ -335,32 +309,61 @@ pub(crate) async fn resolve(context: &NativeCommandContext, id: Uuid) -> Result<
             .is_some_and(|name| name.starts_with("bmux-recorded-")),
         "invalid dedicated runtime locator"
     );
-    let client = BmuxClient::connect_with_paths_and_timeout(
+    let client = match BmuxClient::connect_with_paths_and_timeout(
         &paths(&root),
         "recording-process",
         PROCESS_REQUEST_TIMEOUT,
     )
-    .await?;
+    .await
+    {
+        Ok(client) => client,
+        Err(connect_error) => {
+            ensure!(
+                !root.join("server-stopped.json").try_exists()?,
+                "finalized runtime was explicitly stopped; offline evidence remains available"
+            );
+            let identity: RuntimeIdentity =
+                serde_json::from_slice(&std::fs::read(root.join("runtime-identity.json"))?)?;
+            ensure!(
+                identity.schema_version == 4
+                    && identity.executable == std::fs::canonicalize(std::env::current_exe()?)?
+                    && identity.executable_sha256 == file_hash(&identity.executable)?
+                    && identity.config_sha256 == file_hash(&root.join("config/bmux.toml"))?,
+                "owned runtime executable/config identity changed; refusing restart"
+            );
+            let output = start_owned(&root, &identity.executable)?;
+            ensure!(
+                output.status.success(),
+                "owned daemon restart failed after {connect_error}: {}; retained root {}",
+                String::from_utf8_lossy(&output.stderr),
+                root.display()
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match BmuxClient::connect_with_paths_and_timeout(
+                    &paths(&root),
+                    "recording-process",
+                    PROCESS_REQUEST_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(client) => break client,
+                    Err(error) if Instant::now() >= deadline => {
+                        return Err(anyhow::anyhow!(
+                            "owned daemon reconnect unavailable: {error}; retained root {}; no execution relaunch",
+                            root.display()
+                        ));
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+        }
+    };
     Ok(DedicatedRuntime {
         root,
-        client: ProcessClient {
-            inner: client,
-            terminal: contract_version(context, id)? == 3,
-        },
+        client,
         armed: false,
     })
-}
-
-pub(crate) fn contract_version(context: &NativeCommandContext, id: Uuid) -> Result<u32> {
-    let path = index_root(context).join(format!("{id}.json"));
-    let locator: Locator = serde_json::from_slice(&std::fs::read(path)?)?;
-    ensure!(
-        locator.schema_version == 1
-            && locator.run_id == id
-            && matches!(locator.contract_version, 1 | 3),
-        "invalid or unsupported run locator contract"
-    );
-    Ok(locator.contract_version)
 }
 
 pub(crate) fn recording_root(runtime: &DedicatedRuntime) -> PathBuf {
@@ -373,7 +376,7 @@ pub(crate) fn offline(
 ) -> Result<
     Option<(
         PathBuf,
-        bmux_recording_plugin_api::recording_process_v1::RunStatus,
+        bmux_recording_plugin_api::recording_process_v4::RunStatus,
     )>,
 > {
     let path = index_root(context).join(format!("{id}.json"));
@@ -382,7 +385,7 @@ pub(crate) fn offline(
     }
     let locator: Locator = serde_json::from_slice(&std::fs::read(path)?)?;
     ensure!(
-        locator.schema_version == 1 && locator.run_id == id,
+        locator.schema_version == 4 && locator.run_id == id,
         "invalid run locator"
     );
     let root = std::fs::canonicalize(&locator.root)?;
@@ -400,11 +403,7 @@ pub(crate) fn offline(
         "invalid dedicated offline locator"
     );
     let recordings = root.join("state/recordings");
-    let status = crate::process_store::ProcessStore::for_contract(
-        &recordings,
-        contract_version(context, id)?,
-    )?
-    .load(id)?;
+    let status = crate::process_store::ProcessStore::new(&recordings)?.load(id)?;
     ensure!(
         std::fs::canonicalize(&status.runtime_root)? == root,
         "offline runtime identity mismatch"
@@ -439,8 +438,8 @@ pub(crate) fn retain_launch_root(
     crate::durable::write_atomic(
         &path,
         &serde_json::to_vec(&serde_json::json!({
-            "schema_version":1,"launch_mutation_id":key,"runtime_root":root,
-            "contract":"recording-process-terminal-v3","recovery_required":true,
+            "schema_version":4,"launch_mutation_id":key,"runtime_root":root,
+            "contract":"recording-process-v4","recovery_required":true,
             "automatic_relaunch":false,"automatic_cleanup":false
         }))?,
     )?;
@@ -457,8 +456,8 @@ pub(crate) fn record_native_launch_identity(
     crate::durable::write_atomic(
         path,
         &serde_json::to_vec(&serde_json::json!({
-            "schema_version":1,"launch_mutation_id":key,"runtime_root":root,"run_id":id,
-            "contract":"recording-process-terminal-v3","recovery_required":recovery_required,
+            "schema_version":4,"launch_mutation_id":key,"runtime_root":root,"run_id":id,
+            "contract":"recording-process-v4","recovery_required":recovery_required,
             "automatic_relaunch":false,"automatic_cleanup":false
         }))?,
     )
@@ -500,9 +499,19 @@ impl Drop for DedicatedRuntime {
     }
 }
 fn stop_owned(root: &Path) -> Result<()> {
-    let executable = std::env::current_exe()?;
-    let mut command = Command::new(executable);
+    let identity: RuntimeIdentity =
+        serde_json::from_slice(&std::fs::read(root.join("runtime-identity.json"))?)?;
+    let executable = std::fs::canonicalize(std::env::current_exe()?)?;
+    ensure!(
+        identity.schema_version == 4
+            && identity.executable == executable
+            && identity.executable_sha256 == file_hash(&executable)?
+            && identity.config_sha256 == file_hash(&root.join("config/bmux.toml"))?,
+        "owned cleanup executable/config identity mismatch"
+    );
+    let mut command = Command::new(&executable);
     command.env_clear();
+    configure_isolated_slot(&mut command, root, &executable)?;
     command.env(
         "PATH",
         std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
@@ -562,26 +571,4 @@ fn fingerprint(args: &[String]) -> Result<String> {
         write!(&mut encoded, "{byte:02x}")?;
     }
     Ok(encoded)
-}
-
-#[cfg(test)]
-mod contract_tests {
-    use super::*;
-    #[test]
-    fn locator_contract_commits_with_identity_and_legacy_defaults_are_preserved() {
-        let id = Uuid::new_v4();
-        let legacy = serde_json::json!({"schema_version":1,"run_id":id,"root":"/tmp/owned"});
-        let old: Locator = serde_json::from_value(legacy.clone()).unwrap();
-        assert_eq!(old.contract_version, 1);
-        assert_eq!(serde_json::to_value(&old).unwrap(), legacy);
-        let native = Locator {
-            schema_version: 1,
-            run_id: id,
-            root: PathBuf::from("/tmp/owned"),
-            contract_version: 3,
-        };
-        let value = serde_json::to_value(&native).unwrap();
-        assert_eq!(value["contract_version"], 3);
-        assert_eq!(serde_json::from_value::<Locator>(value).unwrap().run_id, id);
-    }
 }

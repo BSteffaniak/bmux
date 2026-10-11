@@ -81,22 +81,36 @@ exit code alone describes recording integrity.
 
 ## JSON response contract
 
+The consolidated contract uses schema version 4:
+
 - `start`, `status`, exit `wait`, `terminate`, and `run`: direct RunStatus with
-  `schema_version`, `run_id`, `revision`, `recording_id`, `execution`, `runtime_root`,
-  `phase`, `exit_code`, `output_drained`, `output_watermark`, `capture_finalized`,
-  and `errors`.
+  `schema_version`, `run_id`, `launch_mutation_id`, `revision`, `recording_id`,
+  `execution`, `runtime_root`, `phase`, `exit_code`, `target_exited`,
+  `terminal_session_ended`, `capture_eof`, `output_drained`, `output_watermark`,
+  `capture_watermark`, `recording_watermark`, `capture_finalized`,
+  `durable_recording_complete`, `timing_complete`, `cleanup_complete`,
+  `recovery_required`, and `errors`.
 - `read`: `{run_id,since,next_cursor,data:[bytes],complete}`. Cursors are unsigned
   raw-output byte offsets, not event numbers or screen positions.
-- `screen`: `{schema_version:1,run_id,text}`.
-- Screen-condition wait: `{schema_version:1,run_id,matched}`; timeout adds
+- `screen`: `{schema_version:4,run_id,text}`.
+- Screen-condition wait: `{schema_version:4,run_id,matched}`; timeout adds
   `timed_out:true`, sets `matched:false`, and exits 124.
-- `send`: `{schema_version:1,run_id,accepted_bytes}`.
+- `send`: `{schema_version:4,run_id,mutation_id,accepted_bytes,receipt}`.
+  A completed write receipt acknowledges the terminal write, not child consumption.
 - `finish` without output: direct RunStatus. With exports:
-  `{schema_version:1,status,artifacts:[paths...]}`.
-- Command errors: `{schema_version:1,ok:false,error}` and exit 1.
+  `{schema_version:4,status,artifacts:[paths...]}`.
+- Command errors: `{schema_version:4,ok:false,error}` and exit 1.
 
-Do not conflate `exit_code` with capture integrity: require `output_drained` before
-finalization and `capture_finalized` before treating the recording as finalized.
+Do not conflate target exit, session end, capture integrity, cleanup, or recording
+commit. Finalization requires the actual capture boundary and complete durable
+canonical recording; raw-only recovery does not prove original event timing.
+
+Validation gives offline GIF rasterization a separate bounded 120-second command
+deadline, as explicitly approved. Launch and input retain their existing deadlines.
+The helper has a bounded 10-second startup budget; startup uncertainty does not
+permit a second launch. Heavy PTY and recording integration tests reserve scheduler
+resources to avoid flooding the host. These budgets do not relax byte, event,
+identity, final-frame, or durability assertions.
 
 ## Termination and finalization
 
@@ -145,34 +159,30 @@ read all reported artifact paths rather than guessing them.
 
 ## Native terminal-session lifetime decision
 
-The accepted direction is a separately negotiated conventional terminal-session
-contract. It is not a reinterpretation of `recording-process-v1` or the existing
-preserve-descendants execution policy. The new contract is under implementation;
-examples above still describe v1. The opt-in CLI selection is the paired
-`--contract-version 3 --lifetime terminal-session` flags on `start` or `run`.
-Its native service is `recording-process-terminal-v3`; it remains subject to
-end-to-end validation and does not advertise durable daemon recovery.
+The user explicitly approved a breaking API consolidation: retire old execution
+and process API support, reject old clients clearly, and preserve existing recorded
+data. Execution and recording each expose one cohesive current contract;
+conventional terminal-session lifetime is the default, and recovery is part of the
+same contract. Version numbers identify wire/storage representations rather than
+user-selectable lifecycle modes. This is a scoped architectural decision, not an
+exception to capture completeness, mutation authority, persistence, or isolation.
+The consolidated source passes the standard full suite, CLI tests, PTY smoke,
+and terminal compatibility matrix. Real installed-payload acceptance remains a
+separate validation requirement. Unsupported
+representations must be explicitly rejected; migrations must preserve canonical
+recordings rather than silently reinterpret or delete them.
 
-For this selection, JSON wraps the operation result in an explicit envelope:
+The public model must distinguish target outcome, terminal-session end, actual
+capture boundary and watermark, durable recording finalization, and execution
+cleanup. None implies all the others. An incomplete or uncertain operation must
+remain discoverable and report its recovery state explicitly.
 
-```json
-{"contract":{"interface":"recording-process-terminal-v3","lifecycle":"conventional-terminal-session","status_schema_version":1},"result":{}}
-```
-
-`result` retains the existing operation's modeled field shape and schema version.
-The default v1 commands still return their existing bare JSON. Capture readiness
-(`output_drained`) does not claim descendant cleanup: native readiness requires
-session end, complete capture, and the actual raw capture boundary. An incomplete
-or recovery-required native status returns an explicit error.
-
-Native launch persists its key, selected contract, and isolated runtime locator
-before invoking execution. An ambiguous response is not retried as a fresh launch
-and does not implicitly terminate possibly running work. The error identifies the
-retained key, exact runtime root, and `launch-KEY-runtime.json` recovery record;
-known run identity is retained when available. These records support explicit
-investigation, not an advertised automatic daemon-recovery capability. Original
-recording sinks preserve uninterrupted capture timing; raw-only recovered bytes
-must not be presented as recovered original event timing or full telemetry.
+Launch and input mutations require durable admission keys and request fingerprints
+before effects. Retries reconcile the same execution and receipt; conflicting key
+reuse is rejected and ambiguous launch never means permission to relaunch. Original
+source events and timestamps must survive any recovery that claims complete profile
+or animated replay evidence. Raw-only recovery cannot invent missing timing or
+telemetry and must report that limitation.
 
 Execution authority, terminal lifetime, capture, and finalization are separate
 plugin-owned responsibilities:
@@ -202,8 +212,9 @@ The new contract permits conventional session-end effects on future terminal use
 it does **not** permit silently discarding already-written bytes or reporting
 truncated evidence complete. Buffered-output preservation must pass owned burst,
 small unread-tail, and backpressure tests. Failure to establish safe draining
-requires an incomplete/recovery outcome rather than forced success. Legacy
-semantics stay separately supported without target-exit-based automatic retirement.
+requires an incomplete/recovery outcome rather than forced success. Under the
+explicitly approved breaking consolidation, the pinned-terminal contract is
+retired rather than silently redirected to conventional terminal-session behavior.
 
 There is no implicit pipe substitution or guest execution. Native executables,
 query/reply behavior, job control, resizing, retry identity, and isolation remain

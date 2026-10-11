@@ -29,20 +29,23 @@ mod snapshot_v1_migration;
 mod supervisor_protocol;
 
 #[cfg(test)]
+mod retired_execution_tests;
+
+#[cfg(test)]
 mod contract_tests {
     #[test]
-    fn unfinished_execution_contract_is_not_discoverable() {
+    fn only_cohesive_execution_contract_is_discoverable() {
         use bmux_plugin_sdk::RustPlugin;
         let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        for version in [1, 2, 3] {
+            assert!(services.iter().all(
+                |service| service.interface_id != format!("pane-runtime-execution-v{version}")
+            ));
+        }
         assert!(
             services
                 .iter()
-                .all(|service| service.capability.as_str() != "bmux.pane_runtime.execution.v2")
-        );
-        assert!(
-            services
-                .iter()
-                .any(|service| service.capability.as_str() == "bmux.pane_runtime.execution.v1")
+                .any(|service| service.interface_id == "pane-runtime-execution-v4")
         );
     }
 }
@@ -61,9 +64,6 @@ impl RustPlugin for PaneRuntimePlugin {
         services.retain(|service| {
             let capability = service.capability.as_str();
             capability != bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_SPAWN_V1.as_str()
-                && capability
-                    != bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_EXECUTION_V2
-                        .as_str()
         });
         Ok(services)
     }

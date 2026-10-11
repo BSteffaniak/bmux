@@ -1,11 +1,8 @@
 //! Typed process orchestration. This module never owns a PTY engine.
 use anyhow::{Context, Result, ensure};
-use bmux_pane_runtime_plugin_api::{
-    pane_runtime_execution_v1 as pane, pane_runtime_execution_v3 as terminal,
-};
+use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4 as pane;
 use bmux_plugin::{ServiceCallerDispatchClient, TypedServiceCaller};
-use bmux_recording_plugin_api::recording_process_v1 as process;
-use bmux_sessions_plugin_api::sessions_program_v1 as sessions;
+use bmux_recording_plugin_api::recording_process_v4 as process;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -13,15 +10,20 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::process_store::ProcessStore;
+// pane-runtime-execution-v4 durable capture rejects requests above 256 KiB.
+// Keep repair and verification on the same bounded request path.
+const CAPTURE_READ_MAX_BYTES: u32 = 262_144;
+async fn capture_resume(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    cursor: pane::TerminalCaptureCursor,
+) -> Result<pane::TerminalCaptureResponse> {
+    pane::client::capture_resume(client, cursor, CAPTURE_READ_MAX_BYTES)
+        .await?
+        .map_err(|error| anyhow::anyhow!("canonical capture read: {error:?}"))
+}
 type Reply<'a, T> = Pin<Box<dyn Future<Output = Result<T, process::ProcessError>> + Send + 'a>>;
 
 static PROCESS_SERVICE: std::sync::OnceLock<Arc<ProcessService>> = std::sync::OnceLock::new();
-
-static TERMINAL_SERVICE: std::sync::OnceLock<Arc<ProcessService>> = std::sync::OnceLock::new();
-
-pub(crate) fn register_terminal(service: Arc<ProcessService>) {
-    let _ = TERMINAL_SERVICE.set(service);
-}
 
 pub(crate) fn register(service: Arc<ProcessService>) {
     let _ = PROCESS_SERVICE.set(service);
@@ -34,20 +36,15 @@ pub(crate) fn dispatch<T: Send + 'static>(
     + 'static,
 ) -> Result<T> {
     let service = Arc::clone(
-        (if context.request.service.interface_id == "recording-process-terminal-v3" {
-            &TERMINAL_SERVICE
-        } else {
-            &PROCESS_SERVICE
-        })
-        .get()
-        .context("process service unavailable")?,
+        PROCESS_SERVICE
+            .get()
+            .context("process service unavailable")?,
     );
     let service = Arc::new(ProcessService {
         caller: Arc::new(TypedServiceCaller::from_service_context(context)),
         root: service.root.clone(),
         runtime_root: service.runtime_root.clone(),
         isolated: service.isolated,
-        terminal: service.terminal,
         mutation: Arc::clone(&service.mutation),
     });
     std::thread::spawn(move || {
@@ -65,8 +62,123 @@ pub(crate) struct ProcessService {
     root: PathBuf,
     runtime_root: String,
     isolated: bool,
-    terminal: bool,
     mutation: Arc<Mutex<()>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct OriginalWriterClosure {
+    version: u32,
+    run_id: Uuid,
+    recording_id: Uuid,
+    execution: process::ExecutionRef,
+    watermark: u64,
+    manifest_hash: Vec<u8>,
+    segments: Vec<(String, Vec<u8>)>,
+}
+
+fn closed_original_events(
+    directory: &std::path::Path,
+    value: &process::RunStatus,
+    watermark: u64,
+) -> Result<OriginalWriterClosure> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let bytes = std::fs::read(directory.join("manifest.json"))?;
+    let manifest: crate::recording_runtime::Manifest = serde_json::from_slice(&bytes)?;
+    ensure!(
+        manifest.summary.id == value.recording_id && manifest.summary.ended_epoch_ms.is_some(),
+        "original writer manifest is not closed for this recording"
+    );
+    let mut count = 0u64;
+    let mut seq = 0u64;
+    let mut timestamp = 0u64;
+    let mut segments = Vec::new();
+    for name in &manifest.summary.segments {
+        ensure!(
+            std::path::Path::new(name).components().count() == 1 && !name.starts_with('.'),
+            "invalid original event segment"
+        );
+        let mut file = std::fs::File::open(directory.join(name))?;
+        let mut digest = Sha256::new();
+        loop {
+            let mut prefix = [0; 4];
+            if file.read(&mut prefix[..1])? == 0 {
+                break;
+            }
+            file.read_exact(&mut prefix[1..])?;
+            let length = usize::try_from(u32::from_le_bytes(prefix))?;
+            ensure!(
+                length <= 16 * 1024 * 1024,
+                "original event frame exceeds bounded limit"
+            );
+            let mut payload = vec![0; length];
+            file.read_exact(&mut payload)?;
+            let event: bmux_recording_protocol::RecordingEventEnvelope<
+                bmux_ipc::Event,
+                bmux_ipc::ErrorCode,
+            > = bmux_codec::from_bytes(&payload)?;
+            ensure!(
+                event.seq == seq + 1 && event.mono_ns >= timestamp,
+                "original event sequence/timing integrity failure"
+            );
+            seq = event.seq;
+            timestamp = event.mono_ns;
+            count += 1;
+            digest.update(prefix);
+            digest.update(payload);
+        }
+        segments.push((name.clone(), digest.finalize().to_vec()));
+    }
+    ensure!(
+        count == manifest.summary.event_count,
+        "original event count differs from closed manifest"
+    );
+    Ok(OriginalWriterClosure {
+        version: 1,
+        run_id: value.run_id,
+        recording_id: value.recording_id,
+        execution: value
+            .execution
+            .clone()
+            .context("original closure lacks execution identity")?,
+        watermark,
+        manifest_hash: Sha256::digest(bytes).to_vec(),
+        segments,
+    })
+}
+
+fn original_writer_closed(directory: &std::path::Path, value: &process::RunStatus) -> Result<bool> {
+    let path = directory.join("original-writer-closure.json");
+    if !path.try_exists()? {
+        return Ok(false);
+    }
+    let receipt: OriginalWriterClosure = serde_json::from_slice(&std::fs::read(path)?)?;
+    ensure!(
+        receipt.version == 1,
+        "unsupported original writer closure version"
+    );
+    ensure!(
+        receipt.watermark == value.output_watermark,
+        "original writer closure watermark mismatch"
+    );
+    ensure!(
+        receipt == closed_original_events(directory, value, receipt.watermark)?,
+        "original writer closure identity/event integrity mismatch"
+    );
+    Ok(true)
+}
+
+pub(crate) fn verified_launch_root(request: &str, owner: &str) -> Result<String> {
+    // The admitted spelling is stable request identity; the filesystem locator
+    // may have an alias (e.g. macOS /tmp). Verify the same existing owned root,
+    // then retain the original owner spelling in the durable intent.
+    let requested = std::fs::canonicalize(request).context("resolving requested runtime root")?;
+    let canonical_owner = std::fs::canonicalize(owner).context("resolving owned runtime root")?;
+    ensure!(
+        requested == canonical_owner,
+        "isolated runtime locator mismatch"
+    );
+    Ok(owner.to_owned())
 }
 
 impl ProcessService {
@@ -81,7 +193,6 @@ impl ProcessService {
             root,
             runtime_root,
             isolated,
-            terminal: false,
             mutation: Arc::new(Mutex::new(())),
         }
     }
@@ -89,127 +200,38 @@ impl ProcessService {
     async fn execution_status(
         &self,
         client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
-        reference: pane::ExecutionRef,
+        reference: pane::TerminalExecutionRef,
         wait: Option<u32>,
-    ) -> Result<pane::ExecutionStatus> {
-        if !self.terminal {
-            return match wait {
-                Some(timeout) => pane::client::wait(client, reference, timeout).await?,
-                None => pane::client::status(client, reference).await?,
-            }
-            .map_err(|error| anyhow::anyhow!("execution status: {error:?}"));
-        }
-        let reference = terminal::TerminalExecutionRef {
-            session_id: reference.session_id,
-            pane_id: reference.pane_id,
-            execution_token: reference.execution_token,
+    ) -> Result<pane::TerminalExecutionStatus> {
+        let result = match wait {
+            Some(timeout) => pane::client::wait(client, reference, timeout).await?,
+            None => pane::client::status(client, reference).await?,
         };
-        let status = match wait {
-            Some(timeout) => terminal::client::wait(client, reference, timeout).await?,
-            None => terminal::client::status(client, reference).await?,
-        }
-        .map_err(|error| {
-            anyhow::anyhow!("terminal authority unavailable/recovery required: {error:?}")
-        })?;
-        Ok(pane::ExecutionStatus {
-            execution: pane::ExecutionRef {
-                session_id: status.execution.session_id,
-                pane_id: status.execution.pane_id,
-                execution_token: status.execution.execution_token,
-            },
-            phase: match status.phase {
-                terminal::TerminalExecutionPhase::Running => pane::ExecutionPhase::Running,
-                terminal::TerminalExecutionPhase::Exited => pane::ExecutionPhase::Exited,
-                terminal::TerminalExecutionPhase::Failed => pane::ExecutionPhase::Failed,
-            },
-            exit_code: status.exit_code,
-            signal: status.signal,
-            output_drained: status.output_drained
-                && matches!(status.session_end, terminal::TerminalSessionEnd::Ended)
-                && matches!(
-                    status.capture_integrity,
-                    terminal::TerminalCaptureIntegrity::Complete
-                ),
-            output_watermark: status.output_watermark,
-            error: status.error.or_else(|| {
-                if matches!(status.session_end, terminal::TerminalSessionEnd::RecoveryRequired)
-                    || matches!(status.capture_integrity, terminal::TerminalCaptureIntegrity::Incomplete) {
-                    Some("native terminal authority/capture incomplete; recovery required; no daemon recovery capability".into())
-                } else { None }
-            }),
-        })
+        result.map_err(|error| anyhow::anyhow!("execution status: {error:?}"))
     }
-
     async fn execution_screen(
         &self,
         client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
-        reference: pane::ExecutionRef,
+        reference: pane::TerminalExecutionRef,
     ) -> Result<String> {
-        if self.terminal {
-            Ok(
-                terminal::client::screen(client, terminal_reference(&reference))
-                    .await?
-                    .map_err(|error| {
-                        anyhow::anyhow!("terminal screen unavailable/recovery required: {error:?}")
-                    })?
-                    .text,
-            )
-        } else {
-            Ok(pane::client::screen(client, reference)
-                .await?
-                .map_err(|error| anyhow::anyhow!("screen: {error:?}"))?
-                .text)
-        }
-    }
-    async fn execution_send(
-        &self,
-        client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
-        reference: pane::ExecutionRef,
-        data: Vec<u8>,
-    ) -> Result<()> {
-        if self.terminal {
-            bmux_pane_runtime_plugin_api::pane_runtime_execution_v3::client::send(
-                client,
-                terminal_reference(&reference),
-                data,
-            )
+        pane::client::screen(client, reference)
             .await?
-            .map_err(|error| anyhow::anyhow!("terminal input: {error:?}"))
-        } else {
-            pane::client::send(client, reference, data)
-                .await?
-                .map_err(|error| anyhow::anyhow!("input: {error:?}"))
-        }
+            .map(|value| value.text)
+            .map_err(|error| anyhow::anyhow!("screen: {error:?}"))
     }
     async fn execution_terminate(
         &self,
         client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
-        reference: pane::ExecutionRef,
+        reference: pane::TerminalExecutionRef,
         grace: u32,
     ) -> Result<()> {
-        if self.terminal {
-            bmux_pane_runtime_plugin_api::pane_runtime_execution_v3::client::terminate(
-                client,
-                terminal_reference(&reference),
-                grace,
-            )
+        pane::client::terminate(client, reference, grace)
             .await?
-            .map_err(|error| anyhow::anyhow!("terminal termination: {error:?}"))?;
-        } else {
-            pane::client::terminate(client, reference, grace)
-                .await?
-                .map_err(|error| anyhow::anyhow!("termination: {error:?}"))?;
-        }
+            .map_err(|error| anyhow::anyhow!("termination: {error:?}"))?;
         Ok(())
     }
-
-    pub(crate) fn terminal(mut self) -> Self {
-        self.terminal = true;
-        self
-    }
-
     fn store(&self) -> Result<ProcessStore> {
-        ProcessStore::for_contract(&self.root, if self.terminal { 3 } else { 1 })
+        ProcessStore::new(&self.root)
     }
 
     fn require_isolation(&self) -> Result<()> {
@@ -232,86 +254,153 @@ impl ProcessService {
 
     async fn refresh(&self, id: Uuid) -> Result<process::RunStatus> {
         let mut value = self.load(id)?;
-        if value.capture_finalized || value.execution.is_none() {
+        if value.capture_finalized {
             return Ok(value);
         }
+        if value.execution.is_none() {
+            let reservation = self.store()?.reservation(id).context("launch admission retained but reservation outcome unknown; recovery required; refusing relaunch")?;
+            value.execution = Some(process::ExecutionRef {
+                session_id: reservation.execution.session_id,
+                pane_id: reservation.execution.pane_id,
+                execution_token: reservation.execution.execution_token,
+            });
+            self.store()?.replace(value.revision, &mut value)?;
+        }
         let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut authority = pane::client::reconcile(&mut client, execution(&value)?)
+            .await?
+            .map_err(|error| anyhow::anyhow!("reconcile: {error:?}"))?;
+        if matches!(authority.launch.phase, pane::TerminalLaunchPhase::Reserved) {
+            let reservation = self.store()?.reservation(id)?;
+            pane::client::launch(&mut client, reservation)
+                .await?
+                .map_err(|error| anyhow::anyhow!("reserved launch: {error:?}"))?;
+            authority = pane::client::reconcile(&mut client, execution(&value)?)
+                .await?
+                .map_err(|error| anyhow::anyhow!("reconcile: {error:?}"))?;
+        }
+        let capture_active = crate::manual_handle()
+            .and_then(|handle| {
+                handle.read().ok().and_then(|handle| {
+                    handle
+                        .0
+                        .lock()
+                        .ok()
+                        .and_then(|runtime| runtime.active_capture_target())
+                })
+            })
+            .is_some_and(|(recording, _)| recording == value.recording_id);
+        let original_closed =
+            original_writer_closed(&self.root.join(value.recording_id.to_string()), &value)?;
+        if !capture_active && !original_closed {
+            self.recover_raw(&value, &authority).await?;
+        }
         let status = self
             .execution_status(&mut client, execution(&value)?, None)
             .await?;
+        self.store()?.write_authority(id, &authority)?;
         let guard = self
             .mutation
             .lock()
             .map_err(|_| anyhow::anyhow!("process authority lock poisoned"))?;
         let store = self.store()?;
         value = store.load(id)?;
+        let previous = serde_json::to_vec(&value)?;
         if !value.capture_finalized {
             let revision = value.revision;
             let phase = match status.phase {
-                pane::ExecutionPhase::Running => process::RunPhase::Running,
-                pane::ExecutionPhase::Exited => process::RunPhase::Exited,
-                pane::ExecutionPhase::Failed => process::RunPhase::Failed,
+                pane::TerminalExecutionPhase::Running => process::RunPhase::Running,
+                pane::TerminalExecutionPhase::Exited => process::RunPhase::Exited,
+                pane::TerminalExecutionPhase::Failed => process::RunPhase::Failed,
             };
-            if value.phase == phase
-                && value.exit_code == status.exit_code
-                && value.output_drained == status.output_drained
-                && value.output_watermark == status.output_watermark
-                && status
-                    .error
-                    .as_ref()
-                    .is_none_or(|error| value.errors.last() == Some(error))
-            {
-                return Ok(value);
-            }
             value.phase = phase;
             value.exit_code = status.exit_code;
-            value.output_drained = status.output_drained;
+            value.target_exited = !matches!(status.phase, pane::TerminalExecutionPhase::Running);
+            value.terminal_session_ended = status.terminal_session_ended;
+            value.capture_eof = authority.capture_complete;
+            value.recovery_required = authority.recovery_required;
+            if !capture_active && !original_closed {
+                value.timing_complete = false;
+                value.recovery_required = true;
+            }
+            value.cleanup_complete = status.cleanup_complete;
+            value.capture_watermark = authority.continuation_cursor.offset;
+            value.output_drained = status.output_drained
+                && status.terminal_session_ended
+                && matches!(
+                    status.capture_integrity,
+                    pane::TerminalCaptureIntegrity::Complete
+                );
             value.output_watermark = status.output_watermark;
             if let Some(error) = status.error {
                 value.errors.push(error);
             }
-            store.replace(revision, &mut value)?;
+            if serde_json::to_vec(&value)? != previous {
+                store.replace(revision, &mut value)?;
+            }
         }
         drop(guard);
         Ok(value)
     }
 
-    async fn launch_execution(
+    async fn recover_raw(
         &self,
-        client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+        value: &process::RunStatus,
+        authority: &pane::TerminalReconciliation,
+    ) -> Result<()> {
+        let store = self.store()?;
+        let reservation = store.reservation(value.run_id)?;
+        let mut cursor = store
+            .capture_cursor(value.run_id)?
+            .unwrap_or(reservation.initial_cursor);
+        ensure!(
+            cursor.offset <= authority.continuation_cursor.offset,
+            "capture cursor beyond authority"
+        );
+        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        for _ in 0..64 {
+            if cursor.offset == authority.continuation_cursor.offset {
+                return Ok(());
+            }
+            let response = capture_resume(&mut client, cursor.clone()).await?;
+            match response {
+                pane::TerminalCaptureResponse::Batch { value: batch } => {
+                    ensure!(
+                        batch.cursor == cursor && batch.continuation.offset > cursor.offset,
+                        "capture batch did not advance exact cursor"
+                    );
+                    store.commit_raw_batch(value.run_id, &batch)?;
+                    cursor = batch.continuation;
+                }
+                pane::TerminalCaptureResponse::Gap { value: gap } => anyhow::bail!(
+                    "canonical capture gap: {}; requested={} oldest={}; cannot fabricate timing/events",
+                    gap.reason,
+                    gap.requested.offset,
+                    gap.oldest.offset
+                ),
+            }
+        }
+        anyhow::bail!(
+            "raw recovery bounded batch budget exhausted; retry to continue committed cursor"
+        )
+    }
+
+    async fn retry_launch(
+        &self,
         id: Uuid,
+        launch_mutation_id: Uuid,
         options: process::ProgramOptions,
-    ) -> Result<Result<sessions::ExecutionRef>> {
-        if self.terminal {
-            terminal::client::new_program_session(
-                client,
-                Some(format!("process-{id}")),
-                terminal::TerminalProgramOptions {
-                    program: options.program,
-                    args: options.args,
-                    cwd: options.cwd,
-                    env: options.env,
-                    cols: options.cols,
-                    rows: options.rows,
-                },
-                terminal::TerminalLifecycle::ConventionalTerminalSession,
-            )
-            .await
-            .map(|result| {
-                result
-                    .map(|reference| sessions::ExecutionRef {
-                        session_id: reference.session_id,
-                        pane_id: reference.pane_id,
-                        execution_token: reference.execution_token,
-                    })
-                    .map_err(|error| anyhow::anyhow!("terminal launch failed: {error:?}"))
-            })
-            .map_err(|error| anyhow::anyhow!("terminal launch transport: {error}"))
-        } else {
-            sessions::client::new_program_session(
-                client,
-                Some(format!("process-{id}")),
-                sessions::ProgramOptions {
+    ) -> Result<process::RunStatus> {
+        let store = self.store()?;
+        let mut existing = store.load(id).context("admitted launch has no committed run metadata; recovery required; refusing blind relaunch")?;
+        if existing.execution.is_none() {
+            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            // Reserve is idempotent against the exact persisted mutation/options;
+            // it cannot spawn. Lost reserve replies recover the same identity.
+            let reservation = pane::client::reserve(
+                &mut client,
+                launch_mutation_id,
+                pane::TerminalProgramOptions {
                     program: options.program,
                     args: options.args,
                     cwd: options.cwd,
@@ -320,22 +409,52 @@ impl ProcessService {
                     rows: options.rows,
                 },
             )
-            .await
-            .map(|result| result.map_err(|error| anyhow::anyhow!("launch failed: {error:?}")))
-            .map_err(|error| anyhow::anyhow!("launch transport: {error}"))
+            .await?
+            .map_err(|error| anyhow::anyhow!("reserve reconciliation: {error:?}"))?;
+            store.write_reservation(id, &reservation)?;
+            existing.execution = Some(process::ExecutionRef {
+                session_id: reservation.execution.session_id,
+                pane_id: reservation.execution.pane_id,
+                execution_token: reservation.execution.execution_token,
+            });
+            store.replace(existing.revision, &mut existing)?;
+        }
+        self.refresh(id).await
+    }
+
+    fn initial_status(
+        id: Uuid,
+        launch_mutation_id: Uuid,
+        recording_id: Uuid,
+        runtime_root: String,
+    ) -> process::RunStatus {
+        process::RunStatus {
+            schema_version: 4,
+            run_id: id,
+            revision: 1,
+            launch_mutation_id,
+            recording_id,
+            execution: None,
+            runtime_root,
+            phase: process::RunPhase::Starting,
+            exit_code: None,
+            target_exited: false,
+            terminal_session_ended: false,
+            capture_eof: false,
+            capture_watermark: 0,
+            recording_watermark: 0,
+            durable_recording_complete: false,
+            timing_complete: true,
+            cleanup_complete: false,
+            recovery_required: false,
+            output_drained: false,
+            output_watermark: 0,
+            capture_finalized: false,
+            errors: vec![],
         }
     }
 
-    async fn launch(
-        &self,
-        options: process::ProgramOptions,
-        runtime_root: String,
-    ) -> Result<process::RunStatus> {
-        self.require_isolation()?;
-        ensure!(
-            runtime_root == self.runtime_root,
-            "isolated runtime locator mismatch"
-        );
+    fn validate_options(options: &process::ProgramOptions) -> Result<()> {
         ensure!(
             !options.program.is_empty() && options.cols > 0 && options.rows > 0,
             "invalid program or viewport"
@@ -348,29 +467,56 @@ impl ProcessService {
             options.args.len() <= 4096 && options.env.len() <= 4096,
             "program options exceed bounds"
         );
+        Ok(())
+    }
+
+    async fn launch(
+        &self,
+        id: Uuid,
+        launch_mutation_id: Uuid,
+        options: process::ProgramOptions,
+        runtime_root: String,
+    ) -> Result<process::RunStatus> {
+        self.require_isolation()?;
+        let runtime_root = verified_launch_root(&runtime_root, &self.runtime_root)?;
+        Self::validate_options(&options)?;
+        let store = self.store()?;
+        let intent = serde_json::to_vec(&(id, launch_mutation_id, &options, &runtime_root))?;
+        if store.admit_launch(id, launch_mutation_id, &intent)? {
+            return self.retry_launch(id, launch_mutation_id, options).await;
+        }
         let recording = self.prepare_capture(&options)?;
-        let id = Uuid::new_v4();
-        let mut value = process::RunStatus {
-            schema_version: 1,
-            run_id: id,
-            revision: 1,
-            recording_id: recording.id,
-            execution: None,
-            runtime_root,
-            phase: process::RunPhase::Starting,
-            exit_code: None,
-            output_drained: false,
-            output_watermark: 0,
-            capture_finalized: false,
-            errors: vec![],
-        };
+        let mut value = Self::initial_status(id, launch_mutation_id, recording.id, runtime_root);
         // Acknowledged metadata precedes launch; failure to persist prevents execution.
         if let Err(error) = self.store()?.create(&value) {
             let _ = stop_capture(recording.id);
             return Err(error);
         }
         let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
-        let launched = self.launch_execution(&mut client, id, options).await;
+        let reservation = pane::client::reserve(
+            &mut client,
+            launch_mutation_id,
+            pane::TerminalProgramOptions {
+                program: options.program,
+                args: options.args,
+                cwd: options.cwd,
+                env: options.env,
+                cols: options.cols,
+                rows: options.rows,
+            },
+        )
+        .await?
+        .map_err(|error| anyhow::anyhow!("reserve: {error:?}"))?;
+        store.write_reservation(id, &reservation)?;
+        value.execution = Some(process::ExecutionRef {
+            session_id: reservation.execution.session_id,
+            pane_id: reservation.execution.pane_id,
+            execution_token: reservation.execution.execution_token,
+        });
+        store.replace(1, &mut value)?;
+        let launched = pane::client::launch(&mut client, reservation)
+            .await
+            .map(|result| result.map(|receipt| receipt.reservation.execution));
         match launched {
             Ok(Ok(reference)) => {
                 value.execution = Some(process::ExecutionRef {
@@ -380,7 +526,9 @@ impl ProcessService {
                 });
                 value.phase = process::RunPhase::Running;
             }
-            Err(error) if self.terminal => {
+            Err(error) => {
+                value.phase = process::RunPhase::RecoveryRequired;
+                value.recovery_required = true;
                 value.errors.push(format!(
                     "native launch outcome uncertain; recovery required; refusing relaunch: {error}"
                 ));
@@ -388,7 +536,7 @@ impl ProcessService {
                     .mutation
                     .lock()
                     .map_err(|_| anyhow::anyhow!("process authority lock poisoned"))?;
-                self.store()?.replace(1, &mut value)?;
+                self.store()?.replace(value.revision, &mut value)?;
                 drop(guard);
                 return Err(anyhow::anyhow!(
                     "native launch outcome uncertain; retained recording {}; recovery required",
@@ -411,19 +559,9 @@ impl ProcessService {
             .mutation
             .lock()
             .map_err(|_| anyhow::anyhow!("process authority lock poisoned"))?;
-        let persisted = self.store()?.replace(1, &mut value);
+        let persisted = self.store()?.replace(value.revision, &mut value);
         drop(guard);
-        if let Err(error) = persisted {
-            if value.execution.is_some() {
-                let cleanup = self
-                    .execution_terminate(&mut client, execution(&value)?, 0)
-                    .await;
-                return Err(error.context(format!(
-                    "launch persistence failed; execution cleanup: {cleanup:?}"
-                )));
-            }
-            return Err(error);
-        }
+        persisted.context("launch outcome metadata could not commit; retained execution authority requires reconciliation, never implicit termination")?;
         Ok(value)
     }
 
@@ -469,13 +607,92 @@ impl ProcessService {
         Ok(recording)
     }
 
+    async fn verify_raw_source(&self, value: &process::RunStatus, watermark: u64) -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom};
+        let reservation = self.store()?.reservation(value.run_id)?;
+        let mut cursor = reservation.initial_cursor;
+        let mut file = std::fs::File::open(
+            self.root
+                .join(value.recording_id.to_string())
+                .join("output.live"),
+        )?;
+        ensure!(
+            file.metadata()?.len() == watermark,
+            "recording raw boundary differs from execution authority"
+        );
+        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        while cursor.offset < watermark {
+            let response = capture_resume(&mut client, cursor.clone()).await?;
+            match response {
+                pane::TerminalCaptureResponse::Batch { value: batch } => {
+                    ensure!(
+                        batch.cursor == cursor
+                            && batch.continuation.execution == cursor.execution
+                            && batch.continuation.spool_generation == cursor.spool_generation
+                            && batch.continuation.offset > cursor.offset
+                            && batch.continuation.offset <= watermark
+                            && batch
+                                .cursor
+                                .offset
+                                .checked_add(u64::try_from(batch.data.len())?)
+                                == Some(batch.continuation.offset),
+                        "canonical raw verification identity/boundary mismatch"
+                    );
+                    let mut recorded = vec![0; batch.data.len()];
+                    file.seek(SeekFrom::Start(cursor.offset))?;
+                    file.read_exact(&mut recorded)?;
+                    ensure!(
+                        recorded == batch.data,
+                        "event sink raw bytes differ from independently durable execution spool"
+                    );
+                    cursor = batch.continuation;
+                    tokio::task::yield_now().await;
+                }
+                pane::TerminalCaptureResponse::Gap { value: gap } => anyhow::bail!(
+                    "canonical source verification GAP: {}; cannot finalize incomplete recording",
+                    gap.reason
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    fn close_original_writer(&self, value: &process::RunStatus, watermark: u64) -> Result<()> {
+        let directory = self.root.join(value.recording_id.to_string());
+        let manifest: crate::recording_runtime::Manifest =
+            serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
+        if manifest.summary.ended_epoch_ms.is_none() {
+            stop_capture(value.recording_id)?;
+            // Persist original writer disposition independently of derived raw
+            // verification: a later repair must not lose genuine event timing.
+            let closure = closed_original_events(&directory, value, watermark)?;
+            crate::durable::write_atomic(
+                &directory.join("original-writer-closure.json"),
+                &serde_json::to_vec(&closure)?,
+            )?;
+        } else {
+            ensure!(
+                original_writer_closed(&directory, value)?,
+                "original writer closure receipt unavailable; original timing cannot be inferred"
+            );
+        }
+        Ok(())
+    }
+
     async fn finish_capture(
         &self,
         id: Uuid,
         expected: u64,
         terminate_running: bool,
     ) -> Result<process::RunStatus> {
-        let initial = self.load(id)?;
+        let admitted = self.load(id)?;
+        ensure!(admitted.revision == expected, "stale process run revision");
+        let initial = self.refresh(id).await?;
+        let expected = initial.revision;
+        ensure!(
+            initial.timing_complete,
+            "raw-only recovery has no original timing/events; capture remains incomplete and GIF/full telemetry finalization is unavailable"
+        );
         ensure!(initial.revision == expected, "stale process run revision");
         if initial.capture_finalized {
             return Ok(initial);
@@ -484,7 +701,7 @@ impl ProcessService {
         let status = self
             .execution_status(&mut client, execution(&initial)?, None)
             .await?;
-        if matches!(status.phase, pane::ExecutionPhase::Running) {
+        if matches!(status.phase, pane::TerminalExecutionPhase::Running) {
             ensure!(
                 terminate_running,
                 "process still running; explicit termination required"
@@ -496,7 +713,13 @@ impl ProcessService {
             .execution_status(&mut client, execution(&initial)?, Some(30_000))
             .await?;
         ensure!(
-            !matches!(status.phase, pane::ExecutionPhase::Running) && status.output_drained,
+            !matches!(status.phase, pane::TerminalExecutionPhase::Running)
+                && status.output_drained
+                && status.terminal_session_ended
+                && matches!(
+                    status.capture_integrity,
+                    pane::TerminalCaptureIntegrity::Complete
+                ),
             "process exit and capture drain are not yet complete"
         );
         ensure!(
@@ -506,6 +729,11 @@ impl ProcessService {
         );
         let final_screen = self
             .execution_screen(&mut client, execution(&initial)?)
+            .await?;
+        // Join the original writer before asynchronous independent spool verification;
+        // never hold recording authority's mutex across a service round trip.
+        self.close_original_writer(&initial, status.output_watermark)?;
+        self.verify_raw_source(&initial, status.output_watermark)
             .await?;
         let guard = self
             .mutation
@@ -539,25 +767,22 @@ impl ProcessService {
         value.output_drained = true;
         value.output_watermark = status.output_watermark;
         value.capture_finalized = true;
+        value.target_exited = true;
+        value.terminal_session_ended = status.terminal_session_ended;
+        value.capture_eof = status.output_drained;
+        value.capture_watermark = status.output_watermark;
+        value.recording_watermark = status.output_watermark;
+        value.durable_recording_complete = true;
+        value.cleanup_complete = status.cleanup_complete;
         store.replace(expected, &mut value)?;
         drop(guard);
         Ok(value)
     }
 }
 
-fn terminal_reference(
-    value: &pane::ExecutionRef,
-) -> bmux_pane_runtime_plugin_api::pane_runtime_execution_v3::TerminalExecutionRef {
-    bmux_pane_runtime_plugin_api::pane_runtime_execution_v3::TerminalExecutionRef {
-        session_id: value.session_id,
-        pane_id: value.pane_id,
-        execution_token: value.execution_token,
-    }
-}
-
-fn execution(value: &process::RunStatus) -> Result<pane::ExecutionRef> {
+fn execution(value: &process::RunStatus) -> Result<pane::TerminalExecutionRef> {
     let reference = value.execution.as_ref().context("run has no execution")?;
-    Ok(pane::ExecutionRef {
+    Ok(pane::TerminalExecutionRef {
         session_id: reference.session_id,
         pane_id: reference.pane_id,
         execution_token: reference.execution_token,
@@ -583,13 +808,19 @@ fn failure(error: anyhow::Error) -> process::ProcessError {
     }
 }
 
-impl process::RecordingProcessV1Service for ProcessService {
+impl process::RecordingProcessV4Service for ProcessService {
     fn start(
         &self,
+        run_id: Uuid,
+        launch_mutation_id: Uuid,
         options: process::ProgramOptions,
         runtime_root: String,
     ) -> Reply<'_, process::RunStatus> {
-        Box::pin(async move { self.launch(options, runtime_root).await.map_err(failure) })
+        Box::pin(async move {
+            self.launch(run_id, launch_mutation_id, options, runtime_root)
+                .await
+                .map_err(failure)
+        })
     }
     fn status(&self, run_id: Uuid) -> Reply<'_, process::RunStatus> {
         Box::pin(async move { self.refresh(run_id).await.map_err(failure) })
@@ -625,63 +856,152 @@ impl process::RecordingProcessV1Service for ProcessService {
                 .map_err(failure)
         })
     }
-    fn send(&self, run_id: Uuid, data: Vec<u8>, mutation_id: Uuid) -> Reply<'_, ()> {
+    fn reconcile(&self, run_id: Uuid) -> Reply<'_, process::RunStatus> {
+        Box::pin(async move { self.refresh(run_id).await.map_err(failure) })
+    }
+    fn send(
+        &self,
+        run_id: Uuid,
+        data: Vec<u8>,
+        mutation_id: Uuid,
+    ) -> Reply<'_, pane::TerminalInputReceipt> {
         Box::pin(async move {
-            if data.len() > 1024 * 1024 {
-                return Err(process::ProcessError::InvalidOptions {
-                    reason: "input exceeds 1 MiB".into(),
-                });
-            }
             let value = self.load(run_id).map_err(failure)?;
-            if value.capture_finalized {
-                return Err(process::ProcessError::StillRunning);
+            let replayed_input = self
+                .store()
+                .map_err(failure)?
+                .admit_input(run_id, mutation_id, &data)
+                .map_err(failure)?;
+            if let Some(receipt) = self
+                .store()
+                .map_err(failure)?
+                .input_receipt(run_id, mutation_id)
+                .map_err(failure)?
+            {
+                return Ok(receipt);
             }
             let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
-            let receipt = self
-                .root
-                .join(value.recording_id.to_string())
-                .join(format!("send-{mutation_id}.json"));
-            {
-                let _guard = self
-                    .mutation
-                    .lock()
-                    .map_err(|_| failure(anyhow::anyhow!("send lock poisoned")))?;
-                if receipt
-                    .try_exists()
+            // Reconnect authenticates transport; current execution authority must
+            // independently admit input before any write is attempted.
+            let authority =
+                pane::client::reconcile(&mut client, execution(&value).map_err(failure)?)
+                    .await
                     .map_err(|error| failure(error.into()))?
-                {
-                    let (previous, accepted): (Vec<u8>, bool) = serde_json::from_slice(
-                        &std::fs::read(&receipt).map_err(|error| failure(error.into()))?,
-                    )
-                    .map_err(|error| failure(error.into()))?;
-                    if previous != data {
-                        return Err(failure(anyhow::anyhow!(
-                            "conflicting send mutation identity"
-                        )));
-                    }
-                    if accepted {
-                        return Ok(());
-                    }
-                    return Err(failure(anyhow::anyhow!(
-                        "send outcome ambiguous; refusing duplicate input"
-                    )));
-                }
-                crate::durable::write_atomic(
-                    &receipt,
-                    &serde_json::to_vec(&(data.clone(), false))
-                        .map_err(|error| failure(error.into()))?,
-                )
-                .map_err(failure)?;
+                    .map_err(|error| {
+                        failure(anyhow::anyhow!("input authority reconciliation: {error:?}"))
+                    })?;
+            if authority.recovery_required
+                || !matches!(authority.launch.phase, pane::TerminalLaunchPhase::Running)
+            {
+                return Err(process::ProcessError::RecoveryRequired { reason: "execution authority is not currently writable; reconcile/resolve before input".into() });
             }
-            let saved = data.clone();
-            self.execution_send(&mut client, execution(&value).map_err(failure)?, data)
-                .await
+            self.store()
+                .map_err(failure)?
+                .admit_input(run_id, mutation_id, &data)
                 .map_err(failure)?;
-            crate::durable::write_atomic(
-                &receipt,
-                &serde_json::to_vec(&(saved, true)).map_err(|error| failure(error.into()))?,
+            let receipt = pane::client::send_admitted(
+                &mut client,
+                execution(&value).map_err(failure)?,
+                mutation_id,
+                data.clone(),
             )
-            .map_err(failure)
+            .await
+            .map_err(|error| failure(error.into()))?
+            .map_err(|error| failure(anyhow::anyhow!("input admission: {error:?}")))?;
+            if matches!(receipt.phase, pane::TerminalInputPhase::Completed) {
+                self.store()
+                    .map_err(failure)?
+                    .record_input_once(run_id, mutation_id, || {
+                        ensure!(
+                            !replayed_input,
+                            "original input event timing unavailable; cannot invent recovery events"
+                        );
+                        let reference = execution(&value)?;
+                        let handle = crate::manual_handle().context(
+                            "input capture owner unavailable; cannot invent original timing",
+                        )?;
+                        let handle = handle
+                            .read()
+                            .map_err(|_| anyhow::anyhow!("recording handle poisoned"))?;
+                        let runtime = handle
+                            .0
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("recording runtime poisoned"))?;
+                        ensure!(
+                            runtime
+                                .active_capture_target()
+                                .is_some_and(|(id, _)| id == value.recording_id),
+                            "input original capture owner unavailable"
+                        );
+                        runtime.record(
+                            bmux_recording_protocol::RecordingEventKind::PaneInputRaw,
+                            bmux_recording_protocol::RecordingPayload::Bytes { data: data.clone() },
+                            bmux_recording_runtime::RecordMeta {
+                                session_id: Some(reference.session_id),
+                                pane_id: Some(reference.pane_id),
+                                client_id: None,
+                            },
+                        )?;
+                        Ok(())
+                    })
+                    .map_err(failure)?;
+            }
+            self.store()
+                .map_err(failure)?
+                .write_input_receipt(run_id, mutation_id, &receipt)
+                .map_err(failure)?;
+            Ok(receipt)
+        })
+    }
+    fn input_receipt(
+        &self,
+        run_id: Uuid,
+        mutation_id: Uuid,
+    ) -> Reply<'_, pane::TerminalInputReceipt> {
+        Box::pin(async move {
+            let value = self.load(run_id).map_err(failure)?;
+            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            pane::client::input_receipt(
+                &mut client,
+                execution(&value).map_err(failure)?,
+                mutation_id,
+            )
+            .await
+            .map_err(|error| failure(error.into()))?
+            .map_err(|error| failure(anyhow::anyhow!("input receipt: {error:?}")))
+        })
+    }
+    fn resolve(
+        &self,
+        run_id: Uuid,
+        mutation_id: Uuid,
+        expected_revision: u64,
+        action: pane::TerminalResolutionAction,
+        input_mutation_id: Option<Uuid>,
+        grace_ms: u32,
+    ) -> Reply<'_, pane::TerminalResolutionReceipt> {
+        Box::pin(async move {
+            let value = self.load(run_id).map_err(failure)?;
+            let intent =
+                serde_json::to_vec(&(expected_revision, &action, input_mutation_id, grace_ms))
+                    .map_err(|error| failure(error.into()))?;
+            self.store()
+                .map_err(failure)?
+                .admit_resolution(run_id, mutation_id, &intent)
+                .map_err(failure)?;
+            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            pane::client::resolve(
+                &mut client,
+                execution(&value).map_err(failure)?,
+                mutation_id,
+                expected_revision,
+                action,
+                input_mutation_id,
+                grace_ms,
+            )
+            .await
+            .map_err(|error| failure(error.into()))?
+            .map_err(|error| failure(anyhow::anyhow!("resolution: {error:?}")))
         })
     }
     fn wait(&self, run_id: Uuid, timeout_ms: u32) -> Reply<'_, process::RunStatus> {
@@ -735,50 +1055,6 @@ impl process::RecordingProcessV1Service for ProcessService {
                 .await
                 .map_err(failure)
         })
-    }
-}
-
-impl bmux_recording_plugin_api::recording_process_terminal_v3::RecordingProcessTerminalV3Service
-    for ProcessService
-{
-    fn start(
-        &self,
-        options: process::ProgramOptions,
-        runtime_root: String,
-        _policy: bmux_recording_plugin_api::recording_process_terminal_v3::LifetimePolicy,
-    ) -> Reply<'_, process::RunStatus> {
-        Box::pin(async move { self.launch(options, runtime_root).await.map_err(failure) })
-    }
-    fn status(&self, run_id: Uuid) -> Reply<'_, process::RunStatus> {
-        process::RecordingProcessV1Service::status(self, run_id)
-    }
-    fn read(&self, run_id: Uuid, since: u64, max_bytes: u32) -> Reply<'_, process::OutputRead> {
-        process::RecordingProcessV1Service::read(self, run_id, since, max_bytes)
-    }
-    fn screen(&self, run_id: Uuid) -> Reply<'_, String> {
-        process::RecordingProcessV1Service::screen(self, run_id)
-    }
-    fn send(&self, run_id: Uuid, data: Vec<u8>, mutation_id: Uuid) -> Reply<'_, ()> {
-        process::RecordingProcessV1Service::send(self, run_id, data, mutation_id)
-    }
-    fn wait(&self, run_id: Uuid, timeout_ms: u32) -> Reply<'_, process::RunStatus> {
-        process::RecordingProcessV1Service::wait(self, run_id, timeout_ms)
-    }
-    fn terminate(&self, run_id: Uuid, grace_ms: u32) -> Reply<'_, process::RunStatus> {
-        process::RecordingProcessV1Service::terminate(self, run_id, grace_ms)
-    }
-    fn finish(
-        &self,
-        run_id: Uuid,
-        expected_revision: u64,
-        terminate_running: bool,
-    ) -> Reply<'_, process::RunStatus> {
-        process::RecordingProcessV1Service::finish(
-            self,
-            run_id,
-            expected_revision,
-            terminate_running,
-        )
     }
 }
 

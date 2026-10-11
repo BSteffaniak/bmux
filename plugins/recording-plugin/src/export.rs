@@ -2273,6 +2273,45 @@ fn render_screen_rgba(
     pixels
 }
 
+struct RowRaster {
+    svg: String,
+    pixels: Vec<u8>,
+    top: u32,
+}
+
+#[derive(Default)]
+struct RowRasterCache {
+    entries: std::collections::VecDeque<RowRaster>,
+    bytes: usize,
+}
+impl RowRasterCache {
+    const MAX_BYTES: usize = 128 * 1024 * 1024;
+    const MAX_ENTRIES: usize = 128;
+    fn get(&mut self, svg: &str) -> Option<(u32, Vec<u8>)> {
+        let index = self.entries.iter().position(|entry| entry.svg == svg)?;
+        let entry = self.entries.remove(index)?;
+        let pixels = (entry.top, entry.pixels.clone());
+        self.entries.push_back(entry);
+        Some(pixels)
+    }
+    fn insert(&mut self, svg: String, top: u32, pixels: Vec<u8>) {
+        let size = svg.len().saturating_add(pixels.len());
+        if size > Self::MAX_BYTES {
+            return;
+        }
+        while self.entries.len() >= Self::MAX_ENTRIES
+            || self.bytes.saturating_add(size) > Self::MAX_BYTES
+        {
+            let Some(entry) = self.entries.pop_front() else {
+                break;
+            };
+            self.bytes -= entry.svg.len() + entry.pixels.len();
+        }
+        self.bytes += size;
+        self.entries.push_back(RowRaster { svg, pixels, top });
+    }
+}
+
 struct ResvgFrameRenderer {
     width: usize,
     height: usize,
@@ -2287,6 +2326,8 @@ struct ResvgFrameRenderer {
     font_family_attr: String,
     options_usvg: usvg::Options<'static>,
     svg: String,
+    row_cache: RowRasterCache,
+    cache_enabled: bool,
 }
 
 impl ResvgFrameRenderer {
@@ -2361,7 +2402,56 @@ impl ResvgFrameRenderer {
             font_family_attr,
             options_usvg,
             svg: String::with_capacity(width.saturating_mul(height / 4).max(1024)),
+            row_cache: RowRasterCache::default(),
+            cache_enabled: true,
         })
+    }
+
+    fn render_cached_rows(&mut self, sources: &[String]) -> Result<Option<Vec<u8>>> {
+        let mut output = tiny_skia::Pixmap::new(self.width_u32, self.height_u32)
+            .context("failed allocating cached scene")?;
+        for source in sources {
+            let (top, pixels) = if let Some(pixels) = self.row_cache.get(source) {
+                pixels
+            } else {
+                let tree = usvg::Tree::from_str(source, &self.options_usvg)
+                    .context("failed parsing row raster")?;
+                let mut pixmap = tiny_skia::Pixmap::new(self.width_u32, self.height_u32)
+                    .context("failed allocating row raster")?;
+                // Full viewport preserves all overhang and original row paint order.
+                resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+                let stride = self.width * 4;
+                let first = pixmap
+                    .data()
+                    .chunks_exact(stride)
+                    .position(|row| row.chunks_exact(4).any(|pixel| pixel[3] != 0))
+                    .unwrap_or(0);
+                let last = pixmap
+                    .data()
+                    .chunks_exact(stride)
+                    .rposition(|row| row.chunks_exact(4).any(|pixel| pixel[3] != 0))
+                    .unwrap_or(first);
+                let top = u32::try_from(first)?;
+                let pixels = pixmap.data()[first * stride..(last + 1) * stride].to_vec();
+                self.row_cache.insert(source.clone(), top, pixels.clone());
+                (top, pixels)
+            };
+            let image = tiny_skia::PixmapRef::from_bytes(
+                &pixels,
+                self.width_u32,
+                u32::try_from(pixels.len() / (self.width * 4))?,
+            )
+            .context("invalid cached row raster")?;
+            output.draw_pixmap(
+                0,
+                i32::try_from(top)?,
+                image,
+                &tiny_skia::PixmapPaint::default(),
+                tiny_skia::Transform::default(),
+                None,
+            );
+        }
+        Ok(Some(output.take()))
     }
 
     #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
@@ -2387,8 +2477,14 @@ impl ResvgFrameRenderer {
         )
         .expect("svg write cannot fail");
 
+        let header = self.svg.clone();
+        let mut row_sources = Vec::with_capacity(usize::from(rows));
+        let mut cache_safe = self.cache_enabled
+            && rows as usize * self.cell_height_px == self.height
+            && cols as usize * self.cell_width_px == self.width;
         let display_rows = grid.display_rows(0, usize::from(rows));
         for row in 0..rows {
+            let row_start = self.svg.len();
             let mut row_runs = Vec::<TextRun>::new();
             let mut current_run = None::<TextRun>;
             for col in 0..cols {
@@ -2424,6 +2520,11 @@ impl ResvgFrameRenderer {
                 let cell_text = cell
                     .filter(|cell| !cell.is_wide_continuation() && !cell.text().is_empty())
                     .map_or(" ", bmux_terminal_grid::Cell::text);
+                cache_safe &= !grid_style.italic
+                    && !grid_style.bold
+                    && !grid_style.underline
+                    && cell
+                        .is_none_or(|cell| !cell.is_wide_continuation() && cell.text().is_ascii());
                 let style = TextStyle {
                     fg_rgb,
                     bold: grid_style.bold,
@@ -2478,9 +2579,13 @@ impl ResvgFrameRenderer {
                 )
                 .expect("svg write cannot fail");
             }
+            row_sources.push(format!("{header}{}</g></svg>", &self.svg[row_start..]));
         }
 
         self.svg.push_str("</g></svg>");
+        if cache_safe && let Some(pixels) = self.render_cached_rows(&row_sources)? {
+            return Ok(pixels);
+        }
 
         let tree = usvg::Tree::from_str(&self.svg, &self.options_usvg)
             .context("failed to parse SVG frame")?;
@@ -3558,6 +3663,89 @@ fn xterm_256_palette() -> [(u8, u8, u8); 256] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires two explicitly owned export probe paths"]
+    fn decoded_export_probe_matches_every_frame_and_delay() {
+        fn decode(path: &str) -> Vec<(Vec<u8>, u16)> {
+            let mut options = gif::DecodeOptions::new();
+            options.set_color_output(gif::ColorOutput::RGBA);
+            let mut decoder = options
+                .read_info(std::fs::File::open(path).unwrap())
+                .unwrap();
+            let mut frames = Vec::new();
+            while let Some(frame) = decoder.read_next_frame().unwrap() {
+                frames.push((frame.buffer.to_vec(), frame.delay));
+            }
+            frames
+        }
+        let original = decode(&std::env::var("BMUX_EXPORT_PROBE_ORIGINAL").unwrap());
+        let cached = decode(&std::env::var("BMUX_EXPORT_PROBE_CACHED").unwrap());
+        assert_eq!(original.len(), 30);
+        assert_eq!(original, cached);
+    }
+
+    #[test]
+    fn row_raster_cache_evicts_lru_and_rejects_oversized_entries() {
+        let mut cache = RowRasterCache::default();
+        for index in 0..RowRasterCache::MAX_ENTRIES {
+            cache.insert(index.to_string(), 0, vec![0; 4]);
+        }
+        assert!(cache.get("0").is_some());
+        cache.insert("new".into(), 0, vec![0; 4]);
+        assert!(cache.get("1").is_none());
+        assert!(cache.get("0").is_some());
+        cache.insert(
+            "oversized".into(),
+            0,
+            vec![0; RowRasterCache::MAX_BYTES + 1],
+        );
+        assert!(cache.get("oversized").is_none());
+        assert!(cache.bytes <= RowRasterCache::MAX_BYTES);
+        assert!(cache.entries.len() <= RowRasterCache::MAX_ENTRIES);
+    }
+
+    #[test]
+    fn row_raster_cache_matches_original_scene_for_every_update() {
+        let options =
+            build_render_options(None, RecordingRenderMode::Font, None, None, None, &[]).unwrap();
+        let mut cached = ResvgFrameRenderer::new(3, 12, 8, 16, &options).unwrap();
+        let mut original = ResvgFrameRenderer::new(3, 12, 8, 16, &options).unwrap();
+        original.cache_enabled = false;
+        let palette = ExportPalette::xterm();
+        let mut stream = bmux_terminal_grid::TerminalGridStream::new(
+            12,
+            3,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .unwrap();
+        for bytes in [
+            b"hello\r\nworld".as_slice(),
+            b"\x1b[1;1Hhello",
+            b"\x1b[31mred\x1b[0m",
+            b"\x1b[3mitalic\x1b[0m",
+            "界e\u{301}".as_bytes(),
+            b"\x1b[4munder\x1b[0m",
+            b"\x1b[2J\x1b[Hplain",
+        ] {
+            stream.process(bytes);
+            assert_eq!(
+                cached.render(stream.grid(), 3, 12, &palette).unwrap(),
+                original.render(stream.grid(), 3, 12, &palette).unwrap()
+            );
+        }
+        stream.resize(10, 2).unwrap();
+        assert_eq!(
+            cached.render(stream.grid(), 2, 10, &palette).unwrap(),
+            original.render(stream.grid(), 2, 10, &palette).unwrap()
+        );
+        assert!(cached.row_cache.bytes <= RowRasterCache::MAX_BYTES);
+        assert!(cached.row_cache.entries.len() <= RowRasterCache::MAX_ENTRIES);
+        assert!(
+            !cached.row_cache.entries.is_empty(),
+            "test must exercise cache, not only fallback"
+        );
+    }
 
     fn decoded_final_gif(events: &[DisplayTrackEnvelope]) -> Vec<u8> {
         let directory = std::env::temp_dir().join(format!("bmux-gif-boundary-{}", Uuid::new_v4()));

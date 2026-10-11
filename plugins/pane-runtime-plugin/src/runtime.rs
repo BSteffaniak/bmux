@@ -1,10 +1,10 @@
 //! Concrete pane runtime implementation owned by the pane-runtime plugin.
 
+mod durable_capture;
 pub(crate) mod execution;
 pub(crate) mod reservations;
 mod startup_capture;
 pub(crate) mod supervisor;
-pub(crate) mod terminal_session;
 
 use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::{
@@ -1249,6 +1249,11 @@ struct PaneRuntimeHandle {
 }
 
 enum PaneRuntimeCommand {
+    AdmittedInput(
+        Vec<u8>,
+        std::sync::mpsc::SyncSender<Result<(), String>>,
+        tokio::sync::OwnedSemaphorePermit,
+    ),
     GuardedInput(Vec<u8>, tokio::sync::OwnedSemaphorePermit),
     GuardedResize {
         rows: u16,
@@ -5205,13 +5210,26 @@ impl SessionRuntimeManager {
         launch: Option<PaneLaunchSpec>,
         size: (u16, u16),
     ) -> Result<PreparedFreshRuntime> {
+        self.prepare_reserved_program_runtime(session_id, options, launch, size, None)
+    }
+
+    fn prepare_reserved_program_runtime(
+        &self,
+        session_id: SessionId,
+        options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
+        launch: Option<PaneLaunchSpec>,
+        size: (u16, u16),
+        reserved: Option<
+            &bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionRef,
+        >,
+    ) -> Result<PreparedFreshRuntime> {
         validate_initial_shell_options(options.as_ref())?;
         if self.runtimes.contains_key(&session_id) {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
         }
 
         let cleanup = PreparedCleanup::reserve()?;
-        let first_pane_id = Uuid::new_v4();
+        let first_pane_id = reserved.map_or_else(Uuid::new_v4, |reference| reference.pane_id);
         let managed_program = launch.is_some();
         let pane_meta = PaneRuntimeMeta {
             id: first_pane_id,
@@ -5229,6 +5247,13 @@ impl SessionRuntimeManager {
             options,
             Some(permit),
         );
+        if let Some(reference) = reserved {
+            first_pane
+                .resurrection_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("execution identity lock poisoned"))?
+                .observation_execution = reference.execution_token;
+        }
         first_pane
             .execution
             .managed_program
@@ -5677,7 +5702,7 @@ impl SessionRuntimeManager {
                 mark_snapshot_dirty_flag();
             }
             let mut replay_on_prompt = false;
-            let mut supervisor_control: Option<Arc<supervisor::SupervisorControl>> = None;
+
             let (mut command, failed_spawn_label) = if let Some(launch) = launch.as_ref() {
                 if let Err(error) = validate_explicit_launch(launch) {
                     fail_startup!(error.to_string());
@@ -5695,30 +5720,7 @@ impl SessionRuntimeManager {
                 if let Some(cwd) = launch.cwd.as_deref().or(initial_cwd.as_deref()) {
                     command.cwd(cwd);
                 }
-                if managed_program {
-                    let token = resurrection_state_for_reader
-                        .lock()
-                        .expect("execution identity lock")
-                        .observation_execution;
-                    let conventional_session = execution_for_task
-                        .conventional_session
-                        .load(Ordering::SeqCst);
-                    let (control, mut helper) = match supervisor::SupervisorControl::prepare_mode(
-                        token,
-                        conventional_session,
-                    ) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            fail_startup!(format!("supervisor preparation failed: {error}"));
-                            return;
-                        }
-                    };
-                    configure_pane_terminal_env(&mut helper, &pane_term, pane_image_protocol);
-                    supervisor_control = Some(Arc::new(control));
-                    (helper, "execution supervisor".to_string())
-                } else {
-                    (command, format!("command '{}'", launch.program))
-                }
+                (command, format!("command {}", launch.program))
             } else {
                 let mut command = CommandBuilder::new(&shell);
                 configure_pane_terminal_env(&mut command, &pane_term, pane_image_protocol);
@@ -5752,6 +5754,59 @@ impl SessionRuntimeManager {
             if let Some(resume) = &application_resume {
                 command.env("APPLICATION_RESURRECTION_HOST", &resume.endpoint);
             }
+            // One conventional owner path for explicit programs and prepared
+            // initial shells. Preserve the prepared argv/cwd/environment rather
+            // than constructing a second shell command or idle ctty anchor.
+            let argv = match command
+                .get_argv()
+                .iter()
+                .map(|arg| {
+                    arg.to_str().map(str::to_owned).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "non-UTF8 program argument unsupported by execution contract"
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(argv) if !argv.is_empty() => argv,
+                Ok(_) => {
+                    fail_startup!("prepared execution argv is empty".to_string());
+                    return;
+                }
+                Err(error) => {
+                    fail_startup!(error.to_string());
+                    return;
+                }
+            };
+            let guardian_launch = PaneLaunchSpec {
+                program: argv[0].clone(),
+                args: argv[1..].to_vec(),
+                cwd: command
+                    .get_cwd()
+                    .and_then(|path| path.to_str())
+                    .map(str::to_owned),
+                env: command
+                    .iter_full_env_as_str()
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                    .collect(),
+            };
+            if let Err(error) = validate_explicit_launch(&guardian_launch) {
+                fail_startup!(format!("prepared execution command invalid: {error}"));
+                return;
+            }
+            let token = resurrection_state_for_reader
+                .lock()
+                .expect("execution identity lock")
+                .observation_execution;
+            let control = match supervisor::SupervisorControl::prepare(token) {
+                Ok((control, _helper)) => control,
+                Err(error) => {
+                    fail_startup!(format!("guardian preparation failed: {error}"));
+                    return;
+                }
+            };
+            let supervisor_control = Some(Arc::new(control));
             // PTY allocation and command preparation may have overlapped an
             // abandoned request. Check again at the process side-effect boundary.
             if startup_stop_requested(&mut stop_rx) {
@@ -5782,7 +5837,10 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
-            let (mut reader, capture_thread) = match startup_capture::start(raw_reader) {
+            let (mut reader, capture_thread) = match startup_capture::start_captured(
+                raw_reader,
+                Arc::clone(&execution_for_task),
+            ) {
                 Ok(capture) => capture,
                 Err(error) => {
                     fail_startup!(format!("failed to start PTY capture: {error}"));
@@ -5802,10 +5860,7 @@ impl SessionRuntimeManager {
                 }};
             }
             let (startup_cleanup_tx, _) = watch::channel(None);
-            let conventional_session = execution_for_task
-                .conventional_session
-                .load(Ordering::SeqCst);
-            let spawned = if conventional_session {
+            let spawned = if supervisor_control.is_some() {
                 pty_pair
                     .master
                     .tty_name()
@@ -5830,30 +5885,33 @@ impl SessionRuntimeManager {
                 }
             });
             child_spawned = true;
+            let mut target_pid = None;
             if let Some(control) = &supervisor_control {
-                let launch = launch.as_ref().expect("supervised launch options");
-                if let Err(error) = control
+                let launch = &guardian_launch;
+                target_pid = match control
                     .start(launch, || execution_for_task.authorize_spawn())
                     .await
                 {
-                    let reason = cleanup_failed_startup_child_acknowledged(
-                        child.take(),
-                        format!("supervisor target startup failed: {error}"),
-                        &startup_cleanup_tx,
-                    )
-                    .await;
-                    fail_captured_startup!(reason, startup_cleanup_tx.borrow().clone());
-                    return;
-                }
+                    Ok(pid) => pid,
+                    Err(error) => {
+                        let reason = cleanup_failed_startup_child_acknowledged(
+                            child.take(),
+                            format!("supervisor target startup failed: {error}"),
+                            &startup_cleanup_tx,
+                        )
+                        .await;
+                        fail_captured_startup!(reason, startup_cleanup_tx.borrow().clone());
+                        return;
+                    }
+                };
                 *execution_for_task
                     .supervisor
                     .lock()
                     .expect("supervisor control lock") = Some(Arc::clone(control));
             }
             if let Some(resume) = &application_resume {
-                let result = child
-                    .process_id()
-                    .ok_or_else(|| "spawned process has no PID".to_owned())
+                let result = target_pid
+                    .ok_or_else(|| "terminal target has no acknowledged PID".to_owned())
                     .and_then(|pid| resume.bind(pid));
                 if let Err(error) = result {
                     let reason = cleanup_failed_startup_child_acknowledged(
@@ -5869,7 +5927,7 @@ impl SessionRuntimeManager {
             }
             let start_identity = startup_identity_or_stop(
                 async {
-                    match child.process_id() {
+                    match target_pid {
                         Some(pid) => bounded_process_start_identity(pid).await,
                         None => None,
                     }
@@ -5894,7 +5952,7 @@ impl SessionRuntimeManager {
                 *identity = start_identity;
             }
             if let Ok(mut pid) = process_id_for_task.lock() {
-                *pid = child.process_id();
+                *pid = target_pid;
             }
             if let Ok(mut pgid) = process_group_id_for_task.lock() {
                 *pgid = if supervisor_control.is_some() {
@@ -5981,7 +6039,7 @@ impl SessionRuntimeManager {
                             // timeout past the four-second supervision deadline.
                             let status = {
                                 let authority = execution_for_waiter.supervisor.lock();
-                                if execution_for_waiter.group_kill_issued.load(Ordering::SeqCst) {
+                                if execution_for_waiter.group_kill_issued.load(Ordering::SeqCst) || execution_for_waiter.target_stop_issued.load(Ordering::SeqCst) {
                                     break;
                                 }
                                 match authority {
@@ -6001,7 +6059,7 @@ impl SessionRuntimeManager {
                                         let _ = child_exit_tx.send(ExecutionExitNotice::TargetExited);
                                         exit_announced = true;
                                     }
-                                    if execution_for_waiter.conventional_session.load(Ordering::SeqCst) {
+                                    if supervisor_control.is_some() {
                                         if status.terminal_session_ended == Some(true) {
                                             execution_for_waiter.terminal_session_ended.store(true, Ordering::SeqCst);
                                             break;
@@ -6033,6 +6091,7 @@ impl SessionRuntimeManager {
                                 Err(error) => break Err(error),
                                 Ok(None) => {
                                     if execution_for_waiter.group_kill_issued.load(Ordering::SeqCst)
+                                        || execution_for_waiter.target_stop_issued.load(Ordering::SeqCst)
                                         || execution_for_waiter.terminal_owner_retired.load(Ordering::SeqCst)
                                     {
                                         // ChildKiller::clone_killer uses SIGHUP on Unix,
@@ -6411,10 +6470,19 @@ impl SessionRuntimeManager {
                 }
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_millis(10)) => {
-                        if execution_for_task.conventional_session.load(Ordering::SeqCst)
-                            && execution_for_task.terminal_session_ended.load(Ordering::SeqCst)
+                        if execution_for_task.terminal_session_ended.load(Ordering::SeqCst)
                             && execution_for_task.output_drained.load(Ordering::SeqCst) {
-                            let retired = execution_for_task.supervisor.lock().ok().and_then(|control| control.as_ref().map(|control| control.request(crate::supervisor_protocol::Operation::RetireOwner { mutation_id: "00000000-0000-4000-8000-000000000003".into() })));
+                            // Keep the same control fence through publishing retirement
+                            // and closing the guardian, excluding late termination requests.
+                            let retirement_guard = execution_for_task.supervisor.lock();
+                            // Explicit termination may already have acknowledged this
+                            // exact control's retirement before this task acquired the
+                            // fence. Its waiter is then allowed to reap the guardian;
+                            // never open a second socket after that committed receipt.
+                            if retirement_guard.is_ok() && execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let retired = retirement_guard.as_ref().ok().and_then(|control| control.as_ref().map(|control| control.request(crate::supervisor_protocol::Operation::RetireOwner { mutation_id: "00000000-0000-4000-8000-000000000003".into() })));
                             let retirement_error = match retired {
                                 Some(Ok(response)) => response.error,
                                 Some(Err(error)) => Some(error.to_string()),
@@ -6466,6 +6534,10 @@ impl SessionRuntimeManager {
                             other => (other, None),
                         };
                         match input {
+                            Some(PaneRuntimeCommand::AdmittedInput(bytes, acknowledgement, _permit)) => {
+                                let result = writer.lock().map_err(|_| "PTY writer lock poisoned".to_string()).and_then(|mut writer| writer.write_all(&bytes).and_then(|()| writer.flush()).map_err(|error| error.to_string()));
+                                let _ = acknowledgement.send(result);
+                            }
                             Some(PaneRuntimeCommand::Input(bytes)) => {
                                 if let Ok(mut writer) = writer.lock()
                                     && writer.write_all(&bytes).is_ok()
@@ -11547,6 +11619,75 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_shell_uses_conventional_owner_preserves_cwd_and_natural_tail() {
+        use std::os::unix::fs::PermissionsExt;
+        supervisor::install_test_artifact().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let shell = root.path().join("owned-shell");
+        std::fs::write(&shell, "#!/bin/sh\npwd > witness\nprintf TAIL\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let mut manager = SessionRuntimeManager::new(
+            shell.to_str().unwrap().into(),
+            "xterm-256color".into(),
+            protocol_profile_for_term("xterm-256color"),
+            true,
+            None,
+            PanePaddingConfig::default(),
+            exit_tx,
+        );
+        let session_id = SessionId(Uuid::new_v4());
+        let mut prepared = manager
+            .prepare_fresh_program_runtime(
+                session_id,
+                Some(
+                    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions {
+                        cwd: Some(root.path().to_str().unwrap().into()),
+                    },
+                ),
+                None,
+                (24, 80),
+            )
+            .unwrap();
+        let execution = Arc::clone(
+            &prepared
+                .runtime
+                .as_ref()
+                .unwrap()
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .execution,
+        );
+        let _cleanup = ExecutionTestCleanup(Arc::clone(&execution));
+        prepared.wait_until_ready().await.unwrap();
+        manager
+            .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
+            .unwrap();
+        let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pane.cleanup.borrow().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(pane.cleanup.borrow().as_ref().unwrap().is_ok());
+        assert!(execution.terminal_owner_retired.load(Ordering::SeqCst));
+        assert!(execution.output_drained.load(Ordering::SeqCst));
+        assert_eq!(execution.output_watermark.load(Ordering::SeqCst), 4);
+        assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
+        assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("witness"))
+                .unwrap()
+                .trim(),
+            root.path().canonicalize().unwrap().to_str().unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conventional_session_drains_startup_backpressure_and_retires_owner() {
         supervisor::install_test_artifact()
             .expect("explicit coordinator-built supervisor artifact");
@@ -11582,7 +11723,7 @@ mod tests {
                 .unwrap()
                 .execution,
         );
-        execution.conventional_session.store(true, Ordering::SeqCst);
+
         let _cleanup = ExecutionTestCleanup(Arc::clone(&execution));
         prepared.wait_until_ready().await.unwrap();
         manager
@@ -11688,10 +11829,9 @@ mod tests {
             40 * 8192 + 4
         );
         assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
-        assert!(!execution.output_drained.load(Ordering::SeqCst));
+        // Conventional owner retirement must yield natural EOF without Sweep.
+        // Completion is the reader watermark, never target exit or tcdrain.
         assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
-        assert!(execution.signal_owned_group(execution::GROUP_KILL).unwrap());
-        assert!(!execution.signal_owned_group(execution::GROUP_KILL).unwrap());
         tokio::time::timeout(Duration::from_secs(5), async {
             while !execution.output_drained.load(Ordering::SeqCst)
                 || pane.cleanup.borrow().is_none()
@@ -11751,22 +11891,57 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn prepare_escaped_terminal_witness(
+        manager: &SessionRuntimeManager,
+        session_id: SessionId,
+        witness: &std::path::Path,
+    ) -> PreparedFreshRuntime {
+        manager
+            .prepare_fresh_program_runtime(
+                session_id,
+                None,
+                Some(PaneLaunchSpec {
+                    program: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        r#"trap '' HUP TERM
+python3 -c 'import os,signal,time,errno,sys
+root=sys.argv[1]
+for sig in (signal.SIGHUP,signal.SIGTERM): signal.signal(sig,signal.SIG_IGN)
+open(root+"/descendant.pid","w").write(str(os.getpid()))
+open(root+"/ready","w").close()
+while not os.path.exists(root+"/probe"): time.sleep(0.01)
+try:
+ os.write(1,b"UNAUTHORIZED-LATE-OUTPUT")
+ result="unexpected writable terminal"
+except OSError as error: result=str(error.errno)
+open(root+"/late-result","w").write(result)
+while True: time.sleep(1)' "$1" < /dev/tty > /dev/tty 2>&1 &
+while [ ! -f "$1/ready" ]; do sleep 0.01; done
+printf TAIL
+exit 7"#
+                            .into(),
+                        "fixture".into(),
+                        witness.to_string_lossy().into_owned(),
+                    ],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                }),
+                (24, 80),
+            )
+            .unwrap()
+    }
+
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn owned_pty_group_survives_leader_then_is_killed() {
+    async fn ended_terminal_preserves_escaped_descendant_without_late_signal_authority() {
         supervisor::install_test_artifact()
             .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
         manager.runtimes.clear();
         let witness = tempfile::tempdir().unwrap();
-        let mut prepared = manager.prepare_fresh_program_runtime(session_id, None, Some(PaneLaunchSpec {
-            program: "/bin/sh".into(),
-            args: vec!["-c".into(), r#"trap '' HUP TERM
-/bin/sh -c 'trap "" HUP TERM; printf "%s" "$$" > "$1/descendant.pid"; touch "$1/ready"; while :; do sleep 1; done' fixture "$1" < /dev/tty > /dev/tty 2>&1 &
-while [ ! -f "$1/ready" ]; do sleep 0.01; done
-exit 0"#.into(), "fixture".into(), witness.path().to_string_lossy().into_owned()],
-            cwd: None, env: BTreeMap::new(),
-        }), (24, 80)).unwrap();
+        let mut prepared = prepare_escaped_terminal_witness(&manager, session_id, witness.path());
         let _cleanup = ExecutionTestCleanup(Arc::clone(
             &prepared
                 .runtime
@@ -11778,6 +11953,19 @@ exit 0"#.into(), "fixture".into(), witness.path().to_string_lossy().into_owned()
                 .unwrap()
                 .execution,
         ));
+        let capture_root = tempfile::tempdir().unwrap();
+        *prepared
+            .runtime
+            .as_ref()
+            .unwrap()
+            .panes
+            .values()
+            .next()
+            .unwrap()
+            .execution
+            .durable_capture
+            .lock()
+            .unwrap() = Some(durable_capture::DurableCapture::create(capture_root.path()).unwrap());
         prepared.wait_until_ready().await.unwrap();
         manager
             .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
@@ -11800,36 +11988,46 @@ exit 0"#.into(), "fixture".into(), witness.path().to_string_lossy().into_owned()
             pid: descendant,
             identity,
         };
-        let descendant_group =
-            resolve_process_group_id_for_pid(descendant).expect("descendant group");
-        assert_eq!(
-            Some(descendant_group),
-            *pane.process_group_id.lock().unwrap()
-        );
-        // TERM must not kill the witness: traps were installed before ready.
-        assert!(pane.execution.signal_owned_group(libc::SIGTERM).unwrap());
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
-        assert!(!pane.execution.output_drained.load(Ordering::SeqCst));
-        assert!(pane.execution.signal_owned_group(libc::SIGKILL).unwrap());
-        // Successful retirement is fenced locally: the helper may already be
-        // gone, but a second cleanup must not reconnect or signal a reused PGID.
-        assert!(!pane.execution.signal_owned_group(libc::SIGKILL).unwrap());
+        // Conventional terminal lifetime ends independently of escaped work.
+        // Retirement revokes controls; it never authorizes a remembered PGID kill.
         tokio::time::timeout(Duration::from_secs(5), async {
             while !matches!(&*pane.cleanup.borrow(), Some(Ok(()))) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .unwrap();
+        .expect("natural terminal EOF and owner retirement");
+        assert!(pane.execution.terminal_session_ended.load(Ordering::SeqCst));
+        assert!(pane.execution.terminal_owner_retired.load(Ordering::SeqCst));
         assert!(pane.execution.output_drained.load(Ordering::SeqCst));
+        assert_eq!(pane.execution.output_watermark.load(Ordering::SeqCst), 4);
+        let (boundary, bytes) =
+            durable_capture::DurableCapture::read(capture_root.path(), 0, 32).unwrap();
+        assert!(boundary.eof);
+        assert!(boundary.error.is_none());
+        assert_eq!(boundary.bytes, 4);
+        assert_eq!(bytes, b"TAIL");
+        assert_eq!(pane.execution.outcome.lock().unwrap().0, Some(7));
+        assert!(pane.execution.outcome.lock().unwrap().2.is_none());
+        assert!(!pane.execution.group_kill_issued.load(Ordering::SeqCst));
+        assert!(!pane.execution.signal_owned_group(libc::SIGTERM).unwrap());
+        assert!(!pane.execution.signal_owned_group(libc::SIGKILL).unwrap());
+        assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
+        std::fs::write(witness.path().join("probe"), b"").unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while process_start_identity_for_pid(descendant) == Some(identity) {
+            while !witness.path().join("late-result").exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("descendant must be reaped after owned group kill");
+        .expect("surviving witness probes revoked terminal");
+        assert_eq!(
+            std::fs::read_to_string(witness.path().join("late-result")).unwrap(),
+            libc::EIO.to_string()
+        );
+        assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
+        assert_eq!(pane.execution.output_watermark.load(Ordering::SeqCst), 4);
+        // Only WitnessProcessCleanup may terminate this identity-checked fixture.
     }
 
     #[cfg(unix)]
@@ -11898,6 +12096,17 @@ exit 0"#.into(), "fixture".into(), witness.path().to_string_lossy().into_owned()
             pane.execution.outcome.lock().unwrap()
         );
         assert!(pane.exited.load(Ordering::SeqCst));
+        assert_eq!(
+            pane.execution.outcome.lock().unwrap().1.as_deref(),
+            Some("9"),
+            "original target SIGKILL outcome must survive owner retirement"
+        );
+        assert!(pane.execution.target_stop_issued.load(Ordering::SeqCst));
+        assert!(pane.execution.terminal_owner_retired.load(Ordering::SeqCst));
+        assert!(
+            !pane.execution.group_kill_issued.load(Ordering::SeqCst),
+            "target termination must not claim descendant cleanup"
+        );
         assert!(!pane.execution.output_drained.load(Ordering::SeqCst));
         assert!(
             pane.execution

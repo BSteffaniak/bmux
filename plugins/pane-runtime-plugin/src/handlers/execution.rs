@@ -1,5 +1,7 @@
 //! Authorization at the exact execution service boundary.
-use bmux_pane_runtime_plugin_api::pane_runtime_execution_v1::{ExecutionError, ExecutionRef};
+use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
+    TerminalExecutionError as ExecutionError, TerminalExecutionRef as ExecutionRef,
+};
 use bmux_plugin_sdk::NativeServiceContext;
 
 pub(crate) fn authorize(

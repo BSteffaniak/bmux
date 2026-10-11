@@ -608,13 +608,13 @@ fn new_program_session(
     bmux_sessions_plugin_api::sessions_program_v1::ExecutionRef,
     bmux_sessions_plugin_api::sessions_program_v1::ProgramError,
 > {
-    use bmux_pane_runtime_plugin_api::pane_runtime_execution_v1 as execution;
+    use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4 as execution;
     use bmux_sessions_plugin_api::sessions_program_v1::{ExecutionRef, ProgramError};
     let mut client = dispatch_client(caller);
     let result = bmux_plugin::block_on_typed_dispatch(execution::client::new_program_session(
         &mut client,
         name.clone(),
-        execution::ProgramOptions {
+        execution::TerminalProgramOptions {
             program: options.program,
             args: options.args,
             cwd: options.cwd,
@@ -627,9 +627,9 @@ fn new_program_session(
         reason: error.to_string(),
     })?
     .map_err(|error| match error {
-        execution::ExecutionError::Unavailable => ProgramError::Unavailable,
-        execution::ExecutionError::Denied { reason } => ProgramError::Denied { reason },
-        execution::ExecutionError::InvalidOptions { reason } => {
+        execution::TerminalExecutionError::Unavailable => ProgramError::Unavailable,
+        execution::TerminalExecutionError::Denied { reason } => ProgramError::Denied { reason },
+        execution::TerminalExecutionError::InvalidOptions { reason } => {
             ProgramError::InvalidOptions { reason }
         }
         other => ProgramError::LaunchFailed {

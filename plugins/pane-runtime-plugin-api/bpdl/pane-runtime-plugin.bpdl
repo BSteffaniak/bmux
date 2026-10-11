@@ -18,9 +18,7 @@
 
 plugin bmux.pane_runtime version 1;
 
-capability PANE_RUNTIME_EXECUTION_V1 = bmux.pane_runtime.execution.v1;
-capability PANE_RUNTIME_EXECUTION_V2 = bmux.pane_runtime.execution.v2;
-capability PANE_RUNTIME_EXECUTION_V3 = bmux.pane_runtime.execution.v3;
+capability PANE_RUNTIME_EXECUTION_V4 = bmux.pane_runtime.execution.v4;
 capability PANE_RUNTIME_READ = bmux.pane_runtime.read;
 capability PANE_RUNTIME_WRITE = bmux.pane_runtime.write;
 capability ATTACH_RUNTIME_WRITE = bmux.attach_runtime.write;
@@ -28,71 +26,9 @@ capability ATTACH_RUNTIME_READ = bmux.attach_runtime.read;
 capability PANE_RUNTIME_SPAWN_V1 = bmux.pane_runtime.spawn.v1;
 
 // Exact execution controls. A replacement never inherits the old token.
-@capability(PANE_RUNTIME_EXECUTION_V1)
-interface pane-runtime-execution-v1 {
-    record program-options {
-        program: string,
-        args: list<string>,
-        cwd: string?,
-        env: map<string, string>,
-        cols: u16,
-        rows: u16,
-    }
-    record execution-ref {
-        session_id: uuid,
-        pane_id: uuid,
-        execution_token: uuid,
-    }
-    enum execution-phase { running, exited, failed }
-    record execution-status {
-        execution: execution-ref,
-        phase: execution-phase,
-        exit_code: u32?,
-        signal: string?,
-        output_drained: bool,
-        output_watermark: u64,
-        error: string?,
-    }
-    variant execution-error {
-        unavailable,
-        not-found,
-        stale-execution,
-        denied { reason: string },
-        invalid-options { reason: string },
-        launch-failed { reason: string },
-        operation-failed { reason: string },
-    }
-    command new-program-session(name: string?, options: program-options)
-        -> result<execution-ref, execution-error>;
-    record execution-screen {
-        execution: execution-ref,
-        output_watermark: u64,
-        cols: u16,
-        rows: u16,
-        cursor_col: u16,
-        cursor_row: u16,
-        cursor_visible: bool,
-        text: string,
-        // JSON GridSnapshot in the existing bmux_terminal_grid wire format.
-        encoded_grid: bytes,
-    }
-    command screen(execution: execution-ref) -> result<execution-screen, execution-error>;
-    command status(execution: execution-ref) -> result<execution-status, execution-error>;
-    // Acknowledges queue admission, not child consumption. Payloads are bounded.
-    command send(execution: execution-ref, data: bytes) -> result<unit, execution-error>;
-    command resize(execution: execution-ref, cols: u16, rows: u16)
-        -> result<unit, execution-error>;
-    // TERM followed by KILL after grace_ms; returns current state, not a drain promise.
-    command terminate(execution: execution-ref, grace_ms: u32)
-        -> result<execution-status, execution-error>;
-    // Bounded wait for exit AND PTY drain. Timeout returns current status unchanged.
-    command wait(execution: execution-ref, timeout_ms: u32)
-        -> result<execution-status, execution-error>;
-}
-
-// Explicit conventional terminal-session lifetime. Never reinterpret v1/v2.
-@capability(PANE_RUNTIME_EXECUTION_V3)
-interface pane-runtime-execution-v3 {
+// Cohesive execution contract. Earlier execution identities are unsupported.
+@capability(PANE_RUNTIME_EXECUTION_V4)
+interface pane-runtime-execution-v4 {
     record terminal-program-options {
         program: string,
         args: list<string>,
@@ -146,7 +82,7 @@ interface pane-runtime-execution-v3 {
     }
     // Target exit starts drain; owner retirement performs conventional OS hangup.
     // Detached holders are not individually killed, but late terminal I/O may fail.
-    command new-program-session(name: string?, options: terminal-program-options, lifecycle: terminal-lifecycle)
+    command new-program-session(name: string?, options: terminal-program-options)
         -> result<terminal-execution-ref, terminal-execution-error>;
     command status(execution: terminal-execution-ref) -> result<terminal-execution-status, terminal-execution-error>;
     command screen(execution: terminal-execution-ref) -> result<terminal-execution-screen, terminal-execution-error>;
@@ -178,7 +114,6 @@ interface pane-runtime-execution-v3 {
         launch_mutation_id: uuid,
         revision: u64,
         options: terminal-program-options,
-        policy: terminal-lifecycle,
         initial_cursor: terminal-capture-cursor,
     }
     record terminal-launch-receipt {
@@ -256,7 +191,7 @@ interface pane-runtime-execution-v3 {
     }
     variant terminal-capture-response { batch { value: terminal-capture-batch }, gap { value: terminal-capture-gap } }
     // Receipts persist until explicit retirement. Capacity rejects new admission.
-    command reserve(launch_mutation_id: uuid, options: terminal-program-options, policy: terminal-lifecycle)
+    command reserve(launch_mutation_id: uuid, options: terminal-program-options)
         -> result<terminal-launch-reservation, terminal-recovery-error>;
     command launch(reservation: terminal-launch-reservation) -> result<terminal-launch-receipt, terminal-recovery-error>;
     command reconcile(execution: terminal-execution-ref) -> result<terminal-reconciliation, terminal-recovery-error>;
@@ -269,144 +204,11 @@ interface pane-runtime-execution-v3 {
         -> result<terminal-resolution-receipt, terminal-recovery-error>;
     command capture-resume(cursor: terminal-capture-cursor, max_bytes: u32)
         -> result<terminal-capture-response, terminal-recovery-error>;
-    // Retirement requires authoritative completed cleanup and resolved uncertainty.
+    // Retirement requires durable EOF and resolved mutations; it never claims descendant cleanup.
     command retire(execution: terminal-execution-ref, retirement_mutation_id: uuid, expected_revision: u64)
         -> result<terminal-retirement-receipt, terminal-recovery-error>;
 }
 
-// Durable admission and recovery are explicitly negotiated; v1 is unchanged.
-@capability(PANE_RUNTIME_EXECUTION_V2)
-interface pane-runtime-execution-v2 {
-    record program-options {
-        program: string,
-        args: list<string>,
-        cwd: string?,
-        env: map<string, string>,
-        cols: u16,
-        rows: u16,
-    }
-    record execution-ref {
-        session_id: uuid,
-        pane_id: uuid,
-        execution_token: uuid,
-    }
-    enum exit-policy { preserve-descendants }
-    record capture-cursor {
-        execution: execution-ref,
-        spool_generation: uuid,
-        offset: u64,
-    }
-    enum launch-phase { reserved, launching, running, exited, uncertain, failed, retired }
-    enum input-phase { accepted, writing, completed, uncertain, rejected }
-    enum resolution-action { cancel-unstarted, terminate-owned-execution, acknowledge-uncertain-input }
-    variant recovery-error {
-        denied { reason: string },
-        unavailable { reason: string },
-        invalid-options { reason: string },
-        conflict { reason: string },
-        not-found { reason: string },
-        capacity { reason: string },
-        revision-conflict { actual_revision: u64 },
-        recovery-required { reason: string },
-        operation-failed { reason: string },
-    }
-    record launch-reservation {
-        execution: execution-ref,
-        launch_mutation_id: uuid,
-        revision: u64,
-        options: program-options,
-        policy: exit-policy,
-        initial_cursor: capture-cursor,
-    }
-    record launch-receipt {
-        reservation: launch-reservation,
-        phase: launch-phase,
-        revision: u64,
-        exit_code: u32?,
-        exit_signal: string?,
-        cleanup_complete: bool,
-        error: string?,
-    }
-    record input-receipt {
-        execution: execution-ref,
-        input_mutation_id: uuid,
-        revision: u64,
-        phase: input-phase,
-        admitted_bytes: u64,
-        // Completed means write+flush acknowledged, never child consumption.
-        acknowledged_bytes: u64,
-        error: string?,
-    }
-    record supervisor-locator {
-        execution: execution-ref,
-        protocol_version: u32,
-        artifact_sha256: string,
-        endpoint: string,
-        // Not a credential; reconnect independently authenticates runtime owner.
-        generation: u64,
-    }
-    record reconciliation {
-        launch: launch-receipt,
-        supervisor: supervisor-locator?,
-        // True only when the canonical raw stream has reached EOF without a gap.
-        capture_complete: bool,
-        oldest_cursor: capture-cursor,
-        continuation_cursor: capture-cursor,
-        recovery_required: bool,
-    }
-    record resolution-receipt {
-        execution: execution-ref,
-        resolution_mutation_id: uuid,
-        revision: u64,
-        action: resolution-action,
-        input_mutation_id: uuid?,
-        cleanup_complete: bool,
-        recovery_required: bool,
-        error: string?,
-    }
-    record retirement-receipt {
-        execution: execution-ref,
-        retirement_mutation_id: uuid,
-        revision: u64,
-        retired: bool,
-    }
-    record capture-batch {
-        cursor: capture-cursor,
-        continuation: capture-cursor,
-        data: bytes,
-        // Caught up to the response watermark, not process EOF.
-        complete: bool,
-    }
-    record capture-gap {
-        requested: capture-cursor,
-        oldest: capture-cursor,
-        continuation: capture-cursor,
-        reason: string,
-        // Missing snapshot is an explicit unavailable repair, never empty state.
-        encoded_grid: bytes?,
-        snapshot_cursor: capture-cursor?,
-    }
-    variant capture-response { batch { value: capture-batch }, gap { value: capture-gap } }
-    // Receipts persist until explicit retirement. Capacity rejects new admission.
-    command reserve(launch_mutation_id: uuid, options: program-options, policy: exit-policy)
-        -> result<launch-reservation, recovery-error>;
-    command launch(reservation: launch-reservation) -> result<launch-receipt, recovery-error>;
-    command reconcile(execution: execution-ref) -> result<reconciliation, recovery-error>;
-    command send(execution: execution-ref, input_mutation_id: uuid, data: bytes)
-        -> result<input-receipt, recovery-error>;
-    command input-receipt(execution: execution-ref, input_mutation_id: uuid)
-        -> result<input-receipt, recovery-error>;
-    command resolve(execution: execution-ref, resolution_mutation_id: uuid,
-        expected_revision: u64, action: resolution-action, input_mutation_id: uuid?, grace_ms: u32)
-        -> result<resolution-receipt, recovery-error>;
-    command capture-resume(cursor: capture-cursor, max_bytes: u32)
-        -> result<capture-response, recovery-error>;
-    // Retirement requires authoritative completed cleanup and resolved uncertainty.
-    command retire(execution: execution-ref, retirement_mutation_id: uuid, expected_revision: u64)
-        -> result<retirement-receipt, recovery-error>;
-}
-
-// Directory-aware creation is opt-in. Legacy contracts retain their meaning.
 @capability(PANE_RUNTIME_SPAWN_V1)
 interface pane-runtime-spawn-v1 {
     // An execution-host identity, not a client-side filesystem path.

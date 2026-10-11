@@ -2229,7 +2229,6 @@ dependencies = [
  "bmux_recording_plugin_api",
  "bmux_recording_protocol",
  "bmux_recording_runtime",
- "bmux_sessions_plugin_api",
  "bmux_terminal_grid",
  "crossterm",
  "font8x8",

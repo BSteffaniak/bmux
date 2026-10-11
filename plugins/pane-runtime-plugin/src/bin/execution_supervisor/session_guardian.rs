@@ -1,4 +1,4 @@
-//! Explicit terminal-session lifecycle; legacy supervisor is deliberately separate.
+//! Conventional terminal-session owner, independent authenticated guardian.
 use crate::protocol::{self, Bootstrap, Operation, Request, Response};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -12,6 +12,16 @@ struct OwnerOutcome {
     exit_code: Option<i32>,
     exit_signal: Option<i32>,
     drain_error: Option<String>,
+    #[serde(default)]
+    cleanup_requested: bool,
+}
+
+static REQUESTED_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+extern "C" fn request_term(_: libc::c_int) {
+    REQUESTED_SIGNAL.store(libc::SIGTERM, std::sync::atomic::Ordering::SeqCst);
+}
+extern "C" fn request_kill(_: libc::c_int) {
+    REQUESTED_SIGNAL.store(libc::SIGKILL, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn redirect_stdio() -> io::Result<()> {
@@ -53,13 +63,17 @@ pub(super) fn owner(launch_path: &str, outcome_path: &str) -> io::Result<()> {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
     let mut command = Command::new(program);
-    command.args(args).envs(env);
+    command.args(args).env_clear().envs(env);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    // SAFETY: only signal disposition changes in the child pre-exec hook.
+    // SAFETY: process-group/foreground ownership and signal disposition are
+    // established in this fresh direct target before exec; guardian has no ctty.
     unsafe {
         command.pre_exec(|| {
+            if libc::setpgid(0, 0) < 0 || libc::tcsetpgrp(0, libc::getpid()) < 0 {
+                return Err(io::Error::last_os_error());
+            }
             for signal in [
                 libc::SIGHUP,
                 libc::SIGTERM,
@@ -81,6 +95,7 @@ pub(super) fn owner(launch_path: &str, outcome_path: &str) -> io::Result<()> {
                     exit_code: None,
                     exit_signal: None,
                     drain_error: Some(format!("terminal target spawn failed: {error}")),
+                    cleanup_requested: false,
                 },
             )?;
             return Err(error);
@@ -89,11 +104,42 @@ pub(super) fn owner(launch_path: &str, outcome_path: &str) -> io::Result<()> {
     // Dropping the prepared command releases any retained spawn-side state;
     // only the product child and this terminal owner keep terminal descriptors.
     drop(command);
-    let status = child.wait()?;
+    // Signal handlers only store a request. The owner retains/reaps its actual
+    // target Child and durably publishes its result before terminal retirement.
+    unsafe {
+        libc::signal(libc::SIGUSR1, request_term as *const () as usize);
+        libc::signal(libc::SIGUSR2, request_kill as *const () as usize);
+    }
+    crate::atomic_state::commit(
+        &std::path::Path::new(outcome_path).with_extension("ready"),
+        &child.id(),
+    )?;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let signal = REQUESTED_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+        if signal != 0 {
+            // Kill only the actual unreaped direct target. Never kill the owner
+            // before it durably records target outcome; descendant cleanup is
+            // explicitly not claimed by this target termination receipt.
+            if signal == libc::SIGKILL {
+                child.kill()?;
+            } else if unsafe {
+                libc::kill(i32::try_from(child.id()).map_err(io::Error::other)?, signal)
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
     let mut outcome = OwnerOutcome {
         exit_code: status.code(),
         exit_signal: status.signal(),
         drain_error: None,
+        cleanup_requested: REQUESTED_SIGNAL.load(std::sync::atomic::Ordering::SeqCst)
+            == libc::SIGKILL,
     };
     write_outcome(std::path::Path::new(outcome_path), &outcome)?;
     // Target outcome is durable before drain/retirement. Later final publication
@@ -184,13 +230,20 @@ impl Guardian {
                     "terminal owner exited without durable outcome; capture incomplete".into()
                 })
             });
+        let target_pid = match std::fs::read(self.root.join("terminal-owner-outcome.ready")) {
+            Ok(bytes) => Some(serde_json::from_slice::<u32>(&bytes).map_err(io::Error::other)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         Ok(Response {
-            version: protocol::TERMINAL_SESSION_VERSION,
+            version: protocol::VERSION,
             execution_token: self.bootstrap.execution_token.clone(),
             started: self.start.is_some(),
+            target_pid,
             exit_code: outcome.as_ref().and_then(|o| o.exit_code),
             exit_signal: outcome.as_ref().and_then(|o| o.exit_signal),
-            group_consumed: self.consumed,
+            group_consumed: false,
+            target_terminated: self.consumed,
             terminal_session_ended: Some(owner_exited),
             cleanup_error: self.signal_failure.clone(),
             error,
@@ -208,27 +261,59 @@ impl Guardian {
             .owner
             .as_ref()
             .ok_or_else(|| io::Error::other("terminal owner unavailable"))?;
-        let group = i32::try_from(owner.id()).map_err(io::Error::other)?;
-        // SAFETY: unreaped DIRECT child pins this session's group identity.
-        // Never signal an inferred group from a remembered/recycled PID.
-        if unsafe { libc::kill(-group, signal) } != 0 {
-            let error = io::Error::last_os_error();
-            let empty_owned_group = error.raw_os_error() == Some(libc::ESRCH);
-            if !empty_owned_group {
-                self.signal_failure = Some(error.to_string());
-                return Err(error);
+        let pid = i32::try_from(owner.id()).map_err(io::Error::other)?;
+        let ready = self.root.join("terminal-owner-outcome.ready");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready.exists() && !self.owner_exited()? {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "terminal owner signal readiness unavailable",
+                ));
             }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if self.owner_exited()? {
+            // A racing natural/TERM exit is already a terminal target outcome,
+            // not a descendant sweep. Require the durable outcome before ack.
+            let outcome: OwnerOutcome = serde_json::from_slice(&std::fs::read(
+                self.root.join("terminal-owner-outcome.json"),
+            )?)
+            .map_err(io::Error::other)?;
+            if let Some(error) = outcome.drain_error {
+                return Err(io::Error::other(error));
+            }
+            self.consumed = true;
+            return Ok(());
+        }
+        let request_signal = if signal == libc::SIGKILL {
+            libc::SIGUSR2
+        } else {
+            libc::SIGUSR1
+        };
+        // Unreaped direct owner pins identity; it owns and reaps the target.
+        if unsafe { libc::kill(pid, request_signal) } != 0 {
+            return Err(io::Error::last_os_error());
         }
         if signal == libc::SIGKILL {
-            self.consumed = true;
-            let deadline = Instant::now() + Duration::from_secs(4);
-            let owner = self.owner.as_mut().expect("owned child");
-            while owner.try_wait()?.is_none() {
+            while !self.owner_exited()? {
                 if Instant::now() >= deadline {
-                    return Err(io::Error::other("terminal owner cleanup not acknowledged"));
+                    return Err(io::Error::other(
+                        "target outcome/terminal end not acknowledged",
+                    ));
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(5));
             }
+            let outcome: OwnerOutcome = serde_json::from_slice(&std::fs::read(
+                self.root.join("terminal-owner-outcome.json"),
+            )?)
+            .map_err(io::Error::other)?;
+            // The target may naturally exit after the request but before the
+            // owner observes it. Its durable outcome is authoritative either way.
+            if let Some(error) = outcome.drain_error {
+                return Err(io::Error::other(error));
+            }
+            // This acknowledges the ended target only, not escaped descendants.
+            self.consumed = true;
         }
         Ok(())
     }
@@ -300,7 +385,7 @@ impl Guardian {
     }
 
     fn operate(&mut self, request: Request) -> io::Result<Response> {
-        if request.version != protocol::TERMINAL_SESSION_VERSION
+        if request.version != protocol::VERSION
             || request.execution_token != self.bootstrap.execution_token
             || request.authentication != self.bootstrap.authentication
         {
@@ -360,7 +445,7 @@ pub(super) fn run(bootstrap_path: &str, socket_path: &str, slave: &str) -> io::R
     }
     let bootstrap: Bootstrap =
         serde_json::from_slice(&std::fs::read(path)?).map_err(io::Error::other)?;
-    if bootstrap.version != protocol::TERMINAL_SESSION_VERSION {
+    if bootstrap.version != protocol::VERSION {
         return Err(io::Error::other("unsupported supervisor version"));
     }
     // This role is launched with null stdio, never through a PTY spawn adapter.
@@ -401,12 +486,14 @@ pub(super) fn run(bootstrap_path: &str, socket_path: &str, slave: &str) -> io::R
         };
         let response = guardian.operate(request).unwrap_or_else(|error| {
             let mut response = guardian.status().unwrap_or_else(|_| Response {
-                version: protocol::TERMINAL_SESSION_VERSION,
+                version: protocol::VERSION,
                 execution_token: guardian.bootstrap.execution_token.clone(),
                 started: guardian.start.is_some(),
+                target_pid: None,
                 exit_code: None,
                 exit_signal: None,
-                group_consumed: guardian.consumed,
+                group_consumed: false,
+                target_terminated: guardian.consumed,
                 terminal_session_ended: None,
                 cleanup_error: guardian.signal_failure.clone(),
                 error: None,

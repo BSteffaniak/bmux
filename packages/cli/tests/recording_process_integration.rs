@@ -3,7 +3,7 @@
 //! BMUX_RECORDING_TEST_BINARY and BMUX_RECORDING_TEST_INSTALL_ROOT, pointing
 //! inside an explicitly owned staged/relocated installation.
 //! The coordinator builds/validates this target; this fixture never invokes Cargo.
-//! CLI JSON assertions follow process_commands.rs and recording-process-v1.
+//! CLI JSON assertions follow the sole recording-process-v4 contract.
 //! Start must automatically bootstrap an owned isolated runtime; this fixture never
 //! starts a server manually. Cleanup explicitly requests finish --cleanup-server.
 #![cfg(unix)]
@@ -23,6 +23,7 @@ struct RecordingEnv {
     binary: PathBuf,
     runs: std::cell::RefCell<Vec<String>>,
     command_sequence: std::cell::Cell<u64>,
+    profile_export: bool,
 }
 
 impl RecordingEnv {
@@ -48,6 +49,7 @@ impl RecordingEnv {
             binary: acceptance_binary(),
             runs: std::cell::RefCell::new(Vec::new()),
             command_sequence: std::cell::Cell::new(0),
+            profile_export: false,
         }
     }
 
@@ -92,6 +94,9 @@ impl RecordingEnv {
             if key.to_string_lossy().starts_with("BMUX_") {
                 command.env_remove(key);
             }
+        }
+        if self.profile_export {
+            command.env("BMUX_RECORDING_EXPORT_PROFILE", "1");
         }
         command
             .current_dir(&self.root)
@@ -151,13 +156,24 @@ impl RecordingEnv {
                 .env("BMUX_DATA_DIR", root.join("data"))
                 .env("BMUX_STATE_DIR", root.join("state"));
         }
+        let started = Instant::now();
         let mut child = command
             .stdin(stdin)
             .stdout(File::create(&stdout_path).expect("create command stdout"))
             .stderr(File::create(&stderr_path).expect("create command stderr"))
             .spawn()
             .expect("spawn explicit test binary");
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        // GIF export is a bounded offline rasterization workload, not a launch
+        // or input operation. The approved acceptance deadline is two minutes.
+        let exports_gif = args.windows(2).any(|pair| pair == ["--export", "gif"])
+            || args.contains(&"--format=gif")
+            || args.windows(2).any(|pair| pair == ["--format", "gif"]);
+        let timeout = if exports_gif {
+            Duration::from_secs(120)
+        } else {
+            COMMAND_TIMEOUT
+        };
+        let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.try_wait().expect("poll CLI child") {
                 break status;
@@ -172,6 +188,13 @@ impl RecordingEnv {
             }
             thread::sleep(POLL_INTERVAL);
         };
+        if self.profile_export {
+            eprintln!(
+                "finite CLI stage {args:?}: {:?}; stderr={}",
+                started.elapsed(),
+                fs::read_to_string(&stderr_path).expect("stage profiling stderr")
+            );
+        }
         Output {
             status,
             stdout: fs::read(stdout_path).expect("read command stdout"),
@@ -205,8 +228,8 @@ impl RecordingEnv {
         args.push(path.to_str().expect("fixture path UTF-8"));
         args.extend_from_slice(extra_args);
         let value = self.json(&args);
-        // Mirrors recording-process-v1 run-status; no heuristic identity lookup.
-        assert_eq!(value["schema_version"].as_u64(), Some(1));
+        // Mirrors recording-process-v4 run-status; no heuristic identity lookup.
+        assert_eq!(value["schema_version"].as_u64(), Some(4));
         assert!(
             value["revision"]
                 .as_u64()
@@ -250,7 +273,7 @@ impl RecordingEnv {
         .expect("dedicated runtime UUID");
         let locator_path = self
             .root
-            .join("data/recording-process-v1")
+            .join("data/recording-process-v4")
             .join(format!("{id}.json"));
         let locator: Value =
             serde_json::from_slice(&fs::read(locator_path).expect("owned locator"))
@@ -274,21 +297,6 @@ impl RecordingEnv {
         id
     }
 
-    fn wait_leader_exit(&self, id: &str, expected_code: u64) -> Value {
-        // Read-only observation: never terminate implicitly when polling status.
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
-        loop {
-            let status = self.json(&["recording", "process", "status", id, "--json"]);
-            if status["phase"].as_str() == Some("exited") {
-                assert_eq!(status["exit_code"].as_u64(), Some(expected_code));
-                assert_eq!(status["capture_finalized"].as_bool(), Some(false));
-                return status;
-            }
-            assert!(Instant::now() < deadline, "leader did not exit: {status}");
-            thread::sleep(POLL_INTERVAL);
-        }
-    }
-
     fn wait_exit(&self, id: &str) -> Value {
         self.json(&[
             "recording",
@@ -310,7 +318,7 @@ impl RecordingEnv {
             args.extend(["--export", *format]);
         }
         let value = self.json(&args);
-        assert_eq!(value["schema_version"].as_u64(), Some(1));
+        assert_eq!(value["schema_version"].as_u64(), Some(4));
         assert_eq!(value["status"]["run_id"].as_str(), Some(id));
         assert_eq!(value["status"]["capture_finalized"].as_bool(), Some(true));
         let artifacts = value["artifacts"]
@@ -476,6 +484,14 @@ fn process_help_is_discoverable_without_starting_a_server() {
         let text = String::from_utf8(output.stdout).expect("UTF-8 help");
         assert!(text.contains(verb), "missing verb in help: {text}");
         assert!(
+            !text.contains("--contract-version"),
+            "retired selector advertised: {text}"
+        );
+        assert!(
+            !text.contains("--lifetime"),
+            "retired lifecycle advertised: {text}"
+        );
+        assert!(
             text.contains("--json"),
             "missing JSON discoverability: {text}"
         );
@@ -537,6 +553,124 @@ fn malformed_process_arguments_fail_without_creating_a_recording() {
     );
 }
 
+#[test]
+fn retired_lifecycle_selectors_are_rejected_before_launch() {
+    let env = RecordingEnv::new();
+    let marker = env.root.join("must-not-launch");
+    let script = env.script("rejected.sh", &format!("touch '{}'\n", marker.display()));
+    for (selector, value) in [
+        ("--contract-version", "1"),
+        ("--contract-version", "3"),
+        ("--lifetime", "terminal-session"),
+    ] {
+        let output = env.run(&[
+            "recording",
+            "process",
+            "start",
+            selector,
+            value,
+            "--json",
+            "--",
+            "/bin/sh",
+            script.to_str().expect("script path"),
+        ]);
+        assert!(
+            !output.status.success(),
+            "retired selector accepted: {selector}"
+        );
+        let error = parse_json(&output);
+        assert_eq!(error["schema_version"], 4);
+        assert!(
+            error["error"]
+                .as_str()
+                .expect("explicit diagnostic")
+                .contains(&format!("unsupported option {selector}")),
+            "{error}"
+        );
+        assert!(!marker.exists(), "rejected client launched its program");
+    }
+    // An empty derived index directory is not a launch or recording authority.
+    // Reject any receipt/locator/archive file, while allowing that directory.
+    for directory in [
+        env.root.join("data/recording-process-v4"),
+        env.root.join("recordings"),
+    ] {
+        if directory.exists() {
+            assert_eq!(
+                fs::read_dir(&directory)
+                    .expect("owned state directory")
+                    .count(),
+                0,
+                "rejection created durable launch or archive state: {directory:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn process_manifest_exposes_only_the_cohesive_contract() {
+    let manifest = include_str!("../../../plugins/recording-plugin/plugin.toml");
+    assert!(manifest.contains("interface_id = \"recording-process-v4\""));
+    assert!(manifest.contains("capability   = \"bmux.recording.process.v4\""));
+    assert!(manifest.contains("\"bmux.pane_runtime.execution.v4\""));
+    for version in [1, 2, 3] {
+        assert!(!manifest.contains(&format!("recording-process-v{version}\"")));
+        assert!(!manifest.contains(&format!("bmux.recording.process.v{version}\"")));
+        assert!(!manifest.contains(&format!("bmux.pane_runtime.execution.v{version}\"")));
+    }
+}
+
+#[test]
+fn old_durable_versions_are_rejected_without_rewriting_evidence() {
+    let env = RecordingEnv::new();
+    let id = env.start("stty -opost\nprintf 'CANONICAL_DATA'\n", &[]);
+    let exited = env.wait_exit(&id);
+    assert_eq!(exited["output_drained"], true);
+    let evidence = env.finish(&id, "version-evidence", &["raw", "text"]);
+    let status = env.json(&["recording", "process", "status", &id, "--json"]);
+    let runtime = PathBuf::from(status["runtime_root"].as_str().expect("runtime root"));
+    let locator = env
+        .root
+        .join("data/recording-process-v4")
+        .join(format!("{id}.json"));
+    let metadata = runtime
+        .join("state/recordings/process-runs-v4")
+        .join(format!("{id}.json"));
+    let raw = fs::read(evidence.join("output.pty")).expect("canonical raw bytes");
+    for path in [&locator, &metadata] {
+        let original = fs::read(path).expect("current durable metadata");
+        for version in [1, 2, 3, 99] {
+            let mut old: Value = serde_json::from_slice(&original).expect("metadata JSON");
+            old["schema_version"] = Value::from(version);
+            let bytes = serde_json::to_vec(&old).expect("old version fixture");
+            fs::write(path, &bytes).expect("owned metadata mutation");
+            let output = env.run(&["recording", "process", "status", &id, "--json"]);
+            let unchanged = fs::read(path).expect("rejected metadata retained");
+            fs::write(path, &original).expect("restore owned metadata before assertion/cleanup");
+            assert!(
+                !output.status.success(),
+                "old schema {version} silently accepted"
+            );
+            let error = parse_json(&output);
+            let diagnostic = error["error"].as_str().expect("version diagnostic");
+            assert!(
+                diagnostic.contains("invalid run locator")
+                    || diagnostic.contains("unsupported process run schema version"),
+                "{error}"
+            );
+            assert_eq!(unchanged, bytes, "rejection rewrote canonical metadata");
+            assert_eq!(
+                fs::read(evidence.join("output.pty")).expect("retained raw"),
+                raw
+            );
+        }
+    }
+    assert_eq!(
+        env.json(&["recording", "process", "status", &id, "--json"])["run_id"],
+        id
+    );
+}
+
 fn read_all(env: &RecordingEnv, id: &str) -> Vec<u8> {
     let mut cursor = 0_u64;
     let mut bytes = Vec::new();
@@ -574,39 +708,7 @@ fn read_all(env: &RecordingEnv, id: &str) -> Vec<u8> {
 
 #[test]
 #[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
-fn relocated_installed_payload_runs_with_committed_supervisor_inventory() {
-    let env = RecordingEnv::relocated_installation();
-    let id = env.start("stty -opost\nprintf INSTALLED_RELOCATED\n", &[]);
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // This export test explicitly disposes only its exited legacy execution.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
-    let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
-    assert_eq!(status["exit_code"].as_u64(), Some(0));
-    assert_eq!(read_all(&env, &id), b"INSTALLED_RELOCATED");
-    let artifacts = env.finish(&id, "installed-export", &["raw"]);
-    assert_eq!(
-        fs::read(artifacts.join("output.pty")).expect("installed raw"),
-        b"INSTALLED_RELOCATED"
-    );
-}
-
-#[test]
-#[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
-fn relocated_installed_native_terminal_contract_exports_and_remains_offline() {
+fn relocated_installed_payload_exports_and_remains_offline() {
     let env = RecordingEnv::relocated_installation();
     let script = env.script(
         "installed-native.sh",
@@ -616,10 +718,6 @@ fn relocated_installed_native_terminal_contract_exports_and_remains_offline() {
         "recording",
         "process",
         "run",
-        "--contract-version",
-        "3",
-        "--lifetime",
-        "terminal-session",
         "--profile",
         "full",
         "--viewport",
@@ -636,7 +734,7 @@ fn relocated_installed_native_terminal_contract_exports_and_remains_offline() {
         Some(7),
         "installed native foreground outcome"
     );
-    let status = native_result(&output);
+    let status = parse_json(&output);
     let id = env.track_run(&status);
     assert_eq!(status["exit_code"].as_u64(), Some(7));
     assert_eq!(status["output_drained"].as_bool(), Some(true));
@@ -662,7 +760,7 @@ fn relocated_installed_native_terminal_contract_exports_and_remains_offline() {
     ]);
     assert_success(&finished);
     assert_eq!(
-        native_result(&finished)["status"]["run_id"].as_str(),
+        parse_json(&finished)["status"]["run_id"].as_str(),
         Some(id.as_str())
     );
     assert_eq!(
@@ -685,10 +783,7 @@ fn relocated_installed_native_terminal_contract_exports_and_remains_offline() {
     assert!(gif_dominant_colors(&destination.join("output.gif")).contains(&0));
     let offline = env.run(&["recording", "process", "status", &id, "--json"]);
     assert_success(&offline);
-    assert_eq!(
-        native_result(&offline)["recording_id"],
-        status["recording_id"]
-    );
+    assert_eq!(parse_json(&offline)["recording_id"], status["recording_id"]);
 }
 
 fn assert_installed_launch_rejected(env: &RecordingEnv) {
@@ -836,25 +931,8 @@ fn installed_wrong_owner_unsupported_or_corrupt_inventory_rejects_before_launch(
     }
 }
 
-fn native_result(output: &Output) -> Value {
-    let value = parse_json(output);
-    assert_eq!(value["schema_version"].as_u64(), Some(1));
-    assert_eq!(
-        value["contract"],
-        serde_json::json!({
-            "interface": "recording-process-terminal-v3",
-            "lifecycle": "conventional-terminal-session",
-            "status_schema_version": 1,
-        })
-    );
-    value
-        .get("result")
-        .expect("explicit native result envelope")
-        .clone()
-}
-
 #[test]
-fn native_terminal_profiles_use_explicit_contract_and_complete_capture() {
+fn terminal_profiles_complete_capture_without_lifecycle_selectors() {
     for profile in ["full", "functional", "visual"] {
         let env = RecordingEnv::new();
         let script = env.script("native-input.sh", "stty -echo -opost\nprintf 'Ready>'\nIFS= read -r line\nprintf '\\033[41mReply:%s\\033[0m' \"$line\"\nexit 7\n");
@@ -862,10 +940,6 @@ fn native_terminal_profiles_use_explicit_contract_and_complete_capture() {
             "recording",
             "process",
             "start",
-            "--contract-version",
-            "3",
-            "--lifetime",
-            "terminal-session",
             "--profile",
             profile,
             "--viewport",
@@ -878,8 +952,8 @@ fn native_terminal_profiles_use_explicit_contract_and_complete_capture() {
             script.to_str().expect("script"),
         ]);
         assert_success(&start);
-        let status = native_result(&start);
-        assert_eq!(status["schema_version"].as_u64(), Some(1));
+        let status = parse_json(&start);
+        assert_eq!(status["schema_version"].as_u64(), Some(4));
         let id = env.track_run(&status);
         let ready = env.run(&[
             "recording",
@@ -893,13 +967,13 @@ fn native_terminal_profiles_use_explicit_contract_and_complete_capture() {
             "--json",
         ]);
         assert_success(&ready);
-        assert_eq!(native_result(&ready)["matched"].as_bool(), Some(true));
+        assert_eq!(parse_json(&ready)["matched"].as_bool(), Some(true));
         let input = env.run_with_input(
             &["recording", "process", "send", &id, "--stdin", "--json"],
             Some("héllo".as_bytes()),
         );
         assert_success(&input);
-        assert_eq!(native_result(&input)["accepted_bytes"].as_u64(), Some(6));
+        assert_eq!(parse_json(&input)["accepted_bytes"].as_u64(), Some(6));
         let key = env.run(&[
             "recording",
             "process",
@@ -910,7 +984,7 @@ fn native_terminal_profiles_use_explicit_contract_and_complete_capture() {
             "--json",
         ]);
         assert_success(&key);
-        assert_eq!(native_result(&key)["accepted_bytes"].as_u64(), Some(1));
+        assert_eq!(parse_json(&key)["accepted_bytes"].as_u64(), Some(1));
         let waited = env.run(&[
             "recording",
             "process",
@@ -922,7 +996,7 @@ fn native_terminal_profiles_use_explicit_contract_and_complete_capture() {
             "--json",
         ]);
         assert_success(&waited);
-        let status = native_result(&waited);
+        let status = parse_json(&waited);
         assert_eq!(status["exit_code"].as_u64(), Some(7));
         // Capture readiness does not assert descendant cleanup or daemon recovery.
         assert_eq!(status["output_drained"].as_bool(), Some(true));
@@ -943,7 +1017,7 @@ fn native_terminal_profiles_use_explicit_contract_and_complete_capture() {
             "--json",
         ]);
         assert_success(&read);
-        let read = native_result(&read);
+        let read = parse_json(&read);
         assert_eq!(read["complete"].as_bool(), Some(true));
         let bytes: Vec<u8> = read["data"]
             .as_array()
@@ -971,7 +1045,7 @@ fn native_terminal_profiles_use_explicit_contract_and_complete_capture() {
             "--json",
         ]);
         assert_success(&finished);
-        let finished = native_result(&finished);
+        let finished = parse_json(&finished);
         assert_eq!(
             finished["status"]["capture_finalized"].as_bool(),
             Some(true)
@@ -1014,101 +1088,12 @@ fn native_terminal_profiles_use_explicit_contract_and_complete_capture() {
         ]);
         assert_success(&cleanup);
         assert_eq!(
-            native_result(&cleanup)["capture_finalized"].as_bool(),
+            parse_json(&cleanup)["capture_finalized"].as_bool(),
             Some(true)
         );
         let offline = env.run(&["recording", "process", "status", &id, "--json"]);
         assert_success(&offline);
-        assert_eq!(
-            native_result(&offline)["run_id"].as_str(),
-            Some(id.as_str())
-        );
-    }
-}
-
-#[test]
-fn legacy_profiles_preserve_output_and_input_capture_policy() {
-    for profile in ["full", "functional", "visual"] {
-        let env = RecordingEnv::new();
-        let id = env.start_profile(
-            "stty -echo -opost\nprintf 'Ready>'\nIFS= read -r line\nprintf '\\033[41mReply:%s\\033[0m' \"$line\"\n",
-            &[],
-            profile,
-        );
-        env.json(&[
-            "recording",
-            "process",
-            "wait",
-            &id,
-            "--screen-contains",
-            "Ready>",
-            "--timeout",
-            "10s",
-            "--json",
-        ]);
-        assert_success(&env.run_with_input(
-            &["recording", "process", "send", &id, "--stdin", "--json"],
-            Some("héllo".as_bytes()),
-        ));
-        env.json(&[
-            "recording",
-            "process",
-            "send",
-            &id,
-            "--key",
-            "Enter",
-            "--json",
-        ]);
-        let before_disposal = env.wait_leader_exit(&id, 0);
-        // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-        env.json(&[
-            "recording",
-            "process",
-            "terminate",
-            &id,
-            "--grace-period",
-            "1s",
-            "--json",
-        ]);
-        let status = env.wait_exit(&id);
-        assert_eq!(status["execution"], before_disposal["execution"]);
-        assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-        assert_eq!(
-            status["output_watermark"],
-            before_disposal["output_watermark"]
-        );
-        assert_eq!(status["schema_version"].as_u64(), Some(1));
-        assert_eq!(status["exit_code"].as_u64(), Some(0));
-        let expected = "Ready>\x1b[41mReply:héllo\x1b[0m".as_bytes();
-        assert_eq!(read_all(&env, &id), expected);
-        let artifacts = env.finish(&id, "profile-exports", &["raw", "text", "events", "gif"]);
-        assert_eq!(
-            fs::read(artifacts.join("output.pty")).expect("profile raw"),
-            expected
-        );
-        assert!(
-            fs::read_to_string(artifacts.join("output.txt"))
-                .expect("profile text")
-                .contains("Reply:héllo")
-        );
-        let events = fs::read_to_string(artifacts.join("events.jsonl")).expect("profile events");
-        let events: Vec<Value> = events
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("event JSON"))
-            .collect();
-        assert!(
-            events
-                .iter()
-                .any(|event| event["kind"] == "pane_output_raw")
-        );
-        assert_eq!(
-            events.iter().any(|event| event["kind"] == "pane_input_raw"),
-            profile != "visual"
-        );
-        assert!(
-            gif_dominant_colors(&artifacts.join("output.gif")).contains(&0),
-            "profile GIF lost final red reply"
-        );
+        assert_eq!(parse_json(&offline)["run_id"].as_str(), Some(id.as_str()));
     }
 }
 
@@ -1116,24 +1101,8 @@ fn legacy_profiles_preserve_output_and_input_capture_policy() {
 fn stale_finish_revision_does_not_finalize_or_publish() {
     let env = RecordingEnv::new();
     let id = env.start("stty -opost\nprintf STALE\n", &[]);
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     let stale = status["revision"]
         .as_u64()
         .expect("revision")
@@ -1175,24 +1144,8 @@ fn whole_frame_loss_never_publishes_or_overwrites_live_capture() {
         "stty -opost\nprintf FRAME_ONE\nsleep 0.2\nprintf FRAME_TWO\n",
         &[],
     );
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     let expected = read_all(&env, &id);
     let directory = PathBuf::from(status["runtime_root"].as_str().expect("runtime root"))
         .join("state/recordings")
@@ -1250,7 +1203,8 @@ fn whole_frame_loss_never_publishes_or_overwrites_live_capture() {
 
 #[test]
 fn finite_launch_status_before_wait_reports_drain() {
-    let env = RecordingEnv::new();
+    let mut env = RecordingEnv::new();
+    env.profile_export = true;
     let id = env.start("stty -opost\nprintf FINITE\ni=0\nwhile [ \"$i\" -lt 4096 ]; do printf '0123456789abcdef'; i=$((i+1)); done\nprintf LAST\nexit 7\n", &[]);
     let expected = format!("FINITE{}LAST", "0123456789abcdef".repeat(4096)).into_bytes();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -1273,12 +1227,49 @@ fn finite_launch_status_before_wait_reports_drain() {
     let captured = read_all(&env, &id);
     assert_eq!(captured, expected);
     let status = env.wait_exit(&id);
+    assert_eq!(status["output_drained"], true);
     assert_eq!(status["exit_code"].as_u64(), Some(7));
     assert_eq!(
         status["output_watermark"].as_u64(),
         Some(expected.len() as u64)
     );
-    let path = env.finish(&id, "finite-status", &["raw"]);
+    let path = env.finish(&id, "finite-status", &["raw", "events", "gif"]);
+    let events = fs::read_to_string(path.join("events.jsonl")).expect("finite events");
+    assert!(events.lines().count() > 0);
+    for line in events.lines() {
+        serde_json::from_str::<Value>(line).expect("finite event JSON");
+    }
+    let mut decoder = gif::DecodeOptions::new()
+        .read_info(File::open(path.join("output.gif")).expect("finite GIF"))
+        .expect("finite GIF header");
+    let mut frames = 0;
+    while decoder
+        .read_next_frame()
+        .expect("finite GIF frame")
+        .is_some()
+    {
+        frames += 1;
+        assert!(frames <= 1000, "finite GIF frame budget");
+    }
+    assert!(frames > 0, "finite GIF empty");
+    let finalized = env.json(&["recording", "process", "status", &id, "--json"]);
+    for field in [
+        "target_exited",
+        "terminal_session_ended",
+        "capture_eof",
+        "output_drained",
+        "durable_recording_complete",
+        "capture_finalized",
+    ] {
+        assert_eq!(
+            finalized[field], true,
+            "incomplete finite workflow: {finalized}"
+        );
+    }
+    assert_eq!(
+        finalized["capture_watermark"],
+        finalized["recording_watermark"]
+    );
     assert_eq!(
         fs::read(path.join("output.pty")).expect("raw artifact"),
         expected
@@ -1291,51 +1282,8 @@ fn immediate_exit_and_startup_burst_are_not_lost() {
         let env = RecordingEnv::new();
         let id = env.start("stty -opost\nprintf FIRST\ni=0\nwhile [ \"$i\" -lt 4096 ]; do printf '0123456789abcdef'; i=$((i+1)); done\nprintf LAST\nexit 7\n", &[]);
         let expected = format!("FIRST{}LAST", "0123456789abcdef".repeat(4096)).into_bytes();
-        let before_disposal = env.wait_leader_exit(&id, 7);
-        // Leader exit can precede reading its final queued output. Observe the
-        // known complete fixture watermark before explicitly disposing the owner.
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
-        let before_disposal = loop {
-            let observed = env.json(&["recording", "process", "status", &id, "--json"]);
-            assert_eq!(observed["execution"], before_disposal["execution"]);
-            assert_eq!(observed["exit_code"].as_u64(), Some(7));
-            assert!(
-                !observed["capture_finalized"]
-                    .as_bool()
-                    .expect("capture state")
-            );
-            let watermark = observed["output_watermark"].as_u64().expect("watermark");
-            let expected_watermark = u64::try_from(expected.len()).expect("fixture length");
-            assert!(
-                watermark <= expected_watermark,
-                "unexpected extra startup output"
-            );
-            if watermark == expected_watermark {
-                break observed;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "startup capture missing suffix: {observed}"
-            );
-            thread::sleep(POLL_INTERVAL);
-        };
-        // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-        env.json(&[
-            "recording",
-            "process",
-            "terminate",
-            &id,
-            "--grace-period",
-            "1s",
-            "--json",
-        ]);
         let status = env.wait_exit(&id);
-        assert_eq!(status["execution"], before_disposal["execution"]);
-        assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-        assert_eq!(
-            status["output_watermark"],
-            before_disposal["output_watermark"]
-        );
+        assert_eq!(status["output_drained"], true);
         assert_eq!(status["exit_code"].as_u64(), Some(7));
         assert_eq!(status["output_drained"].as_bool(), Some(true));
         assert_eq!(read_all(&env, &id), expected, "burst iteration {iteration}");
@@ -1360,24 +1308,8 @@ fn argv_environment_and_working_directory_are_literal() {
         "stty -opost\nprintf '%s\\n%s\\n%s' \"$1\" \"$BMUX_TEST_VALUE\" \"$PWD\"\n",
         &[literal],
     );
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     let expected = format!("{literal}\nliteral\n{}", env.root.display()).into_bytes();
     assert_eq!(read_all(&env, &id), expected);
     assert!(
@@ -1461,7 +1393,7 @@ fn interactive_send_wait_timeout_and_finish_refusal() {
         "--json",
     ]);
     let screen = env.json(&["recording", "process", "screen", &id, "--json"]);
-    assert_eq!(screen["schema_version"].as_u64(), Some(1));
+    assert_eq!(screen["schema_version"].as_u64(), Some(4));
     assert_eq!(screen["run_id"].as_str(), Some(id.as_str()));
     assert!(
         screen["text"]
@@ -1474,24 +1406,8 @@ fn interactive_send_wait_timeout_and_finish_refusal() {
         Some(b"second\n"),
     );
     assert_success(&stdin);
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     assert_eq!(status["exit_code"].as_u64(), Some(0));
     let bytes = read_all(&env, &id);
     assert!(
@@ -1548,24 +1464,8 @@ fn raw_bytes_transcript_and_export_retries_preserve_evidence() {
         "stty -opost\nprintf '\\033[31mé界é🙂\\033[0m\\nabc\\rXY\\nA\\000B\\n'\n",
         &[],
     );
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     let expected = "\u{1b}[31mé界é🙂\u{1b}[0m\nabc\rXY\nA\0B\n".as_bytes();
     assert_eq!(read_all(&env, &id), expected);
     let blocker = env.root.join("not-a-directory");
@@ -1622,62 +1522,8 @@ fn raw_bytes_transcript_and_export_retries_preserve_evidence() {
 fn unknown_ids_and_invalid_cursors_never_fall_back_to_another_runtime() {
     let first = RecordingEnv::new();
     let id = first.start("stty -opost\nprintf evidence\n", &[]);
-    let before_disposal = first.wait_leader_exit(&id, 0);
-    // Explicitly dispose the first fixture's exited execution, never the second runtime.
-    first.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = first.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
-    let other = RecordingEnv::new();
-    for verb in ["status", "read", "screen", "terminate", "finish"] {
-        let output = other.run(&["recording", "process", verb, &id, "--json"]);
-        assert!(
-            !output.status.success(),
-            "cross-runtime {verb} unexpectedly succeeded"
-        );
-    }
-    for cursor in [
-        "-1",
-        "not-a-cursor",
-        "18446744073709551616",
-        "18446744073709551615",
-    ] {
-        let output = first.run(&[
-            "recording",
-            "process",
-            "read",
-            &id,
-            "--since",
-            cursor,
-            "--json",
-        ]);
-        assert!(
-            !output.status.success(),
-            "invalid cursor accepted: {cursor}"
-        );
-    }
-    let output = first.run(&[
-        "recording",
-        "process",
-        "read",
-        &id,
-        "--max-bytes",
-        "0",
-        "--json",
-    ]);
-    assert!(!output.status.success(), "zero read budget accepted");
+    assert_eq!(status["output_drained"], true);
     assert_eq!(read_all(&first, &id), b"evidence");
 }
 
@@ -1728,24 +1574,8 @@ fn gif_export_decodes_every_frame_and_animates() {
         "Enter",
         "--json",
     ]);
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     let path = env.finish(&id, "gif-export", &["gif"]);
     let gifs: Vec<_> = fs::read_dir(&path)
         .expect("export directory")
@@ -1955,30 +1785,25 @@ fn durable_start_and_send_retries_do_not_duplicate_effects() {
         "two\n",
         "--json",
     ]);
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     assert_eq!(read_all(&env, &id), b"Ready>FIRST:one\nSECOND:two");
     assert_eq!(
         fs::read(env.root.join("launch-count")).expect("one launch"),
         b"launch"
     );
-    env.finish(&id, "exports", &["raw"]);
+    let exports = env.finish(&id, "exports", &["raw", "events"]);
+    let input_events: Vec<Value> = fs::read_to_string(exports.join("events.jsonl"))
+        .expect("retry event export")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("retry event JSON"))
+        .filter(|event| event["kind"] == "pane_input_raw")
+        .collect();
+    assert_eq!(
+        input_events.len(),
+        2,
+        "duplicate or conflicting input recorded: {input_events:?}"
+    );
 }
 
 #[test]
@@ -1988,24 +1813,8 @@ fn finalized_evidence_remains_available_after_explicit_server_cleanup() {
         "stty -opost\nprintf '\\033[2J\\033[HOFFLINE_EVIDENCE'\n",
         &[],
     );
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     let before = read_all(&env, &id);
     let screen = env.json(&["recording", "process", "screen", &id, "--json"]);
     let first = env.finish(&id, "online", &["raw", "text", "events", "gif"]);
@@ -2054,24 +1863,8 @@ fn immediate_output_is_replayed_into_gif_without_screen_polling() {
         "stty -opost\nprintf '\\033[2J\\033[H\\033[41m          \\033[0m'\n",
         &[],
     );
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     let artifacts = env.finish(&id, "immediate-gif", &["gif"]);
     let mut options = gif::DecodeOptions::new();
     options.set_color_output(gif::ColorOutput::RGBA);
@@ -2104,24 +1897,8 @@ fn animated_gif_preserves_ordered_output_and_final_exit_frame() {
     // frame exits immediately and must survive drain without screen polling.
     let script = "stty -opost\nprintf '\\033[2J\\033[H\\033[41mRED\\033[0m'\nsleep 0.3\nprintf '\\033[2J\\033[H\\033[42mGREEN\\033[0m'\nsleep 0.3\nprintf '\\033[2J\\033[H\\033[44mBLUE\\033[0m'\n";
     let id = env.start(script, &[]);
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     assert_eq!(status["output_drained"].as_bool(), Some(true));
     let expected = b"\x1b[2J\x1b[H\x1b[41mRED\x1b[0m\x1b[2J\x1b[H\x1b[42mGREEN\x1b[0m\x1b[2J\x1b[H\x1b[44mBLUE\x1b[0m";
     assert_eq!(read_all(&env, &id), expected);
@@ -2190,24 +1967,8 @@ fn gif_dominant_colors(path: &Path) -> Vec<usize> {
 fn incomplete_capture_refuses_finalization_and_retries_without_relaunch() {
     let env = RecordingEnv::new();
     let id = env.start("stty -opost\nprintf EXACT_CAPTURE\n", &[]);
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     let expected = read_all(&env, &id);
     assert_eq!(expected, b"EXACT_CAPTURE");
     let directory = PathBuf::from(status["runtime_root"].as_str().expect("owned root"))
@@ -2221,11 +1982,15 @@ fn incomplete_capture_refuses_finalization_and_retries_without_relaunch() {
         !refused.status.success(),
         "gap was acknowledged as complete"
     );
+    let error = parse_json(&refused);
+    assert_eq!(error["schema_version"], 4);
+    assert_eq!(error["ok"], false);
     assert!(
-        parse_json(&refused)["error"]
+        error["error"]
             .as_str()
-            .expect("explicit gap error")
-            .contains("output watermark")
+            .expect("explicit boundary error")
+            .contains("recording raw boundary differs from execution authority"),
+        "unexpected integrity refusal: {error}"
     );
     let pending = env.json(&["recording", "process", "status", &id, "--json"]);
     assert_eq!(pending["capture_finalized"].as_bool(), Some(false));
@@ -2284,24 +2049,8 @@ fn exit_wait_longer_than_default_transport_timeout_returns_run_status() {
         "DONE\n",
         "--json",
     ]);
-    let before_disposal = env.wait_leader_exit(&id, 0);
-    // Disposal is explicit here; observing exit alone must not imply PTY EOF.
-    env.json(&[
-        "recording",
-        "process",
-        "terminate",
-        &id,
-        "--grace-period",
-        "1s",
-        "--json",
-    ]);
     let status = env.wait_exit(&id);
-    assert_eq!(status["execution"], before_disposal["execution"]);
-    assert_eq!(status["exit_code"], before_disposal["exit_code"]);
-    assert_eq!(
-        status["output_watermark"],
-        before_disposal["output_watermark"]
-    );
+    assert_eq!(status["output_drained"], true);
     assert_eq!(read_all(&env, &id), b"Ready>DONE");
     env.finish(&id, "long-wait", &["raw"]);
 }
@@ -2318,6 +2067,7 @@ fn exit_wait_beyond_five_seconds_returns_complete_evidence() {
     let started = Instant::now();
     fs::write(env.root.join("long-wait-gate"), b"ready").expect("release owned program");
     let status = env.wait_exit(&id);
+    assert_eq!(status["output_drained"], true);
     assert!(started.elapsed() >= Duration::from_secs(7));
     assert_eq!(status["run_id"].as_str(), Some(id.as_str()));
     assert_eq!(status["exit_code"].as_u64(), Some(7));

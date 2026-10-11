@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
-pub const VERSION: u32 = 1;
-pub const TERMINAL_SESSION_VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
+
 pub const MAX_FRAME: usize = 262_144;
 
 #[derive(Deserialize, Serialize)]
@@ -51,9 +51,14 @@ pub struct Response {
     pub version: u32,
     pub execution_token: String,
     pub started: bool,
+    /// Actual direct target identity, published by its unreaped owner at readiness.
+    #[serde(default)]
+    pub target_pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub exit_signal: Option<i32>,
     pub group_consumed: bool,
+    #[serde(default)]
+    pub target_terminated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_session_ended: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

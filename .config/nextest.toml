@@ -1,0 +1,17 @@
+# Recorded-process tests launch isolated servers and rasterize animated evidence.
+# Bound their aggregate host load without relaxing per-command deadlines.
+[test-groups.recorded-processes]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(recording_process_integration)'
+test-group = 'recorded-processes'
+# Each test owns a server and a font-rasterization workload; reserve the
+# scheduler's CPU budget rather than competing with the rest of the suite.
+threads-required = "num-cpus"
+
+# Pane-runtime PTY fixtures also spawn real controlling-terminal owners with
+# bounded startup deadlines; do not flood the host with concurrent helpers.
+[[profile.default.overrides]]
+filter = 'package(bmux_pane_runtime_plugin)'
+threads-required = "num-cpus"

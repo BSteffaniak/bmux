@@ -6,12 +6,11 @@ import pane = bmux.pane_runtime;
 
 capability RECORDING_READ = bmux.recording.read;
 capability RECORDING_WRITE = bmux.recording.write;
-capability RECORDING_PROCESS_V3 = bmux.recording.process.v3;
+capability RECORDING_PROCESS_V4 = bmux.recording.process.v4;
 
-// Process authority is local to the dedicated, isolated runtime. A run ID is
-// never interpreted as a live user-runtime execution.
-@capability(RECORDING_WRITE)
-interface recording-process-v1 {
+// One process contract. Older process/storage representations are not accepted.
+@capability(RECORDING_PROCESS_V4)
+interface recording-process-v4 {
     record program-options {
         program: string,
         args: list<string>,
@@ -26,19 +25,30 @@ interface recording-process-v1 {
         pane_id: uuid,
         execution_token: uuid,
     }
-    enum run-phase { starting, running, exited, failed, finalized }
+    enum run-phase { starting, running, exited, failed, finalized, recovery-required }
     record run-status {
         schema_version: u32,
         run_id: uuid,
         revision: u64,
+        launch_mutation_id: uuid,
         recording_id: uuid,
         execution: execution-ref?,
         runtime_root: string,
         phase: run-phase,
         exit_code: u32?,
+        target_exited: bool,
+        terminal_session_ended: bool,
+        capture_eof: bool,
+        // Readiness of canonical capture, never a descendant cleanup indicator.
         output_drained: bool,
         output_watermark: u64,
+        capture_watermark: u64,
+        recording_watermark: u64,
         capture_finalized: bool,
+        durable_recording_complete: bool,
+        timing_complete: bool,
+        cleanup_complete: bool,
+        recovery_required: bool,
         errors: list<string>,
     }
     record output-read {
@@ -52,85 +62,29 @@ interface recording-process-v1 {
         not-found,
         invalid-options { reason: string },
         unavailable { reason: string },
+        unsupported-schema { reason: string },
+        conflicting-mutation { reason: string },
+        recovery-required { reason: string },
         stale-revision,
         still-running,
         capture-failed { reason: string },
         operation-failed { reason: string },
     }
-    // Start is admitted only on a dedicated empty runtime, after capture readiness.
-    command start(options: program-options, runtime_root: string)
+    // Caller persists identity/fingerprint before invoking; service commits intent
+    // before reserve/launch and reconciles identical retries without relaunch.
+    command start(run_id: uuid, launch_mutation_id: uuid, options: program-options, runtime_root: string)
         -> result<run-status, process-error>;
     command status(run_id: uuid) -> result<run-status, process-error>;
-    command read(run_id: uuid, since: u64, max_bytes: u32)
-        -> result<output-read, process-error>;
+    command reconcile(run_id: uuid) -> result<run-status, process-error>;
+    command read(run_id: uuid, since: u64, max_bytes: u32) -> result<output-read, process-error>;
     command screen(run_id: uuid) -> result<string, process-error>;
-    command send(run_id: uuid, data: bytes, mutation_id: uuid) -> result<unit, process-error>;
+    command send(run_id: uuid, data: bytes, mutation_id: uuid) -> result<pane.terminal-input-receipt, process-error>;
+    command input-receipt(run_id: uuid, mutation_id: uuid) -> result<pane.terminal-input-receipt, process-error>;
+    command resolve(run_id: uuid, mutation_id: uuid, expected_revision: u64, action: pane.terminal-resolution-action, input_mutation_id: uuid?, grace_ms: u32) -> result<pane.terminal-resolution-receipt, process-error>;
     command wait(run_id: uuid, timeout_ms: u32) -> result<run-status, process-error>;
     command terminate(run_id: uuid, grace_ms: u32) -> result<run-status, process-error>;
     command finish(run_id: uuid, expected_revision: u64, terminate_running: bool)
         -> result<run-status, process-error>;
-}
-
-// Recovery is explicitly selected; legacy process-v1 remains unchanged.
-@capability(RECORDING_WRITE)
-interface recording-process-recovery-v2 {
-    enum capture-state { pending, contiguous, gap, finalized, failed }
-    record recovery-status {
-        schema_version: u32,
-        run_id: uuid,
-        revision: u64,
-        launch_mutation_id: uuid,
-        recording_id: uuid?,
-        runtime_root: string,
-        reservation: pane.launch-reservation?,
-        authority: pane.reconciliation?,
-        cursor: pane.capture-cursor?,
-        capture: capture-state,
-        recovery_required: bool,
-        errors: list<string>,
-    }
-    // Stable run and mutation IDs are persisted by the caller before invocation.
-    // A retry reconciles this intent; it never silently creates a second runtime.
-    command start(run_id: uuid, launch_mutation_id: uuid,
-        options: recording-process-v1.program-options, runtime_root: string)
-        -> result<recovery-status, pane.recovery-error>;
-    command reconcile(run_id: uuid)
-        -> result<recovery-status, pane.recovery-error>;
-    // This is one logical input admission, not exactly-once child consumption.
-    command send(run_id: uuid, input_mutation_id: uuid, data: bytes)
-        -> result<pane.input-receipt, pane.recovery-error>;
-    command input-receipt(run_id: uuid, input_mutation_id: uuid)
-        -> result<pane.input-receipt, pane.recovery-error>;
-    // expected_revision is the authoritative execution aggregate revision,
-    // namely recovery-status.authority.launch.revision, not recording revision.
-    command resolve(run_id: uuid, resolution_mutation_id: uuid, expected_revision: u64,
-        action: pane.resolution-action, input_mutation_id: uuid?, grace_ms: u32)
-        -> result<pane.resolution-receipt, pane.recovery-error>;
-    command capture(run_id: uuid, max_bytes: u32)
-        -> result<recovery-status, pane.recovery-error>;
-    // Finalization never treats natural target exit as descendant cleanup.
-    // Requires authority cleanup_complete + capture_complete and a contiguous
-    // recording cursor at the authority continuation watermark.
-    command finish(run_id: uuid)
-        -> result<recovery-status, pane.recovery-error>;
-    command retire(run_id: uuid, retirement_mutation_id: uuid, expected_revision: u64)
-        -> result<pane.retirement-receipt, pane.recovery-error>;
-}
-
-// Native conventional terminal lifetime. No durable daemon-recovery capability
-// is advertised by this interface; lost execution authority returns an error.
-@capability(RECORDING_PROCESS_V3)
-interface recording-process-terminal-v3 {
-    enum lifetime-policy { conventional-terminal-session }
-    command start(options: recording-process-v1.program-options, runtime_root: string, policy: lifetime-policy)
-        -> result<recording-process-v1.run-status, recording-process-v1.process-error>;
-    command status(run_id: uuid) -> result<recording-process-v1.run-status, recording-process-v1.process-error>;
-    command read(run_id: uuid, since: u64, max_bytes: u32) -> result<recording-process-v1.output-read, recording-process-v1.process-error>;
-    command screen(run_id: uuid) -> result<string, recording-process-v1.process-error>;
-    command send(run_id: uuid, data: bytes, mutation_id: uuid) -> result<unit, recording-process-v1.process-error>;
-    command wait(run_id: uuid, timeout_ms: u32) -> result<recording-process-v1.run-status, recording-process-v1.process-error>;
-    command terminate(run_id: uuid, grace_ms: u32) -> result<recording-process-v1.run-status, recording-process-v1.process-error>;
-    command finish(run_id: uuid, expected_revision: u64, terminate_running: bool) -> result<recording-process-v1.run-status, recording-process-v1.process-error>;
 }
 
 interface recording-types {

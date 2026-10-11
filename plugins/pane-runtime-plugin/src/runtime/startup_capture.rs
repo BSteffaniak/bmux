@@ -52,7 +52,11 @@ impl Read for StartupReader {
         if self.offset == self.pending.len() {
             self.pending = match self.receiver.recv() {
                 Ok(chunk) => chunk?,
-                Err(_) => return Ok(0),
+                Err(_) => {
+                    return Err(io::Error::other(
+                        "raw capture ended without an explicit EOF boundary",
+                    ));
+                }
             };
             self.offset = 0;
         }
@@ -63,7 +67,17 @@ impl Read for StartupReader {
     }
 }
 
-pub(super) fn start(mut raw: Box<dyn Read + Send>) -> io::Result<(StartupReader, JoinHandle<()>)> {
+#[cfg(test)]
+pub(super) fn start(raw: Box<dyn Read + Send>) -> io::Result<(StartupReader, JoinHandle<()>)> {
+    start_captured(
+        raw,
+        std::sync::Arc::new(super::execution::ExecutionCapture::default()),
+    )
+}
+pub(super) fn start_captured(
+    mut raw: Box<dyn Read + Send>,
+    execution: std::sync::Arc<super::execution::ExecutionCapture>,
+) -> io::Result<(StartupReader, JoinHandle<()>)> {
     // At most 32 * 8192 raw bytes queued; saturation backpressures the PTY.
     let (sender, receiver) = sync_channel(32);
     let thread = std::thread::Builder::new()
@@ -75,6 +89,18 @@ pub(super) fn start(mut raw: Box<dyn Read + Send>) -> io::Result<(StartupReader,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     result => result.map(|count| buffer[..count].to_vec()),
                 };
+                let chunk = chunk.and_then(|bytes| {
+                    let mut capture = execution.durable_capture.lock().map_err(|_| io::Error::other("capture authority lock poisoned"))?;
+                    if let Some(capture) = capture.as_mut() {
+                        if bytes.is_empty() { capture.end(None)?; } else { capture.append(&bytes)?; }
+                    }
+                    Ok(bytes)
+                });
+                if let Err(error) = &chunk
+                    && let Ok(mut capture) = execution.durable_capture.lock()
+                    && let Some(capture) = capture.as_mut() {
+                    let _ = capture.end(Some(error.to_string()));
+                }
                 let done = chunk.as_ref().is_err() || chunk.as_ref().is_ok_and(Vec::is_empty);
                 if done {
                     #[cfg(test)]

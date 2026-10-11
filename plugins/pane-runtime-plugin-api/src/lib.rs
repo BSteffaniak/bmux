@@ -46,8 +46,8 @@ mod tests {
 
     #[test]
     fn program_execution_contract_keeps_literal_binary_input_and_identity() {
-        use super::pane_runtime_execution_v1::{ExecutionRef, client::SendRequest};
-        let execution = ExecutionRef {
+        use super::pane_runtime_execution_v4::{TerminalExecutionRef, client::SendRequest};
+        let execution = TerminalExecutionRef {
             session_id: uuid::Uuid::new_v4(),
             pane_id: uuid::Uuid::new_v4(),
             execution_token: uuid::Uuid::new_v4(),
