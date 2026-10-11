@@ -16,10 +16,12 @@ use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use std::collections::BTreeMap;
 
 mod application_resurrection;
+mod capture_handshake;
 mod commands;
 mod handlers;
 mod padding;
 mod padding_api;
+mod private_input;
 mod runtime;
 mod snapshot;
 mod snapshot_v1_migration;

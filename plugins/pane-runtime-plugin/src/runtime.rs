@@ -5868,6 +5868,7 @@ impl SessionRuntimeManager {
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile)
                         .with_bracketed_paste_support(bracketed_paste_supported);
                     let mut terminal_mode_tracker = PaneTerminalModeTracker::default();
+                    let mut capture_handshake = crate::capture_handshake::CaptureHandshake::default();
                     let mut shell_metadata_parser = PaneShellMetadataParser { token: Some(shell_marker_token), ..PaneShellMetadataParser::default() };
 
                     // Image interceptor: detects and extracts image escape sequences
@@ -5885,7 +5886,13 @@ impl SessionRuntimeManager {
                         match reader.read(&mut buffer) {
                             Ok(0) | Err(_) => break,
                             Ok(bytes_read) => {
-                                let chunk = &buffer[..bytes_read];
+                                let (capture_output, capture_reply) = capture_handshake.process(&buffer[..bytes_read], pane_id);
+                                if !capture_reply.is_empty() {
+                                    if let Ok(mut writer) = writer_for_reader.lock() {
+                                        if writer.write_all(&capture_reply).is_err() || writer.flush().is_err() { break; }
+                                    } else { break; }
+                                }
+                                let chunk = capture_output.as_slice();
                                 // Keep resize requests out until both image state
                                 // and the shared grid have consumed this chunk.
                                 let Ok(requested_size) = last_requested_size_for_reader.lock() else {
@@ -7757,10 +7764,24 @@ impl SessionRuntimeManager {
         }
 
         let bytes = data.len();
-        let recording_data = pane_input_recording_data(&data);
-        pane.send_input(data)?;
-        if let Some((handle, data)) = recording_data {
-            record_pane_input_raw(&handle, data, owner_session_id, focused_pane_id, client_id);
+        let recording_data =
+            crate::private_input::with_capture_barrier(focused_pane_id, |capture| {
+                let recording_data = capture.then(|| pane_input_recording_data(&data)).flatten();
+                pane.send_input(data)?;
+                if let Some((handle, data)) = recording_data {
+                    record_pane_input_raw(
+                        &handle,
+                        data,
+                        owner_session_id,
+                        focused_pane_id,
+                        client_id,
+                    );
+                }
+                Ok::<(), SessionRuntimeError>(())
+            });
+        match recording_data {
+            Some(result) => result?,
+            None => return Err(SessionRuntimeError::Closed),
         }
         Ok((bytes, focused_pane_id))
     }
@@ -8544,11 +8565,18 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         }
 
         let bytes = data.len();
-        let recording_data = pane_input_recording_data(&data);
         let send_started = std::time::Instant::now();
-        pane.send_input(data)?;
-        if let Some((handle, data)) = recording_data {
-            record_pane_input_raw(&handle, data, owner_session_id, pane_id, client_id);
+        let recording_data = crate::private_input::with_capture_barrier(pane_id, |capture| {
+            let recording_data = capture.then(|| pane_input_recording_data(&data)).flatten();
+            pane.send_input(data)?;
+            if let Some((handle, data)) = recording_data {
+                record_pane_input_raw(&handle, data, owner_session_id, pane_id, client_id);
+            }
+            Ok::<(), SessionRuntimeError>(())
+        });
+        match recording_data {
+            Some(result) => result?,
+            None => return Err(SessionRuntimeError::Closed),
         }
         let send = send_started.elapsed();
         if send > Duration::from_millis(2) {

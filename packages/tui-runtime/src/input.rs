@@ -8,6 +8,11 @@ use tokio::task::JoinHandle;
 use crate::program::Program;
 use crate::runtime::RuntimeHandle;
 
+type PrivateRouter<M> = (
+    super::private_input::PrivateInputGate,
+    Box<dyn Fn(super::private_input::PrivateInputRoute) -> M + Send>,
+);
+
 /// Managed bounded terminal event stream.
 pub struct ManagedTerminalInput {
     receiver: mpsc::Receiver<Result<Event, std::io::Error>>,
@@ -161,10 +166,47 @@ impl TerminalInput {
         Self::start_stream::<P, _>(handle, map_error, CrosstermEventStream::new())
     }
 
+    /// Start private-capable ingress. `gate` routes before ordinary runtime admission.
+    /// `map_private` must consume secret outcomes without persistence, tracing or cloning.
+    /// Capture suppression must cover enclosing terminals; absent support fails closed.
+    ///
+    /// # Panics
+    /// Panics when called outside a Tokio runtime.
+    #[must_use]
+    pub fn start_private<P>(
+        handle: RuntimeHandle<P::Message>,
+        map_error: impl Fn(std::io::Error) -> P::Message + Send + 'static,
+        gate: super::private_input::PrivateInputGate,
+        map_private: impl Fn(super::private_input::PrivateInputRoute) -> P::Message + Send + 'static,
+    ) -> Self
+    where
+        P: Program,
+    {
+        Self::start_routed_stream::<P, _>(
+            handle,
+            map_error,
+            CrosstermEventStream::new(),
+            Some((gate, Box::new(map_private))),
+        )
+    }
+
     fn start_stream<P, S>(
         handle: RuntimeHandle<P::Message>,
         map_error: impl Fn(std::io::Error) -> P::Message + Send + 'static,
+        events: S,
+    ) -> Self
+    where
+        P: Program,
+        S: futures_util::Stream<Item = Result<Event, std::io::Error>> + Send + Unpin + 'static,
+    {
+        Self::start_routed_stream::<P, S>(handle, map_error, events, None)
+    }
+
+    fn start_routed_stream<P, S>(
+        handle: RuntimeHandle<P::Message>,
+        map_error: impl Fn(std::io::Error) -> P::Message + Send + 'static,
         mut events: S,
+        private: Option<PrivateRouter<P::Message>>,
     ) -> Self
     where
         P: Program,
@@ -190,6 +232,20 @@ impl TerminalInput {
                         }
                         None => break,
                     },
+                };
+                let event = if let Some((gate, map_private)) = &private {
+                    match gate.route(event) {
+                        super::private_input::PrivateInputRoute::Public(event) => event,
+                        super::private_input::PrivateInputRoute::Consumed => continue,
+                        outcome => {
+                            if handle.send(map_private(outcome)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    event
                 };
                 if matches!(
                     event,

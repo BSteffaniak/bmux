@@ -14901,16 +14901,12 @@ pub fn attach_key_event_actions(
     attach_input_processor: &mut InputProcessor,
     _ui_mode: AttachUiMode,
 ) -> Result<Vec<AttachEventAction>> {
-    // Trace every accepted key event at `trace` level so input-path
-    // duplication (e.g. terminal-emitted Press+Repeat on a quick tap)
-    // is diagnosable without spamming the log at default levels.
-    // Enable with `RUST_LOG=bmux_cli::runtime::attach::input=trace`.
+    // Record only event classification, never key codes or modifiers: this path
+    // can carry private input from a nested application before it requests focus.
     let span = tracing::trace_span!(
         target: "bmux_cli::runtime::attach::input",
         "attach_key_event",
         kind = ?key.kind,
-        code = ?key.code,
-        modifiers = ?key.modifiers,
         emitted = tracing::field::Empty,
         dropped_by_repeat_filter = tracing::field::Empty,
     );
@@ -14950,7 +14946,6 @@ pub fn attach_key_event_actions(
         tracing::debug!(
             target: "bmux_cli::runtime::attach::input",
             kind = ?key.kind,
-            code = ?key.code,
             dropped,
             "repeat filter dropped repeat-unsafe actions"
         );

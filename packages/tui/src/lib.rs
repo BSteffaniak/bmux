@@ -33,6 +33,7 @@ pub mod measured_list;
 pub mod paint;
 pub mod selection;
 pub mod semantic;
+pub mod sensitive_input;
 pub mod style;
 pub mod terminal;
 pub mod text;

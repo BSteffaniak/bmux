@@ -579,6 +579,41 @@ fn validate_input_selection(
     })
 }
 
+/// Public, secret-free capture suppression request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuppressPaneInputCaptureArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+}
+
+/// Acknowledge recording suppression under authenticated attach write ownership.
+pub fn suppress_pane_input_capture(
+    req: &SuppressPaneInputCaptureArgs,
+    ctx: &NativeServiceContext,
+) -> Result<bool, AttachCommandError> {
+    let client_id = caller_client_id(ctx)?;
+    let session_id = SessionId(req.session_id);
+    let runtime = super::session_runtime_handle()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    validate_input_selection(follow_state()?.0.selected_session(client_id), session_id)?;
+    if !runtime.0.client_can_write(session_id, client_id) {
+        return Err(AttachCommandError::Denied {
+            reason: "capture suppression requires attach write ownership".into(),
+        });
+    }
+    let panes = runtime
+        .0
+        .list_panes(session_id)
+        .map_err(|_| AttachCommandError::SessionNotFound)?;
+    if !panes.iter().any(|pane| pane.id == req.pane_id) {
+        return Err(AttachCommandError::SessionNotFound);
+    }
+    if !crate::private_input::suppress(req.pane_id) {
+        return Err(failed("capture suppression barrier unavailable"));
+    }
+    Ok(true)
+}
+
 pub fn attach_input(
     req: AttachInputArgs,
     ctx: &NativeServiceContext,

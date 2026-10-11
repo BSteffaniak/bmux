@@ -22,6 +22,8 @@ pub mod input;
 pub mod invalidation;
 mod mailbox;
 pub mod presenter;
+#[cfg(feature = "crossterm")]
+pub mod private_input;
 pub mod program;
 pub mod runtime;
 pub mod stats;

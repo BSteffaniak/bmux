@@ -20,6 +20,8 @@
 // refactored; allow at the crate level.
 #![allow(clippy::too_many_arguments)]
 
+pub mod input_capture;
+
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/pane-runtime-plugin.bpdl",
 }

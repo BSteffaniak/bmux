@@ -592,6 +592,20 @@ interface attach-runtime-commands {
         attach_token: uuid,
     ) -> result<attach-ready, attach-command-error>;
 
+    record input-capture-ack-v1 {
+        nonce: uuid,
+        pane_id: uuid,
+        recording_suppressed: bool,
+    }
+
+    // Suppression is absorbing for this pane lifetime; there is deliberately no
+    // resume command that could race late private input. This acknowledgment
+    // proves BMUX raw recording suppression only, not external recorder safety.
+    command suppress-pane-input-capture-v1(
+        session_id: uuid,
+        pane_id: uuid,
+    ) -> result<bool, attach-command-error>;
+
     command attach-input(
         session_id: uuid,
         data: list<u8>,
