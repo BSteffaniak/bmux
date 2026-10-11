@@ -418,36 +418,85 @@ fn wait_for_command_boundary(entry: &Entry) -> Result<(), String> {
     Ok(())
 }
 
-fn serve(entry: &Entry, stream: UnixStream) -> Result<(), String> {
-    let peer = configure_stream(&stream)?;
-    let mut reader = BufReader::new(stream);
-    let hello = receive_hello(&mut reader, peer)?;
-    wait_for_command_boundary(entry)?;
+struct Rejection(&'static str);
+
+struct Accepted {
+    peer: u32,
+    hello: Hello,
+    registration: crate::execution::Registration,
+    epoch: u64,
+    offer: Option<String>,
+}
+
+fn accept(entry: &Entry, reader: &mut BufReader<UnixStream>) -> Result<Accepted, Rejection> {
+    accept_with_inspector(entry, reader, belongs)
+}
+
+fn accept_with_inspector(
+    entry: &Entry,
+    reader: &mut BufReader<UnixStream>,
+    inspect: impl FnOnce(u32, u32, bool) -> Result<bool, String>,
+) -> Result<Accepted, Rejection> {
+    let peer = configure_stream(reader.get_ref()).map_err(|_| Rejection("invalid_handshake"))?;
+    let hello = receive_hello(reader, peer).map_err(|_| Rejection("invalid_handshake"))?;
+    wait_for_command_boundary(entry).map_err(|_| Rejection("launch_unavailable"))?;
     let (registration, epoch, offer) = {
-        let mut state = entry.state.lock().map_err(|e| e.to_string())?;
-        let root = state.pid.ok_or("unbound launch")?;
+        let mut state = entry
+            .state
+            .lock()
+            .map_err(|_| Rejection("launch_unavailable"))?;
+        let root = state.pid.ok_or(Rejection("launch_unavailable"))?;
         if entry.stopped.load(Ordering::SeqCst)
             || state.command_phase != CommandPhase::Active
             || state.claim.is_some()
-            || !belongs(peer, root, state.shell)
+            || !inspect(peer, root, state.shell)
+                .map_err(|_| Rejection("ownership_verification_unavailable"))?
         {
-            return Err("peer is not the current execution owner".into());
+            return Err(Rejection("ownership_rejected"));
         }
         let registration = state
             .execution
             .register(uuid::Uuid::new_v4())
-            .map_err(str::to_owned)?;
+            .map_err(|_| Rejection("launch_unavailable"))?;
         let offer = if hello.accept_restore {
             state
                 .execution
                 .offer(registration)
-                .map_err(str::to_owned)?
+                .map_err(|_| Rejection("launch_unavailable"))?
                 .map(str::to_owned)
         } else {
             None
         };
         state.claim = Some(peer);
         (registration, state.epoch, offer)
+    };
+    Ok(Accepted {
+        peer,
+        hello,
+        registration,
+        epoch,
+        offer,
+    })
+}
+
+fn serve(entry: &Entry, stream: UnixStream) -> Result<(), String> {
+    let mut reader = BufReader::new(stream);
+    let Accepted {
+        peer,
+        hello,
+        registration,
+        epoch,
+        offer,
+    } = match accept(entry, &mut reader) {
+        Ok(accepted) => accepted,
+        Err(Rejection(code)) => {
+            // Send a bounded, public reason rather than private paths or raw OS errors.
+            let _ = send(
+                reader.get_mut(),
+                &serde_json::json!({"protocol": PROTOCOL, "error": {"code": code}}),
+            );
+            return Err(format!("resurrection handshake rejected: {code}"));
+        }
     };
     let offer = offer
         .map(|value| serde_json::from_str::<serde_json::Value>(&value))
@@ -492,7 +541,7 @@ fn serve(entry: &Entry, stream: UnixStream) -> Result<(), String> {
         let mut state = entry.state.lock().map_err(|e| e.to_string())?;
         if state.epoch != epoch
             || entry.stopped.load(Ordering::SeqCst)
-            || !belongs(peer, state.pid.ok_or("unbound")?, state.shell)
+            || !belongs(peer, state.pid.ok_or("unbound")?, state.shell)?
         {
             return Err("stale execution".into());
         }
@@ -515,19 +564,31 @@ fn serve(entry: &Entry, stream: UnixStream) -> Result<(), String> {
     }
 }
 
-fn belongs(peer: u32, root: u32, shell: bool) -> bool {
+fn belongs(peer: u32, root: u32, shell: bool) -> Result<bool, String> {
     if !shell {
-        return peer == root;
+        return Ok(peer == root);
     }
+    // NixOS provides ps through PATH rather than /bin. macOS retains its system tool.
+    let program = if cfg!(target_os = "macos") {
+        "/bin/ps"
+    } else {
+        "ps"
+    };
+    foreground_owner(peer, root, program)
+}
+
+fn foreground_owner(peer: u32, root: u32, program: &str) -> Result<bool, String> {
     // Parentage alone would allow an unrelated background job to claim recovery.
-    let output = std::process::Command::new("/bin/ps")
+    let output = std::process::Command::new(program)
         .args(["-o", "ppid=,pgid=,tpgid=", "-p", &peer.to_string()])
-        .output();
-    output
-        .ok()
-        .filter(|value| value.status.success())
-        .and_then(|value| String::from_utf8(value.stdout).ok())
-        .is_some_and(|value| foreground_child(&value, root))
+        .output()
+        .map_err(|error| format!("foreground ownership inspection unavailable: {error}"))?;
+    if !output.status.success() {
+        return Err("foreground ownership inspection failed".into());
+    }
+    let identity = String::from_utf8(output.stdout)
+        .map_err(|_| "invalid foreground ownership inspection output".to_owned())?;
+    Ok(foreground_child(&identity, root))
 }
 
 fn foreground_child(identity: &str, root: u32) -> bool {

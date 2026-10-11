@@ -442,5 +442,53 @@ fn actual_peer_identity_rejects_forged_pid() {
         .unwrap();
     let mut reader = BufReader::new(stream);
     send(reader.get_mut(), &serde_json::json!({"protocol":PROTOCOL,"application":"test","pid":1,"accept_restore":true})).unwrap();
+    let rejection: serde_json::Value = receive(&mut reader).unwrap();
+    assert_eq!(rejection["protocol"], PROTOCOL);
+    assert_eq!(rejection["error"]["code"], "invalid_handshake");
     assert!(receive::<serde_json::Value>(&mut reader).is_err());
+}
+
+#[test]
+fn unavailable_process_inspector_is_distinct_from_rejected_ownership() {
+    assert!(foreground_owner(std::process::id(), 1, "/nonexistent/resurrection-ps").is_err());
+    assert!(!belongs(std::process::id(), 1, false).unwrap());
+    assert!(belongs(std::process::id(), std::process::id(), false).unwrap());
+    // Exercise the actual platform tool, including PATH resolution on NixOS.
+    assert!(belongs(std::process::id(), 1, true).is_ok());
+}
+
+#[test]
+fn ownership_rejection_is_structured_and_does_not_claim_the_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = Host::new(directory.path().to_owned()).unwrap();
+    let key = uuid::Uuid::new_v4().to_string();
+    let endpoint = host.prepare(&key, false, false, false).unwrap();
+    host.bind(&key, &endpoint, 1).unwrap();
+    let mut reader = connect(&endpoint, true);
+    let rejection: serde_json::Value = receive(&mut reader).unwrap();
+    assert_eq!(rejection["error"]["code"], "ownership_rejected");
+    assert!(receive::<serde_json::Value>(&mut reader).is_err());
+    let entry = host.entry(&key, &endpoint).unwrap();
+    assert!(entry.state.lock().unwrap().claim.is_none());
+}
+
+#[test]
+fn inspection_failure_returns_a_public_rejection_without_claiming_ownership() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = Host::new(directory.path().to_owned()).unwrap();
+    let key = uuid::Uuid::new_v4().to_string();
+    let endpoint = host.prepare(&key, false, false, false).unwrap();
+    host.bind(&key, &endpoint, std::process::id()).unwrap();
+    let entry = host.entry(&key, &endpoint).unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    send(&mut client, &serde_json::json!({"protocol": PROTOCOL, "application": "test", "pid": std::process::id(), "accept_restore": true})).unwrap();
+    let mut reader = BufReader::new(server);
+    let result = accept_with_inspector(&entry, &mut reader, |_, _, _| {
+        Err("private OS diagnostic".into())
+    });
+    let Err(Rejection(code)) = result else {
+        panic!("inspection failure must reject the handshake")
+    };
+    assert_eq!(code, "ownership_verification_unavailable");
+    assert!(entry.state.lock().unwrap().claim.is_none());
 }

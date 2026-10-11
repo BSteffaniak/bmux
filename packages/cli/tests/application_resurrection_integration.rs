@@ -22,14 +22,29 @@ async fn wait_for(path: &std::path::Path, expected: &str, server: &support::Serv
     }
 }
 
+fn bash_path() -> String {
+    let resolved = std::process::Command::new("which")
+        .arg("bash")
+        .output()
+        .expect("resolve bash from PATH");
+    assert!(
+        resolved.status.success(),
+        "bash required for restart coverage"
+    );
+    String::from_utf8(resolved.stdout)
+        .expect("bash path is UTF-8")
+        .trim()
+        .to_owned()
+}
+
 #[tokio::test]
 async fn application_session_survives_real_daemon_restart() {
-    round_trip(false, "/bin/bash").await;
+    round_trip(false, &bash_path()).await;
 }
 
 #[tokio::test]
 async fn shell_application_session_survives_real_daemon_restart() {
-    round_trip(true, "/bin/bash").await;
+    round_trip(true, &bash_path()).await;
 }
 
 #[tokio::test]

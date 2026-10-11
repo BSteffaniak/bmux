@@ -16911,7 +16911,7 @@ mod tests {
     fn bash_prompt_work_does_not_consume_user_command_boundary() {
         let script = shell_integration_bash_rcfile()
             .replace("if [[ -f \"${HOME}/.bashrc\" ]]; then", "if false; then");
-        let output = std::process::Command::new("/bin/bash")
+        let output = std::process::Command::new("bash")
             .args(["--noprofile", "--norc", "-c"])
             .arg(format!(
                 "PROMPT_COMMAND=:\n{script}\neval \"$PROMPT_COMMAND\"\nprintf actual\n"

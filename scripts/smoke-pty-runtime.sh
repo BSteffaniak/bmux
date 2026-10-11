@@ -73,12 +73,20 @@ run_smoke_with_retry() {
 [keybindings]
 initial_mode = "normal"
 EOF
+    local shell_command
+    local pty_command
+    printf -v shell_command 'bash -lc %q' "stty rows 24 cols 80; exec \"${BMUX_SMOKE_BINARY:?}\" --config \"$sandbox/smoke.toml\""
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      printf -v pty_command 'script -q /dev/null %s' "$shell_command"
+    else
+      printf -v pty_command 'script -q -e -c %q /dev/null' "$shell_command"
+    fi
     set +e
     run_with_timeout "$SMOKE_TIMEOUT_SECS" bash -lc "
       set -euo pipefail
       (
 ${payload}
-      ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_STATE_HOME=\"$sandbox/state\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_CONFIG_DIR=\"$sandbox/config\" BMUX_DATA_DIR=\"$sandbox/data\" BMUX_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_STATE_DIR=\"$sandbox/state\" BMUX_LOG_DIR=\"$sandbox/logs\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null bash -lc 'stty rows 24 cols 80; exec \"${BMUX_SMOKE_BINARY:?}\" --config \"$sandbox/smoke.toml\"'
+      ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_STATE_HOME=\"$sandbox/state\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_CONFIG_DIR=\"$sandbox/config\" BMUX_DATA_DIR=\"$sandbox/data\" BMUX_RUNTIME_DIR=\"$sandbox/runtime\" BMUX_STATE_DIR=\"$sandbox/state\" BMUX_LOG_DIR=\"$sandbox/logs\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" $pty_command
     " >"$sandbox/pty.log" 2>&1
     status=$?
     set -e

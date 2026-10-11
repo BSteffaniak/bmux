@@ -316,7 +316,13 @@ run_case() {
   local status="PASS"
   local notes="ok"
 
-  if ! script -q "$log_file" "$BMUX_BIN" < <(emit_quit_when_marker_or_timeout "$flow_ok_file" "$CASE_TIMEOUT_SECS" "$timeout_file") >/dev/null 2>&1; then
+  local -a pty_command=(script -q "$log_file" "$BMUX_BIN")
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    local binary_command
+    printf -v binary_command '%q' "$BMUX_BIN"
+    pty_command=(script -q -e -c "$binary_command" "$log_file")
+  fi
+  if ! "${pty_command[@]}" < <(emit_quit_when_marker_or_timeout "$flow_ok_file" "$CASE_TIMEOUT_SECS" "$timeout_file") >/dev/null 2>&1; then
     status="FAIL"
     notes="bmux command failed"
   fi

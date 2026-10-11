@@ -64,3 +64,22 @@ Discovery is not authorization. No private credentials are persisted. Normal
 application selection/opening remains the application's responsibility. Host
 transport disconnect is not treated as process exit, and failed descriptor
 persistence stops that endpoint rather than acknowledging uncertain state.
+
+## Socket handshake failures
+
+A successful `application-resurrection/1` hello receives the existing
+`{"protocol":"application-resurrection/1","restore":null}` response (or a restore
+reference). A rejected hello receives a bounded response such as
+`{"protocol":"application-resurrection/1","error":{"code":"ownership_rejected"}}`
+before the connection closes. Success and rejection are mutually exclusive.
+Rejections never contain descriptors, private paths, or raw operating-system errors.
+
+Codes are `invalid_handshake` (framing/protocol/peer identity),
+`ownership_verification_unavailable` (process inspection failed),
+`ownership_rejected` (the peer is not the current execution owner), and
+`launch_unavailable` (launch or registration state is unavailable).
+Clients must fail closed for rejections and unknown codes; older clients fail their
+welcome decoding, and newer clients still recognize EOF from older hosts.
+
+On Linux, foreground inspection resolves `ps` through the host's PATH; macOS uses
+its system `/bin/ps`. Failure to inspect ownership never grants ownership.

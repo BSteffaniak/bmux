@@ -933,14 +933,20 @@ minimum = "1.0"
     #[cfg(unix)]
     #[test]
     fn registry_validates_process_runtime_entry_command() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = temp_dir();
+        let script = dir.join("process-entry.sh");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write process entry");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("make process entry executable");
         let manifest = PluginManifest::from_toml_str(
             r#"
 id = "process.plugin"
 name = "Process Plugin"
 version = "0.1.0"
 runtime = "process"
-entry = "/usr/bin/true"
+entry = "./process-entry.sh"
 
 [plugin_api]
 minimum = "1.0"

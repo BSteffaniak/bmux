@@ -4231,17 +4231,18 @@ enabled = ["three"]
         let path = temp_config_path();
         std::fs::write(
             &path,
-            r#"
+            format!(
+                r#"
 [composition]
 layer_order = ["defaults", "profile:active", "config"]
 
 [[composition.auto_select]]
 profile = "first"
-os = "macos"
+os = "{os}"
 
 [[composition.auto_select]]
 profile = "second"
-os = "macos"
+os = "{os}"
 
 [composition.profiles.first.patch.general]
 server_timeout = 111
@@ -4249,6 +4250,8 @@ server_timeout = 111
 [composition.profiles.second.patch.general]
 server_timeout = 222
 "#,
+                os = std::env::consts::OS
+            ),
         )
         .expect("write temp config");
 
