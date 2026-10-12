@@ -1,0 +1,27 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface", "rendering", "text-processing"]
+description = "Portable presentation decks and canonical BMUX component composition"
+edition     = { workspace = true }
+keywords    = ["bmux", "presentation", "markdown", "terminal", "tui"]
+license     = { workspace = true }
+name        = "bmux_presentation"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_markdown = { path = "../markdown" }
+bmux_tui = { path = "../tui" }
+bmux_tui_components = { path = "../tui-components", features = [
+    "scroll-view",
+    "button",
+] }
+pulldown-cmark = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

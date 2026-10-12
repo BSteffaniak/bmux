@@ -1,0 +1,33 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools", "rendering"]
+description = "Bounded Mermaid diagram rendering for BMUX"
+edition     = { workspace = true }
+keywords    = ["terminal", "diagram", "mermaid"]
+license     = { workspace = true }
+name        = "bmux_mermaid_render"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+libc                = { workspace = true }
+mermaid-rs-renderer = { workspace = true }
+sha2                = { workspace = true }
+tempfile            = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[[bin]]
+name = "bmux-mermaid-worker"
+path = "src/bin/worker.rs"
+
+[features]
+default          = []
+fail-on-warnings = []

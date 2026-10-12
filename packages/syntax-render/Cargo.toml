@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools", "rendering", "text-processing"]
+description = "Syntax-highlighted terminal line rendering for terminal surfaces"
+edition     = { workspace = true }
+keywords    = ["terminal", "syntax", "tui"]
+license     = { workspace = true }
+name        = "bmux_syntax_render"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_tui = { workspace = true }
+syntect  = { workspace = true }
+two-face = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

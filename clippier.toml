@@ -1,2 +1,5 @@
 [tools]
 required = ["mdformat"]
+
+[tools.clippier-md.files]
+exclude = ["/packages/markdown/tests/fixtures/**"]

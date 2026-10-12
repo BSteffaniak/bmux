@@ -1,0 +1,32 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools", "rendering", "text-processing"]
+description = "Markdown to terminal line rendering for terminal surfaces"
+edition     = { workspace = true }
+keywords    = ["terminal", "markdown", "tui"]
+license     = { workspace = true }
+name        = "bmux_markdown"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_mermaid_render          = { workspace = true }
+bmux_syntax_render           = { workspace = true }
+bmux_tui                     = { workspace = true }
+hyperchad_color              = { workspace = true }
+hyperchad_markdown           = { workspace = true, features = ["syntax-highlighting"] }
+hyperchad_transformer        = { workspace = true }
+hyperchad_transformer_models = { workspace = true }
+pulldown-cmark               = { workspace = true }
+smallvec                     = { workspace = true }
+unicode-segmentation         = { workspace = true }
+url                          = { workspace = true }
+
+[dev-dependencies]
+insta         = { workspace = true }
+unicode-width = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

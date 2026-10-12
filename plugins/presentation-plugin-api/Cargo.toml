@@ -1,0 +1,35 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "BPDL contracts for the optional BMUX presentation plugin"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "presentation", "api"]
+license     = { workspace = true }
+name        = "bmux_presentation_plugin_api"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+anyhow                    = { workspace = true }
+bmux_codec                = { workspace = true }
+bmux_ipc                  = { workspace = true }
+bmux_plugin_schema_macros = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+serde                     = { workspace = true, features = ["derive"] }
+serde_json                = { workspace = true }
+
+[package.metadata.cargo-machete]
+# Referenced by BPDL-generated transport, not handwritten source.
+ignored = [
+    "bmux_codec",
+    "bmux_ipc",
+    "bmux_plugin_sdk",
+    "anyhow",
+    "serde",
+    "serde_json",
+]
+
+[features]
+default          = []
+fail-on-warnings = []

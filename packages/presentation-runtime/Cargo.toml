@@ -1,0 +1,42 @@
+[package]
+authors     = { workspace = true }
+categories  = ["network-programming", "command-line-utilities"]
+description = "Authoritative presentation host and bounded TLS participant transport"
+edition     = { workspace = true }
+keywords    = ["presentation", "terminal", "tls"]
+license     = { workspace = true }
+name        = "bmux_presentation_runtime"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_mermaid_render = { path = "../mermaid-render" }
+bmux_presentation = { path = "../presentation" }
+bmux_tui = { path = "../tui" }
+image = { workspace = true }
+pulldown-cmark = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "rt",
+    "macros",
+] }
+tokio-rustls = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

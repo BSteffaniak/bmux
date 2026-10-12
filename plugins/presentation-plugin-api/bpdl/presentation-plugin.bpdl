@@ -1,0 +1,50 @@
+// Contract only. The implementation calls the authoritative runtime Host directly.
+plugin bmux.presentation version 1;
+capability PRESENTATION_VIEW = bmux.presentation.view.v1;
+capability PRESENTATION_MANAGE = bmux.presentation.manage.v1;
+
+@capability(PRESENTATION_VIEW)
+interface presentation-view-v1 {
+    enum interaction-mode { receive-only, submit-only, shared, independent }
+    record cursor { run_id: string, deck_revision: u64, revision: u64 }
+    record participant { id: string, cursor: cursor, mode: interaction-mode, next_action_id: u64? }
+    // JSON documents use bmux_presentation::Deck::public() and runtime mirror/asset
+    // models. Notes are an explicit, separately authorized projection, never Deck JSON.
+    record snapshot {
+        cursor: cursor,
+        public_deck_json: bytes,
+        slide_id: string?,
+        reveal_step: u32,
+        notes: string?,
+        surfaces_json: bytes,
+        assets_json: bytes,
+    }
+    variant poll { unchanged { cursor: cursor }, snapshot { resync: bool, snapshot: snapshot } }
+    variant action {
+        next, previous, first, last,
+        go-to { slide_id: string },
+        demo-input { surface_id: string, surface_revision: u64, x: u16, y: u16, input: string },
+        effect { name: string, input: string },
+    }
+    record acknowledgment { action_id: u64, cursor: cursor, outcome: string }
+    record asset-chunk { id: string, offset: u64, total: u64, data: bytes }
+    enum error { authentication, unauthorized, protocol-version, limit, stale, not-found, invalid, action-conflict, outcome-evicted, action-sequence, effect-uncertain }
+    command authenticate(host_id: string, credential: string?, mode: interaction-mode) -> result<participant, error>;
+    // No wait holds an unbounded service invocation; callers poll at bounded cadence.
+    command poll(host_id: string, participant_id: string, cursor: cursor?) -> result<poll, error>;
+    command snapshot(host_id: string, participant_id: string) -> result<snapshot, error>;
+    command submit(host_id: string, participant_id: string, action_id: u64, expected: cursor, action: action) -> result<acknowledgment, error>;
+    command asset(host_id: string, participant_id: string, id: string, offset: u64, length: u32) -> result<asset-chunk, error>;
+    command leave(host_id: string, participant_id: string) -> unit;
+}
+
+@capability(PRESENTATION_MANAGE)
+interface presentation-host-v1 {
+    record host-info { id: string, run_id: string, source: string }
+    // Paths resolve only in the managing owner's server process. This is privileged
+    // management, not a viewer operation or an arbitrary remote document fetch.
+    command start(source: string, public_read: bool, presenter_credential: string, audience_credential: string?, live_reload: bool) -> result<host-info, string>;
+    command list() -> list<host-info>;
+    command reload(host_id: string) -> result<unit, string>;
+    command stop(host_id: string) -> result<unit, string>;
+}

@@ -1278,6 +1278,7 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_cli_plugin",
  "bmux_plugin_sdk",
+ "bmux_presentation_plugin",
  "bmux_prompted_actions_plugin",
  "bmux_recording_plugin",
  "bmux_recording_plugin_api",
@@ -1872,6 +1873,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_markdown"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_mermaid_render",
+ "bmux_syntax_render",
+ "bmux_tui",
+ "hyperchad_color",
+ "hyperchad_markdown",
+ "hyperchad_transformer",
+ "hyperchad_transformer_models",
+ "insta",
+ "pulldown-cmark",
+ "smallvec",
+ "unicode-segmentation",
+ "unicode-width",
+ "url 2.5.8",
+]
+
+[[package]]
+name = "bmux_mermaid_render"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "libc",
+ "mermaid-rs-renderer",
+ "sha2 0.11.0",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "bmux_mobile_core"
 version = "0.0.1-alpha.1"
 dependencies = [
@@ -2158,6 +2189,83 @@ dependencies = [
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_presentation"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_markdown",
+ "bmux_tui",
+ "bmux_tui_components",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
+name = "bmux_presentation_plugin"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "anyhow",
+ "bmux_cli_schema",
+ "bmux_client",
+ "bmux_config",
+ "bmux_image",
+ "bmux_keyboard",
+ "bmux_mermaid_render",
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "bmux_presentation",
+ "bmux_presentation_plugin_api",
+ "bmux_presentation_runtime",
+ "bmux_syntax_render",
+ "bmux_tui",
+ "bmux_tui_runtime",
+ "clap",
+ "crossterm",
+ "image",
+ "resvg",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_presentation_plugin_api"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "anyhow",
+ "bmux_codec",
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bmux_presentation_runtime"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_mermaid_render",
+ "bmux_presentation",
+ "bmux_tui",
+ "image",
+ "pulldown-cmark",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "unicode-segmentation",
+ "unicode-width",
  "uuid",
 ]
 
@@ -2481,6 +2589,15 @@ dependencies = [
  "bmux_snapshot_protocol",
  "thiserror 2.0.20",
  "tokio",
+]
+
+[[package]]
+name = "bmux_syntax_render"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_tui",
+ "syntect",
+ "two-face",
 ]
 
 [[package]]
@@ -3680,7 +3797,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.119",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -4185,11 +4302,11 @@ checksum = "dd2e7510819d6fbf51a5545c8f922716ecfb14df168a3242f7d33e0239efe6a1"
 
 [[package]]
 name = "fastrand"
-version = "2.4.1"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.2.17",
 ]
 
 [[package]]
@@ -4665,11 +4782,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -6049,6 +6164,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "insta"
+version = "1.49.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b67d3d2e287e4b86c10b3f3b641033d1f89b74bdb39d05f34952e2b9a6fe21cd"
+dependencies = [
+ "once_cell",
+ "similar",
+ "tempfile",
+]
+
+[[package]]
 name = "instability"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6433,6 +6559,16 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "json5"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "733a844dbd6fef128e98cb4487b887cb55454d92cd9994b1bafe004fabbe670c"
+dependencies = [
+ "serde",
+ "ucd-trie",
 ]
 
 [[package]]
@@ -6966,6 +7102,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mermaid-rs-renderer"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cb5b469222ce6b9896edf0a969cf68464f5a028ef394fd6643f00bd943df117"
+dependencies = [
+ "anyhow",
+ "fontdb",
+ "json5",
+ "once_cell",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -10280,6 +10433,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+
+[[package]]
 name = "simple-dns"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12324,6 +12483,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 dependencies = [
  "core_maths",
+]
+
+[[package]]
+name = "two-face"
+version = "0.5.2+bat-0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "915be7adc2ff6f4338acbf71f3eda0a146f46003b992a1669c674308610efdac"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "syntect",
 ]
 
 [[package]]
