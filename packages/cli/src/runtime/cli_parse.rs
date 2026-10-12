@@ -239,9 +239,22 @@ pub(super) fn parse_runtime_cli_with_registry(
         .collect::<Option<Vec<_>>>()
         && let Some(resolved) = command_registry.resolve(&raw_args)
     {
-        let normalized =
-            PluginCommandRegistry::validate_arguments(&resolved.schema, &resolved.arguments)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let normalized = match PluginCommandRegistry::validate_arguments(
+            &resolved.schema,
+            &resolved.arguments,
+        ) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                if let Some(error) = error.downcast_ref::<clap::Error>() {
+                    return Ok(ParsedRuntimeCli::ImmediateExit {
+                        code: if error.use_stderr() { 2 } else { 0 },
+                        output: error.to_string(),
+                        stderr: error.use_stderr(),
+                    });
+                }
+                return Err(error);
+            }
+        };
         let verbose = raw_args.iter().any(|arg| arg == "--verbose" || arg == "-v");
         let log_level = resolve_log_level(
             verbose,

@@ -2291,9 +2291,18 @@ pub(super) async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
         .resolve(args)
         .with_context(|| unknown_external_command_message(args))?;
     let validated_arguments =
-        PluginCommandRegistry::validate_arguments(&resolved.schema, &resolved.arguments).map_err(
-            |error| anyhow::anyhow!(format_plugin_argument_validation_error(args, &error)),
-        )?;
+        match PluginCommandRegistry::validate_arguments(&resolved.schema, &resolved.arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                if let Some(error) = error.downcast_ref::<clap::Error>() {
+                    error.print()?;
+                    return Ok(if error.use_stderr() { 2 } else { 0 });
+                }
+                return Err(anyhow::anyhow!(format_plugin_argument_validation_error(
+                    args, &error
+                )));
+            }
+        };
     let resolve_us = resolve_started.elapsed().as_micros();
     let dispatch_started = Instant::now();
     let status = run_plugin_command(
@@ -2878,6 +2887,68 @@ enabled_by_default = false
                 assert!(arguments.is_empty());
             }
             other => panic!("expected plugin runtime parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interactive_record_cli_preserves_literal_argv_and_supports_help() {
+        let dir = temp_dir();
+        let manifest = dir.join("plugin.toml");
+        fs::write(
+            &manifest,
+            include_str!("../../../../plugins/recording-plugin/plugin.toml"),
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(
+                &manifest,
+                PluginManifest::from_toml_str(&format!(
+                    "entry = 'recording.dylib'\n{}",
+                    include_str!("../../../../plugins/recording-plugin/plugin.toml")
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("bmux.recording".into());
+        for prefix in [vec!["bmux"], vec!["bmux", "--log-level", "debug"]] {
+            let mut argv: Vec<OsString> = prefix.into_iter().map(OsString::from).collect();
+            argv.extend(
+                ["record", "--json", "--", "lazygit", "--help", "a b", "--"]
+                    .into_iter()
+                    .map(OsString::from),
+            );
+            assert_recording_plugin_cli_parse(
+                &config,
+                &registry,
+                &argv,
+                "record",
+                &["--json", "--", "lazygit", "--help", "a b", "--"],
+            );
+        }
+        let argv = ["bmux", "record", "--help"].map(OsString::from);
+        let parsed = parse_runtime_cli_with_registry(
+            &argv,
+            &config,
+            &registry,
+            None,
+            bmux_config::ConfigLoadOverrides::default(),
+        )
+        .unwrap();
+        match parsed {
+            ParsedRuntimeCli::ImmediateExit {
+                code,
+                output,
+                stderr,
+            } => {
+                assert_eq!(code, 0);
+                assert!(!stderr);
+                for option in ["--output", "--export", "--gif", "--json"] {
+                    assert!(output.contains(option), "missing {option}: {output}");
+                }
+            }
+            other => panic!("expected help, got {other:?}"),
         }
     }
 

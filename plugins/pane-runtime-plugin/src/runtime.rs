@@ -11915,11 +11915,15 @@ mod tests {
                 .execution_token
                 .is_none()
         );
+        // Shells may canonicalize /tmp to /private/tmp on macOS.
         assert_eq!(
-            std::fs::read_to_string(root.path().join("witness"))
-                .unwrap()
-                .trim(),
-            root.path().to_str().unwrap()
+            std::fs::canonicalize(
+                std::fs::read_to_string(root.path().join("witness"))
+                    .unwrap()
+                    .trim()
+            )
+            .unwrap(),
+            root.path().canonicalize().unwrap()
         );
     }
 

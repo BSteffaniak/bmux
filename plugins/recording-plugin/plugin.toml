@@ -24,6 +24,30 @@ name = "record"
 path = ["record"]
 summary = "Run an interactive program with durable recording"
 [[commands.arguments]]
+kind       = "path"
+long       = "output"
+name       = "output"
+summary    = "Export artifacts to a new directory (must not exist)"
+value_name = "NEW_DIR"
+[[commands.arguments]]
+choice_values = ["text", "raw", "events", "gif"]
+kind          = "choice"
+long          = "export"
+multiple      = true
+name          = "export"
+summary       = "Export a format; repeat for multiple formats (requires --output)"
+[[commands.arguments]]
+kind       = "path"
+long       = "gif"
+name       = "gif"
+summary    = "Publish a GIF at a new path (must not exist)"
+value_name = "NEW_PATH"
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Emit final JSON after restoring the terminal"
+[[commands.arguments]]
 allow_hyphen_values = true
 kind                = "string"
 multiple            = true

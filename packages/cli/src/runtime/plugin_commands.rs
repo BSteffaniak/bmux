@@ -184,11 +184,7 @@ impl PluginCommandRegistry {
         command: &PluginCommand,
         arguments: &[String],
     ) -> Result<Vec<String>> {
-        let mut clap_command =
-            Command::new(leak_string(&command.name)).disable_help_subcommand(true);
-        for argument in &command.arguments {
-            clap_command = clap_command.arg(build_clap_arg(argument));
-        }
+        let clap_command = build_plugin_leaf_command(&command.name, command);
         let mut argv = Vec::with_capacity(arguments.len() + 1);
         argv.push(command.name.clone());
         argv.extend(arguments.iter().cloned());
@@ -200,41 +196,16 @@ impl PluginCommandRegistry {
             )
         })?;
 
-        let mut normalized = Vec::new();
-        for argument in &command.arguments {
-            if let Some(long) = &argument.long {
-                if matches.value_source(&argument.name).is_none() {
-                    continue;
-                }
-                if matches!(argument.kind, PluginCommandArgumentKind::Boolean) {
-                    if matches.get_flag(&argument.name) {
-                        normalized.push(format!("--{long}"));
-                    }
-                    continue;
-                }
-                if argument.multiple {
-                    if let Some(values) = matches.get_many::<String>(&argument.name) {
-                        for value in values {
-                            normalized.push(format!("--{long}"));
-                            normalized.push(value.clone());
-                        }
-                    }
-                } else if let Some(value) = matches.get_one::<String>(&argument.name) {
-                    normalized.push(format!("--{long}"));
-                    normalized.push(value.clone());
-                }
-                continue;
-            }
-
-            if argument.multiple {
-                if let Some(values) = matches.get_many::<String>(&argument.name) {
-                    normalized.extend(values.cloned());
-                }
-            } else if let Some(value) = matches.get_one::<String>(&argument.name) {
-                normalized.push(value.clone());
-            }
+        // Trailing argv is caller-owned. Clap consumes `--`; reconstructing
+        // values loses that boundary and can reorder options.
+        if command
+            .arguments
+            .iter()
+            .any(|argument| argument.trailing_var_arg)
+        {
+            return Ok(arguments.to_vec());
         }
-
+        let normalized = Self::normalize_arguments_from_matches(command, &matches);
         Ok(normalized)
     }
 
