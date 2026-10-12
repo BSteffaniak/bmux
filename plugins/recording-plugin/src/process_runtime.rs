@@ -47,14 +47,38 @@ pub(crate) fn dispatch<T: Send + 'static>(
         isolated: service.isolated,
         mutation: Arc::clone(&service.mutation),
     });
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        Ok::<T, anyhow::Error>(runtime.block_on(operation(service)))
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("process service dispatch panicked"))?
+    drive_process_operation(move || operation(service))
+}
+
+/// Native dispatch is synchronous, but may be entered on the server's async
+/// worker. Hand its scheduler core off before joining the private driver thread
+/// so timers and I/O on the original runtime can still wake nested service waits.
+fn drive_process_operation<T, F, Fut>(operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+{
+    let drive = move || {
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            Ok::<T, anyhow::Error>(runtime.block_on(operation()))
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("process service dispatch panicked"))?
+    };
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|runtime| runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(drive)
+    } else {
+        // No-runtime and current-thread callers cannot use block_in_place.
+        // The owned driver still has its own timer/I/O context; it never relies
+        // on the blocked current-thread caller to drive its operation.
+        drive()
+    }
 }
 
 pub(crate) struct ProcessService {
@@ -802,6 +826,20 @@ pub(crate) fn stop_capture(id: Uuid) -> Result<()> {
     Ok(())
 }
 
+fn capture_writer_ack(id: Uuid) -> Result<Option<crate::recording_runtime::writer_ack::WriterAck>> {
+    let Some(handle) = crate::manual_handle() else {
+        return Ok(None);
+    };
+    let handle = handle
+        .read()
+        .map_err(|_| anyhow::anyhow!("recording handle poisoned"))?;
+    let runtime = handle
+        .0
+        .lock()
+        .map_err(|_| anyhow::anyhow!("recording runtime poisoned"))?;
+    Ok(runtime.writer_ack(id))
+}
+
 fn failure(error: anyhow::Error) -> process::ProcessError {
     process::ProcessError::OperationFailed {
         reason: error.into_boxed_dyn_error().to_string(),
@@ -829,22 +867,54 @@ impl process::RecordingProcessV4Service for ProcessService {
         Box::pin(async move {
             let value = self.refresh(run_id).await.map_err(failure)?;
             let directory = self.root.join(value.recording_id.to_string());
-            if value.output_drained {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-                while std::fs::metadata(directory.join("output.live"))
-                    .map_err(|error| failure(error.into()))?
-                    .len()
-                    < value.output_watermark
-                {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(failure(anyhow::anyhow!(
-                            "capture writer has not reached drained output watermark"
-                        )));
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let durable_end = if let Some(acknowledgment) =
+                capture_writer_ack(value.recording_id).map_err(failure)?
+            {
+                if value.output_drained {
+                    crate::recording_runtime::writer_ack::wait_for_watermark(
+                        acknowledgment.clone(),
+                        value.output_watermark,
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                    )
+                    .await
+                    .map_err(failure)?;
                 }
+                let state = acknowledgment.borrow();
+                if let Some(error) = &state.error {
+                    return Err(failure(anyhow::anyhow!("recording writer failed: {error}")));
+                }
+                if !state.ready {
+                    return Err(failure(anyhow::anyhow!("recording writer is not ready")));
+                }
+                state.watermark
+            } else if original_writer_closed(&directory, &value).map_err(failure)? {
+                // Live sink absence is not success. A validated original closure
+                // receipt is an explicit offline authority, preserving timing.
+                value.output_watermark
+            } else if !value.timing_complete {
+                // Refresh explicitly repairs raw-only disk capture. Use its
+                // committed cursor, never infer writer health from file length.
+                let store = self.store().map_err(failure)?;
+                store
+                    .capture_cursor(run_id)
+                    .map_err(failure)?
+                    .unwrap_or(store.reservation(run_id).map_err(failure)?.initial_cursor)
+                    .offset
+            } else {
+                return Err(failure(anyhow::anyhow!(
+                    "recording writer acknowledgment unavailable"
+                )));
+            };
+            if value.output_drained && durable_end > value.output_watermark {
+                return Err(failure(anyhow::anyhow!(
+                    "capture exceeds drained execution output watermark"
+                )));
             }
-            read_output(&directory, &value, since, max_bytes).map_err(failure)
+            // The execution status is the authority for this read's boundary;
+            // a concurrently advancing writer cannot enlarge that request.
+            let durable_end = durable_end.min(value.output_watermark);
+            read_output_through(&directory, &value, since, max_bytes, Some(durable_end))
+                .map_err(failure)
         })
     }
     fn screen(&self, run_id: Uuid) -> Reply<'_, String> {
@@ -1064,13 +1134,32 @@ pub(crate) fn read_output(
     since: u64,
     max_bytes: u32,
 ) -> Result<process::OutputRead> {
+    read_output_through(directory, status, since, max_bytes, None)
+}
+
+fn read_output_through(
+    directory: &Path,
+    status: &process::RunStatus,
+    since: u64,
+    max_bytes: u32,
+    durable_end: Option<u64>,
+) -> Result<process::OutputRead> {
     use std::io::{Read, Seek, SeekFrom};
     ensure!(
         max_bytes > 0 && max_bytes <= 1024 * 1024,
         "max-bytes must be 1..1048576"
     );
     let mut file = std::fs::File::open(directory.join("output.live"))?;
-    let end = file.metadata()?.len();
+    let length = file.metadata()?.len();
+    ensure!(
+        !status.output_drained || length <= status.output_watermark,
+        "capture exceeds drained execution output watermark"
+    );
+    let end = durable_end.unwrap_or(length);
+    ensure!(
+        end <= length,
+        "durable capture acknowledgment exceeds disk output"
+    );
     ensure!(
         !status.output_drained || end <= status.output_watermark,
         "capture exceeds drained execution output watermark"

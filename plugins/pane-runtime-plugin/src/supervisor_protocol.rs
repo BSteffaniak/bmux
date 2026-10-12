@@ -4,6 +4,14 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 pub const VERSION: u32 = 4;
+pub const LIFECYCLE_CAPABILITY: u32 = 1;
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct LifecycleSnapshot {
+    pub capability: u32,
+    pub revision: u64,
+    pub status: Response,
+}
 
 pub const MAX_FRAME: usize = 262_144;
 
@@ -26,6 +34,10 @@ pub struct Request {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum Operation {
     Hello,
+    // Explicit private negotiation; v4 status/mutation semantics are unchanged.
+    Subscribe {
+        capability: u32,
+    },
     Start {
         mutation_id: String,
         program: String,

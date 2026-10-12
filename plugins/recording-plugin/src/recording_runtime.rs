@@ -1,3 +1,5 @@
+pub(crate) mod writer_ack;
+
 use anyhow::{Context, Result};
 use bmux_recording_protocol::{
     DisplayTrackEnvelope, DisplayTrackEvent, RECORDING_FORMAT_VERSION,
@@ -34,6 +36,7 @@ pub struct RecordingRuntime {
     rolling_window_secs: Option<u64>,
     rolling_segment_max_age_secs: Option<u64>,
     process_capture: bool,
+    writer_ack: Option<(Uuid, writer_ack::WriterAck)>,
 }
 
 #[derive(Debug)]
@@ -64,6 +67,7 @@ struct ActiveRecording {
     payload_bytes: Arc<AtomicU64>,
     sender: mpsc::SyncSender<RecordingEventEnvelope>,
     capture_failed: Arc<AtomicBool>,
+    progress: writer_ack::WriterPublisher,
     writer: Option<thread::JoinHandle<Result<RecordingSummary>>>,
     path: PathBuf,
 }
@@ -99,6 +103,7 @@ impl RecordingRuntime {
             rolling_window_secs: None,
             rolling_segment_max_age_secs: None,
             process_capture: false,
+            writer_ack: None,
         }
     }
 
@@ -116,7 +121,15 @@ impl RecordingRuntime {
             rolling_window_secs: Some(rolling_window_secs),
             rolling_segment_max_age_secs: Some(DEFAULT_ROLLING_SEGMENT_MAX_AGE_SECS),
             process_capture: false,
+            writer_ack: None,
         }
+    }
+
+    pub(crate) fn writer_ack(&self, id: Uuid) -> Option<writer_ack::WriterAck> {
+        self.writer_ack
+            .as_ref()
+            .filter(|(recording, _)| *recording == id)
+            .map(|(_, acknowledgment)| acknowledgment.clone())
     }
 
     pub(crate) fn enable_process_capture(&mut self) {
@@ -191,10 +204,13 @@ impl RecordingRuntime {
         let rolling_window_secs = self.rolling_window_secs;
         let rolling_segment_max_age_secs = self.rolling_segment_max_age_secs;
 
+        let (progress, acknowledgment) = writer_ack::channel();
+        let writer_progress = progress.clone();
         let writer = thread::Builder::new()
             .name(format!("bmux-recording-{id}"))
             .spawn(move || {
-                writer_loop(
+                let mut guard = writer_ack::WriterGuard::new(writer_progress.clone());
+                let result = writer_loop(
                     &rx,
                     &recording_dir,
                     &manifest_path,
@@ -206,7 +222,10 @@ impl RecordingRuntime {
                     rolling_segment_max_age_secs,
                     &writer_capture_failed,
                     &ready_tx,
-                )
+                    &writer_progress,
+                );
+                guard.complete(&result);
+                result
             })
             .context("failed to spawn recording writer thread")?;
 
@@ -214,6 +233,7 @@ impl RecordingRuntime {
             .recv()
             .context("recording writer failed before capture became ready")??;
 
+        self.writer_ack = Some((id, acknowledgment));
         self.active = Some(ActiveRecording {
             id,
             name,
@@ -228,6 +248,7 @@ impl RecordingRuntime {
             payload_bytes,
             sender: tx,
             capture_failed,
+            progress,
             writer: Some(writer),
             path: dir,
         });
@@ -433,12 +454,17 @@ impl RecordingRuntime {
             .len();
         if encoded_size > usize::try_from(MAX_RECORDING_PAYLOAD_BYTES)? {
             active.capture_failed.store(true, Ordering::SeqCst);
+            writer_ack::fail(
+                &active.progress,
+                "recording event exceeds bounded capture payload limit",
+            );
             anyhow::bail!("recording event exceeds bounded capture payload limit");
         }
         // The independent writer never takes the runtime lock. Blocking here
         // applies bounded backpressure rather than silently dropping output.
         if let Err(error) = active.sender.send(envelope) {
             active.capture_failed.store(true, Ordering::SeqCst);
+            writer_ack::fail(&active.progress, "recording capture queue unavailable");
             anyhow::bail!("recording capture queue unavailable: {error}; output is incomplete");
         }
         Ok(true)
@@ -643,7 +669,9 @@ fn writer_loop(
     rolling_segment_max_age_secs: Option<u64>,
     capture_failed: &AtomicBool,
     ready: &mpsc::SyncSender<Result<()>>,
+    progress: &writer_ack::WriterPublisher,
 ) -> Result<RecordingSummary> {
+    let counters = (event_count.as_ref(), payload_bytes.as_ref());
     let segment_limit_bytes = (segment_mb as u64) * 1024 * 1024;
     let rolling_window_ms = rolling_window_secs.map(|secs| secs.saturating_mul(1000));
     let rolling_segment_max_age_ms =
@@ -658,13 +686,22 @@ fn writer_loop(
     let (file, mut raw) = prepare_writer_files(recording_dir, &segment_path, ready)?;
     let mut writer = BufWriter::new(file);
     summary.segments = vec![segment_name.clone()];
+    progress.send_modify(|state| state.ready = raw.is_some());
+    let mut raw_watermark = 0_u64;
+    let mut flush_deadline: Option<Instant> = None;
 
     loop {
-        match rx.recv_timeout(Duration::from_secs(1)) {
+        let received = receive_writer_event(rx, rolling_window_ms.is_some(), flush_deadline);
+        match received {
             Ok(event) => {
-                write_frame(&mut writer, &event)
-                    .map_err(|e| anyhow::anyhow!("recording write_frame failed: {e}"))?;
-                append_live_output(raw.as_mut(), &event)?;
+                persist_event_and_acknowledge_output(
+                    &mut writer,
+                    raw.as_mut(),
+                    &event,
+                    &mut raw_watermark,
+                    &mut flush_deadline,
+                    progress,
+                )?;
                 let payload_sz = payload_size(&event.payload);
                 event_count.fetch_add(1, Ordering::SeqCst);
                 payload_bytes.fetch_add(payload_sz, Ordering::SeqCst);
@@ -678,9 +715,8 @@ fn writer_loop(
                 if event.seq % 128 == 0 {
                     writer.flush()?;
                     writer.get_ref().sync_all()?;
-                    summary.event_count = event_count.load(Ordering::SeqCst);
-                    summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
-                    write_manifest(manifest_path, &summary)?;
+                    flush_deadline = None;
+                    write_writer_checkpoint(manifest_path, &mut summary, counters)?;
                 }
 
                 let rotate_by_size =
@@ -694,6 +730,7 @@ fn writer_loop(
                 if rotate_by_size || rotate_by_age {
                     writer.flush()?;
                     writer.get_ref().sync_all()?;
+                    flush_deadline = None;
                     drop(writer);
 
                     closed_segments.push_back((segment_name.clone(), event.wall_epoch_ms));
@@ -702,18 +739,7 @@ fn writer_loop(
                     segment_bytes = 0;
                     current_segment_start_wall_ms = None;
                     segment_name = format!("events_{segment_index}.bin");
-                    let new_segment_path = recording_dir.join(&segment_name);
-                    let new_file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&new_segment_path)
-                        .with_context(|| {
-                            format!(
-                                "failed opening new segment file {}",
-                                new_segment_path.display()
-                            )
-                        })?;
-                    writer = BufWriter::new(new_file);
+                    writer = open_next_recording_segment(recording_dir, &segment_name)?;
                     summary.segments.push(segment_name.clone());
 
                     if let Some(window_ms) = rolling_window_ms {
@@ -727,12 +753,11 @@ fn writer_loop(
                     }
 
                     // Update manifest with new segment list.
-                    summary.event_count = event_count.load(Ordering::SeqCst);
-                    summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
-                    write_manifest(manifest_path, &summary)?;
+                    write_writer_checkpoint(manifest_path, &mut summary, counters)?;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                flush_deadline = None;
                 flush_idle_writer(
                     &mut writer,
                     recording_dir,
@@ -758,6 +783,76 @@ fn writer_loop(
     Ok(summary)
 }
 
+fn write_writer_checkpoint(
+    manifest_path: &Path,
+    summary: &mut RecordingSummary,
+    counters: (&AtomicU64, &AtomicU64),
+) -> Result<()> {
+    summary.event_count = counters.0.load(Ordering::SeqCst);
+    summary.payload_bytes = counters.1.load(Ordering::SeqCst);
+    write_manifest(manifest_path, summary)
+}
+
+fn open_next_recording_segment(
+    recording_dir: &Path,
+    segment_name: &str,
+) -> Result<BufWriter<std::fs::File>> {
+    let segment_path = recording_dir.join(segment_name);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&segment_path)
+        .with_context(|| format!("failed opening new segment file {}", segment_path.display()))?;
+    Ok(BufWriter::new(file))
+}
+
+fn receive_writer_event(
+    rx: &mpsc::Receiver<RecordingEventEnvelope>,
+    rolling_retention: bool,
+    flush_deadline: Option<Instant>,
+) -> std::result::Result<RecordingEventEnvelope, mpsc::RecvTimeoutError> {
+    // Rolling retention has an idle timer. Other recordings arm a single
+    // batching deadline only while dirty; idle writers block on events.
+    if rolling_retention {
+        rx.recv_timeout(Duration::from_secs(1))
+    } else if let Some(deadline) = flush_deadline {
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    } else {
+        rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+    }
+}
+
+fn persist_event_and_acknowledge_output(
+    writer: &mut BufWriter<std::fs::File>,
+    raw: Option<&mut BufWriter<std::fs::File>>,
+    event: &RecordingEventEnvelope,
+    raw_watermark: &mut u64,
+    flush_deadline: &mut Option<Instant>,
+    progress: &writer_ack::WriterPublisher,
+) -> Result<()> {
+    write_frame(writer, event)
+        .map_err(|error| anyhow::anyhow!("recording write_frame failed: {error}"))?;
+    let has_raw_sink = raw.is_some();
+    append_live_output(raw, event)?;
+    flush_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(1));
+    if has_raw_sink
+        && event.kind == RecordingEventKind::PaneOutputRaw
+        && let RecordingPayload::Bytes { data } = &event.payload
+    {
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        *flush_deadline = None;
+        *raw_watermark = raw_watermark
+            .checked_add(u64::try_from(data.len())?)
+            .context("recording raw watermark overflow")?;
+        // Both streams are durable before acknowledging output.
+        // Input/decorations batch until this boundary or checkpoint;
+        // capture EOF is not writer finalization.
+        progress.send_modify(|state| state.watermark = *raw_watermark);
+    }
+    Ok(())
+}
+
 fn append_live_output(
     raw: Option<&mut BufWriter<std::fs::File>>,
     event: &RecordingEventEnvelope,
@@ -768,6 +863,7 @@ fn append_live_output(
     {
         raw.write_all(data)?;
         raw.flush()?;
+        raw.get_ref().sync_all()?;
     }
     Ok(())
 }
@@ -847,6 +943,10 @@ fn prepare_writer_files(
     } else {
         None
     };
+    if let Some(raw) = &raw {
+        raw.get_ref().sync_all()?;
+        std::fs::File::open(recording_dir)?.sync_all()?;
+    }
     let file = match file {
         Ok(file) => {
             ready

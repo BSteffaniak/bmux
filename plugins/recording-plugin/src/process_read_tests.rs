@@ -4,6 +4,144 @@ mod tests {
     use bmux_recording_protocol::{
         RecordingEventEnvelope, RecordingEventKind, RecordingPayload, write_frame,
     };
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn synchronous_process_dispatch_hands_off_original_runtime_timer_driver() {
+        // A single worker makes scheduler handoff necessary, not probabilistic.
+        // Run dispatch on that worker (rather than the test's block_on thread).
+        let owner = tokio::runtime::Handle::current();
+        tokio::spawn(async move {
+            let progressed = drive_process_operation(move || async move {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                let timer = owner.spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    let _ = sender.send(());
+                });
+                // This watchdog uses the independent dispatch runtime. Without
+                // handoff the original runtime cannot drive the timer; the test
+                // fails in bounded time instead of hanging like the CLI fixture.
+                let progressed = tokio::time::timeout(std::time::Duration::from_secs(2), receiver)
+                    .await
+                    .is_ok_and(|result| result.is_ok());
+                timer.abort();
+                progressed
+            })
+            .unwrap();
+            assert!(
+                progressed,
+                "original runtime timer starved by synchronous dispatch"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn synchronous_process_dispatch_accepts_current_thread_caller() {
+        let caller_thread = std::thread::current().id();
+        let result = drive_process_operation(move || async move {
+            assert_ne!(std::thread::current().id(), caller_thread);
+            assert_eq!(
+                tokio::runtime::Handle::current().runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::CurrentThread,
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            42
+        })
+        .unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn synchronous_process_dispatch_accepts_no_runtime_caller_and_reports_panic() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let caller_thread = std::thread::current().id();
+        let result = drive_process_operation(move || async move {
+            assert_ne!(std::thread::current().id(), caller_thread);
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            42
+        })
+        .unwrap();
+        assert_eq!(result, 42);
+        let failed: Result<()> =
+            drive_process_operation(|| async { panic!("dispatch operation panic") });
+        assert!(
+            failed
+                .unwrap_err()
+                .to_string()
+                .contains("process service dispatch panicked")
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_writer_ack_survives_stop_without_changing_original_closure() {
+        let root = std::env::temp_dir().join(format!("bmux-writer-ack-{}", Uuid::new_v4()));
+        let mut runtime = crate::recording_runtime::RecordingRuntime::new(root.clone(), 64, 30);
+        runtime.enable_process_capture();
+        let summary = runtime
+            .start(
+                None,
+                true,
+                None,
+                bmux_recording_protocol::RecordingProfile::Full,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .unwrap();
+        let acknowledgment = runtime.writer_ack(summary.id).unwrap();
+        runtime
+            .record(
+                RecordingEventKind::PaneOutputRaw,
+                RecordingPayload::Bytes {
+                    data: b"durable".to_vec(),
+                },
+                bmux_recording_runtime::RecordMeta::default(),
+            )
+            .unwrap();
+        crate::recording_runtime::writer_ack::wait_for_watermark(
+            acknowledgment.clone(),
+            7,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!acknowledgment.borrow().closed);
+        let directory = root.join(summary.id.to_string());
+        assert_eq!(
+            std::fs::read(directory.join("output.live")).unwrap(),
+            b"durable"
+        );
+        let stopped = runtime.stop(Some(summary.id)).unwrap();
+        assert!(stopped.ended_epoch_ms.is_some());
+        assert_eq!(stopped.event_count, 1);
+        assert!(acknowledgment.borrow().closed);
+        crate::recording_runtime::writer_ack::wait_for_watermark(
+            runtime.writer_ack(summary.id).unwrap(),
+            7,
+            tokio::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+        let mut value = ProcessService::initial_status(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            summary.id,
+            "owned".into(),
+        );
+        value.execution = Some(process::ExecutionRef {
+            session_id: Uuid::new_v4(),
+            pane_id: Uuid::new_v4(),
+            execution_token: Uuid::new_v4(),
+        });
+        value.output_watermark = 7;
+        let closure = closed_original_events(&directory, &value, 7).unwrap();
+        crate::durable::write_atomic(
+            &directory.join("original-writer-closure.json"),
+            &serde_json::to_vec(&closure).unwrap(),
+        )
+        .unwrap();
+        assert!(original_writer_closed(&directory, &value).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn original_writer_closure_survives_derived_repair_but_rejects_event_corruption() {
         let root = std::env::temp_dir().join(format!("bmux-writer-closure-{}", Uuid::new_v4()));
@@ -267,6 +405,11 @@ mod tests {
         assert!(next.complete);
         assert!(read_output(&root, &value, 5, 8).is_err());
         assert!(read_output(&root, &value, 0, 0).is_err());
+        let bounded = read_output_through(&root, &value, 0, 8, Some(2)).unwrap();
+        assert_eq!(bounded.data, [0, 255]);
+        assert!(!bounded.complete);
+        assert!(read_output_through(&root, &value, 3, 8, Some(2)).is_err());
+        assert!(read_output_through(&root, &value, 0, 8, Some(5)).is_err());
         // A drained execution watermark is exact, not a lower bound that
         // permits unrelated or corrupt suffix bytes to appear complete.
         std::fs::write(root.join("output.live"), [0, 255, 1, 2, 3]).unwrap();

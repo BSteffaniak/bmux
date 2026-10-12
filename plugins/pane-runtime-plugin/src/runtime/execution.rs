@@ -10,7 +10,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Semaphore;
 
 #[cfg(unix)]
@@ -22,6 +22,8 @@ type SpawnAuthorization = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
 
 pub(super) struct ExecutionCapture {
     pub(super) supervisor: Mutex<Option<Arc<super::supervisor::SupervisorControl>>>,
+    #[cfg(unix)]
+    pub(super) lifecycle_interrupter: Mutex<Option<std::os::unix::net::UnixStream>>,
     pub(super) spawn_authorization: Mutex<Option<SpawnAuthorization>>,
     pub(super) group_kill_issued: AtomicBool,
     pub(super) target_stop_issued: AtomicBool,
@@ -36,6 +38,8 @@ pub(super) struct ExecutionCapture {
     pub(super) output_drained: AtomicBool,
     pub(super) output_watermark: AtomicU64,
     pub(super) outcome: Mutex<(Option<u32>, Option<String>, Option<String>)>,
+    pub(super) lifecycle_done: tokio::sync::watch::Sender<bool>,
+    changes: tokio::sync::watch::Sender<()>,
     admission: Arc<Semaphore>,
 }
 
@@ -43,6 +47,8 @@ impl Default for ExecutionCapture {
     fn default() -> Self {
         Self {
             supervisor: Mutex::new(None),
+            #[cfg(unix)]
+            lifecycle_interrupter: Mutex::new(None),
             spawn_authorization: Mutex::new(None),
             group_kill_issued: AtomicBool::new(false),
             target_stop_issued: AtomicBool::new(false),
@@ -57,12 +63,39 @@ impl Default for ExecutionCapture {
             output_drained: AtomicBool::new(false),
             output_watermark: AtomicU64::new(0),
             outcome: Mutex::new((None, None, None)),
+            lifecycle_done: tokio::sync::watch::channel(true).0,
+            changes: tokio::sync::watch::channel(()).0,
             admission: Arc::new(Semaphore::new(64)),
         }
     }
 }
 
 impl ExecutionCapture {
+    pub(super) fn interrupt_lifecycle(&self) {
+        #[cfg(unix)]
+        if let Ok(socket) = self.lifecycle_interrupter.lock()
+            && let Some(socket) = socket.as_ref()
+        {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    pub(super) async fn join_lifecycle(&self) -> anyhow::Result<()> {
+        let mut done = self.lifecycle_done.subscribe();
+        self.interrupt_lifecycle();
+        while !*done.borrow_and_update() {
+            done.changed().await?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    pub(super) fn notify(&self) {
+        self.changes.send_replace(());
+    }
     pub(super) fn authorize_spawn(&self) -> anyhow::Result<()> {
         let authorization = self
             .spawn_authorization
@@ -82,9 +115,11 @@ impl ExecutionCapture {
             .supervisor
             .lock()
             .map_err(|_| anyhow::anyhow!("supervisor control lock poisoned"))?;
+        if self.terminal_owner_retired.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         if let Some(supervisor) = supervisor_guard.as_ref() {
-            if self.terminal_owner_retired.load(Ordering::SeqCst)
-                || self.group_kill_issued.load(Ordering::SeqCst)
+            if self.group_kill_issued.load(Ordering::SeqCst)
                 || self.target_stop_issued.load(Ordering::SeqCst)
             {
                 return Ok(false);
@@ -125,6 +160,7 @@ impl ExecutionCapture {
                         "terminal owner retirement rejected"
                     );
                     self.terminal_owner_retired.store(true, Ordering::SeqCst);
+                    self.interrupt_lifecycle();
                 }
                 // Publish stop fences only after the retirement receipt; waiter
                 // consumes these without the control lock to reap the guardian.
@@ -133,6 +169,7 @@ impl ExecutionCapture {
                 self.group_kill_issued
                     .store(response.group_consumed, Ordering::SeqCst);
             }
+            self.notify();
             return Ok(true);
         }
         #[cfg(unix)]
@@ -196,6 +233,7 @@ impl ExecutionCapture {
                 Err(error) => outcome.2 = Some(format!("process wait failed: {error}")),
             }
         }
+        self.notify();
     }
     pub(super) fn record_cleanup_error(&self, error: String) {
         self.cleanup_failed.store(true, Ordering::SeqCst);
@@ -206,6 +244,7 @@ impl ExecutionCapture {
         if let Ok(mut outcome) = self.outcome.lock() {
             outcome.2.get_or_insert(error);
         }
+        self.notify();
     }
 }
 
@@ -639,27 +678,27 @@ pub(crate) fn wait(
             reason: "wait timeout exceeds 30000ms; poll again".into(),
         });
     }
-    // Blocking bounded polls run outside Tokio's worker budget; PTY supervision
-    // must keep progressing even when several clients wait concurrently.
-    let poll = || {
-        let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
-        tracing::debug!(execution_token = %reference.execution_token, "execution wait poll entered");
+    let owner = spawn_runtime_handle()
+        .ok_or_else(|| failed("pane execution runtime is not registered for wait"))?;
+    drive_startup(&owner.1, async {
+        // Subscribe before inspecting authority: a change racing the initial
+        // snapshot remains pending, even before changed() is first awaited.
+        let mut changes = with_pane(reference, |pane| Ok(pane.execution.subscribe()))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
             authorize()?;
-            tracing::trace!(execution_token = %reference.execution_token, "execution wait authorization completed");
             let current = status(reference)?;
             if current.error.is_some()
                 || (!matches!(current.phase, ExecutionPhase::Running) && current.output_drained)
-                || Instant::now() >= deadline
+                || tokio::time::Instant::now() >= deadline
             {
                 return Ok(current);
             }
-            std::thread::sleep(Duration::from_millis(10));
+            tokio::time::timeout_at(deadline, changes.changed())
+                .await
+                .map_or(Ok(()), |result| result.map_err(failed))?;
         }
-    };
-    let owner = spawn_runtime_handle()
-        .ok_or_else(|| failed("pane execution runtime is not registered for wait"))?;
-    drive_startup(&owner.1, async { poll() })?
+    })?
 }
 
 pub(crate) fn terminate(
@@ -670,65 +709,73 @@ pub(crate) fn terminate(
     let owner = spawn_runtime_handle()
         .ok_or_else(|| failed("pane execution runtime is not registered for termination"))?;
     drive_startup(&owner.1, async {
-        terminate_blocking(reference, grace_ms, &authorize)
+        if grace_ms > 30_000 {
+            return Err(ExecutionError::InvalidOptions {
+                reason: "termination grace exceeds 30000ms".into(),
+            });
+        }
+        let mut changes = with_pane(reference, |pane| Ok(pane.execution.subscribe()))?;
+        let signal = |signal| {
+            authorize()?;
+            with_pane(reference, |pane| {
+                pane.execution.signal_owned_group(signal).map_err(failed)
+            })
+        };
+        signal(libc::SIGTERM)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(grace_ms));
+        loop {
+            authorize()?;
+            let settled = with_pane(reference, |pane| {
+                Ok(pane.exited.load(Ordering::SeqCst)
+                    && pane.execution.output_drained.load(Ordering::SeqCst))
+            })?;
+            if settled || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::timeout_at(deadline, changes.changed())
+                .await
+                .map_or(Ok(()), |result| result.map_err(failed))?;
+        }
+        // Failed phase is not evidence of process death.
+        signal(GROUP_KILL)?;
+        await_cleanup_acknowledgement(reference, &authorize).await?;
+        authorize()?;
+        status(reference)
     })?
 }
 
-fn terminate_blocking(
-    reference: &ExecutionRef,
-    grace_ms: u32,
-    authorize: impl Fn() -> Result<(), ExecutionError>,
-) -> Result<ExecutionStatus, ExecutionError> {
-    if grace_ms > 30_000 {
-        return Err(ExecutionError::InvalidOptions {
-            reason: "termination grace exceeds 30000ms".into(),
-        });
-    }
-    let signal = |signal| {
-        authorize()?;
-        with_pane(reference, |pane| {
-            pane.execution.signal_owned_group(signal).map_err(failed)
-        })
-    };
-    signal(libc::SIGTERM)?;
-    let deadline = Instant::now() + Duration::from_millis(u64::from(grace_ms));
-    loop {
-        authorize()?;
-        let settled = with_pane(reference, |pane| {
-            Ok(pane.exited.load(Ordering::SeqCst)
-                && pane.execution.output_drained.load(Ordering::SeqCst))
-        })?;
-        if settled || Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    // Phase may be Failed while OS work still lives; query actual PTY group.
-    signal(GROUP_KILL)?;
-    await_cleanup_acknowledgement(reference, &authorize)?;
-    status(reference)
-}
-
-fn await_cleanup_acknowledgement(
+async fn await_cleanup_acknowledgement(
     reference: &ExecutionRef,
     authorize: impl Fn() -> Result<(), ExecutionError>,
 ) -> Result<(), ExecutionError> {
-    let cleanup_deadline = Instant::now() + Duration::from_secs(30);
+    let mut cleanup = with_pane(reference, |pane| Ok(pane.cleanup.clone()))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         authorize()?;
-        let cleanup = with_pane(reference, |pane| Ok(pane.cleanup.borrow().clone()))?;
-        match cleanup {
-            Some(Ok(())) => break,
+        // Revalidate the generation and session after every wake.
+        with_pane(reference, |_| Ok(()))?;
+        match cleanup.borrow_and_update().clone() {
+            Some(Ok(())) => return Ok(()),
             Some(Err(error)) => return Err(failed(error)),
-            None if Instant::now() >= cleanup_deadline => {
-                return Err(failed(
-                    "execution group/thread cleanup not acknowledged; recovery required",
-                ));
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
+            None => {}
+        }
+        if tokio::time::timeout_at(deadline, cleanup.changed())
+            .await
+            .is_err()
+        {
+            authorize()?;
+            return Err(failed(
+                "execution group/thread cleanup not acknowledged; recovery required",
+            ));
+        }
+        // Channel loss is not an acknowledgement; the next authority check
+        // reports session loss, or retained failure is returned explicitly.
+        if cleanup.has_changed().is_err() && cleanup.borrow().is_none() {
+            return Err(failed(
+                "execution cleanup owner disconnected without acknowledgement",
+            ));
         }
     }
-    Ok(())
 }
 
 pub(super) fn send_acknowledged(
@@ -775,6 +822,85 @@ fn install_reserved_capture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concurrent_termination_after_natural_retirement_does_not_dispatch() {
+        let capture = std::sync::Arc::new(super::ExecutionCapture::default());
+        let fence = capture.supervisor.lock().unwrap();
+        let first = std::sync::Arc::clone(&capture);
+        let second = std::sync::Arc::clone(&capture);
+        let a = std::thread::spawn(move || first.signal_owned_group(super::GROUP_KILL));
+        let b = std::thread::spawn(move || second.signal_owned_group(libc::SIGTERM));
+        // Same fence used by natural retirement and side-effect authorization.
+        capture
+            .terminal_owner_retired
+            .store(true, super::Ordering::SeqCst);
+        drop(fence);
+        assert!(!a.join().unwrap().unwrap());
+        assert!(!b.join().unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn retained_event_before_subscription_is_visible_without_pending_wake() {
+        let capture = super::ExecutionCapture::default();
+        capture.record_error("retained failure".into());
+        let changes = capture.subscribe();
+        assert!(!changes.has_changed().unwrap());
+        assert_eq!(
+            capture.outcome.lock().unwrap().2.as_deref(),
+            Some("retained failure")
+        );
+        // Initial inspection, not a synthetic event, establishes readiness.
+    }
+
+    #[tokio::test]
+    async fn simultaneous_waiters_observe_event_before_first_wait() {
+        let capture = super::ExecutionCapture::default();
+        let mut first = capture.subscribe();
+        let mut second = capture.subscribe();
+        capture.notify();
+        let (a, b) = tokio::join!(first.changed(), second.changed());
+        a.unwrap();
+        b.unwrap();
+        assert!(!first.has_changed().unwrap());
+        assert!(!second.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn idle_capture_has_only_one_deadline_and_no_lifecycle_wake() {
+        let capture = super::ExecutionCapture::default();
+        let mut changes = capture.subscribe();
+        let deadline = tokio::time::Instant::now() + super::Duration::from_millis(20);
+        assert!(
+            tokio::time::timeout_at(deadline, changes.changed())
+                .await
+                .is_err()
+        );
+        assert!(!changes.has_changed().unwrap());
+        assert!(!capture.output_drained.load(super::Ordering::SeqCst));
+        assert!(capture.outcome.lock().unwrap().0.is_none());
+    }
+
+    #[tokio::test]
+    async fn errors_eof_and_cleanup_are_independent_acknowledgements() {
+        let capture = super::ExecutionCapture::default();
+        let mut changes = capture.subscribe();
+        capture.record_error("reader failed".into());
+        changes.changed().await.unwrap();
+        assert!(!capture.output_drained.load(super::Ordering::SeqCst));
+        assert!(!capture.cleanup_failed.load(super::Ordering::SeqCst));
+        capture.output_drained.store(true, super::Ordering::SeqCst);
+        capture.notify();
+        changes.changed().await.unwrap();
+        assert!(capture.outcome.lock().unwrap().0.is_none());
+        capture.record_cleanup_error("cleanup failed".into());
+        changes.changed().await.unwrap();
+        assert!(capture.cleanup_failed.load(super::Ordering::SeqCst));
+        assert_eq!(
+            capture.outcome.lock().unwrap().2.as_deref(),
+            Some("reader failed")
+        );
+    }
+
     #[test]
     fn current_thread_control_preserves_cancellation_error() {
         let owner = tokio::runtime::Builder::new_multi_thread()

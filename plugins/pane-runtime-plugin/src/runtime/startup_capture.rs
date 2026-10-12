@@ -24,12 +24,10 @@ impl Drop for CaptureOwner {
             // Cancellation transfers ownership to the persistent runtime rather
             // than detaching the blocking thread or claiming completed cleanup.
             self.runtime.spawn(async move {
-                let mut threads = [Some(thread)];
-                while threads.iter().flatten().any(|thread| !thread.is_finished()) {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                if let Err(error) =
-                    super::join_supervision_threads(&mut threads, std::time::Duration::ZERO).await
+                let mut join = super::supervision_join(&mut [Some(thread)]);
+                if let Err(error) = (&mut join)
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()))
                 {
                     tracing::error!(%error, "cancelled startup capture cleanup failed");
                 }
@@ -128,9 +126,10 @@ pub(super) async fn acknowledge_cleanup(
     previous: Option<Result<(), String>>,
     reason: String,
 ) -> String {
-    let mut threads = [Some(thread)];
+    let mut join = super::supervision_join(&mut [Some(thread)]);
     let capture_result =
-        super::join_supervision_threads(&mut threads, std::time::Duration::from_secs(4)).await;
+        super::join_supervision_threads(&mut join, std::time::Duration::from_secs(4)).await;
+    let join_pending = !join.is_finished();
     let result = match (previous.unwrap_or(Ok(())), capture_result) {
         (Ok(()), capture) => capture,
         (Err(process), Ok(())) => Err(process),
@@ -141,17 +140,59 @@ pub(super) async fn acknowledge_cleanup(
         Err(error) => format!("{reason}; startup capture cleanup failed: {error}"),
     };
     cleanup.send_replace(Some(result));
-    // Retain thread ownership after an explicit timeout until it really settles.
-    while threads.iter().flatten().any(|thread| !thread.is_finished()) {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // A failed deadline is not completion: retain admission until the blocking
+    // join owner acknowledges actual settlement, without probing thread state.
+    if join_pending {
+        let _ = join.await;
     }
-    let _ = super::join_supervision_threads(&mut threads, std::time::Duration::ZERO).await;
     reason
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+
+    #[tokio::test]
+    async fn cancelled_capture_owner_retains_blocked_thread_until_release() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            blocked.recv().unwrap();
+            let _ = done.send(());
+        });
+        let owner = super::CaptureOwner::new(thread);
+        drop(owner);
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), finished)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_cleanup_preserves_prior_failure_after_real_join() {
+        let thread = std::thread::spawn(|| {});
+        let (cleanup, mut acknowledged) = tokio::sync::watch::channel(None);
+        let reason = super::acknowledge_cleanup(
+            thread,
+            &cleanup,
+            Some(Err("process cleanup failed".into())),
+            "startup rejected".into(),
+        )
+        .await;
+        acknowledged.changed().await.unwrap();
+        assert_eq!(
+            acknowledged
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err(),
+            "process cleanup failed"
+        );
+        assert!(reason.contains("process cleanup failed"));
+    }
 
     #[test]
     fn interrupted_read_retries_without_losing_bytes_or_inventing_eof() {

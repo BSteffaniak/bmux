@@ -394,28 +394,56 @@ async fn shutdown_runtime_handle(removed: RemovedRuntime) {
     }
 }
 
-async fn join_supervision_threads(
+struct LifecycleCompletion<'a>(&'a tokio::sync::watch::Sender<bool>);
+
+impl Drop for LifecycleCompletion<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
+struct SupervisionCompletion {
+    done: Arc<AtomicBool>,
+    execution: Arc<execution::ExecutionCapture>,
+}
+
+impl Drop for SupervisionCompletion {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.execution
+                .record_error("pane supervision thread panicked".into());
+        }
+        self.done.store(true, Ordering::SeqCst);
+        self.execution.notify();
+    }
+}
+
+fn supervision_join(
     threads: &mut [Option<std::thread::JoinHandle<()>>],
+) -> tokio::task::JoinHandle<std::result::Result<(), String>> {
+    let handles: Vec<_> = threads.iter_mut().filter_map(Option::take).collect();
+    // This owner retains every unreaped handle across the observer deadline.
+    tokio::task::spawn_blocking(move || {
+        let mut panicked = false;
+        for thread in handles {
+            panicked |= thread.join().is_err();
+        }
+        if panicked {
+            Err("pane supervision thread panicked".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+async fn join_supervision_threads(
+    join: &mut tokio::task::JoinHandle<std::result::Result<(), String>>,
     timeout: Duration,
 ) -> std::result::Result<(), String> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while threads.iter().flatten().any(|thread| !thread.is_finished()) {
-        if tokio::time::Instant::now() >= deadline {
-            return Err("pane supervision threads did not exit before cleanup deadline".into());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    // is_finished guarantees these joins cannot wait for live OS work. Join
-    // every handle, even when one panicked, before acknowledging teardown.
-    let mut panicked = false;
-    for thread in threads.iter_mut().filter_map(Option::take) {
-        panicked |= thread.join().is_err();
-    }
-    if panicked {
-        Err("pane supervision thread panicked".into())
-    } else {
-        Ok(())
-    }
+    tokio::time::timeout(timeout, join)
+        .await
+        .map_err(|_| "pane supervision threads did not exit before cleanup deadline".to_string())?
+        .map_err(|error| format!("pane supervision join failed: {error}"))?
 }
 
 async fn stop_unpublished_pane(pane: &mut PaneRuntimeHandle) -> Result<()> {
@@ -543,6 +571,63 @@ fn mark_pane_startup_failed(
     mark_snapshot_dirty_flag();
 }
 
+// Retains the actual child and its authenticated target authority together.
+// Killing only the receipt guardian during startup leaves its terminal owner
+// holding the slave and makes capture EOF/cleanup impossible.
+struct GuardianStartupChild {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    execution: Arc<execution::ExecutionCapture>,
+    launch_attempted: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for GuardianStartupChild {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardianStartupChild")
+            .field("child", &self.child)
+            .field("launch_attempted", &self.launch_attempted)
+            .finish_non_exhaustive()
+    }
+}
+
+impl portable_pty::ChildKiller for GuardianStartupChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        if self.launch_attempted.load(Ordering::SeqCst) {
+            self.execution
+                .signal_owned_group(execution::GROUP_KILL)
+                .map_err(std::io::Error::other)?;
+            if !self.execution.terminal_owner_retired.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other(
+                    "startup terminal owner retirement not acknowledged",
+                ));
+            }
+        }
+        self.child.kill()
+    }
+
+    fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+        // Published supervision performs its own authority handshake before
+        // using this exact owned child killer.
+        self.child.clone_killer()
+    }
+}
+
+impl portable_pty::Child for GuardianStartupChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        self.child.try_wait()
+    }
+    fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        self.child.wait()
+    }
+    fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        self.child.as_raw_handle()
+    }
+}
+
 struct StartupChild {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     runtime: tokio::runtime::Handle,
@@ -625,31 +710,33 @@ fn cleanup_failed_startup_child_on(
     // future must not drop the only reaper for this newly spawned process.
     let fallback = failure.clone();
     let cleanup = runtime.spawn(async move {
-        let result = reap_failed_startup_child(child.as_mut()).await;
+        let mut reaper = tokio::task::spawn_blocking(move || {
+            let kill_error = child.kill().err();
+            (child.wait(), kill_error)
+        });
+        let result = match tokio::time::timeout(Duration::from_secs(2), &mut reaper).await {
+            Ok(Ok((Ok(_), None))) => Ok(()),
+            Ok(Ok((Ok(_), Some(error)))) => Err(format!("kill failed: {error}")),
+            Ok(Ok((Err(error), kill_error))) => {
+                Err(format!("wait failed: {error}; kill error: {kill_error:?}"))
+            }
+            Ok(Err(error)) => Err(format!("child reaper failed: {error}")),
+            Err(_) => Err("timed out; owned child cleanup not acknowledged".into()),
+        };
         if let Some(acknowledgement) = acknowledgement {
             acknowledgement.send_replace(Some(result.clone()));
         }
+        if !reaper.is_finished() {
+            // The startup task retains admission until the actual wait returns.
+            let late = reaper.await;
+            warn!(?late, "failed startup child settled after cleanup deadline");
+        }
         match result {
             Ok(()) => (failure, Ok(())),
-            Err(error) => {
-                warn!(%error, "failed startup child cleanup requires recovery");
-                // Keep the child owned after the acknowledged deadline failure.
-                // The requesting startup task remains alive, retaining its
-                // preparation admission while the reaper waits for real exit.
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(_)) => break,
-                        Ok(None) | Err(_) => {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                    }
-                }
-                warn!(%error, "failed startup child eventually reaped after cleanup failure");
-                (
-                    format!("{failure}; child cleanup failed: {error}"),
-                    Err(error),
-                )
-            }
+            Err(error) => (
+                format!("{failure}; child cleanup failed: {error}"),
+                Err(error),
+            ),
         }
     });
     async move {
@@ -663,18 +750,7 @@ fn cleanup_failed_startup_child_on(
     }
 }
 
-async fn reap_failed_startup_child(
-    child: &mut (dyn portable_pty::Child + Send + Sync),
-) -> Result<(), String> {
-    let kill_error = child.kill().err();
-    poll_failed_startup_child(
-        || child.try_wait().map(|status| status.is_some()),
-        kill_error,
-        Duration::from_secs(2),
-    )
-    .await
-}
-
+#[cfg(test)]
 async fn poll_failed_startup_child(
     mut poll: impl FnMut() -> std::io::Result<bool>,
     kill_error: Option<std::io::Error>,
@@ -5860,21 +5936,39 @@ impl SessionRuntimeManager {
                 }};
             }
             let (startup_cleanup_tx, _) = watch::channel(None);
-            let spawned = if supervisor_control.is_some() {
-                pty_pair
-                    .master
-                    .tty_name()
-                    .ok_or_else(|| anyhow::anyhow!("terminal slave path unavailable"))
-                    .and_then(|slave| {
-                        supervisor_control
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("guardian control missing"))?
-                            .spawn_guardian(&slave)
-                    })
+            let launch_attempted = Arc::new(AtomicBool::new(false));
+            execution_for_task
+                .supervisor
+                .lock()
+                .expect("supervisor control lock")
+                .clone_from(&supervisor_control);
+            let spawned = if let Some(control) = &supervisor_control {
+                match pty_pair.master.tty_name() {
+                    Some(slave) => {
+                        let control = Arc::clone(control);
+                        let runtime = tokio::runtime::Handle::current();
+                        let execution = Arc::clone(&execution_for_task);
+                        let launch_attempted = Arc::clone(&launch_attempted);
+                        tokio::task::spawn_blocking(move || {
+                            control.spawn_guardian(&slave).map(|child| StartupChild {
+                                child: Some(Box::new(GuardianStartupChild {
+                                    child,
+                                    execution,
+                                    launch_attempted,
+                                })),
+                                runtime,
+                            })
+                        })
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(std::convert::identity)
+                    }
+                    None => Err(anyhow::anyhow!("terminal slave path unavailable")),
+                }
             } else {
-                pty_pair.slave.spawn_command(command)
+                pty_pair.slave.spawn_command(command).map(StartupChild::new)
             };
-            let mut child = StartupChild::new(match spawned {
+            let mut child = match spawned {
                 Ok(child) => child,
                 Err(error) => {
                     fail_captured_startup!(
@@ -5883,17 +5977,47 @@ impl SessionRuntimeManager {
                     );
                     return;
                 }
-            });
+            };
             child_spawned = true;
             let mut target_pid = None;
             if let Some(control) = &supervisor_control {
-                let launch = &guardian_launch;
-                target_pid = match control
-                    .start(launch, || execution_for_task.authorize_spawn())
-                    .await
-                {
+                let startup_control = Arc::clone(control);
+                let authorization = Arc::clone(&execution_for_task);
+                let launch = guardian_launch;
+                let launch_attempted = Arc::clone(&launch_attempted);
+                // Transfer the RAII child into the blocking launch owner. If
+                // this async waiter is cancelled, the completed task result
+                // still drops through supervised cleanup, never a raw Child.
+                let started = tokio::task::spawn_blocking(move || {
+                    let result = startup_control.start(&launch, || {
+                        authorization.authorize_spawn()?;
+                        launch_attempted.store(true, Ordering::SeqCst);
+                        Ok(())
+                    });
+                    (child, result)
+                })
+                .await;
+                let (returned_child, started) = match started {
+                    Ok(result) => result,
+                    Err(error) => {
+                        fail_captured_startup!(
+                            format!("supervisor startup task failed: {error}"),
+                            Some(Err(
+                                "startup child cleanup transferred after task failure".into()
+                            ))
+                        );
+                        return;
+                    }
+                };
+                child = returned_child;
+                target_pid = match started {
                     Ok(pid) => pid,
                     Err(error) => {
+                        // Cleanup replies acknowledge authority retirement, not
+                        // successful launch. Retain the original launch errno
+                        // independently before consuming those replies.
+                        execution_for_task
+                            .record_error(format!("supervisor target startup failed: {error}"));
                         let reason = cleanup_failed_startup_child_acknowledged(
                             child.take(),
                             format!("supervisor target startup failed: {error}"),
@@ -6030,80 +6154,75 @@ impl SessionRuntimeManager {
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn(move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
-                    if let Some(control) = &supervisor_control {
-                        let mut exit_announced = false;
-                        loop {
-                            // Serialize polling with acknowledged sweep/retirement.
-                            // A local control clone could connect just before Sweep
-                            // closes the server, then block on its five-second read
-                            // timeout past the four-second supervision deadline.
-                            let status = {
-                                let authority = execution_for_waiter.supervisor.lock();
-                                if execution_for_waiter.group_kill_issued.load(Ordering::SeqCst) || execution_for_waiter.target_stop_issued.load(Ordering::SeqCst) {
-                                    break;
+                    let _completion = SupervisionCompletion { done: Arc::clone(&child_waiter_done_for_thread), execution: Arc::clone(&execution_for_waiter) };
+                    let wait_result = if let Some(control) = &supervisor_control {
+                        let subscription = {
+                            let _fence = execution_for_waiter.supervisor.lock();
+                            if execution_for_waiter.terminal_owner_retired.load(Ordering::SeqCst) {
+                                None
+                            } else {
+                                let result = control.subscribe().and_then(|watcher| {
+                                    *execution_for_waiter.lifecycle_interrupter.lock()
+                                        .map_err(|error| anyhow::anyhow!(error.to_string()))? = Some(watcher.interrupter()?);
+                                    execution_for_waiter.lifecycle_done.send_replace(false);
+                                    Ok(watcher)
+                                });
+                                Some(result)
+                            }
+                        };
+                        match subscription {
+                            None => child.wait(),
+                            Some(Ok(mut watcher)) => {
+                                std::thread::scope(|scope| {
+                                    scope.spawn(|| {
+                                        let _lifecycle_done = LifecycleCompletion(&execution_for_waiter.lifecycle_done);
+                        let observed = (|| -> anyhow::Result<()> {
+                            let mut snapshot = watcher.initial().clone();
+                            let mut exit_announced = false;
+                            loop {
+                                let status = snapshot.status;
+                                if let Some(error) = status.error.or(status.cleanup_error) {
+                                    anyhow::bail!(error);
                                 }
-                                match authority {
-                                    Ok(authority) => authority.as_ref().unwrap_or(control)
-                                        .request(crate::supervisor_protocol::Operation::Status),
-                                    Err(error) => Err(anyhow::anyhow!(error.to_string())),
-                                }
-                            };
-                            match status {
-                                Ok(status) if status.exit_code.is_some() || status.exit_signal.is_some() => {
+                                if status.exit_code.is_some() || status.exit_signal.is_some() {
                                     if let Ok(mut outcome) = execution_for_waiter.outcome.lock() {
                                         outcome.0 = status.exit_code.and_then(|code| u32::try_from(code).ok());
                                         outcome.1 = status.exit_signal.map(|signal| signal.to_string());
                                     }
-                                    exited_for_waiter.store(true, Ordering::SeqCst);
                                     if !exit_announced {
+                                        exited_for_waiter.store(true, Ordering::SeqCst);
                                         let _ = child_exit_tx.send(ExecutionExitNotice::TargetExited);
                                         exit_announced = true;
                                     }
-                                    if supervisor_control.is_some() {
-                                        if status.terminal_session_ended == Some(true) {
-                                            execution_for_waiter.terminal_session_ended.store(true, Ordering::SeqCst);
-                                            break;
-                                        }
-                                        std::thread::sleep(Duration::from_millis(10));
-                                    } else {
-                                        break;
-                                    }
                                 }
-                                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
-                                Err(error) => {
-                                    // Sweep acknowledges/reaps the target before
-                                    // retiring the socket. Synchronize with that
-                                    // fence instead of misreporting retirement as
-                                    // lost execution authority.
-                                    let retired = execution_for_waiter.supervisor.lock().is_ok_and(|_control| execution_for_waiter.group_kill_issued.load(Ordering::SeqCst));
-                                    if !retired {
-                                        execution_for_waiter.record_error(format!("supervisor outcome unavailable: {error}"));
-                                    }
+                                if status.terminal_session_ended == Some(true) {
+                                    execution_for_waiter.terminal_session_ended.store(true, Ordering::SeqCst);
+                                }
+                                execution_for_waiter.notify();
+                                if execution_for_waiter.terminal_session_ended.load(Ordering::SeqCst) {
                                     break;
                                 }
+                                snapshot = watcher.next()?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = observed {
+                            let _fence = execution_for_waiter.supervisor.lock();
+                            if !execution_for_waiter.terminal_owner_retired.load(Ordering::SeqCst) {
+                                execution_for_waiter.record_error(format!("supervisor outcome unavailable: {error}"));
                             }
                         }
-                    }
-                    let wait_result = if supervisor_control.is_some() {
-                        loop {
-                            match child.try_wait() {
-                                Ok(Some(status)) => break Ok(status),
-                                Err(error) => break Err(error),
-                                Ok(None) => {
-                                    if execution_for_waiter.group_kill_issued.load(Ordering::SeqCst)
-                                        || execution_for_waiter.target_stop_issued.load(Ordering::SeqCst)
-                                        || execution_for_waiter.terminal_owner_retired.load(Ordering::SeqCst)
-                                    {
-                                        // ChildKiller::clone_killer uses SIGHUP on Unix,
-                                        // which the helper intentionally ignores. The
-                                        // waiter owns the unreaped direct Child: retire
-                                        // it via Child::kill only after authority ack.
-                                        if let Err(error) = child.kill() {
-                                            break Err(error);
-                                        }
-                                    }
-                                    std::thread::sleep(Duration::from_millis(10));
-                                }
+                                    });
+                                    // Always block on the actual child concurrently;
+                                    // owner death wakes a subscription blocked on next.
+                                    let result = child.wait();
+                                    execution_for_waiter.interrupt_lifecycle();
+                                    result
+                                })
+                            }
+                            Some(Err(error)) => {
+                                execution_for_waiter.record_error(format!("supervisor subscription unavailable: {error}"));
+                                child.wait()
                             }
                         }
                     } else {
@@ -6134,6 +6253,7 @@ impl SessionRuntimeManager {
                     if !publication_for_waiter.wait() {
                         let _ = child_exit_tx.send(ExecutionExitNotice::OwnerExited);
                         child_waiter_done_for_thread.store(true, Ordering::SeqCst);
+                        execution_for_waiter.notify();
                         return;
                     }
                     if !program_execution {
@@ -6154,6 +6274,7 @@ impl SessionRuntimeManager {
                     }
                     let _ = child_exit_tx.send(ExecutionExitNotice::OwnerExited);
                     child_waiter_done_for_thread.store(true, Ordering::SeqCst);
+                        execution_for_waiter.notify();
                 })
                 .ok();
             if child_waiter.is_none() {
@@ -6174,8 +6295,10 @@ impl SessionRuntimeManager {
                 .name(format!("bmux-server-pane-{pane_id}"))
                 .spawn(move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "reader");
+                    let _completion = SupervisionCompletion { done: Arc::clone(&reader_thread_done_for_thread), execution: Arc::clone(&execution_for_reader) };
                     if !publication_for_reader.wait() {
                         reader_thread_done_for_thread.store(true, Ordering::SeqCst);
+                        execution_for_reader.notify();
                         return;
                     }
                     tracing::debug!(pane_id = %pane_id, "execution reader publication released");
@@ -6206,12 +6329,14 @@ impl SessionRuntimeManager {
                         match reader.read(&mut buffer) {
                             Ok(0) => {
                                 execution_for_reader.output_drained.store(true, Ordering::SeqCst);
+                        execution_for_reader.notify();
                                 break;
                             }
                             Err(error) => {
                                 // Unix PTY masters report EIO when the last slave closes.
                                 if error.raw_os_error() == Some(5) {
                                     execution_for_reader.output_drained.store(true, Ordering::SeqCst);
+                        execution_for_reader.notify();
                                 } else {
                                     execution_for_reader.record_error(format!("PTY read failed: {error}"));
                                 }
@@ -6223,6 +6348,7 @@ impl SessionRuntimeManager {
                                 execution_for_reader.output_watermark.fetch_add(
                                     u64::try_from(bytes_read).unwrap_or(u64::MAX), Ordering::SeqCst,
                                 );
+                                execution_for_reader.notify();
                                 let (capture_output, capture_reply) = capture_handshake.process(&buffer[..bytes_read], pane_id);
                                 if !capture_reply.is_empty() {
                                     if let Ok(mut writer) = writer_for_reader.lock() {
@@ -6442,6 +6568,7 @@ impl SessionRuntimeManager {
                         execution_for_reader.record_error("PTY reader stopped before EOF".into());
                     }
                     reader_thread_done_for_thread.store(true, Ordering::SeqCst);
+                        execution_for_reader.notify();
                 })
                 .ok();
             if reader_thread.is_none() {
@@ -6461,17 +6588,33 @@ impl SessionRuntimeManager {
                         "startup-thread group cleanup failed: {error}"
                     ));
                 }
-                let _ = child_killer.kill();
+                if !execution_for_task
+                    .terminal_owner_retired
+                    .load(Ordering::SeqCst)
+                {
+                    let _ = child_killer.kill();
+                }
             }
 
+            let mut natural_retirement_failed = false;
+            let mut execution_changes = execution_for_task.subscribe();
+            execution_for_task.notify();
             loop {
                 if !startup_ready {
                     break;
                 }
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_millis(10)) => {
+                    changed = execution_changes.changed() => {
+                        if changed.is_err() {
+                            execution_for_task.record_error("execution lifecycle publisher disconnected".into());
+                            break;
+                        }
+                        if execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) {
+                            break;
+                        }
                         if execution_for_task.terminal_session_ended.load(Ordering::SeqCst)
-                            && execution_for_task.output_drained.load(Ordering::SeqCst) {
+                            && execution_for_task.output_drained.load(Ordering::SeqCst)
+                            && !natural_retirement_failed {
                             // Keep the same control fence through publishing retirement
                             // and closing the guardian, excluding late termination requests.
                             let retirement_guard = execution_for_task.supervisor.lock();
@@ -6480,6 +6623,7 @@ impl SessionRuntimeManager {
                             // fence. Its waiter is then allowed to reap the guardian;
                             // never open a second socket after that committed receipt.
                             if retirement_guard.is_ok() && execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) {
+                                execution_for_task.interrupt_lifecycle();
                                 break;
                             }
                             let retired = retirement_guard.as_ref().ok().and_then(|control| control.as_ref().map(|control| control.request(crate::supervisor_protocol::Operation::RetireOwner { mutation_id: "00000000-0000-4000-8000-000000000003".into() })));
@@ -6490,18 +6634,20 @@ impl SessionRuntimeManager {
                             };
                             if let Some(error) = retirement_error {
                                 execution_for_task.record_cleanup_error(format!("terminal-owner retirement failed: {error}"));
+                                natural_retirement_failed = true;
                                 // Preserve the pinned guardian for explicit recovery.
                                 continue;
                             }
                             execution_for_task.terminal_owner_retired.store(true, Ordering::SeqCst);
-                            let _ = child_killer.kill();
+                            execution_for_task.interrupt_lifecycle();
+                            execution_for_task.notify();
                             break;
                         }
                         if reader_thread_done.load(Ordering::SeqCst) && !execution_for_task.output_drained.load(Ordering::SeqCst) {
                             if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
                                 execution_for_task.record_cleanup_error(format!("reader-failure group cleanup failed: {error}"));
                             }
-                            let _ = child_killer.kill();
+                            if !execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) { let _ = child_killer.kill(); }
                             break;
                         }
                     }
@@ -6513,7 +6659,7 @@ impl SessionRuntimeManager {
                         if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL) {
                             execution_for_task.record_cleanup_error(format!("group stop failed: {error}"));
                         }
-                        let _ = child_killer.kill();
+                        if !execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) { let _ = child_killer.kill(); }
                         break;
                     }
                     child_exit = child_exit_rx.recv() => {
@@ -6568,6 +6714,19 @@ impl SessionRuntimeManager {
                 }
             }
 
+            // Interrupt and acknowledge the lifecycle observer before stopping
+            // its receipt guardian. A closed socket is never an exit outcome.
+            if execution_for_task
+                .terminal_owner_retired
+                .load(Ordering::SeqCst)
+            {
+                if let Err(error) = execution_for_task.join_lifecycle().await {
+                    execution_for_task
+                        .record_cleanup_error(format!("lifecycle observer join failed: {error}"));
+                }
+                let _ = child_killer.kill();
+            }
+
             // A program's exit is not EOF: preserve the master while the
             // reader drains buffered bytes and descendants still hold the slave.
             if program_execution && startup_ready {
@@ -6588,7 +6747,9 @@ impl SessionRuntimeManager {
                         }
                         let _ = child_killer.kill();
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    if !reader_thread_done.load(Ordering::SeqCst) {
+                        let _ = execution_changes.changed().await;
+                    }
                 }
                 if !execution_for_task.output_drained.load(Ordering::SeqCst) {
                     if let Err(error) = execution_for_task.signal_owned_group(execution::GROUP_KILL)
@@ -6613,8 +6774,9 @@ impl SessionRuntimeManager {
             // Never occupy a blocking-pool worker with an unbounded join.
             // A timeout is an explicit failure, not acknowledged restoration.
             let mut threads = [child_waiter, reader_thread, Some(capture_owner.take())];
-            let cleanup_result =
-                join_supervision_threads(&mut threads, Duration::from_secs(4)).await;
+            let mut join = supervision_join(&mut threads);
+            let cleanup_result = join_supervision_threads(&mut join, Duration::from_secs(4)).await;
+            let join_timed_out = !join.is_finished();
             let cleanup_result = cleanup_result.and_then(|()| {
                 if execution_for_task.cleanup_failed.load(Ordering::SeqCst) {
                     Err("execution group cleanup failed; recovery required".into())
@@ -6626,14 +6788,13 @@ impl SessionRuntimeManager {
             // Deadline failure is already visible. Keep the handles and the
             // owning task alive so unpublished cleanup retains its admission
             // reservation until all OS work actually finishes.
-            if threads.iter().any(Option::is_some) {
-                while threads.iter().flatten().any(|thread| !thread.is_finished()) {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                let late = join_supervision_threads(&mut threads, Duration::ZERO).await;
+            if join_timed_out {
+                let late = join.await;
                 warn!(%pane_id, ?late, "supervision threads settled after cleanup failure");
             }
+
             exited_for_task.store(true, Ordering::SeqCst);
+            execution_for_task.notify();
         });
 
         let padding_override = self
@@ -12145,15 +12306,16 @@ exit 7"#
             let _ = done.send(());
         });
         let mut threads = [Some(thread), None];
-        let result = super::join_supervision_threads(&mut threads, std::time::Duration::ZERO).await;
+        let mut join = super::supervision_join(&mut threads);
+        let result = super::join_supervision_threads(&mut join, std::time::Duration::ZERO).await;
         assert!(result.unwrap_err().contains("deadline"));
         assert!(
-            threads[0].is_some(),
-            "deadline must retain the live OS handle"
+            !join.is_finished(),
+            "deadline must retain the live OS join owner"
         );
         release.send(()).unwrap();
         finished.await.unwrap();
-        super::join_supervision_threads(&mut threads, std::time::Duration::from_secs(2))
+        super::join_supervision_threads(&mut join, std::time::Duration::from_secs(2))
             .await
             .unwrap();
         assert!(threads.iter().all(Option::is_none));
@@ -12163,7 +12325,7 @@ exit 7"#
     async fn supervision_join_acknowledges_completion_and_reports_panics() {
         let thread = std::thread::spawn(|| {});
         super::join_supervision_threads(
-            &mut [Some(thread), None],
+            &mut super::supervision_join(&mut [Some(thread), None]),
             std::time::Duration::from_secs(2),
         )
         .await
@@ -12171,7 +12333,7 @@ exit 7"#
         let thread = std::thread::spawn(|| panic!("supervision failure"));
         assert!(
             super::join_supervision_threads(
-                &mut [Some(thread), None],
+                &mut super::supervision_join(&mut [Some(thread), None]),
                 std::time::Duration::from_secs(2)
             )
             .await
@@ -17848,7 +18010,12 @@ exit 7"#
             .prefix(&"fish-metadata-".repeat(8))
             .tempdir()
             .unwrap();
-        let cwd = directory.path().to_string_lossy().into_owned();
+        let cwd = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let command = format!("printf {}", "resurrection".repeat(12));
         let token = "long-fields-token";
         let config = shell_integration_fish_config().replace(
@@ -18504,7 +18671,7 @@ exit 7"#
 
     #[derive(Debug, Clone)]
     struct DelayedCleanupChild {
-        exited: Arc<AtomicBool>,
+        exited: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
         dropped: Arc<AtomicBool>,
     }
 
@@ -18526,14 +18693,17 @@ exit 7"#
 
     impl portable_pty::Child for DelayedCleanupChild {
         fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-            Ok(self
-                .exited
-                .load(Ordering::SeqCst)
+            Ok((*self.exited.0.lock().unwrap())
                 .then(|| portable_pty::ExitStatus::with_exit_code(0)))
         }
 
         fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
-            panic!("cleanup must poll without blocking the executor")
+            let (state, changed) = &*self.exited;
+            let mut exited = state.lock().unwrap();
+            while !*exited {
+                exited = changed.wait(exited).unwrap();
+            }
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
         }
 
         fn process_id(&self) -> Option<u32> {
@@ -18546,9 +18716,77 @@ exit 7"#
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preowner_launch_failure_retires_owned_guardian_without_inventing_exit() {
+        supervisor::install_test_artifact()
+            .expect("explicit coordinator-built supervisor artifact");
+        let execution = Arc::new(execution::ExecutionCapture::default());
+        let runtime = tokio::runtime::Handle::current();
+        let setup_execution = Arc::clone(&execution);
+        let (child, launch_error) = tokio::task::spawn_blocking(move || {
+            let (control, _) = supervisor::SupervisorControl::prepare(Uuid::new_v4()).unwrap();
+            let control = Arc::new(control);
+            *setup_execution.supervisor.lock().unwrap() = Some(Arc::clone(&control));
+            // Readiness precedes the owner opening this path. A missing slave
+            // deterministically injects an owner-spawn failure, not target exit.
+            let child = control
+                .spawn_guardian(std::path::Path::new("/definitely/missing/bmux-slave"))
+                .unwrap();
+            let child = StartupChild {
+                child: Some(Box::new(GuardianStartupChild {
+                    child,
+                    execution: Arc::clone(&setup_execution),
+                    launch_attempted: Arc::new(AtomicBool::new(true)),
+                })),
+                runtime,
+            };
+            let error = control
+                .start(
+                    &PaneLaunchSpec {
+                        program: "/bin/sh".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                    },
+                    || Ok(()),
+                )
+                .unwrap_err()
+                .to_string();
+            setup_execution.record_error(error.clone());
+            (child, error)
+        })
+        .await
+        .unwrap();
+        assert!(
+            launch_error.contains("No such file") || launch_error.contains("os error 2"),
+            "{launch_error}"
+        );
+        let (ack, mut acknowledged) = watch::channel(None);
+        let mut child = child;
+        let cleanup = cleanup_failed_startup_child_on(
+            &tokio::runtime::Handle::current(),
+            child.take(),
+            launch_error.clone(),
+            Some(ack),
+        );
+        let (reason, result) = tokio::time::timeout(Duration::from_secs(5), cleanup)
+            .await
+            .expect("failed launch must reap its actual guardian");
+        assert!(result.is_ok(), "{reason}");
+        acknowledged.changed().await.unwrap();
+        assert!(acknowledged.borrow().as_ref().unwrap().is_ok());
+        assert!(reason.contains(&launch_error));
+        assert!(execution.terminal_owner_retired.load(Ordering::SeqCst));
+        assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
+        let outcome = execution.outcome.lock().unwrap();
+        assert!(outcome.0.is_none());
+        assert!(outcome.1.is_none());
+        assert_eq!(outcome.2.as_deref(), Some(launch_error.as_str()));
+    }
+
     #[tokio::test]
     async fn failed_child_deadline_retains_owner_until_late_exit() {
-        let exited = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let dropped = Arc::new(AtomicBool::new(false));
         let child = Box::new(DelayedCleanupChild {
             exited: Arc::clone(&exited),
@@ -18567,7 +18805,8 @@ exit 7"#
             .unwrap();
         assert!(observation.borrow().as_ref().unwrap().is_err());
         assert!(!dropped.load(Ordering::SeqCst));
-        exited.store(true, Ordering::SeqCst);
+        *exited.0.lock().unwrap() = true;
+        exited.1.notify_all();
         let (reason, result) = tokio::time::timeout(Duration::from_secs(2), waiter)
             .await
             .unwrap();

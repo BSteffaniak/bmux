@@ -8,7 +8,10 @@
 //! starts a server manually. Cleanup explicitly requests finish --cleanup-server.
 #![cfg(unix)]
 
+// Match nextest's recorded-processes budget under libtest too: each owned
+// fixture launches servers and/or rasterizes evidence. Keep deadlines strict.
 use serde_json::Value;
+use serial_test::serial;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -449,6 +452,7 @@ fn parse_json(output: &Output) -> Value {
 }
 
 #[test]
+#[serial]
 fn process_help_is_discoverable_without_starting_a_server() {
     let env = RecordingEnv::new();
     for args in [
@@ -499,6 +503,7 @@ fn process_help_is_discoverable_without_starting_a_server() {
 }
 
 #[test]
+#[serial]
 fn malformed_process_arguments_fail_without_creating_a_recording() {
     let env = RecordingEnv::new();
     for args in [
@@ -554,6 +559,7 @@ fn malformed_process_arguments_fail_without_creating_a_recording() {
 }
 
 #[test]
+#[serial]
 fn retired_lifecycle_selectors_are_rejected_before_launch() {
     let env = RecordingEnv::new();
     let marker = env.root.join("must-not-launch");
@@ -621,6 +627,7 @@ fn process_manifest_exposes_only_the_cohesive_contract() {
 }
 
 #[test]
+#[serial]
 fn old_durable_versions_are_rejected_without_rewriting_evidence() {
     let env = RecordingEnv::new();
     let id = env.start("stty -opost\nprintf 'CANONICAL_DATA'\n", &[]);
@@ -708,6 +715,7 @@ fn read_all(env: &RecordingEnv, id: &str) -> Vec<u8> {
 
 #[test]
 #[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
+#[serial]
 fn relocated_installed_payload_exports_and_remains_offline() {
     let env = RecordingEnv::relocated_installation();
     let script = env.script(
@@ -827,6 +835,7 @@ fn assert_installed_launch_rejected(env: &RecordingEnv) {
 
 #[test]
 #[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
+#[serial]
 fn installed_missing_and_same_length_tampered_helpers_reject_before_launch() {
     for tampered in [false, true] {
         let env = RecordingEnv::relocated_installation();
@@ -855,6 +864,7 @@ fn installed_missing_and_same_length_tampered_helpers_reject_before_launch() {
 
 #[test]
 #[ignore = "requires explicit installed payload and real different-slot BMUX_RECORDING_TEST_FOREIGN_SUPERVISOR"]
+#[serial]
 fn installed_different_slot_helper_rejects_against_untouched_inventory() {
     let foreign = PathBuf::from(
         std::env::var_os("BMUX_RECORDING_TEST_FOREIGN_SUPERVISOR")
@@ -891,6 +901,7 @@ fn installed_different_slot_helper_rejects_against_untouched_inventory() {
 
 #[test]
 #[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
+#[serial]
 fn installed_wrong_owner_unsupported_or_corrupt_inventory_rejects_before_launch() {
     for case in ["wrong-owner", "unsupported-schema", "corrupt"] {
         let env = RecordingEnv::relocated_installation();
@@ -932,6 +943,7 @@ fn installed_wrong_owner_unsupported_or_corrupt_inventory_rejects_before_launch(
 }
 
 #[test]
+#[serial]
 fn terminal_profiles_complete_capture_without_lifecycle_selectors() {
     for profile in ["full", "functional", "visual"] {
         let env = RecordingEnv::new();
@@ -1098,6 +1110,7 @@ fn terminal_profiles_complete_capture_without_lifecycle_selectors() {
 }
 
 #[test]
+#[serial]
 fn stale_finish_revision_does_not_finalize_or_publish() {
     let env = RecordingEnv::new();
     let id = env.start("stty -opost\nprintf STALE\n", &[]);
@@ -1138,6 +1151,7 @@ fn stale_finish_revision_does_not_finalize_or_publish() {
 }
 
 #[test]
+#[serial]
 fn whole_frame_loss_never_publishes_or_overwrites_live_capture() {
     let env = RecordingEnv::new();
     let id = env.start(
@@ -1202,6 +1216,7 @@ fn whole_frame_loss_never_publishes_or_overwrites_live_capture() {
 }
 
 #[test]
+#[serial]
 fn finite_launch_status_before_wait_reports_drain() {
     let mut env = RecordingEnv::new();
     env.profile_export = true;
@@ -1277,6 +1292,7 @@ fn finite_launch_status_before_wait_reports_drain() {
 }
 
 #[test]
+#[serial]
 fn immediate_exit_and_startup_burst_are_not_lost() {
     for iteration in 0..4 {
         let env = RecordingEnv::new();
@@ -1301,6 +1317,7 @@ fn immediate_exit_and_startup_burst_are_not_lost() {
 }
 
 #[test]
+#[serial]
 fn argv_environment_and_working_directory_are_literal() {
     let env = RecordingEnv::new();
     let literal = "spaces 'quotes' $(touch SHOULD_NOT_EXIST); * --flag";
@@ -1319,6 +1336,7 @@ fn argv_environment_and_working_directory_are_literal() {
 }
 
 #[test]
+#[serial]
 fn interactive_send_wait_timeout_and_finish_refusal() {
     let env = RecordingEnv::new();
     let id = env.start("stty -echo -opost\nprintf 'Ready>'\nIFS= read -r line\nprintf '\\033[2J\\033[HReply:%s' \"$line\"\nIFS= read -r line\nprintf '\\nSecond:%s' \"$line\"\n", &[]);
@@ -1419,6 +1437,7 @@ fn interactive_send_wait_timeout_and_finish_refusal() {
 }
 
 #[test]
+#[serial]
 fn termination_is_separate_from_finalization() {
     let env = RecordingEnv::new();
     let id = env.start(
@@ -1458,6 +1477,7 @@ fn termination_is_separate_from_finalization() {
 }
 
 #[test]
+#[serial]
 fn raw_bytes_transcript_and_export_retries_preserve_evidence() {
     let env = RecordingEnv::new();
     let id = env.start(
@@ -1519,6 +1539,7 @@ fn raw_bytes_transcript_and_export_retries_preserve_evidence() {
 }
 
 #[test]
+#[serial]
 fn unknown_ids_and_invalid_cursors_never_fall_back_to_another_runtime() {
     let first = RecordingEnv::new();
     let id = first.start("stty -opost\nprintf evidence\n", &[]);
@@ -1528,6 +1549,7 @@ fn unknown_ids_and_invalid_cursors_never_fall_back_to_another_runtime() {
 }
 
 #[test]
+#[serial]
 fn gif_export_decodes_every_frame_and_animates() {
     let env = RecordingEnv::new();
     let id = env.start("stty -echo -opost\nprintf '\\033[2J\\033[HFRAME_ONE'\nIFS= read -r line\nprintf '\\033[2J\\033[HFRAME_TWO'\nIFS= read -r line\n", &[]);
@@ -1647,6 +1669,7 @@ fn gif_export_decodes_every_frame_and_animates() {
 }
 
 #[test]
+#[serial]
 fn foreground_run_reports_nonzero_child_exit_structurally() {
     let env = RecordingEnv::new();
     let script = env.script("nonzero-retry.sh", "printf nonzero; exit 7\n");
@@ -1686,6 +1709,7 @@ fn foreground_run_reports_nonzero_child_exit_structurally() {
 }
 
 #[test]
+#[serial]
 fn durable_start_and_send_retries_do_not_duplicate_effects() {
     let env = RecordingEnv::new();
     let script = env.script("retry.sh", "stty -echo -opost\nprintf launch >> launch-count\nprintf 'Ready>'\nIFS= read -r first\nprintf 'FIRST:%s\\n' \"$first\"\nIFS= read -r second\nprintf 'SECOND:%s' \"$second\"\n");
@@ -1807,6 +1831,7 @@ fn durable_start_and_send_retries_do_not_duplicate_effects() {
 }
 
 #[test]
+#[serial]
 fn finalized_evidence_remains_available_after_explicit_server_cleanup() {
     let env = RecordingEnv::new();
     let id = env.start(
@@ -1856,6 +1881,7 @@ fn finalized_evidence_remains_available_after_explicit_server_cleanup() {
 }
 
 #[test]
+#[serial]
 fn immediate_output_is_replayed_into_gif_without_screen_polling() {
     let env = RecordingEnv::new();
     // No sleeps, screen queries, or screen-condition waits before exit.
@@ -1891,6 +1917,7 @@ fn immediate_output_is_replayed_into_gif_without_screen_polling() {
 }
 
 #[test]
+#[serial]
 fn animated_gif_preserves_ordered_output_and_final_exit_frame() {
     let env = RecordingEnv::new();
     // Deliberately separated source frames exercise animation, while the last
@@ -1964,6 +1991,7 @@ fn gif_dominant_colors(path: &Path) -> Vec<usize> {
 }
 
 #[test]
+#[serial]
 fn incomplete_capture_refuses_finalization_and_retries_without_relaunch() {
     let env = RecordingEnv::new();
     let id = env.start("stty -opost\nprintf EXACT_CAPTURE\n", &[]);
@@ -2014,6 +2042,7 @@ fn incomplete_capture_refuses_finalization_and_retries_without_relaunch() {
 }
 
 #[test]
+#[serial]
 fn exit_wait_longer_than_default_transport_timeout_returns_run_status() {
     let env = RecordingEnv::new();
     let id = env.start(
@@ -2056,6 +2085,7 @@ fn exit_wait_longer_than_default_transport_timeout_returns_run_status() {
 }
 
 #[test]
+#[serial]
 fn exit_wait_beyond_five_seconds_returns_complete_evidence() {
     let env = RecordingEnv::new();
     // Start sleeping only after launch returns, so startup latency cannot
@@ -2086,6 +2116,7 @@ fn exit_wait_beyond_five_seconds_returns_complete_evidence() {
 }
 
 #[test]
+#[serial]
 fn nonzero_foreground_same_key_retry_retains_exit_and_one_launch() {
     let env = RecordingEnv::new();
     let script = env.script(
@@ -2125,6 +2156,7 @@ fn nonzero_foreground_same_key_retry_retains_exit_and_one_launch() {
 }
 
 #[test]
+#[serial]
 fn foreground_run_retry_preserves_identity_and_one_launch() {
     let env = RecordingEnv::new();
     let script = env.script(

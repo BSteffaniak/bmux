@@ -50,7 +50,8 @@ use uuid::Uuid;
 
 use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
 use crate::runtime::attach::runtime::{
-    HeadlessAttachTerminal, HeadlessAttachTerminalHandle, run_session_attach_with_terminal_config,
+    AttachTerminal, AttachTerminalEventFuture, HeadlessAttachTerminal,
+    HeadlessAttachTerminalHandle, run_session_attach_with_terminal_config,
 };
 
 use super::RunOptions;
@@ -640,29 +641,137 @@ pub(super) struct AttachInputState {
     scrollback_offset: usize,
 }
 
+// The attach loop publishes its committed target at the start of each turn,
+// after handling the preceding event. A playbook-owned terminal pairs that
+// boundary with the exact event it delivered, including actions that keep the
+// same target. Session changes alone cannot acknowledge an input action.
+struct AcknowledgedAttachEvent {
+    event: CrosstermEvent,
+    completed: tokio::sync::oneshot::Sender<Uuid>,
+}
+
+struct PlaybookAttachTerminal {
+    inner: HeadlessAttachTerminal,
+    events: tokio::sync::mpsc::UnboundedReceiver<AcknowledgedAttachEvent>,
+    pending: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Uuid>>>,
+}
+
+impl Write for PlaybookAttachTerminal {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl AttachTerminal for PlaybookAttachTerminal {
+    fn geometry(&self) -> crate::runtime::attach::input::TerminalGeometry {
+        self.inner.geometry()
+    }
+
+    fn enter_attach_mode(&mut self, kitty: bool, mouse: bool, paste: bool) -> Result<bool> {
+        self.inner.enter_attach_mode(kitty, mouse, paste)
+    }
+
+    fn next_event(&mut self) -> AttachTerminalEventFuture<'_> {
+        Box::pin(async move {
+            tokio::select! {
+                event = self.events.recv() => {
+                    let Some(event) = event else { return Ok(None); };
+                    *self.pending.lock().map_err(|_| anyhow::anyhow!("attach acknowledgment lock poisoned"))? = Some(event.completed);
+                    Ok(Some(event.event))
+                }
+                event = self.inner.next_event() => event,
+            }
+        })
+    }
+
+    fn restore_after_attach_ui(&mut self) -> Result<()> {
+        self.inner.restore_after_attach_ui()
+    }
+
+    fn set_attached_session_id(&self, session_id: Uuid) {
+        self.inner.set_attached_session_id(session_id);
+        if let Ok(mut pending) = self.pending.lock()
+            && let Some(completed) = pending.take()
+        {
+            let _ = completed.send(session_id);
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_scrollback(&self, active: bool) {
+        self.inner.observe_scrollback(active);
+    }
+
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    fn detect_image_capabilities(&mut self) -> bmux_image::host_caps::HostImageCapabilities {
+        self.inner.detect_image_capabilities()
+    }
+}
+
 pub(super) struct RealAttachPlaybookRuntime {
     terminal: HeadlessAttachTerminalHandle,
+    events: tokio::sync::mpsc::UnboundedSender<AcknowledgedAttachEvent>,
+    input_resolved: std::sync::atomic::AtomicBool,
     task: tokio::task::JoinHandle<Result<crate::runtime::attach::runtime::AttachRunOutcome>>,
 }
 
 impl RealAttachPlaybookRuntime {
-    async fn send_paste(&self, text: &str) -> Result<()> {
-        self.terminal
-            .send_event(CrosstermEvent::Paste(text.to_string()))?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+    async fn send_paste(&self, text: &str, deadline: Instant) -> Result<()> {
+        self.wait_until_ready().await?;
+        self.send_event(CrosstermEvent::Paste(text.to_string()), deadline)
+            .await?;
         Ok(())
     }
 
-    async fn send_chord(&self, chord: &str) -> Result<()> {
+    fn ensure_input_resolved(&self) -> Result<()> {
+        ensure!(
+            self.input_resolved
+                .load(std::sync::atomic::Ordering::Acquire),
+            "real attachment has an uncommitted action; further input is suspended"
+        );
+        Ok(())
+    }
+
+    async fn send_event(&self, event: CrosstermEvent, deadline: Instant) -> Result<Uuid> {
+        self.ensure_input_resolved()?;
+        self.input_resolved
+            .store(false, std::sync::atomic::Ordering::Release);
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        self.events
+            .send(AcknowledgedAttachEvent { event, completed })
+            .map_err(|_| anyhow::anyhow!("real attachment exited before accepting input"))?;
+        let committed =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), completion)
+                .await
+                .context("real attachment action completion timed out; input target is unresolved")?
+                .context("real attachment exited before committing the submitted action")?;
+        self.input_resolved
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(committed)
+    }
+
+    async fn send_chord(&self, chord: &str, deadline: Instant) -> Result<Uuid> {
         self.wait_until_ready().await?;
         let strokes = crate::input::parse_key_chord(chord)
             .map_err(|error| anyhow::anyhow!("invalid attach key chord '{chord}': {error}"))?;
+        let mut committed_target = self
+            .terminal
+            .attached_session_id()
+            .context("real attachment target missing")?;
         for stroke in strokes {
-            self.terminal
-                .send_event(crossterm_event_from_stroke(stroke))?;
+            committed_target = self
+                .send_event(crossterm_event_from_stroke(stroke), deadline)
+                .await?;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        Ok(())
+        Ok(committed_target)
     }
 
     async fn wait_until_ready(&self) -> Result<()> {
@@ -678,15 +787,6 @@ impl RealAttachPlaybookRuntime {
         })
         .await
         .context("real attachment readiness timed out")?
-    }
-
-    async fn wait_for_retarget(&self, before_session_id: Option<Uuid>) {
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            if self.terminal.attached_session_id() != before_session_id {
-                break;
-            }
-        }
     }
 
     fn resize(&self, cols: u16, rows: u16) -> Result<()> {
@@ -3556,7 +3656,13 @@ async fn start_real_attach_playbook_runtime(
         });
         factory
     });
-    let (mut terminal, handle) = HeadlessAttachTerminal::new(viewport.0, viewport.1);
+    let (inner, handle) = HeadlessAttachTerminal::new(viewport.0, viewport.1);
+    let (events, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut terminal = PlaybookAttachTerminal {
+        inner,
+        events: event_rx,
+        pending: std::sync::Mutex::new(None),
+    };
     let target = session_id.to_string();
     let task = tokio::spawn(async move {
         Box::pin(run_session_attach_with_terminal_config(
@@ -3573,6 +3679,8 @@ async fn start_real_attach_playbook_runtime(
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(RealAttachPlaybookRuntime {
         terminal: handle,
+        events,
+        input_resolved: std::sync::atomic::AtomicBool::new(true),
         task,
     })
 }
@@ -3769,6 +3877,9 @@ pub(super) async fn execute_step(
         }
 
         Action::SendKeys { keys, pane } => {
+            if let Some(real_attach) = real_attach_runtime {
+                real_attach.ensure_input_resolved()?;
+            }
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
             if pane.is_none()
@@ -3813,6 +3924,9 @@ pub(super) async fn execute_step(
         }
 
         Action::SendBytes { hex } => {
+            if let Some(real_attach) = real_attach_runtime {
+                real_attach.ensure_input_resolved()?;
+            }
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
             client
@@ -4133,7 +4247,7 @@ pub(super) async fn execute_step(
             let real_attach =
                 real_attach_runtime.context("paste-attach requires @driver real-attach")?;
             real_attach
-                .send_paste(text)
+                .send_paste(text, deadline)
                 .await
                 .map_err(|error| anyhow::anyhow!("paste-attach failed: {error}"))?;
             Ok(Some(format!("pasted_bytes={}", text.len())))
@@ -4148,6 +4262,7 @@ pub(super) async fn execute_step(
                     inspector,
                     session_id,
                     runtime_vars,
+                    deadline,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("send-attach failed: {e}"))?;
@@ -4187,6 +4302,7 @@ pub(super) async fn execute_step(
                     inspector,
                     session_id,
                     runtime_vars,
+                    deadline,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("prefix-key failed: {e}"))?;
@@ -4409,26 +4525,15 @@ async fn execute_real_attach_chord(
     inspector: &mut ScreenInspector,
     session_id: &mut Option<Uuid>,
     runtime_vars: &mut RuntimeVars,
+    deadline: Instant,
 ) -> Result<()> {
     require_session(*session_id)?;
     // Establish the initial attachment before sending input: None -> initial
     // target is startup, not completion of a retarget requested by this chord.
     real_attach.wait_until_ready().await?;
-    let before_session_id = real_attach.terminal.attached_session_id();
-    real_attach.send_chord(chord).await?;
-    let before_control_target = *session_id;
-    let wait_started = Instant::now();
-    real_attach.wait_for_retarget(before_session_id).await;
-    debug!(
-        before_target = ?before_session_id,
-        control_target = ?before_control_target,
-        observed_target = ?real_attach.terminal.attached_session_id(),
-        elapsed_ms = wait_started.elapsed().as_millis(),
-        "playbook retarget wait completed"
-    );
-    if let Some(attached_session_id) = real_attach.terminal.attached_session_id() {
-        reconcile_real_attach_target(attached_session_id, client, session_id, runtime_vars).await?;
-    }
+
+    let committed_target = real_attach.send_chord(chord, deadline).await?;
+    reconcile_real_attach_target(committed_target, client, session_id, runtime_vars).await?;
     let sid = require_session(*session_id)?;
     let snapshot = inspector.refresh(client, sid).await?;
     runtime_vars.pane_count = u32::try_from(snapshot.panes.len()).unwrap_or(u32::MAX);
@@ -5020,37 +5125,134 @@ fn session_plugin_bus_event_matches(kind: &str, payload: &[u8], name: &str) -> b
 mod tests {
     use super::*;
 
+    fn acknowledged_test_runtime() -> (PlaybookAttachTerminal, RealAttachPlaybookRuntime) {
+        let (inner, handle) = HeadlessAttachTerminal::new(10, 3);
+        let (events, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            PlaybookAttachTerminal {
+                inner,
+                events: event_rx,
+                pending: std::sync::Mutex::new(None),
+            },
+            RealAttachPlaybookRuntime {
+                terminal: handle,
+                events,
+                input_resolved: std::sync::atomic::AtomicBool::new(true),
+                task: tokio::spawn(std::future::pending()),
+            },
+        )
+    }
+
     #[tokio::test]
     async fn chord_submission_waits_for_initial_attachment() {
-        use crate::runtime::attach::runtime::AttachTerminal;
-        let (mut terminal, handle) = HeadlessAttachTerminal::new(10, 3);
-        let task = tokio::spawn(std::future::pending());
-        let runtime = RealAttachPlaybookRuntime {
-            terminal: handle,
-            task,
-        };
+        let (mut terminal, runtime) = acknowledged_test_runtime();
         let target = Uuid::new_v4();
-        let send = runtime.send_chord("a");
+        let send = runtime.send_chord("a", Instant::now() + Duration::from_secs(5));
         tokio::pin!(send);
-        // Poll submission while readiness is absent, independently of wall-clock timing.
         assert!(matches!(
             futures_util::poll!(&mut send),
             std::task::Poll::Pending
         ));
-        {
-            let receive = terminal.next_event();
-            tokio::pin!(receive);
-            assert!(matches!(
-                futures_util::poll!(&mut receive),
-                std::task::Poll::Pending
-            ));
-        }
+        assert!(terminal.events.is_empty());
         terminal.set_attached_session_id(target);
-        send.await.unwrap();
+        let driver = async {
+            assert!(matches!(
+                terminal.next_event().await.unwrap(),
+                Some(CrosstermEvent::Key(_))
+            ));
+            terminal.set_attached_session_id(target);
+        };
+        let (result, ()) = tokio::join!(send, driver);
+        result.unwrap();
+        runtime.task.abort();
+    }
+
+    #[tokio::test]
+    async fn action_completion_requires_its_own_delivery_boundary() {
+        let (mut terminal, runtime) = acknowledged_test_runtime();
+        let first = Uuid::new_v4();
+        terminal.set_attached_session_id(first);
+        let send = runtime.send_event(
+            CrosstermEvent::Paste("first".into()),
+            Instant::now() + Duration::from_secs(5),
+        );
+        tokio::pin!(send);
         assert!(matches!(
-            terminal.next_event().await.unwrap(),
-            Some(CrosstermEvent::Key(_))
+            futures_util::poll!(&mut send),
+            std::task::Poll::Pending
         ));
+        // An unrelated/previous retarget before delivery cannot complete this action.
+        terminal.set_attached_session_id(Uuid::new_v4());
+        assert!(matches!(
+            futures_util::poll!(&mut send),
+            std::task::Poll::Pending
+        ));
+        terminal.next_event().await.unwrap().unwrap();
+        assert!(matches!(
+            futures_util::poll!(&mut send),
+            std::task::Poll::Pending
+        ));
+        terminal.set_attached_session_id(first);
+        assert_eq!(send.await.unwrap(), first);
+
+        let second = runtime.send_event(
+            CrosstermEvent::Paste("second".into()),
+            Instant::now() + Duration::from_secs(5),
+        );
+        tokio::pin!(second);
+        assert!(matches!(
+            futures_util::poll!(&mut second),
+            std::task::Poll::Pending
+        ));
+        terminal.set_attached_session_id(first);
+        assert!(matches!(
+            futures_util::poll!(&mut second),
+            std::task::Poll::Pending
+        ));
+        terminal.next_event().await.unwrap().unwrap();
+        // Same-target UI actions complete too, without requiring a retarget.
+        terminal.set_attached_session_id(first);
+        assert_eq!(second.await.unwrap(), first);
+        runtime.task.abort();
+    }
+
+    #[tokio::test]
+    async fn uncommitted_action_times_out_and_disconnect_is_not_completion() {
+        let (mut terminal, runtime) = acknowledged_test_runtime();
+        let send = runtime.send_event(CrosstermEvent::Paste("late".into()), Instant::now());
+        assert!(send.await.unwrap_err().to_string().contains("timed out"));
+        terminal.next_event().await.unwrap().unwrap();
+        // Late completion has only the expired action's receiver.
+        terminal.set_attached_session_id(Uuid::new_v4());
+        assert!(runtime.ensure_input_resolved().is_err());
+        assert!(
+            runtime
+                .send_event(CrosstermEvent::Paste("blocked".into()), Instant::now())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("suspended")
+        );
+        runtime.task.abort();
+
+        let (mut terminal, runtime) = acknowledged_test_runtime();
+        let send = runtime.send_event(
+            CrosstermEvent::Paste("lost".into()),
+            Instant::now() + Duration::from_secs(5),
+        );
+        tokio::pin!(send);
+        assert!(matches!(
+            futures_util::poll!(&mut send),
+            std::task::Poll::Pending
+        ));
+        terminal.next_event().await.unwrap().unwrap();
+        drop(terminal);
+        assert!(
+            send.await
+                .unwrap_err()
+                .to_string()
+                .contains("exited before committing")
+        );
         runtime.task.abort();
     }
 
@@ -5175,12 +5377,12 @@ mod tests {
             control.attach_input(session, b"\r".to_vec()).await?;
             wait_for_replication_screens(&first, &second, "MAIN_RETAINED", (90, 26)).await?;
             for runtime in [&first, &second] {
-                runtime.send_chord("ctrl+a [").await?;
+                runtime.send_chord("ctrl+a [", Instant::now() + Duration::from_secs(5)).await?;
             }
             wait_for_scrollback_mode(&first, &second, true).await?;
             wait_for_replication_screens(&first, &second, "MAIN_RETAINED", (90, 26)).await?;
             for runtime in [&first, &second] {
-                runtime.send_chord("Escape").await?;
+                runtime.send_chord("Escape", Instant::now() + Duration::from_secs(5)).await?;
             }
             wait_for_scrollback_mode(&first, &second, false).await?;
             wait_for_replication_screens(&first, &second, "MAIN_RETAINED", (90, 26)).await?;

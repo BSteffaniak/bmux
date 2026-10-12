@@ -198,19 +198,42 @@ impl SupervisorControl {
         &self,
         slave: &std::path::Path,
     ) -> anyhow::Result<Box<dyn portable_pty::Child + Send + Sync>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
         anyhow::ensure!(
             self.version == protocol::VERSION,
             "guardian requires explicit terminal-session protocol"
         );
-        let child = std::process::Command::new(&self.artifact)
+        let (mut readiness, ready_child) = std::os::unix::net::UnixStream::pair()?;
+        readiness.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        let ready_fd = ready_child.as_raw_fd();
+        let mut command = std::process::Command::new(&self.artifact);
+        command
             .arg("--guardian-terminal-session-v4")
             .arg(self.directory.join("bootstrap.json"))
             .arg(self.directory.join("control.sock"))
             .arg(slave)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
+            .stderr(std::process::Stdio::null());
+        // SAFETY: only async-signal-safe descriptor operations before exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(ready_fd, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn()?;
+        drop(command);
+        drop(ready_child);
+        let version: u32 = protocol::read_frame(&mut readiness)?;
+        anyhow::ensure!(
+            version == protocol::VERSION,
+            "guardian startup negotiation rejected"
+        );
         Ok(Box::new(child))
     }
 
@@ -252,27 +275,15 @@ impl SupervisorControl {
         anyhow::bail!("supervisor requires Unix")
     }
 
-    pub(super) async fn start(
+    /// Blocking startup handshake; callers on an async runtime must dispatch this
+    /// with `spawn_blocking`, owning the control, launch, and authorization handle.
+    pub(super) fn start(
         &self,
         launch: &super::PaneLaunchSpec,
         authorize: impl Fn() -> anyhow::Result<()>,
     ) -> anyhow::Result<Option<u32>> {
-        // Process activation on a loaded host (including immutable helper
-        // verification) needs its own bounded startup budget. Keep this below
-        // the public command deadline; expiration never authorizes a relaunch.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut last_error;
-        loop {
-            match self.request(Operation::Hello) {
-                Ok(_) => break,
-                Err(error) => last_error = error,
-            }
-            anyhow::ensure!(
-                tokio::time::Instant::now() < deadline,
-                "supervisor handshake failed before startup deadline: {last_error}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        // Startup readiness was acknowledged over inherited IPC in spawn_guardian.
+        let mut watcher = self.subscribe()?;
         authorize()?;
         self.request(Operation::Start {
             mutation_id: self.token.clone(),
@@ -281,18 +292,92 @@ impl SupervisorControl {
             cwd: launch.cwd.clone(),
             env: launch.env.clone(),
         })?;
-        // Readiness comes from the actual owner, not the guardian process PID.
-        // Fast-exit/spawn failure may settle without a target: retain that outcome.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut snapshot = watcher.initial().clone();
         loop {
-            let status = self.request(Operation::Status)?;
-            if status.target_pid.is_some() || status.terminal_session_ended == Some(true) {
-                return Ok(status.target_pid);
+            if let Some(error) = snapshot.status.error {
+                anyhow::bail!(error);
             }
+            if snapshot.status.target_pid.is_some()
+                || snapshot.status.terminal_session_ended == Some(true)
+            {
+                return Ok(snapshot.status.target_pid);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             anyhow::ensure!(
-                tokio::time::Instant::now() < deadline,
+                !remaining.is_zero(),
                 "target readiness deadline exceeded; launch must not be repeated"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            watcher.socket.set_read_timeout(Some(remaining))?;
+            snapshot = watcher.next()?;
         }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn subscribe(&self) -> anyhow::Result<LifecycleWatcher> {
+        let mut socket =
+            std::os::unix::net::UnixStream::connect(self.directory.join("control.sock"))?;
+        socket.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        protocol::write_frame(
+            &mut socket,
+            &Request {
+                version: self.version,
+                execution_token: self.token.clone(),
+                authentication: self.authentication.clone(),
+                operation: Operation::Subscribe {
+                    capability: protocol::LIFECYCLE_CAPABILITY,
+                },
+            },
+        )?;
+        let initial: protocol::LifecycleSnapshot = protocol::read_frame(&mut socket)?;
+        validate_snapshot(&initial, &self.token, 0)?;
+        socket.set_read_timeout(None)?;
+        Ok(LifecycleWatcher {
+            socket,
+            initial: initial.clone(),
+            current: initial,
+        })
+    }
+}
+
+fn validate_snapshot(
+    snapshot: &protocol::LifecycleSnapshot,
+    token: &str,
+    previous: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        snapshot.capability == protocol::LIFECYCLE_CAPABILITY
+            && snapshot.status.version == protocol::VERSION
+            && snapshot.status.execution_token == token
+            && snapshot.revision > previous,
+        "invalid or stale supervisor lifecycle snapshot"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(super) struct LifecycleWatcher {
+    socket: std::os::unix::net::UnixStream,
+    initial: protocol::LifecycleSnapshot,
+    current: protocol::LifecycleSnapshot,
+}
+#[cfg(unix)]
+impl LifecycleWatcher {
+    pub(super) fn initial(&self) -> &protocol::LifecycleSnapshot {
+        &self.initial
+    }
+    pub(super) fn interrupter(&self) -> anyhow::Result<std::os::unix::net::UnixStream> {
+        Ok(self.socket.try_clone()?)
+    }
+    pub(super) fn next(&mut self) -> anyhow::Result<protocol::LifecycleSnapshot> {
+        let snapshot: protocol::LifecycleSnapshot = protocol::read_frame(&mut self.socket)?;
+        validate_snapshot(
+            &snapshot,
+            &self.current.status.execution_token,
+            self.current.revision,
+        )?;
+        self.current = snapshot.clone();
+        Ok(snapshot)
     }
 }
