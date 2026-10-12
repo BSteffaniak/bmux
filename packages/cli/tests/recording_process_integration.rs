@@ -42,11 +42,13 @@ impl RecordingEnv {
             .canonicalize()
             .expect("canonical socket base");
         assert!(socket_base.is_absolute(), "socket base must be absolute");
-        let short_tmp = socket_base.join(format!(
-            "t-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        // Exclusive private base leaves room for dedicated runtime socket names.
+        // Exercise the default macOS TMPDIR byte budget in every process test,
+        // instead of masking path regressions with an unusually short parent.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let padding = 56usize
+            .checked_sub(socket_base.as_os_str().len() + 1 + suffix.len())
+            .expect("socket fixture parent must leave room for a 56-byte TMPDIR");
+        let short_tmp = socket_base.join(format!("{}{suffix}", "t".repeat(padding)));
         fs::DirBuilder::new()
             .mode(0o700)
             .create(&short_tmp)
@@ -63,7 +65,11 @@ impl RecordingEnv {
                 & 0o777,
             0o700
         );
-        assert!(short_tmp.as_os_str().len() <= 25, "TMPDIR endpoint budget");
+        assert_eq!(
+            short_tmp.as_os_str().len(),
+            56,
+            "macOS TMPDIR endpoint budget"
+        );
         for directory in [
             "home",
             "config",
@@ -307,11 +313,9 @@ impl RecordingEnv {
             .expect("runtime name")
             .to_str()
             .expect("UTF-8 name");
-        uuid::Uuid::parse_str(
-            name.strip_prefix("bmux-recorded-")
-                .expect("dedicated runtime prefix"),
-        )
-        .expect("dedicated runtime UUID");
+        let suffix = name.strip_prefix("r-").expect("dedicated runtime prefix");
+        assert_eq!(suffix.len(), 24);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
         let locator_path = self
             .root
             .join("data/recording-process-v4")

@@ -268,7 +268,7 @@ inherited `BMUX_*` variables before setting isolated directory overrides,
 `BMUX_NO_BASE_CONFIG=1`, `BMUX_RUNTIME_NAME=default`, and `BMUX_TARGET=local`.
 Also isolate HOME, XDG directories, and TMPDIR, and select explicit local runtime
 and configuration arguments. Automatic start creates a private
-`/tmp/bmux-recorded-UUID` dedicated root (0700) with a durable locator in the
+`r-<random>` dedicated root under the selected platform `TMPDIR` (0700) with a durable locator in the
 isolated caller's data root. Validate this locator and exact returned root before
 routing. Never fall back to default user paths. Cleanup may stop only that owned
 runtime, not an arbitrary path or PID.

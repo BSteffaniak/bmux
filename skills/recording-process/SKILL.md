@@ -22,7 +22,7 @@ and current CLI help before acting; do not infer a JSON schema from old examples
 - Do not build, rebuild plugins, stop servers, or delete shared outputs when a
   coordinator owns those resources. Ask the coordinator for the built binary.
 - Confirm the durable locator is in the caller-owned data root. Automatic start
-  creates a private `/tmp/bmux-recorded-UUID` dedicated root (0700); validate that
+  creates a private `r-<random>` dedicated root under the selected platform `TMPDIR` (0700); validate that
   exact root before routing. Missing endpoints must fail, never fall back to a
   live user runtime.
 - Keep returned resource identities and cursors exactly; do not substitute a PID,

@@ -39,6 +39,44 @@ fn paths(root: &Path) -> ConfigPaths {
     )
 }
 
+fn dedicated_root_name() -> String {
+    // 90 random bits fit alongside the standard 56-byte macOS TMPDIR and
+    // /runtime/server.sock. Exclusive creation remains the collision authority.
+    format!("r-{}", &Uuid::new_v4().simple().to_string()[..24])
+}
+
+fn is_dedicated_root(root: &Path) -> bool {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.strip_prefix("r-")
+                .is_some_and(|id| id.len() == 24 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                || name
+                    .strip_prefix("bmux-recorded-")
+                    .is_some_and(|id| Uuid::parse_str(id).is_ok())
+        })
+}
+
+fn create_dedicated_root(base: &Path) -> Result<PathBuf> {
+    for _ in 0..16 {
+        let root = base.join(dedicated_root_name());
+        // Validate before creating state; never escape the selected volume.
+        validate_runtime_socket(&root)?;
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&root) {
+            Ok(()) => return Ok(root),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("exclusive dedicated runtime allocation exhausted; target not launched")
+}
+
 fn validate_runtime_socket(root: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -151,16 +189,7 @@ pub(crate) async fn bootstrap(context: &NativeCommandContext) -> Result<Dedicate
     crate::durable::private_directory(&index)?;
     let base = std::fs::canonicalize(std::env::temp_dir())
         .context("resolving dedicated platform temporary parent (TMPDIR)")?;
-    let root = base.join(format!("bmux-recorded-{}", Uuid::new_v4()));
-    // Check before creating state or spawning even the isolated server. Never
-    // escape an explicitly selected temporary volume to shorten socket paths.
-    validate_runtime_socket(&root)?;
-    std::fs::create_dir(&root)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
-    }
+    let root = create_dedicated_root(&base)?;
     let paths = paths(&root);
     paths.ensure_dirs()?;
     std::fs::create_dir(root.join("home"))?;
@@ -313,9 +342,7 @@ pub(crate) async fn resolve(context: &NativeCommandContext, id: Uuid) -> Result<
         "process runtime outside dedicated temporary parent"
     );
     ensure!(
-        root.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("bmux-recorded-")),
+        is_dedicated_root(&root),
         "invalid dedicated runtime locator"
     );
     let client = match BmuxClient::connect_with_paths_and_timeout(
@@ -401,11 +428,7 @@ pub(crate) fn offline(
     let base = std::fs::canonicalize(std::env::temp_dir())?;
     validate_runtime_socket(&root)?;
     ensure!(
-        root.parent() == Some(base.as_path())
-            && root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("bmux-recorded-")),
+        root.parent() == Some(base.as_path()) && is_dedicated_root(&root),
         "invalid dedicated offline locator"
     );
     let recordings = root.join("state/recordings");
@@ -576,6 +599,48 @@ pub(crate) async fn cleanup(context: &NativeCommandContext, id: Uuid) -> Result<
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_length_tmpdir_supports_private_root_and_real_socket() {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        // An exclusively owned fixture with the same byte length as macOS's
+        // default /private/var/folders/.../T, without mutating process TMPDIR.
+        let base = PathBuf::from(format!("/tmp/bp-{}", Uuid::new_v4().simple()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&base)
+            .unwrap();
+        let base = base.canonicalize().unwrap();
+        let parent = base.join("x".repeat(55 - base.as_os_str().len()));
+        std::fs::create_dir(&parent).unwrap();
+        assert_eq!(parent.as_os_str().len(), 56);
+        let root = create_dedicated_root(&parent).unwrap();
+        assert_eq!(root.parent(), Some(parent.as_path()));
+        assert!(is_dedicated_root(&root));
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        paths(&root).ensure_dirs().unwrap();
+        let socket = paths(&root).server_socket();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let _client = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        let _server = listener.accept().unwrap();
+        drop(listener);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn root_locator_recognizes_compact_and_existing_names_only() {
+        assert!(is_dedicated_root(Path::new(&dedicated_root_name())));
+        assert!(is_dedicated_root(Path::new(&format!(
+            "bmux-recorded-{}",
+            Uuid::nil()
+        ))));
+        for name in ["r-", "r-../../elsewhere", "bmux-recorded-garbage"] {
+            assert!(!is_dedicated_root(Path::new(name)));
+        }
+    }
 
     #[test]
     fn owned_short_tmpdir_root_accepts_platform_socket_bounds() {
