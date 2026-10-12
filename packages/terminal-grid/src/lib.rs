@@ -18,6 +18,13 @@ mod reflow;
 mod render;
 mod snapshot;
 mod style;
+mod vt_parser;
+
+#[cfg(test)]
+mod vt_parser_tests;
+
+#[cfg(test)]
+mod stream_compat_tests;
 
 pub use delta::{GridDeltaApplyError, GridDeltaBatch, RowUpdateSnapshot};
 pub use model::{

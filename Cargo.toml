@@ -402,7 +402,6 @@ unicode-segmentation = { version = "1.13.2", default-features = false }
 unicode-width = { version = "0.2.2", default-features = false }
 uniffi = { version = "0.31.1" }
 uuid = { version = "1.23.1", default-features = false }
-vte = { version = "0.15.0", default-features = false }
 windows-sys = { version = "0.61.2" }
 zeroize = { version = "1.9.1", default-features = false, features = ["std"] }
 zstd = { version = "0.13", default-features = false }

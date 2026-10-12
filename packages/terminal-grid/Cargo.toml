@@ -15,7 +15,6 @@ serde                = { workspace = true, features = ["derive", "std", "rc"] }
 thiserror            = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width        = { workspace = true }
-vte                  = { workspace = true }
 
 [dev-dependencies]
 bmux_tui   = { workspace = true }

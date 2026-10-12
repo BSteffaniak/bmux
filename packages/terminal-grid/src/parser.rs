@@ -3,15 +3,15 @@ use crate::model::{
     GridLimits, GridMode, MouseProtocolEncoding, MouseProtocolMode, ProtocolState, TerminalGrid,
     TerminalGridError,
 };
-use vte::{Params, Perform};
+use crate::vt_parser::{Params, Parser, Perform};
 
 /// Streaming terminal parser plus structured grid state.
 ///
 /// Unlike [`TerminalGrid::process`](crate::TerminalGrid::process), this type
-/// owns the `vte` parser state and therefore preserves incomplete escape
+/// owns the streaming parser state and therefore preserves incomplete escape
 /// sequences across PTY chunk boundaries.
 pub struct TerminalGridStream {
-    parser: vte::Parser,
+    parser: Parser,
     grid: TerminalGrid,
     pending_bytes: Vec<u8>,
 }
@@ -30,7 +30,7 @@ impl TerminalGridStream {
     #[must_use]
     pub fn from_grid(grid: TerminalGrid) -> Self {
         Self {
-            parser: vte::Parser::new(),
+            parser: Parser::new(),
             grid,
             pending_bytes: Vec::new(),
         }
@@ -49,12 +49,11 @@ impl TerminalGridStream {
     ) -> Result<Self, TerminalGridError> {
         let mut stream = Self::from_grid(TerminalGrid::from_snapshot(snapshot, limits)?);
         if !snapshot.pending_bytes.is_empty() {
-            let mut performer = GridPerformer {
-                grid: &mut stream.grid,
-            };
+            // The snapshot already contains effects of controls executed inside
+            // this prefix. Replay only to reconstruct decoder state.
             stream
                 .parser
-                .advance(&mut performer, &snapshot.pending_bytes);
+                .advance(&mut ParserRestore, &snapshot.pending_bytes);
             stream.pending_bytes.clone_from(&snapshot.pending_bytes);
         }
         Ok(stream)
@@ -83,23 +82,15 @@ impl TerminalGridStream {
             return;
         }
         let revision = self.grid.revision();
-        let mut previous_pending = std::mem::take(&mut self.pending_bytes);
-        let previous_pending_len = previous_pending.len();
-        self.pending_bytes = if previous_pending.is_empty() {
-            trailing_incomplete_sequence(bytes)
-        } else {
-            previous_pending.extend_from_slice(bytes);
-            trailing_incomplete_sequence(&previous_pending)
-        };
+        let previous_pending = std::mem::take(&mut self.pending_bytes);
         let mut performer = GridPerformer {
             grid: &mut self.grid,
         };
         self.parser.advance(&mut performer, bytes);
+        self.pending_bytes = self.parser.replay_prefix();
         // Parser prefixes are replicated state even when no terminal operation
         // completed. Do not mark visible content dirty for a prefix-only update.
-        if self.pending_bytes != previous_pending[..previous_pending_len]
-            && self.grid.revision() == revision
-        {
+        if self.pending_bytes != previous_pending && self.grid.revision() == revision {
             self.grid.bump_revision();
         }
     }
@@ -377,7 +368,7 @@ pub struct ProtocolProcessOutcome {
 
 /// Streaming parser for terminal protocol/input hints without retaining pane cells.
 pub struct TerminalProtocolTracker {
-    parser: vte::Parser,
+    parser: Parser,
     protocol: ProtocolState,
     alternate_screen: bool,
     pending_bytes: Vec<u8>,
@@ -393,7 +384,7 @@ impl TerminalProtocolTracker {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            parser: vte::Parser::new(),
+            parser: Parser::new(),
             protocol: ProtocolState::default(),
             alternate_screen: false,
             pending_bytes: Vec::new(),
@@ -438,19 +429,13 @@ impl TerminalProtocolTracker {
                 toggled_alternate: false,
             };
         }
-        self.pending_bytes = if self.pending_bytes.is_empty() {
-            trailing_incomplete_sequence(bytes)
-        } else {
-            let mut continuity = std::mem::take(&mut self.pending_bytes);
-            continuity.extend_from_slice(bytes);
-            trailing_incomplete_sequence(&continuity)
-        };
         let mut performer = ProtocolPerformer {
             protocol: &mut self.protocol,
             alternate_screen: &mut self.alternate_screen,
             toggled_alternate: false,
         };
         self.parser.advance(&mut performer, bytes);
+        self.pending_bytes = self.parser.replay_prefix();
         ProtocolProcessOutcome {
             toggled_alternate: performer.toggled_alternate,
         }
@@ -474,10 +459,14 @@ pub enum TerminalGridStreamDeltaError {
 }
 
 pub(crate) fn process(grid: &mut TerminalGrid, bytes: &[u8]) {
-    let mut parser = vte::Parser::new();
+    let mut parser = Parser::new();
     let mut performer = GridPerformer { grid };
     parser.advance(&mut performer, bytes);
 }
+
+struct ParserRestore;
+
+impl Perform for ParserRestore {}
 
 struct ProtocolPerformer<'a> {
     protocol: &'a mut ProtocolState,
@@ -797,54 +786,11 @@ fn default_zero(value: Option<&i64>) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn trailing_incomplete_sequence(bytes: &[u8]) -> Vec<u8> {
-    // Earlier invalid bytes do not invalidate an incomplete character at the
-    // end of the chunk. Inspect only the final leading byte and its suffix.
-    let utf8_window_start = bytes.len().saturating_sub(4);
-    let utf8_start = bytes[utf8_window_start..]
-        .iter()
-        .rposition(|byte| byte & 0xc0 != 0x80)
-        .map_or(bytes.len(), |index| utf8_window_start + index);
-    let utf8_pending_start = match std::str::from_utf8(&bytes[utf8_start..]) {
-        Err(error) if error.error_len().is_none() => utf8_start + error.valid_up_to(),
-        Ok(_) | Err(_) => bytes.len(),
-    };
-    let esc_pending_start = bytes
-        .iter()
-        .rposition(|byte| *byte == 0x1b)
-        .filter(|position| !escape_sequence_complete(&bytes[*position..]));
-    let start = esc_pending_start
-        .into_iter()
-        .chain((utf8_pending_start < bytes.len()).then_some(utf8_pending_start))
-        .min();
-    start.map_or_else(Vec::new, |start| bytes[start..].to_vec())
-}
-
-fn escape_sequence_complete(sequence: &[u8]) -> bool {
-    let Some((&first, rest)) = sequence.split_first() else {
-        return true;
-    };
-    if first != 0x1b {
-        return true;
-    }
-    let Some((&next, rest)) = rest.split_first() else {
-        return false;
-    };
-    match next {
-        b'[' => rest.iter().any(|byte| (0x40..=0x7e).contains(byte)),
-        b']' => has_bel_or_string_terminator(rest),
-        b'P' | b'_' | b'^' | b'X' => has_string_terminator(rest),
-        0x20..=0x2f => rest.iter().any(|byte| (0x30..=0x7e).contains(byte)),
-        _ => true,
-    }
-}
-
-fn has_bel_or_string_terminator(bytes: &[u8]) -> bool {
-    bytes.contains(&0x07) || has_string_terminator(bytes)
-}
-
-fn has_string_terminator(bytes: &[u8]) -> bool {
-    bytes.windows(2).any(|window| window == [0x1b, b'\\'])
+    let mut parser = Parser::new();
+    parser.advance(&mut ParserRestore, bytes);
+    parser.replay_prefix()
 }
 
 #[cfg(test)]
