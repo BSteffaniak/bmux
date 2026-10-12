@@ -9,7 +9,6 @@
 use std::fmt::Write;
 
 use serde::Serialize;
-use similar::TextDiff;
 
 use super::types::{PaneCapture, PlaybookResult, StepStatus};
 
@@ -468,20 +467,273 @@ fn diff_pane_captures(left: &[PaneCapture], right: &[PaneCapture]) -> Vec<PaneDi
 }
 
 // ---------------------------------------------------------------------------
-// Text diff using similar crate
+// Text diff: private line-based Myers search and unified formatting
 // ---------------------------------------------------------------------------
 
-fn unified_text_diff(left: &str, right: &str) -> String {
-    let diff = TextDiff::from_lines(left, right);
-    let mut output = String::new();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LineEdit<'a> {
+    Equal(&'a str),
+    Delete(&'a str),
+    Insert(&'a str),
+}
 
-    output.push_str("--- left\n");
-    output.push_str("+++ right\n");
-
-    for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
-        write!(output, "{hunk}").unwrap();
+impl LineEdit<'_> {
+    const fn consumes_left(self) -> bool {
+        !matches!(self, Self::Insert(_))
     }
 
+    const fn consumes_right(self) -> bool {
+        !matches!(self, Self::Delete(_))
+    }
+}
+
+/// Find where shortest paths from opposite ends meet. Only the two current
+/// frontiers are retained, rather than a quadratic history of every edit depth.
+fn myers_split(left: &[&str], right: &[&str]) -> (usize, usize) {
+    let depth_limit = (left.len() + right.len()).div_ceil(2);
+    let center = depth_limit + 1;
+    let mut forward = vec![None; 2 * center + 1];
+    let mut backward = vec![None; 2 * center + 1];
+    forward[center + 1] = Some(0);
+    backward[center + 1] = Some(0);
+    let odd_distance = (left.len() + right.len()) % 2 == 1;
+
+    for depth in 0..=depth_limit {
+        for reverse in [false, true] {
+            let (current, opposite) = if reverse {
+                (&mut backward, &forward)
+            } else {
+                (&mut forward, &backward)
+            };
+            for offset in (0..=2 * depth).step_by(2) {
+                // Search the backward diagonals in the opposite order so an
+                // ambiguous meeting preserves the earliest forward match.
+                let diagonal = if reverse {
+                    center + depth - offset
+                } else {
+                    center - depth + offset
+                };
+                let Some((x, y)) =
+                    advance_frontier(left, right, current, center, depth, diagonal, reverse)
+                else {
+                    continue;
+                };
+                // Opposite diagonal numbers sum to left.len() - right.len().
+                let other = (2 * center + left.len()).checked_sub(right.len() + diagonal);
+                if reverse != odd_distance
+                    && let Some(other_x) = other
+                        .and_then(|index| opposite.get(index))
+                        .copied()
+                        .flatten()
+                    && x + other_x >= left.len()
+                {
+                    return if reverse {
+                        (left.len() - x, right.len() - y)
+                    } else {
+                        (x, y)
+                    };
+                }
+            }
+        }
+    }
+    unreachable!("Myers frontiers must meet within the total line count")
+}
+
+/// A diagonal is represented by its offset index, keeping coordinates unsigned.
+/// Out-of-grid predecessors are absent. Ties favor deletion, consistently.
+fn advance_frontier(
+    left: &[&str],
+    right: &[&str],
+    frontier: &mut [Option<usize>],
+    center: usize,
+    depth: usize,
+    diagonal: usize,
+    reverse: bool,
+) -> Option<(usize, usize)> {
+    let deletion = if diagonal == center - depth {
+        None
+    } else {
+        frontier[diagonal - 1].map(|x| x + 1)
+    };
+    let insertion = if diagonal == center + depth && depth != 0 {
+        None
+    } else {
+        frontier[diagonal + 1]
+    };
+    let Some(mut x) = deletion
+        .into_iter()
+        .chain(insertion)
+        .filter(|&x| {
+            x <= left.len()
+                && (x + center)
+                    .checked_sub(diagonal)
+                    .is_some_and(|y| y <= right.len())
+        })
+        .max()
+    else {
+        frontier[diagonal] = None;
+        return None;
+    };
+    let Some(mut y) = (x + center).checked_sub(diagonal) else {
+        frontier[diagonal] = None;
+        return None;
+    };
+    if x > left.len() || y > right.len() {
+        frontier[diagonal] = None;
+        return None;
+    }
+    while x < left.len() && y < right.len() {
+        let (left_index, right_index) = if reverse {
+            (left.len() - x - 1, right.len() - y - 1)
+        } else {
+            (x, y)
+        };
+        if left[left_index] != right[right_index] {
+            break;
+        }
+        x += 1;
+        y += 1;
+    }
+    frontier[diagonal] = Some(x);
+    Some((x, y))
+}
+
+fn myers_lines<'a>(mut left: &[&'a str], mut right: &[&'a str], edits: &mut Vec<LineEdit<'a>>) {
+    while let (Some(&a), Some(&b)) = (left.first(), right.first()) {
+        if a != b {
+            break;
+        }
+        edits.push(LineEdit::Equal(a));
+        left = &left[1..];
+        right = &right[1..];
+    }
+    let suffix_len = left
+        .iter()
+        .rev()
+        .zip(right.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (left, suffix) = left.split_at(left.len() - suffix_len);
+    let right = &right[..right.len() - suffix_len];
+    if left.is_empty() {
+        edits.extend(right.iter().map(|&line| LineEdit::Insert(line)));
+    } else if right.is_empty() {
+        edits.extend(left.iter().map(|&line| LineEdit::Delete(line)));
+    } else {
+        let (x, y) = myers_split(left, right);
+        debug_assert!((x, y) != (0, 0) && (x, y) != (left.len(), right.len()));
+        myers_lines(&left[..x], &right[..y], edits);
+        myers_lines(&left[x..], &right[y..], edits);
+    }
+    edits.extend(suffix.iter().map(|&line| LineEdit::Equal(line)));
+}
+
+fn write_unified_range(output: &mut String, consumed: usize, count: usize) {
+    let start = consumed + usize::from(count != 0);
+    if count == 1 {
+        write!(output, "{start}").unwrap();
+    } else {
+        write!(output, "{start},{count}").unwrap();
+    }
+}
+
+fn diff_lines(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let (mut start, mut cursor) = (0, 0);
+    let mut lines = Vec::new();
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\r' if bytes.get(cursor + 1) == Some(&b'\n') => cursor += 2,
+            b'\r' | b'\n' => cursor += 1,
+            _ => {
+                cursor += 1;
+                continue;
+            }
+        }
+        // ASCII terminators cannot occur inside a UTF-8 code point.
+        lines.push(&text[start..cursor]);
+        start = cursor;
+    }
+    if start < text.len() {
+        lines.push(&text[start..]);
+    }
+    lines
+}
+
+fn unified_text_diff(left: &str, right: &str) -> String {
+    // Keep terminators in the tokens: CR, CRLF and missing final newlines are
+    // data, and all slicing remains on UTF-8 boundaries.
+    let left = diff_lines(left);
+    let right = diff_lines(right);
+    let mut edits = Vec::with_capacity(left.len() + right.len());
+    myers_lines(&left, &right, &mut edits);
+    // Present each replacement with removals first, without reordering either
+    // input's lines. A shortest path can otherwise interleave insertions.
+    let mut cursor = 0;
+    while cursor < edits.len() {
+        if matches!(edits[cursor], LineEdit::Equal(_)) {
+            cursor += 1;
+            continue;
+        }
+        let end = edits[cursor..]
+            .iter()
+            .position(|edit| matches!(edit, LineEdit::Equal(_)))
+            .map_or(edits.len(), |offset| cursor + offset);
+        edits[cursor..end].sort_by_key(|edit| matches!(edit, LineEdit::Insert(_)));
+        cursor = end;
+    }
+
+    let mut output = String::from("--- left\n+++ right\n");
+    let (mut cursor, mut left_consumed, mut right_consumed) = (0, 0, 0);
+    while let Some(change) = edits[cursor..]
+        .iter()
+        .position(|edit| !matches!(edit, LineEdit::Equal(_)))
+        .map(|offset| cursor + offset)
+    {
+        let start = change.saturating_sub(2).max(cursor);
+        for edit in &edits[cursor..start] {
+            left_consumed += usize::from(edit.consumes_left());
+            right_consumed += usize::from(edit.consumes_right());
+        }
+        let mut end = change + 1;
+        let mut context: usize = 0;
+        while end < edits.len() {
+            if matches!(edits[end], LineEdit::Equal(_)) {
+                context += 1;
+                if context > 4 {
+                    context -= 1;
+                    break;
+                }
+            } else {
+                context = 0;
+            }
+            end += 1;
+        }
+        end -= context.saturating_sub(2);
+        let hunk = &edits[start..end];
+        let left_count = hunk.iter().filter(|edit| edit.consumes_left()).count();
+        let right_count = hunk.iter().filter(|edit| edit.consumes_right()).count();
+        output.push_str("@@ -");
+        write_unified_range(&mut output, left_consumed, left_count);
+        output.push_str(" +");
+        write_unified_range(&mut output, right_consumed, right_count);
+        output.push_str(" @@\n");
+        for &edit in hunk {
+            let (prefix, line) = match edit {
+                LineEdit::Equal(line) => (' ', line),
+                LineEdit::Delete(line) => ('-', line),
+                LineEdit::Insert(line) => ('+', line),
+            };
+            output.push(prefix);
+            output.push_str(line);
+            if !line.ends_with(['\n', '\r']) {
+                output.push_str("\n\\ No newline at end of file\n");
+            }
+        }
+        left_consumed += left_count;
+        right_consumed += right_count;
+        cursor = end;
+    }
     output
 }
 
@@ -709,6 +961,186 @@ mod tests {
         assert_eq!(report.timing_regressions.len(), 1);
         assert_eq!(report.timing_regressions[0].left_ms, 100);
         assert_eq!(report.timing_regressions[0].right_ms, 2500);
+    }
+
+    #[test]
+    fn unified_empty_inputs_and_single_line_ranges() {
+        assert_eq!(unified_text_diff("", ""), "--- left\n+++ right\n");
+        assert_eq!(
+            unified_text_diff("", "new\n"),
+            "--- left\n+++ right\n@@ -0,0 +1 @@\n+new\n"
+        );
+        assert_eq!(
+            unified_text_diff("old\n", ""),
+            "--- left\n+++ right\n@@ -1 +0,0 @@\n-old\n"
+        );
+        assert_eq!(
+            unified_text_diff("old\n", "new\n"),
+            "--- left\n+++ right\n@@ -1 +1 @@\n-old\n+new\n"
+        );
+        assert_eq!(
+            unified_text_diff("same\n", "same\n"),
+            "--- left\n+++ right\n"
+        );
+    }
+
+    #[test]
+    fn unified_insertion_and_deletion_with_context() {
+        assert_eq!(
+            unified_text_diff("a\nb\n", "a\nx\nb\n"),
+            "--- left\n+++ right\n@@ -1,2 +1,3 @@\n a\n+x\n b\n"
+        );
+        assert_eq!(
+            unified_text_diff("a\nx\nb\n", "a\nb\n"),
+            "--- left\n+++ right\n@@ -1,3 +1,2 @@\n a\n-x\n b\n"
+        );
+    }
+
+    #[test]
+    fn unified_repeated_lines_have_stable_order() {
+        let expected = "--- left\n+++ right\n@@ -1,3 +1,3 @@\n a\n+a\n b\n-a\n";
+        for _ in 0..3 {
+            assert_eq!(unified_text_diff("a\nb\na\n", "a\na\nb\n"), expected);
+        }
+    }
+
+    #[test]
+    fn unified_isolated_edit_keeps_two_lines_of_context() {
+        assert_eq!(
+            unified_text_diff(
+                "a\nb\nc\nold\nd\ne\nf\ng\nh\ni\n",
+                "a\nb\nc\nnew\nd\ne\nf\ng\nh\ni\n"
+            ),
+            "--- left\n+++ right\n@@ -2,5 +2,5 @@\n b\n c\n-old\n+new\n d\n e\n"
+        );
+    }
+
+    #[test]
+    fn unified_four_context_lines_merge_hunks() {
+        assert_eq!(
+            unified_text_diff("old\n1\n2\n3\n4\nend\n", "new\n1\n2\n3\n4\nfinish\n"),
+            "--- left\n+++ right\n@@ -1,6 +1,6 @@\n-old\n+new\n 1\n 2\n 3\n 4\n-end\n+finish\n"
+        );
+    }
+
+    #[test]
+    fn unified_five_context_lines_separate_hunks() {
+        assert_eq!(
+            unified_text_diff("old\n1\n2\n3\n4\n5\nend\n", "new\n1\n2\n3\n4\n5\nfinish\n"),
+            "--- left\n+++ right\n@@ -1,3 +1,3 @@\n-old\n+new\n 1\n 2\n@@ -5,3 +5,3 @@\n 4\n 5\n-end\n+finish\n"
+        );
+    }
+
+    #[test]
+    fn unified_unicode_and_line_terminators() {
+        assert_eq!(
+            unified_text_diff("你好\r\ncafé\r\n", "你好\r\n🦀\r\n"),
+            "--- left\n+++ right\n@@ -1,2 +1,2 @@\n 你好\r\n-café\r\n+🦀\r\n"
+        );
+        assert_eq!(
+            unified_text_diff("a\rb\r", "a\rc\r"),
+            "--- left\n+++ right\n@@ -1,2 +1,2 @@\n a\r-b\r+c\r"
+        );
+        assert_eq!(diff_lines("a\rb\r\nc\nd"), vec!["a\r", "b\r\n", "c\n", "d"]);
+    }
+
+    #[test]
+    fn unified_missing_final_newlines() {
+        assert_eq!(
+            unified_text_diff("old", "new"),
+            "--- left\n+++ right\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
+        );
+        assert_eq!(
+            unified_text_diff("same\n", "same"),
+            "--- left\n+++ right\n@@ -1 +1 @@\n-same\n+same\n\\ No newline at end of file\n"
+        );
+        assert_eq!(
+            unified_text_diff("old\ntail", "new\ntail"),
+            "--- left\n+++ right\n@@ -1,2 +1,2 @@\n-old\n+new\n tail\n\\ No newline at end of file\n"
+        );
+    }
+
+    fn minimum_line_edits(left: &[&str], right: &[&str]) -> usize {
+        let mut row: Vec<_> = (0..=right.len()).collect();
+        for (i, a) in left.iter().enumerate() {
+            let mut next = vec![i + 1];
+            for (j, b) in right.iter().enumerate() {
+                next.push(if a == b {
+                    row[j]
+                } else {
+                    1 + row[j + 1].min(next[j])
+                });
+            }
+            row = next;
+        }
+        row[right.len()]
+    }
+
+    #[test]
+    fn myers_exhaustive_small_sequences_are_minimal_and_reconstruct_inputs() {
+        let mut sequences = Vec::new();
+        for len in 0..=5 {
+            for bits in 0..(1 << len) {
+                sequences.push(
+                    (0..len)
+                        .map(|bit| if bits & (1 << bit) == 0 { "a\n" } else { "b\n" })
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        for left in &sequences {
+            for right in &sequences {
+                let mut edits = Vec::new();
+                myers_lines(left, right, &mut edits);
+                let reconstructed_left: Vec<_> = edits
+                    .iter()
+                    .filter_map(|edit| match edit {
+                        LineEdit::Equal(line) | LineEdit::Delete(line) => Some(*line),
+                        LineEdit::Insert(_) => None,
+                    })
+                    .collect();
+                let reconstructed_right: Vec<_> = edits
+                    .iter()
+                    .filter_map(|edit| match edit {
+                        LineEdit::Equal(line) | LineEdit::Insert(line) => Some(*line),
+                        LineEdit::Delete(_) => None,
+                    })
+                    .collect();
+                assert_eq!(&reconstructed_left, left);
+                assert_eq!(&reconstructed_right, right);
+                assert_eq!(
+                    edits
+                        .iter()
+                        .filter(|edit| !matches!(edit, LineEdit::Equal(_)))
+                        .count(),
+                    minimum_line_edits(left, right),
+                    "left={left:?}, right={right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn myers_divergent_screens() {
+        let left = vec!["left\n"; 512];
+        let right = vec!["right\n"; 512];
+        let mut edits = Vec::new();
+        myers_lines(&left, &right, &mut edits);
+        assert_eq!(edits.len(), 1024);
+        assert_eq!(
+            edits
+                .iter()
+                .filter(|edit| matches!(edit, LineEdit::Delete(_)))
+                .count(),
+            512
+        );
+        assert_eq!(
+            edits
+                .iter()
+                .filter(|edit| matches!(edit, LineEdit::Insert(_)))
+                .count(),
+            512
+        );
     }
 
     #[test]

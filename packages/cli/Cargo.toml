@@ -171,7 +171,6 @@ rustls-pemfile = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-similar = { workspace = true }
 switchy = { workspace = true, features = ["fs-native-directories"] }
 time = { workspace = true, features = ["formatting", "parsing", "std"] }
 tokio = { workspace = true, features = [
