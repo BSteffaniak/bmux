@@ -19,6 +19,10 @@ name = "bmux-docs-site"
 path = "src/main.rs"
 test = false
 
+[[test]]
+name = "logging"
+path = "tests/logging.rs"
+
 [dependencies]
 bmux_docs_site_ui = { workspace = true }
 hyperchad = { workspace = true, features = [
@@ -35,14 +39,20 @@ hyperchad = { workspace = true, features = [
 ] }
 hyperchad_docs_site = { workspace = true }
 
-env_logger = { workspace = true, features = [
-    "auto-color",
-    "humantime",
-    "regex",
-] }
-log = { workspace = true }
 serde_json = { workspace = true }
 switchy = { workspace = true, features = ["async", "async-tokio"] }
+tracing-subscriber = { workspace = true, features = [
+    "ansi",
+    "env-filter",
+    "fmt",
+    "std",
+    "tracing-log",
+] }
+
+[dev-dependencies]
+log      = { workspace = true }
+tempfile = { workspace = true }
+tracing  = { workspace = true, features = ["std"] }
 
 [features]
 default          = ["actix", "html", "vanilla-js", "assets", "static-routes"]

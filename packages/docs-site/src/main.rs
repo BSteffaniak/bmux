@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
+mod logging;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    logging::init()?;
 
     let runtime = switchy::unsync::runtime::Builder::new().build()?;
     let runtime = Arc::new(runtime);
