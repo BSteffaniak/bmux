@@ -14,7 +14,12 @@ scroll mode and other contexts.
 - Auto-detection of platform clipboard commands (pbcopy, xclip, xsel, wl-copy, etc.)
 - Fallback chains for Linux (Wayland and X11) and Windows (PowerShell clip.exe)
 - Subprocess-based execution -- no C library bindings
-- Graceful error reporting when no backend is available
+- Failed native clipboard initialization or writes fall back through installed platform commands
+- Linux command copying recovers a missing `WAYLAND_DISPLAY` when `XDG_RUNTIME_DIR`
+  contains exactly one same-owner `wayland-<number>` socket. This recovery is local
+  to the subprocess, ignores symlinks and unrelated sockets, and is disabled over
+  SSH or when a display is explicitly configured. Multiple desktops are not guessed.
+- Graceful error reporting including each attempted backend when copying fails
 
 ## Core Types
 

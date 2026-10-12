@@ -60,47 +60,121 @@ impl Clipboard {
     /// cannot be spawned, stdin writing fails, or the command exits with a
     /// non-zero status.
     pub fn copy_text(&self, text: &str) -> Result<(), ClipboardError> {
-        let mut child = Command::new(self.command.program)
-            .args(self.command.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| ClipboardError::CommandFailed {
-                program: self.command.program.to_string(),
-                message: error.to_string(),
-            })?;
+        copy_with_commands(
+            std::iter::once(self.command).chain(
+                clipboard_commands(env::consts::OS)
+                    .iter()
+                    .copied()
+                    .filter(|command| *command != self.command && command_exists(command.program)),
+            ),
+            Vec::new(),
+            |command| run_copy_command(command, text),
+        )
+    }
+}
 
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin
-                .write_all(text.as_bytes())
-                .and_then(|()| stdin.flush())
-                .map_err(|error| ClipboardError::CommandFailed {
-                    program: self.command.program.to_string(),
-                    message: error.to_string(),
-                })?;
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(|error| ClipboardError::CommandFailed {
-                program: self.command.program.to_string(),
-                message: error.to_string(),
-            })?;
-        if output.status.success() {
-            Ok(())
+fn run_copy_command(command: ClipboardCommand, text: &str) -> Result<(), ClipboardError> {
+    let mut process = Command::new(command.program);
+    process
+        .args(command.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if command.program == "wl-copy"
+        && let Some(display) = recovered_wayland_display()
+    {
+        // Do not mutate the process environment: plugins and other threads share it.
+        process.env("WAYLAND_DISPLAY", display);
+    }
+    let failed = |message| ClipboardError::CommandFailed {
+        program: command.program.to_string(),
+        message,
+    };
+    let mut child = process.spawn().map_err(|error| failed(error.to_string()))?;
+    let write_result = child.stdin.take().map_or(Ok(()), |mut stdin| {
+        stdin
+            .write_all(text.as_bytes())
+            .and_then(|()| stdin.flush())
+    });
+    // Always close stdin and reap the child, including after a broken pipe.
+    let output = child
+        .wait_with_output()
+        .map_err(|error| failed(error.to_string()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(failed(if stderr.is_empty() {
+            format!("exit status {}", output.status)
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(ClipboardError::CommandFailed {
-                program: self.command.program.to_string(),
-                message: if stderr.is_empty() {
-                    format!("exit status {}", output.status)
-                } else {
-                    stderr
-                },
-            })
+            stderr
+        }));
+    }
+    write_result.map_err(|error| failed(error.to_string()))
+}
+
+fn copy_with_commands(
+    commands: impl IntoIterator<Item = ClipboardCommand>,
+    mut errors: Vec<String>,
+    mut copy: impl FnMut(ClipboardCommand) -> Result<(), ClipboardError>,
+) -> Result<(), ClipboardError> {
+    for command in commands {
+        match copy(command) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(error.to_string()),
         }
     }
+    if errors.is_empty() {
+        Err(ClipboardError::BackendUnavailable {
+            os: env::consts::OS.to_string(),
+        })
+    } else {
+        Err(ClipboardError::BackendFailed {
+            backend: "all".to_string(),
+            message: errors.join("; "),
+        })
+    }
+}
+
+fn recovered_wayland_display() -> Option<OsString> {
+    if env::var_os("WAYLAND_DISPLAY").is_some()
+        || env::var_os("SSH_CONNECTION").is_some()
+        || env::var_os("SSH_CLIENT").is_some()
+        || env::var_os("SSH_TTY").is_some()
+    {
+        return None;
+    }
+    unique_wayland_display(Path::new(&env::var_os("XDG_RUNTIME_DIR")?))
+}
+
+#[cfg(unix)]
+fn unique_wayland_display(runtime_dir: &Path) -> Option<OsString> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let owner = std::fs::metadata(runtime_dir).ok()?.uid();
+    let mut display = None;
+    for entry in std::fs::read_dir(runtime_dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let Some(suffix) = name.to_str().and_then(|name| name.strip_prefix("wayland-")) else {
+            continue;
+        };
+        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(entry.path()).ok()?;
+        if metadata.file_type().is_socket() && metadata.uid() == owner {
+            // Ambiguity must not silently send clipboard contents to another desktop.
+            if display.is_some() {
+                return None;
+            }
+            display = Some(name);
+        }
+    }
+    display
+}
+
+#[cfg(not(unix))]
+fn unique_wayland_display(_runtime_dir: &Path) -> Option<OsString> {
+    None
 }
 
 /// Copy text to the system clipboard using a one-shot clipboard handle.
@@ -113,16 +187,24 @@ impl Clipboard {
 /// Returns [`ClipboardError::BackendUnavailable`] if no clipboard backend
 /// is found, or [`ClipboardError::BackendFailed`] / [`ClipboardError::CommandFailed`] if copying fails.
 pub fn copy_text(text: &str) -> Result<(), ClipboardError> {
-    match arboard_clipboard() {
-        Ok(mut clipboard) => {
-            clipboard
-                .set_text(text.to_string())
-                .map_err(|error| ClipboardError::BackendFailed {
-                    backend: "arboard".to_string(),
-                    message: error.to_string(),
-                })
-        }
-        Err(_) => Clipboard::new()?.copy_text(text),
+    let result = arboard_clipboard().and_then(|mut clipboard| {
+        clipboard
+            .set_text(text.to_string())
+            .map_err(|error| ClipboardError::BackendFailed {
+                backend: "arboard".to_string(),
+                message: error.to_string(),
+            })
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => copy_with_commands(
+            clipboard_commands(env::consts::OS)
+                .iter()
+                .copied()
+                .filter(|command| command_exists(command.program)),
+            vec![error.to_string()],
+            |command| run_copy_command(command, text),
+        ),
     }
 }
 
@@ -130,7 +212,14 @@ fn detect_backend<F>(os: &str, exists: &mut F) -> Option<ClipboardCommand>
 where
     F: FnMut(&str) -> bool,
 {
-    let candidates: &[ClipboardCommand] = match os {
+    clipboard_commands(os)
+        .iter()
+        .copied()
+        .find(|candidate| exists(candidate.program))
+}
+
+fn clipboard_commands(os: &str) -> &'static [ClipboardCommand] {
+    match os {
         "macos" => &[ClipboardCommand {
             program: "pbcopy",
             args: &[],
@@ -154,11 +243,7 @@ where
             args: &[],
         }],
         _ => &[],
-    };
-    candidates
-        .iter()
-        .copied()
-        .find(|candidate| exists(candidate.program))
+    }
 }
 
 fn command_exists(program: &str) -> bool {
@@ -775,9 +860,132 @@ fn is_png(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Clipboard, ClipboardCommand, ClipboardError, detect_backend, is_png,
-        percent_decode_file_url_path,
+        Clipboard, ClipboardCommand, ClipboardError, clipboard_commands, copy_with_commands,
+        detect_backend, is_png, percent_decode_file_url_path,
     };
+
+    #[test]
+    fn copy_retries_failed_backends_and_stops_after_success() {
+        let mut attempted = Vec::new();
+        copy_with_commands(
+            clipboard_commands("linux").iter().copied(),
+            vec![],
+            |command| {
+                attempted.push(command.program);
+                if command.program == "xclip" {
+                    Ok(())
+                } else {
+                    Err(ClipboardError::CommandFailed {
+                        program: command.program.to_string(),
+                        message: "no display".to_string(),
+                    })
+                }
+            },
+        )
+        .expect("second backend should succeed");
+        assert_eq!(attempted, ["wl-copy", "xclip"]);
+    }
+
+    #[test]
+    fn copy_reports_every_failed_backend_including_native_failure() {
+        let error = copy_with_commands(
+            clipboard_commands("linux").iter().copied(),
+            vec!["native write failed".to_string()],
+            |command| {
+                Err(ClipboardError::CommandFailed {
+                    program: command.program.to_string(),
+                    message: "unavailable".to_string(),
+                })
+            },
+        )
+        .expect_err("all backends fail")
+        .to_string();
+        for backend in ["native write failed", "wl-copy", "xclip", "xsel"] {
+            assert!(error.contains(backend));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wayland_discovery_requires_one_real_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().expect("temporary runtime directory");
+        let path = directory.path();
+        assert_eq!(super::unique_wayland_display(path), None);
+        std::fs::write(path.join("wayland-0"), "not a socket").unwrap();
+        let _unrelated = UnixListener::bind(path.join("wayland-1-swww-daemon.sock")).unwrap();
+        assert_eq!(super::unique_wayland_display(path), None);
+        let _display = UnixListener::bind(path.join("wayland-1")).unwrap();
+        assert_eq!(
+            super::unique_wayland_display(path),
+            Some("wayland-1".into())
+        );
+        let _other_display = UnixListener::bind(path.join("wayland-2")).unwrap();
+        assert_eq!(super::unique_wayland_display(path), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wayland_discovery_does_not_follow_symlinks() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        let directory = tempfile::tempdir().unwrap();
+        let _socket = UnixListener::bind(directory.path().join("other-socket")).unwrap();
+        symlink("other-socket", directory.path().join("wayland-1")).unwrap();
+        assert_eq!(super::unique_wayland_display(directory.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_recovers_missing_display_in_isolated_process() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+        const OUTPUT: &str = "BMUX_CLIPBOARD_TEST_OUTPUT";
+        if std::env::var_os(OUTPUT).is_some() {
+            if std::env::var_os("BMUX_CLIPBOARD_TEST_NO_DISCOVERY").is_some() {
+                assert!(super::recovered_wayland_display().is_none());
+            } else {
+                super::copy_text("scrollback text\n").expect("recovered clipboard command");
+                assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
+            }
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let _socket = UnixListener::bind(directory.path().join("wayland-1")).unwrap();
+        let command = directory.path().join("wl-copy");
+        std::fs::write(
+            &command,
+            "#!/bin/sh\nread -r text\nprintf '%s\\n%s' \"$WAYLAND_DISPLAY\" \"$text\" > \"$BMUX_CLIPBOARD_TEST_OUTPUT\"\n",
+        ).unwrap();
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = directory.path().join("copied");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "tests::copy_recovers_missing_display_in_isolated_process",
+            ])
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("DISPLAY")
+            .env_remove("SSH_CONNECTION")
+            .env_remove("SSH_CLIENT")
+            .env_remove("SSH_TTY")
+            .env("XDG_RUNTIME_DIR", directory.path())
+            .env("PATH", directory.path())
+            .env(OUTPUT, &output);
+        assert!(child.status().unwrap().success());
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap(),
+            "wayland-1\nscrollback text"
+        );
+        child.env("BMUX_CLIPBOARD_TEST_NO_DISCOVERY", "1");
+        for key in ["WAYLAND_DISPLAY", "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+            child.env(key, "explicit");
+            assert!(child.status().unwrap().success());
+            child.env_remove(key);
+        }
+    }
 
     #[test]
     fn detect_backend_prefers_wl_copy_on_linux() {
