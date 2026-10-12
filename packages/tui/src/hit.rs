@@ -5,6 +5,7 @@ use crate::geometry::{Point, Rect};
 
 /// Stable caller-owned identifier for an interaction region.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HitId(String);
 
 impl HitId {
@@ -35,6 +36,7 @@ impl From<String> for HitId {
 
 /// Semantic interaction behavior for a region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum HitRole {
     /// Generic clickable/actionable region.
     Action,
@@ -60,6 +62,7 @@ pub enum HitRole {
 /// pointer, hover, focus, and enabled semantics without a combinatorial enum.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HitRegion {
     /// Stable region id.
     pub id: HitId,
@@ -217,6 +220,7 @@ impl Hit<'_> {
 
 /// Ordered interaction scene collected during one frame.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HitMap {
     regions: Vec<HitRegion>,
 }
@@ -272,9 +276,11 @@ impl HitMap {
             })
             .collect::<Vec<_>>();
         targets.sort_by_key(|(index, region)| (region.tab_order, *index));
+        let mut seen = std::collections::BTreeSet::new();
         targets
             .into_iter()
             .map(|(_, region)| region.id.clone())
+            .filter(|id| seen.insert(id.clone()))
             .collect()
     }
 

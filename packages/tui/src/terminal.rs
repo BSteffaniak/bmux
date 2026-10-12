@@ -5,13 +5,13 @@ use std::io::{self, Write};
 use crate::ansi::{AnsiFrameDiffStats, write_ansi_frame, write_ansi_frame_diff};
 use crate::buffer::Buffer;
 use crate::damage::Damage;
-use crate::focus::{FocusId, FocusScopeId, FocusTrap};
-use crate::frame::Frame;
+use crate::focus::{FocusId, FocusTrap};
 use crate::geometry::Rect;
 use crate::hit::HitMap;
 use crate::image::ImageContribution;
 use crate::image_scene::{ImageScene, ImageSceneDelta};
 use crate::paint::PaintCx;
+use crate::presentation::PresentationState;
 use crate::selection::SelectionScene;
 
 /// Statistics from one terminal draw.
@@ -47,17 +47,7 @@ impl From<AnsiFrameDiffStats> for DrawStats {
 /// damage-aware flushing.
 pub struct Terminal<W> {
     writer: W,
-    area: Rect,
-    previous: Option<Buffer>,
-    hits: HitMap,
-    focus: FocusTrap,
-    focus_scope: Option<FocusScopeId>,
-    images: Vec<ImageContribution>,
-    image_scene: ImageScene,
-    image_delta: ImageSceneDelta,
-    cursor: Option<crate::frame::Cursor>,
-    selection: SelectionScene,
-    semantics: crate::semantic::SemanticScene,
+    state: PresentationState,
 }
 
 impl<W: Write> Terminal<W> {
@@ -66,89 +56,79 @@ impl<W: Write> Terminal<W> {
     pub fn new(writer: W, area: Rect) -> Self {
         Self {
             writer,
-            area,
-            previous: None,
-            hits: HitMap::new(),
-            focus: FocusTrap::new(),
-            focus_scope: None,
-            images: Vec::new(),
-            image_scene: ImageScene::default(),
-            image_delta: ImageSceneDelta::default(),
-            cursor: None,
-            selection: SelectionScene::new(),
-            semantics: crate::semantic::SemanticScene::new(),
+            state: PresentationState::new(area),
         }
     }
 
     /// Return the terminal area.
     #[must_use]
     pub const fn area(&self) -> Rect {
-        self.area
+        self.state.area()
     }
 
     /// Return the last successfully committed cell buffer, if one exists.
     #[must_use]
     pub const fn retained_buffer(&self) -> Option<&Buffer> {
-        self.previous.as_ref()
+        self.state.retained_buffer()
     }
 
     /// Return the cursor state from the last successfully committed draw.
     #[must_use]
     pub const fn cursor(&self) -> Option<crate::frame::Cursor> {
-        self.cursor
+        self.state.cursor()
     }
 
     /// Return the interaction scene registered by the last draw.
     #[must_use]
     pub const fn hits(&self) -> &HitMap {
-        &self.hits
+        self.state.hits()
     }
 
     /// Return the selection scene from the last successfully committed draw.
     #[must_use]
     pub const fn selection(&self) -> &SelectionScene {
-        &self.selection
+        self.state.selection()
     }
 
     /// Return semantic regions from the last successfully committed draw.
     #[must_use]
     pub const fn semantics(&self) -> &crate::semantic::SemanticScene {
-        &self.semantics
+        self.state.semantics()
     }
 
     /// Return ordered focus state derived from the last committed scene.
     #[must_use]
     pub const fn focus(&self) -> &FocusTrap {
-        &self.focus
+        self.state.focus()
     }
 
     /// Return the active focus target after the last committed draw.
     #[must_use]
     pub fn focused(&self) -> Option<&FocusId> {
-        self.focus.active()
+        self.state.focus().active()
     }
 
     /// Set the active focus target when it exists in the committed scene.
     pub fn set_focused(&mut self, id: &FocusId) -> bool {
-        self.focus.set_active(id)
+        self.state.set_focused(id)
     }
 
     /// Return image lifecycle contributions registered by the last draw.
     #[must_use]
     pub fn images(&self) -> &[ImageContribution] {
-        &self.images
+        self.state.images()
     }
 
     /// Return the active image scene after the last draw.
     #[must_use]
     pub const fn image_scene(&self) -> &ImageScene {
-        &self.image_scene
+        self.state.image_scene()
     }
 
     /// Return image additions, updates, and removals produced by the last draw.
     #[must_use]
     pub const fn image_delta(&self) -> &ImageSceneDelta {
-        &self.image_delta
+        self.state.image_delta()
     }
 
     /// Reset retained terminal presentation state so the next draw repaints fully.
@@ -158,15 +138,12 @@ impl<W: Write> Terminal<W> {
     /// route input against what is still visibly committed after an output
     /// failure or backend reset.
     pub fn reset(&mut self) {
-        self.previous = None;
+        self.state.reset();
     }
 
     /// Resize the terminal area and force the next draw to repaint fully.
     pub fn resize(&mut self, area: Rect) {
-        if self.area != area {
-            self.area = area;
-            self.reset();
-        }
+        self.state.resize(area);
     }
 
     /// Draw one complete frame.
@@ -226,128 +203,37 @@ impl<W: Write> Terminal<W> {
     /// # Errors
     ///
     /// Returns any I/O error reported by the backend writer or overlay callback.
-    #[allow(clippy::too_many_lines)]
     pub fn draw_damage_with_overlay(
         &mut self,
         damage: Damage,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
-        let damage = if self.previous.is_none() {
-            Damage::Full
-        } else {
-            damage
-        };
-        if damage.is_none() {
-            return Ok(DrawStats {
-                changed_cells: 0,
-                full_repaint: false,
-            });
-        }
-        let requested_regions = damage.retained_regions();
-        let mut buffer = Buffer::empty(self.area);
-        let (cursor, hits, focus_scope, images, selection, semantics) = {
-            let mut frame = Frame::new(&mut buffer);
-            render(&mut PaintCx::new(&mut frame));
-            let mut hits = if matches!(damage, Damage::Regions(_)) {
-                let mut retained = self.hits.clone();
-                for region in requested_regions {
-                    retained.retain_outside(*region);
-                }
-                retained
-            } else {
-                HitMap::new()
-            };
-            for hit in frame.hits().regions() {
-                if !matches!(damage, Damage::Regions(_))
-                    || requested_regions
-                        .iter()
-                        .any(|region| !hit.area.intersection(*region).is_empty())
-                {
-                    hits.push(hit.clone());
-                }
-            }
-            let mut images = if matches!(damage, Damage::Regions(_)) {
-                self.image_scene.contributions_outside(requested_regions)
-            } else {
-                Vec::new()
-            };
-            images.extend_from_slice(frame.images());
-            let cursor = frame.cursor().or_else(|| {
-                matches!(damage, Damage::Regions(_))
-                    .then_some(self.cursor)
-                    .flatten()
-            });
-            let focus_scope = frame.focus_scope().cloned().or_else(|| {
-                matches!(damage, Damage::Regions(_))
-                    .then(|| self.focus_scope.clone())
-                    .flatten()
-            });
-            let selection = if matches!(damage, Damage::Regions(_)) {
-                self.selection
-                    .merge_regions(frame.selection(), requested_regions)
-            } else {
-                frame.selection().clone()
-            };
-            let semantics = if matches!(damage, Damage::Regions(_)) {
-                self.semantics
-                    .merge_regions(frame.semantics(), requested_regions)
-            } else {
-                frame.semantics().clone()
-            };
-            (cursor, hits, focus_scope, images, selection, semantics)
-        };
-        let retained_regions =
-            if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
-                buffer.expand_regions_to_cell_spans(previous, requested_regions)
-            } else {
-                requested_regions.to_vec()
-            };
-        if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
-            buffer.restore_outside(previous, &retained_regions);
-        }
-        buffer.debug_assert_valid_wide_spans();
-
-        let mut image_scene = self.image_scene.clone();
-        let image_delta = image_scene.reconcile(&images);
-        let output = (|| {
-            self.writer.write_all(b"\x1b[?2026h")?;
-            let stats = if let Some(previous) = &self.previous {
-                write_ansi_frame_diff(&mut self.writer, previous, &buffer, cursor)?.into()
-            } else {
-                write_ansi_frame(&mut self.writer, &buffer, cursor)?;
-                DrawStats::full(buffer.cells().len())
-            };
-            let overlay_result = overlay(&mut self.writer, &image_scene, &image_delta);
-            let end_result = self.writer.write_all(b"\x1b[?2026l");
-            overlay_result?;
-            end_result?;
-            self.writer.flush()?;
-            Ok(stats)
-        })();
-        let stats = match output {
-            Ok(stats) => stats,
-            Err(error) => {
-                self.reset();
-                return Err(error);
-            }
-        };
-        let previous_focus = self.focus.active().cloned();
-        self.hits = hits;
-        self.focus_scope = focus_scope;
-        self.focus = FocusTrap::from_hits(
-            &self.hits,
-            self.focus_scope.as_ref(),
-            previous_focus.as_ref(),
-        );
-        self.image_scene = image_scene;
-        self.image_delta = image_delta;
-        self.images = images;
-        self.cursor = cursor;
-        self.selection = selection;
-        self.semantics = semantics;
-        self.previous = Some(buffer);
-        Ok(stats)
+        let writer = &mut self.writer;
+        self.state
+            .present(damage, render, |prepared, previous| {
+                writer.write_all(b"\x1b[?2026h")?;
+                let stats = if let Some(previous) = previous {
+                    write_ansi_frame_diff(writer, previous, prepared.buffer(), prepared.cursor())?
+                        .into()
+                } else {
+                    write_ansi_frame(writer, prepared.buffer(), prepared.cursor())?;
+                    DrawStats::full(prepared.buffer().cells().len())
+                };
+                let overlay_result =
+                    overlay(writer, prepared.image_scene(), prepared.image_delta());
+                let end_result = writer.write_all(b"\x1b[?2026l");
+                overlay_result?;
+                end_result?;
+                writer.flush()?;
+                Ok(stats)
+            })
+            .map(|stats| {
+                stats.unwrap_or(DrawStats {
+                    changed_cells: 0,
+                    full_repaint: false,
+                })
+            })
     }
 
     /// Return a reference to the backend writer.
@@ -403,6 +289,59 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn flush_failure_preserves_scene_after_successful_cell_and_overlay_writes() {
+        struct FlushFailure {
+            bytes: Vec<u8>,
+            fail_flush: bool,
+        }
+        impl Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.fail_flush {
+                    Err(io::Error::other("flush failed"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut terminal = Terminal::new(
+            FlushFailure {
+                bytes: Vec::new(),
+                fail_flush: false,
+            },
+            Rect::new(0, 0, 2, 1),
+        );
+        terminal
+            .draw(|cx| {
+                cx.fill(LocalRect::new(0, 0, 2, 1), "A", Style::new());
+                cx.push_hit(HitRegion::new("committed", cx.clip()).focusable(true));
+            })
+            .unwrap();
+        terminal.writer_mut().fail_flush = true;
+        let mut overlay_ran = false;
+        let failed = terminal.draw_with_overlay(
+            |cx| {
+                cx.fill(LocalRect::new(0, 0, 2, 1), "B", Style::new());
+                cx.push_hit(HitRegion::new("speculative", cx.clip()).focusable(true));
+            },
+            |writer, _, _| {
+                overlay_ran = true;
+                writer.write_all(b"overlay")
+            },
+        );
+        assert!(failed.is_err());
+        assert!(overlay_ran);
+        assert_eq!(terminal.hits().regions()[0].id.as_str(), "committed");
+        assert_eq!(terminal.focused().unwrap().as_str(), "committed");
+        assert!(terminal.retained_buffer().is_none());
+        terminal.writer_mut().fail_flush = false;
+        assert!(terminal.draw(|_| {}).unwrap().full_repaint);
     }
 
     #[test]

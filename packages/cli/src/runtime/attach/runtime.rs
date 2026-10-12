@@ -2665,6 +2665,48 @@ pub async fn run_session_attach_with_client(
     .await
 }
 
+/// Run the explicitly selected local attach with a read-only full-view observer.
+/// Existing callers retain the original entry point and its behavior.
+pub async fn run_session_attach_with_client_observer(
+    client: BmuxClient,
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
+    observer: super::observer::AttachObserverPublisher,
+) -> Result<AttachRunOutcome> {
+    let provider = super::provider::resolve(target)?;
+    let session = provider
+        .open(
+            None,
+            bmux_client::AttachProviderOpenContext {
+                fallback_client: Some(client),
+                endpoint_connector: Some(std::sync::Arc::new(CliAttachEndpointConnector)),
+            },
+        )
+        .await?;
+    let effective_target = session.target.as_deref().or(target);
+    match session.backend {
+        AttachProviderBackend::Legacy(client) => {
+            let mut terminal = RealAttachTerminal::new();
+            run_session_attach_with_terminal_config_observer(
+                client,
+                effective_target,
+                follow,
+                global,
+                kernel_client_factory,
+                &mut terminal,
+                None,
+                Some(observer),
+            )
+            .await
+        }
+        AttachProviderBackend::Session(_) => anyhow::bail!(
+            "full-view browser observation requires a local retained attach; provider-only observation is unsupported"
+        ),
+    }
+}
+
 pub async fn run_session_attach_with_provider_session(
     session: bmux_client::AttachProviderSession,
     original_target: Option<&str>,
@@ -3373,6 +3415,29 @@ pub async fn run_session_attach_with_terminal<T: AttachTerminal + ?Sized>(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
 pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>(
+    client: BmuxClient,
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
+    terminal: &mut T,
+    config: Option<BmuxConfig>,
+) -> Result<AttachRunOutcome> {
+    run_session_attach_with_terminal_config_observer(
+        client,
+        target,
+        follow,
+        global,
+        kernel_client_factory,
+        terminal,
+        config,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Preserve legacy wrappers while threading an explicitly scoped observer through attach lifetime.
+async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?Sized>(
     mut client: BmuxClient,
     target: Option<&str>,
     follow: Option<&str>,
@@ -3380,6 +3445,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     kernel_client_factory: Option<KernelClientFactory>,
     terminal: &mut T,
     config: Option<BmuxConfig>,
+    observer: Option<super::observer::AttachObserverPublisher>,
 ) -> Result<AttachRunOutcome> {
     if target.is_none() && follow.is_none() {
         anyhow::bail!("attach requires a session target or --follow <client-uuid>");
@@ -3572,6 +3638,9 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
     }
 
     let mut view_state = AttachViewState::with_private_presentation(attach_info);
+    if let Some(publisher) = observer {
+        view_state.set_observer(publisher);
+    }
     view_state.presentation_events = presentation_events;
     install_bundled_render_extensions(&mut view_state);
     terminal.set_attached_session_id(view_state.attached_id);
@@ -6844,11 +6913,22 @@ fn enter_manual_copy_mode(view_state: &mut AttachViewState) -> bool {
         return false;
     }
     if alternate {
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
         let images = view_state
             .pane_images
             .get(&pane)
             .cloned()
             .unwrap_or_default();
+        #[cfg(not(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        )))]
+        let images = Vec::new();
         let buffer = view_state
             .pane_buffers
             .get_mut(&pane)
@@ -8553,19 +8633,41 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<AttachFrameRenderStats> {
     let previous = view_state.retained_compositor.clone();
-    let result = render_attach_frame_inner(
-        terminal_writer,
-        view_state,
-        layout_state,
-        runtime_appearance,
-        help_lines,
-        help_scroll,
-        damage_config,
-        slow_terminal_write_ms,
-        display_capture,
-        geometry,
-        render_trace,
-    );
+    let observing = view_state.observer.is_some();
+    let (result, operations) = if observing {
+        bmux_attach_pipeline::projection::capture(|| {
+            render_attach_frame_inner(
+                terminal_writer,
+                view_state,
+                layout_state,
+                runtime_appearance,
+                help_lines,
+                help_scroll,
+                damage_config,
+                slow_terminal_write_ms,
+                display_capture,
+                geometry,
+                render_trace,
+            )
+        })
+    } else {
+        (
+            render_attach_frame_inner(
+                terminal_writer,
+                view_state,
+                layout_state,
+                runtime_appearance,
+                help_lines,
+                help_scroll,
+                damage_config,
+                slow_terminal_write_ms,
+                display_capture,
+                geometry,
+                render_trace,
+            ),
+            Vec::new(),
+        )
+    };
     if result.is_err() {
         view_state.retained_compositor = previous;
         view_state
@@ -8610,6 +8712,9 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     let _ = view_state
         .plugin_pointer_router
         .reconcile(&view_state.retained_compositor);
+    if observing {
+        super::observer::publish_committed(view_state, layout_state, geometry, &operations);
+    }
     acknowledge_plugin_surface_output(view_state);
     result
 }
@@ -8666,6 +8771,11 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     };
     let current_prompt_overlay_surface = view_state.prompt.overlay_surface(geometry);
     let mut frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
+    // Observers receive complete repaired snapshots from the very same output plans.
+    // Full damage ensures removal and content occlusion repair need no alternate retained scene.
+    if view_state.observer.is_some() {
+        frame_damage.mark_full_frame();
+    }
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
@@ -8761,6 +8871,12 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         // Repainting characters is not a portable raster deletion operation.
         // ED2 repairs prior Sixel/iTerm2 pixels; the full-damage frame above
         // reconstructs all cells and retained surfaces without erasing history.
+        bmux_attach_pipeline::projection::record(
+            bmux_attach_pipeline::projection::PaintOperation::Fill {
+                rect: bmux_tui::geometry::Rect::new(0, 0, terminal_size.0, terminal_size.1),
+                style: bmux_tui::style::Style::new(),
+            },
+        );
         queue!(frame_bytes, Clear(ClearType::All))
             .context("failed clearing previous image frame")?;
     }
@@ -15499,6 +15615,244 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Err(std::io::Error::other("flush rejected"))
         }
+    }
+
+    fn render_observed_test_frame(state: &mut AttachViewState, layout: &AttachLayoutState) {
+        render_attach_frame_to_writer(
+            &mut Vec::new(),
+            state,
+            layout,
+            &RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            TerminalGeometry { cols: 80, rows: 24 },
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    // Keep one continuous retained-view fixture: publication, revision update, owner drop,
+    // failed flush and teardown must all exercise the same authority and observer lifetime.
+    #[allow(clippy::too_many_lines)]
+    fn observer_full_repair_preserves_unchanged_cells_and_owner_lifetime() {
+        use bmux_plugin::surface::{
+            PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, PluginSurfaceTarget,
+        };
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        let layout = retry_test_layout(&mut state, pane_id, session_id);
+        state.presentation_extensions = Arc::new(bmux_plugin::RenderExtensionRegistry::new());
+        let (publisher, observer) = super::super::observer::attach_observer_channel();
+        state.set_observer(publisher);
+        state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .unwrap()
+            .terminal_grid
+            .process(b"\x1b[2J\x1b[HA");
+        render_observed_test_frame(&mut state, &layout);
+        let first = observer.latest().unwrap();
+        let a = first
+            .prepared
+            .buffer()
+            .cells()
+            .iter()
+            .position(|cell| cell.symbol == "A")
+            .expect("initial A");
+        state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .unwrap()
+            .terminal_grid
+            .process(b"B");
+        state
+            .dirty
+            .mark_pane_dirty(pane_id, AttachDirtySource::ManualRedraw);
+        render_observed_test_frame(&mut state, &layout);
+        let second = observer.latest().unwrap();
+        assert_eq!(second.prepared.buffer().cells()[a].symbol, "A");
+        assert!(
+            second
+                .prepared
+                .buffer()
+                .cells()
+                .iter()
+                .any(|cell| cell.symbol == "B")
+        );
+        let stream_before_chrome = state
+            .pane_buffers
+            .get(&pane_id)
+            .unwrap()
+            .terminal_grid
+            .grid()
+            .content_revision();
+        let owner = state.presentation_surfaces.clone();
+        let mut surface_changes = owner.subscribe();
+        let publisher = owner.publisher("test.chrome");
+        let id = PluginSurfaceId::new("test.chrome", "status", Uuid::new_v4());
+        let surface = PluginSurface {
+            id: id.clone(),
+            revision: 1,
+            target: PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 0, 8, 1)),
+            clip_rect: None,
+            interactive_regions: Vec::new(),
+            accepts_input: false,
+            layer: 10,
+            z: 0,
+            opaque: true,
+            modal: false,
+            visible: true,
+            ops: vec![RenderOp::TextRun {
+                x: 0,
+                y: 0,
+                text: "chrome".into(),
+                style: bmux_plugin::RenderStyle::default(),
+            }],
+        };
+        publisher
+            .publish(PluginSurfaceSnapshot {
+                revision: 1,
+                surfaces: vec![surface.clone()],
+            })
+            .unwrap();
+        assert!(surface_changes.has_changed().unwrap());
+        surface_changes.borrow_and_update();
+        // Deliver the same invalidation as the live surface_revision_rx.changed branch.
+        state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
+        render_observed_test_frame(&mut state, &layout);
+        let chrome = observer.latest().unwrap();
+        assert_eq!(
+            state
+                .pane_buffers
+                .get(&pane_id)
+                .unwrap()
+                .terminal_grid
+                .grid()
+                .content_revision(),
+            stream_before_chrome
+        );
+        assert!(chrome.revision > second.revision);
+        assert!(
+            chrome
+                .prepared
+                .buffer()
+                .row_symbols(0)
+                .unwrap()
+                .contains("chrome")
+        );
+        assert!(
+            chrome
+                .surfaces
+                .iter()
+                .any(
+                    |surface| surface.owner_plugin_id.as_deref() == Some("test.chrome")
+                        && surface.revision == Some(1)
+                )
+        );
+        let mut updated = surface;
+        updated.revision = 2;
+        updated.ops = vec![RenderOp::TextRun {
+            x: 0,
+            y: 0,
+            text: "CHROME".into(),
+            style: bmux_plugin::RenderStyle::default(),
+        }];
+        publisher
+            .publish(PluginSurfaceSnapshot {
+                revision: 2,
+                surfaces: vec![updated],
+            })
+            .unwrap();
+        assert!(surface_changes.has_changed().unwrap());
+        surface_changes.borrow_and_update();
+        state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
+        render_observed_test_frame(&mut state, &layout);
+        let updated_frame = observer.latest().unwrap();
+        assert!(
+            updated_frame
+                .prepared
+                .buffer()
+                .row_symbols(0)
+                .unwrap()
+                .contains("CHROME")
+        );
+        assert!(updated_frame.surfaces.iter().any(|surface| surface.retained_id == id.retained_id && surface.revision == Some(2)));
+        assert_eq!(
+            state
+                .pane_buffers
+                .get(&pane_id)
+                .unwrap()
+                .terminal_grid
+                .grid()
+                .content_revision(),
+            stream_before_chrome
+        );
+        drop(publisher);
+        assert!(surface_changes.has_changed().unwrap());
+        surface_changes.borrow_and_update();
+        state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::SceneChanged);
+        render_observed_test_frame(&mut state, &layout);
+        assert!(
+            !observer
+                .latest()
+                .unwrap()
+                .surfaces
+                .iter()
+                .any(|surface| surface.retained_id == id.retained_id)
+        );
+        let removed_row = observer
+            .latest()
+            .unwrap()
+            .prepared
+            .buffer()
+            .row_symbols(0)
+            .unwrap();
+        assert!(!removed_row.contains("chrome") && !removed_row.contains("CHROME"));
+        assert_eq!(
+            state
+                .pane_buffers
+                .get(&pane_id)
+                .unwrap()
+                .terminal_grid
+                .grid()
+                .content_revision(),
+            stream_before_chrome
+        );
+        let committed = observer.latest().unwrap();
+        let revision = committed.revision;
+        let result = render_attach_frame_to_writer(
+            &mut FailingWriter { fail_flush: true },
+            &mut state,
+            &layout,
+            &RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            TerminalGeometry { cols: 80, rows: 24 },
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(observer.latest().unwrap().revision, revision);
+        assert!(Arc::ptr_eq(&observer.latest().unwrap(), &committed));
+        drop(state);
+        assert!(observer.latest().is_none());
     }
 
     #[test]

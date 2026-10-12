@@ -468,8 +468,19 @@ pub(super) async fn dispatch_built_in_command(
                 target,
                 follow,
                 global,
+                web_assets,
             },
         ) => {
+            if let Some(assets) = web_assets {
+                return Box::pin(super::web_attach::run(
+                    target.as_deref(),
+                    follow.as_deref(),
+                    *global,
+                    assets,
+                    connection_context,
+                ))
+                .await;
+            }
             Box::pin(run_session_attach(
                 target.as_deref(),
                 follow.as_deref(),

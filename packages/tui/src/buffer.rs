@@ -1,4 +1,10 @@
 //! Render buffer primitives.
+//!
+//! Optional serde decoding is for output transport only. Decoders must bound
+//! allocations and validate grid length, geometry, symbols, widths, and complete
+//! wide-cell topology (including continuation styles) before consuming a buffer.
+//! Private width/continuation fields are untrusted after decoding. A decoded
+//! buffer cannot be installed into authoritative `PresentationState`.
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -9,6 +15,7 @@ use crate::text::Line;
 
 /// One render-buffer cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cell {
     /// Cell symbol.
     pub symbol: String,
@@ -82,6 +89,7 @@ impl Cell {
 
 /// A two-dimensional terminal render buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Buffer {
     area: Rect,
     cells: Vec<Cell>,

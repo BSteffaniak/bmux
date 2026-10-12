@@ -1508,15 +1508,13 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
     use uuid::Uuid;
 
     fn temp_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time should be monotonic for test")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bmux-recording-test-{nanos}"));
+        // Nextest runs these fixtures in separate processes: wall-clock samples
+        // are not an exclusive directory identity when clocks share resolution.
+        let dir = std::env::temp_dir().join(format!("bmux-recording-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("temp dir should be created");
         dir
     }

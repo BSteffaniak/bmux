@@ -2,6 +2,7 @@
 
 /// Terminal color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Color {
     /// Backend default foreground/background color.
     #[default]
@@ -46,6 +47,7 @@ pub enum Color {
 
 /// Text style modifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Modifier(u16);
 
 impl Modifier {
@@ -109,6 +111,7 @@ impl std::ops::BitOrAssign for Modifier {
 
 /// Cell text style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Style {
     /// Optional foreground color.
     pub fg: Option<Color>,

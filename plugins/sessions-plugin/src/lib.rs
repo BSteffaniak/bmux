@@ -20,7 +20,6 @@
 pub mod session_manager;
 pub use session_manager::SessionManager;
 
-use bmux_context_state::{ContextSelector as PrimitiveContextSelector, ContextStateHandle};
 use bmux_plugin::{
     ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
 };
@@ -530,67 +529,24 @@ fn new_session_with_context(
     caller: &(impl ServiceCaller + Sync),
     name: Option<String>,
 ) -> Result<SessionAck, NewSessionError> {
-    let client_id = resolve_current_client_id(caller)?;
-    let session = new_session_via_ipc(caller, name.clone())?;
-    let context_handle = global_plugin_state_registry()
-        .get::<ContextStateHandle>()
-        .and_then(|arc| arc.read().ok().map(|guard| (*guard).clone()))
-        .ok_or_else(|| NewSessionError::Failed {
-            reason: "context state handle not registered".to_string(),
-        })?;
-    let mut attributes = BTreeMap::from([("workspace".to_string(), "default".to_string())]);
-    attributes.insert(
-        bmux_context_state::CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
-        session.id.to_string(),
-    );
-    let context = context_handle.0.create(client_id, name, attributes);
-    context_handle
-        .0
-        .bind_session(context.id, SessionId(session.id))
-        .map_err(|reason| NewSessionError::Failed {
-            reason: reason.to_string(),
-        })?;
-    let _ = context_handle
-        .0
-        .select_for_client(client_id, &PrimitiveContextSelector::ById(context.id));
-    let _ = global_event_bus().emit(
-        &bmux_contexts_plugin_api::contexts_events::EVENT_KIND,
-        bmux_contexts_plugin_api::contexts_events::ContextEvent::Created {
-            context_id: context.id,
-            name: context.name.clone(),
-        },
-    );
-    let _ = global_event_bus().emit(
-        &bmux_contexts_plugin_api::contexts_events::EVENT_KIND,
-        bmux_contexts_plugin_api::contexts_events::ContextEvent::Selected {
-            context_id: context.id,
-        },
-    );
-    let _ = global_event_bus().emit(
-        &bmux_contexts_plugin_api::contexts_events::EVENT_KIND,
-        bmux_contexts_plugin_api::contexts_events::ContextEvent::SessionActiveContextChanged {
-            session_id: session.id,
-            context_id: context.id,
-            initiator_client_id: Some(client_id.0),
-        },
-    );
-    Ok(SessionAck { id: context.id })
-}
-
-fn resolve_current_client_id(
-    caller: &(impl ServiceCaller + Sync),
-) -> Result<ClientId, NewSessionError> {
+    // CLI callers do not own context state. Let the activated contexts provider
+    // allocate, bind and select in the caller's target runtime; do not preallocate
+    // a session here, which would orphan it if context creation cannot run.
     let mut client = dispatch_client(caller);
-    bmux_plugin::block_on_typed_dispatch(
-        bmux_clients_plugin_api::clients_state::client::current_client(&mut client),
+    let context = bmux_plugin::block_on_typed_dispatch(
+        bmux_contexts_plugin_api::contexts_commands::client::create_context(
+            &mut client,
+            name,
+            BTreeMap::from([("workspace".to_string(), "default".to_string())]),
+        ),
     )
     .map_err(|error| NewSessionError::Failed {
-        reason: format!("clients-state/current-client failed: {error}"),
+        reason: format!("contexts-commands/create-context failed: {error}"),
     })?
-    .map(|summary| ClientId(summary.id))
     .map_err(|error| NewSessionError::Failed {
-        reason: format!("current client unavailable: {error:?}"),
-    })
+        reason: format!("context creation failed: {error:?}"),
+    })?;
+    Ok(SessionAck { id: context.id })
 }
 
 fn record_selected_context_outcome(context_id: ::uuid::Uuid) {
@@ -1078,6 +1034,121 @@ bmux_plugin_sdk::export_plugin!(SessionsPlugin, include_str!("../plugin.toml"));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ContextCreationCaller {
+        expected_name: Option<String>,
+        result: Result<
+            bmux_contexts_plugin_api::contexts_commands::ContextAck,
+            bmux_contexts_plugin_api::contexts_commands::CreateContextError,
+        >,
+        transport_failure: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ServiceCaller for ContextCreationCaller {
+        fn call_service_raw(
+            &self,
+            capability: &str,
+            kind: bmux_plugin_sdk::ServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            use bmux_contexts_plugin_api::contexts_commands;
+            // Any preallocation/current-client lookup fails these assertions. The
+            // generated dispatcher must reach just the target's contexts provider.
+            assert_eq!(
+                capability,
+                bmux_contexts_plugin_api::capabilities::CONTEXTS_WRITE.as_str()
+            );
+            assert_eq!(kind, bmux_plugin_sdk::ServiceKind::Command);
+            assert_eq!(interface, contexts_commands::INTERFACE_ID.as_str());
+            assert_eq!(operation, contexts_commands::OP_CREATE_CONTEXT.as_str());
+            let request: contexts_commands::client::CreateContextRequest =
+                bmux_plugin_sdk::decode_service_message(&payload)?;
+            assert_eq!(request.name, self.expected_name);
+            assert_eq!(
+                request.attributes,
+                BTreeMap::from([("workspace".to_string(), "default".to_string())])
+            );
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.transport_failure {
+                return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                    details: "target contexts unavailable".into(),
+                });
+            }
+            bmux_plugin_sdk::encode_service_message(&self.result)
+        }
+
+        fn execute_kernel_request(
+            &self,
+            _request: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            panic!("CLI context creation must not allocate through a kernel fallback")
+        }
+    }
+
+    #[test]
+    fn cli_new_session_dispatches_context_creation_without_local_state_or_preallocation() {
+        use bmux_contexts_plugin_api::contexts_commands::ContextAck;
+        let context_id = ::uuid::Uuid::from_u128(123);
+        let session_id = ::uuid::Uuid::from_u128(456);
+        for name in [None, Some("remote-work".to_string())] {
+            let caller = ContextCreationCaller {
+                expected_name: name.clone(),
+                result: Ok(ContextAck {
+                    id: context_id,
+                    session_id: Some(session_id),
+                }),
+                transport_failure: false,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            // No activate call or registry setup: the CLI is a remote caller only.
+            let ack = new_session_with_context(&caller, name).unwrap();
+            assert_eq!(ack.id, context_id);
+            assert_eq!(caller.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+            // The unchanged CLI outcome path must publish the returned context,
+            // not the different underlying session id.
+            bmux_plugin_sdk::begin_command_outcome_capture();
+            record_selected_context_outcome(ack.id);
+            let outcome = bmux_plugin_sdk::finish_command_outcome_capture();
+            let expected = context_id.to_string();
+            assert_eq!(
+                outcome
+                    .metadata
+                    .get(COMMAND_OUTCOME_SELECTED_CONTEXT_ID_KEY)
+                    .and_then(serde_json::Value::as_str),
+                Some(expected.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn cli_context_creation_failure_has_no_preallocated_session_or_fallback() {
+        use bmux_contexts_plugin_api::contexts_commands::CreateContextError;
+        for transport_failure in [false, true] {
+            let caller = ContextCreationCaller {
+                expected_name: Some("unavailable-target".to_string()),
+                result: Err(CreateContextError::Failed {
+                    reason: "creation denied".into(),
+                }),
+                transport_failure,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            };
+            let error =
+                new_session_with_context(&caller, caller.expected_name.clone()).unwrap_err();
+            let expected = if transport_failure {
+                "target contexts unavailable"
+            } else {
+                "creation denied"
+            };
+            assert!(
+                matches!(error, NewSessionError::Failed { reason } if reason.contains(expected))
+            );
+            assert_eq!(caller.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
+    }
 
     #[test]
     fn missing_attach_session_maps_to_select_not_found() {

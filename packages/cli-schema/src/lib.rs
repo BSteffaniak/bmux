@@ -344,6 +344,9 @@ pub enum Command {
     Attach {
         /// Session name or UUID
         target: Option<String>,
+        /// Serve this terminal view read-only in a local browser using these built WASM assets
+        #[arg(long, value_name = "ASSET_DIRECTORY")]
+        web_assets: Option<std::path::PathBuf>,
         /// Follow target client UUID and attach to its selected session
         #[arg(long)]
         follow: Option<String>,
@@ -3178,10 +3181,12 @@ mod tests {
             target,
             follow,
             global,
+            web_assets,
         }) = cli.command
         else {
             panic!("expected attach command");
         };
+        assert!(web_assets.is_none());
         assert_eq!(target.as_deref(), Some("dev"));
         assert_eq!(cli.target, None);
         assert_eq!(follow, None);
@@ -3213,6 +3218,7 @@ mod tests {
             target,
             follow,
             global,
+            ..
         }) = cli.command
         else {
             panic!("expected attach command");
@@ -3223,6 +3229,25 @@ mod tests {
             Some("550e8400-e29b-41d4-a716-446655440000")
         );
         assert!(global);
+    }
+
+    #[test]
+    fn parses_attach_web_assets() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "attach",
+            "dev",
+            "--web-assets",
+            "/tmp/browser-assets",
+        ])
+        .expect("valid browser observation args");
+        let Some(Command::Attach { web_assets, .. }) = cli.command else {
+            panic!("expected attach command");
+        };
+        assert_eq!(
+            web_assets.as_deref(),
+            Some(std::path::Path::new("/tmp/browser-assets"))
+        );
     }
 
     #[test]

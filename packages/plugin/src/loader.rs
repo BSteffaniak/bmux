@@ -3872,7 +3872,9 @@ id = "process.plugin"
 name = "Process Plugin"
 version = "0.1.0"
 runtime = "process"
-entry = "true"
+# Consume the one-shot request before exiting; `true` races the parent's pipe write.
+entry = "sh"
+entry_args = ["-c", "cat >/dev/null"]
 
 [[commands]]
 name = "hello"

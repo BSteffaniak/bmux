@@ -60,6 +60,8 @@ impl PartialEq<DamageRect> for RetainedInteractiveRegion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetainedSurface {
     pub id: Uuid,
+    /// Owner identity captured atomically with this retained payload.
+    pub owner: Option<bmux_plugin::surface::PluginSurfaceId>,
     pub rect: DamageRect,
     pub layer: i16,
     pub z: i32,
@@ -108,6 +110,7 @@ impl RetainedSurface {
     ) -> Self {
         Self {
             id,
+            owner: None,
             rect,
             layer,
             z,
@@ -230,7 +233,9 @@ pub fn retained_surfaces_from_plugin_surfaces(
             } else {
                 builder.transparent()
             };
-            Some(builder.build())
+            let mut retained = builder.build();
+            retained.owner = Some(surface.id.clone());
+            Some(retained)
         })
         .collect()
 }

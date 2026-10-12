@@ -1166,8 +1166,10 @@ dependencies = [
  "bmux_scene_protocol",
  "bmux_scene_protocol_render",
  "bmux_terminal_grid",
+ "bmux_tui",
  "crossterm",
  "futures-util",
+ "image",
  "tracing",
  "unicode-width",
  "uuid",
@@ -1269,6 +1271,8 @@ dependencies = [
  "bmux_tui 0.0.1-alpha.1",
  "bmux_tui_components 0.0.1-alpha.1",
  "bmux_visual_adapters_plugin_renderer",
+ "bmux_web_host",
+ "bmux_web_renderer",
  "bmux_workspaces_plugin",
  "bmux_workspaces_plugin_api",
  "clap",
@@ -2458,8 +2462,6 @@ name = "bmux_sessions_plugin"
 version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
- "bmux_clients_plugin_api",
- "bmux_context_state",
  "bmux_contexts_plugin_api",
  "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
@@ -2707,6 +2709,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "libc",
+ "serde",
  "unicode-segmentation",
  "unicode-width",
  "zeroize",
@@ -2808,6 +2811,30 @@ dependencies = [
  "bmux_plugin",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "bmux_web_host"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "bmux_web_renderer"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_tui",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "unicode-width",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

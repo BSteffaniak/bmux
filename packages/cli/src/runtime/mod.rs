@@ -49,6 +49,7 @@ pub mod slot;
 mod slot_cli;
 mod terminal_doctor;
 mod terminal_protocol;
+mod web_attach;
 
 use self::logs_watch::{
     active_log_file_path, run_logs_profiles_delete, run_logs_profiles_list,

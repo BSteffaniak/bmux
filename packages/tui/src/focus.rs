@@ -25,6 +25,7 @@ pub enum FocusKeyOutcome {
 /// [`Self::from_hits`]. The explicit constructor remains useful for tests and
 /// callers that deliberately own a custom focus order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FocusTrap {
     targets: Vec<FocusId>,
     active: Option<usize>,
@@ -98,6 +99,11 @@ impl FocusTrap {
     #[must_use]
     pub fn active(&self) -> Option<&FocusId> {
         self.active.and_then(|index| self.targets.get(index))
+    }
+
+    /// Clear active focus without discarding eligible targets.
+    pub const fn clear_active(&mut self) {
+        self.active = None;
     }
 
     /// Set active focus target if it exists in the trap.

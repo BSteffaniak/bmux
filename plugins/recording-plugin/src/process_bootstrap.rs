@@ -146,13 +146,55 @@ struct RuntimeIdentity {
 }
 fn file_hash(path: &Path) -> Result<String> {
     use std::fmt::Write;
-    let digest = Sha256::digest(std::fs::read(path)?);
+    use std::io::Read;
+    let started = Instant::now();
+    let mut file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    tracing::info!(bytes = before.len(), "recording.identity.hash_start");
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = file.metadata()?;
+    ensure!(
+        same_hash_file(&before, &after) && same_hash_file(&after, &std::fs::metadata(path)?),
+        "identity file changed while hashing"
+    );
+    let digest = hasher.finalize();
+    tracing::info!(
+        bytes = after.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "recording.identity.hash_complete"
+    );
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
         write!(&mut encoded, "{byte:02x}")?;
     }
     Ok(encoded)
 }
+fn same_hash_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    if left.len() != right.len() || left.modified().ok() != right.modified().ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev()
+            && left.ino() == right.ino()
+            && left.ctime() == right.ctime()
+            && left.ctime_nsec() == right.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn start_owned(root: &Path, executable: &Path) -> Result<std::process::Output> {
     let paths = paths(root);
     ensure!(executable.is_absolute(), "BMUX executable is not absolute");
@@ -220,17 +262,33 @@ pub(crate) async fn bootstrap(context: &NativeCommandContext) -> Result<Dedicate
     let config_file = paths.config_dir.join("bmux.toml");
     crate::durable::write_atomic(&config_file, config.as_bytes())?;
     let executable = std::fs::canonicalize(std::env::current_exe()?)?;
+    let identity_executable = executable.clone();
+    let identity_config = config_file.clone();
+    let (executable_sha256, config_sha256) = tokio::task::spawn_blocking(move || {
+        Ok::<_, anyhow::Error>((
+            file_hash(&identity_executable)?,
+            file_hash(&identity_config)?,
+        ))
+    })
+    .await
+    .context("identity hashing worker failed")??;
     let identity = RuntimeIdentity {
         schema_version: 4,
         executable: executable.clone(),
-        executable_sha256: file_hash(&executable)?,
-        config_sha256: file_hash(&config_file)?,
+        executable_sha256,
+        config_sha256,
     };
     crate::durable::write_atomic(
         &root.join("runtime-identity.json"),
         &serde_json::to_vec(&identity)?,
     )?;
-    let output = start_owned(&root, &executable)?;
+    tracing::info!("recording.bootstrap.server_start");
+    let start_root = root.clone();
+    let start_executable = executable.clone();
+    let output = tokio::task::spawn_blocking(move || start_owned(&start_root, &start_executable))
+        .await
+        .context("server bootstrap worker failed")??;
+    tracing::info!("recording.bootstrap.server_start_complete");
     if !output.status.success() {
         let cleanup = stop_owned(&root);
         anyhow::bail!(
@@ -382,14 +440,28 @@ pub(crate) async fn resolve(context: &NativeCommandContext, id: Uuid) -> Result<
             );
             let identity: RuntimeIdentity =
                 serde_json::from_slice(&std::fs::read(root.join("runtime-identity.json"))?)?;
+            let identity_executable = identity.executable.clone();
+            let identity_config = root.join("config/bmux.toml");
+            let (executable_hash, config_hash) = tokio::task::spawn_blocking(move || {
+                Ok::<_, anyhow::Error>((
+                    file_hash(&identity_executable)?,
+                    file_hash(&identity_config)?,
+                ))
+            })
+            .await
+            .context("restart identity hashing worker failed")??;
             ensure!(
                 identity.schema_version == 4
                     && identity.executable == std::fs::canonicalize(std::env::current_exe()?)?
-                    && identity.executable_sha256 == file_hash(&identity.executable)?
-                    && identity.config_sha256 == file_hash(&root.join("config/bmux.toml"))?,
+                    && identity.executable_sha256 == executable_hash
+                    && identity.config_sha256 == config_hash,
                 "owned runtime executable/config identity changed; refusing restart"
             );
-            let output = start_owned(&root, &identity.executable)?;
+            let start_root = root.clone();
+            let output =
+                tokio::task::spawn_blocking(move || start_owned(&start_root, &identity.executable))
+                    .await
+                    .context("owned restart worker failed")??;
             ensure!(
                 output.status.success(),
                 "owned daemon restart failed after {connect_error}: {}; retained root {}",

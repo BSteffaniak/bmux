@@ -70,6 +70,8 @@ members = [
     "packages/tui",
     "packages/tui-components",
     "packages/tui-runtime",
+    "packages/web-renderer",
+    "packages/web-host",
     "packages/mobile-core",
     "packages/mobile-ffi",
     "packages/image",
@@ -233,6 +235,8 @@ bmux_text_edit = { version = "0.0.1-alpha.1", default-features = false, path = "
 bmux_tui = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui" }
 bmux_tui_components = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui-components" }
 bmux_tui_runtime = { version = "0.0.1-alpha.1", default-features = false, path = "packages/tui-runtime" }
+bmux_web_host = { version = "0.0.1-alpha.1", default-features = false, path = "packages/web-host" }
+bmux_web_renderer = { version = "0.0.1-alpha.1", default-features = false, path = "packages/web-renderer" }
 hyperchad_docs_config = { version = "0.4.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 hyperchad_docs_config_derive = { version = "0.4.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
 hyperchad_docs_site = { version = "0.4.0", default-features = false, git = "https://github.com/MoosicBox/MoosicBox", branch = "master" }
@@ -423,6 +427,10 @@ mlua = { version = "0.11", default-features = false }
 
 # Dev/test dependencies
 serial_test = { version = "3.4.0" }
+
+# Keep identity checks bounded in debug native acceptance runs with large binaries.
+[profile.dev.package.sha2]
+opt-level = 3
 
 # [patch.crates-io]
 # moosicbox_log_watch = { path = "../MoosicBox/packages/log_watch" }

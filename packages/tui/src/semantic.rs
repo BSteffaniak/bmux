@@ -4,6 +4,7 @@ use crate::geometry::Rect;
 
 /// Stable semantic role exposed by a rendered component.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SemanticRegion {
     /// Stable caller-owned semantic identity.
     pub id: String,
@@ -27,6 +28,7 @@ impl SemanticRegion {
 
 /// Ordered semantic scene from one committed frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SemanticScene {
     regions: Vec<SemanticRegion>,
 }

@@ -5,6 +5,8 @@
 pub mod compositor;
 pub mod cursor;
 pub mod mouse;
+pub mod projection;
+pub mod projection_images;
 pub mod reconcile;
 pub mod render;
 pub mod scene_pipeline;

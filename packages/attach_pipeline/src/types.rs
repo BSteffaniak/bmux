@@ -226,6 +226,9 @@ pub struct ExtensionRetainedLayerCacheEntry {
 
 pub struct PaneRenderBuffer {
     pub terminal_grid: TerminalGridStream,
+    /// Neutral declarative output retained alongside extension byte caches.
+    pub extension_projection_cache:
+        BTreeMap<(String, Uuid), Vec<crate::projection::PaintOperation>>,
     pub protocol_tracker: TerminalProtocolTracker,
     pub prev_rows: Vec<String>,
     pub sync_update_in_progress: bool,
@@ -632,6 +635,7 @@ impl Default for PaneRenderBuffer {
             prev_rows: Vec::new(),
             sync_update_in_progress: false,
             expected_stream_start: None,
+            extension_projection_cache: BTreeMap::new(),
             retained_screen_copy: false,
             scrollback_window: None,
             extension_render_cache: BTreeMap::new(),

@@ -22,6 +22,7 @@ impl Default for DamagePolicy {
 
 /// Coalesced damage for one process-local terminal presentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Damage {
     /// No terminal cells require presentation.
     None,

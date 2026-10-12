@@ -75,6 +75,7 @@ headless agent interaction, and explicit recovery.
 - [Concepts](docs/concepts.md) and [configuration profiles](docs/config-profiles.md)
 - [Plugins](docs/plugins.md) and [window presentation](docs/tab-presentations.md)
 - [Images and compression](docs/images.md)
+- [Shared Rust/WASM browser rendering](docs/browser-rendering.md) (local read-only view)
 - [Operations](docs/operations.md) and [testing](TESTING.md)
 
 Remote gateways and login startup are opt-in operations. Review their network exposure and supervision behavior before enabling them. Do not copy gateway examples into an internet-facing deployment without appropriate access controls.

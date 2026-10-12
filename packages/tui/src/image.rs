@@ -8,6 +8,7 @@ use crate::geometry::Rect;
 /// different content or placement updates that image rather than adding a
 /// second image.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageKey(String);
 
 impl ImageKey {
@@ -38,6 +39,7 @@ impl From<&str> for ImageKey {
 
 /// Pixel encoding supplied by a TUI image producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ImagePixelFormat {
     /// Three bytes per pixel in red, green, blue order.
     Rgb8,
@@ -47,6 +49,7 @@ pub enum ImagePixelFormat {
 
 /// Protocol-neutral image payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ImagePayload {
     /// PNG-encoded image bytes and their decoded dimensions.
     Png {
@@ -72,6 +75,7 @@ pub enum ImagePayload {
 
 /// Lifetime requested for a presented image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ImageLifecycle {
     /// Keep the image only while its key is contributed in each frame.
     Frame,
@@ -81,6 +85,7 @@ pub enum ImageLifecycle {
 
 /// A protocol-neutral image and its cell-space placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImagePlacement {
     /// Stable caller-owned identity.
     pub key: ImageKey,
@@ -96,6 +101,7 @@ pub struct ImagePlacement {
 
 /// One image lifecycle contribution emitted while rendering a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ImageContribution {
     /// Add or update an image and its placement.
     Present(ImagePlacement),

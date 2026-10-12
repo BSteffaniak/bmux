@@ -1,0 +1,592 @@
+//! Explicit per-attach, read-only latest-snapshot channel.
+//! The host must authorize access before receiving this observer. There is no registry.
+use std::sync::Arc;
+
+use bmux_attach_pipeline::RetainedCompositor;
+use bmux_tui::geometry::Rect;
+use bmux_tui::presentation::PreparedPresentation;
+use tokio::sync::watch;
+use uuid::Uuid;
+
+/// Provenance of a surface in the exact committed retained graph.
+#[derive(Debug, Clone)]
+pub struct AttachSurfaceProvenance {
+    pub retained_id: Uuid,
+    pub owner_plugin_id: Option<String>,
+    pub owner_local_id: Option<String>,
+    pub revision: Option<u64>,
+    pub rect: Rect,
+    pub clip: Rect,
+    pub layer: i16,
+    pub z: i32,
+    pub content_id: Option<Uuid>,
+    /// Execution-scoped output watermark, not an execution-generation identifier.
+    pub stream_end: Option<u64>,
+}
+
+/// A complete repaired frame; omitted surfaces/images are removed, never retained implicitly.
+#[derive(Debug)]
+pub struct AttachSnapshot {
+    /// Unique observer lifetime, known before attach starts.
+    pub epoch: Uuid,
+    /// Monotonic successful presentation revision within this epoch.
+    pub revision: u64,
+    /// Authoritative attached target identity (may change during retarget).
+    pub attached_id: Uuid,
+    pub prepared: PreparedPresentation,
+    pub surfaces: Vec<AttachSurfaceProvenance>,
+}
+
+/// Single publisher, owned and dropped by one attach view.
+#[derive(Debug)]
+pub struct AttachObserverPublisher {
+    epoch: Uuid,
+    revision: u64,
+    sender: watch::Sender<Option<Arc<AttachSnapshot>>>,
+}
+
+/// Latest-only observer; skipped updates are safe because every value is a full snapshot.
+#[derive(Debug, Clone)]
+pub struct AttachObserver {
+    epoch: Uuid,
+    receiver: watch::Receiver<Option<Arc<AttachSnapshot>>>,
+}
+
+/// Allocate an explicit observer before starting the selected attach.
+#[must_use]
+pub fn attach_observer_channel() -> (AttachObserverPublisher, AttachObserver) {
+    let epoch = Uuid::new_v4();
+    let (sender, receiver) = watch::channel(None);
+    (
+        AttachObserverPublisher {
+            epoch,
+            revision: 0,
+            sender,
+        },
+        AttachObserver { epoch, receiver },
+    )
+}
+
+impl AttachObserver {
+    #[must_use]
+    pub const fn epoch(&self) -> Uuid {
+        self.epoch
+    }
+    #[must_use]
+    pub fn latest(&self) -> Option<Arc<AttachSnapshot>> {
+        if self.receiver.has_changed().is_err() {
+            None
+        } else {
+            self.receiver.borrow().clone()
+        }
+    }
+    /// Await another full snapshot. Closure means the explicit attach lifetime ended.
+    ///
+    /// # Errors
+    /// Returns an error when the attach publisher has been dropped.
+    pub async fn changed(&mut self) -> Result<Arc<AttachSnapshot>, watch::error::RecvError> {
+        loop {
+            self.receiver.changed().await?;
+            let latest = self.receiver.borrow_and_update().clone();
+            if let Some(snapshot) = latest {
+                return Ok(snapshot);
+            }
+        }
+    }
+}
+
+impl Drop for AttachObserverPublisher {
+    fn drop(&mut self) {
+        self.sender.send_replace(None);
+    }
+}
+
+impl AttachObserverPublisher {
+    pub(super) fn publish(
+        &mut self,
+        attached_id: Uuid,
+        prepared: PreparedPresentation,
+        graph: &RetainedCompositor,
+        stream_ends: &std::collections::BTreeMap<Uuid, Option<u64>>,
+    ) {
+        let Some(revision) = self.revision.checked_add(1) else {
+            return;
+        };
+        let surfaces = graph
+            .ordered_surfaces()
+            .into_iter()
+            .map(|surface| {
+                let rect = Rect::new(
+                    surface.rect.x,
+                    surface.rect.y,
+                    surface.rect.w,
+                    surface.rect.h,
+                );
+                let clip = surface
+                    .paint_rect()
+                    .map_or(Rect::new(0, 0, 0, 0), |r| Rect::new(r.x, r.y, r.w, r.h));
+                AttachSurfaceProvenance {
+                    retained_id: surface.id,
+                    owner_plugin_id: surface
+                        .owner
+                        .as_ref()
+                        .map(|owner| owner.owner_plugin_id.clone()),
+                    owner_local_id: surface.owner.as_ref().map(|owner| owner.local_id.clone()),
+                    revision: surface.revision,
+                    rect,
+                    clip,
+                    layer: surface.layer,
+                    z: surface.z,
+                    stream_end: match &surface.payload {
+                        bmux_attach_pipeline::RetainedSurfacePayload::Content { content_id } => {
+                            stream_ends.get(content_id).copied().flatten()
+                        }
+                        _ => None,
+                    },
+                    content_id: match &surface.payload {
+                        bmux_attach_pipeline::RetainedSurfacePayload::Content { content_id } => {
+                            Some(*content_id)
+                        }
+                        _ => None,
+                    },
+                }
+            })
+            .collect();
+        self.sender.send_replace(Some(Arc::new(AttachSnapshot {
+            epoch: self.epoch,
+            revision,
+            attached_id,
+            prepared,
+            surfaces,
+        })));
+        self.revision = revision;
+    }
+}
+
+pub(super) fn publish_committed(
+    view: &mut super::state::AttachViewState,
+    layout: &bmux_client::AttachLayoutState,
+    geometry: super::input::TerminalGeometry,
+    operations: &[bmux_attach_pipeline::projection::PaintOperation],
+) {
+    use bmux_tui::{
+        damage::Damage,
+        image::ImageContribution,
+        presentation::{PresentationLimits, PresentationState},
+    };
+    if operations.iter().any(|operation| {
+        matches!(
+            operation,
+            bmux_attach_pipeline::projection::PaintOperation::Unsupported
+        )
+    }) {
+        tracing::warn!("browser observer disconnected: unsupported or over-budget presentation");
+        view.observer.take();
+        return;
+    }
+    let area = Rect::new(0, 0, geometry.cols, geometry.rows);
+    if usize::from(geometry.cols) * usize::from(geometry.rows) > 131_072 {
+        view.observer.take();
+        return;
+    }
+    let images = match observed_images(view, layout, area) {
+        Ok(images) => images,
+        Err(reason) => {
+            tracing::warn!(%reason, "browser observer disconnected: image projection unavailable");
+            view.observer.take();
+            return;
+        }
+    };
+    let interactions = match projected_interactions(&view.retained_compositor, area) {
+        Ok(hits) => hits,
+        Err(reason) => {
+            tracing::warn!(%reason, "browser observer disconnected: interaction projection unavailable");
+            view.observer.take();
+            return;
+        }
+    };
+    let state = PresentationState::new(area);
+    let limits = PresentationLimits {
+        max_cells: 131_072,
+        max_entries: 131_072,
+        max_bytes: 32 * 1024 * 1024,
+    };
+    let prepared = state.prepare_bounded(limits, Damage::Full, |cx| {
+        bmux_attach_pipeline::projection::paint(cx, operations);
+        for image in images {
+            cx.push_image(ImageContribution::Present(image));
+        }
+        for hit in interactions {
+            cx.push_hit(hit);
+        }
+        if let Some(cursor) = view.last_cursor_state {
+            cx.set_cursor_local(cursor.x, cursor.y, cursor.visible);
+        }
+    });
+    if view.retained_compositor.surfaces().len() > 4096 {
+        view.observer.take();
+        return;
+    }
+    if let Ok(Some(mut prepared)) = prepared {
+        let active = view
+            .plugin_focus
+            .focused()
+            .map(|id| bmux_tui::focus::FocusId::new(region_identity(id)));
+        if !prepared.project_active_focus(active.as_ref()) {
+            prepared.project_active_focus(None);
+        }
+        if let Some(publisher) = view.observer.as_mut() {
+            let stream_ends = view
+                .pane_buffers
+                .iter()
+                .map(|(id, buffer)| (*id, buffer.expected_stream_start))
+                .collect();
+            publisher.publish(
+                view.attached_id,
+                prepared,
+                &view.retained_compositor,
+                &stream_ends,
+            );
+        }
+    } else {
+        tracing::warn!("browser observer disconnected: presentation admission failed");
+        view.observer.take();
+    }
+}
+
+fn region_identity(id: &bmux_plugin::surface::PluginSurfaceRegionId) -> String {
+    format!(
+        "{}:{}:{}",
+        id.owner_plugin_id, id.surface_local_id, id.region_local_id
+    )
+}
+
+/// Rasterize the compositor's actual winning hits, not the raw region rectangles.
+fn projected_interactions(
+    graph: &RetainedCompositor,
+    area: Rect,
+) -> Result<Vec<bmux_tui::hit::HitRegion>, String> {
+    use bmux_tui::hit::HitRegion;
+    let regions = graph
+        .surfaces()
+        .values()
+        .map(|surface| surface.interactive_regions.len())
+        .sum::<usize>();
+    let cells = usize::from(area.width) * usize::from(area.height);
+    if graph.surfaces().len() > 128
+        || regions > 1024
+        || cells.saturating_mul(graph.surfaces().len().saturating_add(regions)) > 4_194_304
+    {
+        return Err("interaction projection work budget exceeded".into());
+    }
+    let mut hits = Vec::new();
+    for y in area.y..area.bottom() {
+        let winners = (area.x..area.right())
+            .map(|x| graph.hit_test(x, y))
+            .collect::<Vec<_>>();
+        let mut x = area.x;
+        while x < area.right() {
+            let Some(hit) = winners[usize::from(x - area.x)].as_ref() else {
+                x += 1;
+                continue;
+            };
+            let start = x;
+            x += 1;
+            while x < area.right()
+                && winners[usize::from(x - area.x)]
+                    .as_ref()
+                    .is_some_and(|next| {
+                        next.surface_id == hit.surface_id && next.region_index == hit.region_index
+                    })
+            {
+                x += 1;
+            }
+            let surface = &graph.surfaces()[&hit.surface_id];
+            let region = &surface.interactive_regions[hit.region_index];
+            let id = region.id.as_ref().map_or_else(
+                || format!("{}:{}", surface.id, hit.region_index),
+                region_identity,
+            );
+            let focusable =
+                region.focusable && region.id.as_ref().is_some_and(|id| graph.focus_allowed(id));
+            hits.push(
+                HitRegion::new(id, Rect::new(start, y, x - start, 1))
+                    .layer(surface.layer)
+                    .focusable(focusable),
+            );
+            if hits.len() > 4096 {
+                return Err("interaction span budget exceeded".into());
+            }
+        }
+    }
+    Ok(hits)
+}
+
+#[cfg(not(any(
+    feature = "image-sixel",
+    feature = "image-kitty",
+    feature = "image-iterm2"
+)))]
+fn observed_images(
+    _view: &super::state::AttachViewState,
+    _layout: &bmux_client::AttachLayoutState,
+    _area: Rect,
+) -> Result<Vec<bmux_tui::image::ImagePlacement>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(any(
+    feature = "image-sixel",
+    feature = "image-kitty",
+    feature = "image-iterm2"
+))]
+fn observed_images(
+    view: &super::state::AttachViewState,
+    layout: &bmux_client::AttachLayoutState,
+    area: Rect,
+) -> Result<Vec<bmux_tui::image::ImagePlacement>, String> {
+    use bmux_tui::image::ImagePayload;
+    let mut result = Vec::new();
+    let mut budget = 0_usize;
+    for surface in &layout.scene.surfaces {
+        let Some(content_id) = surface.pane_id else {
+            continue;
+        };
+        if !surface.visible {
+            continue;
+        }
+        let content = Rect::new(
+            surface.content_rect.x,
+            surface.content_rect.y,
+            surface.content_rect.w,
+            surface.content_rect.h,
+        );
+        for image in view.presented_images(content_id) {
+            let payload = observed_image_payload(image)?;
+            let destination = Rect::new(
+                content.x.saturating_add(image.position_col),
+                content.y.saturating_add(image.position_row),
+                image.cell_cols,
+                image.cell_rows,
+            );
+            let clip = content.intersection(area);
+            let watermark = view
+                .pane_buffers
+                .get(&content_id)
+                .and_then(|buffer| buffer.expected_stream_start)
+                .unwrap_or(0);
+            let key = format!("{}:{}:{watermark}:{}", surface.id, content_id, image.id);
+            let strips = bmux_attach_pipeline::projection_images::visible_image_strips(
+                &key,
+                &payload,
+                destination,
+                clip,
+                |x, y| {
+                    view.retained_compositor
+                        .point_visible_from(surface.id, x, y)
+                },
+            )?;
+            for strip in strips {
+                budget = budget.saturating_add(match &strip.payload {
+                    ImagePayload::Png { bytes, .. } | ImagePayload::Pixels { bytes, .. } => {
+                        bytes.len()
+                    }
+                });
+                if budget > 8 * 1024 * 1024 || result.len() >= 4096 {
+                    return Err("full-view image budget exceeded".into());
+                }
+                result.push(strip);
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(any(
+    feature = "image-sixel",
+    feature = "image-kitty",
+    feature = "image-iterm2"
+))]
+fn observed_image_payload(
+    image: &bmux_attach_image_protocol::AttachPaneImage,
+) -> Result<bmux_tui::image::ImagePayload, String> {
+    use bmux_tui::image::ImagePayload;
+    #[cfg(feature = "image-sixel")]
+    use bmux_tui::image::ImagePixelFormat;
+
+    if image.raw_data.len() > 16 * 1024 * 1024 {
+        return Err("encoded image budget exceeded".into());
+    }
+    let native = bmux_image::PaneImage::from(image);
+    match image.protocol {
+        bmux_attach_image_protocol::AttachImageProtocol::KittyGraphics => {
+            // The authoritative registry normalizes completed Kitty transfers to PNG.
+            Ok(ImagePayload::Png {
+                bytes: native.payload.raw.ok_or("missing Kitty image")?,
+                width: image.pixel_width,
+                height: image.pixel_height,
+            })
+        }
+        bmux_attach_image_protocol::AttachImageProtocol::ITerm2 => {
+            #[cfg(feature = "image-iterm2")]
+            {
+                let (_, bytes) = bmux_image::codec::iterm2::parse_body(
+                    native.payload.raw.as_deref().ok_or("missing iTerm image")?,
+                )
+                .ok_or("invalid iTerm image")?;
+                Ok(ImagePayload::Png {
+                    bytes,
+                    width: image.pixel_width,
+                    height: image.pixel_height,
+                })
+            }
+            #[cfg(not(feature = "image-iterm2"))]
+            {
+                Err("iTerm decoding disabled".into())
+            }
+        }
+        bmux_attach_image_protocol::AttachImageProtocol::Sixel => {
+            #[cfg(feature = "image-sixel")]
+            {
+                if u64::from(image.pixel_width) * u64::from(image.pixel_height)
+                    > bmux_attach_pipeline::projection_images::MAX_IMAGE_PIXELS
+                {
+                    return Err("sixel pixel budget exceeded".into());
+                }
+                let pixels = bmux_image::codec::sixel::decode(
+                    native.payload.raw.as_deref().ok_or("missing sixel image")?,
+                )
+                .ok_or("invalid sixel image")?;
+                Ok(ImagePayload::Pixels {
+                    bytes: pixels.data,
+                    width: pixels.width,
+                    height: pixels.height,
+                    format: match pixels.format {
+                        bmux_image::model::PixelFormat::Rgb8 => ImagePixelFormat::Rgb8,
+                        bmux_image::model::PixelFormat::Rgba8 => ImagePixelFormat::Rgba8,
+                        bmux_image::model::PixelFormat::Png => {
+                            return Err("unexpected sixel PNG".into());
+                        }
+                    },
+                })
+            }
+            #[cfg(not(feature = "image-sixel"))]
+            {
+                Err("sixel decoding disabled".into())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_tui::{damage::Damage, presentation::PresentationState};
+
+    #[test]
+    fn interactions_use_winning_clipped_spans_and_exact_native_focus() {
+        use bmux_attach_pipeline::{
+            DamageCoalescingPolicy, DamageRect, RetainedInteractiveRegion, RetainedSurface,
+        };
+        use bmux_plugin::surface::{PluginSurfaceCursor, PluginSurfaceId, PluginSurfaceRegionId};
+        use bmux_tui::{geometry::Point, hit::HitId};
+        let area = Rect::new(0, 0, 8, 2);
+        let owner = PluginSurfaceId::new("owner", "surface", Uuid::new_v4());
+        let id = PluginSurfaceRegionId::new(&owner, "control");
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "test".into(),
+            interface_id: "test".into(),
+            operation: "test".into(),
+        };
+        let mut surface = RetainedSurface::new(
+            owner.retained_id,
+            DamageRect::new(1, 0, 4, 2),
+            0,
+            0,
+            true,
+            Vec::new(),
+        );
+        surface.clip_rect = Some(DamageRect::new(2, 0, 2, 2));
+        surface.interactive_regions = vec![RetainedInteractiveRegion {
+            id: Some(id),
+            rect: DamageRect::new(0, 0, 8, 2),
+            focusable: true,
+            cursor: PluginSurfaceCursor::Pointer,
+            endpoint: Some(endpoint),
+        }];
+        let mut graph = RetainedCompositor::new();
+        graph.replace_surfaces(
+            vec![surface.clone()],
+            DamageRect::new(0, 0, 8, 2),
+            DamageCoalescingPolicy::default(),
+        );
+        let hits = projected_interactions(&graph, area).unwrap();
+        assert!(
+            hits.iter()
+                .all(|hit| hit.area.x == 2 && hit.area.width == 2)
+        );
+        let state = PresentationState::new(area);
+        let mut prepared = state
+            .prepare(Damage::Full, |cx| {
+                for hit in hits {
+                    cx.push_hit(hit);
+                }
+            })
+            .unwrap();
+        assert!(prepared.project_active_focus(None));
+        assert!(prepared.focus().active().is_none());
+        let mut native_focus = bmux_attach_pipeline::RetainedFocusState::default();
+        assert!(native_focus.focus_hit(&graph, &graph.hit_test(2, 0).unwrap()));
+        native_focus.reconcile(&graph);
+        let active = HitId::new(region_identity(native_focus.focused().unwrap()));
+        assert!(prepared.project_active_focus(Some(&active)));
+        assert_eq!(prepared.focus().active(), Some(&active));
+        assert!(prepared.hits().hit_test(Point::new(1, 0)).is_none());
+        let mut modal = RetainedSurface::new(
+            Uuid::new_v4(),
+            DamageRect::new(3, 0, 3, 2),
+            1,
+            0,
+            true,
+            Vec::new(),
+        );
+        modal.modal = true;
+        graph.replace_surfaces(
+            vec![surface, modal],
+            DamageRect::new(0, 0, 8, 2),
+            DamageCoalescingPolicy::default(),
+        );
+        let hits = projected_interactions(&graph, area).unwrap();
+        assert!(
+            hits.iter()
+                .all(|hit| hit.area.x == 2 && hit.area.width == 1 && !hit.focusable)
+        );
+        graph.replace_surfaces(
+            Vec::new(),
+            DamageRect::new(0, 0, 8, 2),
+            DamageCoalescingPolicy::default(),
+        );
+        native_focus.reconcile(&graph);
+        assert!(native_focus.focused().is_none());
+        assert!(projected_interactions(&graph, area).unwrap().is_empty());
+    }
+
+    #[test]
+    fn latest_replaces_pending_frames_and_closes_with_view() {
+        let (mut publisher, observer) = attach_observer_channel();
+        let state = PresentationState::new(Rect::new(0, 0, 2, 1));
+        for _ in 0..3 {
+            publisher.publish(
+                Uuid::nil(),
+                state.prepare(Damage::Full, |_| {}).unwrap(),
+                &RetainedCompositor::new(),
+                &std::collections::BTreeMap::new(),
+            );
+        }
+        assert_eq!(observer.latest().unwrap().revision, 3);
+        assert_eq!(observer.latest().unwrap().epoch, observer.epoch());
+        drop(publisher);
+        assert!(observer.latest().is_none());
+        assert!(observer.receiver.has_changed().is_err());
+    }
+}

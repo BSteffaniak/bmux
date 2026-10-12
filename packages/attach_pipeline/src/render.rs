@@ -237,11 +237,80 @@ fn optimize_terminal_commands(commands: &[TerminalCommand]) -> Vec<TerminalComma
     optimized
 }
 
+fn capture_terminal_commands(commands: &[TerminalCommand]) {
+    if !crate::projection::capturing() {
+        return;
+    }
+    let bytes = commands
+        .iter()
+        .map(|command| match command {
+            TerminalCommand::Print(text) => text.len(),
+            _ => 0,
+        })
+        .fold(0_usize, usize::saturating_add);
+    if bytes > 16 * 1024 * 1024 || commands.len() > 131_072 {
+        crate::projection::record(crate::projection::PaintOperation::Unsupported);
+        return;
+    }
+    for operation in terminal_command_operations(commands) {
+        crate::projection::record(operation);
+    }
+}
+
+fn terminal_command_operations(
+    commands: &[TerminalCommand],
+) -> Vec<crate::projection::PaintOperation> {
+    let bytes = commands
+        .iter()
+        .map(|command| match command {
+            TerminalCommand::Print(text) => text.len(),
+            _ => 0,
+        })
+        .fold(0_usize, usize::saturating_add);
+    if bytes > 16 * 1024 * 1024 || commands.len() > 131_072 {
+        return vec![crate::projection::PaintOperation::Unsupported];
+    }
+    let mut operations = Vec::new();
+    let mut x = 0_u16;
+    let mut y = 0_u16;
+    let mut style = RenderStyle::default();
+    for command in commands {
+        match command {
+            TerminalCommand::MoveTo {
+                x: next_x,
+                y: next_y,
+            } => {
+                x = *next_x;
+                y = *next_y;
+            }
+            TerminalCommand::ApplyStyle(next) => style = *next,
+            TerminalCommand::ResetStyle => style = RenderStyle::default(),
+            TerminalCommand::Print(text) => {
+                operations.push(crate::projection::PaintOperation::Text {
+                    x,
+                    y,
+                    text: text.clone(),
+                    style: crate::projection::style(style),
+                });
+                x = x.saturating_add(render_text_width_u16(text));
+            }
+            TerminalCommand::EraseCells { x, y, width, style } => {
+                operations.push(crate::projection::PaintOperation::Fill {
+                    rect: bmux_tui::geometry::Rect::new(*x, *y, *width, 1),
+                    style: crate::projection::style(*style),
+                });
+            }
+        }
+    }
+    operations
+}
+
 fn queue_terminal_commands<W: io::Write>(
     stdout: &mut W,
     commands: &[TerminalCommand],
 ) -> Result<bool> {
     let commands = optimize_terminal_commands(commands);
+    capture_terminal_commands(&commands);
     for command in &commands {
         match command {
             TerminalCommand::MoveTo { x, y } => {
@@ -1208,6 +1277,38 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
 ) -> Result<bool> {
     if !terminal_graphic_can_render(capabilities) {
         return Ok(false);
+    }
+    if crate::projection::capturing() {
+        if u64::from(graphic.pixel_width) * u64::from(graphic.pixel_height)
+            > crate::projection_images::MAX_IMAGE_PIXELS
+        {
+            crate::projection::record(crate::projection::PaintOperation::Unsupported);
+        } else {
+            crate::projection::record(crate::projection::PaintOperation::Image(
+                bmux_tui::image::ImagePlacement {
+                    key: bmux_tui::image::ImageKey::new(format!("{surface_id}:{instance_key}")),
+                    payload: bmux_tui::image::ImagePayload::Pixels {
+                        bytes: terminal_graphic_pixels(graphic),
+                        width: graphic.pixel_width,
+                        height: graphic.pixel_height,
+                        format: bmux_tui::image::ImagePixelFormat::Rgba8,
+                    },
+                    destination: bmux_tui::geometry::Rect::new(
+                        graphic.cell_rect.x,
+                        graphic.cell_rect.y,
+                        graphic.cell_rect.w,
+                        graphic.cell_rect.h,
+                    ),
+                    clip: bmux_tui::geometry::Rect::new(
+                        graphic.cell_rect.x,
+                        graphic.cell_rect.y,
+                        graphic.cell_rect.w,
+                        graphic.cell_rect.h,
+                    ),
+                    lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+                },
+            ));
+        }
     }
     let source = terminal_graphic_source_signature(graphic);
     let placement = terminal_graphic_placement_signature(graphic);
@@ -2656,6 +2757,15 @@ pub fn queue_layer_fill<W: io::Write>(stdout: &mut W, surface: AttachLayerSurfac
         .y
         .saturating_add(surface.content_rect.h);
     for y in start_y..end_y {
+        crate::projection::record(crate::projection::PaintOperation::Fill {
+            rect: bmux_tui::geometry::Rect::new(
+                surface.content_rect.x,
+                y,
+                surface.content_rect.w,
+                1,
+            ),
+            style: bmux_tui::style::Style::new(),
+        });
         queue!(stdout, MoveTo(surface.content_rect.x, y), Print(&fill))
             .with_context(|| format!("failed filling {:?} layer row", surface.layer))?;
     }
@@ -2922,6 +3032,15 @@ fn render_grid_row_segment(
     start_col: u16,
     end_col: u16,
 ) -> String {
+    resolve_grid_row_segment(context, start_col, end_col).0
+}
+
+fn resolve_grid_row_segment(
+    context: GridRowRenderContext<'_>,
+    start_col: u16,
+    end_col: u16,
+) -> (String, Vec<(u16, String, CellStyle)>) {
+    let mut resolved = Vec::new();
     let mut line = String::new();
     let mut current = CellStyle::default();
     let mut emitted_cols = 0_usize;
@@ -2934,35 +3053,20 @@ fn render_grid_row_segment(
         });
         let selected = cell_selected(context.selection, context.selection_line, usize::from(col));
         let coverage = pane_cell_coverage(cell, raw_style, selected);
-        if let Some(under_cell) = context.before_content_cells.get(&col) {
-            match coverage {
-                CellCoverage::Transparent => {
-                    let style =
-                        apply_content_effects(CellStyle::default(), context.runtime_appearance);
-                    push_under_cell_with_background(
-                        &mut line,
-                        &mut current,
-                        under_cell,
-                        (!matches!(style.bg, CellColor::Default)).then_some(style.bg),
-                    );
-                    emitted_cols = emitted_cols.saturating_add(1);
-                    col = col.saturating_add(1);
-                    continue;
-                }
-                CellCoverage::BackgroundOnly => {
-                    let style = apply_content_effects(raw_style, context.runtime_appearance);
-                    push_under_cell_with_background(
-                        &mut line,
-                        &mut current,
-                        under_cell,
-                        Some(style.bg),
-                    );
-                    emitted_cols = emitted_cols.saturating_add(1);
-                    col = col.saturating_add(1);
-                    continue;
-                }
-                CellCoverage::Opaque => {}
-            }
+        if let Some(under_cell) = context.before_content_cells.get(&col)
+            && !matches!(coverage, CellCoverage::Opaque)
+        {
+            let background = apply_content_effects(raw_style, context.runtime_appearance).bg;
+            push_under_cell_with_background(
+                &mut line,
+                &mut current,
+                under_cell,
+                (!matches!(background, CellColor::Default)).then_some(background),
+            );
+            resolved.push((col, under_cell.ch.to_string(), current));
+            emitted_cols = emitted_cols.saturating_add(1);
+            col = col.saturating_add(1);
+            continue;
         }
 
         let mut style = raw_style;
@@ -2978,6 +3082,7 @@ fn render_grid_row_segment(
         if let Some(cell) = cell {
             if cell.is_wide_continuation() {
                 line.push(' ');
+                resolved.push((col, " ".to_string(), style));
                 emitted_cols = emitted_cols.saturating_add(1);
                 col = col.saturating_add(1);
                 continue;
@@ -2988,6 +3093,7 @@ fn render_grid_row_segment(
                 cell.text()
             };
             line.push_str(text);
+            resolved.push((col, text.to_string(), style));
             emitted_cols = emitted_cols.saturating_add(UnicodeWidthStr::width(text).max(1));
             col = col.saturating_add(u16::from(cell.width()).max(1));
         } else {
@@ -2996,6 +3102,7 @@ fn render_grid_row_segment(
             } else {
                 1
             };
+            resolved.push((col, " ".repeat(usize::from(run_width)), style));
             line.push_str(&" ".repeat(usize::from(run_width)));
             emitted_cols = emitted_cols.saturating_add(usize::from(run_width));
             col = col.saturating_add(run_width);
@@ -3016,12 +3123,49 @@ fn render_grid_row_segment(
             line.push_str(&style_sgr(style));
             current = style;
         }
+        resolved.push((
+            start_col.saturating_add(u16::try_from(emitted_cols).unwrap_or(u16::MAX)),
+            " ".repeat(target_cols - emitted_cols),
+            style,
+        ));
         line.push_str(&" ".repeat(target_cols - emitted_cols));
     }
     if current != CellStyle::default() {
         line.push_str("\x1b[0m");
     }
-    line
+    (line, resolved)
+}
+
+fn capture_grid_row(context: GridRowRenderContext<'_>, x: u16, y: u16, start: u16, end: u16) {
+    if !crate::projection::capturing() {
+        return;
+    }
+    for (col, text, style) in resolve_grid_row_segment(context, start, end).1 {
+        crate::projection::record(crate::projection::PaintOperation::Text {
+            x: x.saturating_add(col),
+            y,
+            text,
+            style: cell_style_to_tui(style),
+        });
+    }
+}
+
+fn cell_style_to_tui(value: CellStyle) -> bmux_tui::style::Style {
+    let color = |value| match value {
+        CellColor::Default => Some(RenderColor::Default),
+        CellColor::Indexed(index) => Some(RenderColor::Indexed(index)),
+        CellColor::Rgb(r, g, b) => Some(RenderColor::Rgb { r, g, b }),
+    };
+    crate::projection::style(RenderStyle {
+        fg: color(value.fg),
+        bg: color(value.bg),
+        bold: value.bold,
+        dim: value.dim,
+        italic: value.italic,
+        underline: value.underline,
+        reverse: value.inverse,
+        ..RenderStyle::default()
+    })
 }
 
 fn before_content_row_cells(
@@ -4211,6 +4355,53 @@ fn record_after_content_extension_ops(
     }
 }
 
+fn execute_imperative_extension<W: io::Write>(
+    stdout: &mut W,
+    plan: &AfterContentExtensionOutputPlan,
+    context: &RenderExtensionContext,
+) {
+    crate::projection::record(crate::projection::PaintOperation::Unsupported);
+    let snapshot = &plan.snapshot;
+    let writer: &mut dyn io::Write = stdout;
+    if let Err(error) = snapshot.extension.render_layer_surface_with_context(
+        writer,
+        snapshot.surface_id,
+        &snapshot.surface_rect,
+        &snapshot.render_damage,
+        snapshot.layer,
+        context,
+    ) {
+        tracing::warn!(extension = snapshot.extension.name(), %error, "render extension render_surface failed");
+    }
+}
+
+fn cache_neutral_extension(
+    buffer: &mut PaneRenderBuffer,
+    plan: &AfterContentExtensionOutputPlan,
+    output: &RenderOpsOutputPlan,
+) {
+    buffer.extension_projection_cache.insert(
+        plan.cache_key.clone(),
+        terminal_command_operations(&output.commands),
+    );
+}
+
+fn capture_cached_extension(
+    plan: &AfterContentExtensionOutputPlan,
+    buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
+) {
+    if let Some(operations) = buffers
+        .get(&plan.snapshot.pane_id)
+        .and_then(|buffer| buffer.extension_projection_cache.get(&plan.cache_key))
+    {
+        for operation in operations {
+            crate::projection::record_borrowed(operation);
+        }
+    } else {
+        crate::projection::record(crate::projection::PaintOperation::Unsupported);
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Executes one planned after-content action with frame-local mutable resources.
 fn execute_after_content_extension_output_plan<W: io::Write>(
     stdout: &mut W,
@@ -4243,9 +4434,12 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
             );
             Ok(())
         }
-        AfterContentExtensionOutputAction::CachedReplay { bytes } => stdout
-            .write_all(bytes)
-            .context("failed replaying cached declarative render ops"),
+        AfterContentExtensionOutputAction::CachedReplay { bytes } => {
+            capture_cached_extension(plan, pane_buffers);
+            stdout
+                .write_all(bytes)
+                .context("failed replaying cached declarative render ops")
+        }
         AfterContentExtensionOutputAction::RenderItems { items } => {
             if let Err(err) = queue_render_items_for_frame(
                 stdout,
@@ -4277,6 +4471,7 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
                     if let Some(revision) = snapshot.revision
                         && let Some(buffer) = pane_buffers.get_mut(&snapshot.pane_id)
                     {
+                        cache_neutral_extension(buffer, plan, output_plan);
                         buffer.extension_render_cache.insert(
                             plan.cache_key.clone(),
                             ExtensionRenderCacheEntry {
@@ -4301,25 +4496,7 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
             Ok(())
         }
         AfterContentExtensionOutputAction::Imperative => {
-            // Re-bind through `&mut dyn io::Write` so the extension trait's
-            // object-safe signature sees a dyn writer regardless of the
-            // concrete `W` the caller passed.
-            let dyn_writer: &mut dyn io::Write = stdout;
-            if let Err(err) = snapshot.extension.render_layer_surface_with_context(
-                dyn_writer,
-                snapshot.surface_id,
-                &snapshot.surface_rect,
-                &snapshot.render_damage,
-                snapshot.layer,
-                render_context,
-            ) {
-                tracing::warn!(
-                    extension = snapshot.extension.name(),
-                    surface_id = %snapshot.surface_id,
-                    error = %err,
-                    "render extension render_surface failed",
-                );
-            }
+            execute_imperative_extension(stdout, plan, render_context);
             Ok(())
         }
     }
@@ -5307,6 +5484,9 @@ fn queue_pane_content_for_surface<W: io::Write>(
             }
         }
         if !stage.content_damage.requires_redraw() || stage.sync_deferred {
+            if stage.sync_deferred {
+                crate::projection::record(crate::projection::PaintOperation::Unsupported);
+            }
             if stage.sync_deferred
                 && let Some(stats) = render_stats.as_deref_mut()
             {
@@ -5425,6 +5605,34 @@ fn queue_pane_content_for_surface<W: io::Write>(
                 } else {
                     PaneContentRowOutputPlan::cache_skip(row_u16, line)
                 };
+                if crate::projection::capturing() {
+                    let blank = PhysicalRow::new();
+                    let context = GridRowRenderContext {
+                        row: grid_rows.get(row).unwrap_or(&blank),
+                        selection,
+                        selection_line: viewport_base.line_for_viewport_row(row),
+                        runtime_appearance: stage.runtime_appearance,
+                        palette: entry.scrollback_palette(scrollback.as_ref()),
+                        before_content_cells: &before_cells,
+                    };
+                    match &row_plan.action {
+                        PaneContentRowOutputAction::Full { width } => {
+                            capture_grid_row(context, stage.content.x, y, 0, *width);
+                        }
+                        PaneContentRowOutputAction::Segments { segments } => {
+                            for segment in segments {
+                                capture_grid_row(
+                                    context,
+                                    stage.content.x,
+                                    y,
+                                    segment.start_col,
+                                    segment.start_col.saturating_add(segment.width),
+                                );
+                            }
+                        }
+                        PaneContentRowOutputAction::CacheSkip => {}
+                    }
+                }
                 execute_pane_content_row_output_plan(
                     stdout,
                     stage.content.x,

@@ -14,6 +14,7 @@ use crate::style::Style;
 
 /// Stable caller-owned identifier for a selection scope.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectionScopeId(String);
 
 impl SelectionScopeId {
@@ -44,6 +45,7 @@ impl From<String> for SelectionScopeId {
 
 /// Stable caller-owned identifier for logical selectable content.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectionContentId(String);
 
 impl SelectionContentId {
@@ -74,6 +76,7 @@ impl From<String> for SelectionContentId {
 
 /// Stable caller-owned identifier for one rendered selection fragment.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectionFragmentId(String);
 
 impl SelectionFragmentId {
@@ -104,6 +107,7 @@ impl From<String> for SelectionFragmentId {
 
 /// Whether pointer-down inside a scope may lock that scope.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SelectionCapture {
     /// Lock this scope when it is the deepest eligible scope.
     #[default]
@@ -134,6 +138,7 @@ pub enum SelectionScrollDirection {
 
 /// Generic edge-autoscroll policy for one scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectionAutoScrollPolicy {
     /// Whether edge autoscroll is enabled.
     pub enabled: bool,
@@ -169,6 +174,7 @@ impl Default for SelectionAutoScrollPolicy {
 
 /// One hierarchical selection scope in a committed scene.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectionScope {
     /// Stable scope identity.
     pub id: SelectionScopeId,
@@ -265,6 +271,7 @@ pub enum SelectionGranularity {
 
 /// One visible grapheme or semantic visual unit mapped to source bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectionFragment {
     /// Stable fragment identity within the rendered content revision.
     pub id: SelectionFragmentId,
@@ -562,6 +569,7 @@ impl std::error::Error for SelectionSceneError {}
 
 /// Hierarchical selectable geometry belonging to one rendered frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SelectionScene {
     scopes: Vec<SelectionScope>,
     fragments: Vec<SelectionFragment>,

@@ -5,6 +5,7 @@ pub mod events;
 pub mod input;
 pub mod layout;
 mod local_presentation;
+pub mod observer;
 pub mod prompt_ui;
 pub mod provider;
 pub mod render;

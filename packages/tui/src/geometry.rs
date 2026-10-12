@@ -2,6 +2,7 @@
 
 /// A terminal-space point measured in cells.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Point {
     /// Zero-based column.
     pub x: u16,
@@ -19,6 +20,7 @@ impl Point {
 
 /// A terminal-space size measured in cells.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Size {
     /// Width in terminal columns.
     pub width: u16,
@@ -91,6 +93,7 @@ impl Insets {
 
 /// A terminal-space rectangle measured in cells.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Rect {
     /// Left column.
     pub x: u16,

@@ -3162,6 +3162,7 @@ allow_hyphen_values=true
                         target: Some(ref target),
                         follow: None,
                         global: false,
+                        ..
                     }) if target == "dev"
                 ));
             }

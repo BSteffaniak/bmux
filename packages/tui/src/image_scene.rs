@@ -6,6 +6,7 @@ use crate::image::{ImageContribution, ImageKey, ImageLifecycle, ImagePlacement};
 
 /// Changes produced by reconciling one rendered frame with the active image scene.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageSceneDelta {
     /// Images newly added or changed by this frame, in stable key order.
     pub upserted: Vec<ImagePlacement>,
@@ -15,6 +16,7 @@ pub struct ImageSceneDelta {
 
 /// Active protocol-neutral image scene retained across rendered frames.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageScene {
     active: BTreeMap<ImageKey, ImagePlacement>,
 }

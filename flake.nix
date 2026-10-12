@@ -55,6 +55,7 @@
             "aarch64-linux-android"
             "x86_64-linux-android"
             "armv7-linux-androideabi"
+            "wasm32-unknown-unknown"
           ];
         };
       in

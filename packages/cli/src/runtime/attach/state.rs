@@ -240,6 +240,7 @@ impl AttachDirtyFlags {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
+    pub(super) observer: Option<super::observer::AttachObserverPublisher>,
     pub async_services: Option<bmux_plugin::AsyncServiceClient>,
     pub presentation_events: std::sync::Arc<bmux_plugin::EventBus>,
     pub presentation_extensions: std::sync::Arc<bmux_plugin::RenderExtensionRegistry>,
@@ -590,6 +591,12 @@ pub struct AttachMouseResizeAxisDrag {
 }
 
 impl AttachViewState {
+    /// Bind the explicitly authorized observer to this view, never a global registry.
+    pub fn set_observer(&mut self, publisher: super::observer::AttachObserverPublisher) {
+        self.observer = Some(publisher);
+        self.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
+    }
+
     /// Start with independently owned retained presentation resources.
     pub fn with_private_presentation(attach_info: bmux_client::AttachOpenInfo) -> Self {
         let mut state = Self::new(attach_info);
@@ -608,6 +615,7 @@ impl AttachViewState {
     }
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
+            observer: None,
             async_services: None,
             presentation_events: bmux_plugin::global_event_bus(),
             presentation_extensions: bmux_plugin::global_render_extension_registry(),
@@ -774,6 +782,11 @@ impl AttachViewState {
     /// Live images must never be projected over captured historical text.
     /// Historical graphics need their own capture-bound viewport projection;
     /// absence of that projection is not permission to substitute live images.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
     #[must_use]
     pub fn presented_images(
         &self,
@@ -791,6 +804,11 @@ impl AttachViewState {
 
     /// Whether the selected presentation contains graphics, including immutable
     /// history windows after live image deletion. Used for raster damage repair.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
     #[must_use]
     pub fn has_presented_images(&self) -> bool {
         self.pane_images

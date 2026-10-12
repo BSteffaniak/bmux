@@ -1,0 +1,30 @@
+[package]
+authors     = { workspace = true }
+categories  = ["network-programming"]
+description = "Bounded domain-neutral read-only loopback browser snapshot hosting"
+edition     = { workspace = true }
+keywords    = ["bmux", "browser", "loopback", "snapshot"]
+license     = { workspace = true }
+name        = "bmux_web_host"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+getrandom = "0.3.4"
+libc = { workspace = true }
+tokio = { workspace = true, features = [
+    "io-util",
+    "net",
+    "rt",
+    "sync",
+    "time",
+    "macros",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -15,6 +15,7 @@ use crate::text::Line;
 
 /// Cursor requested by a rendered frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cursor {
     /// Cursor position.
     pub position: Point,
