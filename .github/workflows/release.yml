@@ -91,12 +91,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build bmux CLI
-        run: cargo build --release --target ${{ matrix.target }} -p bmux_cli
-
-      - name: Build declared auxiliary executables and release installer
+      - name: Build complete bmux product
         shell: bash
-        run: cargo xtask auxiliary build --target '${{ matrix.target }}'
+        run: cargo xtask build --profile release --target '${{ matrix.target }}'
 
       - name: Prepare archive
         shell: bash
@@ -174,11 +171,8 @@ jobs:
           curl -fsSL https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_Linux_x86_64.tar.gz | tar -xz
           sudo mv nfpm /usr/local/bin/nfpm
 
-      - name: Build bmux binary
-        run: cargo build --release --target ${{ matrix.target }} -p bmux_cli
-
-      - name: Build declared auxiliary executables and release installer
-        run: cargo xtask auxiliary build --target '${{ matrix.target }}'
+      - name: Build complete bmux product
+        run: cargo xtask build --profile release --target '${{ matrix.target }}'
 
       - name: Stage distribution
         shell: bash

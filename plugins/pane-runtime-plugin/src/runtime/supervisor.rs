@@ -102,6 +102,26 @@ pub(super) fn install_test_artifact() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Ordinary terminals have no durable supervision promise. Managed executions
+// must fail before spawn instead of silently weakening their lifecycle contract.
+pub(super) fn select_backend(
+    preparation: anyhow::Result<(SupervisorControl, portable_pty::CommandBuilder)>,
+    required: bool,
+) -> anyhow::Result<Option<SupervisorControl>> {
+    match preparation {
+        Ok((control, _)) => Ok(Some(control)),
+        Err(error) if required => Err(error),
+        Err(error) => {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(%error, "supervisor unavailable; ordinary terminals use direct PTYs without durable supervision or application resurrection");
+            }
+            Ok(None)
+        }
+    }
+}
+
 pub(super) struct SupervisorControl {
     directory: PathBuf,
     token: String,

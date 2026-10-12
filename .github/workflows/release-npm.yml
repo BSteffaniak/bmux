@@ -84,12 +84,9 @@ jobs:
         with:
           key: npm-${{ matrix.target }}
 
-      - name: Build CLI binary
-        run: cargo build --release --target ${{ matrix.target }} -p bmux_cli
-
-      - name: Build declared auxiliary executables and release installer
+      - name: Build complete bmux product
         shell: bash
-        run: cargo xtask auxiliary build --target '${{ matrix.target }}'
+        run: cargo xtask build --profile release --target '${{ matrix.target }}'
 
       - name: Stage distribution
         shell: bash

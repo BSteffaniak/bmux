@@ -25,9 +25,10 @@ Install Git, Nix, and a native build toolchain. macOS and Linux are primary term
 git clone https://github.com/BSteffaniak/bmux.git
 cd bmux
 nix develop
-cargo build --locked --release -p bmux_cli --bin bmux
-"$CARGO_TARGET_DIR/release/bmux" --help
-"$CARGO_TARGET_DIR/release/bmux"
+cargo xtask build --profile release
+TARGET="$(rustc -vV | awk '/^host:/ { print $2 }')"
+"$CARGO_TARGET_DIR/$TARGET/release/bmux" --help
+"$CARGO_TARGET_DIR/$TARGET/release/bmux"
 ```
 
 On Windows, use `target\release\bmux.exe`. Use the built binary's full path, or add its directory to `PATH` before using the examples below.

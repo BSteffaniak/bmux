@@ -5824,7 +5824,43 @@ impl SessionRuntimeManager {
             };
 
             let managed_program = execution_for_task.managed_program.load(Ordering::SeqCst);
-            let application_resume = if managed_program
+            let token = resurrection_state_for_reader
+                .lock()
+                .expect("execution identity lock")
+                .observation_execution;
+            // Select the backend before either backend can launch a product.
+            // A failed/uncertain guardian launch must never retry a direct shell.
+            #[cfg(test)]
+            let preparation = if execution_for_task
+                .inject_missing_supervisor
+                .load(Ordering::SeqCst)
+            {
+                Err(anyhow::anyhow!(
+                    "execution supervisor helper artifact is unavailable"
+                ))
+            } else {
+                supervisor::SupervisorControl::prepare(token)
+            };
+            #[cfg(not(test))]
+            let preparation = supervisor::SupervisorControl::prepare(token);
+            let supervisor_control =
+                match supervisor::select_backend(preparation, managed_program || program_execution)
+                {
+                    Ok(control) => control.map(Arc::new),
+                    Err(error) => {
+                        fail_startup!(format!("durable supervision unavailable: {error}"));
+                        return;
+                    }
+                };
+            if supervisor_control.is_none() {
+                let mut state = resurrection_state_for_reader
+                    .lock()
+                    .expect("execution identity lock");
+                state.close_launch();
+                state.execution_token = None;
+            }
+            let application_resume = if supervisor_control.is_none()
+                || managed_program
                 || (launch.is_none()
                     && !matches!(
                         shell_kind_for_path(&shell),
@@ -5950,18 +5986,6 @@ impl SessionRuntimeManager {
                 fail_startup!(format!("prepared execution command invalid: {error}"));
                 return;
             }
-            let token = resurrection_state_for_reader
-                .lock()
-                .expect("execution identity lock")
-                .observation_execution;
-            let control = match supervisor::SupervisorControl::prepare(token) {
-                Ok((control, _helper)) => control,
-                Err(error) => {
-                    fail_startup!(format!("guardian preparation failed: {error}"));
-                    return;
-                }
-            };
-            let supervisor_control = Some(Arc::new(control));
             // PTY allocation and command preparation may have overlapped an
             // abandoned request. Check again at the process side-effect boundary.
             if startup_stop_requested(&mut stop_rx) {
@@ -6045,7 +6069,13 @@ impl SessionRuntimeManager {
                     None => Err(anyhow::anyhow!("terminal slave path unavailable")),
                 }
             } else {
-                pty_pair.slave.spawn_command(command).map(StartupChild::new)
+                match execution_for_task.authorize_spawn() {
+                    Ok(()) => {
+                        launch_attempted.store(true, Ordering::SeqCst);
+                        pty_pair.slave.spawn_command(command).map(StartupChild::new)
+                    }
+                    Err(error) => Err(error),
+                }
             };
             let mut child = match spawned {
                 Ok(child) => child,
@@ -6058,7 +6088,11 @@ impl SessionRuntimeManager {
                 }
             };
             child_spawned = true;
-            let mut target_pid = None;
+            let mut target_pid = if supervisor_control.is_none() {
+                child.process_id()
+            } else {
+                None
+            };
             if let Some(control) = &supervisor_control {
                 let startup_control = Arc::clone(control);
                 let authorization = Arc::clone(&execution_for_task);
@@ -11809,6 +11843,192 @@ pub fn activate_pane_runtime(config: PaneRuntimePluginConfig, padding_config: Pa
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_helper_still_starts_an_ordinary_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let shell = root.path().join("direct-shell");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\nread ready\npwd > witness\nprintf DIRECT\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let mut manager = SessionRuntimeManager::new(
+            shell.to_str().unwrap().into(),
+            "xterm-256color".into(),
+            protocol_profile_for_term("xterm-256color"),
+            true,
+            None,
+            PanePaddingConfig::default(),
+            exit_tx,
+        );
+        let session_id = SessionId(Uuid::new_v4());
+        let options = Some(
+            bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions {
+                cwd: Some(root.path().to_str().unwrap().into()),
+            },
+        );
+        let mut prepared = manager
+            .prepare_fresh_program_runtime(session_id, options, None, (17, 73))
+            .unwrap();
+        let pane = prepared
+            .runtime
+            .as_ref()
+            .unwrap()
+            .panes
+            .values()
+            .next()
+            .unwrap();
+        pane.execution
+            .inject_missing_supervisor
+            .store(true, Ordering::SeqCst);
+        let execution = Arc::clone(&pane.execution);
+        let _cleanup = ExecutionTestCleanup(Arc::clone(&execution));
+        prepared.wait_until_ready().await.unwrap();
+        manager
+            .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
+            .unwrap();
+        let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
+        pane.input_tx
+            .send(PaneRuntimeCommand::Input(b"\n".to_vec()))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pane.exited.load(Ordering::SeqCst)
+                || !execution.output_drained.load(Ordering::SeqCst)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(execution.supervisor.lock().unwrap().is_none());
+        assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
+        assert!(execution.output_watermark.load(Ordering::SeqCst) >= 6);
+        assert_eq!(*pane.last_requested_size.lock().unwrap(), (17, 73));
+        assert!(
+            pane.resurrection_state
+                .lock()
+                .unwrap()
+                .execution_token
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("witness"))
+                .unwrap()
+                .trim(),
+            root.path().to_str().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_helper_rejects_managed_program_before_spawn() {
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let manager = SessionRuntimeManager::new(
+            "/bin/sh".into(),
+            "xterm-256color".into(),
+            protocol_profile_for_term("xterm-256color"),
+            true,
+            None,
+            PanePaddingConfig::default(),
+            exit_tx,
+        );
+        let mut durable_request = manager
+            .prepare_fresh_program_runtime(
+                SessionId(Uuid::new_v4()),
+                None,
+                Some(PaneLaunchSpec {
+                    program: "/bin/sh".into(),
+                    args: vec![],
+                    cwd: None,
+                    env: BTreeMap::default(),
+                }),
+                (24, 80),
+            )
+            .unwrap();
+        let pane = durable_request
+            .runtime
+            .as_ref()
+            .unwrap()
+            .panes
+            .values()
+            .next()
+            .unwrap();
+        pane.execution
+            .inject_missing_supervisor
+            .store(true, Ordering::SeqCst);
+        let error = durable_request.wait_until_ready().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("durable supervision unavailable"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_terminal_accepts_input_resize_and_explicit_shutdown() {
+        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
+        let mut manager = SessionRuntimeManager::new(
+            "/bin/sh".into(),
+            "xterm-256color".into(),
+            protocol_profile_for_term("xterm-256color"),
+            true,
+            None,
+            PanePaddingConfig::default(),
+            exit_tx,
+        );
+        // Repeat to prove retiring a direct terminal does not poison later starts.
+        for _ in 0..2 {
+            let session_id = SessionId(Uuid::new_v4());
+            let mut prepared = manager
+                .prepare_fresh_program_runtime(session_id, None, None, (24, 80))
+                .unwrap();
+            let pane = prepared
+                .runtime
+                .as_ref()
+                .unwrap()
+                .panes
+                .values()
+                .next()
+                .unwrap();
+            pane.execution
+                .inject_missing_supervisor
+                .store(true, Ordering::SeqCst);
+            let execution = Arc::clone(&pane.execution);
+            let _cleanup = ExecutionTestCleanup(Arc::clone(&execution));
+            prepared.wait_until_ready().await.unwrap();
+            manager
+                .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
+                .unwrap();
+            let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
+            pane.resize_pty(31, 91);
+            assert_eq!(*pane.last_requested_size.lock().unwrap(), (31, 91));
+            pane.input_tx
+                .send(PaneRuntimeCommand::Input(b"printf DIRECT_INPUT\n".to_vec()))
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while execution.output_watermark.load(Ordering::SeqCst) < 12 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(execution.supervisor.lock().unwrap().is_none());
+            assert!(!pane.exited.load(Ordering::SeqCst));
+            let removed = manager.remove_runtime(session_id).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), shutdown_runtime_handle(removed))
+                .await
+                .unwrap();
+            assert!(execution.output_drained.load(Ordering::SeqCst));
+            assert!(!execution.cleanup_failed.load(Ordering::SeqCst));
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn program_first_pane_captures_fast_literal_argv_and_drains() {
         supervisor::install_test_artifact()
@@ -11829,7 +12049,12 @@ mod tests {
                 session_id,
                 None,
                 Some(PaneLaunchSpec {
-                    program: "/usr/bin/printf".into(),
+                    program: std::env::split_paths(&std::env::var_os("PATH").unwrap())
+                        .map(|directory| directory.join("printf"))
+                        .find(|path| path.is_file())
+                        .expect("coreutils printf on the Nix development PATH")
+                        .to_string_lossy()
+                        .into_owned(),
                     args: vec!["%s".into(), "literal;$(no-shell)".into()],
                     cwd: None,
                     env: BTreeMap::new(),
@@ -12230,13 +12455,21 @@ exit 7"#
         };
         // Conventional terminal lifetime ends independently of escaped work.
         // Retirement revokes controls; it never authorizes a remembered PGID kill.
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let natural_cleanup = tokio::time::timeout(Duration::from_secs(5), async {
             while !matches!(&*pane.cleanup.borrow(), Some(Ok(()))) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("natural terminal EOF and owner retirement");
+        .await;
+        assert!(
+            natural_cleanup.is_ok(),
+            "natural terminal EOF and owner retirement: ended={} retired={} drained={} outcome={:?} cleanup={:?}",
+            pane.execution.terminal_session_ended.load(Ordering::SeqCst),
+            pane.execution.terminal_owner_retired.load(Ordering::SeqCst),
+            pane.execution.output_drained.load(Ordering::SeqCst),
+            pane.execution.outcome.lock().unwrap(),
+            pane.cleanup.borrow()
+        );
         assert!(pane.execution.terminal_session_ended.load(Ordering::SeqCst));
         assert!(pane.execution.terminal_owner_retired.load(Ordering::SeqCst));
         assert!(pane.execution.output_drained.load(Ordering::SeqCst));

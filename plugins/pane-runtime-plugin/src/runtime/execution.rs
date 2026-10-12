@@ -32,6 +32,8 @@ pub(super) struct ExecutionCapture {
     pub(super) terminal_session_ended: AtomicBool,
     pub(super) terminal_owner_retired: AtomicBool,
     #[cfg(test)]
+    pub(super) inject_missing_supervisor: AtomicBool,
+    #[cfg(test)]
     pub(super) inject_reader_failure: AtomicBool,
     pub(super) durable_capture: Mutex<Option<super::durable_capture::DurableCapture>>,
     pub(super) master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
@@ -57,6 +59,8 @@ impl Default for ExecutionCapture {
             managed_program: AtomicBool::new(false),
             terminal_session_ended: AtomicBool::new(false),
             terminal_owner_retired: AtomicBool::new(false),
+            #[cfg(test)]
+            inject_missing_supervisor: AtomicBool::new(false),
             #[cfg(test)]
             inject_reader_failure: AtomicBool::new(false),
             durable_capture: Mutex::new(None),

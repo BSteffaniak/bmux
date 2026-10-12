@@ -158,6 +158,24 @@ fn declaration_rejects_unsafe_duplicate_reserved_unknown_and_zero_protocol() {
 }
 
 #[test]
+fn missing_declared_helper_prevents_product_stage_publication() {
+    let root = root();
+    let (build, declarations) = fixture(root.path());
+    fs::remove_file(build.join("fixture-helper")).unwrap();
+    let destination = root.path().join("incomplete");
+    assert!(
+        artifacts::stage(
+            &build,
+            &destination,
+            "x86_64-unknown-linux-gnu",
+            &declarations
+        )
+        .is_err()
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
 fn corrupt_and_missing_artifacts_never_publish_partial_installations() {
     let root = root();
     let stage = staged(root.path());

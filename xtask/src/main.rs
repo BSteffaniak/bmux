@@ -1,8 +1,9 @@
 //! Repository tasks, deliberately outside build.rs and the runtime.
 mod artifacts;
+mod build;
 
 use artifacts::{Result, error};
-use std::{collections::BTreeMap, env, path::PathBuf, process::Command};
+use std::{collections::BTreeMap, env, path::PathBuf};
 
 fn main() {
     let args = invocation_args(env::args().next().as_deref(), env::args().skip(1).collect());
@@ -26,7 +27,7 @@ fn invocation_args(executable: Option<&str>, mut args: Vec<String>) -> Vec<Strin
 fn run(args: Vec<String>) -> Result<()> {
     let Some(command) = args.first() else {
         return Err(error(
-            "usage: cargo xtask auxiliary {build,stage,nfpm} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
+            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] | auxiliary {build,stage,nfpm} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
         ));
     };
     let mut positional = Vec::new();
@@ -49,6 +50,7 @@ fn run(args: Vec<String>) -> Result<()> {
         }
     }
     let allowed: &[&str] = match command.as_str() {
+        "build" => &["--workspace", "--target", "--profile"],
         "auxiliary" => &[
             "--workspace",
             "--target",
@@ -66,6 +68,26 @@ fn run(args: Vec<String>) -> Result<()> {
     };
     if options.keys().any(|key| !allowed.contains(&key.as_str())) {
         return Err(error("unknown option"));
+    }
+    if command == "build" {
+        if !positional.is_empty() {
+            return Err(error("build takes no positional arguments"));
+        }
+        let workspace = options
+            .get("--workspace")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."));
+        let target = options
+            .get("--target")
+            .cloned()
+            .map_or_else(|| build::host_target(&workspace), Ok)?;
+        let profile = options.get("--profile").map_or("dev", String::as_str);
+        return build::run(
+            &workspace,
+            &target,
+            profile,
+            &artifacts::declarations(&workspace)?,
+        );
     }
     if command == "install" {
         let source = positional
@@ -113,47 +135,7 @@ fn run(args: Vec<String>) -> Result<()> {
                 .ok_or_else(|| error(format!("{name} is required")))
         };
         match positional[0].as_str() {
-            "build" => {
-                let status = Command::new("cargo")
-                    .args([
-                        "build",
-                        "--locked",
-                        "--release",
-                        "--target",
-                        target,
-                        "-p",
-                        "xtask",
-                        "--bin",
-                        "xtask",
-                    ])
-                    .current_dir(&workspace)
-                    .status()?;
-                if !status.success() {
-                    return Err(error("installer build failed"));
-                }
-                if unix {
-                    for item in declarations {
-                        let status = Command::new("cargo")
-                            .args([
-                                "build",
-                                "--locked",
-                                "--release",
-                                "--target",
-                                target,
-                                "-p",
-                                artifacts::field(&item, "cargo_package")?,
-                                "--bin",
-                                artifacts::field(&item, "cargo_binary")?,
-                            ])
-                            .current_dir(&workspace)
-                            .status()?;
-                        if !status.success() {
-                            return Err(error("auxiliary build failed"));
-                        }
-                    }
-                }
-                Ok(())
-            }
+            "build" => build::run(&workspace, target, "release", &declarations),
             "stage" => artifacts::stage(
                 &required("--artifact-dir")?,
                 &required("--destination")?,

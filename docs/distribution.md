@@ -60,6 +60,21 @@ basenames, never traversal paths. Duplicate destinations fail the release.
 The pane plugin owns `bmux-pane-execution-supervisor`; release infrastructure does
 not special-case its domain or protocol.
 
+`cargo xtask build` is the canonical product build: the CLI, installer, and all
+supported manifest-declared helpers are built in one Cargo invocation with the
+same target and profile. The default profile is `dev`; use `--profile release`
+for distribution. `--target` defaults to the compiler host triple. Outputs live
+under `$CARGO_TARGET_DIR/$TARGET/$PROFILE` (`dev` uses `debug`). Raw package-only
+Cargo builds are partial builds, not complete product installations.
+
+`cargo xtask auxiliary build --target TARGET` remains a release-profile alias for
+the complete product build. Staging and installation verify the complete bundle.
+
+Ordinary shells use direct PTYs when the supervisor is unavailable. They do not
+claim durable supervision or application resurrection. Managed terminal
+executions fail before launch if their required supervisor is unavailable;
+failed guardian launches are never retried as direct executions.
+
 `cargo xtask auxiliary` discovers these manifests, builds each
 specified Cargo binary for the release target, and stages the exact build outputs
 alongside BMUX. It does not resolve a binary from PATH, a previous installation,
