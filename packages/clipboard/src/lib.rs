@@ -946,7 +946,16 @@ mod tests {
             if std::env::var_os("BMUX_CLIPBOARD_TEST_NO_DISCOVERY").is_some() {
                 assert!(super::recovered_wayland_display().is_none());
             } else {
-                super::copy_text("scrollback text\n").expect("recovered clipboard command");
+                // Exercise Wayland recovery explicitly even on macOS, where
+                // copy_text correctly selects pbcopy instead of this fixture.
+                super::run_copy_command(
+                    super::ClipboardCommand {
+                        program: "wl-copy",
+                        args: &[],
+                    },
+                    "scrollback text\n",
+                )
+                .expect("recovered clipboard command");
                 assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
             }
             return;
