@@ -35,6 +35,9 @@ pub(super) struct ExecutionCapture {
     pub(super) inject_missing_supervisor: AtomicBool,
     #[cfg(test)]
     pub(super) inject_reader_failure: AtomicBool,
+    pub(super) capture_order: Mutex<()>,
+    projection_progress: Mutex<u64>,
+    projection_changed: std::sync::Condvar,
     pub(super) durable_capture: Mutex<Option<super::durable_capture::DurableCapture>>,
     pub(super) master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
     pub(super) output_drained: AtomicBool,
@@ -63,6 +66,9 @@ impl Default for ExecutionCapture {
             inject_missing_supervisor: AtomicBool::new(false),
             #[cfg(test)]
             inject_reader_failure: AtomicBool::new(false),
+            capture_order: Mutex::new(()),
+            projection_progress: Mutex::new(0),
+            projection_changed: std::sync::Condvar::new(),
             durable_capture: Mutex::new(None),
             master: Mutex::new(None),
             output_drained: AtomicBool::new(false),
@@ -77,6 +83,37 @@ impl Default for ExecutionCapture {
 }
 
 impl ExecutionCapture {
+    // Resize freezes capture publication, then waits without holding parser locks.
+    // The bounded capture queue can drain while no new bytes enter its boundary.
+    pub(super) fn wait_for_projection(&self, boundary: u64) -> std::io::Result<()> {
+        let progress = self
+            .projection_progress
+            .lock()
+            .map_err(|_| std::io::Error::other("projection progress lock poisoned"))?;
+        let (progress, _) = self
+            .projection_changed
+            .wait_timeout_while(progress, std::time::Duration::from_secs(2), |progress| {
+                *progress < boundary
+            })
+            .map_err(|_| std::io::Error::other("projection progress lock poisoned"))?;
+        if *progress < boundary {
+            return Err(std::io::Error::other(
+                "output projection did not reach resize boundary",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn commit_projection(&self) -> std::io::Result<()> {
+        let mut progress = self
+            .projection_progress
+            .lock()
+            .map_err(|_| std::io::Error::other("projection progress lock poisoned"))?;
+        *progress = self.output_watermark.load(Ordering::SeqCst);
+        self.projection_changed.notify_all();
+        Ok(())
+    }
+
     pub(super) fn interrupt_lifecycle(&self) {
         #[cfg(unix)]
         if let Ok(socket) = self.lifecycle_interrupter.lock()
@@ -707,6 +744,9 @@ pub(crate) fn resize(reference: &ExecutionRef, cols: u16, rows: u16) -> Result<(
         let permit = Arc::clone(&pane.execution.admission)
             .try_acquire_owned()
             .map_err(failed)?;
+        if *pane.last_requested_size.lock().map_err(failed)? == (rows, cols) {
+            return Ok(());
+        }
         let geometry_revision = pane.execution.geometry_revision.load(Ordering::SeqCst);
         pane.resize_pty_admitted(rows, cols, Some(permit));
         if pane.execution.geometry_revision.load(Ordering::SeqCst) == geometry_revision
@@ -973,6 +1013,41 @@ fn install_reserved_capture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resize_barrier_waits_for_committed_projection_not_capture_or_early_watermark() {
+        let execution = std::sync::Arc::new(super::ExecutionCapture::default());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::sync::Arc::clone(&execution);
+        let thread = std::thread::spawn(move || {
+            let _order = worker.capture_order.lock().unwrap();
+            started_tx.send(()).unwrap();
+            worker.wait_for_projection(1024).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        execution
+            .output_watermark
+            .store(1024, super::Ordering::SeqCst);
+        assert!(done_rx.try_recv().is_err());
+        // Parser publication does not need the capture gate or a new raw read.
+        execution.commit_projection().unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn resize_barrier_accepts_an_already_projected_boundary() {
+        let execution = super::ExecutionCapture::default();
+        execution
+            .output_watermark
+            .store(2048, super::Ordering::SeqCst);
+        execution.commit_projection().unwrap();
+        execution.wait_for_projection(1024).unwrap();
+    }
+
     fn presentation_state() -> (super::ExecutionScreen, super::ExecutionStatus) {
         let reference = super::ExecutionRef {
             session_id: uuid::Uuid::new_v4(),

@@ -88,6 +88,10 @@ pub(super) fn start_captured(
                     result => result.map(|count| buffer[..count].to_vec()),
                 };
                 let chunk = chunk.and_then(|bytes| {
+                    // Never hold this gate across bounded-channel send: resize
+                    // must let the projection reader drain already captured bytes.
+                    let _order = execution.capture_order.lock()
+                        .map_err(|_| io::Error::other("capture ordering lock poisoned"))?;
                     let mut capture = execution.durable_capture.lock().map_err(|_| io::Error::other("capture authority lock poisoned"))?;
                     if let Some(capture) = capture.as_mut() {
                         if bytes.is_empty() { capture.end(None)?; } else { capture.append(&bytes)?; }

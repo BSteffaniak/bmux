@@ -3115,12 +3115,36 @@ impl PaneRuntimeHandle {
         }
     }
 
+    fn lock_resize_capture_order(&self) -> std::io::Result<std::sync::MutexGuard<'_, ()>> {
+        let order = self
+            .execution
+            .capture_order
+            .lock()
+            .map_err(|_| std::io::Error::other("capture ordering lock poisoned"))?;
+        let boundary = self
+            .execution
+            .durable_capture
+            .lock()
+            .map_err(|_| std::io::Error::other("capture authority lock poisoned"))?
+            .as_ref()
+            .map(durable_capture::DurableCapture::raw_bytes);
+        if let Some(boundary) = boundary {
+            self.execution.wait_for_projection(boundary)?;
+        }
+        Ok(order)
+    }
+
     fn resize_pty_admitted(
         &self,
         rows: u16,
         cols: u16,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) {
+        // Freeze new capture commits, not raw reads or parser progress. Drain
+        // the finite captured prefix before entering the geometry/parser locks.
+        let Ok(_order) = self.lock_resize_capture_order() else {
+            return;
+        };
         // Serialize geometry publication with the reader's entire output chunk.
         // The reader acquires size before image state, grid, and output.
         let Ok(mut last) = self.last_requested_size.lock() else {
@@ -6586,6 +6610,7 @@ impl SessionRuntimeManager {
                                 #[cfg(feature = "image-registry")]
                                 drop(registry);
                                 drop(cursor_tracker);
+                                if execution_for_reader.commit_projection().is_err() { break; }
                                 drop(requested_size);
                                 // Metadata callbacks can acquire the runtime manager. Never
                                 // invoke them while holding image/grid/output capture locks.
