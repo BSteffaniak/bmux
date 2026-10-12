@@ -4,6 +4,7 @@ import signal
 import sys
 import termios
 import tty
+import time
 
 mode = sys.argv[1]
 assert all(os.isatty(fd) for fd in (0, 1, 2))
@@ -43,6 +44,20 @@ try:
     # Only retire this displayed frame after the real outer terminal sees it.
     if os.read(0, 1) != b'!':
         raise RuntimeError('missing visible final-frame acknowledgment')
+    if mode == 'pending-capture':
+        root = sys.argv[2]
+        descendant = os.fork()
+        if descendant == 0:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            with open(root + '/slave-holder.pid', 'w') as output:
+                output.write(str(os.getpid()))
+            while not os.path.exists(root + '/release-slave'):
+                time.sleep(0.01)
+            for fd in (0, 1, 2):
+                os.close(fd)
+            os._exit(0)
+        while not os.path.exists(root + '/slave-holder.pid'):
+            time.sleep(0.01)
     emit(b'\x1b[?1049l')
 finally:
     termios.tcsetattr(0, termios.TCSANOW, before)

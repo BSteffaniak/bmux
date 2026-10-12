@@ -6309,6 +6309,9 @@ impl SessionRuntimeManager {
                                     }
                                 }
                                 if status.terminal_session_ended == Some(true) {
+                                    // Share the control fence with signal admission. Owner
+                                    // exit revokes signal authority, independently of EOF.
+                                    let _control_fence = execution_for_waiter.supervisor.lock().expect("supervisor control fence");
                                     execution_for_waiter.terminal_session_ended.store(true, Ordering::SeqCst);
                                 }
                                 execution_for_waiter.notify();
@@ -6726,7 +6729,6 @@ impl SessionRuntimeManager {
                             break;
                         }
                         if execution_for_task.terminal_session_ended.load(Ordering::SeqCst)
-                            && execution_for_task.output_drained.load(Ordering::SeqCst)
                             && !natural_retirement_failed {
                             // Keep the same control fence through publishing retirement
                             // and closing the guardian, excluding late termination requests.
@@ -6875,9 +6877,15 @@ impl SessionRuntimeManager {
                 }
             }
             drop(writer);
-            // Retain the master until supervision settles; exact controls can
-            // terminate descendants even after the direct child was reaped.
-            if execution_for_task.output_drained.load(Ordering::SeqCst) && !program_execution {
+            // Release PTY authority only after actual capture drain and owner
+            // retirement. A pending descendant-held slave retains capture, not
+            // permission to signal a remembered process group.
+            if execution_for_task.output_drained.load(Ordering::SeqCst)
+                && (!program_execution
+                    || execution_for_task
+                        .terminal_owner_retired
+                        .load(Ordering::SeqCst))
+            {
                 execution_for_task
                     .master
                     .lock()
@@ -12385,6 +12393,9 @@ try:
  result="unexpected writable terminal"
 except OSError as error: result=str(error.errno)
 open(root+"/late-result","w").write(result)
+while not os.path.exists(root+"/release"): time.sleep(0.01)
+for fd in (0,1,2): os.close(fd)
+open(root+"/released","w").close()
 while True: time.sleep(1)' "$1" < /dev/tty > /dev/tty 2>&1 &
 while [ ! -f "$1/ready" ]; do sleep 0.01; done
 printf TAIL
@@ -12403,6 +12414,9 @@ exit 7"#
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Keep the real owner/descendant/capture ordering visible in one acceptance
+    // fixture; splitting it obscures which boundary each assertion observes.
+    #[allow(clippy::too_many_lines)]
     async fn ended_terminal_preserves_escaped_descendant_without_late_signal_authority() {
         supervisor::install_test_artifact()
             .expect("explicit coordinator-built supervisor artifact");
@@ -12457,35 +12471,17 @@ exit 7"#
             pid: descendant,
             identity,
         };
-        // Conventional terminal lifetime ends independently of escaped work.
-        // Retirement revokes controls; it never authorizes a remembered PGID kill.
-        let natural_cleanup = tokio::time::timeout(Duration::from_secs(5), async {
-            while !matches!(&*pane.cleanup.borrow(), Some(Ok(()))) {
+        // Retiring the exact owner must not depend on a descendant closing the
+        // PTY. Neither retirement nor session end is a capture EOF receipt.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pane.execution.terminal_owner_retired.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await;
-        assert!(
-            natural_cleanup.is_ok(),
-            "natural terminal EOF and owner retirement: ended={} retired={} drained={} outcome={:?} cleanup={:?}",
-            pane.execution.terminal_session_ended.load(Ordering::SeqCst),
-            pane.execution.terminal_owner_retired.load(Ordering::SeqCst),
-            pane.execution.output_drained.load(Ordering::SeqCst),
-            pane.execution.outcome.lock().unwrap(),
-            pane.cleanup.borrow()
-        );
+        .await
+        .expect("owner retirement independent of capture EOF");
         assert!(pane.execution.terminal_session_ended.load(Ordering::SeqCst));
-        assert!(pane.execution.terminal_owner_retired.load(Ordering::SeqCst));
-        assert!(pane.execution.output_drained.load(Ordering::SeqCst));
-        assert_eq!(pane.execution.output_watermark.load(Ordering::SeqCst), 4);
-        let (boundary, bytes) =
-            durable_capture::DurableCapture::read(capture_root.path(), 0, 32).unwrap();
-        assert!(boundary.eof);
-        assert!(boundary.error.is_none());
-        assert_eq!(boundary.bytes, 4);
-        assert_eq!(bytes, b"TAIL");
         assert_eq!(pane.execution.outcome.lock().unwrap().0, Some(7));
-        assert!(pane.execution.outcome.lock().unwrap().2.is_none());
         assert!(!pane.execution.group_kill_issued.load(Ordering::SeqCst));
         assert!(!pane.execution.signal_owned_group(libc::SIGTERM).unwrap());
         assert!(!pane.execution.signal_owned_group(libc::SIGKILL).unwrap());
@@ -12497,13 +12493,59 @@ exit 7"#
             }
         })
         .await
-        .expect("surviving witness probes revoked terminal");
-        assert_eq!(
-            std::fs::read_to_string(witness.path().join("late-result")).unwrap(),
-            libc::EIO.to_string()
+        .expect("surviving witness probes its retained terminal");
+        let late_result = std::fs::read_to_string(witness.path().join("late-result")).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(late_result, "unexpected writable terminal");
+            assert!(!pane.execution.output_drained.load(Ordering::SeqCst));
+            assert!(pane.cleanup.borrow().is_none());
+            let (boundary, _) =
+                durable_capture::DurableCapture::read(capture_root.path(), 0, 128).unwrap();
+            assert!(!boundary.eof);
+            assert!(boundary.error.is_none());
+        }
+        // Other kernels can revoke the slave on session-leader exit. Capture
+        // must report the observed read boundary rather than assume either path.
+        assert!(
+            late_result == "unexpected writable terminal" || late_result == libc::EIO.to_string(),
+            "{late_result}"
         );
         assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
-        assert_eq!(pane.execution.output_watermark.load(Ordering::SeqCst), 4);
+        std::fs::write(witness.path().join("release"), b"").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !witness.path().join("released").exists()
+                || !matches!(&*pane.cleanup.borrow(), Some(Ok(())))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual descriptor release permits capture EOF and cleanup");
+        assert!(pane.execution.output_drained.load(Ordering::SeqCst));
+        let (boundary, bytes) =
+            durable_capture::DurableCapture::read(capture_root.path(), 0, 128).unwrap();
+        let expected: &[u8] = if late_result == "unexpected writable terminal" {
+            b"TAILUNAUTHORIZED-LATE-OUTPUT"
+        } else {
+            b"TAIL"
+        };
+        assert!(boundary.eof);
+        assert!(boundary.error.is_none());
+        assert_eq!(bytes, expected);
+        assert_eq!(boundary.bytes, expected.len() as u64);
+        assert_eq!(
+            pane.execution.output_watermark.load(Ordering::SeqCst),
+            expected.len() as u64
+        );
+        assert!(pane.execution.outcome.lock().unwrap().2.is_none());
+        assert!(
+            pane.execution
+                .cleanup_complete(matches!(&*pane.cleanup.borrow(), Some(Ok(()))))
+        );
+        assert!(pane.execution.master.lock().unwrap().is_none());
+        assert!(!pane.execution.group_kill_issued.load(Ordering::SeqCst));
+        assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
         // Only WitnessProcessCleanup may terminate this identity-checked fixture.
     }
 

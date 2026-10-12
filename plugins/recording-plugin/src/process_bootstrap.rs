@@ -179,6 +179,20 @@ fn start_owned(root: &Path, executable: &Path) -> Result<std::process::Output> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // The retained recording runtime must outlive its interactive caller.
+        // SAFETY: only async-signal-safe setsid runs between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     command
         .output()
         .context("starting dedicated recorded-program server")
@@ -400,6 +414,18 @@ pub(crate) async fn resolve(context: &NativeCommandContext, id: Uuid) -> Result<
         client,
         armed: false,
     })
+}
+
+pub(crate) async fn connect_finalized(root: &Path) -> Result<BmuxClient> {
+    // This is observation only: never restart a finalized runtime or route to
+    // the user's default server just to refresh a cleanup receipt.
+    BmuxClient::connect_with_paths_and_timeout(
+        &paths(root),
+        "recording-process",
+        PROCESS_REQUEST_TIMEOUT,
+    )
+    .await
+    .map_err(Into::into)
 }
 
 pub(crate) fn recording_root(runtime: &DedicatedRuntime) -> PathBuf {

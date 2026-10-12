@@ -25,8 +25,12 @@ to the outer terminal. Resizes and output share one timestamped canonical captur
 
 Normal completion restores the outer terminal, waits for real capture EOF and
 durable recording completion, publishes requested artifacts, and requests shutdown
-of the owned isolated server. The child exit outcome remains distinct from capture,
-restoration, and server-cleanup outcomes. `--json` prints the final structured result
+of the owned isolated server. Target exit and terminal-owner retirement alone do
+not complete capture: a surviving slave descriptor can keep it pending and produce
+late output. Pending capture must remain explicitly observable; it is not permission
+to keep the outer terminal unrestored indefinitely or to invent successful completion.
+The child exit outcome remains distinct from capture, restoration, execution cleanup,
+and server-cleanup outcomes. `--json` prints the final structured result
 after interactive rendering; otherwise the evidence location is reported on stderr.
 
 A disconnect, transport error, or failed restoration is not permission to kill the
@@ -143,6 +147,29 @@ Do not conflate target exit, session end, capture integrity, cleanup, or recordi
 commit. Finalization requires the actual capture boundary and complete durable
 canonical recording; raw-only recovery does not prove original event timing.
 
+### Pending capture after session end
+
+`target_exited:true` and `terminal_session_ended:true` can coexist with
+`capture_eof:false`, `output_drained:false`, `capture_finalized:false`, and
+`durable_recording_complete:false`. This is a legitimate pending capture state,
+not evidence that the target is still running or that capture failed. The output
+and capture watermarks can continue advancing as surviving descriptor holders
+write. An empty read, a stable watermark, a retirement receipt, or an observation
+timeout must not promote this state to complete. A failed read or lost capture
+instead requires an explicit incomplete/recovery outcome.
+
+`cleanup_complete` acknowledges execution resource cleanup and owner retirement,
+not capture EOF, descendant death, durable recording completion, or owned-server
+shutdown. It must be consumed independently of the capture fields. In particular,
+it cannot authorize stopping the capture reader or finalizing evidence.
+
+The current `wait --exit` command also waits for output drain: it can return 124
+with the target already exited while capture is still pending. Inspect the returned
+fields rather than interpreting 124 as a running target. `finish` must refuse
+pending capture, even after target exit and successful retirement; a bounded wait
+is not a successful capture boundary. Keep the run identity and owned runtime
+available for later status/read/reconcile and finalization after real fd closure.
+
 Validation gives offline GIF rasterization a separate bounded 120-second command
 deadline, as explicitly approved. Launch and input retain their existing deadlines.
 The helper has a bounded 10-second startup budget; startup uncertainty does not
@@ -204,9 +231,9 @@ conventional terminal-session lifetime is the default, and recovery is part of t
 same contract. Version numbers identify wire/storage representations rather than
 user-selectable lifecycle modes. This is a scoped architectural decision, not an
 exception to capture completeness, mutation authority, persistence, or isolation.
-The consolidated source passes the standard full suite, CLI tests, PTY smoke,
-and terminal compatibility matrix. Real installed-payload acceptance remains a
-separate validation requirement. Unsupported
+The required validation includes the standard full suite, CLI tests, PTY smoke,
+and terminal compatibility matrix; source changes alone do not establish a pass.
+Real installed-payload acceptance remains a separate validation requirement. Unsupported
 representations must be explicitly rejected; migrations must preserve canonical
 recordings rather than silently reinterpret or delete them.
 
@@ -228,29 +255,44 @@ plugin-owned responsibilities:
 - A control guardian retains authenticated execution identity, mutation receipts,
   reconnect authority, and its precisely fenced signal scope outside the
   controlling-terminal session.
-- A designated terminal owner defines that session's lifetime. At session end,
-  normal OS hangup/revocation semantics apply. BMUX does not thereby gain
-  authority to kill unrelated or escaped processes; continued access to the ended
-  terminal is not guaranteed by this new contract.
-- Capture retains the master reader and durably records actual kernel bytes.
+- A designated terminal owner defines that session's lifetime. Its retirement is
+  independent of raw capture EOF and does not wait for every descendant to exit
+  or close its slave descriptor. Conventional OS session-end effects apply, but
+  BMUX promises neither universal descriptor revocation nor future terminal access.
+  Retirement is not a descendant sweep and does not extend signal authority to
+  unrelated, escaped, or surviving processes.
+- Capture retains the master reader independently of owner retirement and durably
+  records actual kernel bytes, including late bytes from surviving slave holders.
   Target exit, terminal-owner exit, an empty group, and a timeout are not
   substitutes for a capture boundary or proof of byte completeness.
 - Finalization requires the target outcome, acknowledged capture boundary, and
   required durable recording commit. Execution cleanup remains a separate outcome.
   Lost or uncertain capture stays explicitly incomplete.
 
+On Linux, a descendant holding a slave descriptor can survive terminal-owner exit
+and write after retirement. While such a holder keeps the PTY open, capture stays
+pending until actual kernel EOF (including the platform's terminal-closure read
+result), and all observed late bytes belong to the canonical recording. BMUX must
+not manufacture EOF, close the master to force completion, kill descendants to
+obtain EOF, or turn a timeout into successful finalization.
+
 On native macOS, opening `/dev/tty` can retain a hidden controlling-terminal vnode
 reference until session-leader exit, after ordinary slave descriptors close.
 Keeping the terminal owner alive solely for fencing can therefore prevent EOF.
 Conversely, retiring it can revoke descriptors held by escaped descendants or
-queued descriptor transfers. Process/descriptor snapshots cannot prove atomic
-holder quiescence.
+queued descriptor transfers. These are platform effects, not a portable BMUX
+revocation guarantee. Process/descriptor snapshots cannot prove atomic holder
+quiescence, and Linux's surviving-holder behavior must not be inferred away from
+macOS behavior (or vice versa). Other platforms must report their actual observed
+capture boundary or an explicit unsupported/incomplete outcome.
 
-The new contract permits conventional session-end effects on future terminal use;
+The contract permits conventional session-end effects on future terminal use;
 it does **not** permit silently discarding already-written bytes or reporting
 truncated evidence complete. Buffered-output preservation must pass owned burst,
-small unread-tail, and backpressure tests. Failure to establish safe draining
-requires an incomplete/recovery outcome rather than forced success. Under the
+small unread-tail, and backpressure tests, as well as Linux surviving-holder late
+output coverage. Owner retirement and capture completion require independent
+observations. Failure to establish safe draining requires an incomplete/recovery
+outcome rather than forced success; legitimate open capture remains pending. Under the
 explicitly approved breaking consolidation, the pinned-terminal contract is
 retired rather than silently redirected to conventional terminal-session behavior.
 

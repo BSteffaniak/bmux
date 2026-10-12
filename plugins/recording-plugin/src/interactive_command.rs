@@ -322,11 +322,17 @@ async fn complete(
         .await?
         .map_err(|error| anyhow::anyhow!("recording status: {error:?}"))?;
     ensure!(
-        status.output_drained && status.terminal_session_ended,
-        "attachment ended before target capture settled; run {} retained at {}",
-        status.run_id,
-        status.runtime_root
+        !matches!(status.phase, process::RunPhase::Failed) && status.errors.is_empty(),
+        "recorded target failed; refusing successful artifact publication: {:?}",
+        status.errors
     );
+    if !status.output_drained || !status.terminal_session_ended {
+        bail!(
+            "terminal restored; capture pending after target exit; run {} retained at {}; surviving terminal descriptors may still produce output; use recording process status/wait and finish after real EOF",
+            status.run_id,
+            status.runtime_root
+        );
+    }
     *status = process::client::finish(&mut dedicated.client, status.run_id, status.revision, false)
         .await?
         .map_err(|error| anyhow::anyhow!("recording finalization: {error:?}"))?;

@@ -96,9 +96,9 @@ args = [binary, '--runtime', 'default', '--target', 'local', '--config',
         '--export', 'raw', '--export', 'text', '--export', 'events', '--json']
 if mode == 'gif':
     args += ['--gif', root + '/animation.gif']
-args += ['--', sys.executable, fixture, mode]
+args += ['--', sys.executable, fixture, mode, root]
 if mode == 'launch-error':
-    args = args[:-3] + [root + '/missing-executable']
+    args = args[:-4] + [root + '/missing-executable']
 child = subprocess.Popen([sys.executable, __file__, '--terminal-owner', root] + args,
                          stdin=slave, stdout=slave, stderr=slave,
                          close_fds=True, preexec_fn=controlling_terminal)

@@ -4,7 +4,7 @@
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = 'binary(recording_process_integration)'
+filter = 'binary(recording_process_integration) | binary(interactive_recording_integration)'
 test-group = 'recorded-processes'
 # Each test owns a server and a font-rasterization workload; reserve the
 # scheduler's CPU budget rather than competing with the rest of the suite.

@@ -18,6 +18,9 @@ const MAX_INPUT: usize = 16_384;
 const MAX_SNAPSHOT: usize = 4 * 1024 * 1024;
 const MAX_FRAME: usize = 4 * 1024 * 1024;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+// Give already-buffered output a bounded presentation grace, never wait for
+// arbitrary surviving slave holders while owning the caller's raw terminal.
+const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 type InputModes = bmux_terminal_grid::ProtocolState;
 
@@ -453,6 +456,9 @@ async fn dispatch_input(
     Ok(())
 }
 
+// Keep authoritative status, presentation and input admission in one ordered
+// loop; separating the transitions would obscure the post-exit input fence.
+#[allow(clippy::too_many_lines)]
 async fn interact_loop(
     client: &mut BmuxClient,
     run_id: Uuid,
@@ -465,13 +471,8 @@ async fn interact_loop(
     };
     let mut dimensions = viewport()?;
     let mut last_frame = None;
+    let mut target_exit_observed: Option<std::time::Instant> = None;
     loop {
-        let current = viewport()?;
-        if current != dimensions {
-            recorded_resize(client, run_id, current).await?;
-            dimensions = current;
-            last_frame = None;
-        }
         let status = process::client::status(&mut *client, run_id)
             .await
             .context(InteractiveFailureKind::Transport)?
@@ -491,6 +492,21 @@ async fn interact_loop(
             "interactive execution requires recovery: {:?}",
             status.errors
         );
+        if let Some(observed) = target_exit_observed
+            && !status.output_drained
+            && observed.elapsed() >= POST_EXIT_DRAIN_GRACE
+        {
+            return Ok(status); // Restore terminal; capture stays pending, never finalized.
+        }
+        if status.target_exited {
+            target_exit_observed.get_or_insert_with(std::time::Instant::now);
+        }
+        let current = viewport()?;
+        if current != dimensions && !status.target_exited {
+            recorded_resize(client, run_id, current).await?;
+            dimensions = current;
+            last_frame = None;
+        }
         let screen = presentation::client::present(&mut *client, run_id)
             .await
             .context("interactive recording requires advertised bmux.recording.process.presentation.v1; refusing legacy screen fallback").context(InteractiveFailureKind::Transport)?
@@ -532,6 +548,10 @@ async fn interact_loop(
                 "final interactive grid has not reached canonical output boundary"
             );
             return Ok(status);
+        }
+        if status.target_exited {
+            tokio::time::sleep(FRAME_INTERVAL).await;
+            continue;
         }
         // At most one input effect per validated authoritative snapshot. Queued
         // events remain in the bounded OS terminal queue rather than our heap.

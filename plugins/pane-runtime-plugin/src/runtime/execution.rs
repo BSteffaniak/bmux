@@ -114,6 +114,17 @@ impl ExecutionCapture {
         Ok(())
     }
 
+    pub(super) fn cleanup_complete(&self, resource_cleanup_acknowledged: bool) -> bool {
+        // Resource release and owner retirement are independent acknowledgements.
+        // Neither a kill request nor capture EOF substitutes for either receipt.
+        resource_cleanup_acknowledged
+            && self.terminal_owner_retired.load(Ordering::SeqCst)
+            && !self.cleanup_failed.load(Ordering::SeqCst)
+    }
+
+    // Keep admission, exact supervisor receipts and direct PTY authority under
+    // one control fence; splitting these transitions would obscure signal safety.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn signal_owned_group(&self, signal: i32) -> anyhow::Result<bool> {
         // Serialize controls through their acknowledged consumption fence, so
         // concurrent cleanup callers cannot send Sweep after helper retirement.
@@ -121,7 +132,12 @@ impl ExecutionCapture {
             .supervisor
             .lock()
             .map_err(|_| anyhow::anyhow!("supervisor control lock poisoned"))?;
-        if self.terminal_owner_retired.load(Ordering::SeqCst) {
+        // Natural session end revokes signal authority before the separate
+        // owner-retirement acknowledgement. A retained owner is not a license
+        // to sweep descendants after that terminal session has ended.
+        if self.terminal_session_ended.load(Ordering::SeqCst)
+            || self.terminal_owner_retired.load(Ordering::SeqCst)
+        {
             return Ok(false);
         }
         if let Some(supervisor) = supervisor_guard.as_ref() {
@@ -329,7 +345,10 @@ pub(crate) fn status(reference: &ExecutionRef) -> Result<ExecutionStatus, Execut
                 bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalCaptureIntegrity::Complete
             } else if outcome.2.is_some() { bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalCaptureIntegrity::Incomplete
             } else { bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalCaptureIntegrity::Capturing },
-            cleanup_complete: pane.execution.group_kill_issued.load(Ordering::SeqCst) && !pane.execution.cleanup_failed.load(Ordering::SeqCst) && matches!(&*pane.cleanup.borrow(), Some(Ok(()))),
+            cleanup_complete: pane.execution.cleanup_complete(matches!(
+                &*pane.cleanup.borrow(),
+                Some(Ok(()))
+            )),
             execution: reference.clone(),
             phase: if outcome.2.is_some() {
                 ExecutionPhase::Failed
@@ -855,6 +874,84 @@ fn install_reserved_capture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn natural_cleanup_completes_without_kill_or_capture_eof() {
+        let capture = super::ExecutionCapture::default();
+        capture
+            .terminal_session_ended
+            .store(true, super::Ordering::SeqCst);
+        capture
+            .terminal_owner_retired
+            .store(true, super::Ordering::SeqCst);
+
+        assert!(capture.cleanup_complete(true));
+        assert!(!capture.group_kill_issued.load(super::Ordering::SeqCst));
+        assert!(!capture.target_stop_issued.load(super::Ordering::SeqCst));
+        assert!(!capture.output_drained.load(super::Ordering::SeqCst));
+        assert_eq!(*capture.outcome.lock().unwrap(), (None, None, None));
+    }
+
+    #[test]
+    fn cleanup_requires_resource_acknowledgement_and_retired_authority() {
+        let capture = super::ExecutionCapture::default();
+        capture
+            .group_kill_issued
+            .store(true, super::Ordering::SeqCst);
+        capture.output_drained.store(true, super::Ordering::SeqCst);
+        capture
+            .terminal_session_ended
+            .store(true, super::Ordering::SeqCst);
+
+        // Killing, actual EOF, and session end cannot replace owner retirement.
+        assert!(!capture.cleanup_complete(true));
+        capture
+            .terminal_owner_retired
+            .store(true, super::Ordering::SeqCst);
+        assert!(!capture.cleanup_complete(false));
+        assert!(capture.cleanup_complete(true));
+    }
+
+    #[test]
+    fn acknowledged_cleanup_does_not_hide_cleanup_failure_or_change_capture_truth() {
+        let capture = super::ExecutionCapture::default();
+        capture
+            .terminal_owner_retired
+            .store(true, super::Ordering::SeqCst);
+        capture.output_drained.store(true, super::Ordering::SeqCst);
+        capture.record_cleanup_error("resource cleanup failed".into());
+
+        assert!(!capture.cleanup_complete(true));
+        assert!(capture.output_drained.load(super::Ordering::SeqCst));
+        assert_eq!(
+            capture.outcome.lock().unwrap().2.as_deref(),
+            Some("resource cleanup failed")
+        );
+    }
+
+    #[test]
+    fn concurrent_termination_after_natural_session_end_does_not_dispatch() {
+        let capture = std::sync::Arc::new(super::ExecutionCapture::default());
+        // A missing PTY would be a recovery error if signaling fell through.
+        capture.managed_program.store(true, super::Ordering::SeqCst);
+        let fence = capture.supervisor.lock().unwrap();
+        let first = std::sync::Arc::clone(&capture);
+        let second = std::sync::Arc::clone(&capture);
+        let a = std::thread::spawn(move || first.signal_owned_group(super::GROUP_KILL));
+        let b = std::thread::spawn(move || second.signal_owned_group(libc::SIGTERM));
+        capture
+            .terminal_session_ended
+            .store(true, super::Ordering::SeqCst);
+        drop(fence);
+
+        assert!(!a.join().unwrap().unwrap());
+        assert!(!b.join().unwrap().unwrap());
+        assert!(!capture.terminal_owner_retired.load(super::Ordering::SeqCst));
+        assert!(!capture.group_kill_issued.load(super::Ordering::SeqCst));
+        assert!(!capture.target_stop_issued.load(super::Ordering::SeqCst));
+        assert!(!capture.output_drained.load(super::Ordering::SeqCst));
+        assert!(!capture.cleanup_complete(true));
+    }
+
     #[test]
     fn concurrent_termination_after_natural_retirement_does_not_dispatch() {
         let capture = std::sync::Arc::new(super::ExecutionCapture::default());

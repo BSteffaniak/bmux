@@ -201,6 +201,9 @@ async fn leader_failover_recovers_committed_launch_without_duplicate_execution()
         .initialize_single(ids[0], endpoints[0])
         .await
         .unwrap();
+    // Initialization admits membership; it does not acknowledge election.
+    // Await leader readiness before submitting a leader-only membership change.
+    assert_eq!(wait_for_leader(&[&nodes[0]]).await, ids[0]);
     nodes[0]
         .change_voters(BTreeMap::from([
             (ids[0], openraft::BasicNode::new(endpoints[0])),

@@ -279,7 +279,9 @@ impl ProcessService {
     async fn refresh(&self, id: Uuid) -> Result<process::RunStatus> {
         let mut value = self.load(id)?;
         if value.capture_finalized {
-            return Ok(value);
+            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            return refresh_finalized_cleanup(&mut client, &self.store()?, &self.mutation, value)
+                .await;
         }
         if value.execution.is_none() {
             let reservation = self.store()?.reservation(id).context("launch admission retained but reservation outcome unknown; recovery required; refusing relaunch")?;
@@ -339,7 +341,7 @@ impl ProcessService {
             };
             value.phase = phase;
             value.exit_code = status.exit_code;
-            value.target_exited = !matches!(status.phase, pane::TerminalExecutionPhase::Running);
+            value.target_exited = target_exit_observed(&status);
             value.terminal_session_ended = status.terminal_session_ended;
             value.capture_eof = authority.capture_complete;
             value.recovery_required = authority.recovery_required;
@@ -848,6 +850,51 @@ impl ProcessService {
     }
 }
 
+fn target_exit_observed(status: &pane::TerminalExecutionStatus) -> bool {
+    matches!(status.phase, pane::TerminalExecutionPhase::Exited)
+        || status.exit_code.is_some()
+        || status.signal.is_some()
+}
+
+pub(crate) async fn refresh_finalized_cleanup(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    store: &ProcessStore,
+    mutation: &Mutex<()>,
+    value: process::RunStatus,
+) -> Result<process::RunStatus> {
+    // Finalized evidence remains authoritative and readable offline. Query only
+    // this exact execution's cleanup receipt; never resume capture or relaunch.
+    if value.execution.is_none() {
+        return Ok(value);
+    }
+    let reference = execution(&value)?;
+    let Ok(Ok(status)) = pane::client::status(client, reference.clone()).await else {
+        // The owned endpoint may already have gone away after finalization.
+        // Unavailability does not invalidate durable evidence or prove cleanup.
+        return Ok(value);
+    };
+    ensure!(
+        status.execution == reference,
+        "cleanup execution identity mismatch"
+    );
+    let _guard = mutation
+        .lock()
+        .map_err(|_| anyhow::anyhow!("process authority lock poisoned"))?;
+    // Reload after the await so a concurrent refresh cannot overwrite a newer
+    // revision. Finalized exit, bytes, timing and capture state are immutable here.
+    let mut current = store.load(value.run_id)?;
+    ensure!(current.capture_finalized, "finalized capture regressed");
+    ensure!(
+        execution(&current)? == reference,
+        "cleanup execution identity changed"
+    );
+    if current.cleanup_complete != status.cleanup_complete {
+        current.cleanup_complete = status.cleanup_complete;
+        store.replace(current.revision, &mut current)?;
+    }
+    Ok(current)
+}
+
 fn execution(value: &process::RunStatus) -> Result<pane::TerminalExecutionRef> {
     let reference = value.execution.as_ref().context("run has no execution")?;
     Ok(pane::TerminalExecutionRef {
@@ -1273,6 +1320,234 @@ fn read_output_through(
         data,
         complete: status.output_drained && since + count == end && end >= status.output_watermark,
     })
+}
+
+#[cfg(test)]
+mod lifecycle_consumer_tests {
+    use super::*;
+
+    fn execution_status(phase: pane::TerminalExecutionPhase) -> pane::TerminalExecutionStatus {
+        pane::TerminalExecutionStatus {
+            execution: pane::TerminalExecutionRef {
+                session_id: Uuid::new_v4(),
+                pane_id: Uuid::new_v4(),
+                execution_token: Uuid::new_v4(),
+            },
+            lifecycle: pane::TerminalLifecycle::ConventionalTerminalSession,
+            phase,
+            session_end: pane::TerminalSessionEnd::Ended,
+            terminal_session_ended: true,
+            capture_integrity: pane::TerminalCaptureIntegrity::Capturing,
+            exit_code: None,
+            signal: None,
+            output_drained: false,
+            output_watermark: 0,
+            cleanup_complete: false,
+            error: Some("cleanup failed without target outcome".into()),
+        }
+    }
+
+    #[test]
+    fn failed_execution_requires_observed_exit_or_signal() {
+        let mut status = execution_status(pane::TerminalExecutionPhase::Failed);
+        assert!(!target_exit_observed(&status));
+        status.exit_code = Some(7);
+        assert!(target_exit_observed(&status));
+        status.exit_code = None;
+        status.signal = Some("SIGTERM".into());
+        assert!(target_exit_observed(&status));
+        status.signal = None;
+        status.phase = pane::TerminalExecutionPhase::Exited;
+        assert!(target_exit_observed(&status));
+        status.phase = pane::TerminalExecutionPhase::Running;
+        assert!(!target_exit_observed(&status));
+    }
+
+    struct CleanupClient {
+        expected: pane::TerminalExecutionRef,
+        response: Option<Result<pane::TerminalExecutionStatus, pane::TerminalExecutionError>>,
+        calls: usize,
+    }
+
+    impl bmux_plugin_sdk::TypedDispatchClient for CleanupClient {
+        async fn invoke_service_raw(
+            &mut self,
+            _capability: &str,
+            _kind: bmux_ipc::InvokeServiceKind,
+            _interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            assert_eq!(operation, "status", "must not reopen capture or launch");
+            let request =
+                bmux_plugin_sdk::decode_service_message::<pane::client::StatusRequest>(&payload)
+                    .unwrap();
+            assert_eq!(request.execution, self.expected);
+            self.calls += 1;
+            let Some(response) = &self.response else {
+                return Err(bmux_plugin_sdk::TypedDispatchClientError::transport(
+                    "pane-runtime-execution-v4",
+                    operation,
+                    "owned endpoint absent",
+                ));
+            };
+            Ok(bmux_plugin_sdk::encode_service_message(response).unwrap())
+        }
+    }
+
+    fn finalized_status(reference: &pane::TerminalExecutionRef) -> process::RunStatus {
+        let mut value = ProcessService::initial_status(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "/owned/runtime".into(),
+        );
+        value.execution = Some(process::ExecutionRef {
+            session_id: reference.session_id,
+            pane_id: reference.pane_id,
+            execution_token: reference.execution_token,
+        });
+        value.phase = process::RunPhase::Finalized;
+        value.exit_code = Some(7);
+        value.target_exited = true;
+        value.terminal_session_ended = true;
+        value.capture_eof = true;
+        value.output_drained = true;
+        value.capture_finalized = true;
+        value.durable_recording_complete = true;
+        value.output_watermark = 123;
+        value.capture_watermark = 123;
+        value.recording_watermark = 123;
+        value
+    }
+
+    fn fixture(value: &process::RunStatus) -> (PathBuf, ProcessStore) {
+        let root = std::env::temp_dir().join(format!("bmux-finalized-cleanup-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let store = ProcessStore::new(&root).unwrap();
+        store.create(value).unwrap();
+        (root, store)
+    }
+
+    #[tokio::test]
+    async fn finalized_refresh_updates_only_cleanup_and_is_idempotent() {
+        // Contradictory live exit/capture fields must never replace finalized evidence.
+        let mut status = execution_status(pane::TerminalExecutionPhase::Failed);
+        status.cleanup_complete = true;
+        let original = finalized_status(&status.execution);
+        let (root, store) = fixture(&original);
+        let mutation = Mutex::new(());
+        let mut client = CleanupClient {
+            expected: status.execution.clone(),
+            response: Some(Ok(status)),
+            calls: 0,
+        };
+        let refreshed = refresh_finalized_cleanup(&mut client, &store, &mutation, original.clone())
+            .await
+            .unwrap();
+        let mut expected = original.clone();
+        expected.cleanup_complete = true;
+        expected.revision += 1;
+        assert_eq!(
+            serde_json::to_value(&refreshed).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(store.load(expected.run_id).unwrap()).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        // A caller holding the old revision must reload rather than overwrite it.
+        let repeated = refresh_finalized_cleanup(&mut client, &store, &mutation, original)
+            .await
+            .unwrap();
+        assert_eq!(repeated.revision, expected.revision);
+        assert_eq!(client.calls, 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalized_refresh_preserves_offline_status_when_endpoint_absent() {
+        let status = execution_status(pane::TerminalExecutionPhase::Exited);
+        let original = finalized_status(&status.execution);
+        let (root, store) = fixture(&original);
+        let mutation = Mutex::new(());
+        let mut client = CleanupClient {
+            expected: status.execution,
+            response: None,
+            calls: 0,
+        };
+        // Both transport absence and an unavailable exact execution preserve evidence.
+        for response in [
+            None,
+            Some(Err(pane::TerminalExecutionError::NotFound)),
+            Some(Err(pane::TerminalExecutionError::Unavailable)),
+        ] {
+            client.response = response;
+            let refreshed =
+                refresh_finalized_cleanup(&mut client, &store, &mutation, original.clone())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(refreshed).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
+        assert_eq!(
+            store.load(original.run_id).unwrap().revision,
+            original.revision
+        );
+        assert_eq!(client.calls, 3);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalized_refresh_without_execution_does_not_dispatch() {
+        let status = execution_status(pane::TerminalExecutionPhase::Exited);
+        let mut original = finalized_status(&status.execution);
+        original.execution = None;
+        let (root, store) = fixture(&original);
+        let mut client = CleanupClient {
+            expected: status.execution,
+            response: None,
+            calls: 0,
+        };
+        let mutation = Mutex::new(());
+        let refreshed = refresh_finalized_cleanup(&mut client, &store, &mutation, original.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(refreshed).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+        assert_eq!(client.calls, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalized_refresh_rejects_wrong_execution_without_mutation() {
+        let status = execution_status(pane::TerminalExecutionPhase::Exited);
+        let original = finalized_status(&status.execution);
+        let (root, store) = fixture(&original);
+        let mut wrong = status.clone();
+        wrong.execution.execution_token = Uuid::new_v4();
+        wrong.cleanup_complete = true;
+        let mut client = CleanupClient {
+            expected: status.execution,
+            response: Some(Ok(wrong)),
+            calls: 0,
+        };
+        let mutation = Mutex::new(());
+        assert!(
+            refresh_finalized_cleanup(&mut client, &store, &mutation, original.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(store.load(original.run_id).unwrap()).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]

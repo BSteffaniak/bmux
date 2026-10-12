@@ -308,6 +308,94 @@ fn assert_complete(fixture: &Fixture, transcript: &[u8], expected_exit: u64) {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[serial]
+fn interactive_restores_terminal_while_descendant_capture_remains_pending() {
+    let fixture = Fixture::new();
+    struct ReleaseSlave(PathBuf);
+    impl Drop for ReleaseSlave {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"");
+        }
+    }
+    let release = ReleaseSlave(fixture.root.join("release-slave"));
+    let (report, transcript) = fixture.interactive("pending-capture");
+    assert_eq!(report["restored"], true);
+    assert_eq!(report["exit_code"], 1);
+    let result = final_json(&transcript);
+    let status = &result["status"];
+    assert_eq!(status["target_exited"], true);
+    assert_eq!(status["exit_code"], 0);
+    assert_eq!(status["output_drained"], false);
+    assert_eq!(status["capture_finalized"], false);
+    assert_eq!(status["durable_recording_complete"], false);
+    assert_eq!(result["terminal_restored"], true);
+    assert!(
+        result["error"]
+            .as_str()
+            .unwrap()
+            .contains("capture pending"),
+        "{result}"
+    );
+    assert!(!fixture.root.join("exports").exists());
+    drop(release); // fixture-owned descriptor holder exits voluntarily.
+    let run = status["run_id"].as_str().unwrap();
+    let mut wait = Command::new(&fixture.binary);
+    fixture.isolate(&mut wait);
+    let output = wait
+        .args([
+            "--runtime",
+            "default",
+            "--target",
+            "local",
+            "recording",
+            "process",
+            "wait",
+            run,
+            "--exit",
+            "--timeout",
+            "10s",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let observed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(observed["output_drained"], true, "{observed}");
+    let mut finish = Command::new(&fixture.binary);
+    fixture.isolate(&mut finish);
+    let output = finish
+        .args([
+            "--runtime",
+            "default",
+            "--target",
+            "local",
+            "recording",
+            "process",
+            "finish",
+            run,
+            "--output",
+            fixture.root.join("completed").to_str().unwrap(),
+            "--export",
+            "raw",
+            "--cleanup-server",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.root.join("completed/output.pty").is_file());
+}
+
 #[test]
 #[serial]
 fn direct_interactive_record_routes_keyboard_resize_and_finalizes() {

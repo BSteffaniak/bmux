@@ -102,6 +102,23 @@ pub(crate) async fn execute(
     if !matches!(operation, "start" | "run")
         && let Some((root, status)) = crate::process_bootstrap::offline(context, args.id()?)?
     {
+        let status = if matches!(operation, "status" | "wait") && !status.cleanup_complete {
+            let runtime = std::path::Path::new(&status.runtime_root);
+            match crate::process_bootstrap::connect_finalized(runtime).await {
+                Ok(mut client) => {
+                    crate::process_runtime::refresh_finalized_cleanup(
+                        &mut client,
+                        &crate::process_store::ProcessStore::new(&root)?,
+                        &std::sync::Mutex::new(()),
+                        status,
+                    )
+                    .await?
+                }
+                Err(_) => status, // Durable evidence remains readable offline.
+            }
+        } else {
+            status
+        };
         return offline_command(context, operation, &args, &root, status).await;
     }
     let launch_key = args
