@@ -39,6 +39,19 @@ fn paths(root: &Path) -> ConfigPaths {
     )
 }
 
+fn validate_runtime_socket(root: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let socket = paths(root).server_socket();
+        std::os::unix::net::SocketAddr::from_pathname(&socket).with_context(|| {
+            format!("dedicated Unix socket path exceeds platform bounds or is invalid: {}; select a shorter owned TMPDIR; target not launched", socket.display())
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
+}
+
 fn configure_isolated_slot(command: &mut Command, root: &Path, executable: &Path) -> Result<()> {
     let name = executable
         .file_stem()
@@ -136,12 +149,12 @@ fn start_owned(root: &Path, executable: &Path) -> Result<std::process::Output> {
 pub(crate) async fn bootstrap(context: &NativeCommandContext) -> Result<DedicatedRuntime> {
     let index = index_root(context);
     crate::durable::private_directory(&index)?;
-    let base = if cfg!(unix) {
-        PathBuf::from("/tmp")
-    } else {
-        std::env::temp_dir()
-    };
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .context("resolving dedicated platform temporary parent (TMPDIR)")?;
     let root = base.join(format!("bmux-recorded-{}", Uuid::new_v4()));
+    // Check before creating state or spawning even the isolated server. Never
+    // escape an explicitly selected temporary volume to shorten socket paths.
+    validate_runtime_socket(&root)?;
     std::fs::create_dir(&root)?;
     #[cfg(unix)]
     {
@@ -292,13 +305,9 @@ pub(crate) async fn resolve(context: &NativeCommandContext, id: Uuid) -> Result<
         value.schema_version == 4 && value.run_id == id,
         "invalid or unsupported process locator"
     );
-    let base = if cfg!(unix) {
-        PathBuf::from("/tmp")
-    } else {
-        std::env::temp_dir()
-    };
-    let canonical_base = std::fs::canonicalize(base)?;
+    let canonical_base = std::fs::canonicalize(std::env::temp_dir())?;
     let root = std::fs::canonicalize(&value.root)?;
+    validate_runtime_socket(&root)?;
     ensure!(
         root.parent() == Some(canonical_base.as_path()),
         "process runtime outside dedicated temporary parent"
@@ -389,11 +398,8 @@ pub(crate) fn offline(
         "invalid run locator"
     );
     let root = std::fs::canonicalize(&locator.root)?;
-    let base = std::fs::canonicalize(if cfg!(unix) {
-        PathBuf::from("/tmp")
-    } else {
-        std::env::temp_dir()
-    })?;
+    let base = std::fs::canonicalize(std::env::temp_dir())?;
+    validate_runtime_socket(&root)?;
     ensure!(
         root.parent() == Some(base.as_path())
             && root
@@ -555,12 +561,38 @@ pub(crate) async fn cleanup(context: &NativeCommandContext, id: Uuid) -> Result<
         "cleanup requires finalized capture"
     );
     if marker.try_exists()? {
+        ensure!(
+            std::fs::read(&marker)? == b"true",
+            "invalid owned server cleanup acknowledgment"
+        );
         return Ok(());
     }
     let mut runtime = resolve(context, id).await?;
     runtime.client.stop_server().await?;
     crate::durable::write_atomic(&marker, b"true")?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_short_tmpdir_root_accepts_platform_socket_bounds() {
+        let root =
+            PathBuf::from("/Volumes/ehdd/tmp").join(format!("bmux-recorded-{}", Uuid::nil()));
+        validate_runtime_socket(&root).unwrap();
+    }
+
+    #[test]
+    fn oversized_tmpdir_root_is_rejected_without_fallback_or_creation() {
+        let root = PathBuf::from("/Volumes/ehdd/tmp")
+            .join("x".repeat(300))
+            .join(format!("bmux-recorded-{}", Uuid::nil()));
+        let error = validate_runtime_socket(&root).unwrap_err();
+        assert!(error.to_string().contains("shorter owned TMPDIR"));
+        assert!(!root.exists());
+    }
 }
 
 fn fingerprint(args: &[String]) -> Result<String> {

@@ -3037,6 +3037,84 @@ impl PaneRuntimeHandle {
         self.resize_pty_admitted(rows, cols, None);
     }
 
+    fn dispatch_uncaptured_resize(
+        &self,
+        rows: u16,
+        cols: u16,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        let command = match permit {
+            Some(permit) => PaneRuntimeCommand::GuardedResize {
+                rows,
+                cols,
+                _permit: permit,
+            },
+            None => PaneRuntimeCommand::Resize { rows, cols },
+        };
+        let captured = self
+            .execution
+            .durable_capture
+            .lock()
+            .ok()
+            .is_some_and(|capture| capture.is_some());
+        if !captured {
+            let _ = self.input_tx.send(command);
+        }
+    }
+
+    // Caller retains geometry, grid, output and capture locks throughout this
+    // commit, preserving the reader/resize ordering across this private helper.
+    fn commit_captured_resize(
+        &self,
+        capture: &mut Option<durable_capture::DurableCapture>,
+        grid: &mut TerminalGridStream,
+        rows: u16,
+        cols: u16,
+    ) -> bool {
+        if let Some(capture) = capture.as_mut() {
+            let resized = self.execution.master.lock().ok().and_then(|master| {
+                master.as_ref().map(|master| {
+                    master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                })
+            });
+            if !matches!(resized, Some(Ok(()))) {
+                return false;
+            }
+            if let Err(error) = capture.resize(cols, rows) {
+                let _ = capture.end(Some(error.to_string()));
+                return false;
+            }
+        }
+        if let Err(error) = grid.resize(cols, rows) {
+            if let Some(capture) = capture.as_mut() {
+                let _ = capture.end(Some(format!(
+                    "retained geometry could not commit: {error:?}"
+                )));
+            }
+            return false;
+        }
+        true
+    }
+
+    #[cfg(feature = "image-registry")]
+    fn publish_resized_images(&self) {
+        if self
+            .image_dirty
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            publish_pane_event(PaneEvent::ImageAvailable {
+                session_id: self.session_id.0,
+                pane_id: self.meta.id,
+            });
+        }
+    }
+
     fn resize_pty_admitted(
         &self,
         rows: u16,
@@ -3060,6 +3138,20 @@ impl PaneRuntimeHandle {
         #[cfg(feature = "image-registry")]
         let mut images_changed = false;
         if let Ok(mut grid) = self.terminal_grid.lock() {
+            // The retained parser and output watermark must have consumed all
+            // capture-ahead bytes before geometry can enter the same stream.
+            // Hold grid -> output -> capture, matching output publication.
+            let Ok(_output) = self.output_buffer.lock() else {
+                return;
+            };
+            let Ok(mut capture) = self.execution.durable_capture.lock() else {
+                return;
+            };
+            if capture.as_ref().is_some_and(|capture| {
+                capture.raw_bytes() != self.execution.output_watermark.load(Ordering::SeqCst)
+            }) {
+                return;
+            }
             #[cfg(feature = "image-registry")]
             if (cols != tracker.cols || rows != tracker.rows)
                 && rows > 0
@@ -3113,7 +3205,7 @@ impl PaneRuntimeHandle {
                 }
                 images_changed = images.sequence() != revision;
             }
-            if grid.resize(cols, rows).is_err() {
+            if !self.commit_captured_resize(&mut capture, &mut grid, rows, cols) {
                 return;
             }
         } else {
@@ -3121,30 +3213,17 @@ impl PaneRuntimeHandle {
         }
         tracker.resize(rows, cols);
         *last = (rows, cols);
-        let command = match permit {
-            Some(permit) => PaneRuntimeCommand::GuardedResize {
-                rows,
-                cols,
-                _permit: permit,
-            },
-            None => PaneRuntimeCommand::Resize { rows, cols },
-        };
-        let _ = self.input_tx.send(command);
+        self.execution
+            .geometry_revision
+            .fetch_add(1, Ordering::SeqCst);
+        self.dispatch_uncaptured_resize(rows, cols, permit);
         #[cfg(feature = "image-registry")]
         drop(images);
         drop(tracker);
         drop(last);
         #[cfg(feature = "image-registry")]
-        if images_changed
-            && self
-                .image_dirty
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            publish_pane_event(PaneEvent::ImageAvailable {
-                session_id: self.session_id.0,
-                pane_id: self.meta.id,
-            });
+        if images_changed {
+            self.publish_resized_images();
         }
     }
 }
@@ -6343,6 +6422,9 @@ impl SessionRuntimeManager {
                                 break;
                             }
                             Ok(bytes_read) => {
+                                // Serialize the watermark with geometry and the
+                                // entire retained parser publication, not merely read.
+                                let Ok(requested_size) = last_requested_size_for_reader.lock() else { break; };
                                 // This watermark describes raw PTY capture, independently
                                 // of optional recording sinks or projection processing.
                                 execution_for_reader.output_watermark.fetch_add(
@@ -6363,9 +6445,6 @@ impl SessionRuntimeManager {
                                 );
                                 // Keep resize requests out until both image state
                                 // and the shared grid have consumed this chunk.
-                                let Ok(requested_size) = last_requested_size_for_reader.lock() else {
-                                    break;
-                                };
                                 let Ok(mut cursor_tracker) = cursor_tracker_for_reader.lock() else {
                                     break;
                                 };

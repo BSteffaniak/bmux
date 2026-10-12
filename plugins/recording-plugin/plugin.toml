@@ -1,16 +1,37 @@
 execution_class = "native_fast"
-id = "bmux.recording"
-name = "bmux Recording"
-owns_namespaces = ["recording"]
-owns_paths = [["server", "recording"], ["playbook", "from-recording"]]
+id              = "bmux.recording"
+name            = "bmux Recording"
+owns_namespaces = ["recording", "record"]
+owns_paths      = [["server", "recording"], ["playbook", "from-recording"]]
+
+optional_capabilities = ["bmux.pane_runtime.presentation.v1"]
 provided_capabilities = [
     "bmux.recording.read",
     "bmux.recording.write",
     "bmux.recording.process.v4",
+    "bmux.recording.process.presentation.v1",
 ]
 provided_features = ["bmux.recording", "bmux.recording.process.v4"]
 required_capabilities = ["bmux.pane_runtime.execution.v4"]
 version = "0.0.1-alpha.0"
+
+[[commands]]
+description = """bmux record [--output NEW_DIR] [--export text|raw|events|gif]... [--gif NEW_PATH] [--json] -- PROGRAM ARGS
+Requires stdin and stdout TTY. Resolves caller PATH and inherits caller cwd/environment except BMUX routing and runtime-owned terminal identity. Uses actual viewport and full recording profile. Literal argv, no implicit shell. Canonical recording is retained at a unique dedicated root; GIF is opt-in. Detachment never terminates work. Final JSON is emitted after terminal restoration: schema_version=4, ok, status, artifacts, optional error. Success propagates child exit; recording, restoration, export or cleanup failure exits nonzero with recovery identity retained. Artifact destinations must not exist; no overwrite. Automatic owned-server cleanup occurs only after durable finalization.
+"""
+expose_in_cli = true
+name = "record"
+path = ["record"]
+summary = "Run an interactive program with durable recording"
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
 
 [[services]]
 capability   = "bmux.recording.read"
@@ -25,6 +46,11 @@ kind         = "command"
 [[services]]
 capability   = "bmux.recording.process.v4"
 interface_id = "recording-process-v4"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.recording.process.presentation.v1"
+interface_id = "recording-process-presentation-v1"
 kind         = "command"
 
 [[event_publications]]

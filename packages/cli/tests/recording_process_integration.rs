@@ -13,6 +13,7 @@
 use serde_json::Value;
 use serial_test::serial;
 use std::fs::{self, File};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -23,6 +24,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 struct RecordingEnv {
     root: PathBuf,
+    short_tmp: PathBuf,
     binary: PathBuf,
     runs: std::cell::RefCell<Vec<String>>,
     command_sequence: std::cell::Cell<u64>,
@@ -31,8 +33,37 @@ struct RecordingEnv {
 
 impl RecordingEnv {
     fn new() -> Self {
-        // /tmp keeps Unix socket paths below macOS's small sockaddr_un limit.
-        let root = PathBuf::from("/tmp").join(format!("bmux-rp-{}", uuid::Uuid::new_v4().simple()));
+        let fixture_base = std::env::var_os("BMUX_RECORDING_TEST_TMP_ROOT")
+            .map_or_else(std::env::temp_dir, PathBuf::from);
+        assert!(fixture_base.is_absolute(), "fixture base must be absolute");
+        let root = fixture_base.join(format!("bmux-rp-{}", uuid::Uuid::new_v4().simple()));
+        let socket_base = std::env::var_os("BMUX_RECORDING_TEST_SOCKET_ROOT")
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+            .canonicalize()
+            .expect("canonical socket base");
+        assert!(socket_base.is_absolute(), "socket base must be absolute");
+        let short_tmp = socket_base.join(format!(
+            "t-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        // Exclusive private base leaves room for dedicated runtime socket names.
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&short_tmp)
+            .expect("exclusive owned TMPDIR");
+        assert_eq!(
+            short_tmp.canonicalize().expect("canonical TMPDIR"),
+            short_tmp
+        );
+        assert_eq!(
+            fs::symlink_metadata(&short_tmp)
+                .expect("TMPDIR metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(short_tmp.as_os_str().len() <= 25, "TMPDIR endpoint budget");
         for directory in [
             "home",
             "config",
@@ -47,8 +78,14 @@ impl RecordingEnv {
         }
         let root = root.canonicalize().expect("canonical owned root");
         fs::write(root.join("config/bmux.toml"), "").expect("write empty isolated config");
+        fs::write(
+            root.join("short-tmpdir.txt"),
+            short_tmp.as_os_str().as_encoded_bytes(),
+        )
+        .expect("retain TMPDIR locator");
         Self {
             root,
+            short_tmp,
             binary: acceptance_binary(),
             runs: std::cell::RefCell::new(Vec::new()),
             command_sequence: std::cell::Cell::new(0),
@@ -109,7 +146,7 @@ impl RecordingEnv {
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_CACHE_HOME", self.root.join("home/cache"))
             .env("XDG_RUNTIME_DIR", self.root.join("runtime"))
-            .env("TMPDIR", self.root.join("tmp"))
+            .env("TMPDIR", &self.short_tmp)
             .env("BMUX_CONFIG_DIR", self.root.join("config"))
             .env("BMUX_RUNTIME_DIR", self.root.join("runtime"))
             .env("BMUX_DATA_DIR", self.root.join("data"))
@@ -256,9 +293,10 @@ impl RecordingEnv {
         let root = runtime_root
             .canonicalize()
             .expect("dedicated runtime exists");
-        let base = PathBuf::from("/tmp")
+        let base = self
+            .short_tmp
             .canonicalize()
-            .expect("canonical temp base");
+            .expect("canonical owned temp base");
         assert_eq!(
             root.parent(),
             Some(base.as_path()),

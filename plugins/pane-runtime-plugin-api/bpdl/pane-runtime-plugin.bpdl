@@ -18,6 +18,7 @@
 
 plugin bmux.pane_runtime version 1;
 
+capability PANE_RUNTIME_PRESENTATION_V1 = bmux.pane_runtime.presentation.v1;
 capability PANE_RUNTIME_EXECUTION_V4 = bmux.pane_runtime.execution.v4;
 capability PANE_RUNTIME_READ = bmux.pane_runtime.read;
 capability PANE_RUNTIME_WRITE = bmux.pane_runtime.write;
@@ -207,6 +208,45 @@ interface pane-runtime-execution-v4 {
     // Retirement requires durable EOF and resolved mutations; it never claims descendant cleanup.
     command retire(execution: terminal-execution-ref, retirement_mutation_id: uuid, expected_revision: u64)
         -> result<terminal-retirement-receipt, terminal-recovery-error>;
+}
+
+// Optional presentation over the existing v4 execution, not a new execution engine.
+// encoded_grid is the canonical retained terminal snapshot, including protocol modes.
+@capability(PANE_RUNTIME_PRESENTATION_V1)
+interface pane-runtime-presentation-v1 {
+    record presentation-capabilities {
+        schema_version: u32,
+        coherent_screen: bool,
+        canonical_resize: bool,
+    }
+    command capabilities() -> result<presentation-capabilities, pane-runtime-execution-v4.terminal-execution-error>;
+    // Explicit representation selection. Capture v1 is a single ordered stream
+    // of little-endian u32-length-prefixed JSON terminal-capture-event records.
+    enum terminal-capture-format { ordered-events-v1 }
+    variant terminal-capture-event-kind {
+        output { data: bytes },
+        resize { cols: u16, rows: u16 },
+    }
+    record terminal-capture-event {
+        mono_ns: u64,
+        event: terminal-capture-event-kind,
+    }
+    record terminal-event-batch {
+        execution: pane-runtime-execution-v4.terminal-execution-ref,
+        format: terminal-capture-format,
+        offset: u64,
+        continuation: u64,
+        data: bytes,
+        eof: bool,
+    }
+    command resize(execution: pane-runtime-execution-v4.terminal-execution-ref,
+        format: terminal-capture-format, cols: u16, rows: u16)
+        -> result<unit, pane-runtime-execution-v4.terminal-execution-error>;
+    command capture-events(execution: pane-runtime-execution-v4.terminal-execution-ref,
+        format: terminal-capture-format, offset: u64, max_bytes: u32)
+        -> result<terminal-event-batch, pane-runtime-execution-v4.terminal-recovery-error>;
+    command present(execution: pane-runtime-execution-v4.terminal-execution-ref)
+        -> result<pane-runtime-execution-v4.terminal-execution-screen, pane-runtime-execution-v4.terminal-execution-error>;
 }
 
 @capability(PANE_RUNTIME_SPAWN_V1)

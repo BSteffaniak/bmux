@@ -36,6 +36,7 @@ pub(super) struct ExecutionCapture {
     pub(super) durable_capture: Mutex<Option<super::durable_capture::DurableCapture>>,
     pub(super) master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
     pub(super) output_drained: AtomicBool,
+    pub(super) geometry_revision: AtomicU64,
     pub(super) output_watermark: AtomicU64,
     pub(super) outcome: Mutex<(Option<u32>, Option<String>, Option<String>)>,
     pub(super) lifecycle_done: tokio::sync::watch::Sender<bool>,
@@ -61,6 +62,7 @@ impl Default for ExecutionCapture {
             durable_capture: Mutex::new(None),
             master: Mutex::new(None),
             output_drained: AtomicBool::new(false),
+            geometry_revision: AtomicU64::new(0),
             output_watermark: AtomicU64::new(0),
             outcome: Mutex::new((None, None, None)),
             lifecycle_done: tokio::sync::watch::channel(true).0,
@@ -651,6 +653,28 @@ pub(crate) fn send(reference: &ExecutionRef, data: Vec<u8>) -> Result<(), Execut
     })
 }
 
+pub(crate) fn resize_ordered(
+    reference: &ExecutionRef,
+    cols: u16,
+    rows: u16,
+) -> Result<(), ExecutionError> {
+    with_pane(reference, |pane| {
+        if pane
+            .execution
+            .durable_capture
+            .lock()
+            .map_err(failed)?
+            .is_none()
+        {
+            return Err(failed(
+                "ordered-events-v1 capture is not available for this execution",
+            ));
+        }
+        Ok(())
+    })?;
+    resize(reference, cols, rows)
+}
+
 pub(crate) fn resize(reference: &ExecutionRef, cols: u16, rows: u16) -> Result<(), ExecutionError> {
     validate_size(cols, rows)?;
     with_pane(reference, |pane| {
@@ -660,8 +684,11 @@ pub(crate) fn resize(reference: &ExecutionRef, cols: u16, rows: u16) -> Result<(
         let permit = Arc::clone(&pane.execution.admission)
             .try_acquire_owned()
             .map_err(failed)?;
+        let geometry_revision = pane.execution.geometry_revision.load(Ordering::SeqCst);
         pane.resize_pty_admitted(rows, cols, Some(permit));
-        if *pane.last_requested_size.lock().map_err(failed)? != (rows, cols) {
+        if pane.execution.geometry_revision.load(Ordering::SeqCst) == geometry_revision
+            || *pane.last_requested_size.lock().map_err(failed)? != (rows, cols)
+        {
             return Err(failed("terminal geometry could not be committed"));
         }
         Ok(())
@@ -689,7 +716,9 @@ pub(crate) fn wait(
             authorize()?;
             let current = status(reference)?;
             if current.error.is_some()
-                || (!matches!(current.phase, ExecutionPhase::Running) && current.output_drained)
+                || (!matches!(current.phase, ExecutionPhase::Running)
+                    && current.output_drained
+                    && current.terminal_session_ended)
                 || tokio::time::Instant::now() >= deadline
             {
                 return Ok(current);

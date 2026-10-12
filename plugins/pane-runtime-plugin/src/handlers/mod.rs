@@ -33,6 +33,18 @@ mod spawn;
 )]
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
+        "pane-runtime-presentation-v1", "capabilities" => |_req: (), _ctx| {
+            Ok::<_, ServiceResponse>(Ok::<_, bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionError>(bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::PresentationCapabilities { schema_version: 1, coherent_screen: true, canonical_resize: true }))
+        },
+        "pane-runtime-presentation-v1", "resize" => |req: bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::ResizeRequest, ctx| {
+            Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "pane.resize").and_then(|()| crate::runtime::execution::resize_ordered(&req.execution, req.cols, req.rows)))
+        },
+        "pane-runtime-presentation-v1", "capture-events" => |req: bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::CaptureEventsRequest, ctx| {
+            Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.execution.session_id, "read").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::capture_events(&req.execution, req.format, req.offset, req.max_bytes)))
+        },
+        "pane-runtime-presentation-v1", "present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::PresentRequest, ctx| {
+            Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::screen(&req.execution)))
+        },
         "pane-runtime-execution-v4", "reserve" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::ReserveRequest, ctx| {
             Ok::<_, ServiceResponse>(crate::runtime::reservations::reserve(req.launch_mutation_id, req.options, |id| spawn::authorize_creation(ctx, id, "session.create").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") })))
         },

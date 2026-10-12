@@ -631,6 +631,49 @@ impl ProcessService {
         Ok(recording)
     }
 
+    async fn persist_ordered_capture(&self, value: &process::RunStatus) -> Result<()> {
+        use bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1 as presentation;
+        let directory = self.root.join(value.recording_id.to_string());
+        if !directory.join("capture-format.json").try_exists()? {
+            return Ok(());
+        }
+        let format: presentation::TerminalCaptureFormat =
+            serde_json::from_slice(&std::fs::read(directory.join("capture-format.json"))?)?;
+        let reference = execution(value)?;
+        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let mut offset = 0;
+        let mut bytes = Vec::new();
+        loop {
+            let batch = presentation::client::capture_events(
+                &mut client,
+                reference.clone(),
+                format,
+                offset,
+                CAPTURE_READ_MAX_BYTES,
+            )
+            .await?
+            .map_err(|error| anyhow::anyhow!("ordered capture: {error:?}"))?;
+            ensure!(
+                batch.execution == reference
+                    && batch.offset == offset
+                    && batch.continuation == offset + u64::try_from(batch.data.len())?,
+                "ordered capture identity or cursor mismatch"
+            );
+            ensure!(
+                bytes.len().saturating_add(batch.data.len()) <= 256 * 1024 * 1024,
+                "ordered capture exceeds bound"
+            );
+            bytes.extend_from_slice(&batch.data);
+            offset = batch.continuation;
+            if batch.eof {
+                break;
+            }
+            ensure!(!batch.data.is_empty(), "ordered capture EOF not committed");
+        }
+        crate::durable::write_atomic(&directory.join("capture.events"), &bytes)?;
+        Ok(())
+    }
+
     async fn verify_raw_source(&self, value: &process::RunStatus, watermark: u64) -> Result<()> {
         use std::io::{Read, Seek, SeekFrom};
         let reservation = self.store()?.reservation(value.run_id)?;
@@ -759,6 +802,7 @@ impl ProcessService {
         self.close_original_writer(&initial, status.output_watermark)?;
         self.verify_raw_source(&initial, status.output_watermark)
             .await?;
+        self.persist_ordered_capture(&initial).await?;
         let guard = self
             .mutation
             .lock()
@@ -843,6 +887,59 @@ fn capture_writer_ack(id: Uuid) -> Result<Option<crate::recording_runtime::write
 fn failure(error: anyhow::Error) -> process::ProcessError {
     process::ProcessError::OperationFailed {
         reason: error.into_boxed_dyn_error().to_string(),
+    }
+}
+
+impl bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProcessPresentationV1Service
+    for ProcessService
+{
+    fn capabilities(&self) -> Reply<'_, bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::PresentationCapabilities> {
+        Box::pin(async move {
+            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::capabilities(&mut client)
+                .await.map_err(|error| failure(error.into()))?
+                .map_err(|error| failure(anyhow::anyhow!("presentation negotiation: {error:?}")))
+        })
+    }
+    fn resize(
+        &self,
+        run_id: Uuid,
+        format: bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::TerminalCaptureFormat,
+        cols: u16,
+        rows: u16,
+    ) -> Reply<'_, ()> {
+        Box::pin(async move {
+            let value = self.load(run_id).map_err(failure)?;
+            let directory = self.root.join(value.recording_id.to_string());
+            // Persist negotiated representation before the side effect. This is
+            // selection metadata, never a second resize order or event journal.
+            crate::durable::write_atomic(&directory.join("capture-format.json"), &serde_json::to_vec(&format).map_err(|error| failure(error.into()))?).map_err(failure)?;
+            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::resize(
+                &mut client, execution(&value).map_err(failure)?, format, cols, rows,
+            ).await.map_err(|error| failure(error.into()))?
+                .map_err(|error| failure(anyhow::anyhow!("ordered resize: {error:?}")))
+        })
+    }
+    fn present(&self, run_id: Uuid) -> Reply<'_, pane::TerminalExecutionScreen> {
+        Box::pin(async move {
+            // Durable run ownership is checked before dispatch. The pane service
+            // independently authorizes read access and validates the exact token.
+            let value = self.load(run_id).map_err(failure)?;
+            let reference = execution(&value).map_err(failure)?;
+            let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+            let screen = bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::present(
+                &mut client,
+                reference.clone(),
+            )
+            .await
+            .map_err(|error| failure(error.into()))?
+            .map_err(|error| failure(anyhow::anyhow!("presentation: {error:?}")))?;
+            if screen.execution != reference {
+                return Err(failure(anyhow::anyhow!("presentation execution mismatch")));
+            }
+            Ok(screen)
+        })
     }
 }
 

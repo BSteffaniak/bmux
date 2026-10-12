@@ -10,6 +10,9 @@ use std::path::Path;
 use uuid::Uuid;
 
 pub(crate) fn replay(directory: &Path, recording_id: Uuid, cols: u16, rows: u16) -> Result<String> {
+    if directory.join("capture-format.json").try_exists()? {
+        return replay_ordered(directory, recording_id, cols, rows);
+    }
     let client_id = Uuid::nil();
     let (mut output, mut stream) = open_replay_stream(recording_id, cols, rows)?;
     let mut canonical_raw = Vec::new();
@@ -98,6 +101,80 @@ pub(crate) fn replay(directory: &Path, recording_id: Uuid, cols: u16, rows: u16)
         &canonical_raw,
         &text,
     )?;
+    Ok(text)
+}
+
+fn replay_ordered(directory: &Path, recording_id: Uuid, cols: u16, rows: u16) -> Result<String> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::{
+        TerminalCaptureEvent, TerminalCaptureEventKind, TerminalCaptureFormat,
+    };
+    let _: TerminalCaptureFormat =
+        serde_json::from_slice(&std::fs::read(directory.join("capture-format.json"))?)?;
+    let bytes = std::fs::read(directory.join("capture.events"))?;
+    ensure!(
+        bytes.len() <= 256 * 1024 * 1024,
+        "ordered capture exceeds bound"
+    );
+    let (mut output, mut stream) = open_replay_stream(recording_id, cols, rows)?;
+    let mut reader = std::io::Cursor::new(bytes);
+    let mut raw = Vec::new();
+    let mut last = 0;
+    while reader.position() < u64::try_from(reader.get_ref().len())? {
+        let mut length = [0; 4];
+        reader.read_exact(&mut length)?;
+        let length = usize::try_from(u32::from_le_bytes(length))?;
+        ensure!(length <= 65536, "ordered capture frame exceeds bound");
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes)?;
+        let event: TerminalCaptureEvent = serde_json::from_slice(&bytes)?;
+        ensure!(event.mono_ns >= last, "ordered capture time regressed");
+        last = event.mono_ns;
+        match event.event {
+            TerminalCaptureEventKind::Output { data } => {
+                ensure!(
+                    raw.len().saturating_add(data.len()) <= 64 * 1024 * 1024,
+                    "ordered raw exceeds bound"
+                );
+                raw.extend_from_slice(&data);
+                stream.process(&data);
+            }
+            TerminalCaptureEventKind::Resize { cols, rows } => {
+                ensure!(
+                    cols > 0 && rows > 0 && cols <= 1000 && rows <= 1000,
+                    "invalid captured viewport"
+                );
+                stream
+                    .resize(cols, rows)
+                    .map_err(|error| anyhow::anyhow!("replay resize: {error:?}"))?;
+                frame(
+                    &mut output,
+                    &DisplayTrackEnvelope {
+                        mono_ns: last,
+                        event: DisplayTrackEvent::Resize { cols, rows },
+                    },
+                )?;
+            }
+        }
+        frame(
+            &mut output,
+            &DisplayTrackEnvelope {
+                mono_ns: last,
+                event: DisplayTrackEvent::FrameBytes {
+                    data: bmux_terminal_grid::full_screen_repaint_bytes(stream.grid()),
+                },
+            },
+        )?;
+        ensure!(
+            output.len() <= 64 * 1024 * 1024,
+            "ordered display exceeds bound"
+        );
+    }
+    ensure!(
+        std::fs::read(directory.join("output.live"))? == raw,
+        "ordered capture differs from canonical raw projection"
+    );
+    let text = bmux_terminal_grid::visible_text(stream.grid(), 0, stream.grid().height());
+    publish_replay(directory, Uuid::nil(), last, &mut output, &raw, &text)?;
     Ok(text)
 }
 
@@ -198,6 +275,73 @@ fn read_replay_event(
 
 fn frame(writer: &mut Vec<u8>, value: &DisplayTrackEnvelope) -> Result<()> {
     write_frame(writer, value).map_err(|error| anyhow::anyhow!("display encoding: {error}"))
+}
+
+#[cfg(test)]
+mod ordered_replay_tests {
+    use super::*;
+    #[test]
+    fn ordered_stream_replays_resize_time_and_final_geometry() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::{
+            TerminalCaptureEvent, TerminalCaptureEventKind, TerminalCaptureFormat,
+        };
+        let root = std::env::temp_dir().join(format!("bmux-ordered-replay-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let events = [
+            TerminalCaptureEvent {
+                mono_ns: 10,
+                event: TerminalCaptureEventKind::Output {
+                    data: b"before".to_vec(),
+                },
+            },
+            TerminalCaptureEvent {
+                mono_ns: 50_000_000,
+                event: TerminalCaptureEventKind::Resize {
+                    cols: 101,
+                    rows: 29,
+                },
+            },
+            TerminalCaptureEvent {
+                mono_ns: 70_000_000,
+                event: TerminalCaptureEventKind::Output {
+                    data: b"\r\nafter".to_vec(),
+                },
+            },
+        ];
+        let mut capture = Vec::new();
+        for event in events {
+            let bytes = serde_json::to_vec(&event).unwrap();
+            capture.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_le_bytes());
+            capture.extend_from_slice(&bytes);
+        }
+        std::fs::write(
+            root.join("capture-format.json"),
+            serde_json::to_vec(&TerminalCaptureFormat::OrderedEventsV1).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("capture.events"), capture).unwrap();
+        std::fs::write(root.join("output.live"), b"before\r\nafter").unwrap();
+        let text = replay(&root, Uuid::new_v4(), 80, 24).unwrap();
+        assert!(text.contains("after"));
+        let display = std::fs::read(root.join(format!("display-{}.bin", Uuid::nil()))).unwrap();
+        let frames =
+            bmux_recording_protocol::read_frames::<DisplayTrackEnvelope>(&display).unwrap();
+        assert_eq!(frames.bytes_remaining, 0);
+        let mut found = false;
+        for event in frames.frames {
+            if matches!(
+                event.event,
+                DisplayTrackEvent::Resize {
+                    cols: 101,
+                    rows: 29
+                }
+            ) {
+                assert_eq!(event.mono_ns, 50_000_000);
+                found = true;
+            }
+        }
+        assert!(found);
+    }
 }
 
 #[cfg(test)]

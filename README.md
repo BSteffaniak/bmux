@@ -57,6 +57,17 @@ Inside an attached session, `bmux detach` disconnects the client without intenti
 
 Read the [TUI framework guide](docs/tui-framework.md) for reusable APIs and ownership boundaries. Sessions surviving client disconnects do not imply that arbitrary foreground processes survive a machine restart.
 
+## Record an interactive terminal
+
+```sh
+bmux record -- lazygit
+bmux record --gif ./demo.gif -- nvim
+```
+
+Quit the program normally to restore the terminal and finalize the recording.
+See [recorded processes](docs/recording-process.md) for raw/text exports,
+headless agent interaction, and explicit recovery.
+
 ## Documentation
 
 - [CLI workflows and advanced examples](docs/cli-workflows.md)

@@ -19,6 +19,8 @@ mod commands;
 mod durable;
 mod export;
 mod from_recording;
+mod interactive_command;
+mod interactive_terminal;
 mod process_artifacts;
 mod process_bootstrap;
 mod process_commands;
@@ -260,6 +262,9 @@ impl RustPlugin for RecordingPlugin {
         &mut self,
         context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        if context.command == "record" {
+            return Ok(interactive_command::run(&context));
+        }
         if context.command.starts_with("recording-process-") {
             return Ok(process_commands::run(&context));
         }
@@ -276,10 +281,20 @@ impl RustPlugin for RecordingPlugin {
     // auditable typed dispatch boundary; splitting the route obscures fallback.
     #[allow(clippy::too_many_lines)]
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        use bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProcessPresentationV1Service;
         use bmux_recording_plugin_api::recording_process_v4::{
             self as process, RecordingProcessV4Service,
         };
         bmux_plugin_sdk::route_service!(context, {
+            "recording-process-presentation-v1", "capabilities" => |_req: (), ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.capabilities().await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-presentation-v1", "resize" => |req: bmux_recording_plugin_api::recording_process_presentation_v1::client::ResizeRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.resize(req.run_id, req.format, req.cols, req.rows).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-presentation-v1", "present" => |req: bmux_recording_plugin_api::recording_process_presentation_v1::client::PresentRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.present(req.run_id).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
             "recording-process-v4", "start" => |req: process::client::StartRequest, ctx| {
                 process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.start(req.run_id, req.launch_mutation_id, req.options, req.runtime_root).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
             },
@@ -416,6 +431,11 @@ impl RustPlugin for RecordingPlugin {
             isolated,
         ));
         process_runtime::register(Arc::clone(&service));
+        let presentation: Arc<dyn bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProcessPresentationV1Service + Send + Sync> = service.clone();
+        let _ = bmux_recording_plugin_api::recording_process_presentation_v1::register_provider(
+            registry,
+            presentation,
+        );
         let provider: Arc<
             dyn bmux_recording_plugin_api::recording_process_v4::RecordingProcessV4Service
                 + Send

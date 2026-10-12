@@ -21,6 +21,7 @@ bmux_codec                   = { workspace = true }
 bmux_config                  = { workspace = true }
 bmux_fonts                   = { workspace = true }
 bmux_ipc                     = { workspace = true }
+bmux_keyboard                = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin                  = { workspace = true }
 bmux_plugin_sdk              = { workspace = true }
@@ -28,16 +29,17 @@ bmux_recording_plugin_api    = { workspace = true }
 bmux_recording_protocol      = { workspace = true }
 bmux_recording_runtime       = { workspace = true }
 bmux_terminal_grid           = { workspace = true }
-crossterm                    = { workspace = true, features = ["events"] }
+crossterm                    = { workspace = true, features = ["events", "bracketed-paste"] }
 font8x8                      = { workspace = true }
 fontdb                       = { workspace = true }
 gif                          = { workspace = true }
+libc                         = { workspace = true }
 resvg                        = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true, features = ["std"] }
 sha2                         = { workspace = true }
 thiserror                    = { workspace = true }
-tokio                        = { workspace = true, features = ["rt", "time"] }
+tokio                        = { workspace = true, features = ["rt", "time", "signal"] }
 tracing                      = { workspace = true, features = ["std"] }
 ttf-parser                   = { workspace = true }
 uuid                         = { workspace = true, features = ["serde", "std", "v4"] }

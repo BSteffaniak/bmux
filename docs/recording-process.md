@@ -1,5 +1,43 @@
 # Recorded processes
 
+## Record an interactive program
+
+Run a program normally in an undecorated terminal, then finalize its recording
+when it exits:
+
+```sh
+bmux record -- lazygit
+bmux record --output ./capture --export raw --export text --export events -- nvim
+bmux record --gif ./demo.gif -- nvim
+```
+
+Arguments after `--` are literal argv, not shell text. The command resolves the
+program through PATH and uses the current directory, environment, terminal size,
+and full capture profile. Terminal stdin and stdout are required; use
+`bmux recording process` for headless interaction instead. Output directories and
+GIF destinations must be new: existing evidence is not overwritten. GIF export
+is optional, not part of ordinary recording startup.
+
+Keyboard, paste, mouse, and resize input target only the recorded execution.
+BMUX navigation shortcuts and decorations are absent. The server owns terminal
+parsing and query replies; application escape sequences are not blindly forwarded
+to the outer terminal. Resizes and output share one timestamped canonical capture.
+
+Normal completion restores the outer terminal, waits for real capture EOF and
+durable recording completion, publishes requested artifacts, and requests shutdown
+of the owned isolated server. The child exit outcome remains distinct from capture,
+restoration, and server-cleanup outcomes. `--json` prints the final structured result
+after interactive rendering; otherwise the evidence location is reported on stderr.
+
+A disconnect, transport error, or failed restoration is not permission to kill the
+recorded process. Preserve the reported run identity and use the headless status,
+reconcile, terminate, and finish commands below to recover deliberately. Outer
+suspend/resume is unsupported: suspension requests leave the interactive frontend
+with an explicit recovery error rather than pretending job-control continuity.
+Recordings may contain credentials and other sensitive input or output.
+
+## Headless recorded processes
+
 `bmux recording process` runs a program in a recorded PTY without requiring an
 interactive BMUX attachment. Recording owns the command surface; the process
 and recording have separate lifetimes. A detached CLI invocation is not a reason

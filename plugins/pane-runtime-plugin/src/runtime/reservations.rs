@@ -446,6 +446,36 @@ pub(crate) fn capture(
     })
 }
 
+pub(crate) fn capture_events(
+    reference: &ExecutionRef,
+    _format: bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::TerminalCaptureFormat,
+    offset: u64,
+    max_bytes: u32,
+) -> Result<
+    bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::TerminalEventBatch,
+    RecoveryError,
+> {
+    with_store(|store| {
+        find(store, reference)?;
+        let root = store
+            .root
+            .join(format!("capture-{}", reference.execution_token));
+        let (boundary, data) =
+            super::durable_capture::DurableCapture::read_events(&root, offset, max_bytes)
+                .map_err(failed)?;
+        if let Some(error) = boundary.error {
+            return Err(failed(error));
+        }
+        let continuation = offset + u64::try_from(data.len()).map_err(failed)?;
+        Ok(bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::TerminalEventBatch {
+            execution: reference.clone(),
+            format: bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::TerminalCaptureFormat::OrderedEventsV1,
+            offset, continuation, data,
+            eof: boundary.eof && continuation == boundary.stream_bytes,
+        })
+    })
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredInput {
     version: u32,

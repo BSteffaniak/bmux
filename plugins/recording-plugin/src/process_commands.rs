@@ -46,7 +46,49 @@ pub(crate) fn run(context: &NativeCommandContext) -> i32 {
     }
 }
 
-async fn execute(
+pub(crate) async fn execute_interactive_start(
+    context: &NativeCommandContext,
+) -> Result<(serde_json::Value, i32)> {
+    let args = Arguments::parse(&context.arguments)?;
+    program_options(&args)?;
+    let launch_key = args
+        .one("idempotency-key")?
+        .context("interactive launch identity missing")?
+        .parse::<Uuid>()?;
+    crate::process_bootstrap::record_launch(context, launch_key, &context.arguments, None)?;
+    let mut dedicated = crate::process_bootstrap::bootstrap(context).await?;
+    // Probe this exact isolated server before target admission. An advertised
+    // facade alone cannot prove its pane provider has coherent presentation.
+    let capabilities =
+        bmux_recording_plugin_api::recording_process_presentation_v1::client::capabilities(
+            &mut dedicated.client,
+        )
+        .await
+        .context(
+            "interactive presentation capability negotiation unavailable; target not launched",
+        )?
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "interactive presentation capability negotiation: {error:?}; target not launched"
+            )
+        })?;
+    validate_interactive_capabilities(&capabilities)?;
+    command_start(context, "start", &args, &mut dedicated, launch_key).await
+}
+
+fn validate_interactive_capabilities(
+    capabilities: &bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::PresentationCapabilities,
+) -> Result<()> {
+    ensure!(
+        capabilities.schema_version == 1
+            && capabilities.coherent_screen
+            && capabilities.canonical_resize,
+        "unsupported interactive presentation capabilities; requires schema1 coherent-screen and canonical-resize; target not launched"
+    );
+    Ok(())
+}
+
+pub(crate) async fn execute(
     context: &NativeCommandContext,
     operation: &str,
 ) -> Result<(serde_json::Value, i32)> {
@@ -814,6 +856,27 @@ fn help(operation: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_capabilities_require_exact_supported_representation() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::PresentationCapabilities;
+        for (schema_version, coherent_screen, canonical_resize, accepted) in [
+            (1, true, true, true),
+            (2, true, true, false),
+            (1, false, true, false),
+            (1, true, false, false),
+        ] {
+            assert_eq!(
+                validate_interactive_capabilities(&PresentationCapabilities {
+                    schema_version,
+                    coherent_screen,
+                    canonical_resize,
+                })
+                .is_ok(),
+                accepted
+            );
+        }
+    }
 
     #[test]
     fn retired_selectors_reject_before_launch_receipt_or_runtime_creation() {

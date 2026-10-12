@@ -99,6 +99,24 @@ pub(crate) fn export_process_artifacts(
     options: &ProcessArtifactOptions,
     screen: Option<&[u8]>,
 ) -> Result<ProcessArtifactReport> {
+    export_process_artifacts_selected(recording_dir, output_dir, options, screen, true, true, true)
+}
+
+// Interactive callers select derived artifacts without changing the historical
+// headless export surface. GIF selection remains options.gif_fps.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit private format selection preserves the existing headless options contract"
+)]
+pub(crate) fn export_process_artifacts_selected(
+    recording_dir: &Path,
+    output_dir: &Path,
+    options: &ProcessArtifactOptions,
+    screen: Option<&[u8]>,
+    include_pty: bool,
+    include_text: bool,
+    include_events: bool,
+) -> Result<ProcessArtifactReport> {
     validate_options(options)?;
     let summary = read_summary(recording_dir)?;
     ensure!(
@@ -135,7 +153,27 @@ pub(crate) fn export_process_artifacts(
     finish_writer(raw)?;
     finish_writer(text)?;
     finish_writer(events)?;
-    let mut names = vec!["output.pty", "output.txt", "events.jsonl"];
+    let mut names = Vec::new();
+    if recording_dir.join("capture-format.json").try_exists()? {
+        for name in ["capture-format.json", "capture.events", "viewport.json"] {
+            let bytes = fs::read(recording_dir.join(name))?;
+            let mut writer = artifact_writer(&staging.path.join(name), options.max_artifact_bytes)?;
+            writer.write_all(&bytes)?;
+            finish_writer(writer)?;
+            names.push(name);
+        }
+    }
+    for (selected, name) in [
+        (include_pty, "output.pty"),
+        (include_text, "output.txt"),
+        (include_events, "events.jsonl"),
+    ] {
+        if selected {
+            names.push(name);
+        } else {
+            fs::remove_file(staging.path.join(name))?;
+        }
+    }
     if let Some(screen) = screen {
         let mut writer =
             artifact_writer(&staging.path.join("screen.txt"), options.max_artifact_bytes)?;
@@ -169,12 +207,63 @@ pub(crate) fn export_process_artifacts(
         !output_dir.try_exists()?,
         "artifact directory appeared during export"
     );
-    fs::rename(&staging.path, output_dir).context("publishing artifact directory")?;
+    publish_directory_noreplace(&staging.path, output_dir)?;
     File::open(parent)?
         .sync_all()
         .context("syncing artifact parent after publication")?;
     report.artifacts = names.iter().map(|name| output_dir.join(name)).collect();
     Ok(report)
+}
+
+fn publish_directory_noreplace(source: &Path, target: &Path) -> Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+        let target = std::ffi::CString::new(target.as_os_str().as_bytes())?;
+        // Both paths point into the caller-owned export parent. The kernel
+        // atomically rejects any competing destination, including empty dirs.
+        #[cfg(target_os = "macos")]
+        let result =
+            unsafe { libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL) };
+        #[cfg(target_os = "linux")]
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("publishing artifacts without replacement");
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (source, target);
+        bail!("atomic no-replace artifact publication is unsupported on this platform")
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    #[test]
+    fn no_replace_publication_rejects_competing_empty_directory() {
+        let root = std::env::temp_dir().join(format!("bmux-no-replace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("staging");
+        let target = root.join("published");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("evidence"), b"owned").unwrap();
+        std::fs::create_dir(&target).unwrap();
+        assert!(super::publish_directory_noreplace(&source, &target).is_err());
+        assert!(source.join("evidence").exists());
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+    }
 }
 
 fn export_segments(

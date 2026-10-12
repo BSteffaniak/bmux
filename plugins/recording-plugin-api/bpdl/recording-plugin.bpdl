@@ -6,7 +6,18 @@ import pane = bmux.pane_runtime;
 
 capability RECORDING_READ = bmux.recording.read;
 capability RECORDING_WRITE = bmux.recording.write;
+capability RECORDING_PROCESS_PRESENTATION_V1 = bmux.recording.process.presentation.v1;
 capability RECORDING_PROCESS_V4 = bmux.recording.process.v4;
+
+// Optional retained presentation for the execution already owned by a v4 run.
+@capability(RECORDING_PROCESS_PRESENTATION_V1)
+interface recording-process-presentation-v1 {
+    command capabilities() -> result<pane.presentation-capabilities, recording-process-v4.process-error>;
+    command resize(run_id: uuid, format: pane.terminal-capture-format, cols: u16, rows: u16)
+        -> result<unit, recording-process-v4.process-error>;
+    command present(run_id: uuid)
+        -> result<pane.terminal-execution-screen, recording-process-v4.process-error>;
+}
 
 // One process contract. Older process/storage representations are not accepted.
 @capability(RECORDING_PROCESS_V4)
