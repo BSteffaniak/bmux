@@ -23,6 +23,17 @@ BMUX navigation shortcuts and decorations are absent. The server owns terminal
 parsing and query replies; application escape sequences are not blindly forwarded
 to the outer terminal. Resizes and output share one timestamped canonical capture.
 
+Interactive recording reuses the ordinary attach terminal backend and retained
+scene renderer. Only successfully flushed frames advance presentation baselines;
+unchanged grids do not repaint. Presentation waits are separately negotiated
+through `bmux.recording.process.presentation.wait.v1` (backed by
+`bmux.pane_runtime.presentation.wait.v1`), without changing presentation v1 or
+durable process v4. Bounded receiving and status connections do not serialize
+keyboard input behind screen polling or durable status reconciliation. A bounded
+FIFO control queue coalesces only already queued adjacent input bytes into existing
+durable input mutations; it adds no collection timer and never crosses a resize
+barrier. Uncertain input outcomes are reported rather than automatically retried.
+
 Normal completion restores the outer terminal, waits for real capture EOF and
 durable recording completion, publishes requested artifacts, and requests shutdown
 of the owned isolated server. Target exit and terminal-owner retirement alone do

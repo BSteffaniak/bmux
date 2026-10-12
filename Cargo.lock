@@ -1200,6 +1200,7 @@ dependencies = [
  "bmux_scene_protocol_render",
  "bmux_terminal_grid",
  "crossterm",
+ "futures-util",
  "tracing",
  "unicode-width",
  "uuid",
@@ -2220,6 +2221,7 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
+ "bmux_attach_pipeline",
  "bmux_client",
  "bmux_codec",
  "bmux_config",

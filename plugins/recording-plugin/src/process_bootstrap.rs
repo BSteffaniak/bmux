@@ -39,6 +39,14 @@ fn paths(root: &Path) -> ConfigPaths {
     )
 }
 
+pub(crate) async fn connect_owned(root: &Path, name: &str) -> Result<BmuxClient> {
+    validate_runtime_socket(root)?;
+    Ok(
+        BmuxClient::connect_with_paths_and_timeout(&paths(root), name, PROCESS_REQUEST_TIMEOUT)
+            .await?,
+    )
+}
+
 fn dedicated_root_name() -> String {
     // 90 random bits fit alongside the standard 56-byte macOS TMPDIR and
     // /runtime/server.sock. Exclusive creation remains the collision authority.

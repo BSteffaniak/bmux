@@ -4692,7 +4692,8 @@ fn pane_surface_geometry(
         w: surface.rect.w,
         h: surface.rect.h,
     };
-    if rect.w < 2 || rect.h < 2 {
+    // Undecorated surfaces may legitimately be one cell wide or tall.
+    if rect.w == 0 || rect.h == 0 {
         return None;
     }
     // Interior used for PTY content and cursor positioning. Read from the

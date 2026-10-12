@@ -299,8 +299,13 @@ async fn complete(
         .execution
         .clone()
         .context("recorded run has no execution identity")?;
-    match crate::interactive_terminal::interact(&mut dedicated.client, status.run_id, execution)
-        .await
+    match crate::interactive_terminal::interact(
+        &dedicated.root,
+        &mut dedicated.client,
+        status.run_id,
+        execution,
+    )
+    .await
     {
         Ok(observed) => {
             *terminal_restored = Some(true);

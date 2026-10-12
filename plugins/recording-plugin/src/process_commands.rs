@@ -73,6 +73,19 @@ pub(crate) async fn execute_interactive_start(
             )
         })?;
     validate_interactive_capabilities(&capabilities)?;
+    let wait =
+        bmux_recording_plugin_api::recording_process_presentation_wait_v1::client::capabilities(
+            &mut dedicated.client,
+        )
+        .await
+        .context("interactive wait capability unavailable; target not launched")?;
+    ensure!(
+        wait.schema_version == 1
+            && wait.token_bytes == 32
+            && wait.max_timeout_ms == 1000
+            && wait.max_response_bytes == 4 * 1024 * 1024,
+        "unsupported interactive wait capability; target not launched"
+    );
     command_start(context, "start", &args, &mut dedicated, launch_key).await
 }
 

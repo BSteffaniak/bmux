@@ -286,6 +286,12 @@ impl RustPlugin for RecordingPlugin {
             self as process, RecordingProcessV4Service,
         };
         bmux_plugin_sdk::route_service!(context, {
+            "recording-process-presentation-wait-v1", "capabilities" => |_req: (), ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.wait_capabilities().await })).and_then(|value| value).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
+            "recording-process-presentation-wait-v1", "wait-present" => |req: bmux_recording_plugin_api::recording_process_presentation_wait_v1::client::WaitPresentRequest, ctx| {
+                process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.wait_present(req.run_id, req.after, req.timeout_ms, req.max_bytes).await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
+            },
             "recording-process-presentation-v1", "capabilities" => |_req: (), ctx| {
                 process_runtime::dispatch(ctx, move |service| Box::pin(async move { service.capabilities().await })).map_err(|error| ServiceResponse::error("process_dispatch", error.to_string()))
             },

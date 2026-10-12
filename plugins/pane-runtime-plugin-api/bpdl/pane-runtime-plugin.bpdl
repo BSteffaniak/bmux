@@ -18,6 +18,7 @@
 
 plugin bmux.pane_runtime version 1;
 
+capability PANE_RUNTIME_PRESENTATION_WAIT_V1 = bmux.pane_runtime.presentation.wait.v1;
 capability PANE_RUNTIME_PRESENTATION_V1 = bmux.pane_runtime.presentation.v1;
 capability PANE_RUNTIME_EXECUTION_V4 = bmux.pane_runtime.execution.v4;
 capability PANE_RUNTIME_READ = bmux.pane_runtime.read;
@@ -212,6 +213,32 @@ interface pane-runtime-execution-v4 {
 
 // Optional presentation over the existing v4 execution, not a new execution engine.
 // encoded_grid is the canonical retained terminal snapshot, including protocol modes.
+// Read-only, stateless wait. Tokens are exactly 32 SHA-256 bytes, timeout is
+// at most 1000ms, and encoded responses are at most 4MiB. Cancellation never
+// advances server state; retrying the same token observes the latest state.
+@capability(PANE_RUNTIME_PRESENTATION_WAIT_V1)
+interface pane-runtime-presentation-wait-v1 {
+    record wait-capabilities {
+        schema_version: u32,
+        max_timeout_ms: u32,
+        max_response_bytes: u32,
+        token_bytes: u32,
+    }
+    record presentation-frame {
+        revision: bytes,
+        screen: pane-runtime-execution-v4.terminal-execution-screen,
+    }
+    variant wait-error {
+        invalid-request { reason: string },
+        oversized { max_bytes: u32 },
+        authority { error: pane-runtime-execution-v4.terminal-execution-error },
+    }
+    command capabilities() -> wait-capabilities;
+    command wait-present(execution: pane-runtime-execution-v4.terminal-execution-ref,
+        after: bytes?, timeout_ms: u32, max_bytes: u32)
+        -> result<presentation-frame?, wait-error>;
+}
+
 @capability(PANE_RUNTIME_PRESENTATION_V1)
 interface pane-runtime-presentation-v1 {
     record presentation-capabilities {

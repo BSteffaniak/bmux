@@ -276,6 +276,60 @@ impl ProcessService {
         Ok(value)
     }
 
+    pub(crate) async fn wait_capabilities(
+        &self,
+    ) -> Result<bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::WaitCapabilities>
+    {
+        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        Ok(
+            bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::client::capabilities(
+                &mut client,
+            )
+            .await?,
+        )
+    }
+
+    pub(crate) async fn wait_present(
+        &self,
+        run_id: Uuid,
+        after: Option<Vec<u8>>,
+        timeout_ms: u32,
+        max_bytes: u32,
+    ) -> Result<
+        Option<bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::PresentationFrame>,
+        bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::WaitError,
+    > {
+        use bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::WaitError;
+        let unavailable = |error: anyhow::Error| WaitError::Authority {
+            error: pane::TerminalExecutionError::OperationFailed {
+                reason: error.to_string(),
+            },
+        };
+        // Resolve durable ownership only; never refresh capture/status in this lane.
+        let value = self.load(run_id).map_err(unavailable)?;
+        let reference = execution(&value).map_err(unavailable)?;
+        let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
+        let frame =
+            bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::client::wait_present(
+                &mut client,
+                reference.clone(),
+                after,
+                timeout_ms,
+                max_bytes,
+            )
+            .await
+            .map_err(|error| unavailable(error.into()))??;
+        if frame
+            .as_ref()
+            .is_some_and(|frame| frame.screen.execution != reference)
+        {
+            return Err(WaitError::Authority {
+                error: pane::TerminalExecutionError::StaleExecution,
+            });
+        }
+        Ok(frame)
+    }
+
     async fn refresh(&self, id: Uuid) -> Result<process::RunStatus> {
         let mut value = self.load(id)?;
         if value.capture_finalized {
@@ -1095,20 +1149,9 @@ impl process::RecordingProcessV4Service for ProcessService {
                 return Ok(receipt);
             }
             let mut client = ServiceCallerDispatchClient::new(self.caller.as_ref());
-            // Reconnect authenticates transport; current execution authority must
-            // independently admit input before any write is attempted.
-            let authority =
-                pane::client::reconcile(&mut client, execution(&value).map_err(failure)?)
-                    .await
-                    .map_err(|error| failure(error.into()))?
-                    .map_err(|error| {
-                        failure(anyhow::anyhow!("input authority reconciliation: {error:?}"))
-                    })?;
-            if authority.recovery_required
-                || !matches!(authority.launch.phase, pane::TerminalLaunchPhase::Running)
-            {
-                return Err(process::ProcessError::RecoveryRequired { reason: "execution authority is not currently writable; reconcile/resolve before input".into() });
-            }
+            // send_admitted validates exact-token launch/runtime/capture
+            // authority at fresh-effect admission without durable refresh.
+            // Mutation admission and uncertain receipts remain durable.
             self.store()
                 .map_err(failure)?
                 .admit_input(run_id, mutation_id, &data)
@@ -1121,7 +1164,12 @@ impl process::RecordingProcessV4Service for ProcessService {
             )
             .await
             .map_err(|error| failure(error.into()))?
-            .map_err(|error| failure(anyhow::anyhow!("input admission: {error:?}")))?;
+            .map_err(|error| match error {
+                pane::TerminalRecoveryError::RecoveryRequired { reason } => {
+                    process::ProcessError::RecoveryRequired { reason }
+                }
+                error => failure(anyhow::anyhow!("input admission: {error:?}")),
+            })?;
             if matches!(receipt.phase, pane::TerminalInputPhase::Completed) {
                 self.store()
                     .map_err(failure)?

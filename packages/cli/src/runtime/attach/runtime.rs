@@ -63,15 +63,16 @@ use bmux_tui_components::modal_frame::{ModalFrame, ModalFrameComponent, ModalSiz
 use bmux_tui_components::theme::ComponentTheme;
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+#[cfg(test)]
+use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
 use crossterm::queue;
 use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use futures_util::StreamExt;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -119,18 +120,14 @@ pub trait AttachTerminal: Write {
 }
 
 pub struct RealAttachTerminal {
-    stdout: io::Stdout,
-    event_stream: Option<crossterm::event::EventStream>,
-    raw_mode_guard: Option<RawModeGuard>,
+    terminal: bmux_attach_pipeline::terminal::TerminalIo<io::Stdout>,
 }
 
 impl RealAttachTerminal {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            stdout: io::stdout(),
-            event_stream: None,
-            raw_mode_guard: None,
+            terminal: bmux_attach_pipeline::terminal::TerminalIo::new(io::stdout()),
         }
     }
 }
@@ -143,11 +140,11 @@ impl Default for RealAttachTerminal {
 
 impl Write for RealAttachTerminal {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stdout.write(buf)
+        self.terminal.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.stdout.flush()
+        self.terminal.flush()
     }
 }
 
@@ -438,34 +435,38 @@ impl AttachTerminal for RealAttachTerminal {
         mouse_capture_enabled: bool,
         bracketed_paste_enabled: bool,
     ) -> Result<bool> {
-        let guard = RawModeGuard::enable(
-            kitty_keyboard_enabled,
-            mouse_capture_enabled,
-            bracketed_paste_enabled,
-        )
-        .context("failed to enable raw mode for attach")?;
-        let keyboard_enhanced = guard.keyboard_enhanced;
-        self.raw_mode_guard = Some(guard);
-        self.event_stream = Some(crossterm::event::EventStream::new());
-        Ok(keyboard_enhanced)
+        #[cfg(feature = "kitty-keyboard")]
+        let keyboard_enhanced = kitty_keyboard_enabled;
+        #[cfg(not(feature = "kitty-keyboard"))]
+        let keyboard_enhanced = false;
+        let _ = kitty_keyboard_enabled;
+        self.terminal
+            .enter(bmux_attach_pipeline::terminal::TerminalOptions {
+                keyboard_enhanced,
+                mouse_capture: mouse_capture_enabled,
+                bracketed_paste: bracketed_paste_enabled,
+                ..bmux_attach_pipeline::terminal::TerminalOptions::default()
+            })
+            .context("failed to enable raw mode for attach")?;
+        Ok(self.terminal.keyboard_enhanced())
     }
 
     fn next_event(&mut self) -> AttachTerminalEventFuture<'_> {
         Box::pin(async move {
-            let Some(stream) = self.event_stream.as_mut() else {
-                anyhow::bail!("attach terminal event stream was not initialized");
-            };
-            match stream.next().await {
-                Some(result) => Ok(Some(result.context("failed reading terminal event")?)),
-                None => Ok(None),
-            }
+            self.terminal
+                .next_event()
+                .await
+                .context("failed reading terminal event")
         })
     }
 
     fn restore_after_attach_ui(&mut self) -> Result<()> {
-        self.event_stream = None;
-        self.raw_mode_guard = None;
-        restore_terminal_after_attach_ui()
+        let modes = self
+            .terminal
+            .restore()
+            .context("failed restoring attach terminal modes");
+        let display = restore_terminal_after_attach_ui();
+        modes.and(display)
     }
 
     #[cfg(any(
@@ -9019,14 +9020,8 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     }
 
     let terminal_write_started_at = Instant::now();
-    let write_result = terminal_writer
-        .write_all(&frame_bytes)
-        .context("failed writing attach frame")
-        .and_then(|()| {
-            terminal_writer
-                .flush()
-                .context("failed flushing attach frame")
-        });
+    let write_result = bmux_attach_pipeline::terminal::write_frame(terminal_writer, &frame_bytes)
+        .context("failed writing or flushing attach frame");
     if let Err(error) = write_result {
         // Encoding has advanced row baselines, but partial output is not a
         // presented frame. Repaint every row before using incremental diffs.
@@ -9607,6 +9602,7 @@ pub fn describe_timeout(timeout: &ResolvedTimeout) -> String {
     }
 }
 
+#[cfg(test)]
 fn queue_attach_input_modes<W: Write>(
     writer: &mut W,
     mouse_capture_enabled: bool,
@@ -9621,6 +9617,7 @@ fn queue_attach_input_modes<W: Write>(
     Ok(())
 }
 
+#[cfg(test)]
 fn queue_active_attach_input_mode_restore<W: Write>(
     writer: &mut W,
     mouse_capture_enabled: bool,
@@ -9637,83 +9634,6 @@ fn queue_active_attach_input_mode_restore<W: Write>(
 
 fn queue_attach_input_mode_restore<W: Write>(writer: &mut W) -> io::Result<()> {
     queue!(writer, DisableMouseCapture, DisableBracketedPaste)
-}
-
-pub struct RawModeGuard {
-    keyboard_enhanced: bool,
-    mouse_capture_enabled: bool,
-    bracketed_paste_enabled: bool,
-}
-
-impl RawModeGuard {
-    fn enable(
-        kitty_keyboard_enabled: bool,
-        mouse_capture_enabled: bool,
-        bracketed_paste_enabled: bool,
-    ) -> Result<Self> {
-        enable_raw_mode().context("failed enabling raw mode")?;
-
-        #[cfg(feature = "kitty-keyboard")]
-        let keyboard_enhanced = kitty_keyboard_enabled
-            && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-        #[cfg(not(feature = "kitty-keyboard"))]
-        let keyboard_enhanced = false;
-
-        let _ = kitty_keyboard_enabled; // suppress unused warning when feature is disabled
-
-        let mut guard = Self {
-            keyboard_enhanced: false,
-            mouse_capture_enabled: false,
-            bracketed_paste_enabled: false,
-        };
-        let mut stdout = io::stdout();
-        if keyboard_enhanced {
-            use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-            queue!(
-                stdout,
-                PushKeyboardEnhancementFlags(
-                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
-            )
-            .context("failed to push keyboard enhancement flags")?;
-            guard.keyboard_enhanced = true;
-            stdout
-                .flush()
-                .context("failed to flush after pushing keyboard flags")?;
-        }
-
-        queue_attach_input_modes(&mut stdout, mouse_capture_enabled, bracketed_paste_enabled)
-            .context("failed to enable terminal input modes")?;
-        guard.mouse_capture_enabled = mouse_capture_enabled;
-        guard.bracketed_paste_enabled = bracketed_paste_enabled;
-        if mouse_capture_enabled || bracketed_paste_enabled {
-            stdout
-                .flush()
-                .context("failed to flush terminal input modes")?;
-        }
-
-        Ok(guard)
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let mut stdout = io::stdout();
-        let _ = queue_active_attach_input_mode_restore(
-            &mut stdout,
-            self.mouse_capture_enabled,
-            self.bracketed_paste_enabled,
-        );
-        let _ = stdout.flush();
-        if self.keyboard_enhanced {
-            use crossterm::event::PopKeyboardEnhancementFlags;
-            let mut stdout = io::stdout();
-            let _ = queue!(stdout, PopKeyboardEnhancementFlags);
-            let _ = stdout.flush();
-        }
-        let _ = disable_raw_mode();
-    }
 }
 
 pub async fn update_attach_viewport(

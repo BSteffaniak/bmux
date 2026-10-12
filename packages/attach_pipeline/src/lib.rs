@@ -8,6 +8,7 @@ pub mod mouse;
 pub mod reconcile;
 pub mod render;
 pub mod scene_pipeline;
+pub mod terminal;
 pub mod types;
 
 use bmux_attach_layout_protocol::{

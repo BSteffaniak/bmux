@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 ab_glyph                     = { workspace = true }
 anyhow                       = { workspace = true, features = ["std"] }
+bmux_attach_pipeline         = { workspace = true }
 bmux_client                  = { workspace = true }
 bmux_codec                   = { workspace = true }
 bmux_config                  = { workspace = true }

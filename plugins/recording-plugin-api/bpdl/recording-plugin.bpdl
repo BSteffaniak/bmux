@@ -6,8 +6,17 @@ import pane = bmux.pane_runtime;
 
 capability RECORDING_READ = bmux.recording.read;
 capability RECORDING_WRITE = bmux.recording.write;
+capability RECORDING_PROCESS_PRESENTATION_WAIT_V1 = bmux.recording.process.presentation.wait.v1;
 capability RECORDING_PROCESS_PRESENTATION_V1 = bmux.recording.process.presentation.v1;
 capability RECORDING_PROCESS_V4 = bmux.recording.process.v4;
+
+// Additive stateless wait; durable process v4 and presentation v1 are unchanged.
+@capability(RECORDING_PROCESS_PRESENTATION_WAIT_V1)
+interface recording-process-presentation-wait-v1 {
+    command capabilities() -> pane.wait-capabilities;
+    command wait-present(run_id: uuid, after: bytes?, timeout_ms: u32, max_bytes: u32)
+        -> result<pane.presentation-frame?, pane.wait-error>;
+}
 
 // Optional retained presentation for the execution already owned by a v4 run.
 @capability(RECORDING_PROCESS_PRESENTATION_V1)

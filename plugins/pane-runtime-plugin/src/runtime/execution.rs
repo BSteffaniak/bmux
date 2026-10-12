@@ -714,8 +714,107 @@ pub(crate) fn resize(reference: &ExecutionRef, cols: u16, rows: u16) -> Result<(
         {
             return Err(failed("terminal geometry could not be committed"));
         }
+        pane.execution.notify();
         Ok(())
     })
+}
+
+pub(crate) fn presentation_wait_capabilities()
+-> bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::WaitCapabilities {
+    bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::WaitCapabilities {
+        schema_version: 1,
+        max_timeout_ms: 1000,
+        max_response_bytes: 4 * 1024 * 1024,
+        token_bytes: 32,
+    }
+}
+
+fn validate_presentation_wait(
+    after: Option<&[u8]>,
+    timeout_ms: u32,
+    max_bytes: u32,
+) -> Result<(), bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::WaitError> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::WaitError;
+    let caps = presentation_wait_capabilities();
+    if after.is_some_and(|token| token.len() != 32)
+        || timeout_ms > caps.max_timeout_ms
+        || max_bytes == 0
+        || max_bytes > caps.max_response_bytes
+    {
+        return Err(WaitError::InvalidRequest {
+            reason: "requires 32-byte token, timeout <=1000ms and response budget 1..=4194304"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+fn presentation_revision(
+    screen: &ExecutionScreen,
+    state: &ExecutionStatus,
+) -> Result<Vec<u8>, ExecutionError> {
+    use sha2::{Digest, Sha256};
+    // Include protocol/parser state and geometry even when no output byte was
+    // appended. Lifecycle changes wake completion without inventing output.
+    Ok(Sha256::digest(serde_json::to_vec(&(screen, state)).map_err(failed)?).to_vec())
+}
+
+pub(crate) fn wait_present(
+    reference: &ExecutionRef,
+    after: Option<&[u8]>,
+    timeout_ms: u32,
+    max_bytes: u32,
+    authorize: impl Fn() -> Result<(), ExecutionError> + Sync,
+) -> Result<
+    Option<bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::PresentationFrame>,
+    bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::WaitError,
+> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::{
+        PresentationFrame, WaitError,
+    };
+    validate_presentation_wait(after, timeout_ms, max_bytes)?;
+    let authority = |error| WaitError::Authority { error };
+    let owner = spawn_runtime_handle()
+        .ok_or_else(|| authority(failed("pane execution runtime unavailable")))?;
+    // This bounded wait owns no cursor or journal. Dropping the client request
+    // cannot consume a frame; a retry supplies the same immutable token.
+    drive_startup(&owner.1, async {
+        let mut changes =
+            with_pane(reference, |pane| Ok(pane.execution.subscribe())).map_err(authority)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        loop {
+            authorize().map_err(authority)?;
+            let screen = screen(reference).map_err(|error| match error {
+                ExecutionError::OperationFailed { ref reason }
+                    if reason == "screen exceeds response budget" =>
+                {
+                    WaitError::Oversized { max_bytes }
+                }
+                error => authority(error),
+            })?;
+            let state = status(reference).map_err(authority)?;
+            let revision = presentation_revision(&screen, &state).map_err(authority)?;
+            if after != Some(revision.as_slice()) {
+                let frame = PresentationFrame { revision, screen };
+                let size = serde_json::to_vec(&frame)
+                    .map_err(|error| authority(failed(error)))?
+                    .len();
+                if size > max_bytes as usize {
+                    return Err(WaitError::Oversized { max_bytes });
+                }
+                return Ok(Some(frame));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::timeout_at(deadline, changes.changed())
+                .await
+                .map_or(Ok(()), |result| {
+                    result.map_err(|error| authority(failed(error)))
+                })?;
+        }
+    })
+    .map_err(authority)?
 }
 
 pub(crate) fn wait(
@@ -874,6 +973,80 @@ fn install_reserved_capture(
 
 #[cfg(test)]
 mod tests {
+    fn presentation_state() -> (super::ExecutionScreen, super::ExecutionStatus) {
+        let reference = super::ExecutionRef {
+            session_id: uuid::Uuid::new_v4(),
+            pane_id: uuid::Uuid::new_v4(),
+            execution_token: uuid::Uuid::new_v4(),
+        };
+        let screen = super::ExecutionScreen {
+            execution: reference.clone(),
+            output_watermark: 0,
+            cols: 8,
+            rows: 2,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_visible: true,
+            text: String::new(),
+            encoded_grid: b"protocol-a".to_vec(),
+        };
+        let state = serde_json::from_value(serde_json::json!({"execution":reference,"phase":"running","lifecycle":"conventional_terminal_session","session_end":"active","terminal_session_ended":false,"capture_integrity":"capturing","exit_code":null,"signal":null,"output_drained":false,"output_watermark":0,"cleanup_complete":false,"error":null})).unwrap();
+        (screen, state)
+    }
+
+    #[test]
+    fn presentation_revision_covers_resize_protocol_and_end_without_output() {
+        let (mut screen, mut state) = presentation_state();
+        let original = super::presentation_revision(&screen, &state).unwrap();
+        assert_eq!(original.len(), 32);
+        assert_eq!(
+            original,
+            super::presentation_revision(&screen, &state).unwrap()
+        );
+        screen.cols += 1;
+        assert_ne!(
+            original,
+            super::presentation_revision(&screen, &state).unwrap()
+        );
+        screen.cols -= 1;
+        screen.encoded_grid = b"protocol-b".to_vec();
+        assert_ne!(
+            original,
+            super::presentation_revision(&screen, &state).unwrap()
+        );
+        screen.encoded_grid = b"protocol-a".to_vec();
+        state.terminal_session_ended = true;
+        assert_ne!(
+            original,
+            super::presentation_revision(&screen, &state).unwrap()
+        );
+    }
+
+    #[test]
+    fn presentation_wait_bounds_are_explicit() {
+        assert!(super::validate_presentation_wait(Some(&[0; 32]), 1000, 4 * 1024 * 1024).is_ok());
+        assert!(super::validate_presentation_wait(Some(&[0; 31]), 1000, 100).is_err());
+        assert!(super::validate_presentation_wait(None, 1001, 100).is_err());
+        assert!(super::validate_presentation_wait(None, 1000, 0).is_err());
+        assert!(super::validate_presentation_wait(None, 1000, 4 * 1024 * 1024 + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn canceled_wait_does_not_consume_token_or_notification() {
+        let capture = super::ExecutionCapture::default();
+        let mut changes = capture.subscribe();
+        let (screen, state) = presentation_state();
+        let token = super::presentation_revision(&screen, &state).unwrap();
+        let canceled = changes.changed();
+        drop(canceled);
+        capture.notify();
+        changes.changed().await.unwrap();
+        assert_eq!(
+            token,
+            super::presentation_revision(&screen, &state).unwrap()
+        );
+    }
+
     #[test]
     fn natural_cleanup_completes_without_kill_or_capture_eof() {
         let capture = super::ExecutionCapture::default();

@@ -59,6 +59,155 @@ pub struct AttachScenePipeline {
     max_diagnostics: usize,
 }
 
+/// Undecorated authoritative grid presentation through the ordinary attach
+/// scene renderer.
+///
+/// Local surface keys are derived presentation identities, not
+/// execution identities. The caller owns execution validation and input policy.
+pub struct UndecoratedGridPresenter {
+    dimensions: (u16, u16),
+    snapshot: Option<GridSnapshot>,
+    pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+    terminal_graphics_cache: TerminalGraphicsCache,
+    last_cursor_state: Option<AttachCursorState>,
+    synchronized_updates: bool,
+}
+
+impl UndecoratedGridPresenter {
+    #[must_use]
+    pub const fn new(cols: u16, rows: u16) -> Self {
+        Self {
+            dimensions: (cols, rows),
+            snapshot: None,
+            pane_buffers: BTreeMap::new(),
+            terminal_graphics_cache: TerminalGraphicsCache::new(),
+            last_cursor_state: None,
+            synchronized_updates: false,
+        }
+    }
+
+    /// Select only a capability supported by the outer terminal. This does not
+    /// advertise any protocol to the application inside the execution.
+    pub const fn set_synchronized_updates(&mut self, enabled: bool) {
+        self.synchronized_updates = enabled;
+    }
+
+    /// Paint a validated grid, returning false when it is unchanged. Rendering
+    /// uses exactly the retained row/damage encoder used by ordinary attach.
+    /// Cursor, graphics and row baselines commit only after write and flush.
+    ///
+    /// # Errors
+    /// Reports invalid snapshots, encoding failures, and failed terminal output.
+    pub fn present<W: std::io::Write + ?Sized>(
+        &mut self,
+        writer: &mut W,
+        snapshot: &GridSnapshot,
+    ) -> Result<bool> {
+        if self.snapshot.as_ref() == Some(snapshot) {
+            return Ok(false);
+        }
+        let grid = TerminalGridStream::from_snapshot(snapshot, GridLimits::default())
+            .context("invalid presentation grid snapshot")?;
+        let dimensions = (snapshot.width, snapshot.height);
+        let surface_id = Uuid::nil();
+        let full_frame = self.snapshot.is_none() || dimensions != self.dimensions;
+        let mut pending_buffer = PaneRenderBuffer {
+            terminal_grid: grid,
+            ..PaneRenderBuffer::default()
+        };
+        if !full_frame && let Some(previous) = self.pane_buffers.get(&surface_id) {
+            pending_buffer.prev_rows.clone_from(&previous.prev_rows);
+        }
+        let mut pending_buffers = BTreeMap::from([(surface_id, pending_buffer)]);
+        let mut pending_graphics = self.terminal_graphics_cache.clone();
+        let mut pending_cursor = self.last_cursor_state;
+        let scene = undecorated_scene(dimensions);
+        let frame_damage = if full_frame {
+            FrameDamage::full_frame()
+        } else {
+            let mut damage = FrameDamage::default();
+            damage.mark_content_surface(surface_id);
+            damage
+        };
+        let mut frame_bytes = Vec::new();
+        if self.synchronized_updates {
+            queue!(frame_bytes, BeginSynchronizedUpdate)?;
+        }
+        queue!(frame_bytes, SavePosition, Hide)?;
+        // Hide is encoded, not committed. Ensure cursor visibility is restored
+        // even when its desired state matches the previously displayed frame.
+        if let Some(cursor) = &mut pending_cursor {
+            cursor.visible = false;
+        }
+        let cursor = render_attach_scene_with_terminal_graphics_cache(
+            &mut frame_bytes,
+            &scene,
+            &[],
+            &mut pending_buffers,
+            &mut pending_graphics,
+            &frame_damage,
+            0,
+            0,
+            &PaneScrollbackViews::new(),
+            false,
+            dimensions,
+            &bmux_appearance::RuntimeAppearance::default(),
+            DamageCoalescingPolicy::default(),
+            &[],
+        )?;
+        apply_attach_cursor_state(&mut frame_bytes, cursor, &mut pending_cursor, false)?;
+        if self.synchronized_updates {
+            queue!(frame_bytes, EndSynchronizedUpdate)?;
+        }
+        if let Err(error) = crate::terminal::write_frame(writer, &frame_bytes) {
+            // A partial frame is never the new baseline. Repair the next frame
+            // in full, including cursor and any retained graphics.
+            self.snapshot = None;
+            self.pane_buffers.clear();
+            self.terminal_graphics_cache.clear();
+            self.last_cursor_state = None;
+            return Err(error).context("failed presenting authoritative grid");
+        }
+        self.dimensions = dimensions;
+        self.pane_buffers = pending_buffers;
+        self.terminal_graphics_cache = pending_graphics;
+        self.last_cursor_state = pending_cursor;
+        self.snapshot = Some(snapshot.clone());
+        Ok(true)
+    }
+}
+
+fn undecorated_scene(dimensions: (u16, u16)) -> bmux_attach_layout_protocol::AttachScene {
+    use bmux_attach_layout_protocol::{
+        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+    };
+    let id = Uuid::nil();
+    let rect = AttachRect {
+        x: 0,
+        y: 0,
+        w: dimensions.0,
+        h: dimensions.1,
+    };
+    AttachScene {
+        session_id: id,
+        focus: AttachFocusTarget::Pane { pane_id: id },
+        surfaces: vec![AttachSurface {
+            id,
+            kind: AttachSurfaceKind::Pane,
+            layer: AttachLayer::Pane,
+            z: 0,
+            rect,
+            content_rect: rect,
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: false,
+            cursor_owner: true,
+            pane_id: Some(id),
+        }],
+    }
+}
+
 impl AttachScenePipeline {
     #[allow(clippy::missing_const_for_fn)]
     #[must_use]
@@ -583,6 +732,95 @@ fn now_epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undecorated_grid_uses_retained_attach_rows_and_skips_unchanged_frames() {
+        let mut source = TerminalGridStream::new(40, 4, GridLimits::default()).unwrap();
+        source.process(b"\x1b[31mhello\x1b[0m\r\nwide: \xe7\x95\x8c");
+        let mut presenter = UndecoratedGridPresenter::new(40, 4);
+        let mut output = Vec::new();
+        let first = source.snapshot(0, 4);
+        assert!(presenter.present(&mut output, &first).unwrap());
+        let initial = output.clone();
+        assert!(!presenter.present(&mut output, &first).unwrap());
+        assert_eq!(output, initial);
+        source.process(b"\x1b[1;1Hj");
+        let second = source.snapshot(0, 4);
+        let mut differential = Vec::new();
+        assert!(presenter.present(&mut differential, &second).unwrap());
+        assert!(differential.len() < initial.len());
+        assert!(!differential.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+        let mut displayed = TerminalGridStream::new(40, 4, GridLimits::default()).unwrap();
+        displayed.process(&initial);
+        displayed.process(&differential);
+        assert_eq!(
+            bmux_terminal_grid::visible_text(displayed.grid(), 0, 4),
+            bmux_terminal_grid::visible_text(source.grid(), 0, 4),
+        );
+        let mut fresh = UndecoratedGridPresenter::new(40, 4);
+        let mut full = Vec::new();
+        fresh.present(&mut full, &second).unwrap();
+        let mut full_display = TerminalGridStream::new(40, 4, GridLimits::default()).unwrap();
+        full_display.process(&full);
+        assert_eq!(
+            bmux_terminal_grid::visible_text(displayed.grid(), 0, 4),
+            bmux_terminal_grid::visible_text(full_display.grid(), 0, 4),
+        );
+    }
+
+    #[test]
+    fn undecorated_failed_flush_invalidates_baseline_before_repair() {
+        struct FailFlush;
+        impl std::io::Write for FailFlush {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush failed"))
+            }
+        }
+        let mut source = TerminalGridStream::new(20, 2, GridLimits::default()).unwrap();
+        source.process(b"initial");
+        let mut presenter = UndecoratedGridPresenter::new(20, 2);
+        presenter
+            .present(&mut Vec::new(), &source.snapshot(0, 2))
+            .unwrap();
+        source.process(b"\rchanged");
+        let next = source.snapshot(0, 2);
+        assert!(presenter.present(&mut FailFlush, &next).is_err());
+        assert!(presenter.snapshot.is_none());
+        assert!(presenter.pane_buffers.is_empty());
+        assert!(presenter.last_cursor_state.is_none());
+        let mut repaired = Vec::new();
+        assert!(presenter.present(&mut repaired, &next).unwrap());
+        let mut fresh = Vec::new();
+        UndecoratedGridPresenter::new(20, 2)
+            .present(&mut fresh, &next)
+            .unwrap();
+        assert_eq!(repaired, fresh);
+    }
+
+    #[test]
+    fn undecorated_grid_supports_one_cell_geometry_and_resize() {
+        let mut source = TerminalGridStream::new(1, 1, GridLimits::default()).unwrap();
+        source.process(b"x");
+        let mut presenter = UndecoratedGridPresenter::new(1, 1);
+        let mut output = Vec::new();
+        assert!(
+            presenter
+                .present(&mut output, &source.snapshot(0, 1))
+                .unwrap()
+        );
+        assert!(output.contains(&b'x'));
+        source.resize(2, 1).unwrap();
+        output.clear();
+        assert!(
+            presenter
+                .present(&mut output, &source.snapshot(0, 1))
+                .unwrap()
+        );
+        assert_eq!(presenter.dimensions, (2, 1));
+    }
 
     #[test]
     fn structured_history_survives_updates_and_alternate_exit() {

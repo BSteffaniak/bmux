@@ -4,11 +4,15 @@ name            = "bmux Recording"
 owns_namespaces = ["recording", "record"]
 owns_paths      = [["server", "recording"], ["playbook", "from-recording"]]
 
-optional_capabilities = ["bmux.pane_runtime.presentation.v1"]
+optional_capabilities = [
+    "bmux.pane_runtime.presentation.v1",
+    "bmux.pane_runtime.presentation.wait.v1",
+]
 provided_capabilities = [
     "bmux.recording.read",
     "bmux.recording.write",
     "bmux.recording.process.v4",
+    "bmux.recording.process.presentation.wait.v1",
     "bmux.recording.process.presentation.v1",
 ]
 provided_features = ["bmux.recording", "bmux.recording.process.v4"]
@@ -75,6 +79,11 @@ kind         = "command"
 [[services]]
 capability   = "bmux.recording.process.presentation.v1"
 interface_id = "recording-process-presentation-v1"
+kind         = "command"
+
+[[services]]
+capability   = "bmux.recording.process.presentation.wait.v1"
+interface_id = "recording-process-presentation-wait-v1"
 kind         = "command"
 
 [[event_publications]]

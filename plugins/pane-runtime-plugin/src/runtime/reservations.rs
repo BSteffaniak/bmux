@@ -238,6 +238,56 @@ fn failed(error: impl std::fmt::Display) -> RecoveryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_admission_checks_running_exact_token_recovery_and_end() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
+            TerminalCaptureIntegrity, TerminalExecutionPhase, TerminalExecutionStatus,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store = ReservationStore::open(root.path()).unwrap();
+        let reservation = store
+            .reserve(
+                uuid::Uuid::new_v4(),
+                ProgramOptions {
+                    program: "/bin/echo".into(),
+                    args: vec![],
+                    cwd: None,
+                    env: std::collections::BTreeMap::new(),
+                    cols: 80,
+                    rows: 24,
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let reference = reservation.execution.clone();
+        let mut launch = store.read(reservation.launch_mutation_id).unwrap().receipt;
+        launch.phase = LaunchPhase::Running;
+        let mut state = TerminalExecutionStatus {
+            execution: reference.clone(), phase: TerminalExecutionPhase::Running,
+            lifecycle: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalLifecycle::ConventionalTerminalSession,
+            session_end: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalSessionEnd::Active,
+            terminal_session_ended: false, capture_integrity: TerminalCaptureIntegrity::Capturing,
+            exit_code: None, signal: None, output_drained: false, output_watermark: 0, cleanup_complete: false, error: None,
+        };
+        assert!(validate_input_authority(&reference, &launch, &state, false).is_ok());
+        assert!(validate_input_authority(&reference, &launch, &state, true).is_err());
+        state.execution.execution_token = uuid::Uuid::new_v4();
+        assert!(validate_input_authority(&reference, &launch, &state, false).is_err());
+        state.execution = reference.clone();
+        state.terminal_session_ended = true;
+        assert!(validate_input_authority(&reference, &launch, &state, false).is_err());
+        state.terminal_session_ended = false;
+        state.phase = TerminalExecutionPhase::Exited;
+        assert!(validate_input_authority(&reference, &launch, &state, false).is_err());
+        state.phase = TerminalExecutionPhase::Running;
+        launch.phase = LaunchPhase::Uncertain;
+        assert!(validate_input_authority(&reference, &launch, &state, false).is_err());
+        launch.phase = LaunchPhase::Running;
+        state.error = Some("capture failed".into());
+        assert!(validate_input_authority(&reference, &launch, &state, false).is_err());
+    }
+
     #[test]
     fn keyed_admission_preserves_identity_rejects_conflict_and_corruption() {
         let root = tempfile::tempdir().unwrap();
@@ -505,6 +555,68 @@ pub(crate) fn input_receipt(
         Ok(stored.receipt)
     })
 }
+fn validate_input_authority(
+    reference: &ExecutionRef,
+    launch: &LaunchReceipt,
+    state: &bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionStatus,
+    capture_error: bool,
+) -> Result<(), RecoveryError> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
+        TerminalCaptureIntegrity, TerminalExecutionPhase,
+    };
+    if launch.reservation.execution != *reference || state.execution != *reference {
+        return Err(RecoveryError::RecoveryRequired {
+            reason: "stale execution input authority".into(),
+        });
+    }
+    if !matches!(launch.phase, LaunchPhase::Running)
+        || !matches!(state.phase, TerminalExecutionPhase::Running)
+        || state.terminal_session_ended
+        || launch.error.is_some()
+        || state.error.is_some()
+        || matches!(
+            state.capture_integrity,
+            TerminalCaptureIntegrity::Incomplete
+        )
+        || capture_error
+    {
+        return Err(RecoveryError::RecoveryRequired {
+            reason: "execution authority is not currently writable; reconcile/resolve before input"
+                .into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_fresh_input(
+    store: &ReservationStore,
+    reference: &ExecutionRef,
+) -> Result<(), RecoveryError> {
+    // Move recording's pre-send reconcile admission here, nearer
+    // the effect. Read identical launch/runtime/capture authority
+    // without mutating reconciliation state. Existing receipts
+    // still replay unchanged before this fresh-effect check.
+    let launch = find(store, reference)?;
+    let state =
+        super::execution::status(reference).map_err(|error| RecoveryError::RecoveryRequired {
+            reason: format!("input authority unavailable: {error:?}"),
+        })?;
+    let capture_root = store
+        .root
+        .join(format!("capture-{}", reference.execution_token));
+    let capture_error = if capture_root.exists() {
+        super::durable_capture::DurableCapture::read(&capture_root, 0, 1)
+            .map_err(failed)?
+            .0
+            .error
+            .is_some()
+    } else {
+        false
+    };
+    validate_input_authority(reference, &launch.receipt, &state, capture_error)?;
+    Ok(())
+}
+
 pub(crate) fn send_admitted(
     reference: &ExecutionRef,
     mutation: uuid::Uuid,
@@ -543,6 +655,7 @@ pub(crate) fn send_admitted(
                 Ok((false, stored))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                validate_fresh_input(store, reference)?;
                 let count = std::fs::read_dir(&store.root)
                     .map_err(failed)?
                     .collect::<Result<Vec<_>, _>>()

@@ -33,6 +33,12 @@ mod spawn;
 )]
 pub fn route(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
+        "pane-runtime-presentation-wait-v1", "capabilities" => |_req: (), _ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::execution::presentation_wait_capabilities())
+        },
+        "pane-runtime-presentation-wait-v1", "wait-present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::client::WaitPresentRequest, ctx| {
+            Ok::<_, ServiceResponse>(crate::runtime::execution::wait_present(&req.execution, req.after.as_deref(), req.timeout_ms, req.max_bytes, || execution::authorize(ctx, &req.execution, "read")))
+        },
         "pane-runtime-presentation-v1", "capabilities" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(Ok::<_, bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionError>(bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::PresentationCapabilities { schema_version: 1, coherent_screen: true, canonical_resize: true }))
         },
