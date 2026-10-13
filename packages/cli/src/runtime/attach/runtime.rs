@@ -3990,8 +3990,13 @@ async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?S
             // Terminal input (keyboard, mouse, resize) via async EventStream.
             terminal_result = terminal.next_event() => {
                 let Some(result) = terminal_result? else {
-                    // Terminal stream ended unexpectedly.
-                    exit_reason = AttachExitReason::StreamClosed;
+                    // A closed output-only viewport is an explicit detach,
+                    // not unexpected terminal loss (nor a terminal message).
+                    exit_reason = if terminal.presentation_only() {
+                        AttachExitReason::Detached
+                    } else {
+                        AttachExitReason::StreamClosed
+                    };
                     break;
                 };
                 let terminal_event = AttachTerminalEvent::from_crossterm(

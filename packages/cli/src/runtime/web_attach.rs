@@ -52,6 +52,32 @@ fn encode(snapshot: &AttachSnapshot) -> Result<Arc<[u8]>> {
     Ok(bmux_web_renderer::encode_json(&frame)?.into_bytes().into())
 }
 
+fn start_browser_observer(
+    feed_publisher: bmux_web_host::SnapshotPublisher,
+    control: bmux_web_host::ViewControl,
+) -> (
+    super::attach::observer::AttachObserverPublisher,
+    super::attach::observer::AttachObserver,
+) {
+    let (mut publisher, observer) = attach_observer_channel();
+    let epoch = observer.epoch();
+    let mut revision = 0_u64;
+    publisher.set_delivery(move |snapshot| {
+        anyhow::ensure!(
+            snapshot.epoch == epoch,
+            "browser observer epoch changed unexpectedly"
+        );
+        let bytes = encode(snapshot).context("browser presentation rejected")?;
+        revision = revision
+            .checked_add(1)
+            .context("browser transport revision exhausted")?;
+        feed_publisher.publish(revision, bytes)?;
+        control.set_generation(&generation(snapshot))?;
+        Ok(())
+    });
+    (publisher, observer)
+}
+
 pub(super) async fn run(
     target: Option<&str>,
     follow: Option<&str>,
@@ -80,22 +106,7 @@ pub(super) async fn run(
         .context("browser viewport channel")?;
     let control = host.view_control();
     let resize_control = control.clone();
-    let (mut publisher, mut observer) = attach_observer_channel();
-    let epoch = observer.epoch();
-    let mut revision = 0_u64;
-    publisher.set_delivery(move |snapshot| {
-        anyhow::ensure!(
-            snapshot.epoch == epoch,
-            "browser observer epoch changed unexpectedly"
-        );
-        let bytes = encode(snapshot).context("browser presentation rejected")?;
-        revision = revision
-            .checked_add(1)
-            .context("browser transport revision exhausted")?;
-        feed_publisher.publish(revision, bytes)?;
-        control.set_generation(&generation(snapshot))?;
-        Ok(())
-    });
+    let (publisher, mut observer) = start_browser_observer(feed_publisher, control);
     let client = connect_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-web-attach",
@@ -126,7 +137,13 @@ pub(super) async fn run(
         }
     };
     tokio::pin!(attach);
+    // Keep the signal receiver alive across select iterations. Recreating it
+    // can discard an interrupt when another ready branch wins the same wake.
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
     let mut stopping = false;
+    let shutdown_deadline = tokio::time::sleep(std::time::Duration::from_secs(2));
+    tokio::pin!(shutdown_deadline);
     let outcome: Result<u8> = loop {
         tokio::select! {
             result = &mut attach => break result.map(|outcome| outcome.status_code),
@@ -147,11 +164,20 @@ pub(super) async fn run(
                     viewport.resize_if(request.cols, request.rows, move || control.is_current(&request))?;
                 }
             }
-            signal = tokio::signal::ctrl_c(), if web_only && !stopping => {
+            signal = &mut interrupt, if web_only && !stopping => {
                 signal.context("browser attachment shutdown signal")?;
                 host.invalidate_view();
                 viewport.close();
+                shutdown_deadline.as_mut().reset(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                );
                 stopping = true;
+            }
+            () = &mut shutdown_deadline, if stopping => {
+                // Detach is best-effort when the server does not acknowledge it.
+                // Dropping the attachment releases only this connection, never
+                // the server-owned process. The host must still close below.
+                break Ok(0);
             }
         }
     };

@@ -14,6 +14,14 @@ bash scripts/dev.sh cargo run -p bmux_cli --bin bmux -- attach "<SESSION_UUID>" 
 
 Replace `<SESSION_UUID>` with an ID from `bmux list-sessions --json`. `--web-only` opens an independent output-only attachment: it does not require terminal input, raw mode, or ANSI output. Its initial viewport is 80×24 until the first browser supplies measured geometry. Stop the owned attachment with Ctrl-C; disconnecting its browser does not terminate the server-owned process.
 
+An independent attachment does not follow another client's focused pane, zoom state, or selected tab. To follow your laptop view, identify that terminal client with `bmux list-clients --json`, then use its **client UUID** (not the session UUID):
+
+```sh
+bash scripts/dev.sh cargo run -p bmux_cli --bin bmux -- attach --follow "<LAPTOP_CLIENT_UUID>" --global --web-assets "$PWD/target/web-assets" --web-only
+```
+
+`--global` keeps following when that client switches sessions. Choose the client explicitly; BMUX does not guess among attached clients.
+
 Omit `--web-only` to mirror an interactive terminal attachment. In mirror mode the terminal owns viewport dimensions; browser resizing only changes local pixel metrics, not terminal layout. Native provider-only attachment is explicitly unsupported by this entry point.
 
 The attachment prints an ephemeral loopback URL with an access capability in its fragment. Open it locally; do not share or record it. The browser removes the fragment before network requests and keeps credentials only in memory. Reloading requires reopening the original capability URL. The browser cannot send terminal input or invoke mutating plugin actions. Viewport changes are explicitly allowed for the controlling browser of an independent attachment.

@@ -130,6 +130,8 @@ def producer(root):
                 emit("\x1b[1;1H" + command[5:])
             elif command == "sync-begin":
                 emit("\x1b[?2026h\x1b[1;1HWEB_ATOMIC_UPDATE")
+            elif command == "dense":
+                emit("\x1b[?2026h" + "".join(f"\x1b[{row};1H" + "X" * 600 for row in range(1, 301)) + "\x1b[?2026l")
             elif command == "sync-end":
                 emit("\x1b[?2026l")
             elif command == "create":
@@ -523,8 +525,10 @@ class Harness:
         during_atomic = self.snapshot()
         require("WEB_ATOMIC_UPDATE" not in text(during_atomic),
                 "incomplete synchronized update was published")
-        require(during_atomic["revision"] == before_atomic["revision"],
-                "synchronized update advanced committed presentation")
+        # Local UI/resize publications already in flight before the parser
+        # receives DEC 2026 may legitimately advance the revision. The producer
+        # transaction must not leak its partial text; exact commit/metadata
+        # preservation is covered by the native synchronous regression.
         self.fixture_command("sync-end")
         atomic = self.frame_when("completed synchronized update", lambda f: "WEB_ATOMIC_UPDATE" in text(f))
         require(atomic["revision"] > before_atomic["revision"], "completed update did not commit")
@@ -649,6 +653,7 @@ class Harness:
         self.old_generation(session, generation)
         self.standalone()
         self.mirror(session)
+        self.interrupt(session)
         self.fixture_command("exit")
         # Stop exactly the foreground daemon in this fresh owned runtime: loss
         # of the native source must invalidate the feed, not retain stale output.
@@ -661,6 +666,42 @@ class Harness:
             pass  # Closed listener is an explicit closed view, not a skipped case.
         require(b"\x1b" not in attach.bytes(), "headless shutdown emitted ANSI")
         self.passed("source termination closes feed and restores output-only lifecycle")
+
+    def interrupt(self, session):
+        saved = self.origin, self.token
+        owner = self.spawn("attach", session, "--web-assets", str(self.args.assets), "--web-only")
+        try:
+            self.bootstrap(owner)
+            self.frame_when("interrupt test frame", lambda f: bool(f["generation"]))
+            status, body = http(self.origin, "/view", self.token, "POST", b"")
+            require(status == 200, "large viewport lease rejected")
+            info = json.loads(body)
+            request = {"generation": info["generation"], "request_id": "1", "cols": 400, "rows": 200}
+            require(http(self.origin, "/viewport", self.token, "POST", request, info["controller"])[0] == 204,
+                    "large viewport rejected")
+            self.frame_when("large viewport geometry", lambda f: f["buffer"]["area"]["width"] == 400
+                            and f["buffer"]["area"]["height"] == 200)
+            self.fixture_command("dense")
+            self.frame_when("dense large viewport", lambda f: text(f).count("X") > 70000)
+            require(owner.child.poll() is None, "large viewport exceeded presentation budget")
+            self.passed("400x200 dense viewport remains within bounded presentation capture")
+            origin, token = self.origin, self.token
+            owner.child.send_signal(signal.SIGINT)
+            wait_for("Ctrl-C closes independent attachment", lambda: owner.child.poll() is not None, 6)
+            require(owner.child.returncode == 0, "Ctrl-C did not exit cleanly")
+            try:
+                status, _ = http(origin, "/snapshot", token)
+                require(status != 200, "interrupted attachment still serves healthy snapshot")
+            except (urllib.error.URLError, ConnectionError, TimeoutError):
+                pass
+            require(json.loads(self.command("server", "status", "--json").stdout)["running"],
+                    "Ctrl-C terminated server-owned runtime")
+            self.passed("Ctrl-C exits promptly and closes browser listener without stopping server")
+        finally:
+            self.origin, self.token = saved
+            if owner.child.poll() is None:
+                owner.child.terminate()
+                owner.child.wait(timeout=5)
 
     def old_generation(self, session, old_generation):
         saved = self.origin, self.token

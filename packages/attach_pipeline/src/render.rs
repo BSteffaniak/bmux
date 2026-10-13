@@ -3161,9 +3161,34 @@ fn capture_grid_row(context: GridRowRenderContext<'_>, x: u16, y: u16, start: u1
     if !crate::projection::capturing() {
         return;
     }
+    let mut run: Option<(u16, u16, String, CellStyle)> = None;
     for (col, text, style) in resolve_grid_row_segment(context, start, end).1 {
+        if let Some((_, next_col, content, current_style)) = run.as_mut()
+            && *next_col == col
+            && *current_style == style
+        {
+            content.push_str(&text);
+            *next_col = col.saturating_add(
+                u16::try_from(UnicodeWidthStr::width(text.as_str()).max(1)).unwrap_or(u16::MAX),
+            );
+            continue;
+        }
+        if let Some((start_col, _, content, current_style)) = run.take() {
+            crate::projection::record(crate::projection::PaintOperation::Text {
+                x: x.saturating_add(start_col),
+                y,
+                text: content,
+                style: cell_style_to_tui(current_style),
+            });
+        }
+        let next_col = col.saturating_add(
+            u16::try_from(UnicodeWidthStr::width(text.as_str()).max(1)).unwrap_or(u16::MAX),
+        );
+        run = Some((col, next_col, text, style));
+    }
+    if let Some((start_col, _, text, style)) = run {
         crate::projection::record(crate::projection::PaintOperation::Text {
-            x: x.saturating_add(col),
+            x: x.saturating_add(start_col),
             y,
             text,
             style: cell_style_to_tui(style),
@@ -9696,6 +9721,46 @@ mod tests {
         assert!(
             rendered.contains("LIVEROW"),
             "focused pane without a scrollback view must render live rows: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn neutral_grid_capture_groups_large_viewport_into_style_runs() {
+        let mut buffer = PaneRenderBuffer::default();
+        buffer.terminal_grid.resize(600, 300).unwrap();
+        for row in 1..=300 {
+            buffer
+                .terminal_grid
+                .process(format!("\x1b[{row};1H{}", "x".repeat(600)).as_bytes());
+        }
+        let appearance = RuntimeAppearance::default();
+        let under = BTreeMap::new();
+        let grid = buffer.terminal_grid.grid();
+        let rows = grid.viewport_rows();
+        let ((), operations) = crate::projection::capture_neutral(|| {
+            for (index, row) in rows.iter().enumerate() {
+                super::capture_grid_row(
+                    GridRowRenderContext {
+                        row,
+                        selection: None,
+                        selection_line: 0,
+                        runtime_appearance: &appearance,
+                        palette: grid.palette(),
+                        before_content_cells: &under,
+                    },
+                    0,
+                    u16::try_from(index).unwrap(),
+                    0,
+                    600,
+                );
+            }
+        });
+        assert_eq!(operations.len(), 300);
+        assert!(operations.iter().all(|op| matches!(op,
+            crate::projection::PaintOperation::Text { text, .. } if text.len() == 600)));
+        assert!(
+            matches!(&operations[0], crate::projection::PaintOperation::Text { text, .. }
+            if text == &"x".repeat(600))
         );
     }
 

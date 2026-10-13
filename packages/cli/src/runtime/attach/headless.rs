@@ -133,6 +133,11 @@ impl AttachTerminal for HeadlessAttachDriver {
     fn next_event(&mut self) -> AttachTerminalEventFuture<'_> {
         Box::pin(async move {
             loop {
+                // A select! may cancel this future after a viewport update was
+                // consumed. Closure is persistent state, not a one-shot event.
+                if self.viewport.borrow().closed {
+                    return Ok(None);
+                }
                 if self.viewport.changed().await.is_err() {
                     return Ok(None);
                 }
@@ -180,6 +185,8 @@ mod tests {
         assert_eq!(driver.geometry().cols, 100);
         sender.resize_if(110, 31, || false).unwrap();
         sender.close();
+        assert!(driver.next_event().await.unwrap().is_none());
+        // Closure survives consumption/cancellation by the surrounding select!.
         assert!(driver.next_event().await.unwrap().is_none());
         assert_eq!(driver.geometry().cols, 100);
         assert!(sender.resize(80, 24).is_err());
