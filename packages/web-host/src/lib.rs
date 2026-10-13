@@ -1,4 +1,4 @@
-//! Domain-neutral, bounded browser hosting with explicit authenticated remote binding.
+//! Domain-neutral, bounded browser hosting with configurable binding and optional authentication.
 //! Encoded snapshots are opaque: callers own presentation semantics and serialization.
 #![cfg(unix)]
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
@@ -79,7 +79,7 @@ impl Limits {
 /// Loopback HTTP authentication policy. Origin and Host checks apply in both modes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AuthMode {
-    /// Unauthenticated loopback-only serving.
+    /// Unauthenticated serving; deployment owns any external access controls.
     #[default]
     None,
     /// Require an ephemeral bearer capability on non-asset routes.
@@ -89,7 +89,7 @@ pub enum AuthMode {
 /// Assets are explicit build output, never discovered recursively or built by this crate.
 #[derive(Clone, Debug)]
 pub struct HostConfig {
-    /// Bind IP; non-loopback requires token authentication.
+    /// Bind IP; authentication is configured independently.
     pub host: IpAddr,
     /// Browser-facing IP for exact Host/Origin checks. Required for wildcard binds.
     pub public_host: Option<IpAddr>,
@@ -332,12 +332,6 @@ fn validate_network(config: &HostConfig) -> io::Result<()> {
             "host and public_host must use the same IP family",
         ));
     }
-    if !config.host.is_loopback() && config.auth_mode != AuthMode::Token {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "non-loopback hosting requires token authentication (--web-auth token)",
-        ));
-    }
     if !config.host.is_unspecified() && config.host != public {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -347,7 +341,7 @@ fn validate_network(config: &HostConfig) -> io::Result<()> {
     Ok(())
 }
 
-/// Requires an active Tokio runtime. Defaults to IPv4 loopback; remote binds require tokens.
+/// Requires an active Tokio runtime. Defaults to IPv4 loopback; authentication is opt-in.
 ///
 /// # Errors
 /// Rejects invalid budgets/assets, unavailable OS entropy, and bind failures.

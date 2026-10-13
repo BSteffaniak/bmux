@@ -347,7 +347,7 @@ pub enum Command {
         /// Serve this terminal view read-only in a local browser using these built WASM assets
         #[arg(long, value_name = "ASSET_DIRECTORY")]
         web_assets: Option<std::path::PathBuf>,
-        /// Listener IP (default 127.0.0.1); remote binds require --web-auth token
+        /// Listener IP (default 127.0.0.1); authentication is opt-in
         #[arg(long, requires = "web_assets")]
         web_host: Option<std::net::IpAddr>,
         /// Browser-facing IP for wildcard binds (0.0.0.0 or ::)
@@ -356,7 +356,7 @@ pub enum Command {
         /// Browser port (default 8080); zero selects an ephemeral port
         #[arg(long, requires = "web_assets")]
         web_port: Option<u16>,
-        /// Browser access: none (loopback default) or token (required remotely)
+        /// Browser access: none (default) or token (opt-in)
         #[arg(long, value_parser = ["none", "token"], requires = "web_assets")]
         web_auth: Option<String>,
         /// Attach without terminal input/output; the first browser controls this view's viewport

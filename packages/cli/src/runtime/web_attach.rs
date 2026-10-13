@@ -223,11 +223,6 @@ fn configure_browser_host(
         bmux_config::WebAuth::None => bmux_web_host::AuthMode::None,
         bmux_config::WebAuth::Token => bmux_web_host::AuthMode::Token,
     };
-    if !config.host.is_loopback() {
-        eprintln!(
-            "Warning: network browser hosting uses unencrypted HTTP. Use only a trusted LAN/VPN; protect the capability URL and restrict the port with your firewall."
-        );
-    }
     config.viewport_mode = if web_only {
         bmux_web_host::ViewportMode::Resizable
     } else {

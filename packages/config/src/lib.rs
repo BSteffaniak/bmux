@@ -1053,16 +1053,16 @@ pub struct BmuxConfig {
     pub sandbox: SandboxConfig,
 }
 
-/// Browser hosting. Unauthenticated access is loopback-only.
+/// Browser hosting with opt-in token authentication.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "web")]
 #[serde(default)]
 pub struct WebConfig {
-    /// Listener IP (default 127.0.0.1); non-loopback requires token auth
+    /// Listener IP (default 127.0.0.1); independent of authentication
     pub host: std::net::IpAddr,
     /// Browser-facing IP; required when host is 0.0.0.0 or ::
     pub public_host: Option<std::net::IpAddr>,
-    /// Loopback HTTP port; zero requests an ephemeral port
+    /// HTTP port; zero requests an ephemeral port
     pub port: u16,
     /// Browser authentication: none (local users) or token (capability URL)
     pub auth: WebAuth,

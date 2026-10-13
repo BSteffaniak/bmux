@@ -100,15 +100,16 @@ foreign-origin requests and sibling-origin fetches even if a capability leaks.
 Static bootstrap assets are public but host/origin guarded. Snapshots require a
 bearer only in explicit token mode; loopback defaults to port 8080 without a token.
 `HostConfig.port = 0` selects an ephemeral port; `auth_mode = AuthMode::Token`
-restores capability-URL access. Token-free mode exposes output to local users,
-never remote interfaces. Occupied fixed ports fail rather than selecting another.
-`HostConfig.host` accepts IPv4/IPv6, defaulting to `127.0.0.1`. Every non-loopback
-bind requires `AuthMode::Token`. Wildcard binds require `public_host`, a concrete
-same-family IP for the bootstrap URL and exact Host/Origin policy. With concrete
-binds, `public_host` must equal `host`. This is direct HTTP, not TLS: observers can
-read output and steal tokens. Restrict serving to trusted LAN/VPN peers with a
-firewall; never expose this plaintext service to the Internet. The capability
-is scoped only to this presentation and its leased viewport controls.
+restores capability-URL access. Token-free mode exposes output to reachable clients;
+external access controls are deployment-owned. Occupied fixed ports fail rather
+than selecting another.
+`HostConfig.host` accepts IPv4/IPv6, defaulting to `127.0.0.1`. Authentication is
+independent: `AuthMode::None` is the default on any bind; `AuthMode::Token` opts in.
+Wildcard binds require `public_host`, a concrete same-family IP for the bootstrap
+URL and exact Host/Origin policy. With concrete binds, `public_host` must equal
+`host`. HTTP is unencrypted. With no token, reachable clients can read output and
+acquire leased viewport controls; deployment owners provide any external access
+controls. Neither mode grants authority beyond this presentation/viewport scope.
 
 All responses disable caches/referrers, deny framing and MIME sniffing, and use CSP:
 external same-origin scripts plus `wasm-unsafe-eval`, same-origin connections/styles,

@@ -665,7 +665,8 @@ class Harness:
         self.mirror(session)
         self.local_no_auth(session)
         if self.args.lan_host:
-            self.lan_host(session)
+            self.lan_host(session, "none")
+            self.lan_host(session, "token")
         attach = self.spawn("attach", session, "--web-assets", str(self.args.assets), "--web-only")
         self.bootstrap(attach)
         self.frame_when("source lifecycle test frame", lambda f: bool(f["generation"]))
@@ -682,29 +683,37 @@ class Harness:
         require(b"\x1b" not in attach.bytes(), "headless shutdown emitted ANSI")
         self.passed("source termination closes feed and restores output-only lifecycle")
 
-    def lan_host(self, session):
+    def lan_host(self, session, auth):
         saved = self.origin, self.token
         owner = self.spawn("attach", session, "--web-assets", str(self.args.assets), "--web-only",
                            "--web-host", "0.0.0.0", "--web-public-host", self.args.lan_host,
-                           "--web-port", "0", "--web-auth", "token")
+                           "--web-port", "0", *(["--web-auth", "token"] if auth == "token" else []))
         def url_ready():
             require(owner.child.poll() is None, "LAN attach exited before bootstrap")
-            match = re.search(rb"http://[0-9.]+:\d+/[^\s\x1b]*token=[^\s\x1b]+", owner.bytes())
+            pattern = (rb"http://[0-9.]+:\d+/[^\s\x1b]*token=[^\s\x1b]+" if auth == "token"
+                       else rb"http://[0-9.]+:\d+/")
+            match = re.search(pattern, owner.bytes())
             return match[0].decode() if match else None
         try:
             url = wait_for("LAN capability URL", url_ready)
             parts = urllib.parse.urlsplit(url)
             require(parts.hostname == self.args.lan_host, "wrong advertised LAN IP")
             self.origin = "http://" + parts.netloc
-            self.token = urllib.parse.parse_qs(parts.fragment)["token"][0]
-            require(http(self.origin, "/snapshot", "bad")[0] == 401, "LAN bearer not enforced")
+            self.token = urllib.parse.parse_qs(parts.fragment).get("token", [""])[0]
+            if auth == "token":
+                require(http(self.origin, "/snapshot", "bad")[0] == 401, "LAN bearer not enforced")
+            else:
+                require(not parts.fragment and b"#token=" not in owner.bytes(), "default LAN URL contains token")
             self.client.call("Page.navigate", {"url": url})
             self.frame_when("native LAN Canvas commit", lambda f: bool(f["generation"]))
             require(self.client.evaluate("location.hash") == "", "LAN capability fragment not cleared")
+            if auth == "none":
+                self.client.call("Page.reload", {})
+                wait_for("token-free LAN reload commit", lambda: (self.pixels() or {}).get("status", "").startswith("Read-only"))
             owner.child.send_signal(signal.SIGINT)
             wait_for("LAN Ctrl-C", lambda: owner.child.poll() is not None, 6)
             require(owner.child.returncode == 0, "LAN detach failed")
-            self.passed("wildcard LAN listener: non-loopback TCP peer, bearer, WASM/Canvas, viewport and clean detach")
+            self.passed(f"wildcard LAN listener ({auth}): non-loopback TCP peer, WASM/Canvas, viewport and clean detach")
         finally:
             owner.stop()
             self.origin, self.token = saved
