@@ -4,6 +4,20 @@ Portable, source-independent presentation content and canonical BMUX components.
 Inspired by Presenterm, not syntax- or behavior-compatible with it. No alternate
 terminal, wrapping, ANSI, hit-testing, or geometry engine is introduced.
 
+## Try a self-contained deck
+
+With the presentation plugin enabled, run from the repository root:
+
+```sh
+cargo run -p bmux_cli -- present check packages/presentation/examples/quickstart.md
+cargo run -p bmux_cli -- present play packages/presentation/examples/quickstart.md
+```
+
+Add `--presenter` to playback to show speaker notes. The quickstart includes
+code, columns, reveals, and live reload without images, Mermaid, or custom
+component registration. `examples/deck.md` is a richer authoring fixture that
+requires external assets and component registration; it is not self-contained.
+
 ## Public interfaces
 
 - `Deck { id, metadata, slides }`, `Slide { id, blocks, reveal_steps, notes }`,
