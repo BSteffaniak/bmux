@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             cx.set_cursor(Point::new(2, 5), true);
             cx.push_image(ImageContribution::Present(ImagePlacement {
-                fit: bmux_tui::image::ImageFit::Stretch,
+                fit: bmux_tui::image::ImageFit::default(),
                 allocation: None,
                 key: ImageKey::new("example:rgba"),
                 payload: ImagePayload::Pixels {

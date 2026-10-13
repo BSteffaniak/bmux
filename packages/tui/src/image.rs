@@ -87,10 +87,10 @@ pub enum ImageLifecycle {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ImageFit {
-    /// Fill the allocation, permitting a change in aspect ratio.
-    #[default]
+    /// Fill the allocation, permitting a change in aspect ratio. Explicit opt-in.
     Stretch,
-    /// Preserve aspect ratio and center inside the allocation.
+    /// Preserve aspect ratio and center inside the allocation (default).
+    #[default]
     Contain,
 }
 
@@ -182,7 +182,7 @@ pub struct ImagePlacement {
     pub payload: ImagePayload,
     /// Destination rectangle in terminal cell coordinates.
     pub destination: Rect,
-    /// Output-specific fitting policy. Missing wire fields retain legacy stretch.
+    /// Output-specific fitting policy. Missing wire fields default to containment.
     #[cfg_attr(feature = "serde", serde(default))]
     pub fit: ImageFit,
     /// Original allocation before paint clipping; absent for legacy placements.
@@ -208,6 +208,30 @@ pub enum ImageContribution {
 mod tests {
     use super::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
     use crate::geometry::Rect;
+
+    #[test]
+    fn default_fit_preserves_aspect_ratio_and_stretch_is_explicit() {
+        assert_eq!(super::ImageFit::default(), super::ImageFit::Contain);
+        let mut placement = ImagePlacement {
+            fit: super::ImageFit::default(),
+            allocation: None,
+            key: ImageKey::new("default-fit"),
+            payload: ImagePayload::Png {
+                bytes: vec![],
+                width: 100,
+                height: 100,
+            },
+            destination: Rect::new(0, 0, 40, 12),
+            clip: Rect::new(0, 0, 40, 12),
+            lifecycle: ImageLifecycle::Frame,
+        };
+        let contained = placement.pixel_rect(8.0, 16.0);
+        assert!((contained.width - contained.height).abs() < 1e-10);
+        placement.fit = super::ImageFit::Stretch;
+        let stretched = placement.pixel_rect(8.0, 16.0);
+        assert!((stretched.width - 320.0).abs() < 1e-10);
+        assert!((stretched.height - 192.0).abs() < 1e-10);
+    }
 
     #[test]
     fn contain_uses_pixel_metrics_and_ignores_clip() {

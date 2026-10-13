@@ -197,6 +197,18 @@ impl BrowserBackend for Recording {
         Ok(())
     }
 }
+#[test]
+fn image_fit_deserialization_defaults_to_contain_but_honors_stretch() {
+    let original = image();
+    let mut json = serde_json::to_value(&original).unwrap();
+    json.as_object_mut().unwrap().remove("fit");
+    let decoded: ImagePlacement = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(decoded.fit, bmux_tui::image::ImageFit::Contain);
+    json["fit"] = serde_json::json!("Stretch");
+    let decoded: ImagePlacement = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.fit, bmux_tui::image::ImageFit::Stretch);
+}
+
 fn image() -> ImagePlacement {
     ImagePlacement {
         fit: bmux_tui::image::ImageFit::Contain,

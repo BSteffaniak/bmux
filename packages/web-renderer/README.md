@@ -112,7 +112,8 @@ its visible phase (no animation); cursor is a steady underline. Font rasterizati
 is browser monospace, not guaranteed native font parity. Selection highlights
 already belong to the final buffer. Metadata is read-only; no remote input API.
 
-Image placements carry a `Stretch`/`Contain` policy and optional signed original
+Image placements default to `Contain`; `Stretch` is explicit opt-in. Placements
+carry the policy and optional signed original
 allocation. Canvas containment uses browser cell pixel metrics before clipping;
 terminal adapters use their own cell metrics. Binary transport is `BMWP\\x02`
 (version 2): rebuild matching browser assets when upgrading from version 1,
