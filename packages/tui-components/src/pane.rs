@@ -673,7 +673,9 @@ impl Component for PaneComponent<'_, '_> {
                 );
             }
         }
-        if let Some(title) = &self.pane.title {
+        if let Some(title) = &self.pane.title
+            && layout.size.height > 0
+        {
             cx.write_line(
                 LocalRect::new(
                     1,
@@ -953,6 +955,49 @@ mod tests {
                 .map(|cell| cell.symbol.as_str())
                 .collect::<String>();
             assert_eq!(top, expected, "title: {title:?}");
+        }
+    }
+
+    #[test]
+    fn child_text_cannot_overwrite_chrome_at_small_sizes() {
+        for width in 0..=8 {
+            for height in 0..=5 {
+                let state = Cell::new(PaneState::new(Rect::new(0, 0, width, height)));
+                let component = PaneComponent::new(
+                    "pane",
+                    Pane::new().title("界 oversized title"),
+                    &state,
+                    TextBlock::new("overflowing content\nsecond\nthird\nfourth")
+                        .wrap(bmux_tui::text::TextWrap::None),
+                );
+                let layout = component.layout(
+                    Constraints::tight(Size::new(width, height)),
+                    &mut LayoutCx::new(),
+                );
+                let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 7));
+                component.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+                for y in 0..7 {
+                    for x in 0..10 {
+                        if x >= width || y >= height {
+                            assert_eq!(
+                                buffer.get(Point::new(x, y)).unwrap().symbol,
+                                " ",
+                                "width={width} height={height} layout={:?} x={x} y={y}",
+                                layout.size
+                            );
+                        }
+                    }
+                }
+                if width >= 2 && height >= 2 {
+                    for y in 1..height - 1 {
+                        assert_eq!(buffer.get(Point::new(0, y)).unwrap().symbol, "│");
+                        assert_eq!(buffer.get(Point::new(width - 1, y)).unwrap().symbol, "│");
+                    }
+                    for x in 1..width - 1 {
+                        assert_eq!(buffer.get(Point::new(x, height - 1)).unwrap().symbol, "─");
+                    }
+                }
+            }
         }
     }
 

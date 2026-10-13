@@ -41,6 +41,35 @@ background, or modifier wins, while omitted values inherit from that surface. Ov
 also carry a scrim. `terminal_default()` preserves `Color::Default` at every depth; `opaque_dark()`
 and `opaque_light()` provide neutral gallery/reference palettes rather than product theme policy.
 
+## Bordered panels
+
+Use `pane::PaneComponent` with a `pane::Pane` configuration and a content child
+such as `bmux_tui::composition::TextBlock`. Do not hand-paint borders or write
+titles over full-width rows: row replacement clears unused cells and can erase
+chrome. The pane owns title clipping, border/padding geometry, and the child's
+clipped content area. Low-level `PaintCx` calls belong inside custom components.
+
+```rust
+use std::cell::Cell;
+use bmux_tui::composition::TextBlock;
+use bmux_tui::geometry::Rect;
+use bmux_tui::text::TextWrap;
+use bmux_tui_components::pane::{Pane, PaneComponent, PaneState};
+
+let state = Cell::new(PaneState::new(Rect::new(0, 0, 40, 10)));
+let logs = PaneComponent::new(
+    "logs", // Stable application-owned identity, not a list index.
+    Pane::new().title("Logs"),
+    &state,
+    TextBlock::new("Log content").wrap(TextWrap::None),
+);
+```
+
+Enable the `pane` feature. Keep interactive pane state in the caller across
+frames, and lay out, paint, and route events through the same component tree.
+Applications remain responsible for sanitizing untrusted text and choosing
+content wrapping/scrolling policies.
+
 ## Canonical composition
 
 Use `bmux_tui::composition` for child ownership, measurement, placement, and
