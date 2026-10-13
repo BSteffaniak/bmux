@@ -415,7 +415,12 @@ fn contain_payload(
             image::RgbaImage::from_raw(pixels.width, pixels.height, pixels.data.clone())
                 .expect("validated RGBA"),
         ),
-        PixelFormat::Png => return Err(invalid(&placement.key, "expected decoded pixels")),
+        PixelFormat::Png => image::ImageReader::with_format(
+            std::io::Cursor::new(&pixels.data),
+            image::ImageFormat::Png,
+        )
+        .decode()
+        .map_err(|error| invalid(&placement.key, format!("PNG decode failed: {error}")))?,
     };
     let fitted = decoded
         .resize_exact(fit_width, fit_height, image::imageops::FilterType::Lanczos3)
@@ -709,6 +714,90 @@ mod tests {
                 .height,
             16
         );
+    }
+
+    #[cfg(all(feature = "kitty", feature = "sixel", feature = "iterm2"))]
+    #[test]
+    fn contain_renders_real_deck_pngs_across_protocols() {
+        for bytes in [
+            include_bytes!("../../../presentations/bmux-tour/assets/system.png").as_slice(),
+            include_bytes!("../../../presentations/bmux-tour/assets/frame.png").as_slice(),
+            include_bytes!("../../../presentations/bmux-tour/assets/ownership.png").as_slice(),
+        ] {
+            let decoded = image::load_from_memory(bytes).unwrap();
+            let mut placed = placement(
+                "deck-png",
+                Rect::new(0, 0, 40, 12),
+                Rect::new(0, 0, 40, 12),
+                0,
+            );
+            placed.fit = bmux_tui::image::ImageFit::default();
+            placed.payload = ImagePayload::Png {
+                bytes: bytes.to_vec(),
+                width: decoded.width(),
+                height: decoded.height(),
+            };
+            let config = ImageConfig::default();
+            let source = super::decode_payload(&placed.key, &placed.payload, &config).unwrap();
+            assert_eq!(
+                source.pixels.as_ref().unwrap().format,
+                crate::model::PixelFormat::Png
+            );
+            let mut scene = ImageScene::default();
+            scene.reconcile(&[ImageContribution::Present(placed)]);
+            for (kitty_graphics, sixel, iterm2_inline) in [
+                (true, false, false),
+                (false, true, false),
+                (false, false, true),
+            ] {
+                let caps = HostImageCapabilities {
+                    kitty_graphics,
+                    sixel,
+                    iterm2_inline,
+                    cell_pixel_width: 8,
+                    cell_pixel_height: 16,
+                    ..Default::default()
+                };
+                let mut compositor = TuiImageCompositor::new();
+                let mut output = Vec::new();
+                compositor
+                    .render(
+                        &mut output,
+                        &scene,
+                        PaneRect {
+                            x: 0,
+                            y: 0,
+                            w: 40,
+                            h: 12,
+                        },
+                        &caps,
+                        &config,
+                    )
+                    .unwrap();
+                assert!(!output.is_empty());
+                let fitted = &compositor.fitted.values().next().unwrap().1;
+                assert_eq!(
+                    fitted.payload.pixels.as_ref().unwrap().format,
+                    crate::model::PixelFormat::Rgba8
+                );
+                let id = fitted.id;
+                compositor
+                    .render(
+                        &mut Vec::new(),
+                        &scene,
+                        PaneRect {
+                            x: 0,
+                            y: 0,
+                            w: 40,
+                            h: 12,
+                        },
+                        &caps,
+                        &config,
+                    )
+                    .unwrap();
+                assert_eq!(compositor.fitted.values().next().unwrap().1.id, id);
+            }
+        }
     }
 
     #[cfg(all(feature = "kitty", feature = "sixel", feature = "iterm2"))]
