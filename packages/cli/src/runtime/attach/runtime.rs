@@ -1139,7 +1139,7 @@ async fn recover_attach_output_desync_for_pane(
         .await
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)] // Independent frame facts keep telemetry aggregation explicit.
 pub struct AttachFrameRenderStats {
     pub frame_bytes: usize,
@@ -8809,6 +8809,32 @@ fn refresh_retained_extensions(
     Ok(())
 }
 
+fn finish_presented_scroll_tracking(view: &mut AttachViewState) {
+    let now = Instant::now();
+    view.scroll_started.retain(|pane, (first, latest)| {
+        if view.pending_scroll.contains_key(pane) {
+            return true;
+        }
+        tracing::debug!(target: "attach.scrollback", pane_id = %pane,
+            oldest_input_to_frame_us = now.saturating_duration_since(*first).as_micros(),
+            latest_input_to_frame_us = now.saturating_duration_since(*latest).as_micros(),
+            "scrollback.frame_committed");
+        false
+    });
+}
+
+fn retained_frame_sync_pending(view: &AttachViewState, layout: &AttachLayoutState) -> bool {
+    (view.observer.is_some() || view.presentation_only)
+        && layout.scene.surfaces.iter().any(|surface| {
+            surface.visible
+                && surface.pane_id.is_some_and(|id| {
+                    view.pane_buffers
+                        .get(&id)
+                        .is_some_and(|buffer| buffer.sync_update_in_progress)
+                })
+        })
+}
+
 #[allow(clippy::too_many_arguments)] // Preserve the public render entry point while committing interaction only after flush.
 pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     terminal_writer: &mut W,
@@ -8824,6 +8850,12 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<AttachFrameRenderStats> {
     view_state.driver_geometry = Some(geometry);
+    // A retained publication is a complete view, not a mixture of committed
+    // metadata and an application's unfinished DEC 2026 update. Defer before
+    // producer sampling or composition so all displayed authority stays put.
+    if retained_frame_sync_pending(view_state, layout_state) {
+        return Ok(AttachFrameRenderStats::default());
+    }
     // Explicit producer phase: current reduced UI geometry, before capture or
     // composition. All native/headless/test callers use this preparation entry.
     refresh_retained_extensions(view_state, layout_state, geometry, help_lines)?;
@@ -8886,17 +8918,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             .mark_full_frame(AttachDirtySource::PluginCommand);
         return result;
     }
-    let now = Instant::now();
-    view_state.scroll_started.retain(|pane, (first, latest)| {
-        if view_state.pending_scroll.contains_key(pane) {
-            return true;
-        }
-        tracing::debug!(target: "attach.scrollback", pane_id = %pane,
-            oldest_input_to_frame_us = now.saturating_duration_since(*first).as_micros(),
-            latest_input_to_frame_us = now.saturating_duration_since(*latest).as_micros(),
-            "scrollback.frame_committed");
-        false
-    });
+    finish_presented_scroll_tracking(view_state);
     let old_focus = view_state.plugin_focus.focused().and_then(|target| {
         previous.endpoint_for_region(target).map(|endpoint| {
             (
@@ -15965,6 +15987,60 @@ mod tests {
             .is_err()
         );
         assert!(Arc::ptr_eq(&committed, &output.latest().unwrap()));
+    }
+
+    #[test]
+    fn observed_synchronized_update_retains_commit_until_complete() {
+        for headless in [false, true] {
+            let session_id = Uuid::new_v4();
+            let pane_id = Uuid::new_v4();
+            let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+                context_id: None,
+                session_id,
+                can_write: true,
+            });
+            let layout = retry_test_layout(&mut state, pane_id, session_id);
+            state.presentation_extensions = Arc::new(bmux_plugin::RenderExtensionRegistry::new());
+            state.presentation_only = headless;
+            let (publisher, observer) = super::super::observer::attach_observer_channel();
+            state.set_observer(publisher);
+            state
+                .pane_buffers
+                .get_mut(&pane_id)
+                .unwrap()
+                .sync_update_in_progress = true;
+            render_observed_test_frame(&mut state, &layout);
+            assert!(observer.latest().is_none());
+            state
+                .pane_buffers
+                .get_mut(&pane_id)
+                .unwrap()
+                .sync_update_in_progress = false;
+            render_observed_test_frame(&mut state, &layout);
+            let committed = observer.latest().unwrap();
+            let graph = state.retained_compositor.clone();
+            let cursor = state.last_cursor_state;
+            let buffer = state.pane_buffers.get_mut(&pane_id).unwrap();
+            buffer.sync_update_in_progress = true;
+            buffer
+                .terminal_grid
+                .process(b"\x1b[Hcompleted atomic update");
+            state.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
+            render_observed_test_frame(&mut state, &layout);
+            assert!(Arc::ptr_eq(&committed, &observer.latest().unwrap()));
+            assert_eq!(state.retained_compositor, graph);
+            assert_eq!(state.last_cursor_state, cursor);
+            assert!(state.dirty.needs_render());
+            state
+                .pane_buffers
+                .get_mut(&pane_id)
+                .unwrap()
+                .sync_update_in_progress = false;
+            render_observed_test_frame(&mut state, &layout);
+            let next = observer.latest().unwrap();
+            assert!(next.revision > committed.revision);
+            assert_ne!(next.prepared.buffer(), committed.prepared.buffer());
+        }
     }
 
     #[test]

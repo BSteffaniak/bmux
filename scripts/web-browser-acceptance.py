@@ -128,6 +128,10 @@ def producer(root):
                 (root / "producer-last-command").write_text(command)
             if command.startswith("mark "):
                 emit("\x1b[1;1H" + command[5:])
+            elif command == "sync-begin":
+                emit("\x1b[?2026h\x1b[1;1HWEB_ATOMIC_UPDATE")
+            elif command == "sync-end":
+                emit("\x1b[?2026l")
             elif command == "create":
                 emit(f"\x1b_Ga=t,f=32,s=2,v=2,i=77,q=2;{rgba}\x1b\\")
                 place(5, 5)
@@ -509,6 +513,23 @@ class Harness:
         require(updated_pixels["checksum"] != pixels["checksum"], "PTY update did not change Canvas pixels")
         require(frame["revision"] > initial["revision"], "live revision did not advance")
         self.passed("live PTY output update")
+
+        # An incomplete DEC 2026 transaction must not publish partial output or
+        # terminate the output-only attachment. The end marker commits it.
+        before_atomic = self.snapshot()
+        self.fixture_command("sync-begin")
+        time.sleep(0.05)
+        require(attach.child.poll() is None, "synchronized update disconnected browser attachment")
+        during_atomic = self.snapshot()
+        require("WEB_ATOMIC_UPDATE" not in text(during_atomic),
+                "incomplete synchronized update was published")
+        require(during_atomic["revision"] == before_atomic["revision"],
+                "synchronized update advanced committed presentation")
+        self.fixture_command("sync-end")
+        atomic = self.frame_when("completed synchronized update", lambda f: "WEB_ATOMIC_UPDATE" in text(f))
+        require(atomic["revision"] > before_atomic["revision"], "completed update did not commit")
+        self.rendered(atomic)
+        self.passed("synchronized PTY update retains committed frame and completes without disconnect")
 
         self.fixture_command("create")
         frame = self.frame_when("Kitty create", lambda f: bool(placements(f)))
