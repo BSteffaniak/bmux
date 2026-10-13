@@ -49,26 +49,36 @@ pub fn base64_decode(input: &[u8]) -> Vec<u8> {
 
 /// Simple base64 encoder (standard alphabet with padding).
 pub fn base64_encode(input: &[u8]) -> String {
+    let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
+    base64_encode_into(input, &mut out);
+    // The encoder emits only the standard ASCII alphabet and '=' padding.
+    String::from_utf8(out).expect("base64 output is ASCII")
+}
+
+/// Append standard padded base64 directly to an existing byte buffer.
+///
+/// Existing bytes are preserved, and empty input appends nothing. Padding is
+/// local to this call, so callers must choose protocol chunk boundaries first.
+pub fn base64_encode_into(input: &[u8], out: &mut Vec<u8>) {
     const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    out.reserve(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
         let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
         let triple = (b0 << 16) | (b1 << 8) | b2;
 
-        out.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        out.push(CHARS[((triple >> 18) & 0x3F) as usize]);
+        out.push(CHARS[((triple >> 12) & 0x3F) as usize]);
         if chunk.len() > 1 {
-            out.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+            out.push(CHARS[((triple >> 6) & 0x3F) as usize]);
         } else {
-            out.push('=');
+            out.push(b'=');
         }
         if chunk.len() > 2 {
-            out.push(CHARS[(triple & 0x3F) as usize] as char);
+            out.push(CHARS[(triple & 0x3F) as usize]);
         } else {
-            out.push('=');
+            out.push(b'=');
         }
     }
-    out
 }

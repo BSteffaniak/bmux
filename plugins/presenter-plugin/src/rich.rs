@@ -50,15 +50,29 @@ impl RichAssets {
                 limits.max_alloc = Some(64 * 1024 * 1024);
                 reader.limits(limits);
                 let decoded = reader.decode()?;
-                ImagePayload::Pixels {
-                    bytes: decoded.to_rgba8().into_raw(),
-                    width: decoded.width(),
-                    height: decoded.height(),
-                    format: bmux_tui::image::ImagePixelFormat::Rgba8,
+                // Keep prepared PNG bytes for compact protocol uploads. Decoding
+                // here still validates the full stream under the existing limits.
+                let width = decoded.width();
+                let height = decoded.height();
+                let bytes = if image::guess_format(&asset.bytes)? == image::ImageFormat::Png {
+                    asset.bytes.clone()
+                } else {
+                    let mut encoded = std::io::Cursor::new(Vec::new());
+                    decoded.write_to(&mut encoded, image::ImageFormat::Png)?;
+                    encoded.into_inner()
+                };
+                ImagePayload::Png {
+                    bytes,
+                    width,
+                    height,
                 }
             };
             let size = match &payload {
-                ImagePayload::Png { bytes, .. } | ImagePayload::Pixels { bytes, .. } => bytes.len(),
+                ImagePayload::Png { width, height, .. } => {
+                    usize::try_from(u64::from(*width) * u64::from(*height) * 4)
+                        .context("decoded asset size overflow")?
+                }
+                ImagePayload::Pixels { bytes, .. } => bytes.len(),
             };
             decoded_bytes = decoded_bytes
                 .checked_add(size)
@@ -106,6 +120,36 @@ mod tests {
     use super::*;
     use bmux_tui::component::{Constraints, LayoutCx};
     use bmux_tui::{geometry::Rect, terminal::Terminal};
+    #[test]
+    fn prepared_png_preserves_compact_bytes_and_dimensions() {
+        let bytes = include_bytes!("../../../packages/presenter/examples/architecture.png");
+        let rich = RichAssets::prepare(&[Asset {
+            id: "architecture".into(),
+            media_type: "image/png".into(),
+            bytes: bytes.to_vec(),
+        }])
+        .unwrap();
+        assert!(matches!(
+            &rich.images["architecture"],
+            ImagePayload::Png { bytes: retained, width: 640, height: 240 }
+                if retained.as_slice() == bytes
+        ));
+    }
+
+    #[test]
+    fn prepared_png_budget_counts_decoded_pixels_not_compressed_bytes() {
+        let encoded = include_bytes!("../../../packages/presenter/examples/architecture.png");
+        // Each small compressed image expands to 614,400 RGBA bytes.
+        let assets = (0..110)
+            .map(|id| Asset {
+                id: id.to_string(),
+                media_type: "image/png".into(),
+                bytes: encoded.to_vec(),
+            })
+            .collect::<Vec<_>>();
+        assert!(RichAssets::prepare(&assets).is_err());
+    }
+
     #[test]
     fn rasterized_diagram_contributes_committed_image_scene() {
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>"#;

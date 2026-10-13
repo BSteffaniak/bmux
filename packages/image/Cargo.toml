@@ -26,6 +26,11 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 
+[[bench]]
+harness           = false
+name              = "image_pipeline"
+required-features = ["kitty", "sixel", "iterm2"]
+
 [features]
 compression-lz4 = ["bmux_ipc/compression-lz4"]
 compression-zstd = ["bmux_ipc/compression-zstd"]

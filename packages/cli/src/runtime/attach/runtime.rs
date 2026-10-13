@@ -4388,7 +4388,8 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
             {
                 view_state.image_sequences.clear();
                 view_state.pane_images.clear();
-                view_state.kitty_host_state.transmitted.clear();
+                // Geometry changes invalidate placements, not uploaded content.
+                // The next frame reconciles visibility/crops against the new layout.
                 image_fetch_pending = true;
             }
         }
@@ -4773,6 +4774,25 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
         "attach.runtime.end"
     );
 
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    {
+        let mut candidate = view_state.kitty_host_state.clone();
+        let cleanup = candidate
+            .reset(&mut &mut *terminal)
+            .and_then(|()| terminal.flush());
+        if let Err(error) = cleanup {
+            view_state
+                .kitty_host_state
+                .invalidate_after_failed_output(&candidate);
+            terminal.restore_after_attach_ui()?;
+            return Err(error.into());
+        }
+        view_state.kitty_host_state = candidate;
+    }
     terminal.restore_after_attach_ui()?;
     drop(started_companions);
     super::local_presentation::uninstall(&view_state.presentation_surfaces);
@@ -8720,7 +8740,14 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pending_kitty_state.clear_placements(&mut frame_bytes)?;
+    {
+        pending_kitty_state.begin_frame();
+        pending_kitty_state.select_protocol(
+            &mut frame_bytes,
+            view_state.host_image_caps.preferred_protocol(),
+        )?;
+        pending_kitty_state.clear_placements(&mut frame_bytes)?;
+    }
     queue!(frame_bytes, SavePosition).context("failed queuing cursor save for attach frame")?;
     // Hide the cursor during the frame render to prevent it from visibly
     // jumping to every MoveTo position as pane content is drawn.
@@ -9014,6 +9041,13 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         )?;
     }
 
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    pending_kitty_state.finish_frame(&mut frame_bytes)?;
+
     if frame_plan.use_synchronized_update {
         queue!(frame_bytes, EndSynchronizedUpdate)
             .context("failed queuing end synchronized update")?;
@@ -9023,6 +9057,14 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     let write_result = bmux_attach_pipeline::terminal::write_frame(terminal_writer, &frame_bytes)
         .context("failed writing or flushing attach frame");
     if let Err(error) = write_result {
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
+        view_state
+            .kitty_host_state
+            .invalidate_after_failed_output(&pending_kitty_state);
         // Encoding has advanced row baselines, but partial output is not a
         // presented frame. Repaint every row before using incremental diffs.
         for buffer in view_state.pane_buffers.values_mut() {

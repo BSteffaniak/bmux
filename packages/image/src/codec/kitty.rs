@@ -166,15 +166,16 @@ pub fn encode_transmit_chunks(
         KittyFormat::Rgba => 32,
         KittyFormat::Png => 100,
     };
-    let chunks = data.chunks(KITTY_RAW_CHUNK_BYTES).collect::<Vec<_>>();
-    let chunk_count = chunks.len().max(1);
+    let chunk_count = data.len().div_ceil(KITTY_RAW_CHUNK_BYTES).max(1);
     (0..chunk_count)
         .map(|index| {
-            let chunk = chunks.get(index).copied().unwrap_or_default();
+            let start = index * KITTY_RAW_CHUNK_BYTES;
+            let chunk = &data[start..data.len().min(start + KITTY_RAW_CHUNK_BYTES)];
             let more = u8::from(index + 1 < chunk_count);
-            let b64 = base64_encode(chunk);
-            format!("Ga=t,i={image_id},f={fmt},s={width},v={height},m={more},q=2;{b64}")
-                .into_bytes()
+            let mut body = format!("Ga=t,i={image_id},f={fmt},s={width},v={height},m={more},q=2;")
+                .into_bytes();
+            super::base64::base64_encode_into(chunk, &mut body);
+            body
         })
         .collect()
 }
@@ -193,11 +194,12 @@ pub fn encode_transmit(
         KittyFormat::Rgba => 32,
         KittyFormat::Png => 100,
     };
-    let b64 = base64_encode(data);
     // q=2 suppresses terminal replies. Without it, Kitty-compatible terminals
     // send APC acknowledgements on stdin, which attach clients may forward to
     // the running pane as literal text.
-    format!("Ga=t,i={image_id},f={fmt},s={width},v={height},q=2;{b64}").into_bytes()
+    let mut body = format!("Ga=t,i={image_id},f={fmt},s={width},v={height},q=2;").into_bytes();
+    super::base64::base64_encode_into(data, &mut body);
+    body
 }
 
 /// Encode a kitty graphics placement command for the current cursor cell.

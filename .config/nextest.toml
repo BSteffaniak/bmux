@@ -16,6 +16,12 @@ threads-required = "num-cpus"
 filter = 'package(bmux_pane_runtime_plugin)'
 threads-required = "num-cpus"
 
+# Playbook fixtures also boot isolated plugin-loaded servers. Reserve host
+# capacity so parallel sandbox startups do not exhaust their fixed deadlines.
+[[profile.default.overrides]]
+filter = 'binary(playbook_integration)'
+threads-required = "num-cpus"
+
 # Mutual-authentication fixtures run multiple real servers and Raft voters.
 # Reserve host capacity just as for PTY fixtures; libtest serializes these in
 # the integration binary, while nextest runs each test in a separate process.

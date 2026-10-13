@@ -285,7 +285,14 @@ where
                     }
                 })
         },
-    )?;
+    );
+    let stats = match stats {
+        Ok(stats) => stats,
+        Err(error) => {
+            compositor.invalidate_after_failed_output(&staged_compositor);
+            return Err(error.into());
+        }
+    };
     *compositor = staged_compositor;
     Ok(PresentReport {
         changed_cells: stats.changed_cells,

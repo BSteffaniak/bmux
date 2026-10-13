@@ -245,29 +245,26 @@ fn paint_sixel_column(
     }
 }
 
-/// Encode an RGBA pixel buffer as sixel DCS data (without the ESC P q / ESC \
+/// Encode an RGB or RGBA pixel buffer as sixel DCS data (without the ESC P q / ESC \
 /// wrapper).
 ///
-/// Uses a basic 256-color quantization with direct RGB mapping.
+/// Uses a fixed 216-color palette (6x6x6 RGB cube).
 pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
-    if pixels.width == 0 || pixels.height == 0 {
+    if pixels.width == 0 || pixels.height == 0 || pixels.format == PixelFormat::Png {
         return None;
     }
 
     let width = pixels.width as usize;
     let height = pixels.height as usize;
-    let pixel_data = match pixels.format {
-        PixelFormat::Rgba8 => &pixels.data,
-        PixelFormat::Rgb8 => &pixels.data,
-        PixelFormat::Png => return None, // Can't encode PNG directly to sixel.
-    };
     let bpp = match pixels.format {
         PixelFormat::Rgba8 => 4,
         PixelFormat::Rgb8 => 3,
         PixelFormat::Png => return None,
     };
+    let pixel_count = width.checked_mul(height)?;
+    pixel_count.checked_mul(bpp)?;
 
-    let mut out = Vec::with_capacity(width * height);
+    let mut out = Vec::with_capacity(pixel_count);
 
     // Raster attributes: Pan=1; Pad=1; Ph=width; Pv=height
     out.extend_from_slice(format!("\"1;1;{};{}", width, height).as_bytes());
@@ -287,59 +284,17 @@ pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
 
     // Encode pixel data in sixel bands (6 rows per band).
     let num_bands = height.div_ceil(6);
+    let mut band_data = SixelBand::new();
     for band in 0..num_bands {
-        let band_y = band * 6;
-
-        // For each color that has pixels in this band, emit a sixel row.
-        // Simple approach: iterate all colors, emit non-empty ones.
+        band_data.fill(pixels, band, quantize_color);
         let mut band_has_output = false;
 
-        for color_idx in 0u16..216 {
-            let cr = ((color_idx / 36) as u8) * 51;
-            let cg = (((color_idx / 6) % 6) as u8) * 51;
-            let cb = ((color_idx % 6) as u8) * 51;
-
-            // Build the sixel column data for this color in this band.
-            let mut has_pixels = false;
-            let mut columns = Vec::with_capacity(width);
-
-            for x in 0..width {
-                let mut bits: u8 = 0;
-                for bit in 0..6usize {
-                    let y = band_y + bit;
-                    if y >= height {
-                        continue;
-                    }
-                    let offset = (y * width + x) * bpp;
-                    if offset + 2 < pixel_data.len() {
-                        // Skip transparent pixels (alpha < 128) for RGBA format.
-                        if bpp == 4 && offset + 3 < pixel_data.len() && pixel_data[offset + 3] < 128
-                        {
-                            continue;
-                        }
-                        let pr = pixel_data[offset];
-                        let pg = pixel_data[offset + 1];
-                        let pb = pixel_data[offset + 2];
-                        // Quantize to 6x6x6 cube.
-                        let qr = ((pr as u16 + 25) / 51).min(5) as u8 * 51;
-                        let qg = ((pg as u16 + 25) / 51).min(5) as u8 * 51;
-                        let qb = ((pb as u16 + 25) / 51).min(5) as u8 * 51;
-                        if qr == cr && qg == cg && qb == cb {
-                            bits |= 1 << bit;
-                        }
-                    }
-                }
-                columns.push(bits);
-            }
-
-            // Check if any column has pixels for this color.
-            if columns.iter().any(|&b| b != 0) {
-                has_pixels = true;
-            }
-
-            if !has_pixels {
+        // Palette order is part of the established byte representation.
+        for color_idx in 0..216 {
+            if !band_data.contains(color_idx) {
                 continue;
             }
+            let columns = &band_data.columns[color_idx];
 
             // Select color.
             if band_has_output {
@@ -380,9 +335,174 @@ pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Quantize once, retaining the established round-to-nearest cube mapping.
+fn quantize_color(rgb: [u8; 3]) -> usize {
+    let level = |value: u8| usize::from((u16::from(value) + 25) / 51).min(5);
+    level(rgb[0]) * 36 + level(rgb[1]) * 6 + level(rgb[2])
+}
+
+/// Reusable band-local scratch: at most 216 full-width column buffers.
+/// Buffers are allocated only for encountered colors; no image-sized cache is kept.
+struct SixelBand {
+    columns: [Vec<u8>; 216],
+    used: [u64; 4],
+}
+
+impl SixelBand {
+    fn new() -> Self {
+        Self {
+            columns: std::array::from_fn(|_| Vec::new()),
+            used: [0; 4],
+        }
+    }
+
+    fn contains(&self, color: usize) -> bool {
+        self.used[color / 64] & (1u64 << (color % 64)) != 0
+    }
+
+    fn fill(
+        &mut self,
+        pixels: &PixelBuffer,
+        band: usize,
+        mut quantize: impl FnMut([u8; 3]) -> usize,
+    ) {
+        for color in 0..216 {
+            if self.contains(color) {
+                self.columns[color].fill(0);
+            }
+        }
+        self.used.fill(0);
+        let width = pixels.width as usize;
+        let height = pixels.height as usize;
+        let bpp = if pixels.format == PixelFormat::Rgba8 {
+            4
+        } else {
+            3
+        };
+        for bit in 0..6 {
+            let y = band * 6 + bit;
+            if y >= height {
+                break;
+            }
+            for x in 0..width {
+                let offset = (y * width + x) * bpp;
+                let Some(rgb) = pixels.data.get(offset..offset + 3) else {
+                    continue;
+                };
+                // Preserve truncated RGBA semantics: a missing alpha is opaque.
+                if bpp == 4
+                    && pixels
+                        .data
+                        .get(offset + 3)
+                        .is_some_and(|&alpha| alpha < 128)
+                {
+                    continue;
+                }
+                let color = quantize([rgb[0], rgb[1], rgb[2]]);
+                if !self.contains(color) {
+                    self.columns[color].resize(width, 0);
+                    self.used[color / 64] |= 1u64 << (color % 64);
+                }
+                self.columns[color][x] |= 1 << bit;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn band_work_quantizes_each_drawable_pixel_once_and_reuses_scratch() {
+        let width = 640;
+        let height = 13;
+        let mut pixels = PixelBuffer {
+            width,
+            height,
+            format: PixelFormat::Rgba8,
+            data: [255, 0, 0, 255].repeat(width as usize * height as usize),
+        };
+        let mut scratch = SixelBand::new();
+        let mut quantizations = 0;
+        for band in 0..(height as usize).div_ceil(6) {
+            scratch.fill(&pixels, band, |rgb| {
+                quantizations += 1;
+                quantize_color(rgb)
+            });
+            assert_eq!(
+                scratch
+                    .used
+                    .iter()
+                    .map(|word| word.count_ones())
+                    .sum::<u32>(),
+                1
+            );
+            assert!(scratch.contains(180));
+            assert_eq!(
+                scratch.columns.iter().map(Vec::len).sum::<usize>(),
+                width as usize
+            );
+            let bits = if band == 2 { 1 } else { 63 };
+            assert!(scratch.columns[180].iter().all(|&column| column == bits));
+        }
+        assert_eq!(quantizations, width as usize * height as usize);
+        let allocation = scratch.columns[180].as_ptr();
+
+        // An empty intervening band must clear old bits without quantization.
+        for pixel in pixels.data.chunks_exact_mut(4) {
+            pixel[3] = 127;
+        }
+        scratch.fill(&pixels, 0, |_| {
+            panic!("transparent pixels must not be quantized")
+        });
+        assert_eq!(scratch.used, [0; 4]);
+        assert!(scratch.columns[180].iter().all(|&column| column == 0));
+        pixels.data[..4].copy_from_slice(&[255, 0, 0, 128]);
+        let mut quantizations = 0;
+        scratch.fill(&pixels, 0, |rgb| {
+            quantizations += 1;
+            quantize_color(rgb)
+        });
+        assert_eq!(quantizations, 1);
+        assert_eq!(scratch.columns[180].as_ptr(), allocation);
+        assert_eq!(scratch.columns[180][0], 1);
+        assert!(scratch.columns[180][1..].iter().all(|&column| column == 0));
+    }
+
+    #[test]
+    fn band_masks_cover_all_colors_with_width_bounded_scratch() {
+        let mut data = Vec::new();
+        for color in 0..216u16 {
+            data.extend_from_slice(&[
+                (color / 36 * 51) as u8,
+                (color / 6 % 6 * 51) as u8,
+                (color % 6 * 51) as u8,
+            ]);
+        }
+        let pixels = PixelBuffer {
+            width: 216,
+            height: 1,
+            format: PixelFormat::Rgb8,
+            data,
+        };
+        let mut scratch = SixelBand::new();
+        let mut quantizations = 0;
+        scratch.fill(&pixels, 0, |rgb| {
+            quantizations += 1;
+            quantize_color(rgb)
+        });
+        assert_eq!(quantizations, 216);
+        assert_eq!(scratch.used, [u64::MAX, u64::MAX, u64::MAX, (1 << 24) - 1]);
+        assert_eq!(
+            scratch.columns.iter().map(Vec::len).sum::<usize>(),
+            216 * 216
+        );
+        for color in 0..216 {
+            assert!(scratch.contains(color));
+            assert_eq!(scratch.columns[color][color], 1);
+        }
+    }
 
     #[test]
     fn estimate_simple_sixel() {

@@ -5,7 +5,10 @@
 //! terminal coordinates, clips to pane boundaries, and emits the
 //! appropriate protocol-specific escape sequences.
 
+mod cache;
 pub(crate) mod clipping;
+#[cfg(all(test, any(feature = "kitty", feature = "sixel")))]
+mod tests;
 use std::io::Write;
 
 #[cfg(feature = "iterm2")]
@@ -34,11 +37,24 @@ pub struct KittyHostState {
     /// Next host-side kitty image ID to allocate.
     #[cfg(feature = "kitty")]
     next_host_id: u32,
+    cache: cache::Cache,
+    protocol: Option<crate::model::ImageProtocol>,
+    #[cfg(feature = "kitty")]
+    content_bytes: std::collections::HashMap<u64, usize>,
+    frame_seen: std::collections::HashSet<u64>,
+    repair_ids: std::collections::BTreeSet<u32>,
+    allocated_ids: std::collections::BTreeSet<u32>,
+    #[cfg(feature = "kitty")]
+    placements: std::collections::BTreeMap<(u32, u16, u16), u32>,
+    #[cfg(feature = "kitty")]
+    seen_placements: std::collections::BTreeSet<(u32, u16, u16)>,
+    #[cfg(feature = "kitty")]
+    next_placement_id: u32,
 }
 
 impl KittyHostState {
-    /// Delete compositor-owned persistent Kitty images before a repair frame.
-    /// The caller must commit this state only after output succeeds.
+    /// Hide all compositor-owned Kitty placements while retaining reusable content.
+    /// The caller must commit this candidate only after output and flush succeed.
     pub fn clear_placements(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         #[cfg(feature = "kitty")]
         for host_id in self.transmitted.values() {
@@ -48,29 +64,236 @@ impl KittyHostState {
         }
         #[cfg(not(feature = "kitty"))]
         let _ = out;
-        self.transmitted.clear();
+        #[cfg(feature = "kitty")]
+        self.placements.clear();
         Ok(())
     }
 
-    fn next_fragment_id(&self) -> u32 {
-        u32::try_from(self.transmitted.len())
-            .unwrap_or(u32::MAX)
-            .saturating_add(1)
+    /// Start one complete host frame (all panes), on a cloned candidate state.
+    pub fn begin_frame(&mut self) {
+        self.frame_seen.clear();
+        self.allocated_ids.clear();
+        #[cfg(feature = "kitty")]
+        self.seen_placements.clear();
+    }
+
+    /// Invalidate uncertain host output without advancing committed scene state.
+    /// Supply the candidate that may have partially reached the terminal.
+    pub fn invalidate_after_failed_output(&mut self, candidate: &Self) {
+        self.repair_ids.extend(self.transmitted.values().copied());
+        self.repair_ids
+            .extend(candidate.transmitted.values().copied());
+        self.repair_ids
+            .extend(candidate.allocated_ids.iter().copied());
+        self.repair_ids.extend(candidate.repair_ids.iter().copied());
+        #[cfg(feature = "kitty")]
+        {
+            self.next_host_id = self.next_host_id.max(candidate.next_host_id);
+        }
+    }
+
+    /// Remove stale placements and release inactive content beyond the host budget.
+    /// Commit this candidate only after the enclosing output flush succeeds.
+    pub fn finish_frame(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        self.emit_repair(out)?;
+        #[cfg(feature = "kitty")]
+        {
+            let stale: Vec<_> = self
+                .placements
+                .iter()
+                .filter(|(key, _)| !self.seen_placements.contains(key))
+                .map(|(key, id)| (*key, *id))
+                .collect();
+            for (key, id) in stale {
+                out.write_all(b"\x1b_")?;
+                out.write_all(&crate::codec::kitty::encode_delete_placement(key.0, id))?;
+                out.write_all(b"\x1b\\")?;
+                self.placements.remove(&key);
+            }
+            let mut inactive: Vec<_> = self
+                .transmitted
+                .iter()
+                .filter(|(id, _)| !self.frame_seen.contains(id))
+                .map(|(id, host)| (*id, *host))
+                .collect();
+            inactive.sort_unstable();
+            for (id, host) in inactive {
+                if self.transmitted.len() <= 128
+                    && self.content_bytes.values().sum::<usize>() <= 64 * 1024 * 1024
+                {
+                    break;
+                }
+                write!(out, "\x1b_Ga=d,d=I,i={host},q=2\x1b\\")?;
+                self.transmitted.remove(&id);
+                self.content_bytes.remove(&id);
+            }
+        }
+        self.cache.trim();
+        Ok(())
+    }
+
+    fn emit_repair(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        #[cfg(feature = "kitty")]
+        if !self.repair_ids.is_empty() {
+            for id in &self.repair_ids {
+                write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
+            }
+            self.transmitted.clear();
+            self.content_bytes.clear();
+            self.placements.clear();
+        }
+        #[cfg(not(feature = "kitty"))]
+        let _ = out;
+        self.repair_ids.clear();
+        Ok(())
+    }
+
+    /// Release every owned host resource, including retained invisible content.
+    /// Perform on a candidate and commit only after flush succeeds.
+    pub fn reset(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        self.repair_ids.extend(self.transmitted.values().copied());
+        self.emit_repair(out)?;
+        self.cache.clear();
+        Ok(())
+    }
+
+    /// Release retained resources when host protocol selection changes.
+    /// Call once per candidate frame even when there are no image placements.
+    /// Commit the candidate only after output and flush succeed.
+    pub fn select_protocol(
+        &mut self,
+        out: &mut impl Write,
+        protocol: Option<crate::model::ImageProtocol>,
+    ) -> std::io::Result<()> {
+        if self.protocol != protocol {
+            self.reset(out)?;
+            self.protocol = protocol;
+        }
+        self.emit_repair(out)
+    }
+
+    /// Deterministic cache work counters: source decodes and fragment preparations.
+    #[must_use]
+    pub fn work_counts(&self) -> (usize, usize) {
+        (self.cache.decodes, self.cache.preparations)
+    }
+
+    #[cfg(feature = "kitty")]
+    fn place(
+        &mut self,
+        out: &mut impl Write,
+        host: u32,
+        x: u16,
+        y: u16,
+        cols: u16,
+        rows: u16,
+    ) -> std::io::Result<()> {
+        let key = (host, x, y);
+        if self.seen_placements.len() >= 1024 && !self.seen_placements.contains(&key) {
+            return Err(std::io::Error::other(
+                "kitty frame placement budget exceeded",
+            ));
+        }
+        let id = if let Some(id) = self.placements.get(&key) {
+            *id
+        } else {
+            let index = self
+                .placements
+                .iter()
+                .find(|(existing, _)| {
+                    existing.0 == host && !self.seen_placements.contains(existing)
+                })
+                .map(|(key, id)| (*key, *id));
+            if let Some((old_key, old_id)) = index {
+                out.write_all(b"\x1b_")?;
+                out.write_all(&crate::codec::kitty::encode_delete_placement(host, old_id))?;
+                out.write_all(b"\x1b\\")?;
+                self.placements.remove(&old_key);
+            }
+            self.next_placement_id = self
+                .next_placement_id
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("kitty placement ID space exhausted"))?;
+            self.placements.insert(key, self.next_placement_id);
+            self.next_placement_id
+        };
+        self.seen_placements.insert(key);
+        out.write_all(b"\x1b_")?;
+        out.write_all(&crate::codec::kitty::encode_place_with_z_and_cells(
+            host, id, 0, cols, rows,
+        ))?;
+        out.write_all(b"\x1b\\")
+    }
+
+    #[cfg(feature = "kitty")]
+    fn reserve_content(
+        &mut self,
+        out: &mut impl Write,
+        id: u64,
+        cost: usize,
+    ) -> std::io::Result<()> {
+        const LIMIT: usize = 64 * 1024 * 1024;
+        if cost > LIMIT {
+            return Err(std::io::Error::other("kitty content exceeds byte budget"));
+        }
+        let mut inactive: Vec<_> = self
+            .transmitted
+            .keys()
+            .filter(|key| **key != id && !self.frame_seen.contains(key))
+            .copied()
+            .collect();
+        inactive.sort_unstable();
+        let old_cost = self.content_bytes.get(&id).copied().unwrap_or(0);
+        for stale in inactive {
+            let bytes = self
+                .content_bytes
+                .values()
+                .sum::<usize>()
+                .saturating_sub(old_cost);
+            if bytes <= LIMIT - cost
+                && (self.transmitted.contains_key(&id) || self.transmitted.len() < 128)
+            {
+                break;
+            }
+            let host = self.transmitted[&stale];
+            write!(out, "\x1b_Ga=d,d=I,i={host},q=2\x1b\\")?;
+            self.transmitted.remove(&stale);
+            self.content_bytes.remove(&stale);
+            self.placements.retain(|key, _| key.0 != host);
+            self.seen_placements.retain(|key| key.0 != host);
+        }
+        let retained = self
+            .content_bytes
+            .values()
+            .sum::<usize>()
+            .saturating_sub(old_cost);
+        if cost > LIMIT || retained > LIMIT - cost {
+            return Err(std::io::Error::other(
+                "kitty retained content byte budget exceeded",
+            ));
+        }
+        self.content_bytes.insert(id, cost);
+        Ok(())
     }
 
     /// Get or allocate a host-side kitty image ID for a bmux image.
     #[cfg(feature = "kitty")]
-    fn get_or_allocate(&mut self, bmux_image_id: u64) -> (u32, bool) {
+    fn get_or_allocate(&mut self, bmux_image_id: u64) -> std::io::Result<(u32, bool)> {
+        if self.frame_seen.len() >= 128 && !self.frame_seen.contains(&bmux_image_id) {
+            return Err(std::io::Error::other("kitty frame content budget exceeded"));
+        }
+        self.frame_seen.insert(bmux_image_id);
         if let Some(&host_id) = self.transmitted.get(&bmux_image_id) {
-            (host_id, false) // Already transmitted.
+            Ok((host_id, false)) // Already transmitted.
         } else {
-            self.next_host_id = self.next_host_id.wrapping_add(1);
-            if self.next_host_id == 0 {
-                self.next_host_id = 1; // kitty image_id 0 is invalid.
-            }
+            self.next_host_id = self
+                .next_host_id
+                .checked_add(1)
+                .ok_or_else(|| std::io::Error::other("kitty image ID space exhausted"))?;
             let host_id = self.next_host_id;
+            self.allocated_ids.insert(host_id);
             self.transmitted.insert(bmux_image_id, host_id);
-            (host_id, true) // Newly allocated, needs transmission.
+            Ok((host_id, true)) // Newly allocated, needs transmission.
         }
     }
 }
@@ -88,6 +311,7 @@ pub fn render_pane_images(
     decode_mode: ImageDecodeMode,
     kitty_state: &mut KittyHostState,
 ) -> std::io::Result<()> {
+    kitty_state.select_protocol(out, host_caps.preferred_protocol())?;
     if images.is_empty() {
         return Ok(());
     }
@@ -138,6 +362,7 @@ pub fn render_pane_images_clipped(
     state: &mut KittyHostState,
 ) -> std::io::Result<()> {
     use bmux_tui::geometry::Rect;
+    state.select_protocol(out, caps.preferred_protocol())?;
     for image in images {
         let destination = Rect::new(
             pane.x.saturating_add(image.position.col),
@@ -145,36 +370,160 @@ pub fn render_pane_images_clipped(
             image.cell_size.cols,
             image.cell_size.rows,
         );
-        let mut fragments =
-            vec![destination.intersection(Rect::new(pane.x, pane.y, pane.w, pane.h))];
-        for cover in covers {
-            fragments = fragments
-                .into_iter()
-                .flat_map(|rect| clipping::subtract(rect, *cover))
-                .collect();
-            if fragments.len() > 256 {
-                return Err(std::io::Error::other(
-                    "image occlusion fragment budget exceeded",
-                ));
-            }
+        render_image_clipped(
+            out,
+            image,
+            destination,
+            Rect::new(pane.x, pane.y, pane.w, pane.h),
+            covers,
+            caps,
+            state,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+/// Shared source entry point used by the TUI adapter; geometry is not content.
+#[allow(clippy::too_many_arguments)] // Placement and borrowed source remain separate from wire models.
+pub(crate) fn render_image_clipped(
+    out: &mut impl Write,
+    image: &PaneImage,
+    destination: bmux_tui::geometry::Rect,
+    clip: bmux_tui::geometry::Rect,
+    covers: &[bmux_tui::geometry::Rect],
+    caps: &HostImageCapabilities,
+    state: &mut KittyHostState,
+    shared: Option<&std::sync::Arc<PaneImage>>,
+) -> std::io::Result<()> {
+    use bmux_tui::geometry::Rect;
+    state.select_protocol(out, caps.preferred_protocol())?;
+    let mut fragments = vec![destination.intersection(clip)];
+    for cover in covers {
+        fragments = fragments
+            .into_iter()
+            .flat_map(|rect| clipping::subtract(rect, *cover))
+            .collect();
+        if fragments.len() > 256 {
+            return Err(std::io::Error::other(
+                "image occlusion fragment budget exceeded",
+            ));
         }
-        for visible in fragments.into_iter().filter(|rect| !rect.is_empty()) {
-            let mut fragment = image.clone();
-            // Decode even an unclipped image: its source protocol may differ
-            // from the host protocol, and passthrough would bypass negotiation.
-            fragment.payload.pixels = Some(clipping::decoded(image)?);
-            fragment.payload.raw = None;
-            if visible != destination {
-                fragment.pixel_size =
-                    crate::tui::crop_to_visible(&mut fragment.payload, destination, visible);
-                fragment.payload.raw = None;
+    }
+    for visible in fragments.into_iter().filter(|rect| !rect.is_empty()) {
+        let crop = Rect::new(
+            visible.x - destination.x,
+            visible.y - destination.y,
+            visible.width,
+            visible.height,
+        );
+        let size = (destination.width, destination.height);
+        let host = (
+            caps.preferred_protocol(),
+            caps.cell_pixel_width,
+            caps.cell_pixel_height,
+        );
+        let prepared = if let Some(fragment) = state.cache.find(image, shared, crop, size, host) {
+            fragment
+        } else {
+            let decoded = state.cache.decoded(image, shared)?;
+            let (prepared_pixels, pixel_size) = if visible != destination {
+                let mut payload = crate::model::ImagePayload {
+                    raw: None,
+                    pixels: Some((*decoded).clone()),
+                };
+                let pixel_size = crate::tui::crop_to_visible(&mut payload, destination, visible);
+                (
+                    std::sync::Arc::new(payload.pixels.take().expect("cropped pixels")),
+                    pixel_size,
+                )
+            } else {
+                (decoded, image.pixel_size)
+            };
+            let fragment = PaneImage {
+                id: image.id,
+                protocol: image.protocol,
+                payload: crate::model::ImagePayload::default(),
+                position: image.position,
+                cell_size: crate::model::ImageCellSize {
+                    cols: visible.width,
+                    rows: visible.height,
+                },
+                pixel_size,
+            };
+            let mut encoded = Vec::new();
+            if caps.preferred_protocol() != Some(crate::model::ImageProtocol::KittyGraphics) {
+                emit_pixels(
+                    &mut encoded,
+                    &fragment,
+                    &prepared_pixels,
+                    0,
+                    0,
+                    caps,
+                    &mut KittyHostState::default(),
+                )?;
+                // Position is placement state, never part of cached content.
+                if encoded.starts_with(b"\x1b[1;1H") {
+                    encoded.drain(..6);
+                }
             }
-            fragment.cell_size.cols = visible.width;
-            fragment.cell_size.rows = visible.height;
-            // Each fragment has a distinct transmission; callers clear old
-            // placements before repair and commit the state after flush.
-            fragment.id = u64::from(state.next_fragment_id());
-            emit_from_pixels(out, &fragment, visible.x, visible.y, caps, state)?;
+            state
+                .cache
+                .insert(image, shared, crop, size, host, prepared_pixels, encoded)
+        };
+        if caps.preferred_protocol() == Some(crate::model::ImageProtocol::KittyGraphics) {
+            let fragment = PaneImage {
+                id: prepared.id,
+                payload: crate::model::ImagePayload::default(),
+                cell_size: crate::model::ImageCellSize {
+                    cols: visible.width,
+                    rows: visible.height,
+                },
+                protocol: image.protocol,
+                position: image.position,
+                pixel_size: image.pixel_size,
+            };
+            #[cfg(feature = "kitty")]
+            if visible == destination {
+                let png = image
+                    .payload
+                    .pixels
+                    .as_ref()
+                    .filter(|pixels| pixels.format == crate::model::PixelFormat::Png)
+                    .map(|pixels| pixels.data.as_slice())
+                    .or_else(|| {
+                        (image.protocol == crate::model::ImageProtocol::KittyGraphics)
+                            .then_some(image.payload.raw.as_deref())
+                            .flatten()
+                    });
+                if let Some(png) = png {
+                    write!(out, "\x1b[{};{}H", visible.y + 1, visible.x + 1)?;
+                    emit_kitty_data(
+                        out,
+                        &fragment,
+                        crate::model::KittyFormat::Png,
+                        png,
+                        prepared.pixels.width,
+                        prepared.pixels.height,
+                        visible.x,
+                        visible.y,
+                        state,
+                    )?;
+                    continue;
+                }
+            }
+            emit_pixels(
+                out,
+                &fragment,
+                &prepared.pixels,
+                visible.x,
+                visible.y,
+                caps,
+                state,
+            )?;
+        } else {
+            write!(out, "\x1b[{};{}H", visible.y + 1, visible.x + 1)?;
+            out.write_all(&prepared.encoded)?;
         }
     }
     Ok(())
@@ -207,34 +556,17 @@ fn emit_passthrough(
         }
         #[cfg(feature = "kitty")]
         crate::model::ImageProtocol::KittyGraphics => {
-            // Transmit-once-place-many with globally unique host IDs.
-            let (host_image_id, needs_transmit) = kitty_state.get_or_allocate(image.id);
-            let placement_id = host_image_id;
-
-            if needs_transmit {
-                for chunk in crate::codec::kitty::encode_transmit_chunks(
-                    host_image_id,
-                    crate::model::KittyFormat::Png,
-                    raw,
-                    image.pixel_size.width,
-                    image.pixel_size.height,
-                ) {
-                    out.write_all(b"\x1b_")?;
-                    out.write_all(&chunk)?;
-                    out.write_all(b"\x1b\\")?;
-                }
-            }
-
-            // Always re-place at the (potentially updated) position.
-            out.write_all(b"\x1b_")?;
-            out.write_all(&crate::codec::kitty::encode_place_with_z_and_cells(
-                host_image_id,
-                placement_id,
-                0,
-                image.cell_size.cols,
-                image.cell_size.rows,
-            ))?;
-            out.write_all(b"\x1b\\")?;
+            emit_kitty_data(
+                out,
+                image,
+                crate::model::KittyFormat::Png,
+                raw,
+                image.pixel_size.width,
+                image.pixel_size.height,
+                host_x,
+                host_y,
+                kitty_state,
+            )?;
         }
         #[cfg(feature = "iterm2")]
         crate::model::ImageProtocol::ITerm2 => {
@@ -264,6 +596,19 @@ fn emit_from_pixels(
         return emit_passthrough(out, image, host_x, host_y, host_caps, kitty_state);
     };
 
+    emit_pixels(out, image, pixels, host_x, host_y, host_caps, kitty_state)
+}
+
+#[allow(unused_variables)]
+fn emit_pixels(
+    out: &mut impl Write,
+    image: &PaneImage,
+    pixels: &crate::model::PixelBuffer,
+    host_x: u16,
+    host_y: u16,
+    host_caps: &HostImageCapabilities,
+    kitty_state: &mut KittyHostState,
+) -> std::io::Result<()> {
     write!(out, "\x1b[{};{}H", host_y + 1, host_x + 1)?;
 
     match host_caps.preferred_protocol() {
@@ -284,7 +629,14 @@ fn emit_from_pixels(
                         "sixel placement exceeds pixel budget",
                     ));
                 }
-                let decoded = clipping::pixels(&image.payload)?;
+                let decoded = if pixels.format == crate::model::PixelFormat::Png {
+                    clipping::pixels(&crate::model::ImagePayload {
+                        raw: None,
+                        pixels: Some(pixels.clone()),
+                    })?
+                } else {
+                    pixels.clone()
+                };
                 let rgba = match decoded.format {
                     crate::model::PixelFormat::Rgb8 => image::DynamicImage::ImageRgb8(
                         image::RgbImage::from_raw(decoded.width, decoded.height, decoded.data)
@@ -329,29 +681,17 @@ fn emit_from_pixels(
                     (crate::model::KittyFormat::Png, pixels.data.as_slice())
                 }
             };
-            let (host_id, needs_transmit) = kitty_state.get_or_allocate(image.id);
-            if needs_transmit {
-                for chunk in crate::codec::kitty::encode_transmit_chunks(
-                    host_id,
-                    kitty_format,
-                    data,
-                    pixels.width,
-                    pixels.height,
-                ) {
-                    out.write_all(b"\x1b_")?;
-                    out.write_all(&chunk)?;
-                    out.write_all(b"\x1b\\")?;
-                }
-            }
-            out.write_all(b"\x1b_")?;
-            out.write_all(&crate::codec::kitty::encode_place_with_z_and_cells(
-                host_id,
-                host_id,
-                0,
-                image.cell_size.cols,
-                image.cell_size.rows,
-            ))?;
-            out.write_all(b"\x1b\\")?;
+            emit_kitty_data(
+                out,
+                image,
+                kitty_format,
+                data,
+                pixels.width,
+                pixels.height,
+                host_x,
+                host_y,
+                kitty_state,
+            )?;
         }
         #[cfg(feature = "iterm2")]
         Some(crate::model::ImageProtocol::ITerm2) => {
@@ -368,6 +708,59 @@ fn emit_from_pixels(
     }
 
     Ok(())
+}
+
+#[cfg(feature = "kitty")]
+#[allow(clippy::too_many_arguments)] // Protocol metadata and caller-owned placement are separate inputs.
+fn emit_kitty_data(
+    out: &mut impl Write,
+    image: &PaneImage,
+    format: crate::model::KittyFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    x: u16,
+    y: u16,
+    state: &mut KittyHostState,
+) -> std::io::Result<()> {
+    let cost = data.len().max(
+        usize::try_from(
+            u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(4),
+        )
+        .unwrap_or(usize::MAX),
+    );
+    let frame_bytes = state
+        .frame_seen
+        .iter()
+        .filter(|id| **id != image.id)
+        .map(|id| state.content_bytes.get(id).copied().unwrap_or(0))
+        .sum::<usize>();
+    if cost > 64 * 1024 * 1024 || frame_bytes > 64 * 1024 * 1024 - cost {
+        return Err(std::io::Error::other(
+            "kitty visible content byte budget exceeded",
+        ));
+    }
+    state.reserve_content(out, image.id, cost)?;
+    let (host_id, transmit) = state.get_or_allocate(image.id)?;
+    if transmit {
+        for chunk in
+            crate::codec::kitty::encode_transmit_chunks(host_id, format, data, width, height)
+        {
+            out.write_all(b"\x1b_")?;
+            out.write_all(&chunk)?;
+            out.write_all(b"\x1b\\")?;
+        }
+    }
+    state.place(
+        out,
+        host_id,
+        x,
+        y,
+        image.cell_size.cols,
+        image.cell_size.rows,
+    )
 }
 
 #[cfg(feature = "iterm2")]

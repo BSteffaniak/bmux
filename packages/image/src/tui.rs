@@ -6,14 +6,14 @@ use std::io::Write;
 use bmux_tui::image::{ImageKey, ImagePayload as TuiImagePayload, ImagePixelFormat};
 use bmux_tui::image_scene::{ImageScene, ImageSceneDelta};
 
-use crate::compositor::{KittyHostState, PaneRect, render_pane_images};
-use crate::config::{ImageConfig, ImageDecodeMode};
+use crate::compositor::{KittyHostState, PaneRect, render_image_clipped};
+use crate::config::ImageConfig;
 use crate::host_caps::HostImageCapabilities;
 use crate::model::{
     ImageCellSize, ImagePayload, ImagePixelSize, ImagePosition, ImageProtocol, PaneImage,
     PixelBuffer, PixelFormat,
 };
-use crate::registry::ImageRegistry;
+use std::sync::Arc;
 
 /// Failure while adapting a TUI image scene into BMUX's image pipeline.
 #[derive(Debug)]
@@ -55,17 +55,17 @@ impl From<std::io::Error> for TuiImageError {
     }
 }
 
+type RetainedSource = (Arc<TuiImagePayload>, usize, Arc<PaneImage>);
+
 /// BMUX-owned adapter that assigns image IDs, validates payloads, clips
 /// placements, and delegates host protocol selection to the compositor.
 #[derive(Default, Clone)]
 pub struct TuiImageCompositor {
     next_id: u64,
-    ids: BTreeMap<ImageKey, u64>,
-    payloads: BTreeMap<ImageKey, TuiImagePayload>,
-    visible_ids: std::collections::BTreeSet<u64>,
-    registry: ImageRegistry,
-    pending_removals: Vec<u64>,
+    sources: BTreeMap<ImageKey, RetainedSource>,
     kitty_state: KittyHostState,
+    reset_pending: bool,
+    validations: usize,
 }
 
 impl TuiImageCompositor {
@@ -78,10 +78,7 @@ impl TuiImageCompositor {
     /// Apply lifecycle removals produced by the TUI frame reconciler.
     pub fn apply_delta(&mut self, delta: &ImageSceneDelta) {
         for key in &delta.removed {
-            if let Some(id) = self.ids.remove(key) {
-                self.pending_removals.push(id);
-            }
-            self.payloads.remove(key);
+            self.sources.remove(key);
         }
     }
 
@@ -102,78 +99,152 @@ impl TuiImageCompositor {
         host_caps: &HostImageCapabilities,
         config: &ImageConfig,
     ) -> Result<(), TuiImageError> {
+        let mut candidate = self.clone();
+        match candidate.render_candidate(out, scene, terminal, host_caps, config) {
+            Ok(()) => {
+                *self = candidate;
+                Ok(())
+            }
+            Err(error) => {
+                self.invalidate_after_failed_output(&candidate);
+                Err(error)
+            }
+        }
+    }
+
+    /// Mark all potentially emitted host IDs for repair after write or flush failure.
+    /// Call on committed state with the failed candidate; do not commit the candidate.
+    pub fn invalidate_after_failed_output(&mut self, candidate: &Self) {
+        self.kitty_state
+            .invalidate_after_failed_output(&candidate.kitty_state);
+    }
+
+    fn render_candidate(
+        &mut self,
+        out: &mut impl Write,
+        scene: &ImageScene,
+        terminal: PaneRect,
+        host_caps: &HostImageCapabilities,
+        config: &ImageConfig,
+    ) -> Result<(), TuiImageError> {
+        self.kitty_state.begin_frame();
+        if self.reset_pending {
+            self.kitty_state.reset(out)?;
+            self.reset_pending = false;
+        }
+        self.kitty_state.select_protocol(
+            out,
+            if config.enabled {
+                host_caps.preferred_protocol()
+            } else {
+                None
+            },
+        )?;
         if !config.enabled || !host_caps.any_supported() {
+            self.kitty_state.finish_frame(out)?;
             return Ok(());
         }
 
-        self.emit_pending_removals(out, host_caps)?;
-        let mut images = Vec::with_capacity(scene.placements().len());
-        let mut visible_ids = std::collections::BTreeSet::new();
+        self.kitty_state
+            .select_protocol(out, host_caps.preferred_protocol())?;
+        let terminal_clip =
+            bmux_tui::geometry::Rect::new(terminal.x, terminal.y, terminal.w, terminal.h);
         for placement in scene.placements() {
-            let Some(visible) = clipped_destination(
-                placement.destination,
-                placement.clip,
-                bmux_tui::geometry::Rect::new(terminal.x, terminal.y, terminal.w, terminal.h),
-            ) else {
+            let Some(_) = clipped_destination(placement.destination, placement.clip, terminal_clip)
+            else {
                 continue;
             };
-            let id = if self.payloads.get(&placement.key) == Some(&placement.payload) {
-                *self.ids.entry(placement.key.clone()).or_insert_with(|| {
-                    self.next_id = self.next_id.saturating_add(1);
-                    self.next_id
-                })
-            } else {
-                if let Some(previous_id) = self.ids.get(&placement.key).copied() {
-                    self.pending_removals.push(previous_id);
-                }
-                self.next_id = self.next_id.saturating_add(1);
-                self.ids.insert(placement.key.clone(), self.next_id);
-                self.payloads
-                    .insert(placement.key.clone(), placement.payload.clone());
-                self.next_id
-            };
-            let mut payload = decode_payload(&placement.key, &placement.payload, config)?;
-            let visible_pixel_size = crop_to_visible(&mut payload, placement.destination, visible);
-            let position = ImagePosition {
-                row: visible.y.saturating_sub(terminal.y),
-                col: visible.x.saturating_sub(terminal.x),
-            };
-            visible_ids.insert(id);
-            images.push(PaneImage {
-                id,
-                protocol: ImageProtocol::KittyGraphics,
-                payload,
-                position,
-                cell_size: ImageCellSize {
-                    rows: visible.height,
-                    cols: visible.width,
-                },
-                pixel_size: visible_pixel_size,
-            });
+            let unchanged = self
+                .sources
+                .get(&placement.key)
+                .is_some_and(|(payload, limit, _)| {
+                    **payload == placement.payload && *limit == config.max_image_bytes
+                });
+            if !unchanged {
+                let payload = decode_payload(&placement.key, &placement.payload, config)?;
+                self.validations += 1;
+                self.next_id = self
+                    .next_id
+                    .checked_add(1)
+                    .expect("TUI image ID space exhausted");
+                let pixels = payload.pixels.as_ref().expect("validated pixels");
+                let image = Arc::new(PaneImage {
+                    id: self.next_id,
+                    protocol: ImageProtocol::KittyGraphics,
+                    position: ImagePosition { row: 0, col: 0 },
+                    cell_size: ImageCellSize::default(),
+                    pixel_size: ImagePixelSize {
+                        width: pixels.width,
+                        height: pixels.height,
+                    },
+                    payload,
+                });
+                self.sources.insert(
+                    placement.key.clone(),
+                    (
+                        Arc::new(placement.payload.clone()),
+                        config.max_image_bytes,
+                        image,
+                    ),
+                );
+            }
+            let image = &self.sources.get(&placement.key).expect("retained source").2;
+            render_image_clipped(
+                out,
+                image,
+                placement.destination,
+                placement.clip.intersection(terminal_clip),
+                &[],
+                host_caps,
+                &mut self.kitty_state,
+                Some(image),
+            )?;
+            self.trim_sources();
         }
-
-        self.emit_pending_removals(out, host_caps)?;
-        self.emit_hidden_removals(out, host_caps, &visible_ids)?;
-        self.visible_ids = visible_ids;
-        self.registry.replace_images(images);
-        render_pane_images(
-            out,
-            self.registry.images(),
-            terminal,
-            host_caps,
-            ImageDecodeMode::Server,
-            &mut self.kitty_state,
-        )?;
+        self.kitty_state.finish_frame(out)?;
+        self.sources.retain(|key, _| scene.get(key).is_some());
+        self.trim_sources();
         Ok(())
+    }
+
+    fn trim_sources(&mut self) {
+        // Source retention is derived and bounded; oversized scenes remain correct
+        // but are revalidated on their next frame rather than retained unboundedly.
+        while self.sources.len() > 128
+            || self
+                .sources
+                .values()
+                .map(|(source, _, image)| {
+                    let source_bytes = match &**source {
+                        TuiImagePayload::Pixels { bytes, .. }
+                        | TuiImagePayload::Png { bytes, .. } => bytes.len(),
+                    };
+                    source_bytes
+                        + image.payload.raw.as_ref().map_or(0, Vec::len)
+                        + image
+                            .payload
+                            .pixels
+                            .as_ref()
+                            .map_or(0, |pixels| pixels.data.len())
+                })
+                .sum::<usize>()
+                > 64 * 1024 * 1024
+        {
+            self.sources.pop_first();
+        }
+    }
+
+    /// Deterministic adapter validations, source decodes and fragment preparations.
+    #[must_use]
+    pub fn work_counts(&self) -> (usize, usize, usize) {
+        let (decodes, preparations) = self.kitty_state.work_counts();
+        (self.validations, decodes, preparations)
     }
 
     /// Queue every active image for protocol-specific removal.
     pub fn clear(&mut self) {
-        self.pending_removals.extend(self.ids.values().copied());
-        self.ids.clear();
-        self.payloads.clear();
-        self.visible_ids.clear();
-        self.registry.clear();
+        self.reset_pending = true;
+        self.sources.clear();
     }
 
     /// Emit queued removals and clear all compositor-owned host resources.
@@ -186,51 +257,20 @@ impl TuiImageCompositor {
         out: &mut impl Write,
         host_caps: &HostImageCapabilities,
     ) -> std::io::Result<()> {
-        self.clear();
-        self.emit_pending_removals(out, host_caps)
-    }
-
-    fn emit_hidden_removals(
-        &mut self,
-        out: &mut impl Write,
-        host_caps: &HostImageCapabilities,
-        visible_ids: &std::collections::BTreeSet<u64>,
-    ) -> std::io::Result<()> {
-        #[cfg(not(feature = "kitty"))]
-        let _ = (&mut *out, host_caps, visible_ids);
-        #[cfg(feature = "kitty")]
-        if host_caps.preferred_protocol() == Some(ImageProtocol::KittyGraphics) {
-            for id in self.visible_ids.difference(visible_ids) {
-                if let Some(host_id) = self.kitty_state.transmitted.remove(id) {
-                    out.write_all(b"\x1b_")?;
-                    out.write_all(&crate::codec::kitty::encode_delete_image(host_id))?;
-                    out.write_all(b"\x1b\\")?;
-                }
+        let _ = host_caps;
+        let mut candidate = self.clone();
+        candidate.clear();
+        match candidate.kitty_state.reset(out) {
+            Ok(()) => {
+                candidate.reset_pending = false;
+                *self = candidate;
+                Ok(())
+            }
+            Err(error) => {
+                self.invalidate_after_failed_output(&candidate);
+                Err(error)
             }
         }
-        Ok(())
-    }
-
-    fn emit_pending_removals(
-        &mut self,
-        out: &mut impl Write,
-        host_caps: &HostImageCapabilities,
-    ) -> std::io::Result<()> {
-        #[cfg(not(feature = "kitty"))]
-        let _ = (&mut *out, host_caps);
-        #[cfg(feature = "kitty")]
-        if host_caps.preferred_protocol() == Some(ImageProtocol::KittyGraphics) {
-            for id in self.pending_removals.drain(..) {
-                if let Some(host_id) = self.kitty_state.transmitted.remove(&id) {
-                    out.write_all(b"\x1b_")?;
-                    out.write_all(&crate::codec::kitty::encode_delete_image(host_id))?;
-                    out.write_all(b"\x1b\\")?;
-                }
-            }
-            return Ok(());
-        }
-        self.pending_removals.clear();
-        Ok(())
     }
 }
 
@@ -285,6 +325,7 @@ pub(crate) fn crop_to_visible(
             height: pixels.height,
         };
     }
+    payload.raw = None;
     let bytes_per_pixel = match pixels.format {
         PixelFormat::Rgb8 => 3,
         PixelFormat::Rgba8 => 4,
@@ -394,7 +435,7 @@ fn decode_payload(
             if rgba.len() > config.max_image_bytes {
                 return Err(invalid(key, "decoded pixels exceed configured byte limit"));
             }
-            (rgba, *width, *height, PixelFormat::Rgba8)
+            (bytes.clone(), *width, *height, PixelFormat::Png)
         }
     };
 
@@ -450,6 +491,8 @@ mod tests {
         ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
     };
     use bmux_tui::image_scene::ImageScene;
+    #[cfg(feature = "sixel")]
+    use std::sync::Arc;
 
     use crate::compositor::PaneRect;
     use crate::config::ImageConfig;
@@ -754,7 +797,96 @@ mod tests {
                 &ImageConfig::default(),
             )
             .unwrap();
-        assert!(String::from_utf8(readded).unwrap().contains("a=t"));
+        assert!(!String::from_utf8(readded).unwrap().contains("a=t"));
+    }
+
+    #[cfg(feature = "sixel")]
+    #[test]
+    fn warm_tui_scene_and_clip_changes_do_not_repeat_source_work() {
+        let mut scene = ImageScene::default();
+        let mut placed = placement("diagram", Rect::new(0, 0, 4, 2), Rect::new(0, 0, 3, 2), 1);
+        scene.reconcile(&[ImageContribution::Present(placed.clone())]);
+        let caps = HostImageCapabilities {
+            sixel: true,
+            cell_pixel_width: 2,
+            cell_pixel_height: 2,
+            ..HostImageCapabilities::default()
+        };
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 5,
+        };
+        let config = ImageConfig::default();
+        let mut compositor = TuiImageCompositor::new();
+        compositor
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        assert_eq!(compositor.work_counts(), (1, 1, 1));
+        let source = Arc::clone(&compositor.sources.get(&placed.key).unwrap().2);
+        let mut candidate = compositor.clone();
+        candidate
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        assert_eq!(candidate.work_counts(), (1, 1, 1));
+        assert!(Arc::ptr_eq(
+            &source,
+            &candidate.sources.get(&placed.key).unwrap().2
+        ));
+        placed.clip.width = 2;
+        scene.reconcile(&[ImageContribution::Present(placed.clone())]);
+        candidate
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        assert_eq!(candidate.work_counts(), (1, 1, 2));
+        placed.clip.width = 3;
+        scene.reconcile(&[ImageContribution::Present(placed)]);
+        candidate
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        assert_eq!(candidate.work_counts(), (1, 1, 2));
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn explicit_clear_releases_retained_content_before_same_payload_retransmission() {
+        let mut scene = ImageScene::default();
+        scene.reconcile(&[ImageContribution::Present(placement(
+            "diagram",
+            Rect::new(0, 0, 4, 2),
+            Rect::new(0, 0, 10, 5),
+            1,
+        ))]);
+        let mut compositor = TuiImageCompositor::new();
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 5,
+        };
+        compositor
+            .render(
+                &mut Vec::new(),
+                &scene,
+                terminal,
+                &kitty_caps(),
+                &ImageConfig::default(),
+            )
+            .unwrap();
+        compositor.clear();
+        let mut output = Vec::new();
+        compositor
+            .render(
+                &mut output,
+                &scene,
+                terminal,
+                &kitty_caps(),
+                &ImageConfig::default(),
+            )
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.find("a=d,d=I").unwrap() < output.find("a=t").unwrap());
     }
 
     #[cfg(feature = "kitty")]
@@ -791,7 +923,7 @@ mod tests {
 
     #[cfg(feature = "kitty")]
     #[test]
-    fn hidden_and_revealed_image_deletes_then_retransmits() {
+    fn hidden_and_revealed_image_reuses_retained_content() {
         let mut scene = ImageScene::default();
         scene.reconcile(&[ImageContribution::Present(placement(
             "diagram",
@@ -850,7 +982,7 @@ mod tests {
                 &ImageConfig::default(),
             )
             .unwrap();
-        assert!(String::from_utf8(revealed).unwrap().contains("a=t"));
+        assert!(!String::from_utf8(revealed).unwrap().contains("a=t"));
     }
 
     #[test]

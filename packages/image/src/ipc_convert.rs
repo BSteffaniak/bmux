@@ -29,9 +29,9 @@ pub fn pane_image_to_ipc(
     img: &PaneImage,
     codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
 ) -> AttachPaneImage {
-    let raw = img.payload.raw.clone().unwrap_or_default();
+    let raw = img.payload.raw.as_deref().unwrap_or_default();
     let (compressed_data, compression_id) =
-        compress_image_payload(&raw, protocol_to_ipc(img.protocol), codec);
+        compress_image_payload(raw, protocol_to_ipc(img.protocol), codec);
     AttachPaneImage {
         id: img.id,
         protocol: protocol_to_ipc(img.protocol),
