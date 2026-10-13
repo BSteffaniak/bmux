@@ -1,0 +1,24 @@
+body {
+  margin: 0;
+  background: #101010;
+  color: #e5e5e5;
+  font: 14px/20px monospace;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+#status {
+  padding: 8px;
+  flex: none;
+}
+
+#viewport {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+canvas {
+  display: block;
+}

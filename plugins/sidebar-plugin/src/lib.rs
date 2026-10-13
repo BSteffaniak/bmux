@@ -934,6 +934,11 @@ fn paint_sidebar_field(
     placement: &(u64, std::ops::Range<u64>),
     style: RenderStyle,
     ops: &mut Vec<RenderOp>,
+    metadata: (
+        &mut bmux_plugin::surface::PluginSurfaceMetadata,
+        String,
+        u64,
+    ),
 ) {
     use bmux_tui::buffer::Buffer;
     use bmux_tui::component::Component;
@@ -955,12 +960,60 @@ fn paint_sidebar_field(
     let height = u16::try_from(visible_end - visible_start).unwrap_or(u16::MAX);
     let offset = i64::try_from(visible_start - start).unwrap_or(i64::MAX);
     let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
-    PaintCx::new(&mut Frame::new(&mut buffer)).with_child(
+    let mut frame = Frame::new(&mut buffer);
+    PaintCx::new(&mut frame).with_child(
         0,
         -offset,
         bmux_tui::paint::LocalRect::new(0, offset, width, height),
-        |cx| field.paint(&child.node, cx),
+        |cx| {
+            field.paint(&child.node, cx);
+            field.register_selection(
+                &child.node,
+                cx,
+                metadata.1.clone(),
+                metadata.1.clone(),
+                0,
+                metadata.2,
+            );
+        },
     );
+    let origin_x = 2_u16.saturating_add(u16::try_from(child.x).unwrap_or(u16::MAX));
+    let origin_y =
+        u16::try_from(visible_start.saturating_sub(placement.1.start) + 1).unwrap_or(u16::MAX);
+    let area = Rect::new(origin_x, origin_y, width, height);
+    let selection = metadata
+        .0
+        .selection
+        .as_mut()
+        .expect("producer selection scene");
+    selection.push_scope(
+        bmux_tui::selection::SelectionScope::new(metadata.1.clone(), area).revision(metadata.2),
+    );
+    for fragment in frame.selection().fragments() {
+        let mut fragment = fragment.clone();
+        fragment.area.x = fragment.area.x.saturating_add(origin_x);
+        fragment.area.y = fragment.area.y.saturating_add(origin_y);
+        selection.push_fragment(fragment);
+    }
+    metadata.0.text.insert(
+        metadata.1.clone().into(),
+        field
+            .text()
+            .lines
+            .iter()
+            .map(bmux_tui::text::Line::plain_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    metadata
+        .0
+        .semantics
+        .as_mut()
+        .expect("producer semantic scene")
+        .push(bmux_tui::semantic::SemanticRegion::new(
+            metadata.1, area, "label",
+        ));
+    drop(frame);
     for (offset, cells) in buffer.cells().chunks(usize::from(width)).enumerate() {
         let text = cells
             .iter()
@@ -1009,6 +1062,8 @@ fn sidebar_region(id: Uuid, width: u16, row: u16, height: u16) -> PluginSurfaceR
     .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer)
 }
 
+// Paint and logical descriptions share the same measured scroll projection.
+#[allow(clippy::too_many_lines)]
 fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     let width = state.allocated_width();
     let background = RenderStyle::new()
@@ -1032,6 +1087,11 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         ),
         RenderOp::text_run(2, 0, format!(" {} ", state.settings.heading), active),
     ];
+    let mut metadata = bmux_plugin::surface::PluginSurfaceMetadata {
+        selection: Some(bmux_tui::selection::SelectionScene::new()),
+        semantics: Some(bmux_tui::semantic::SemanticScene::new()),
+        text: std::collections::BTreeMap::new(),
+    };
     let mut regions = Vec::with_capacity(state.snapshot.tabs.len());
     let layout = state.scroll_layout();
     let visible = state.scroll.vertical_offset()
@@ -1068,7 +1128,18 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
                 "status" if tab.active => active,
                 _ => inactive.dim(),
             };
-            paint_sidebar_field(field, child, &(item.y, visible.clone()), style, &mut ops);
+            paint_sidebar_field(
+                field,
+                child,
+                &(item.y, visible.clone()),
+                style,
+                &mut ops,
+                (
+                    &mut metadata,
+                    format!("{}:{}", tab.id, child.node.id.as_str()),
+                    revision,
+                ),
+            );
         }
         row = u16::try_from(projected.end + 1).unwrap_or(u16::MAX);
         regions.push(sidebar_region(
@@ -1090,6 +1161,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         ops,
     )
     .opaque(true);
+    surface.metadata = Some(metadata);
     for region in regions {
         surface = surface.interactive_region(region);
     }
@@ -1293,12 +1365,18 @@ mod tests {
         let layout = field.layout(Constraints::for_width(4), &mut LayoutCx::new());
         let child = ChildLayout::new(0, 0, layout);
         let mut ops = Vec::new();
+        let mut metadata = bmux_plugin::surface::PluginSurfaceMetadata {
+            selection: Some(bmux_tui::selection::SelectionScene::new()),
+            semantics: Some(bmux_tui::semantic::SemanticScene::new()),
+            text: std::collections::BTreeMap::new(),
+        };
         super::paint_sidebar_field(
             &field,
             &child,
             &(0, 70_000..70_001),
             super::RenderStyle::new(),
             &mut ops,
+            (&mut metadata, "deep-field".to_owned(), 1),
         );
         assert_eq!(ops.len(), 1);
         assert!(matches!(&ops[0], super::RenderOp::TextRun { text, .. } if text == "deep"));
@@ -2066,6 +2144,14 @@ mod tests {
             revision: 1,
         });
         let surface = build_surface(&state, 1);
+        let metadata = surface
+            .metadata
+            .as_ref()
+            .expect("real sidebar producer metadata");
+        assert!(metadata.selection.as_ref().unwrap().validate().is_ok());
+        assert!(!metadata.selection.as_ref().unwrap().fragments().is_empty());
+        assert!(metadata.text.values().any(|text| text.contains("one")));
+        assert!(!metadata.semantics.as_ref().unwrap().regions().is_empty());
         assert!(matches!(
             surface.ops[0],
             RenderOp::FillRect {

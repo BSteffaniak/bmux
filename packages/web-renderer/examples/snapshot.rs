@@ -8,6 +8,7 @@ use bmux_tui::{
     },
     paint::LocalRect,
     presentation::PresentationState,
+    selection::{SelectionContentId, SelectionScope, plain_text_fragments},
     semantic::SemanticRegion,
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -16,6 +17,11 @@ use bmux_web_renderer::{BrowserFrame, encode_json};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = PresentationState::new(Rect::new(0, 0, 80, 24));
+    let title = "bmux_tui → browser · 界 · e\u{301} · 🦀";
+    let text = std::collections::BTreeMap::from([(
+        SelectionContentId::new("example:title"),
+        title.to_owned(),
+    )]);
     let json = state.present(
         Damage::Full,
         |cx| {
@@ -27,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cx.write_line(
                 LocalRect::new(2, 1, 70, 1),
                 &Line::from_spans(vec![Span::styled(
-                    "bmux_tui → browser · 界 · e\u{301} · 🦀",
+                    title,
                     Style::new()
                         .fg(Color::BrightCyan)
                         .add_modifier(Modifier::BOLD),
@@ -43,6 +49,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Rect::new(2, 1, 40, 1),
                 "heading",
             ));
+            cx.push_selection_scope(SelectionScope::new("example:scope", Rect::new(2, 1, 40, 1)));
+            for fragment in plain_text_fragments(
+                "example:scope",
+                "example:title",
+                Rect::new(2, 1, 40, 1),
+                0,
+                title,
+                0,
+                1,
+            ) {
+                cx.push_selection_fragment(fragment);
+            }
             cx.set_cursor(Point::new(2, 5), true);
             cx.push_image(ImageContribution::Present(ImagePlacement {
                 key: ImageKey::new("example:rgba"),
@@ -60,11 +78,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }));
         },
         |prepared, _previous| {
-            encode_json(&BrowserFrame::from_prepared_in_generation(
-                "standalone-example",
-                1,
-                prepared,
-            )?)
+            encode_json(
+                &BrowserFrame::from_prepared_in_generation("standalone-example", 1, prepared)?
+                    .with_selection_text(&text)?,
+            )
         },
     )?;
     if let Some(json) = json {

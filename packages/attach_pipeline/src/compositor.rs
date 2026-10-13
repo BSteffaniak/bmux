@@ -62,6 +62,7 @@ pub struct RetainedSurface {
     pub id: Uuid,
     /// Owner identity captured atomically with this retained payload.
     pub owner: Option<bmux_plugin::surface::PluginSurfaceId>,
+    pub metadata: Option<bmux_plugin::surface::PluginSurfaceMetadata>,
     pub rect: DamageRect,
     pub layer: i16,
     pub z: i32,
@@ -111,6 +112,7 @@ impl RetainedSurface {
         Self {
             id,
             owner: None,
+            metadata: None,
             rect,
             layer,
             z,
@@ -235,6 +237,7 @@ pub fn retained_surfaces_from_plugin_surfaces(
             };
             let mut retained = builder.build();
             retained.owner = Some(surface.id.clone());
+            retained.metadata.clone_from(&surface.metadata);
             Some(retained)
         })
         .collect()
@@ -1750,6 +1753,7 @@ mod tests {
                 revision: 1,
                 target: PluginSurfaceTarget::Layout(layout_id),
                 clip_rect: None,
+                metadata: None,
                 interactive_regions: Vec::new(),
                 accepts_input: false,
                 layer: 3,
@@ -1764,6 +1768,7 @@ mod tests {
                 revision: 1,
                 target: PluginSurfaceTarget::Explicit(ExtensionRect::new(30, 5, 10, 2)),
                 clip_rect: None,
+                metadata: None,
                 interactive_regions: Vec::new(),
                 accepts_input: false,
                 layer: 5,
@@ -1904,6 +1909,7 @@ mod tests {
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4)),
             clip_rect: None,
+            metadata: None,
             interactive_regions: vec![PluginSurfaceRegion {
                 local_id: "link".to_owned(),
                 rect: ExtensionRect::new(0, 0, 8, 4),
@@ -1968,6 +1974,7 @@ mod tests {
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4)),
             clip_rect: None,
+            metadata: None,
             interactive_regions: vec![PluginSurfaceRegion {
                 local_id: "field".to_owned(),
                 rect: ExtensionRect::new(0, 0, 8, 4),
@@ -2056,6 +2063,7 @@ mod tests {
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4)),
             clip_rect: None,
+            metadata: None,
             interactive_regions: vec![PluginSurfaceRegion {
                 local_id: "field".to_owned(),
                 rect: ExtensionRect::new(0, 0, 8, 4),
@@ -2700,6 +2708,7 @@ mod tests {
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(10, 4, 8, 4)),
             clip_rect: Some(ExtensionRect::new(2, 1, 4, 2)),
+            metadata: None,
             interactive_regions: vec![
                 bmux_plugin::surface::PluginSurfaceRegion {
                     local_id: "whole".to_owned(),
@@ -2769,6 +2778,7 @@ mod tests {
                 revision: 1,
                 target: PluginSurfaceTarget::Explicit(ExtensionRect::new(1, 1, 4, 1)),
                 clip_rect: None,
+                metadata: None,
                 interactive_regions: Vec::new(),
                 accepts_input: false,
                 layer: 0,
@@ -2785,6 +2795,7 @@ mod tests {
                     owner, "missing",
                 )),
                 clip_rect: None,
+                metadata: None,
                 interactive_regions: Vec::new(),
                 accepts_input: false,
                 layer: 0,
@@ -2799,6 +2810,7 @@ mod tests {
                 revision: 1,
                 target: PluginSurfaceTarget::Explicit(ExtensionRect::new(1, 1, 0, 1)),
                 clip_rect: None,
+                metadata: None,
                 interactive_regions: Vec::new(),
                 accepts_input: false,
                 layer: 0,
@@ -2980,6 +2992,7 @@ mod tests {
             revision: 7,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(5, 3, 10, 8)),
             clip_rect: Some(ExtensionRect::new(1, 1, 8, 6)),
+            metadata: None,
             interactive_regions: Vec::new(),
             accepts_input: false,
             layer: 0,

@@ -33,6 +33,7 @@ pub fn publish_notification(
                 revision,
                 target: PluginSurfaceTarget::Explicit(rect),
                 clip_rect: Some(ExtensionRect::new(0, 0, remaining.w, 1)),
+                metadata: None,
                 interactive_regions: Vec::new(),
                 accepts_input: false,
                 layer: 40,

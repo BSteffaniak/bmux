@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use bmux_tui::{
     buffer::Buffer,
     damage::Damage,
@@ -8,14 +10,23 @@ use bmux_tui::{
     image::{ImagePayload, ImagePixelFormat},
     image_scene::ImageScene,
     presentation::PreparedPresentation,
-    selection::SelectionScene,
+    selection::{SelectionContentId, SelectionScene},
     semantic::SemanticScene,
 };
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
 
 /// Full-snapshot wire version. Unknown versions are never guessed.
-pub const WIRE_VERSION: u32 = 1;
+pub const WIRE_VERSION: u32 = 2;
+
+/// Producer metadata that is not supplied by this output projection.
+/// An empty scene alone never establishes availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataKind {
+    Selection,
+    Semantics,
+}
 
 /// Hard bounds checked before a backend sees output.
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +73,11 @@ pub struct SurfaceProvenance {
     pub z: i32,
     /// Opaque UUID text copied from the native content identity, if present.
     pub content_id: Option<String>,
+    /// Producer supplies logical selection metadata for this surface.
+    /// False remains explicit even when another surface supplies selection.
+    pub selection_available: bool,
+    /// Producer supplies semantic metadata for this surface.
+    pub semantics_available: bool,
 }
 
 /// A directional snapshot of shared TUI output, not a second compositor.
@@ -72,6 +88,8 @@ pub struct BrowserFrame {
     version: u32,
     revision: u64,
     generation: String,
+    // Required in v2: v1 cannot establish producer metadata availability.
+    unsupported_metadata: Vec<MetadataKind>,
     #[serde(default)]
     surfaces: Vec<SurfaceProvenance>,
     buffer: Buffer,
@@ -80,6 +98,9 @@ pub struct BrowserFrame {
     focus_scope: Option<FocusScopeId>,
     focus: FocusTrap,
     selection: SelectionScene,
+    selection_text_available: bool,
+    #[serde(deserialize_with = "selection_text_map")]
+    selection_text: BTreeMap<SelectionContentId, String>,
     semantics: SemanticScene,
     image_scene: ImageScene,
     damage: Damage,
@@ -100,6 +121,7 @@ impl BrowserFrame {
             version: WIRE_VERSION,
             revision,
             generation: generation.to_owned(),
+            unsupported_metadata: Vec::new(),
             surfaces: Vec::new(),
             buffer: prepared.buffer().clone(),
             cursor: prepared.cursor(),
@@ -107,6 +129,8 @@ impl BrowserFrame {
             focus_scope: prepared.focus_scope().cloned(),
             focus: prepared.focus().clone(),
             selection: prepared.selection().clone(),
+            selection_text_available: prepared.selection().fragments().is_empty(),
+            selection_text: BTreeMap::new(),
             semantics: prepared.semantics().clone(),
             image_scene: prepared.image_scene().clone(),
             damage: prepared.damage().clone(),
@@ -118,6 +142,58 @@ impl BrowserFrame {
         self.surfaces = surfaces;
         self.validate(Limits::default())?;
         Ok(self)
+    }
+    pub fn with_unsupported_metadata(
+        mut self,
+        kinds: &[MetadataKind],
+    ) -> Result<Self, DecodeError> {
+        if kinds.len() > 2 {
+            return Err(DecodeError::Limit("metadata availability"));
+        }
+        self.unsupported_metadata = kinds.to_vec();
+        self.validate(Limits::default())?;
+        Ok(self)
+    }
+    pub fn unsupported_metadata(&self) -> &[MetadataKind] {
+        &self.unsupported_metadata
+    }
+    /// Categories supplied by some producers but not every retained surface.
+    /// No surfaces is the standalone prepared-presentation contract.
+    pub fn with_selection_text(
+        mut self,
+        text: &BTreeMap<SelectionContentId, String>,
+    ) -> Result<Self, DecodeError> {
+        validate_text_bounds(text)?;
+        self.selection_text = text.clone();
+        self.selection_text_available = true;
+        self.validate(Limits::default())?;
+        Ok(self)
+    }
+    pub const fn selection_text_available(&self) -> bool {
+        self.selection_text_available
+    }
+    pub const fn selection_text(&self) -> &BTreeMap<SelectionContentId, String> {
+        &self.selection_text
+    }
+    pub fn partial_metadata(&self) -> Vec<MetadataKind> {
+        let mut partial = Vec::new();
+        if !self.unsupported_metadata.contains(&MetadataKind::Selection)
+            && self
+                .surfaces
+                .iter()
+                .any(|surface| !surface.selection_available)
+        {
+            partial.push(MetadataKind::Selection);
+        }
+        if !self.unsupported_metadata.contains(&MetadataKind::Semantics)
+            && self
+                .surfaces
+                .iter()
+                .any(|surface| !surface.semantics_available)
+        {
+            partial.push(MetadataKind::Semantics);
+        }
+        partial
     }
     pub fn surfaces(&self) -> &[SurfaceProvenance] {
         &self.surfaces
@@ -166,6 +242,32 @@ impl BrowserFrame {
         {
             return Err(DecodeError::Invalid("generation"));
         }
+        if self.unsupported_metadata.len() > 2 {
+            return Err(DecodeError::Limit("metadata availability"));
+        }
+        if self.unsupported_metadata.len() == 2
+            && self.unsupported_metadata[0] == self.unsupported_metadata[1]
+        {
+            return Err(DecodeError::Invalid("duplicate metadata availability"));
+        }
+        if (self.unsupported_metadata.contains(&MetadataKind::Selection)
+            && (!self.selection.scopes().is_empty() || !self.selection.fragments().is_empty()))
+            || (self.unsupported_metadata.contains(&MetadataKind::Semantics)
+                && !self.semantics.regions().is_empty())
+        {
+            return Err(DecodeError::Invalid("unavailable metadata has content"));
+        }
+        validate_text_bounds(&self.selection_text)?;
+        if !self.selection_text_available && !self.selection_text.is_empty() {
+            return Err(DecodeError::Invalid(
+                "unavailable selection text has content",
+            ));
+        }
+        if self.unsupported_metadata.contains(&MetadataKind::Selection)
+            && !self.selection_text.is_empty()
+        {
+            return Err(DecodeError::Invalid("unsupported selection has text"));
+        }
         if self.revision == 0 {
             return Err(DecodeError::Invalid("zero revision"));
         }
@@ -177,6 +279,15 @@ impl BrowserFrame {
         }
         let mut ids = std::collections::BTreeSet::new();
         for surface in &self.surfaces {
+            if (surface.selection_available
+                && self.unsupported_metadata.contains(&MetadataKind::Selection))
+                || (surface.semantics_available
+                    && self.unsupported_metadata.contains(&MetadataKind::Semantics))
+            {
+                return Err(DecodeError::Invalid(
+                    "surface availability contradicts global unsupported metadata",
+                ));
+            }
             bounded_identity(&surface.retained_id, 128)?;
             if !ids.insert(surface.retained_id.as_str()) {
                 return Err(DecodeError::Invalid("duplicate retained surface identity"));
@@ -262,10 +373,35 @@ impl BrowserFrame {
             within(region.area, area)?;
         }
         for scope in self.selection.scopes() {
+            bounded_identity(scope.id.as_str(), 1024)?;
+            if let Some(parent) = &scope.parent {
+                bounded_identity(parent.as_str(), 1024)?;
+            }
             within(scope.area, area)?;
             within(scope.initiation_area, area)?;
         }
         for fragment in self.selection.fragments() {
+            bounded_identity(fragment.content_id.as_str(), 1024)?;
+            bounded_identity(fragment.scope_id.as_str(), 1024)?;
+            bounded_identity(fragment.id.as_str(), 1024)?;
+            if self.selection_text_available {
+                let text = self
+                    .selection_text
+                    .get(&fragment.content_id)
+                    .ok_or(DecodeError::Invalid("missing selection source text"))?;
+                for range in std::iter::once(&fragment.source_range)
+                    .chain(fragment.word_range.iter())
+                    .chain(fragment.line_range.iter())
+                {
+                    if range.start > range.end
+                        || range.end > text.len()
+                        || !text.is_char_boundary(range.start)
+                        || !text.is_char_boundary(range.end)
+                    {
+                        return Err(DecodeError::Invalid("selection source range"));
+                    }
+                }
+            }
             within(fragment.area, area)?;
         }
         self.selection
@@ -390,6 +526,62 @@ fn valid_rect(area: Rect) -> Result<(), DecodeError> {
     }
     Ok(())
 }
+fn validate_text_bounds(text: &BTreeMap<SelectionContentId, String>) -> Result<(), DecodeError> {
+    if text.len() > 4096 {
+        return Err(DecodeError::Limit("selection text entries"));
+    }
+    let mut total = 0_usize;
+    for (id, value) in text {
+        bounded_identity(id.as_str(), 1024)?;
+        if value.len() > 64 * 1024 {
+            return Err(DecodeError::Limit("selection text value"));
+        }
+        total = total
+            .checked_add(value.len())
+            .ok_or(DecodeError::Limit("selection text bytes"))?;
+        if total > 1024 * 1024 {
+            return Err(DecodeError::Limit("selection text bytes"));
+        }
+    }
+    Ok(())
+}
+
+fn selection_text_map<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<SelectionContentId, String>, D::Error> {
+    struct TextVisitor;
+    impl<'de> serde::de::Visitor<'de> for TextVisitor {
+        type Value = BTreeMap<SelectionContentId, String>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded selection source-text map with unique IDs")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut access: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut map = BTreeMap::new();
+            let mut total = 0_usize;
+            while let Some((id, value)) = access.next_entry::<SelectionContentId, String>()? {
+                if map.len() >= 4096 || value.len() > 64 * 1024 {
+                    return Err(serde::de::Error::custom("selection text limit"));
+                }
+                bounded_identity(id.as_str(), 1024).map_err(serde::de::Error::custom)?;
+                total = total
+                    .checked_add(value.len())
+                    .ok_or_else(|| serde::de::Error::custom("selection text bytes"))?;
+                if total > 1024 * 1024 {
+                    return Err(serde::de::Error::custom("selection text bytes"));
+                }
+                if map.insert(id, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate selection source ID"));
+                }
+            }
+            Ok(map)
+        }
+    }
+    deserializer.deserialize_map(TextVisitor)
+}
+
 fn within(rect: Rect, area: Rect) -> Result<(), DecodeError> {
     valid_rect(rect)?;
     if rect.intersection(area) != rect {

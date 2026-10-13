@@ -15,12 +15,21 @@ pub(crate) struct State {
     pub token: String,
     pub authority: String,
     pub origin: String,
+    pub viewport: Arc<crate::viewport::Viewport>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum Route<'a> {
     Asset(&'a str),
     Snapshot(Option<u64>),
+    View {
+        controller: Option<&'a str>,
+        release: bool,
+    },
+    Viewport {
+        controller: Option<&'a str>,
+        length: usize,
+    },
 }
 
 fn route(target: &str) -> Result<Route<'_>, u16> {
@@ -87,7 +96,12 @@ fn parse<'a>(bytes: &'a [u8], state: &State) -> Result<Route<'a>, u16> {
     if parts.next() != Some("HTTP/1.1") || parts.next().is_some() {
         return Err(400);
     }
-    if method != "GET" {
+    if method != "GET"
+        && !matches!(
+            (method, target),
+            ("POST" | "DELETE", "/view") | ("POST", "/viewport")
+        )
+    {
         return Err(405);
     }
     let mut headers = BTreeMap::new();
@@ -134,14 +148,55 @@ fn parse<'a>(bytes: &'a [u8], state: &State) -> Result<Route<'a>, u16> {
     if headers.contains_key("transfer-encoding")
         || headers.contains_key("upgrade")
         || headers.contains_key("expect")
-        || headers
-            .get("content-length")
-            .is_some_and(|length| *length != "0")
     {
         return Err(400);
     }
-    let route = route(target)?;
-    if matches!(route, Route::Snapshot(_))
+    let mutation = method != "GET";
+    let length = match headers.get("content-length") {
+        Some(value)
+            if !value.is_empty()
+                && value.len() <= 4
+                && value.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            value.parse::<usize>().map_err(|_| 400_u16)?
+        }
+        Some(_) => return Err(400),
+        None => 0,
+    };
+    if length > 512 {
+        return Err(413);
+    }
+    if mutation && headers.get("origin").copied() != Some(state.origin.as_str()) {
+        return Err(403);
+    }
+    let route = if mutation {
+        let controller = headers.get("x-bmux-controller").copied();
+        if controller
+            .is_some_and(|value| value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(400);
+        }
+        if target == "/viewport" {
+            if length == 0 || headers.get("content-type").copied() != Some("application/json") {
+                return Err(400);
+            }
+            Route::Viewport { controller, length }
+        } else {
+            if length != 0 {
+                return Err(400);
+            }
+            Route::View {
+                controller,
+                release: method == "DELETE",
+            }
+        }
+    } else {
+        if length != 0 {
+            return Err(400);
+        }
+        route(target)?
+    };
+    if !matches!(route, Route::Asset(_))
         && !headers
             .get("authorization")
             .is_some_and(|value| token_matches(value, &state.token))
@@ -168,10 +223,7 @@ async fn read_request(stream: &mut TcpStream, state: &State) -> Result<Vec<u8>, 
             return Err(400);
         }
         bytes.extend_from_slice(&chunk[..count]);
-        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            if end + 4 != bytes.len() {
-                return Err(400);
-            }
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
             return Ok(bytes);
         }
     }
@@ -212,6 +264,9 @@ async fn response(
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        409 => "Conflict",
+        413 => "Content Too Large",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         _ => "Service Unavailable",
     };
@@ -233,12 +288,86 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
         read_request(&mut stream, &state),
     )
     .await;
+    let header_end = request
+        .as_ref()
+        .ok()
+        .and_then(|result| result.as_ref().ok())
+        .and_then(|bytes| bytes.windows(4).position(|window| window == b"\r\n\r\n"))
+        .map_or(0, |end| end + 4);
     let route = match &request {
-        Ok(Ok(bytes)) => parse(bytes, &state),
+        Ok(Ok(bytes)) => parse(&bytes[..header_end], &state),
         Ok(Err(status)) => Err(*status),
         Err(_) => Err(408),
     };
+    let body_prefix = request
+        .as_ref()
+        .ok()
+        .and_then(|result| result.as_ref().ok())
+        .map_or(&[][..], |bytes| &bytes[header_end..]);
+    if !matches!(route, Ok(Route::Viewport { .. })) && !body_prefix.is_empty() {
+        error(&mut stream, &state, 400).await;
+        return;
+    }
     match route {
+        Ok(Route::View {
+            controller,
+            release,
+        }) => {
+            // A closed producer must never grant a new controller over stale output.
+            if feed.receiver.has_changed().is_err() {
+                error(&mut stream, &state, 503).await;
+                return;
+            }
+            let result = if release {
+                state.viewport.release(controller).map(|()| Vec::new())
+            } else {
+                state.viewport.claim(controller)
+            };
+            match result {
+                Ok(body) => {
+                    let _ = timeout(
+                        state.limits.write_timeout,
+                        response(
+                            &mut stream,
+                            if release { 204 } else { 200 },
+                            "application/json",
+                            &body,
+                            None,
+                        ),
+                    )
+                    .await;
+                }
+                Err(status) => error(&mut stream, &state, status).await,
+            }
+        }
+        Ok(Route::Viewport { controller, length }) => {
+            if feed.receiver.has_changed().is_err() {
+                error(&mut stream, &state, 503).await;
+                return;
+            }
+            if body_prefix.len() > length {
+                error(&mut stream, &state, 400).await;
+                return;
+            }
+            let mut body = vec![0; length];
+            body[..body_prefix.len()].copy_from_slice(body_prefix);
+            let read = timeout(
+                state.limits.header_timeout,
+                stream.read_exact(&mut body[body_prefix.len()..]),
+            )
+            .await;
+            let result = match read {
+                Ok(Ok(_)) => state.viewport.submit(controller, &body),
+                Ok(Err(_)) => Err(400),
+                Err(_) => Err(408),
+            };
+            error(
+                &mut stream,
+                &state,
+                result.map_or_else(|status| status, |()| 204),
+            )
+            .await;
+        }
         Ok(Route::Asset(path)) => {
             if let Some(asset) = state.assets.get(path) {
                 let _ = timeout(
@@ -298,6 +427,7 @@ mod tests {
             token: "a".repeat(64),
             authority: "127.0.0.1:1234".into(),
             origin: "http://127.0.0.1:1234".into(),
+            viewport: Arc::new(crate::viewport::Viewport::new(crate::ViewportMode::Observer).0),
         }
     }
 
@@ -378,6 +508,62 @@ mod tests {
         assert!(parse(&bytes, &state).is_err());
         let headers = format!("X: {}\r\n", "a".repeat(9000));
         assert!(parse(&request("GET", "/", &headers), &state).is_err());
+    }
+
+    #[test]
+    fn control_routes_require_origin_auth_and_bounded_exact_body() {
+        let state = state();
+        let auth = format!("Authorization: Bearer {}\r\n", state.token);
+        let origin = "Origin: http://127.0.0.1:1234\r\n";
+        for (method, path) in [
+            ("POST", "/view"),
+            ("DELETE", "/view"),
+            ("POST", "/viewport"),
+        ] {
+            assert_eq!(parse(&request(method, path, &auth), &state), Err(403));
+            let headers = format!(
+                "{origin}Content-Type: application/json\r\nContent-Length: {}\r\n",
+                if path == "/viewport" { 10 } else { 0 }
+            );
+            assert_eq!(parse(&request(method, path, &headers), &state), Err(401));
+            let headers = format!("{auth}{headers}");
+            assert!(parse(&request(method, path, &headers), &state).is_ok());
+            for extra in [
+                "Origin: null\r\n",
+                "Host: evil.example\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "Content-Length: 513\r\n",
+                "X-Bmux-Controller: short\r\n",
+            ] {
+                assert!(
+                    parse(&request(method, path, &format!("{headers}{extra}")), &state).is_err()
+                );
+            }
+        }
+        assert_eq!(
+            parse(
+                &request(
+                    "POST",
+                    "/viewport",
+                    &format!(
+                        "{auth}{origin}Content-Length: 513\r\nContent-Type: application/json\r\n"
+                    )
+                ),
+                &state
+            ),
+            Err(413)
+        );
+        assert_eq!(
+            parse(
+                &request(
+                    "POST",
+                    "/viewport",
+                    &format!("{auth}{origin}Content-Length: 10\r\n")
+                ),
+                &state
+            ),
+            Err(400)
+        );
     }
 
     #[tokio::test]

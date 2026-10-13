@@ -19,5 +19,6 @@ cargo build -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown
 mkdir -p "$ROOT/target/web-assets"
 "$BINDGEN" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/bmux_web_renderer.wasm" \
   --target web --out-dir "$ROOT/target/web-assets"
-cp packages/web-renderer/browser/index.html packages/web-renderer/browser/bootstrap.js target/web-assets/
+cp packages/web-renderer/browser/index.html packages/web-renderer/browser/bootstrap.js \
+  packages/web-renderer/browser/style.css target/web-assets/
 echo "Browser assets: $ROOT/target/web-assets"

@@ -12,7 +12,7 @@ use web_sys::{
     Blob, BlobPropertyBag, CanvasRenderingContext2d, HtmlCanvasElement, ImageBitmap, ImageData,
 };
 
-use crate::{BrowserBackend, BrowserFrame, Limits, Renderer, decode_json};
+use crate::{BackendCapabilities, BrowserBackend, BrowserFrame, Limits, Renderer, decode_json};
 
 struct Bitmap(ImageBitmap);
 impl Drop for Bitmap {
@@ -26,6 +26,8 @@ struct CanvasBackend {
     output: CanvasRenderingContext2d,
     cell_width: f64,
     cell_height: f64,
+    font: String,
+    baseline: f64,
     resources: BTreeMap<String, Bitmap>,
     pending: Option<BTreeMap<String, Bitmap>>,
 }
@@ -122,17 +124,14 @@ impl CanvasBackend {
                 } else {
                     ""
                 };
-                context.set_font(&format!(
-                    "{italic}{bold}{}px monospace",
-                    self.cell_height * 0.8
-                ));
+                context.set_font(&format!("{italic}{bold}{}", self.font));
                 context.set_fill_style_str(&fg);
                 context.set_global_alpha(if modifiers.contains(Modifier::DIM) {
                     0.5
                 } else {
                     1.0
                 });
-                context.fill_text(&cell.symbol, x, y + self.cell_height * 0.8)?;
+                context.fill_text(&cell.symbol, x, y + self.baseline)?;
                 if modifiers.contains(Modifier::UNDERLINE) {
                     context.fill_rect(x, y + self.cell_height - 2.0, width, 1.0);
                 }
@@ -176,6 +175,12 @@ impl CanvasBackend {
     }
 }
 impl BrowserBackend for CanvasBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            blinking_text: false,
+            ..BackendCapabilities::COMPLETE
+        }
+    }
     type Error = JsValue;
     fn render(
         &mut self,
@@ -186,11 +191,9 @@ impl BrowserBackend for CanvasBackend {
         let (width, height) = self.bounds(frame)?;
         let staging = scratch(width, height)?;
         let staging_context = context(&staging)?;
-        let resources = self
-            .pending
-            .take()
-            .ok_or_else(|| error("resources not prepared"))?;
-        self.paint(&staging_context, frame, &resources)?;
+        let prepared = self.pending.take();
+        let resources = prepared.as_ref().unwrap_or(&self.resources);
+        self.paint(&staging_context, frame, resources)?;
         // Keep a repair copy across resize: setting canvas dimensions clears it.
         let old_width = self.canvas.width();
         let old_height = self.canvas.height();
@@ -222,7 +225,9 @@ impl BrowserBackend for CanvasBackend {
             }
             return Err(failure);
         }
-        self.resources = resources; // Dropping superseded bitmaps releases them.
+        if let Some(resources) = prepared {
+            self.resources = resources; // Dropping superseded bitmaps releases them.
+        }
         Ok(())
     }
     fn reset(&mut self) -> Result<(), JsValue> {
@@ -318,6 +323,8 @@ impl CanvasRenderer {
                     output,
                     cell_width,
                     cell_height,
+                    font: format!("{}px monospace", cell_height * 0.8),
+                    baseline: cell_height * 0.8,
                     resources: BTreeMap::new(),
                     pending: None,
                 },
@@ -325,39 +332,76 @@ impl CanvasRenderer {
             ),
         })
     }
+    /// Update physical-pixel metrics and repaint the committed full snapshot.
+    /// Failed repaint restores metrics and does not change metadata authority.
+    pub fn set_metrics(
+        &mut self,
+        width: f64,
+        height: f64,
+        font: String,
+        baseline: f64,
+    ) -> Result<(), JsValue> {
+        if !width.is_finite()
+            || !height.is_finite()
+            || !baseline.is_finite()
+            || width <= 0.0
+            || height <= 0.0
+            || width > 256.0
+            || height > 256.0
+            || baseline < 0.0
+            || baseline > height
+            || font.is_empty()
+            || font.len() > 512
+        {
+            return Err(error("invalid font metrics"));
+        }
+        let frame = self.renderer.committed().cloned();
+        let backend = self.renderer.backend_mut();
+        let previous = (
+            backend.cell_width,
+            backend.cell_height,
+            backend.font.clone(),
+            backend.baseline,
+        );
+        backend.cell_width = width;
+        backend.cell_height = height;
+        backend.font = font;
+        backend.baseline = baseline;
+        if let Some(frame) = frame
+            && let Err(failure) = backend.render(&frame, Some(&frame))
+        {
+            (
+                backend.cell_width,
+                backend.cell_height,
+                backend.font,
+                backend.baseline,
+            ) = previous;
+            return Err(failure);
+        }
+        Ok(())
+    }
     /// Validate before a host resets a changed generation or trusts a header.
     pub fn inspect_json(json: &str) -> Result<String, JsValue> {
         let frame = decode_json(json, Limits::default()).map_err(error)?;
+        let supported = BackendCapabilities {
+            blinking_text: false,
+            ..BackendCapabilities::COMPLETE
+        }
+        .check(&frame)
+        .is_ok();
         serde_json::to_string(&serde_json::json!({ "generation": frame.generation(),
-            "revision": frame.revision().to_string() }))
+            "revision": frame.revision().to_string(), "supported": supported,
+            "unsupported_metadata": frame.unsupported_metadata(), "selection_text_available": frame.selection_text_available(), "partial_metadata": frame.partial_metadata() }))
         .map_err(error)
     }
     /// Resolves only after decoded resources and complete output have committed.
     pub async fn present_json(&mut self, json: String) -> Result<(), JsValue> {
-        let frame = decode_json(&json, Limits::default()).map_err(error)?;
-        if self
-            .renderer
-            .committed()
-            .is_some_and(|previous| frame.generation() != previous.generation())
-        {
-            return Err(error("generation changed: reset required"));
-        }
-        if self
-            .renderer
-            .committed()
-            .is_some_and(|previous| frame.revision() <= previous.revision())
-        {
-            return Err(error("stale revision"));
-        }
-        self.renderer.backend().bounds(&frame)?;
-        let images = prepare_images(&frame).await?;
-        self.renderer.backend_mut().pending = Some(images);
-        let result = self
-            .renderer
-            .present(frame)
-            .map_err(|failure| error(format!("{failure:?}")));
-        self.renderer.backend_mut().pending = None;
-        result
+        self.present_snapshot(json, false).await
+    }
+    /// A validated full repair may replace a generation without clearing authority
+    /// before successful backend output.
+    pub async fn repair_json(&mut self, json: String) -> Result<(), JsValue> {
+        self.present_snapshot(json, true).await
     }
     /// Revision as decimal text, avoiding JavaScript's lossy integer range.
     pub fn revision(&self) -> String {
@@ -371,11 +415,43 @@ impl CanvasRenderer {
             return Ok("null".to_owned());
         };
         serde_json::to_string(&serde_json::json!({ "revision": frame.revision().to_string(),
-            "generation": frame.generation(), "surfaces": frame.surfaces(), "hits": frame.hits(), "focus": frame.focus(), "focus_scope": frame.focus_scope(),
-            "selection": frame.selection(), "semantics": frame.semantics() })).map_err(error)
+            "generation": frame.generation(), "unsupported_metadata": frame.unsupported_metadata(), "partial_metadata": frame.partial_metadata(), "surfaces": frame.surfaces(), "hits": frame.hits(), "focus": frame.focus(), "focus_scope": frame.focus_scope(),
+            "selection": frame.selection(), "selection_text": frame.selection_text(), "selection_text_available": frame.selection_text_available(), "semantics": frame.semantics() })).map_err(error)
     }
     pub fn reset(&mut self) -> Result<(), JsValue> {
         self.renderer.reset()
+    }
+}
+
+impl CanvasRenderer {
+    async fn present_snapshot(&mut self, json: String, repair: bool) -> Result<(), JsValue> {
+        let frame = decode_json(&json, Limits::default()).map_err(error)?;
+        if let Some(previous) = self.renderer.committed() {
+            if !repair && frame.generation() != previous.generation() {
+                return Err(error("generation changed: explicit repair required"));
+            }
+            if frame.generation() == previous.generation()
+                && frame.revision() <= previous.revision()
+            {
+                return Err(error("stale revision"));
+            }
+        }
+        self.renderer
+            .backend()
+            .capabilities()
+            .check(&frame)
+            .map_err(|feature| error(format!("unsupported feature: {feature:?}")))?;
+        self.renderer.backend().bounds(&frame)?;
+        let images = prepare_images(&frame).await?;
+        self.renderer.backend_mut().pending = Some(images);
+        let result = if repair {
+            self.renderer.repair(frame)
+        } else {
+            self.renderer.present(frame)
+        }
+        .map_err(|failure| error(format!("{failure:?}")));
+        self.renderer.backend_mut().pending = None;
+        result
     }
 }
 

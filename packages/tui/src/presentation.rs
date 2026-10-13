@@ -31,11 +31,45 @@ pub struct PreparedPresentation {
     image_scene: ImageScene,
     image_delta: ImageSceneDelta,
     selection: SelectionScene,
+    selection_text: std::collections::BTreeMap<crate::selection::SelectionContentId, String>,
     semantics: SemanticScene,
     damage: Damage,
 }
 
 impl PreparedPresentation {
+    /// Caller-owned immutable logical text referenced by selection fragments.
+    #[must_use]
+    pub const fn selection_text(
+        &self,
+    ) -> &std::collections::BTreeMap<crate::selection::SelectionContentId, String> {
+        &self.selection_text
+    }
+
+    /// Install bounded producer text before output, never reconstructing it from cells.
+    ///
+    /// # Errors
+    /// Rejects oversized or invalid logical source mappings.
+    pub fn set_selection_text(
+        &mut self,
+        text: std::collections::BTreeMap<crate::selection::SelectionContentId, String>,
+    ) -> Result<(), PresentationLimitError> {
+        if text.len() > 4096
+            || text
+                .iter()
+                .any(|(id, text)| id.as_str().len() > 1024 || text.len() > 65_536)
+            || text.values().map(String::len).sum::<usize>() > 1_048_576
+            || self.selection.fragments().iter().any(|fragment| {
+                text.get(&fragment.content_id).is_none_or(|text| {
+                    !text.is_char_boundary(fragment.source_range.start)
+                        || !text.is_char_boundary(fragment.source_range.end)
+                })
+            })
+        {
+            return Err(PresentationLimitError::Bytes);
+        }
+        self.selection_text = text;
+        Ok(())
+    }
     /// Project an external compositor's committed active focus onto this output.
     /// This changes descriptive output only; it cannot install retained authority.
     /// Returns false when the requested target is not eligible in this prepared scene.
@@ -135,6 +169,9 @@ impl PreparedPresentation {
         }
         if let Some(scope) = self.focus.active_scope() {
             add(0, scope.as_str().len())?;
+        }
+        for (id, text) in &self.selection_text {
+            add(1, id.as_str().len().saturating_add(text.len()))?;
         }
         for scope in self.selection.scopes() {
             add(1, scope.id.as_str().len())?;
@@ -248,6 +285,7 @@ pub struct PresentationState {
     image_delta: ImageSceneDelta,
     cursor: Option<Cursor>,
     selection: SelectionScene,
+    selection_text: std::collections::BTreeMap<crate::selection::SelectionContentId, String>,
     semantics: SemanticScene,
 }
 
@@ -266,6 +304,7 @@ impl PresentationState {
             image_delta: ImageSceneDelta::default(),
             cursor: None,
             selection: SelectionScene::new(),
+            selection_text: std::collections::BTreeMap::new(),
             semantics: SemanticScene::new(),
         }
     }
@@ -348,6 +387,39 @@ impl PresentationState {
         damage: Damage,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
     ) -> Option<PreparedPresentation> {
+        self.prepare_from(damage, false, render)
+    }
+
+    /// Repair committed cells with already-clipped output operations while
+    /// replacing metadata completely. This produces a full snapshot without
+    /// requiring the producer to emit a full repaint for an observer.
+    ///
+    /// # Errors
+    /// Returns the exceeded admission limit without committing staged state.
+    ///
+    /// # Panics
+    /// Panics if full-damage preparation violates its always-prepares invariant.
+    pub fn prepare_repaired_bounded(
+        &self,
+        limits: PresentationLimits,
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
+    ) -> Result<PreparedPresentation, PresentationLimitError> {
+        if usize::from(self.area.width) * usize::from(self.area.height) > limits.max_cells {
+            return Err(PresentationLimitError::Cells);
+        }
+        let prepared = self
+            .prepare_from(Damage::Full, true, render)
+            .expect("full damage always prepares output");
+        prepared.validate_limits(limits)?;
+        Ok(prepared)
+    }
+
+    fn prepare_from(
+        &self,
+        damage: Damage,
+        repair: bool,
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
+    ) -> Option<PreparedPresentation> {
         let damage = if self.previous.is_none() {
             Damage::Full
         } else {
@@ -357,7 +429,13 @@ impl PresentationState {
             return None;
         }
         let requested_regions = damage.retained_regions();
-        let mut buffer = Buffer::empty(self.area);
+        let mut buffer = if repair {
+            self.previous
+                .clone()
+                .unwrap_or_else(|| Buffer::empty(self.area))
+        } else {
+            Buffer::empty(self.area)
+        };
         let (cursor, hits, focus_scope, images, selection, semantics) = {
             let mut frame = Frame::new(&mut buffer);
             render(&mut PaintCx::new(&mut frame));
@@ -437,6 +515,7 @@ impl PresentationState {
             image_scene,
             image_delta,
             selection,
+            selection_text: std::collections::BTreeMap::new(),
             semantics,
             damage,
         })
@@ -508,7 +587,11 @@ impl PresentationState {
         self.present_prepared(prepared, output)
     }
 
-    fn present_prepared<T, E>(
+    /// Deliver an already prepared frame; only successful output commits it.
+    ///
+    /// # Errors
+    /// Returns the backend error without installing staged metadata.
+    pub fn present_prepared<T, E>(
         &mut self,
         prepared: Option<PreparedPresentation>,
         output: impl FnOnce(&PreparedPresentation, Option<&Buffer>) -> Result<T, E>,
@@ -532,6 +615,7 @@ impl PresentationState {
         self.image_delta = prepared.image_delta;
         self.cursor = prepared.cursor;
         self.selection = prepared.selection;
+        self.selection_text = prepared.selection_text;
         self.semantics = prepared.semantics;
         Ok(Some(result))
     }
@@ -549,6 +633,76 @@ mod tests {
         cx.fill(LocalRect::new(0, 0, 2, 1), symbol, Style::new());
         cx.push_hit(HitRegion::new(id, Rect::new(0, 0, 2, 1)).focusable(true));
         cx.set_cursor(Point::new(1, 0), true);
+    }
+
+    #[test]
+    fn repaired_snapshot_keeps_unchanged_cells_and_failed_delivery_keeps_metadata() {
+        let mut state = PresentationState::new(Rect::new(0, 0, 2, 1));
+        state
+            .present(
+                Damage::Full,
+                |cx| paint(cx, "old", "A"),
+                |_, _| Ok::<_, ()>(()),
+            )
+            .unwrap();
+        let staged = state
+            .prepare_repaired_bounded(
+                PresentationLimits {
+                    max_cells: 2,
+                    max_entries: 100,
+                    max_bytes: 4096,
+                },
+                |cx| {
+                    cx.write_line(LocalRect::new(1, 0, 1, 1), &crate::text::Line::raw("B"));
+                },
+            )
+            .unwrap();
+        assert_eq!(staged.buffer().cells()[0].symbol, "A");
+        assert_eq!(staged.buffer().cells()[1].symbol, "B");
+        assert!(staged.hits().regions().is_empty());
+        assert_eq!(
+            state.present_prepared(Some(staged), |_, _| Err::<(), _>("host rejected")),
+            Err("host rejected")
+        );
+        assert_eq!(state.hits().regions()[0].id.as_str(), "old");
+    }
+
+    #[test]
+    fn prepared_source_text_commits_only_after_successful_delivery() {
+        use crate::selection::{SelectionScope, plain_text_fragments};
+        let mut state = PresentationState::new(Rect::new(0, 0, 2, 1));
+        let mut prepared = state
+            .prepare(Damage::Full, |cx| {
+                cx.push_selection_scope(SelectionScope::new("scope", Rect::new(0, 0, 2, 1)));
+                for fragment in
+                    plain_text_fragments("scope", "source", Rect::new(0, 0, 2, 1), 0, "界", 0, 1)
+                {
+                    cx.push_selection_fragment(fragment);
+                }
+            })
+            .unwrap();
+        assert!(
+            prepared
+                .set_selection_text([("source".into(), "x".to_owned())].into())
+                .is_err()
+        );
+        prepared
+            .set_selection_text([("source".into(), "界".to_owned())].into())
+            .unwrap();
+        assert_eq!(
+            prepared.selection_text()[&crate::selection::SelectionContentId::new("source")],
+            "界"
+        );
+        assert!(
+            state
+                .present_prepared(Some(prepared.clone()), |_, _| Err::<(), _>("failed"))
+                .is_err()
+        );
+        assert!(state.selection_text.is_empty());
+        state
+            .present_prepared(Some(prepared), |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.selection_text.len(), 1);
     }
 
     #[test]

@@ -25,7 +25,14 @@ use bmux_plugin::{
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
 use bmux_terminal_grid::{Cell, Color as GridColor, PhysicalRow, Style as GridStyle};
 use crossterm::cursor::MoveTo;
-use crossterm::queue;
+// Output-only composition never invokes a terminal encoder.
+macro_rules! queue {
+    ($($args:tt)*) => {
+        if crate::projection::encoding_terminal() {
+            crossterm::queue!($($args)*)
+        } else { Ok::<(), std::io::Error>(()) }
+    };
+}
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
@@ -311,6 +318,9 @@ fn queue_terminal_commands<W: io::Write>(
 ) -> Result<bool> {
     let commands = optimize_terminal_commands(commands);
     capture_terminal_commands(&commands);
+    if !crate::projection::encoding_terminal() {
+        return Ok(!commands.is_empty());
+    }
     for command in &commands {
         match command {
             TerminalCommand::MoveTo { x, y } => {
@@ -1134,7 +1144,7 @@ fn active_terminal_graphic_keys(
     items: &[RenderLayerItem],
     capabilities: TerminalRenderCapabilities,
 ) -> BTreeSet<u64> {
-    if !terminal_graphic_can_render(capabilities) {
+    if !terminal_graphic_can_render(capabilities) && crate::projection::encoding_terminal() {
         return BTreeSet::new();
     }
     items
@@ -1172,7 +1182,9 @@ fn terminal_graphic_needs_reconcile(
     graphics_cache: &TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
 ) -> bool {
-    if !terminal_graphic_can_render(capabilities) || !graphic.cell_rect.intersects(surface_rect) {
+    if (!terminal_graphic_can_render(capabilities) && crate::projection::encoding_terminal())
+        || !graphic.cell_rect.intersects(surface_rect)
+    {
         return false;
     }
     if terminal_graphic_intersects_damage(graphic, damage) {
@@ -1275,7 +1287,7 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
     capabilities: TerminalRenderCapabilities,
     mut resource_stats: Option<&mut TerminalGraphicsResourceStats>,
 ) -> Result<bool> {
-    if !terminal_graphic_can_render(capabilities) {
+    if !terminal_graphic_can_render(capabilities) && crate::projection::encoding_terminal() {
         return Ok(false);
     }
     if crate::projection::capturing() {
@@ -1309,6 +1321,9 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
                 },
             ));
         }
+    }
+    if !crate::projection::encoding_terminal() {
+        return Ok(true);
     }
     let source = terminal_graphic_source_signature(graphic);
     let placement = terminal_graphic_placement_signature(graphic);
@@ -1524,6 +1539,9 @@ fn cleanup_stale_terminal_graphics_by_plan<W: io::Write>(
     capabilities: TerminalRenderCapabilities,
     resource_stats: Option<&mut TerminalGraphicsResourceStats>,
 ) -> Result<bool> {
+    if !crate::projection::encoding_terminal() {
+        return Ok(false);
+    }
     if plan.is_empty() {
         return Ok(false);
     }
@@ -2930,6 +2948,9 @@ fn color_sgr(color: CellColor, foreground: bool) -> String {
 }
 
 fn style_sgr(style: CellStyle) -> String {
+    if !crate::projection::encoding_terminal() {
+        return String::new();
+    }
     let mut parts = vec!["0".to_string()];
     if style.bold {
         parts.push("1".to_string());
@@ -3130,7 +3151,7 @@ fn resolve_grid_row_segment(
         ));
         line.push_str(&" ".repeat(target_cols - emitted_cols));
     }
-    if current != CellStyle::default() {
+    if current != CellStyle::default() && crate::projection::encoding_terminal() {
         line.push_str("\x1b[0m");
     }
     (line, resolved)
@@ -4362,6 +4383,9 @@ fn execute_imperative_extension<W: io::Write>(
 ) {
     crate::projection::record(crate::projection::PaintOperation::Unsupported);
     let snapshot = &plan.snapshot;
+    if !crate::projection::encoding_terminal() {
+        return;
+    }
     let writer: &mut dyn io::Write = stdout;
     if let Err(error) = snapshot.extension.render_layer_surface_with_context(
         writer,
@@ -4436,6 +4460,9 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
         }
         AfterContentExtensionOutputAction::CachedReplay { bytes } => {
             capture_cached_extension(plan, pane_buffers);
+            if !crate::projection::encoding_terminal() {
+                return Ok(());
+            }
             stdout
                 .write_all(bytes)
                 .context("failed replaying cached declarative render ops")
@@ -4613,6 +4640,10 @@ fn queue_full_frame_content_clear<W: io::Write>(
     let clear_start = top_inset.min(rows);
     let clear_end = rows.saturating_sub(bottom_inset).max(clear_start);
     for y in clear_start..clear_end {
+        crate::projection::record(crate::projection::PaintOperation::Fill {
+            rect: bmux_tui::geometry::Rect::new(0, y, cols, 1),
+            style: bmux_tui::style::Style::new(),
+        });
         queue!(stdout, MoveTo(0, y), Print(" ".repeat(usize::from(cols))))
             .context("failed clearing attach pane row")?;
         if let Some(stats) = render_stats.as_deref_mut() {
@@ -5816,7 +5847,6 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     use bmux_plugin::{RenderLayerItem, TerminalGraphicFill, TerminalGraphicOverlay, TerminalRgba};
     use crossterm::cursor::MoveTo;
-    use crossterm::queue;
     use crossterm::style::Print;
     use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;

@@ -5,7 +5,42 @@ Native transport, clients, CLI, plugin loading, and product state are not depend
 The compositor remains the only authority; browsers consume its final buffer and
 shared cursor/hit/focus/selection/semantic/image/damage vocabulary.
 
-## Host API and wire v1
+## Host API and wire v2
+
+Wire v2 requires `unsupported_metadata`: a bounded list of the typed
+`MetadataKind::{Selection, Semantics}` values, serialized as `selection` and
+`semantics`. V1 is explicitly rejected: it cannot establish whether an empty
+metadata scene means available-but-empty or absent producer support. Unknown,
+duplicate, over-budget, or missing availability declarations are rejected.
+`from_prepared` defaults to complete standalone metadata (`[]`). Native projections
+whose producer does not supply logical metadata must explicitly call
+`with_unsupported_metadata(&[MetadataKind::Selection, MetadataKind::Semantics])`.
+Unavailable kinds cannot also contain scene entries. The browser still renders
+faithfully available output and displays unavailable metadata; it does not fabricate
+logical content or reject cells/images merely because metadata is unavailable.
+
+`selection_text` is the exact `BTreeMap<SelectionContentId, String>` supplied by
+the producer; no text is reconstructed from output cells. Use
+`with_selection_text(&source_map)?` to declare text available. Mandatory
+`selection_text_available` distinguishes absent source text from an empty supplied
+map. Prepared standalone frames with selection fragments initially declare text
+unavailable until this builder runs; standalone frames without fragments have a
+complete empty map. The example supplies its real title source and fragments.
+Keys are bounded to 1024 bytes; maps have at most 4096 entries, 1 MiB aggregate
+UTF-8 text and 64 KiB per value. Duplicate wire keys, missing referenced content,
+and out-of-range/non-UTF-8-boundary source/word/line ranges are rejected when text
+is supplied. Committed metadata includes the source map and availability. Producer
+namespaced keys must match the scene's content IDs exactly; retained provenance
+continues to identify owner-local surface/revision rather than a browser authority.
+`inspect_json` and committed `metadata_json` expose this list. Every retained
+`SurfaceProvenance` also requires `selection_available` and `semantics_available`.
+These source-owned flags do not default to true. Global `unsupported_metadata`
+means no producer supplies that category; absence from that list does **not** imply
+complete coverage when a retained surface declares it unavailable. Derived
+`partial_metadata` in inspection/committed metadata and the browser status makes
+mixed coverage explicit. Native terminal-grid surfaces remain unavailable until
+their logical producer supplies metadata. A true per-surface flag contradicting a
+global unsupported declaration is rejected. No metadata is inferred from cells.
 
 ```rust,ignore
 let frame = bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
@@ -105,7 +140,7 @@ and must advance within the host. A failed output retries a full snapshot and ma
 receive the same transport publication; regression is rejected. Native generation
 changes may restart native revisions without restarting the transport counter.
 Poll errors trigger full repair; unchanged native revisions are skipped. A changed validated generation
-causes an explicit reset before the new snapshot. The host owns endpoint security,
+uses transactional full-snapshot repair; failed replacement preserves old output and metadata. The host owns endpoint security,
 authorization, token generation and exact asset allowlisting.
 
 ## Build and validation (coordinator)

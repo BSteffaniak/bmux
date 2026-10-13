@@ -347,6 +347,9 @@ pub enum Command {
         /// Serve this terminal view read-only in a local browser using these built WASM assets
         #[arg(long, value_name = "ASSET_DIRECTORY")]
         web_assets: Option<std::path::PathBuf>,
+        /// Attach without terminal input/output; the first browser controls this view's viewport
+        #[arg(long, requires = "web_assets")]
+        web_only: bool,
         /// Follow target client UUID and attach to its selected session
         #[arg(long)]
         follow: Option<String>,
@@ -3182,11 +3185,13 @@ mod tests {
             follow,
             global,
             web_assets,
+            web_only,
         }) = cli.command
         else {
             panic!("expected attach command");
         };
         assert!(web_assets.is_none());
+        assert!(!web_only);
         assert_eq!(target.as_deref(), Some("dev"));
         assert_eq!(cli.target, None);
         assert_eq!(follow, None);
@@ -3229,6 +3234,24 @@ mod tests {
             Some("550e8400-e29b-41d4-a716-446655440000")
         );
         assert!(global);
+    }
+
+    #[test]
+    fn parses_headless_browser_attach() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "attach",
+            "dev",
+            "--web-assets",
+            "/tmp/assets",
+            "--web-only",
+        ])
+        .expect("valid browser-only attachment");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Attach { web_only: true, .. })
+        ));
+        assert!(Cli::try_parse_from(["bmux", "attach", "dev", "--web-only"]).is_err());
     }
 
     #[test]

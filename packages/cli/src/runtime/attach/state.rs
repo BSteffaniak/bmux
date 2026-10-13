@@ -240,6 +240,11 @@ impl AttachDirtyFlags {
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
+    pub(super) prepared_extensions:
+        Option<Vec<std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>>>,
+    pub(super) presentation_only: bool,
+    pub(super) viewport_guard: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+    pub(super) presentation: bmux_tui::presentation::PresentationState,
     pub(super) observer: Option<super::observer::AttachObserverPublisher>,
     pub async_services: Option<bmux_plugin::AsyncServiceClient>,
     pub presentation_events: std::sync::Arc<bmux_plugin::EventBus>,
@@ -295,6 +300,10 @@ pub struct AttachViewState {
     pub cached_contexts: Vec<ContextRow>,
     pub cached_sessions: Vec<SessionRow>,
     pub cached_context_session_bindings: Vec<ContextSessionBinding>,
+    /// Execution incarnations, rotated on authoritative restart rather than output.
+    pub image_execution_incarnations: BTreeMap<Uuid, Uuid>,
+    /// Viewport selected by the attach driver, never inferred from outer stdout.
+    pub driver_geometry: Option<super::input::TerminalGeometry>,
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
     pub scoped_pane_appearances: BTreeMap<Uuid, RuntimeAppearance>,
     pub terminal_graphics_cache: TerminalGraphicsCache,
@@ -613,8 +622,17 @@ impl AttachViewState {
             std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new());
         state
     }
+    // Keep explicit defaults together: this constructor is the audit point for
+    // per-view resource isolation, not orchestration to split apart.
+    #[allow(clippy::too_many_lines)]
     pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
+            prepared_extensions: None,
+            presentation_only: false,
+            viewport_guard: None,
+            presentation: bmux_tui::presentation::PresentationState::new(
+                bmux_tui::geometry::Rect::new(0, 0, 0, 0),
+            ),
             observer: None,
             async_services: None,
             presentation_events: bmux_plugin::global_event_bus(),
@@ -651,6 +669,8 @@ impl AttachViewState {
             cached_contexts: Vec::new(),
             cached_sessions: Vec::new(),
             cached_context_session_bindings: Vec::new(),
+            image_execution_incarnations: BTreeMap::new(),
+            driver_geometry: None,
             pane_buffers: BTreeMap::new(),
             scoped_pane_appearances: BTreeMap::new(),
             terminal_graphics_cache: TerminalGraphicsCache::new(),
@@ -920,6 +940,8 @@ impl AttachViewState {
 
     /// Drop scrollback views for panes that no longer exist.
     pub fn retain_scrollback_panes(&mut self, active_pane_ids: &BTreeSet<Uuid>) {
+        self.image_execution_incarnations
+            .retain(|pane, _| active_pane_ids.contains(pane));
         self.captured_alternate
             .retain(|pane| active_pane_ids.contains(pane));
         self.scroll_started

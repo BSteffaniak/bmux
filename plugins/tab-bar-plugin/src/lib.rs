@@ -1229,8 +1229,68 @@ fn build_surface_with_editor(
         projected.height,
     );
     let mut ops = vec![RenderOp::fill_rect(rect, ' ', styles.base)];
+    let mut metadata = bmux_plugin::surface::PluginSurfaceMetadata {
+        selection: Some(bmux_tui::selection::SelectionScene::new()),
+        semantics: Some(bmux_tui::semantic::SemanticScene::new()),
+        text: std::collections::BTreeMap::new(),
+    };
     let mut regions = Vec::with_capacity(state.snapshot.tabs.len());
-    for (segment, x, row, width) in projected.positioned_rows() {
+    for (segment_index, (segment, x, row, width)) in projected.positioned_rows().enumerate() {
+        // This producer owns the projected segment source, not painted cells.
+        // Editable overlays replace this text and therefore cannot reuse its ranges.
+        if !segment.text.is_empty()
+            && (segment.tab_id.is_some() || segment.kind == projection::SegmentKind::Workspace)
+            && !matches!(
+                segment.kind,
+                projection::SegmentKind::EditingTab | projection::SegmentKind::EditingWorkspace
+            )
+        {
+            // A tab can own several projected segments (padding, label, suffix).
+            // Each has distinct geometry and source; sharing an ID overwrites the
+            // earlier scope/text while retaining its fragments.
+            let id = format!(
+                "{}:segment:{segment_index}",
+                segment.tab_id.map_or_else(
+                    || "workspace-label".to_owned(),
+                    |id| format!("tab-label:{id}"),
+                )
+            );
+            let area = bmux_tui::geometry::Rect::new(x, row, width, 1);
+            let selection = metadata
+                .selection
+                .as_mut()
+                .expect("producer selection scene");
+            selection.push_scope(
+                bmux_tui::selection::SelectionScope::new(id.clone(), area).revision(revision),
+            );
+            for fragment in bmux_tui::selection::plain_text_fragments(
+                id.clone(),
+                id.clone(),
+                area,
+                u64::from(row),
+                &segment.text,
+                0,
+                revision,
+            ) {
+                selection.push_fragment(fragment);
+            }
+            metadata
+                .text
+                .insert(id.clone().into(), segment.text.clone());
+            metadata
+                .semantics
+                .as_mut()
+                .expect("producer semantic scene")
+                .push(bmux_tui::semantic::SemanticRegion::new(
+                    id,
+                    area,
+                    if segment.tab_id.is_some() {
+                        "tab"
+                    } else {
+                        "workspace-label"
+                    },
+                ));
+        }
         if !segment.text.is_empty() {
             ops.push(RenderOp::text_run(
                 x,
@@ -1369,6 +1429,7 @@ fn build_surface_with_editor(
         ops,
     )
     .opaque(true);
+    surface.metadata = Some(metadata);
     for region in regions {
         surface = surface.interactive_region(region);
     }
@@ -3419,6 +3480,26 @@ bar_bg = "#112233"
             })
             .collect();
         let surface = build_surface(&state, 1);
+        let metadata = surface
+            .metadata
+            .as_ref()
+            .expect("real tab-label producer metadata");
+        assert!(metadata.selection.as_ref().unwrap().validate().is_ok());
+        assert!(!metadata.selection.as_ref().unwrap().fragments().is_empty());
+        assert!(metadata.text.values().any(|text| text.contains("w2")));
+        assert!(!metadata.semantics.as_ref().unwrap().regions().is_empty());
+        // Registry admission checks fragment containment/source bounds, not just
+        // the selection scene's hierarchy. Exercise the actual producer output.
+        let registry = bmux_plugin::surface::PluginSurfaceRegistry::new(2);
+        registry
+            .publish(
+                OWNER,
+                PluginSurfaceSnapshot {
+                    revision: 1,
+                    surfaces: vec![surface.clone()],
+                },
+            )
+            .unwrap();
         let second_region = surface
             .interactive_regions
             .iter()

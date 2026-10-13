@@ -1,10 +1,58 @@
 use crate::{BrowserFrame, DecodeError, Limits};
 
-/// Replaceable output backend. Implementations must accept the *complete* frame
-/// before returning success. Failure must not mutate interaction authority.
-/// Backend-owned resources are released by reset and by Drop.
+/// Explicit fidelity requirements, independent of any DOM or GPU API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequiredFeature {
+    Cells,
+    Cursor,
+    Images,
+    BlinkingText,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendCapabilities {
+    pub cells: bool,
+    pub cursor: bool,
+    pub images: bool,
+    pub blinking_text: bool,
+}
+impl BackendCapabilities {
+    pub const COMPLETE: Self = Self {
+        cells: true,
+        cursor: true,
+        images: true,
+        blinking_text: true,
+    };
+
+    pub fn check(self, frame: &BrowserFrame) -> Result<(), RequiredFeature> {
+        if !self.cells {
+            return Err(RequiredFeature::Cells);
+        }
+        if !self.cursor && frame.cursor().is_some_and(|cursor| cursor.visible) {
+            return Err(RequiredFeature::Cursor);
+        }
+        if !self.images && frame.image_scene().placements().len() != 0 {
+            return Err(RequiredFeature::Images);
+        }
+        if !self.blinking_text
+            && frame.buffer().cells().iter().any(|cell| {
+                cell.style
+                    .modifiers
+                    .contains(bmux_tui::style::Modifier::SLOW_BLINK)
+            })
+        {
+            return Err(RequiredFeature::BlinkingText);
+        }
+        Ok(())
+    }
+}
+
+/// Replaceable output backend. Implementations accept a complete frame before
+/// success; failure preserves visible output and committed interaction authority.
+/// Full replacement releases omitted resources. Reset and Drop release all resources.
 pub trait BrowserBackend {
     type Error;
+    fn capabilities(&self) -> BackendCapabilities;
     fn render(
         &mut self,
         frame: &BrowserFrame,
@@ -18,6 +66,7 @@ pub enum PresentError<E> {
     Invalid(DecodeError),
     StaleRevision,
     GenerationChanged,
+    Unsupported(RequiredFeature),
     Backend(E),
 }
 
@@ -46,23 +95,42 @@ impl<B: BrowserBackend> Renderer<B> {
         &mut self.backend
     }
     pub fn present(&mut self, frame: BrowserFrame) -> Result<(), PresentError<B::Error>> {
+        self.present_snapshot(frame, false)
+    }
+    /// Explicit complete-snapshot repair, including replacement generations.
+    /// Unlike reset followed by present, failure preserves the old output authority.
+    pub fn repair(&mut self, frame: BrowserFrame) -> Result<(), PresentError<B::Error>> {
+        self.present_snapshot(frame, true)
+    }
+    fn present_snapshot(
+        &mut self,
+        frame: BrowserFrame,
+        repair: bool,
+    ) -> Result<(), PresentError<B::Error>> {
         frame.validate(self.limits).map_err(PresentError::Invalid)?;
-        if self
-            .committed
-            .as_ref()
-            .is_some_and(|previous| frame.generation() != previous.generation())
+        self.backend
+            .capabilities()
+            .check(&frame)
+            .map_err(PresentError::Unsupported)?;
+        if !repair
+            && self
+                .committed
+                .as_ref()
+                .is_some_and(|previous| frame.generation() != previous.generation())
         {
             return Err(PresentError::GenerationChanged);
         }
-        if self
-            .committed
-            .as_ref()
-            .is_some_and(|previous| frame.revision() <= previous.revision())
-        {
+        if self.committed.as_ref().is_some_and(|previous| {
+            frame.generation() == previous.generation() && frame.revision() <= previous.revision()
+        }) {
             return Err(PresentError::StaleRevision);
         }
+        let previous = self
+            .committed
+            .as_ref()
+            .filter(|previous| previous.generation() == frame.generation());
         self.backend
-            .render(&frame, self.committed.as_ref())
+            .render(&frame, previous)
             .map_err(PresentError::Backend)?;
         self.committed = Some(frame);
         Ok(())
@@ -88,11 +156,18 @@ mod tests {
     };
     #[derive(Default)]
     struct Recording {
+        reject_cells: bool,
         fail: bool,
         revisions: Vec<u64>,
         resets: usize,
     }
     impl BrowserBackend for Recording {
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                cells: !self.reject_cells,
+                ..BackendCapabilities::COMPLETE
+            }
+        }
         type Error = ();
         fn render(
             &mut self,
@@ -146,6 +221,72 @@ mod tests {
         renderer.present(frame(1)).expect("new stream");
     }
     #[test]
+    fn missing_feature_fails_before_output_or_commit() {
+        let mut renderer = Renderer::new(Recording::default(), Limits::default());
+        renderer.present(frame(1)).expect("initial output");
+        renderer.backend_mut().reject_cells = true;
+        assert!(matches!(
+            renderer.present(frame(2)),
+            Err(PresentError::Unsupported(RequiredFeature::Cells))
+        ));
+        assert_eq!(renderer.backend().revisions, vec![1]);
+        assert_eq!(renderer.committed().expect("retained").revision(), 1);
+    }
+    #[test]
+    fn generation_repair_commits_only_successful_output() {
+        let mut renderer = Renderer::new(Recording::default(), Limits::default());
+        renderer.present(frame(4)).expect("initial");
+        let prepared = PresentationState::new(Rect::new(0, 0, 4, 2))
+            .prepare(Damage::Full, |_| {})
+            .expect("prepared");
+        let replacement =
+            BrowserFrame::from_prepared_in_generation("replacement", 1, &prepared).expect("frame");
+        assert!(matches!(
+            renderer.present(replacement.clone()),
+            Err(PresentError::GenerationChanged)
+        ));
+        renderer.backend_mut().fail = true;
+        assert!(renderer.repair(replacement.clone()).is_err());
+        assert_eq!(
+            renderer.committed().expect("retained").generation(),
+            "standalone"
+        );
+        assert_eq!(renderer.committed().expect("retained").revision(), 4);
+        renderer.backend_mut().fail = false;
+        renderer.repair(replacement).expect("repair");
+        assert_eq!(
+            renderer.committed().expect("replacement").generation(),
+            "replacement"
+        );
+        assert_eq!(renderer.committed().expect("replacement").revision(), 1);
+    }
+    #[test]
+    fn required_cursor_and_blink_features_are_explicit() {
+        let cursor = BackendCapabilities {
+            cursor: false,
+            ..BackendCapabilities::COMPLETE
+        };
+        assert_eq!(cursor.check(&frame(1)), Err(RequiredFeature::Cursor));
+        let prepared = PresentationState::new(Rect::new(0, 0, 4, 2))
+            .prepare(Damage::Full, |cx| {
+                cx.fill(
+                    LocalRect::new(0, 0, 4, 2),
+                    "x",
+                    Style::new().add_modifier(bmux_tui::style::Modifier::SLOW_BLINK),
+                );
+            })
+            .expect("prepared");
+        let blinking = BrowserFrame::from_prepared(1, &prepared).expect("frame");
+        let static_text = BackendCapabilities {
+            blinking_text: false,
+            ..BackendCapabilities::COMPLETE
+        };
+        assert_eq!(
+            static_text.check(&blinking),
+            Err(RequiredFeature::BlinkingText)
+        );
+    }
+    #[test]
     fn shared_json_roundtrip_and_bounds() {
         let frame = frame(1);
         let json = crate::encode_json(&frame).expect("encode");
@@ -161,7 +302,7 @@ mod tests {
             crate::decode_json(&json, limits),
             Err(DecodeError::Limit(_))
         ));
-        let unknown = json.replace("\"version\":1", "\"version\":42");
+        let unknown = json.replace("\"version\":2", "\"version\":42");
         assert_eq!(
             crate::decode_json(&unknown, Limits::default()),
             Err(DecodeError::Version)

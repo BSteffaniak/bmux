@@ -7,9 +7,10 @@
 mod contract;
 mod renderer;
 pub use contract::{
-    BrowserFrame, DecodeError, Limits, SurfaceProvenance, WIRE_VERSION, decode_json, encode_json,
+    BrowserFrame, DecodeError, Limits, MetadataKind, SurfaceProvenance, WIRE_VERSION, decode_json,
+    encode_json,
 };
-pub use renderer::{BrowserBackend, PresentError, Renderer};
+pub use renderer::{BackendCapabilities, BrowserBackend, PresentError, Renderer, RequiredFeature};
 
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 mod canvas;

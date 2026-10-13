@@ -21,6 +21,7 @@ fn fixture() -> (TempDir, HostConfig) {
             b"<!doctype html><title>fixture</title>".as_slice(),
         ),
         ("bootstrap.js", b"export const fixture = true;".as_slice()),
+        ("style.css", b"body { margin: 0; }".as_slice()),
     ] {
         std::fs::write(directory.path().join(filename), bytes).unwrap();
     }
@@ -32,6 +33,11 @@ fn fixture() -> (TempDir, HostConfig) {
             url: "/".into(),
             filename: "index.html".into(),
             content_type: ContentType::Html,
+        },
+        Asset {
+            url: "/style.css".into(),
+            filename: "style.css".into(),
+            content_type: ContentType::TextCss,
         },
         Asset {
             url: "/bootstrap.js".into(),
@@ -146,6 +152,126 @@ async fn assert_disconnected(stream: &mut TcpStream) {
 }
 
 #[tokio::test]
+async fn tcp_view_claim_geometry_renewal_release_and_source_loss() {
+    let (directory, mut config) = fixture();
+    config.viewport_mode = crate::ViewportMode::Resizable;
+    let (publisher, feed) = snapshot_feed(128).unwrap();
+    let mut host = start(config, feed).await.unwrap();
+    let mut requests = host.take_viewport_requests().unwrap();
+    let address = host.address();
+    let token = token(&host);
+    let origin = format!("Origin: http://{address}\r\n");
+    let claim = exchange(address, &request(address, "POST", "/view", &token, &origin)).await;
+    status(&claim, 503);
+    publisher.publish(1, Arc::from(*b"{}")).unwrap();
+    host.set_generation("generation-1").unwrap();
+    let claim = exchange(address, &request(address, "POST", "/view", &token, &origin)).await;
+    status(&claim, 200);
+    let info: serde_json::Value =
+        serde_json::from_str(claim.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let controller = info["controller"].as_str().unwrap();
+    assert_eq!(info["generation"], "generation-1");
+    assert_eq!(info["viewport_allowed"], true);
+    let ownership = format!("{origin}X-Bmux-Controller: {controller}\r\n");
+    let extra = exchange(address, &request(address, "POST", "/view", &token, &origin)).await;
+    assert!(!extra.contains(controller));
+    assert!(extra.contains("\"viewport_allowed\":false"));
+    let body = r#"{"generation":"generation-1","request_id":"1","cols":100,"rows":40}"#;
+    let headers = format!(
+        "{ownership}Content-Type: application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    let submit = format!(
+        "{}{body}",
+        request(address, "POST", "/viewport", &token, &headers)
+    );
+    status(&exchange(address, &submit).await, 204);
+    let geometry = timeout(DEADLINE, requests.recv()).await.unwrap().unwrap();
+    assert_eq!((geometry.cols, geometry.rows), (100, 40));
+    assert!(requests.is_current(&geometry));
+    status(&exchange(address, &submit).await, 409);
+    status(
+        &exchange(
+            address,
+            &request(address, "POST", "/view", &token, &ownership),
+        )
+        .await,
+        200,
+    );
+    assert!(requests.is_current(&geometry));
+    status(
+        &exchange(
+            address,
+            &request(address, "DELETE", "/view", &token, &origin),
+        )
+        .await,
+        403,
+    );
+    status(
+        &exchange(
+            address,
+            &request(address, "DELETE", "/view", &token, &ownership),
+        )
+        .await,
+        204,
+    );
+    assert!(!requests.is_current(&geometry));
+    status(&exchange(address, &submit).await, 409);
+    host.invalidate_view();
+    status(
+        &exchange(address, &request(address, "POST", "/view", &token, &origin)).await,
+        503,
+    );
+    host.set_generation("generation-2").unwrap();
+    host.shutdown().await;
+    assert!(timeout(DEADLINE, requests.recv()).await.unwrap().is_none());
+    drop(directory);
+}
+
+#[tokio::test]
+async fn tcp_viewport_partial_body_disconnect_timeout_and_bounds() {
+    let (_directory, mut config) = fixture();
+    config.viewport_mode = crate::ViewportMode::Resizable;
+    config.limits.header_timeout = Duration::from_millis(100);
+    let (publisher, feed) = snapshot_feed(128).unwrap();
+    let mut host = start(config, feed).await.unwrap();
+    let mut requests = host.take_viewport_requests().unwrap();
+    publisher.publish(1, Arc::from(*b"{}")).unwrap();
+    host.set_generation("g").unwrap();
+    let address = host.address();
+    let token = token(&host);
+    let origin = format!("Origin: http://{address}\r\n");
+    let claim = exchange(address, &request(address, "POST", "/view", &token, &origin)).await;
+    let info: serde_json::Value =
+        serde_json::from_str(claim.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let controller = info["controller"].as_str().unwrap();
+    let headers = format!(
+        "{origin}X-Bmux-Controller: {controller}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n"
+    );
+    let partial = request(address, "POST", "/viewport", &token, &headers);
+    let mut slow = connect(address, &format!("{partial}{{")).await;
+    status(&read_response(&mut slow).await, 408);
+    let mut disconnected = connect(address, &format!("{partial}{{")).await;
+    disconnected.shutdown().await.unwrap();
+    status(&read_response(&mut disconnected).await, 400);
+    assert!(
+        timeout(Duration::from_millis(30), requests.recv())
+            .await
+            .is_err()
+    );
+    let oversized = format!("{origin}Content-Type: application/json\r\nContent-Length: 513\r\n");
+    status(
+        &exchange(
+            address,
+            &request(address, "POST", "/viewport", &token, &oversized),
+        )
+        .await,
+        413,
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test]
 async fn tcp_full_snapshots_longpoll_and_latest_repair() {
     let (_directory, publisher, host) = host().await;
     let address = host.address();
@@ -180,6 +306,16 @@ async fn tcp_full_snapshots_longpoll_and_latest_repair() {
     let asset = exchange(address, &request(address, "GET", "/", "", "")).await;
     status(&asset, 200);
     assert!(asset.ends_with("<!doctype html><title>fixture</title>"));
+    let stylesheet = exchange(address, &request(address, "GET", "/style.css", "", "")).await;
+    status(&stylesheet, 200);
+    assert!(stylesheet.contains("\r\nContent-Type: text/css; charset=utf-8\r\n"));
+    assert!(stylesheet.contains("style-src 'self';"));
+    assert!(!stylesheet.contains("'unsafe-inline'"));
+    assert!(stylesheet.ends_with("body { margin: 0; }"));
+    status(
+        &exchange(address, &request(address, "GET", "/unlisted.css", "", "")).await,
+        404,
+    );
     host.shutdown().await;
 }
 
@@ -237,13 +373,24 @@ async fn tcp_closed_producer_invalidates_retained_and_waiting_snapshots() {
     .await;
     assert_pending(&mut poll).await;
     drop(publisher);
-    status(&read_response(&mut poll).await, 503);
-    for path in ["/snapshot", "/snapshot?after=99", "/snapshot?after=1"] {
-        status(
-            &exchange(address, &request(address, "GET", path, &token, "")).await,
-            503,
-        );
+    // Either the poll observes feed closure first, or owner cancellation closes TCP first.
+    let mut bytes = Vec::new();
+    let _ = timeout(DEADLINE, poll.read_to_end(&mut bytes))
+        .await
+        .unwrap();
+    if !bytes.is_empty() {
+        status(&String::from_utf8(bytes).unwrap(), 503);
     }
+    timeout(DEADLINE, async {
+        loop {
+            if TcpStream::connect(address).await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     host.shutdown().await;
 }
 

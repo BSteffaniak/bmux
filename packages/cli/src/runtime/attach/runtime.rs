@@ -68,7 +68,13 @@ use crossterm::event::{
 };
 #[cfg(test)]
 use crossterm::event::{EnableBracketedPaste, EnableMouseCapture};
-use crossterm::queue;
+macro_rules! queue {
+    ($($args:tt)*) => {
+        if bmux_attach_pipeline::projection::encoding_terminal() {
+            crossterm::queue!($($args)*)
+        } else { Ok::<(), std::io::Error>(()) }
+    };
+}
 use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
@@ -93,6 +99,13 @@ pub const fn bracketed_paste_enabled(config_enabled: bool) -> bool {
 }
 
 pub trait AttachTerminal: Write {
+    /// Output-only drivers bypass terminal encoding and lifecycle entirely.
+    fn presentation_only(&self) -> bool {
+        false
+    }
+    fn viewport_guard(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        None
+    }
     fn geometry(&self) -> TerminalGeometry;
 
     fn enter_attach_mode(
@@ -2665,6 +2678,51 @@ pub async fn run_session_attach_with_client(
     .await
 }
 
+/// Run an independent output-only local view through the authorized attach path.
+///
+/// # Errors
+/// Returns authorization, provider, viewport, or output delivery failures.
+#[allow(clippy::too_many_arguments)] // Same explicit attach parameters as terminal entry point.
+pub async fn run_session_attach_with_client_headless(
+    client: BmuxClient,
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
+    mut driver: super::headless::HeadlessAttachDriver,
+    observer: super::observer::AttachObserverPublisher,
+) -> Result<AttachRunOutcome> {
+    let provider = super::provider::resolve(target)?;
+    let session = provider
+        .open(
+            None,
+            bmux_client::AttachProviderOpenContext {
+                fallback_client: Some(client),
+                endpoint_connector: Some(std::sync::Arc::new(CliAttachEndpointConnector)),
+            },
+        )
+        .await?;
+    let effective_target = session.target.as_deref().or(target);
+    match session.backend {
+        AttachProviderBackend::Legacy(client) => {
+            Box::pin(run_session_attach_with_terminal_config_observer(
+                client,
+                effective_target,
+                follow,
+                global,
+                kernel_client_factory,
+                &mut driver,
+                None,
+                Some(observer),
+            ))
+            .await
+        }
+        AttachProviderBackend::Session(_) => {
+            anyhow::bail!("native provider headless presentation is unsupported")
+        }
+    }
+}
+
 /// Run the explicitly selected local attach with a read-only full-view observer.
 /// Existing callers retain the original entry point and its behavior.
 pub async fn run_session_attach_with_client_observer(
@@ -2689,7 +2747,7 @@ pub async fn run_session_attach_with_client_observer(
     match session.backend {
         AttachProviderBackend::Legacy(client) => {
             let mut terminal = RealAttachTerminal::new();
-            run_session_attach_with_terminal_config_observer(
+            Box::pin(run_session_attach_with_terminal_config_observer(
                 client,
                 effective_target,
                 follow,
@@ -2698,7 +2756,7 @@ pub async fn run_session_attach_with_client_observer(
                 &mut terminal,
                 None,
                 Some(observer),
-            )
+            ))
             .await
         }
         AttachProviderBackend::Session(_) => anyhow::bail!(
@@ -3638,6 +3696,8 @@ async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?S
     }
 
     let mut view_state = AttachViewState::with_private_presentation(attach_info);
+    view_state.presentation_only = terminal.presentation_only();
+    view_state.viewport_guard = terminal.viewport_guard();
     if let Some(publisher) = observer {
         view_state.set_observer(publisher);
     }
@@ -3729,6 +3789,7 @@ async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?S
 
     let mut layout_revision_rx = view_state.presentation_layouts.subscribe();
     let mut surface_revision_rx = view_state.presentation_surfaces.subscribe();
+    view_state.driver_geometry = Some(terminal.geometry());
     update_attach_viewport_with_geometry(&mut client, &view_state, terminal.geometry()).await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
     maybe_sync_remote_clipboard(
@@ -3815,7 +3876,7 @@ async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?S
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    let mut image_fetch_pending = false;
+    let mut image_fetch_pending = view_state.presentation_only || view_state.observer.is_some();
 
     // Subscribe to the generic retained scene-protocol state so the attach
     // runtime can mark the frame dirty whenever a new scene arrives. Render
@@ -4256,6 +4317,7 @@ async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?S
 
         let _ = view_state.clear_expired_transient_status(Instant::now());
         let geometry = terminal.geometry();
+        view_state.driver_geometry = Some(geometry);
         let selection = bmux_tabs_plugin_api::tabs_local_view::TabSelection {
             context_id: view_state.attached_context_id,
         };
@@ -4711,11 +4773,16 @@ async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?S
             feature = "image-iterm2"
         ))]
         if image_fetch_pending
-            && view_state.host_image_caps.any_supported()
-            && !view_state.dirty.pane_dirty_ids.is_empty()
+            && (view_state.presentation_only
+                || view_state.observer.is_some()
+                || view_state.host_image_caps.any_supported())
         {
             image_fetch_pending = false;
-            let dirty_panes: Vec<Uuid> = view_state.dirty.pane_dirty_ids.iter().copied().collect();
+            let dirty_panes: Vec<Uuid> = if view_state.dirty.pane_dirty_ids.is_empty() {
+                view_state.pane_buffers.keys().copied().collect()
+            } else {
+                view_state.dirty.pane_dirty_ids.iter().copied().collect()
+            };
             let sequences: Vec<u64> = dirty_panes
                 .iter()
                 .map(|id| view_state.image_sequences.get(id).copied().unwrap_or(0))
@@ -5477,6 +5544,21 @@ fn handle_pane_runtime_plugin_event(
             session_id,
             pane_id,
         } if session_id == view_state.attached_id => {
+            view_state
+                .image_execution_incarnations
+                .insert(pane_id, Uuid::new_v4());
+            #[cfg(any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            ))]
+            {
+                view_state.pane_images.remove(&pane_id);
+                view_state.image_sequences.remove(&pane_id);
+            }
+            view_state
+                .dirty
+                .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
             view_state.set_transient_status(
                 format!("pane {} restarted", short_uuid(pane_id)),
                 Instant::now(),
@@ -5684,7 +5766,7 @@ pub async fn retarget_attach_to_context(
         "attach.retarget.start"
     );
     let retarget_service_started = Instant::now();
-    let geometry = current_attach_terminal_geometry();
+    let geometry = selected_attach_geometry(view_state);
     let insets = resolved_attach_viewport_insets(geometry, &view_state.presentation_layouts);
     let attach_info = client
         .retarget_attach_context_with_insets(
@@ -8211,6 +8293,12 @@ fn queue_retained_background_clear(
     };
     let mut wrote = false;
     for rect in rects {
+        bmux_attach_pipeline::projection::record(
+            bmux_attach_pipeline::projection::PaintOperation::Fill {
+                rect: bmux_tui::geometry::Rect::new(rect.x, rect.y, rect.w, rect.h),
+                style: bmux_tui::style::Style::new(),
+            },
+        );
         let blank = " ".repeat(usize::from(rect.w));
         for row in rect.y..rect.y.saturating_add(rect.h) {
             queue!(stdout, MoveTo(rect.x, row), Print(&blank))
@@ -8618,6 +8706,109 @@ impl<'a> AttachAppearanceResolver<'a> {
     }
 }
 
+fn refresh_retained_extensions(
+    view: &mut AttachViewState,
+    layout: &AttachLayoutState,
+    geometry: TerminalGeometry,
+    help: &[String],
+) -> Result<()> {
+    let capabilities = terminal_render_capabilities(view);
+    // Preview authoritative current geometry without advancing committed output.
+    // Stale help/prompt surfaces must not occlude a closed or resized overlay.
+    let current_overlays = [
+        help_overlay_surface(help, geometry).filter(|_| view.help_overlay_open),
+        view.prompt.overlay_surface(geometry),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let mut preview_surfaces = retained_surfaces_from_attach_scene(&layout.scene);
+    preview_surfaces.extend(
+        view.retained_compositor
+            .surfaces()
+            .values()
+            .filter(|surface| view.retained_plugin_surface_ids.contains(&surface.id))
+            .cloned(),
+    );
+    preview_surfaces.extend(current_overlays.iter().map(|surface| {
+        retained_surface_from_attach_surface(surface, RetainedOpacity::Opaque, Vec::new())
+    }));
+    let mut geometry_preview = view.retained_compositor.clone();
+    geometry_preview.replace_surfaces(
+        preview_surfaces,
+        DamageRect::new(0, 0, geometry.cols, geometry.rows),
+        DamageCoalescingPolicy::default(),
+    );
+    let occluders = geometry_preview
+        .content_occluders()
+        .into_iter()
+        .map(|rect| ExtensionRect::new(rect.x, rect.y, rect.w, rect.h))
+        .collect::<Vec<_>>();
+    let mut surfaces = layout
+        .scene
+        .surfaces
+        .iter()
+        .filter(|surface| surface.visible)
+        .map(|surface| {
+            (
+                surface.id,
+                ExtensionRect::new(
+                    surface.rect.x,
+                    surface.rect.y,
+                    surface.rect.w,
+                    surface.rect.h,
+                ),
+                RenderExtensionContext {
+                    capabilities,
+                    surface_role: bmux_plugin::RenderSurfaceRole::Content,
+                    opaque_occluders: occluders.clone(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    for surface in geometry_preview.surfaces().values() {
+        if surfaces.iter().any(|(id, _, _)| *id == surface.id) {
+            continue;
+        }
+        surfaces.push((
+            surface.id,
+            ExtensionRect::new(
+                surface.rect.x,
+                surface.rect.y,
+                surface.rect.w,
+                surface.rect.h,
+            ),
+            RenderExtensionContext {
+                capabilities,
+                surface_role: bmux_plugin::RenderSurfaceRole::Overlay,
+                opaque_occluders: Vec::new(),
+            },
+        ));
+    }
+    for surface in current_overlays {
+        surfaces.retain(|(id, _, _)| *id != surface.id);
+        surfaces.push((
+            surface.id,
+            ExtensionRect::new(
+                surface.rect.x,
+                surface.rect.y,
+                surface.rect.w,
+                surface.rect.h,
+            ),
+            RenderExtensionContext {
+                capabilities,
+                surface_role: bmux_plugin::RenderSurfaceRole::Overlay,
+                opaque_occluders: Vec::new(),
+            },
+        ));
+    }
+    view.prepared_extensions = Some(super::retained_extensions::refresh(
+        &view.presentation_extensions.snapshot(),
+        &surfaces,
+    )?);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Preserve the public render entry point while committing interaction only after flush.
 pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     terminal_writer: &mut W,
@@ -8632,9 +8823,29 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     geometry: TerminalGeometry,
     render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<AttachFrameRenderStats> {
+    view_state.driver_geometry = Some(geometry);
+    // Explicit producer phase: current reduced UI geometry, before capture or
+    // composition. All native/headless/test callers use this preparation entry.
+    refresh_retained_extensions(view_state, layout_state, geometry, help_lines)?;
     let previous = view_state.retained_compositor.clone();
     let observing = view_state.observer.is_some();
-    let (result, operations) = if observing {
+    let (result, _operations) = if view_state.presentation_only {
+        bmux_attach_pipeline::projection::capture_neutral(|| {
+            render_attach_frame_inner(
+                terminal_writer,
+                view_state,
+                layout_state,
+                runtime_appearance,
+                help_lines,
+                help_scroll,
+                damage_config,
+                slow_terminal_write_ms,
+                display_capture,
+                geometry,
+                render_trace,
+            )
+        })
+    } else if observing {
         bmux_attach_pipeline::projection::capture(|| {
             render_attach_frame_inner(
                 terminal_writer,
@@ -8712,9 +8923,6 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     let _ = view_state
         .plugin_pointer_router
         .reconcile(&view_state.retained_compositor);
-    if observing {
-        super::observer::publish_committed(view_state, layout_state, geometry, &operations);
-    }
     acknowledge_plugin_surface_output(view_state);
     result
 }
@@ -8771,11 +8979,6 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     };
     let current_prompt_overlay_surface = view_state.prompt.overlay_surface(geometry);
     let mut frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
-    // Observers receive complete repaired snapshots from the very same output plans.
-    // Full damage ensures removal and content occlusion repair need no alternate retained scene.
-    if view_state.observer.is_some() {
-        frame_damage.mark_full_frame();
-    }
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
@@ -8795,13 +8998,16 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         retained_help_overlay_surface(surface, help_lines, help_scroll, runtime_appearance)
     });
     let prompt_overlay_render = if view_state.prompt.is_active() {
-        let extensions = view_state.presentation_extensions.snapshot();
+        let extensions = view_state
+            .prepared_extensions
+            .as_ref()
+            .expect("entry prepares retained extension intent");
         let prompt_surface = view_state.prompt.overlay_surface(geometry);
         let extension_chrome = prompt_surface.as_ref().is_some_and(|surface| {
             retained_surface_extension_chrome_owned(
                 surface.id,
                 attach_surface_damage_rect(surface),
-                &extensions,
+                extensions,
                 terminal_render_capabilities(view_state),
             )
         });
@@ -8850,7 +9056,7 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    {
+    if bmux_attach_pipeline::projection::encoding_terminal() {
         pending_kitty_state.begin_frame();
         pending_kitty_state.select_protocol(
             &mut frame_bytes,
@@ -8914,7 +9120,10 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         // once per frame. The snapshot is cheap (Arc-clones) and
         // keeps the per-surface loop inside `render_attach_scene`
         // free of registry-lock churn.
-        let extensions = view_state.presentation_extensions.snapshot();
+        let extensions = view_state
+            .prepared_extensions
+            .clone()
+            .expect("entry prepares retained extension intent");
         view_state
             .visual_projection_updates
             .extend(collect_visual_projection_updates(
@@ -8956,6 +9165,9 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
+    // The gate below concerns native raster emission only. Browser images are
+    // fetched independently and materialized by observer::observed_images from
+    // authoritative registry data, even when no terminal protocol is supported.
     if frame_plan.render_scene && view_state.host_image_caps.any_supported() {
         for surface in &layout_state.scene.surfaces {
             let Some(pane_id) = surface.pane_id else {
@@ -8975,25 +9187,27 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
                     .iter()
                     .map(|rect| bmux_tui::geometry::Rect::new(rect.x, rect.y, rect.w, rect.h))
                     .collect::<Vec<_>>();
-                bmux_image::compositor::render_pane_images_clipped(
-                    &mut frame_bytes,
-                    &pane_images,
-                    pane_rect,
-                    &covers,
-                    &view_state.host_image_caps,
-                    &mut pending_kitty_state,
-                )
-                .context("failed composing pane images")?;
+                if !view_state.presentation_only {
+                    bmux_image::compositor::render_pane_images_clipped(
+                        &mut frame_bytes,
+                        &pane_images,
+                        pane_rect,
+                        &covers,
+                        &view_state.host_image_caps,
+                        &mut pending_kitty_state,
+                    )
+                    .context("failed composing pane images")?;
+                }
             }
         }
     }
 
     let previous_cursor_state = cursor_state_before_forced_hide;
     let mut overlay_rendered = false;
-    let retained_extensions = view_state.presentation_extensions.snapshot();
-    for extension in &retained_extensions {
-        extension.refresh_state();
-    }
+    let retained_extensions = view_state
+        .prepared_extensions
+        .clone()
+        .expect("entry prepares retained extension intent");
     let retained_plugin_repaints = if frame_plan.render_scene {
         view_state
             .retained_compositor
@@ -9128,12 +9342,16 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     }
 
     if view_state.help_overlay_open || view_state.prompt.is_active() {
-        apply_attach_cursor_state(
-            &mut frame_bytes,
-            overlay_cursor_state,
-            &mut pending_cursor_state,
-            false,
-        )?;
+        if view_state.presentation_only {
+            pending_cursor_state = overlay_cursor_state;
+        } else {
+            apply_attach_cursor_state(
+                &mut frame_bytes,
+                overlay_cursor_state,
+                &mut pending_cursor_state,
+                false,
+            )?;
+        }
     } else {
         let force_cursor_move = std::mem::take(&mut view_state.force_cursor_move_next_frame);
         let cursor_state = cursor_state.map(|mut cursor| {
@@ -9149,12 +9367,16 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
                 });
             cursor
         });
-        apply_attach_cursor_state(
-            &mut frame_bytes,
-            cursor_state,
-            &mut pending_cursor_state,
-            force_cursor_move,
-        )?;
+        if view_state.presentation_only {
+            pending_cursor_state = cursor_state;
+        } else {
+            apply_attach_cursor_state(
+                &mut frame_bytes,
+                cursor_state,
+                &mut pending_cursor_state,
+                force_cursor_move,
+            )?;
+        }
     }
 
     #[cfg(any(
@@ -9170,8 +9392,33 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     }
 
     let terminal_write_started_at = Instant::now();
-    let write_result = bmux_attach_pipeline::terminal::write_frame(terminal_writer, &frame_bytes)
-        .context("failed writing or flushing attach frame");
+    let write_result = if view_state.observer.is_some() || view_state.presentation_only {
+        let cursor = view_state.last_cursor_state;
+        view_state.last_cursor_state = pending_cursor_state;
+        let operations = bmux_attach_pipeline::projection::staged_operations();
+        let headless = view_state.presentation_only;
+        let delivered = super::observer::deliver_prepared(
+            view_state,
+            layout_state,
+            geometry,
+            &operations,
+            || {
+                if headless {
+                    Ok(())
+                } else {
+                    bmux_attach_pipeline::terminal::write_frame(terminal_writer, &frame_bytes)
+                        .context("failed writing or flushing attach frame")
+                }
+            },
+        );
+        if delivered.is_err() {
+            view_state.last_cursor_state = cursor;
+        }
+        delivered
+    } else {
+        bmux_attach_pipeline::terminal::write_frame(terminal_writer, &frame_bytes)
+            .context("failed writing or flushing attach frame")
+    };
     if let Err(error) = write_result {
         #[cfg(any(
             feature = "image-sixel",
@@ -9798,8 +10045,14 @@ pub async fn update_attach_viewport(
     client: &mut StreamingBmuxClient,
     view_state: &AttachViewState,
 ) -> std::result::Result<(), ClientError> {
-    update_attach_viewport_with_geometry(client, view_state, current_attach_terminal_geometry())
-        .await
+    update_attach_viewport_with_geometry(
+        client,
+        view_state,
+        view_state
+            .driver_geometry
+            .unwrap_or_else(current_attach_terminal_geometry),
+    )
+    .await
 }
 
 pub async fn update_attach_viewport_with_geometry(
@@ -9808,6 +10061,13 @@ pub async fn update_attach_viewport_with_geometry(
     geometry: TerminalGeometry,
 ) -> std::result::Result<(), ClientError> {
     if geometry.cols == 0 || geometry.rows == 0 {
+        return Ok(());
+    }
+    if view_state
+        .viewport_guard
+        .as_ref()
+        .is_some_and(|guard| !guard())
+    {
         return Ok(());
     }
     let insets = resolved_attach_viewport_insets(geometry, &view_state.presentation_layouts);
@@ -10677,7 +10937,15 @@ async fn hydrate_attach_state_from_snapshot_mode(
     }
 
     if let Some(layout_state) = view_state.cached_layout_state.as_ref() {
-        resize_attach_grids_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
+        let geometry = view_state
+            .driver_geometry
+            .unwrap_or_else(current_attach_terminal_geometry);
+        resize_attach_grids_for_scene_with_size(
+            &mut view_state.pane_buffers,
+            &layout_state.scene,
+            geometry.cols,
+            geometry.rows,
+        );
     }
     let structured_hydrated = hydrate_attach_structured_grid_snapshots(
         client,
@@ -10747,7 +11015,15 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
             .pane_buffers
             .insert(*pane_id, PaneRenderBuffer::default());
     }
-    resize_attach_grids_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
+    let geometry = view_state
+        .driver_geometry
+        .unwrap_or_else(current_attach_terminal_geometry);
+    resize_attach_grids_for_scene_with_size(
+        &mut view_state.pane_buffers,
+        &layout_state.scene,
+        geometry.cols,
+        geometry.rows,
+    );
 
     let structured_hydrated =
         hydrate_attach_structured_grid_snapshots(client, view_state, pane_ids.to_vec()).await?;
@@ -10823,17 +11099,14 @@ pub fn attach_layout_requires_snapshot_hydration(
     bmux_attach_pipeline::reconcile::attach_layout_requires_snapshot_hydration(previous, next)
 }
 
+fn selected_attach_geometry(view: &AttachViewState) -> TerminalGeometry {
+    view.driver_geometry
+        .unwrap_or_else(current_attach_terminal_geometry)
+}
+
 fn current_attach_terminal_geometry() -> TerminalGeometry {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     TerminalGeometry { cols, rows }
-}
-
-pub fn resize_attach_grids_for_scene(
-    pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
-    scene: &AttachScene,
-) {
-    let geometry = current_attach_terminal_geometry();
-    resize_attach_grids_for_scene_with_size(pane_buffers, scene, geometry.cols, geometry.rows);
 }
 
 pub fn resize_attach_grids_for_scene_with_size(
@@ -11389,6 +11662,7 @@ pub async fn handle_attach_terminal_event(
 ) -> Result<AttachLoopControl> {
     let now = terminal_event.received_at;
     let geometry = terminal_event.geometry;
+    view_state.driver_geometry = Some(geometry);
     let normalized_event = terminal_event.normalized;
     let raw_event = terminal_event.raw;
     match &normalized_event {
@@ -11435,6 +11709,7 @@ pub async fn handle_attach_terminal_event(
         // Immutable pins keep their coordinate identity while live history may
         // reflow. Capture logical endpoints before changing presentation size.
         prepare_attach_selections_for_resize(view_state);
+        view_state.driver_geometry = Some(geometry);
         update_attach_viewport_with_geometry(client, view_state, geometry).await?;
     }
 
@@ -15617,6 +15892,170 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_and_headless_same_viewport_share_prepared_frame_and_fail_transactionally() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let make_state = || {
+            let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+                context_id: None,
+                session_id,
+                can_write: true,
+            });
+            let layout = retry_test_layout(&mut state, pane_id, session_id);
+            state.presentation_extensions = Arc::new(bmux_plugin::RenderExtensionRegistry::new());
+            state
+                .pane_buffers
+                .get_mut(&pane_id)
+                .unwrap()
+                .terminal_grid
+                .process(b"same output");
+            (state, layout)
+        };
+        let (mut terminal, terminal_layout) = make_state();
+        let (publisher, observed) = super::super::observer::attach_observer_channel();
+        terminal.set_observer(publisher);
+        render_observed_test_frame(&mut terminal, &terminal_layout);
+        let (mut headless, headless_layout) = make_state();
+        headless.presentation_only = true;
+        let (publisher, output) = super::super::observer::attach_observer_channel();
+        headless.set_observer(publisher);
+        let mut forbidden_writer = FailingWriter { fail_flush: false };
+        render_attach_frame_to_writer(
+            &mut forbidden_writer,
+            &mut headless,
+            &headless_layout,
+            &RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            TerminalGeometry { cols: 80, rows: 24 },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            observed.latest().unwrap().prepared,
+            output.latest().unwrap().prepared
+        );
+        let committed = output.latest().unwrap();
+        headless
+            .observer
+            .as_mut()
+            .unwrap()
+            .set_delivery(|_| anyhow::bail!("serialization rejected"));
+        headless
+            .dirty
+            .mark_full_frame(AttachDirtySource::ManualRedraw);
+        assert!(
+            render_attach_frame_to_writer(
+                &mut forbidden_writer,
+                &mut headless,
+                &headless_layout,
+                &RuntimeAppearance::default(),
+                &[],
+                0,
+                &bmux_config::DamageBehaviorConfig::default(),
+                u64::MAX,
+                &mut DisplayCaptureFanout::default(),
+                TerminalGeometry { cols: 80, rows: 24 },
+                None
+            )
+            .is_err()
+        );
+        assert!(Arc::ptr_eq(&committed, &output.latest().unwrap()));
+    }
+
+    #[test]
+    fn selected_driver_viewport_survives_retarget_geometry_selection() {
+        let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+            session_id: Uuid::new_v4(),
+            context_id: None,
+            can_write: true,
+        });
+        for geometry in [
+            TerminalGeometry {
+                cols: 100,
+                rows: 30,
+            },
+            TerminalGeometry { cols: 60, rows: 16 },
+            TerminalGeometry {
+                cols: 120,
+                rows: 36,
+            },
+        ] {
+            state.driver_geometry = Some(geometry);
+            // Retargeting changes the execution target, not the selected viewport.
+            state.attached_id = Uuid::new_v4();
+            let selected = selected_attach_geometry(&state);
+            assert_eq!(
+                (selected.cols, selected.rows),
+                (geometry.cols, geometry.rows)
+            );
+        }
+    }
+
+    #[test]
+    fn extension_query_preserves_unchanged_prompt_on_terminal() {
+        let session = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+            session_id: session,
+            context_id: None,
+            can_write: true,
+        });
+        let layout = retry_test_layout(&mut state, pane, session);
+        install_bundled_render_extensions(&mut state);
+        state.prompt.enqueue_internal(
+            PromptRequest::search_select(
+                "Find Tab",
+                vec![PromptOption::new("tab-2", "default/tab-2")],
+            ),
+            super::super::prompt_ui::AttachInternalPromptAction::QuitSession,
+        );
+        let render = |state: &mut AttachViewState| {
+            let mut bytes = Vec::new();
+            render_attach_frame_to_writer(
+                &mut bytes,
+                state,
+                &layout,
+                &RuntimeAppearance::default(),
+                &[],
+                0,
+                &bmux_config::DamageBehaviorConfig::default(),
+                u64::MAX,
+                &mut DisplayCaptureFanout::default(),
+                TerminalGeometry { cols: 80, rows: 24 },
+                None,
+            )
+            .unwrap();
+            bytes
+        };
+        let mut screen = bmux_terminal_grid::TerminalGridStream::new(
+            80,
+            24,
+            bmux_terminal_grid::GridLimits::default(),
+        )
+        .unwrap();
+        screen.process(&render(&mut state));
+        assert!(bmux_terminal_grid::visible_text(screen.grid(), 0, 24).contains("default/tab-2"));
+        state
+            .pane_buffers
+            .get_mut(&pane)
+            .unwrap()
+            .terminal_grid
+            .process(b"\x1b[2J\x1b[HNAV_RESULT_MARKER");
+        state
+            .dirty
+            .mark_pane_dirty(pane, AttachDirtySource::PaneOutput);
+        state
+            .dirty
+            .mark_extension_dirty(AttachDirtySource::PluginCommand);
+        screen.process(&render(&mut state));
+        assert!(bmux_terminal_grid::visible_text(screen.grid(), 0, 24).contains("default/tab-2"));
+    }
+
     fn render_observed_test_frame(state: &mut AttachViewState, layout: &AttachLayoutState) {
         render_attach_frame_to_writer(
             &mut Vec::new(),
@@ -15704,6 +16143,7 @@ mod tests {
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 0, 8, 1)),
             clip_rect: None,
+            metadata: None,
             interactive_regions: Vec::new(),
             accepts_input: false,
             layer: 10,
@@ -15943,6 +16383,116 @@ mod tests {
             );
             verify_frame_retry(&mut state, &layout);
         }
+    }
+
+    #[cfg(feature = "image-sixel")]
+    fn assert_single_observed_image(observer: &super::super::observer::AttachObserver) {
+        assert_eq!(
+            observer
+                .latest()
+                .unwrap()
+                .prepared
+                .image_scene()
+                .placements()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(feature = "image-sixel")]
+    fn observed_test_image(
+        observer: &super::super::observer::AttachObserver,
+    ) -> bmux_tui::image::ImagePlacement {
+        observer
+            .latest()
+            .unwrap()
+            .prepared
+            .image_scene()
+            .placements()
+            .next()
+            .unwrap()
+            .clone()
+    }
+
+    #[cfg(feature = "image-sixel")]
+    #[test]
+    fn headless_images_do_not_require_terminal_protocol_advertisement() {
+        let session = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+            session_id: session,
+            context_id: None,
+            can_write: true,
+        });
+        let layout = retry_test_layout(&mut state, pane, session);
+        state.presentation_only = true;
+        assert!(!state.host_image_caps.any_supported());
+        state.pane_images.insert(
+            pane,
+            vec![bmux_attach_image_protocol::AttachPaneImage {
+                id: 42,
+                protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
+                raw_data: b"\"1;1;1;6#1;2;100;0;0~".to_vec(),
+                compression: bmux_attach_image_protocol::CompressionId::None,
+                position_row: 0,
+                position_col: 3,
+                cell_rows: 1,
+                cell_cols: 1,
+                pixel_width: 1,
+                pixel_height: 6,
+            }],
+        );
+        let (publisher, observer) = super::super::observer::attach_observer_channel();
+        state.set_observer(publisher);
+        render_attach_frame_to_writer(
+            &mut FailingWriter { fail_flush: false },
+            &mut state,
+            &layout,
+            &RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            TerminalGeometry { cols: 80, rows: 24 },
+            None,
+        )
+        .unwrap();
+        assert_single_observed_image(&observer);
+        assert!(!state.host_image_caps.any_supported());
+        let initial = observed_test_image(&observer);
+        state
+            .pane_buffers
+            .get_mut(&pane)
+            .unwrap()
+            .expected_stream_start = Some(900);
+        state.pane_images.get_mut(&pane).unwrap()[0].position_col = 9;
+        state.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
+        render_observed_test_frame(&mut state, &layout);
+        let moved = observed_test_image(&observer);
+        assert_eq!(initial.key, moved.key);
+        assert_ne!(initial.destination, moved.destination);
+        state.pane_images.get_mut(&pane).unwrap()[0].raw_data = b"\"1;1;1;6#1;2;0;100;0~".to_vec();
+        state.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
+        render_observed_test_frame(&mut state, &layout);
+        let replaced = observed_test_image(&observer);
+        assert_eq!(moved.key, replaced.key);
+        assert_ne!(moved.payload, replaced.payload);
+        let retained = state.pane_images[&pane].clone();
+        handle_pane_runtime_plugin_event(
+            pane_events::PaneEvent::Restarted {
+                session_id: session,
+                pane_id: pane,
+            },
+            &mut state,
+            &mut false,
+        );
+        assert!(!state.pane_images.contains_key(&pane));
+        state.pane_images.insert(pane, retained);
+        state.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
+        render_observed_test_frame(&mut state, &layout);
+        let restarted = observed_test_image(&observer);
+        assert_ne!(replaced.key, restarted.key);
     }
 
     #[cfg(feature = "image-sixel")]
@@ -16735,6 +17285,7 @@ mod tests {
                 2, 2, 8, 4,
             )),
             clip_rect: None,
+            metadata: None,
             interactive_regions: Vec::new(),
             accepts_input: false,
             layer: 0,
@@ -18078,6 +18629,7 @@ mod tests {
                             revision,
                             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 0, 100, 1)),
                             clip_rect: Some(ExtensionRect::new(0, 0, 100, 1)),
+                            metadata: None,
                             interactive_regions: Vec::new(),
                             accepts_input: false,
                             layer: 0,

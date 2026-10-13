@@ -1,4 +1,4 @@
-//! Domain-neutral, bounded read-only browser hosting on an ephemeral loopback port.
+//! Domain-neutral, bounded browser hosting on an ephemeral loopback port.
 //! Encoded snapshots are opaque: callers own presentation semantics and serialization.
 #![cfg(unix)]
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
@@ -7,6 +7,8 @@
 mod acceptance;
 mod assets;
 mod http;
+mod viewport;
+pub use viewport::{ViewControl, ViewportMode, ViewportRequest, ViewportRequests};
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -78,6 +80,7 @@ pub struct HostConfig {
     pub asset_directory: PathBuf,
     pub assets: Vec<Asset>,
     pub limits: Limits,
+    pub viewport_mode: ViewportMode,
 }
 
 impl HostConfig {
@@ -87,6 +90,7 @@ impl HostConfig {
             asset_directory,
             assets: Asset::browser_defaults(),
             limits: Limits::default(),
+            viewport_mode: ViewportMode::Observer,
         }
     }
 }
@@ -175,9 +179,35 @@ pub struct HostHandle {
     token: String,
     task: Option<JoinHandle<()>>,
     stop: watch::Sender<bool>,
+    viewport_requests: Option<ViewportRequests>,
+    viewport: Arc<viewport::Viewport>,
 }
 
 impl HostHandle {
+    /// Restricted cloneable output-generation control; no bearer or lifecycle authority.
+    #[must_use]
+    pub fn view_control(&self) -> ViewControl {
+        ViewControl::new(Arc::clone(&self.viewport))
+    }
+
+    /// Updates opaque authoritative generation after successful output publication.
+    ///
+    /// # Errors
+    /// Rejects empty, non-ASCII, or over-128-byte generations.
+    pub fn set_generation(&self, generation: &str) -> io::Result<()> {
+        self.viewport.set_generation(generation)
+    }
+
+    /// Revokes controller ownership and pending geometry on source loss.
+    pub fn invalidate_view(&self) {
+        self.viewport.invalidate();
+    }
+
+    /// Takes the one latest-only viewport receiver; dropping it disables mutation transport.
+    pub fn take_viewport_requests(&mut self) -> Option<ViewportRequests> {
+        self.viewport_requests.take()
+    }
+
     #[must_use]
     pub const fn address(&self) -> SocketAddr {
         self.address
@@ -191,6 +221,7 @@ impl HostHandle {
 
     /// Stops accepting, cancels all in-flight reads/polls/writes, and waits for cleanup.
     pub async fn shutdown(mut self) {
+        self.viewport.close();
         self.stop.send_replace(true);
         if let Some(task) = self.task.take() {
             let _ = task.await;
@@ -200,6 +231,7 @@ impl HostHandle {
 
 impl Drop for HostHandle {
     fn drop(&mut self) {
+        self.viewport.close();
         self.stop.send_replace(true);
         if let Some(task) = self.task.take() {
             task.abort();
@@ -225,7 +257,10 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
     let token: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let address = listener.local_addr()?;
+    let (viewport, viewport_requests) = viewport::Viewport::new(config.viewport_mode);
+    let viewport = Arc::new(viewport);
     let state = Arc::new(http::State {
+        viewport: Arc::clone(&viewport),
         assets,
         limits: config.limits,
         token: token.clone(),
@@ -234,11 +269,13 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
     });
     let (stop, mut stopped) = watch::channel(false);
     let task = tokio::spawn(async move {
+        let mut feed = feed;
         let mut connections = JoinSet::new();
         loop {
             tokio::select! {
                 biased;
                 _ = stopped.changed() => break,
+                result = feed.receiver.changed() => { if result.is_err() { break; } },
                 Some(_) = connections.join_next(), if !connections.is_empty() => {},
                 accepted = listener.accept() => {
                     let Ok((stream, peer)) = accepted else { break; };
@@ -252,10 +289,13 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
                 }
             }
         }
+        state.viewport.close();
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     });
     Ok(HostHandle {
+        viewport_requests: Some(viewport_requests),
+        viewport,
         address,
         token,
         task: Some(task),

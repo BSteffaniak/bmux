@@ -120,6 +120,15 @@ pub struct PluginSurfaceRegion {
     pub endpoint: Option<crate::AttachInputEndpoint>,
 }
 
+/// Optional caller-owned scene descriptions in surface-local cell geometry.
+/// None is unavailable, while Some(empty) is an explicitly empty producer scene.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PluginSurfaceMetadata {
+    pub selection: Option<bmux_tui::selection::SelectionScene>,
+    pub semantics: Option<bmux_tui::semantic::SemanticScene>,
+    pub text: BTreeMap<bmux_tui::selection::SelectionContentId, String>,
+}
+
 /// Complete retained visual state for one independent surface.
 #[allow(clippy::struct_excessive_bools)] // Independent visibility, opacity, modal, and input policies.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +149,7 @@ pub struct PluginSurface {
     pub modal: bool,
     pub visible: bool,
     pub ops: Vec<RenderOp>,
+    pub metadata: Option<PluginSurfaceMetadata>,
 }
 
 impl PluginSurface {
@@ -163,6 +173,7 @@ impl PluginSurface {
             modal: false,
             visible: true,
             ops,
+            metadata: None,
         }
     }
 
@@ -313,6 +324,9 @@ pub enum PluginSurfacePublishError {
         id: PluginLayoutId,
     },
     ConflictingRevision,
+    InvalidMetadata {
+        id: PluginSurfaceId,
+    },
 }
 
 impl std::fmt::Display for PluginSurfacePublishError {
@@ -388,6 +402,9 @@ impl std::fmt::Display for PluginSurfacePublishError {
                 "layout target '{}:{}' belongs to another owner",
                 id.owner_plugin_id, id.local_id
             ),
+            Self::InvalidMetadata { id } => {
+                write!(formatter, "invalid caller metadata for {}", id.local_id)
+            }
             Self::ConflictingRevision => {
                 formatter.write_str("surface revision conflicts with retained owner state")
             }
@@ -582,6 +599,16 @@ impl PluginSurfaceRegistry {
             .snapshots
             .write()
             .map_err(|_| PluginSurfacePublishError::ConflictingRevision)?;
+        // Admit the producer's original revision and source ranges before rebasing
+        // freshness. Advancing cannot turn invalid source metadata into valid input.
+        validate_snapshot(
+            owner_plugin_id,
+            &snapshot,
+            self.maximum_surfaces_per_owner,
+            self.maximum_retained_items_per_surface,
+            self.maximum_text_bytes,
+            self.maximum_snapshot_bytes,
+        )?;
         if let Some(current) = snapshots.get(owner_plugin_id)
             && snapshot.revision <= current.revision
             && snapshot != *current
@@ -589,6 +616,22 @@ impl PluginSurfaceRegistry {
             snapshot.revision = current.revision.saturating_add(1).max(1);
             for surface in &mut snapshot.surfaces {
                 surface.revision = snapshot.revision;
+                if let Some(metadata) = &mut surface.metadata
+                    && let Some(selection) = metadata.selection.take()
+                {
+                    let mut rebased = bmux_tui::selection::SelectionScene::new();
+                    for scope in selection.scopes() {
+                        let mut scope = scope.clone();
+                        scope.revision = snapshot.revision;
+                        rebased.push_scope(scope);
+                    }
+                    for fragment in selection.fragments() {
+                        let mut fragment = fragment.clone();
+                        fragment.revision = snapshot.revision;
+                        rebased.push_fragment(fragment);
+                    }
+                    metadata.selection = Some(rebased);
+                }
             }
         }
         validate_snapshot(
@@ -737,6 +780,11 @@ fn validate_snapshot(
                 .saturating_add(std::mem::size_of::<RenderOp>())
                 .saturating_add(text_bytes);
         }
+        snapshot_bytes = snapshot_bytes.saturating_add(validate_surface_metadata(
+            surface,
+            maximum_retained_items_per_surface,
+            maximum_text_bytes,
+        )?);
         if snapshot_bytes > maximum_snapshot_bytes {
             return Err(PluginSurfacePublishError::SnapshotTooLarge {
                 bytes: snapshot_bytes,
@@ -789,6 +837,128 @@ fn validate_snapshot(
     Ok(())
 }
 
+fn validate_surface_metadata(
+    surface: &PluginSurface,
+    maximum_retained_items_per_surface: usize,
+    maximum_text_bytes: usize,
+) -> Result<usize, PluginSurfacePublishError> {
+    let Some(metadata) = &surface.metadata else {
+        return Ok(0);
+    };
+    let selection = metadata.selection.as_ref();
+    let count = selection
+        .map_or(0, |scene| {
+            scene.scopes().len().saturating_add(scene.fragments().len())
+        })
+        .saturating_add(
+            metadata
+                .semantics
+                .as_ref()
+                .map_or(0, |scene| scene.regions().len()),
+        )
+        .saturating_add(metadata.text.len());
+    if count > maximum_retained_items_per_surface {
+        return Err(PluginSurfacePublishError::TooManyRetainedItems {
+            id: surface.id.clone(),
+            count,
+            maximum: maximum_retained_items_per_surface,
+        });
+    }
+    if metadata.text.len() > 4096
+        || metadata
+            .text
+            .iter()
+            .any(|(id, text)| id.as_str().len() > 960 || text.len() > 65_536)
+        || metadata.text.values().map(String::len).sum::<usize>() > 1_048_576
+    {
+        return Err(PluginSurfacePublishError::InvalidMetadata {
+            id: surface.id.clone(),
+        });
+    }
+    if selection.is_some_and(|scene| {
+        scene.validate().is_err()
+            || scene.scopes().iter().any(|scope| {
+                scope.revision != surface.revision
+                    || scope.parent.as_ref().is_some_and(|id| {
+                        scene
+                            .scopes()
+                            .iter()
+                            .find(|parent| &parent.id == id)
+                            .is_none_or(|parent| scope.area.intersection(parent.area) != scope.area)
+                    })
+            })
+            || scene.fragments().iter().any(|fragment| {
+                metadata.text.get(&fragment.content_id).is_none_or(|text| {
+                    fragment.revision != surface.revision
+                        || scene
+                            .scopes()
+                            .iter()
+                            .find(|scope| scope.id == fragment.scope_id)
+                            .is_none_or(|scope| {
+                                fragment.area.intersection(scope.area) != fragment.area
+                            })
+                        || fragment.source_range.start > fragment.source_range.end
+                        || !text.is_char_boundary(fragment.source_range.start)
+                        || !text.is_char_boundary(fragment.source_range.end)
+                        || fragment.word_range.as_ref().is_some_and(|range| {
+                            !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end)
+                        })
+                        || fragment.line_range.as_ref().is_some_and(|range| {
+                            !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end)
+                        })
+                })
+            })
+    }) {
+        return Err(PluginSurfacePublishError::InvalidMetadata {
+            id: surface.id.clone(),
+        });
+    }
+    let bytes = metadata_bytes(metadata);
+    if bytes > maximum_text_bytes {
+        return Err(PluginSurfacePublishError::TextTooLong {
+            id: surface.id.clone(),
+            bytes,
+            maximum: maximum_text_bytes,
+        });
+    }
+    Ok(bytes.saturating_add(count.saturating_mul(256)))
+}
+
+fn metadata_bytes(metadata: &PluginSurfaceMetadata) -> usize {
+    let selection = metadata.selection.as_ref();
+    metadata
+        .text
+        .iter()
+        .map(|(id, text)| id.as_str().len().saturating_add(text.len()))
+        .sum::<usize>()
+        .saturating_add(selection.map_or(0, |scene| {
+            scene
+                .scopes()
+                .iter()
+                .map(|scope| {
+                    scope.id.as_str().len()
+                        + scope.parent.as_ref().map_or(0, |id| id.as_str().len())
+                })
+                .sum::<usize>()
+                + scene
+                    .fragments()
+                    .iter()
+                    .map(|fragment| {
+                        fragment.id.as_str().len()
+                            + fragment.scope_id.as_str().len()
+                            + fragment.content_id.as_str().len()
+                    })
+                    .sum::<usize>()
+        }))
+        .saturating_add(metadata.semantics.as_ref().map_or(0, |scene| {
+            scene
+                .regions()
+                .iter()
+                .map(|region| region.id.len() + region.role.len())
+                .sum::<usize>()
+        }))
+}
+
 fn render_op_text_bytes(op: &RenderOp) -> usize {
     match op {
         RenderOp::TextRun { text, .. } => text.len(),
@@ -828,12 +998,135 @@ mod tests {
     use super::*;
     use crate::RenderStyle;
 
+    #[test]
+    fn metadata_distinguishes_unavailable_empty_and_validated_source_ranges() {
+        use bmux_tui::selection::{SelectionScene, SelectionScope, plain_text_fragments};
+        let mut surface = surface("metadata-owner", "label", Uuid::new_v4());
+        assert_eq!(
+            validate_surface_metadata(&surface, 4096, 65_536).unwrap(),
+            0
+        );
+        surface.metadata = Some(PluginSurfaceMetadata {
+            selection: Some(SelectionScene::new()),
+            semantics: Some(bmux_tui::semantic::SemanticScene::new()),
+            text: BTreeMap::new(),
+        });
+        assert!(validate_surface_metadata(&surface, 4096, 65_536).is_ok());
+        let metadata = surface.metadata.as_mut().unwrap();
+        let scene = metadata.selection.as_mut().unwrap();
+        scene.push_scope(
+            SelectionScope::new("scope", bmux_tui::geometry::Rect::new(0, 0, 2, 1)).revision(1),
+        );
+        for fragment in plain_text_fragments(
+            "scope",
+            "text",
+            bmux_tui::geometry::Rect::new(0, 0, 2, 1),
+            0,
+            "界",
+            0,
+            1,
+        ) {
+            scene.push_fragment(fragment);
+        }
+        metadata.text.insert("text".into(), "界".to_owned());
+        assert!(validate_surface_metadata(&surface, 4096, 65_536).is_ok());
+        surface
+            .metadata
+            .as_mut()
+            .unwrap()
+            .text
+            .insert("text".into(), "x".to_owned());
+        assert!(matches!(
+            validate_surface_metadata(&surface, 4096, 65_536),
+            Err(PluginSurfacePublishError::InvalidMetadata { .. })
+        ));
+    }
+
+    #[test]
+    fn advancing_rebases_valid_metadata_without_repairing_invalid_source() {
+        use bmux_tui::selection::{SelectionScene, SelectionScope, plain_text_fragments};
+        let registry = PluginSurfaceRegistry::new(2);
+        let mut label = surface("metadata-owner", "label", Uuid::new_v4());
+        let mut selection = SelectionScene::new();
+        selection.push_scope(
+            SelectionScope::new("label", bmux_tui::geometry::Rect::new(0, 0, 2, 1)).revision(1),
+        );
+        for fragment in plain_text_fragments(
+            "label",
+            "source",
+            bmux_tui::geometry::Rect::new(0, 0, 2, 1),
+            0,
+            "界",
+            0,
+            1,
+        ) {
+            selection.push_fragment(fragment);
+        }
+        label.metadata = Some(PluginSurfaceMetadata {
+            selection: Some(selection),
+            semantics: None,
+            text: BTreeMap::from([("source".into(), "界".to_owned())]),
+        });
+        registry
+            .publish(
+                "metadata-owner",
+                PluginSurfaceSnapshot {
+                    revision: 1,
+                    surfaces: vec![label.clone()],
+                },
+            )
+            .unwrap();
+        label.layer += 1;
+        registry
+            .publish_advancing(
+                "metadata-owner",
+                PluginSurfaceSnapshot {
+                    revision: 1,
+                    surfaces: vec![label.clone()],
+                },
+            )
+            .unwrap();
+        let committed = registry.owner_snapshot("metadata-owner").unwrap();
+        assert_eq!(committed.revision, 2);
+        let metadata = committed.surfaces[0].metadata.as_ref().unwrap();
+        let selection = metadata.selection.as_ref().unwrap();
+        assert!(selection.scopes().iter().all(|scope| scope.revision == 2));
+        assert!(
+            selection
+                .fragments()
+                .iter()
+                .all(|fragment| fragment.revision == 2)
+        );
+        assert_eq!(selection.fragments()[0].source_range, 0..3);
+        label
+            .metadata
+            .as_mut()
+            .unwrap()
+            .text
+            .insert("source".into(), "x".to_owned());
+        assert!(matches!(
+            registry.publish_advancing(
+                "metadata-owner",
+                PluginSurfaceSnapshot {
+                    revision: 1,
+                    surfaces: vec![label],
+                }
+            ),
+            Err(PluginSurfacePublishError::InvalidMetadata { .. })
+        ));
+        assert_eq!(
+            registry.owner_snapshot("metadata-owner").unwrap(),
+            committed
+        );
+    }
+
     fn surface(owner: &str, local: &str, retained_id: Uuid) -> PluginSurface {
         PluginSurface {
             id: PluginSurfaceId::new(owner, local, retained_id),
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(1, 2, 3, 4)),
             clip_rect: None,
+            metadata: None,
             interactive_regions: Vec::new(),
             accepts_input: false,
             layer: 1,

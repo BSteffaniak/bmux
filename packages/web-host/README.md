@@ -1,6 +1,6 @@
 # bmux_web_host
 
-Reusable **Unix-native**, read-only loopback HTTP hosting for opaque immutable encoded
+Reusable **Unix-native** loopback HTTP hosting for opaque immutable encoded
 presentation snapshots. No renderer, terminal, attach, CLI or plugin dependencies.
 This crate neither builds browser code nor invents WASM output.
 
@@ -77,15 +77,60 @@ external same-origin scripts plus `wasm-unsafe-eval`, same-origin connections/st
 self/blob/data images, no forms/base/frame ancestors. Browser lane must use external
 scripts/styles (or set styling through Canvas); inline scripts/styles are not supported.
 
-Strict HTTP/1.1 GET-only subset; duplicate headers, folded headers, transfer encoding,
-nonzero bodies, upgrades, malformed paths and pipelined requests are rejected.
+Strict HTTP/1.1 subset; duplicate headers, folded headers, transfer encoding,
+unexpected bodies, upgrades, malformed paths and pipelined GET requests are rejected.
 Every response closes its connection. Headers are byte/count bounded with a read
 deadline; full-response writes have a deadline (slow consumers are disconnected).
 Connection count, poll duration, snapshot bytes, per-file bytes and total asset bytes
 have configured budgets and hard ceilings. There are no unbounded queues or detached
 connection tasks. Shutdown stops the listener, aborts/drains all connection tasks;
 Drop requests shutdown and aborts the owning task, whose JoinSet cancels its children.
-Dropping the caller's publisher closes the watch feed; caller should also stop the host.
+Dropping the caller's publisher closes the watch feed and stops the host and its children.
+
+## Optional viewport control
+
+`HostConfig::new` defaults to `ViewportMode::Observer`. `Resizable` enables only
+neutral geometry transport; product authorization and effects remain caller-owned.
+After publishing successful output, call `host.set_generation(&generation)` with
+an opaque 1–128 byte printable ASCII identity. Before that, control is unavailable.
+`host.invalidate_view()` revokes the lease and pending requests on source loss.
+
+`host.view_control()` provides a cloneable `ViewControl` exposing only
+`set_generation` and `invalidate_view`, suitable for an owned output delivery
+closure without exposing the bootstrap capability or lifecycle authority.
+
+All control requests require bearer authentication, exact Host and an explicit exact
+Origin (and reject foreign Fetch-Site). `POST /view` with no body claims the first
+controller. It returns JSON `{protocol_version:1, generation, viewport_allowed, controller, lease_ms}`;
+clients must reject unsupported protocol versions;
+additional viewers remain mirrors (`viewport_allowed:false`, `controller:null`).
+The generation is authoritative output identity, not a lease ID. The controller is
+a fresh independent random secret; never log or persist it. Renew every 10 seconds
+by repeating `POST /view` with `X-Bmux-Controller`. The lease lasts 30 seconds;
+`DELETE /view` with the same header releases it. A disconnected browser loses its
+lease after inactivity; reconnect with the same controller before expiry preserves
+ownership and request ordering. After losing a lease, discard the controller and
+claim again without the header. Existing viewers cannot resize a live controller.
+
+`POST /viewport` requires `X-Bmux-Controller`, `Content-Type: application/json` and
+an exact Content-Length at most 512 bytes. Body is strictly
+`{generation:string,request_id:decimal_u64_string,cols:u16,rows:u16}`. Dimensions
+must be nonzero, at most 262144 cells. Request IDs increase strictly for the lease,
+including across reconnect; no leading zeros. Accepted resize submissions are
+limited to 20/sec (429 means retry with the same ID); stale generation/lease/ID
+returns 409. No command, terminal-input, or arbitrary application endpoint exists.
+
+Take the one receiver with `host.take_viewport_requests()`. `recv().await` returns
+the latest request, skipping intermediate values without queue growth. Check
+`requests.is_current(&request)` and the application's authoritative generation
+immediately before the effect. A cloned `ViewControl` also exposes
+`is_current(&request) -> bool` for revalidation when an asynchronous driver
+consumes an enqueued request, before its native sizing effect. For short synchronous effects,
+`requests.with_current(&request, || effect())` pins current lease/generation while
+running the closure (do not call back into the host). Async effects must revalidate
+at their actual application point. Requests contain private owner identity so a
+queued old-owner request is invalid after transfer even if generation is unchanged.
+Drop/shutdown/producer closure invalidate ownership and wake the receiver closed.
 
 ## Validation ownership
 

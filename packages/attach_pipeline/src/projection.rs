@@ -26,6 +26,33 @@ pub enum PaintOperation {
     },
 }
 
+thread_local! {
+    static ENCODE_TERMINAL: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether synchronous composition should lower terminal control bytes.
+#[must_use]
+pub fn encoding_terminal() -> bool {
+    ENCODE_TERMINAL.with(std::cell::Cell::get)
+}
+
+/// Run the same lowering plans without invoking terminal encoders.
+///
+/// # Panics
+/// Panics if called inside another synchronous capture.
+pub fn capture_neutral<T>(run: impl FnOnce() -> T) -> (T, Vec<PaintOperation>) {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ENCODE_TERMINAL.with(|flag| flag.set(self.0));
+        }
+    }
+    let reset = Reset(ENCODE_TERMINAL.with(|flag| flag.replace(false)));
+    let result = capture(run);
+    drop(reset);
+    result
+}
+
 #[derive(Default)]
 struct CaptureState {
     operations: Vec<PaintOperation>,
@@ -113,6 +140,16 @@ pub fn record_with(bytes: usize, make: impl FnOnce() -> PaintOperation) {
         }
         state.operations.push(operation);
     });
+}
+
+/// Owned operations staged so far in this synchronous composition.
+#[must_use]
+pub fn staged_operations() -> Vec<PaintOperation> {
+    CAPTURE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or_else(Vec::new, |state| state.operations.clone())
+    })
 }
 
 /// Whether synchronous output planning has an observer.

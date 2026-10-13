@@ -1,37 +1,55 @@
 # Browser rendering
 
-BMUX shares retained presentation primitives between terminal output and a Rust/WASM browser renderer. Canvas 2D is the initial browser backend; `BrowserBackend` keeps browser output replaceable without exposing Canvas, DOM, or GPU objects in the shared contract. HTML and WebGL backends are not implemented yet.
+BMUX shares retained presentation primitives between terminal output and a Rust/WASM browser renderer. Canvas 2D is the initial browser backend; `BrowserBackend` keeps output replaceable without exposing Canvas, DOM, or GPU objects in the shared contract. HTML/WebGL and interactive browser input remain future work.
 
-## Build and observe a local view
+## Build and attach locally
 
 Use the locked Nix shell throughout:
 
 ```sh
 bash scripts/dev.sh cargo install wasm-bindgen-cli --version 0.2.126 --locked --root "$PWD/target/web-tools"
 bash scripts/dev.sh bash scripts/build-web-renderer.sh
-bash scripts/dev.sh cargo run -p bmux_cli --bin bmux -- attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets"
+bash scripts/dev.sh cargo run -p bmux_cli --bin bmux -- attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only
 ```
 
-The terminal attachment prints a loopback browser URL containing a short-lived access capability in its fragment. Open it locally; do not share or record that URL. The browser removes the fragment before making requests and keeps the capability only in memory. Reloading requires opening the original capability URL again.
+Replace `<SESSION_UUID>` with an ID from `bmux list-sessions --json`. `--web-only` opens an independent output-only attachment: it does not require terminal input, raw mode, or ANSI output. Its initial viewport is 80×24 until the first browser supplies measured geometry. Stop the owned attachment with Ctrl-C; disconnecting its browser does not terminate the server-owned process.
 
-This initial implementation **observes an existing terminal attachment**; it is not a standalone headless browser attachment. Replace `<SESSION_UUID>` with an ID from `bmux list-sessions --json`. The terminal remains interactive. The browser cannot send terminal input or mutate plugin state. Native provider-only attachment is explicitly unsupported by this observation entry point.
+Omit `--web-only` to mirror an interactive terminal attachment. In mirror mode the terminal owns viewport dimensions; browser resizing only changes local pixel metrics, not terminal layout. Native provider-only attachment is explicitly unsupported by this entry point.
 
-The host binds an ephemeral IPv4 loopback port, restricts assets to an explicit allowlist, checks Host/Origin and capability headers, limits connections and request/output sizes, and closes with the attachment. There is no unauthenticated remote deployment mode.
+The attachment prints an ephemeral loopback URL with an access capability in its fragment. Open it locally; do not share or record it. The browser removes the fragment before network requests and keeps credentials only in memory. Reloading requires reopening the original capability URL. The browser cannot send terminal input or invoke mutating plugin actions. Viewport changes are explicitly allowed for the controlling browser of an independent attachment.
 
-## Shared boundaries
+## Viewport ownership and lifecycle
 
-- `bmux_tui::presentation` prepares owned cells, cursor, images and interaction/selection/semantic metadata. Successful output alone commits retained authority.
-- The attach observer projects the same terminal lowering plans and retained compositor identities. Observed attachments currently force complete terminal repaint to produce coherent repaired snapshots; this is a correctness-first tradeoff, not an optimized delta transport.
-- `bmux_web_renderer` validates bounded versioned output snapshots, stages Canvas output/resources, and commits metadata after successful backend output. It has no native client, daemon or plugin-loader dependency.
-- `bmux_web_host` serves opaque immutable full snapshots using a latest-only feed. Transport publication revisions are distinct from presentation revisions and attachment generations.
-- Full snapshots replace omitted surfaces and images. Slow consumers skip intermediate snapshots and recover from the latest complete value; incompatible or over-budget projection closes observation rather than silently presenting incomplete output.
+- The first browser claims a separate random controller lease; additional viewers mirror the same composed view.
+- Lease renewal occurs periodically; expiry, generation changes, explicit release, or source loss revoke resize authority. An old owner's queued request cannot become a new owner's request.
+- Font, container and device-pixel-ratio changes update Canvas metrics. Bounded cell dimensions are sent through an authenticated latest-only channel, not a terminal input endpoint.
+- Native sizing uses the existing attachment/PTY policy and authoritative plugin layout; there is no browser-specific competing layout authority.
+- Temporary transport loss repairs from a complete snapshot. Source closure shuts down hosting rather than retaining a healthy-looking stale frame. The attachment host remains alive while an independent viewer disconnects; explicit shutdown closes it.
 
-Surface provenance preserves owner-local identity, retained identity, revision, clipping, ordering, content identity and continuation watermark. It is descriptive output, not another composition authority.
+The host binds an ephemeral IPv4 loopback port, restricts assets to an explicit allowlist, validates Host/Origin and capability headers, and bounds bodies, connections, requests and snapshots. Styles are external same-origin assets compatible with the strict CSP. There is no unauthenticated remote deployment mode.
 
-Standalone TUI consumers can prepare the same presentation and use `BrowserFrame::from_prepared`; `packages/web-renderer/examples/snapshot.rs` demonstrates this without native attachment dependencies.
+## Shared presentation boundaries
 
-## Future backends
+- `bmux_tui::presentation` prepares owned cells, cursor, images and metadata. Only successful output commits retained authority.
+- Terminal and headless frontends consume the same lowering/composition path. Neutral composition does not encode terminal bytes. Mirroring repairs complete browser snapshots from retained cells without forcing a terminal full repaint solely for capture.
+- Plugins publish owner-scoped retained presentation. Legacy extension adapters cache producer intent outside frame composition; they are compatibility adapters, not a replacement ownership model.
+- Synchronous browser serialization/publication failures prevent headless presentation commit. Browser delivery has its own successful-output boundary; a failed Canvas presentation retains previously committed metadata.
+- `bmux_web_renderer` validates bounded versioned snapshots and backend capabilities, stages Canvas output/resources, and commits metadata only after successful output. It has no native client, daemon or plugin-loader dependency.
+- `bmux_web_host` treats snapshots as opaque immutable bytes. Its latest-only feed uses transport revisions distinct from presentation revisions and attachment generations.
+- Complete snapshots remove omitted surfaces/images. Slow consumers skip intermediate values and repair from the latest complete frame. Delta transport is not implemented.
 
-A faithful HTML or WebGL backend should consume the same validated presentation and implement the browser backend contract. Backend resource caches remain private; geometry, clipping, ownership, selection and committed interaction semantics remain shared. A responsive, web-native HTML presentation would be a distinct presentation policy using preserved semantics, not a backend silently rearranging an already-composed frame.
+Surface provenance preserves owner-local identity, retained identity, revision, clipping, ordering, content identity and continuation watermark. It describes authoritative output; it cannot install another compositor.
 
-Interactive browser input, mobile behavior, web-native HTML and remote hosting remain later work. Image formats unsupported by the neutral projection fail explicitly; they are not silently omitted.
+Metadata availability is explicit in wire version 2. An empty scene does not imply that a producer supplied logical selection or semantics. Per-surface availability describes partial coverage, and unavailable categories are disclosed by the browser. Logical source text must come from the owning producer, never reconstructed from flattened display cells. Native terminal source metadata remains subject to its actual producer contract.
+
+Standalone TUI consumers can prepare the same presentation and use `BrowserFrame::from_prepared`; `packages/web-renderer/examples/snapshot.rs` demonstrates this without native attachment dependencies. Backends report supported features and fail explicitly on unsupported required output rather than silently omit it.
+
+## Acceptance testing
+
+`scripts/smoke-web-browser.sh` runs the real browser acceptance harness with explicit built artifacts and isolated owned runtime state. It requires Python, a Chromium executable, native BMUX, built WASM assets, and the snapshot example's JSON. Missing dependencies are failures, not successful skips. See `--help` for artifact arguments and credential-safe evidence output.
+
+Run repository validation inside the locked shell, build current native/WASM artifacts, then exercise live plugin chrome, terminal updates, images, resize, owner/mirror policy, reconnect, generation repair and backend lifecycle. Fixture decoding alone does not establish live acceptance.
+
+## Future work
+
+Faithful HTML/WebGL backends should implement the same presentation contract with private resource caches. Responsive web-native HTML is a separate presentation policy with its own authoritative geometry, not a backend silently rearranging cells. Interactive browser input, mobile behavior and remote hosting remain outside this release. Unsupported image formats fail explicitly.

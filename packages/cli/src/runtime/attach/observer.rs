@@ -20,6 +20,10 @@ pub struct AttachSurfaceProvenance {
     pub layer: i16,
     pub z: i32,
     pub content_id: Option<Uuid>,
+    /// Whether this producer supplies a logical selection scene (including empty).
+    pub selection_available: bool,
+    /// Whether this producer supplies semantic descriptions (including empty).
+    pub semantics_available: bool,
     /// Execution-scoped output watermark, not an execution-generation identifier.
     pub stream_end: Option<u64>,
 }
@@ -35,14 +39,30 @@ pub struct AttachSnapshot {
     pub attached_id: Uuid,
     pub prepared: PreparedPresentation,
     pub surfaces: Vec<AttachSurfaceProvenance>,
+    /// Native producers expose compositor hits/focus, but not logical selection
+    /// or semantic region snapshots. Empty metadata must not imply support.
+    /// Source text keyed exactly as committed logical fragment content IDs.
+    pub selection_text: std::collections::BTreeMap<bmux_tui::selection::SelectionContentId, String>,
+    pub unsupported_metadata: &'static [&'static str],
 }
 
+type SnapshotDelivery = dyn FnMut(&AttachSnapshot) -> anyhow::Result<()> + Send + Sync;
+
 /// Single publisher, owned and dropped by one attach view.
-#[derive(Debug)]
 pub struct AttachObserverPublisher {
     epoch: Uuid,
     revision: u64,
     sender: watch::Sender<Option<Arc<AttachSnapshot>>>,
+    delivery: Option<Box<SnapshotDelivery>>,
+}
+
+impl std::fmt::Debug for AttachObserverPublisher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachObserverPublisher")
+            .field("epoch", &self.epoch)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Latest-only observer; skipped updates are safe because every value is a full snapshot.
@@ -62,6 +82,7 @@ pub fn attach_observer_channel() -> (AttachObserverPublisher, AttachObserver) {
             epoch,
             revision: 0,
             sender,
+            delivery: None,
         },
         AttachObserver { epoch, receiver },
     )
@@ -102,15 +123,22 @@ impl Drop for AttachObserverPublisher {
 }
 
 impl AttachObserverPublisher {
+    /// Install synchronous bounded host admission/delivery before frame commit.
+    pub fn set_delivery(
+        &mut self,
+        delivery: impl FnMut(&AttachSnapshot) -> anyhow::Result<()> + Send + Sync + 'static,
+    ) {
+        self.delivery = Some(Box::new(delivery));
+    }
     pub(super) fn publish(
         &mut self,
         attached_id: Uuid,
         prepared: PreparedPresentation,
         graph: &RetainedCompositor,
         stream_ends: &std::collections::BTreeMap<Uuid, Option<u64>>,
-    ) {
+    ) -> anyhow::Result<()> {
         let Some(revision) = self.revision.checked_add(1) else {
-            return;
+            anyhow::bail!("attach presentation revision exhausted");
         };
         let surfaces = graph
             .ordered_surfaces()
@@ -135,6 +163,14 @@ impl AttachObserverPublisher {
                     revision: surface.revision,
                     rect,
                     clip,
+                    selection_available: surface
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.selection.is_some()),
+                    semantics_available: surface
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.semantics.is_some()),
                     layer: surface.layer,
                     z: surface.z,
                     stream_end: match &surface.payload {
@@ -152,106 +188,123 @@ impl AttachObserverPublisher {
                 }
             })
             .collect();
-        self.sender.send_replace(Some(Arc::new(AttachSnapshot {
+        let snapshot = Arc::new(AttachSnapshot {
             epoch: self.epoch,
             revision,
             attached_id,
+            selection_text: prepared.selection_text().clone(),
+            unsupported_metadata: match (
+                graph.surfaces().values().any(|surface| {
+                    surface
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.selection.is_some())
+                }),
+                graph.surfaces().values().any(|surface| {
+                    surface
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.semantics.is_some())
+                }),
+            ) {
+                (true, true) => &[],
+                (true, false) => &["semantics"],
+                (false, true) => &["selection"],
+                (false, false) => &["selection", "semantics"],
+            },
             prepared,
             surfaces,
-        })));
+        });
+        if let Some(delivery) = &mut self.delivery {
+            delivery(&snapshot)?;
+        }
+        self.sender.send_replace(Some(snapshot));
         self.revision = revision;
+        Ok(())
     }
 }
 
-pub(super) fn publish_committed(
+pub(super) fn deliver_prepared(
     view: &mut super::state::AttachViewState,
     layout: &bmux_client::AttachLayoutState,
     geometry: super::input::TerminalGeometry,
     operations: &[bmux_attach_pipeline::projection::PaintOperation],
-) {
-    use bmux_tui::{
-        damage::Damage,
-        image::ImageContribution,
-        presentation::{PresentationLimits, PresentationState},
-    };
-    if operations.iter().any(|operation| {
+    output: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use bmux_tui::{image::ImageContribution, presentation::PresentationLimits};
+    if operations.iter().any(|op| {
         matches!(
-            operation,
+            op,
             bmux_attach_pipeline::projection::PaintOperation::Unsupported
         )
     }) {
-        tracing::warn!("browser observer disconnected: unsupported or over-budget presentation");
-        view.observer.take();
-        return;
+        anyhow::bail!("unsupported or over-budget presentation");
     }
     let area = Rect::new(0, 0, geometry.cols, geometry.rows);
-    if usize::from(geometry.cols) * usize::from(geometry.rows) > 131_072 {
-        view.observer.take();
-        return;
-    }
-    let images = match observed_images(view, layout, area) {
-        Ok(images) => images,
-        Err(reason) => {
-            tracing::warn!(%reason, "browser observer disconnected: image projection unavailable");
-            view.observer.take();
-            return;
-        }
-    };
-    let interactions = match projected_interactions(&view.retained_compositor, area) {
-        Ok(hits) => hits,
-        Err(reason) => {
-            tracing::warn!(%reason, "browser observer disconnected: interaction projection unavailable");
-            view.observer.take();
-            return;
-        }
-    };
-    let state = PresentationState::new(area);
+    let images = observed_images(view, layout, area).map_err(anyhow::Error::msg)?;
+    let interactions =
+        projected_interactions(&view.retained_compositor, area).map_err(anyhow::Error::msg)?;
+    view.presentation.resize(area);
     let limits = PresentationLimits {
-        max_cells: 131_072,
+        max_cells: 262_144,
         max_entries: 131_072,
         max_bytes: 32 * 1024 * 1024,
     };
-    let prepared = state.prepare_bounded(limits, Damage::Full, |cx| {
-        bmux_attach_pipeline::projection::paint(cx, operations);
-        for image in images {
-            cx.push_image(ImageContribution::Present(image));
-        }
-        for hit in interactions {
-            cx.push_hit(hit);
-        }
-        if let Some(cursor) = view.last_cursor_state {
-            cx.set_cursor_local(cursor.x, cursor.y, cursor.visible);
-        }
-    });
+    let metadata = super::metadata::project(&view.retained_compositor, area)?;
+    let mut prepared = view
+        .presentation
+        .prepare_repaired_bounded(limits, |cx| {
+            bmux_attach_pipeline::projection::paint(cx, operations);
+            for image in images {
+                cx.push_image(ImageContribution::Present(image));
+            }
+            for hit in interactions {
+                cx.push_hit(hit);
+            }
+            for scope in metadata.selection.scopes() {
+                cx.push_selection_scope(scope.clone());
+            }
+            for fragment in metadata.selection.fragments() {
+                cx.push_selection_fragment(fragment.clone());
+            }
+            for region in metadata.semantics.regions() {
+                cx.push_semantic(region.clone());
+            }
+            if let Some(cursor) = view.last_cursor_state {
+                cx.set_cursor_local(cursor.x, cursor.y, cursor.visible);
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("presentation admission failed: {error:?}"))?;
+    prepared
+        .set_selection_text(metadata.text)
+        .map_err(|error| anyhow::anyhow!("logical source admission failed: {error:?}"))?;
     if view.retained_compositor.surfaces().len() > 4096 {
-        view.observer.take();
-        return;
+        anyhow::bail!("surface budget exceeded");
     }
-    if let Ok(Some(mut prepared)) = prepared {
-        let active = view
-            .plugin_focus
-            .focused()
-            .map(|id| bmux_tui::focus::FocusId::new(region_identity(id)));
-        if !prepared.project_active_focus(active.as_ref()) {
-            prepared.project_active_focus(None);
-        }
-        if let Some(publisher) = view.observer.as_mut() {
-            let stream_ends = view
-                .pane_buffers
-                .iter()
-                .map(|(id, buffer)| (*id, buffer.expected_stream_start))
-                .collect();
-            publisher.publish(
-                view.attached_id,
-                prepared,
-                &view.retained_compositor,
-                &stream_ends,
-            );
-        }
-    } else {
-        tracing::warn!("browser observer disconnected: presentation admission failed");
-        view.observer.take();
+    let active = view
+        .plugin_focus
+        .focused()
+        .map(|id| bmux_tui::focus::FocusId::new(region_identity(id)));
+    if !prepared.project_active_focus(active.as_ref()) {
+        prepared.project_active_focus(None);
     }
+    let publisher = view
+        .observer
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("presentation output closed"))?;
+    let stream_ends = view
+        .pane_buffers
+        .iter()
+        .map(|(id, buffer)| (*id, buffer.expected_stream_start))
+        .collect();
+    let attached = view.attached_id;
+    let graph = &view.retained_compositor;
+    view.presentation
+        .present_prepared(Some(prepared), |frame, _| {
+            output()?;
+            publisher.publish(attached, frame.clone(), graph, &stream_ends)
+        })?;
+    Ok(())
 }
 
 fn region_identity(id: &bmux_plugin::surface::PluginSurfaceRegionId) -> String {
@@ -370,12 +423,12 @@ fn observed_images(
                 image.cell_rows,
             );
             let clip = content.intersection(area);
-            let watermark = view
-                .pane_buffers
+            let incarnation = view
+                .image_execution_incarnations
                 .get(&content_id)
-                .and_then(|buffer| buffer.expected_stream_start)
-                .unwrap_or(0);
-            let key = format!("{}:{}:{watermark}:{}", surface.id, content_id, image.id);
+                .copied()
+                .unwrap_or(Uuid::nil());
+            let key = format!("{}:{}:{incarnation}:{}", surface.id, content_id, image.id);
             let strips = bmux_attach_pipeline::projection_images::visible_image_strips(
                 &key,
                 &payload,
@@ -576,12 +629,14 @@ mod tests {
         let (mut publisher, observer) = attach_observer_channel();
         let state = PresentationState::new(Rect::new(0, 0, 2, 1));
         for _ in 0..3 {
-            publisher.publish(
-                Uuid::nil(),
-                state.prepare(Damage::Full, |_| {}).unwrap(),
-                &RetainedCompositor::new(),
-                &std::collections::BTreeMap::new(),
-            );
+            publisher
+                .publish(
+                    Uuid::nil(),
+                    state.prepare(Damage::Full, |_| {}).unwrap(),
+                    &RetainedCompositor::new(),
+                    &std::collections::BTreeMap::new(),
+                )
+                .unwrap();
         }
         assert_eq!(observer.latest().unwrap().revision, 3);
         assert_eq!(observer.latest().unwrap().epoch, observer.epoch());

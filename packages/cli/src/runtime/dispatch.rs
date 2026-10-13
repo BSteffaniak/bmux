@@ -469,6 +469,7 @@ pub(super) async fn dispatch_built_in_command(
                 follow,
                 global,
                 web_assets,
+                web_only,
             },
         ) => {
             if let Some(assets) = web_assets {
@@ -477,6 +478,7 @@ pub(super) async fn dispatch_built_in_command(
                     follow.as_deref(),
                     *global,
                     assets,
+                    *web_only,
                     connection_context,
                 ))
                 .await;
