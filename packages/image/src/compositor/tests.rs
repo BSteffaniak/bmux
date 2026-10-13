@@ -44,6 +44,42 @@ fn kitty() -> HostImageCapabilities {
         ..HostImageCapabilities::default()
     }
 }
+#[cfg(feature = "kitty")]
+#[test]
+fn compositor_hide_reveal_roundtrips_through_nested_registry() {
+    use crate::codec::kitty::parse_command;
+    use crate::model::{ImageEvent, ImagePosition};
+    use crate::registry::ImageRegistry;
+    let mut host = KittyHostState::default();
+    let mut nested = ImageRegistry::default();
+    let mut apply = |output: &[u8]| {
+        for body in output.split(|byte| *byte == 0x1b) {
+            if let Some(body) = body.strip_prefix(b"_") {
+                let command = parse_command(body, ImagePosition { row: 0, col: 0 }).unwrap();
+                nested.handle_event(
+                    ImageEvent::KittyCommand {
+                        command,
+                        filtered_byte_offset: 0,
+                    },
+                    1,
+                    1,
+                );
+            }
+        }
+        nested.images().len()
+    };
+    let first = frame(&mut host, &[image()], &[], &kitty());
+    assert_eq!(apply(&first), 1);
+    let mut hidden = Vec::new();
+    host.begin_frame();
+    host.clear_placements(&mut hidden).unwrap();
+    host.finish_frame(&mut hidden).unwrap();
+    assert_eq!(apply(&hidden), 0);
+    let revealed = frame(&mut host, &[image()], &[], &kitty());
+    assert!(!String::from_utf8_lossy(&revealed).contains("a=t"));
+    assert_eq!(apply(&revealed), 1);
+}
+
 fn frame(
     state: &mut KittyHostState,
     images: &[PaneImage],
@@ -71,12 +107,12 @@ fn movement_hide_reveal_and_changed_pixels_reconcile_content() {
     image.position.col = 2;
     let moved = String::from_utf8(frame(&mut state, &[image.clone()], &[], &kitty())).unwrap();
     assert!(!moved.contains("a=t"));
-    assert!(moved.contains("a=d,d=p"));
+    assert!(moved.contains("a=d,d=i"));
     assert_eq!(state.work_counts(), (1, 1));
     assert!(
         String::from_utf8(frame(&mut state, &[], &[], &kitty()))
             .unwrap()
-            .contains("a=d,d=p")
+            .contains("a=d,d=i")
     );
     assert!(
         !String::from_utf8(frame(&mut state, &[image.clone()], &[], &kitty()))

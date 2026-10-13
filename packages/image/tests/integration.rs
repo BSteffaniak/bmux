@@ -32,7 +32,7 @@ mod pipeline {
         assert!(registry.delta_since(sequence).removed.contains(&old_id));
         let current_id = registry.images()[0].id;
         let sequence = registry.sequence();
-        for event in interceptor.process(b"\x1b_Ga=d,d=p,i=42,p=7;\x1b\\").events {
+        for event in interceptor.process(b"\x1b_Ga=d,d=i,i=42,p=7;\x1b\\").events {
             registry.handle_event(event, 8, 16);
         }
         assert!(registry.images().is_empty());
@@ -395,7 +395,7 @@ mod pipeline {
         registry.clear_display();
         assert_eq!(registry.project_viewport(2, 10).unwrap().len(), 1);
         let before = registry.sequence();
-        for event in interceptor.process(b"\x1b_Ga=d,d=p,i=42,p=7;\x1b\\").events {
+        for event in interceptor.process(b"\x1b_Ga=d,d=i,i=42,p=7;\x1b\\").events {
             registry.handle_event(event, 8, 16);
         }
         assert!(registry.sequence() > before);
@@ -726,7 +726,7 @@ mod pipeline {
 
     #[test]
     fn kitty_delete_cancels_partial_transmission_at_every_read_split() {
-        let wire = b"\x1b_Ga=t,f=32,s=1,v=1,i=42,m=1;AQI=\x1b\\\x1b_Ga=d,d=i,i=42;\x1b\\\x1b_Ga=t,f=32,s=1,v=1,i=42,m=0;AwQFBg==\x1b\\\x1b_Ga=p,i=42,p=7;\x1b\\";
+        let wire = b"\x1b_Ga=t,f=32,s=1,v=1,i=42,m=1;AQI=\x1b\\\x1b_Ga=d,d=I,i=42;\x1b\\\x1b_Ga=t,f=32,s=1,v=1,i=42,m=0;AwQFBg==\x1b\\\x1b_Ga=p,i=42,p=7;\x1b\\";
         for split in 0..=wire.len() {
             let mut interceptor = ImageInterceptor::new();
             let mut registry = ImageRegistry::default();

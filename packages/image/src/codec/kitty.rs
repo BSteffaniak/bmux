@@ -112,16 +112,31 @@ pub fn parse_command(body: &[u8], cursor_pos: ImagePosition) -> Option<KittyComm
             let specifier =
                 if let Some(what) = params.get("d").and_then(|v| v.as_bytes().first().copied()) {
                     match what {
-                        b'a' | b'A' => KittyDeleteSpecifier::All,
+                        b'a' => KittyDeleteSpecifier::All,
+                        b'A' => KittyDeleteSpecifier::AllAndData,
                         b'i' | b'I' => {
                             let id = parse_u32(&params, "i").unwrap_or(0);
-                            KittyDeleteSpecifier::ByImageId(id)
+                            if let Some(placement_id) = parse_u32(&params, "p") {
+                                if what == b'I' {
+                                    KittyDeleteSpecifier::ByPlacementIdAndData {
+                                        image_id: id,
+                                        placement_id,
+                                    }
+                                } else {
+                                    KittyDeleteSpecifier::ByPlacementId {
+                                        image_id: id,
+                                        placement_id,
+                                    }
+                                }
+                            } else if what == b'I' {
+                                KittyDeleteSpecifier::ByImageIdAndData(id)
+                            } else {
+                                KittyDeleteSpecifier::ByImageId(id)
+                            }
                         }
-                        b'p' | b'P' => KittyDeleteSpecifier::ByPlacementId {
-                            image_id: parse_u32(&params, "i").unwrap_or(0),
-                            placement_id: parse_u32(&params, "p").unwrap_or(0),
-                        },
-                        _ => KittyDeleteSpecifier::All,
+                        // Coordinate/number selectors are not placement-ID selectors.
+                        // Reject unsupported selectors rather than deleting unrelated images.
+                        _ => return None,
                     }
                 } else {
                     // Default: delete by image ID if 'i' is present.
@@ -244,7 +259,7 @@ pub fn encode_delete_image(image_id: u32) -> Vec<u8> {
 /// Encode a kitty graphics delete-by-placement-id command.
 pub fn encode_delete_placement(image_id: u32, placement_id: u32) -> Vec<u8> {
     // q=2 suppresses delete acknowledgements too.
-    format!("Ga=d,d=p,i={image_id},p={placement_id},q=2").into_bytes()
+    format!("Ga=d,d=i,i={image_id},p={placement_id},q=2").into_bytes()
 }
 
 fn parse_u32(params: &std::collections::HashMap<&str, &str>, key: &str) -> Option<u32> {
@@ -338,12 +353,12 @@ mod tests {
 
         let delete_placement = String::from_utf8(encode_delete_placement(42, 43))
             .expect("kitty delete placement command should be utf8");
-        assert_eq!(delete_placement, "Ga=d,d=p,i=42,p=43,q=2");
+        assert_eq!(delete_placement, "Ga=d,d=i,i=42,p=43,q=2");
     }
 
     #[test]
     fn parse_delete_placement() {
-        let body = b"Ga=d,d=p,i=42,p=43";
+        let body = b"Ga=d,d=i,i=42,p=43";
         let pos = ImagePosition { row: 0, col: 0 };
         let cmd = parse_command(body, pos).unwrap();
         match cmd {

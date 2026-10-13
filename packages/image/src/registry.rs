@@ -922,6 +922,22 @@ impl ImageRegistry {
                         }
                         (data, format, width, height)
                     };
+                // An evicted/incomplete chunk stream must not be published as a
+                // complete raw image when its final suffix arrives.
+                if matches!(
+                    format,
+                    crate::model::KittyFormat::Rgb | crate::model::KittyFormat::Rgba
+                ) {
+                    let channels = if matches!(format, crate::model::KittyFormat::Rgb) {
+                        3
+                    } else {
+                        4
+                    };
+                    let expected = u64::from(width) * u64::from(height) * channels;
+                    if expected == 0 || u64::try_from(final_data.len()).ok() != Some(expected) {
+                        return;
+                    }
+                }
                 self.kitty_transmitted.insert(
                     image_id,
                     KittyTransmittedImage {
@@ -1034,15 +1050,30 @@ impl ImageRegistry {
                 }
             }
             KittyCommand::Delete { specifier } => match specifier {
-                KittyDeleteSpecifier::All => {
+                KittyDeleteSpecifier::All | KittyDeleteSpecifier::AllAndData => {
+                    let release = matches!(specifier, KittyDeleteSpecifier::AllAndData);
+                    let targets = self
+                        .kitty_placements
+                        .keys()
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>();
                     let ids = self.kitty_placements.values().copied().collect::<Vec<_>>();
                     for id in ids {
                         self.remove_image(id);
                     }
+                    if release {
+                        for id in targets {
+                            self.kitty_transmitted.remove(&id);
+                            self.kitty_pending_chunks.remove(&id);
+                        }
+                    }
                 }
-                KittyDeleteSpecifier::ByImageId(id) => {
-                    self.kitty_transmitted.remove(&id);
-                    self.kitty_pending_chunks.remove(&id);
+                KittyDeleteSpecifier::ByImageId(id)
+                | KittyDeleteSpecifier::ByImageIdAndData(id) => {
+                    if matches!(specifier, KittyDeleteSpecifier::ByImageIdAndData(_)) {
+                        self.kitty_transmitted.remove(&id);
+                        self.kitty_pending_chunks.remove(&id);
+                    }
                     let ids = self
                         .kitty_placements
                         .iter()
@@ -1057,17 +1088,76 @@ impl ImageRegistry {
                 KittyDeleteSpecifier::ByPlacementId {
                     image_id,
                     placement_id,
+                }
+                | KittyDeleteSpecifier::ByPlacementIdAndData {
+                    image_id,
+                    placement_id,
                 } => {
+                    let release =
+                        matches!(specifier, KittyDeleteSpecifier::ByPlacementIdAndData { .. });
                     if let Some(retained_id) =
                         self.kitty_placements.remove(&(image_id, placement_id))
                     {
                         self.remove_image(retained_id);
+                    }
+                    // Placement-specific deletion cannot release content still used
+                    // by another placement of the same image.
+                    if release && !self.kitty_placements.keys().any(|(id, _)| *id == image_id) {
+                        self.kitty_transmitted.remove(&image_id);
+                        self.kitty_pending_chunks.remove(&image_id);
                     }
                 }
             },
             KittyCommand::Query { .. } => {
                 // Queries are forwarded, not stored.
             }
+        }
+        self.trim_kitty_uploads();
+    }
+
+    /// Hidden uploads and incomplete transfers share a bounded retention budget.
+    #[cfg(feature = "kitty")]
+    fn trim_kitty_uploads(&mut self) {
+        let limit = if self.max_bytes == 0 {
+            64 * 1024 * 1024
+        } else {
+            self.max_bytes
+        };
+        loop {
+            let bytes = self
+                .kitty_transmitted
+                .values()
+                .map(|image| image.data.len())
+                .sum::<usize>()
+                .saturating_add(
+                    self.kitty_pending_chunks
+                        .values()
+                        .map(|image| image.data.len())
+                        .sum::<usize>(),
+                );
+            if bytes <= limit
+                && self.kitty_transmitted.len() + self.kitty_pending_chunks.len()
+                    <= self.max_images.max(1)
+            {
+                break;
+            }
+            let victim = self
+                .kitty_transmitted
+                .keys()
+                .chain(self.kitty_pending_chunks.keys())
+                .filter(|id| {
+                    !self
+                        .kitty_placements
+                        .keys()
+                        .any(|(placed, _)| placed == *id)
+                })
+                .copied()
+                .min();
+            let Some(id) = victim else {
+                break;
+            };
+            self.kitty_transmitted.remove(&id);
+            self.kitty_pending_chunks.remove(&id);
         }
     }
 }
@@ -1327,7 +1417,7 @@ mod tests {
         );
         reg.handle_kitty_command(
             KittyCommand::Delete {
-                specifier: KittyDeleteSpecifier::ByImageId(42),
+                specifier: KittyDeleteSpecifier::ByImageIdAndData(42),
             },
             8,
             16,
@@ -1346,6 +1436,47 @@ mod tests {
             16,
         );
         assert_eq!(reg.kitty_transmitted[&42].data, vec![3, 4, 5, 6]);
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn hidden_kitty_upload_bytes_and_partial_transfers_are_bounded() {
+        use crate::codec::kitty::parse_command;
+        let mut reg = ImageRegistry::new(100, 8);
+        for id in 1..=20 {
+            let body = format!("Ga=t,i={id},f=32,s=1,v=1,m=0;AQIDBA==");
+            reg.handle_kitty_command(
+                parse_command(body.as_bytes(), ImagePosition { row: 0, col: 0 }).unwrap(),
+                8,
+                16,
+            );
+            assert!(
+                reg.kitty_transmitted
+                    .values()
+                    .map(|image| image.data.len())
+                    .sum::<usize>()
+                    <= 8
+            );
+        }
+        for id in 21..=40 {
+            let body = format!("Ga=t,i={id},f=32,s=1,v=1,m=1;AQI=");
+            reg.handle_kitty_command(
+                parse_command(body.as_bytes(), ImagePosition { row: 0, col: 0 }).unwrap(),
+                8,
+                16,
+            );
+            let bytes = reg
+                .kitty_transmitted
+                .values()
+                .map(|image| image.data.len())
+                .sum::<usize>()
+                + reg
+                    .kitty_pending_chunks
+                    .values()
+                    .map(|image| image.data.len())
+                    .sum::<usize>();
+            assert!(bytes <= 8);
+        }
     }
 
     #[test]

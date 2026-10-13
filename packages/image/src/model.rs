@@ -229,8 +229,11 @@ pub enum KittyCommand {
 #[derive(Clone, Debug)]
 pub enum KittyDeleteSpecifier {
     All,
+    AllAndData,
     ByImageId(u32),
+    ByImageIdAndData(u32),
     ByPlacementId { image_id: u32, placement_id: u32 },
+    ByPlacementIdAndData { image_id: u32, placement_id: u32 },
 }
 
 impl ImageEvent {

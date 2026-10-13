@@ -7658,7 +7658,7 @@ mod tests {
             &mut pane_buffers,
             &FrameDamage::default(),
         );
-        assert!(removed.contains("Ga=d,d=p,"), "{removed:?}");
+        assert!(removed.contains("Ga=d,d=i,"), "{removed:?}");
         assert!(removed.contains("Ga=d,d=i,"), "{removed:?}");
         assert_eq!(removed_stats.terminal_graphic_deletes, 1);
         assert!(cache.is_empty());
@@ -7919,7 +7919,7 @@ mod tests {
             .expect("stale kitty graphic delete should queue")
         );
         let fourth = String::from_utf8(fourth).expect("kitty command should be utf8");
-        assert!(fourth.contains("Ga=d,d=p,"), "{fourth:?}");
+        assert!(fourth.contains("Ga=d,d=i,"), "{fourth:?}");
         assert!(fourth.contains("Ga=d,d=i,"), "{fourth:?}");
         assert!(cache.is_empty());
     }
@@ -8004,7 +8004,7 @@ mod tests {
             .expect("clipped graphic cleanup")
         );
         let clipped_output = String::from_utf8(clipped_output).expect("kitty cleanup output");
-        assert!(clipped_output.contains("Ga=d,d=p,"), "{clipped_output:?}");
+        assert!(clipped_output.contains("Ga=d,d=i,"), "{clipped_output:?}");
         assert!(cache.is_empty());
     }
 
@@ -8154,7 +8154,7 @@ mod tests {
             .expect("old pane graphic should be deleted");
         let second = String::from_utf8(second).expect("kitty command should be utf8");
         assert!(second.contains("Ga=t,"), "{second:?}");
-        assert!(second.contains("Ga=d,d=p,"), "{second:?}");
+        assert!(second.contains("Ga=d,d=i,"), "{second:?}");
         assert!(second.contains("Ga=d,d=i,"), "{second:?}");
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.values().next().expect("cache entry").pane_id, pane_b);
@@ -8192,7 +8192,7 @@ mod tests {
             .cleanup_stale(&mut deleted, &mut cache, capabilities)
             .expect("terminal-scoped cleanup should delete stale image");
         let deleted = String::from_utf8(deleted).expect("kitty command should be utf8");
-        assert!(deleted.contains("Ga=d,d=p,"), "{deleted:?}");
+        assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(cache.is_empty());
     }
@@ -8246,7 +8246,7 @@ mod tests {
         .expect("replacement text should queue after stale graphic cleanup");
         let replacement = String::from_utf8(replacement).expect("kitty command should be utf8");
         let delete_at = replacement
-            .find("Ga=d,d=p,")
+            .find("Ga=d,d=i,")
             .expect("stale graphic placement should be deleted before text");
         let image_delete_at = replacement
             .find("Ga=d,d=i,")
@@ -8544,7 +8544,7 @@ mod tests {
         .expect("partial render should keep undamaged graphics active");
         let partial = String::from_utf8(partial).expect("kitty command should be utf8");
         assert!(!partial.contains("Ga=d,d=i,"), "{partial:?}");
-        assert!(!partial.contains("Ga=d,d=p,"), "{partial:?}");
+        assert!(!partial.contains("Ga=d,d=i,"), "{partial:?}");
         assert_eq!(graphics_cache.len(), 2);
     }
 
@@ -8690,7 +8690,7 @@ mod tests {
 
         let switched = String::from_utf8(switched).expect("kitty command should be utf8");
         let placement_delete_at = switched
-            .find("Ga=d,d=p,")
+            .find("Ga=d,d=i,")
             .expect("stale placement should be deleted on tab switch");
         let image_delete_at = switched
             .find("Ga=d,d=i,")
@@ -8745,7 +8745,7 @@ mod tests {
             .expect("lost graphics capability should delete cached image")
         );
         let deleted = String::from_utf8(deleted).expect("kitty command should be utf8");
-        assert!(deleted.contains("Ga=d,d=p,"), "{deleted:?}");
+        assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(cache.is_empty());
     }

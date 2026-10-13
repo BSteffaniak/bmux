@@ -9084,12 +9084,16 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         feature = "image-iterm2"
     ))]
     if bmux_attach_pipeline::projection::encoding_terminal() {
-        pending_kitty_state.begin_frame();
+        // Capability changes release resources even on partial frames. Visibility
+        // reconciliation, however, requires a complete image scene.
         pending_kitty_state.select_protocol(
             &mut frame_bytes,
             view_state.host_image_caps.preferred_protocol(),
         )?;
-        pending_kitty_state.clear_placements(&mut frame_bytes)?;
+        if frame_plan.render_scene {
+            pending_kitty_state.begin_frame();
+            pending_kitty_state.clear_placements(&mut frame_bytes)?;
+        }
     }
     queue!(frame_bytes, SavePosition).context("failed queuing cursor save for attach frame")?;
     // Hide the cursor during the frame render to prevent it from visibly
@@ -9411,7 +9415,9 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pending_kitty_state.finish_frame(&mut frame_bytes)?;
+    if frame_plan.render_scene && bmux_attach_pipeline::projection::encoding_terminal() {
+        pending_kitty_state.finish_frame(&mut frame_bytes)?;
+    }
 
     if frame_plan.use_synchronized_update {
         queue!(frame_bytes, EndSynchronizedUpdate)
@@ -16701,6 +16707,95 @@ mod tests {
             },
             zoomed: false,
         }
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn partial_attach_frame_preserves_retained_kitty_image() {
+        use bmux_image::compositor::{PaneRect, render_pane_images};
+        use bmux_image::model::{
+            ImageCellSize, ImagePayload, ImagePixelSize, ImagePosition, ImageProtocol, PaneImage,
+            PixelBuffer, PixelFormat,
+        };
+        let session = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
+            session_id: session,
+            context_id: None,
+            can_write: true,
+        });
+        let layout = retry_test_layout(&mut state, pane, session);
+        state.host_image_caps.kitty_graphics = true;
+        let render = |state: &mut AttachViewState| {
+            let mut output = Vec::new();
+            render_attach_frame_to_writer(
+                &mut output,
+                state,
+                &layout,
+                &RuntimeAppearance::default(),
+                &[],
+                0,
+                &bmux_config::DamageBehaviorConfig::default(),
+                u64::MAX,
+                &mut DisplayCaptureFanout::default(),
+                TerminalGeometry { cols: 80, rows: 24 },
+                None,
+            )
+            .unwrap();
+            output
+        };
+        render(&mut state);
+        let image = PaneImage {
+            id: 42,
+            protocol: ImageProtocol::KittyGraphics,
+            position: ImagePosition { row: 0, col: 0 },
+            cell_size: ImageCellSize { rows: 1, cols: 1 },
+            pixel_size: ImagePixelSize {
+                width: 1,
+                height: 1,
+            },
+            payload: ImagePayload {
+                raw: None,
+                pixels: Some(PixelBuffer {
+                    width: 1,
+                    height: 1,
+                    format: PixelFormat::Rgba8,
+                    data: vec![255, 0, 0, 255],
+                }),
+            },
+        };
+        let mut initial = Vec::new();
+        state.kitty_host_state.begin_frame();
+        render_pane_images(
+            &mut initial,
+            &[image],
+            PaneRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 24,
+            },
+            &state.host_image_caps,
+            bmux_image::config::ImageDecodeMode::Server,
+            &mut state.kitty_host_state,
+        )
+        .unwrap();
+        state.kitty_host_state.finish_frame(&mut initial).unwrap();
+        let committed = state.kitty_host_state.transmitted.clone();
+        for _ in 0..3 {
+            let output = render(&mut state);
+            assert!(
+                !String::from_utf8_lossy(&output).contains("Ga=d"),
+                "partial frame erased image"
+            );
+            assert_eq!(state.kitty_host_state.transmitted, committed);
+        }
+        // Losing the capability is explicit resource invalidation, not an
+        // incomplete visibility pass: it still cleans up on a partial frame.
+        state.host_image_caps.kitty_graphics = false;
+        let output = render(&mut state);
+        assert!(String::from_utf8_lossy(&output).contains("Ga=d,d=I"));
+        assert!(state.kitty_host_state.transmitted.is_empty());
     }
 
     fn seed_retry_graphics_cache(state: &mut AttachViewState, pane_id: Uuid) {
