@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="360" viewBox="0 0 1100 360">
+<rect width="1100" height="360" fill="#111827"/>
+<g font-family="sans-serif" text-anchor="middle" fill="#f9fafb">
+<rect x="20" y="35" width="315" height="250" rx="14" fill="#1d4ed8"/><text x="177" y="80" font-size="26">Local runtime</text><text x="177" y="130" font-size="20">execution + terminal state</text><text x="177" y="167" font-size="20">independent client views</text><text x="177" y="230" font-size="18">useful without federation</text>
+<rect x="393" y="35" width="315" height="250" rx="14" fill="#6d28d9"/><text x="550" y="80" font-size="26">Remote connection</text><text x="550" y="130" font-size="20">request / output transport</text><text x="550" y="167" font-size="20">connectivity ≠ authority</text><text x="550" y="230" font-size="18">optional remote access</text>
+<rect x="765" y="35" width="315" height="250" rx="14" fill="#047857"/><text x="922" y="80" font-size="26">Federated domain</text><text x="922" y="130" font-size="20">durable intent + reconciliation</text><text x="922" y="167" font-size="20">authority + generation fencing</text><text x="922" y="230" font-size="18">explicit promotion / replacement</text>
+<text x="550" y="330" font-size="20">Three responsibilities—not three interchangeable sources of truth.</text>
+</g></svg>

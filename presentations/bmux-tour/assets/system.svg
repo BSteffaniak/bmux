@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="350" viewBox="0 0 1100 350">
+<rect width="1100" height="350" fill="#111827"/>
+<g font-family="sans-serif" font-size="24" fill="#f9fafb" text-anchor="middle">
+<rect x="20" y="35" width="240" height="85" rx="14" fill="#1d4ed8"/><text x="140" y="70">Client input</text><text x="140" y="102" font-size="18">one intended target</text>
+<rect x="420" y="35" width="260" height="85" rx="14" fill="#6d28d9"/><text x="550" y="70">Domain plugins</text><text x="550" y="102" font-size="18">typed services / host dispatch</text>
+<rect x="840" y="35" width="240" height="85" rx="14" fill="#047857"/><text x="960" y="70">PTY + process</text><text x="960" y="102" font-size="18">running execution</text>
+<rect x="840" y="225" width="240" height="85" rx="14" fill="#047857"/><text x="960" y="261">Terminal state</text><text x="960" y="292" font-size="18">interpreted program output</text>
+<rect x="420" y="225" width="260" height="85" rx="14" fill="#6d28d9"/><text x="550" y="261">Attachment projection</text><text x="550" y="292" font-size="18">viewport / retained scene</text>
+<rect x="20" y="225" width="240" height="85" rx="14" fill="#b45309"/><text x="140" y="261">Output backend</text><text x="140" y="292" font-size="18">terminal or browser</text>
+<text x="550" y="185" font-size="18" fill="#cbd5e1">Conceptual flow — not a crate dependency graph</text>
+</g>
+<g stroke="#e2e8f0" stroke-width="4" fill="none"><path d="M260 78H400m-12-8 12 8-12 8M680 78H820m-12-8 12 8-12 8M960 120V207m-8-12 8 12 8-12M840 268H700m12-8-12 8 12 8M420 268H280m12-8-12 8 12 8"/></g>
+</svg>

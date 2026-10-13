@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="300" viewBox="0 0 1100 300">
+<rect width="1100" height="300" fill="#111827"/>
+<g font-family="sans-serif" fill="#f9fafb" text-anchor="middle">
+<rect x="20" y="35" width="240" height="105" rx="14" fill="#1d4ed8"/><text x="140" y="75" font-size="25">Prepare</text><text x="140" y="109" font-size="18">layout / cells / hit regions</text>
+<rect x="295" y="35" width="240" height="105" rx="14" fill="#6d28d9"/><text x="415" y="75" font-size="25">Write output</text><text x="415" y="109" font-size="18">cleanup + paint + images</text>
+<rect x="570" y="35" width="240" height="105" rx="14" fill="#047857"/><text x="690" y="75" font-size="25">Flush</text><text x="690" y="109" font-size="18">acceptance boundary</text>
+<rect x="845" y="35" width="235" height="105" rx="14" fill="#b45309"/><text x="962" y="75" font-size="25">Commit</text><text x="962" y="109" font-size="18">display + interaction state</text>
+<text x="550" y="235" font-size="22">Failure: retain committed authority; repair uncertain host output.</text>
+</g>
+<g stroke="#e2e8f0" stroke-width="4" fill="none"><path d="M260 87H285m-10-7 10 7-10 7M535 87H560m-10-7 10 7-10 7M810 87H835m-10-7 10 7-10 7"/></g>
+</svg>
