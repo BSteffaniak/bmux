@@ -36,10 +36,10 @@ members = [
     "packages/markdown",
     "packages/syntax-render",
     "packages/mermaid-render",
-    "packages/presentation",
-    "packages/presentation-runtime",
-    "plugins/presentation-plugin",
-    "plugins/presentation-plugin-api",
+    "packages/presenter",
+    "packages/presenter-runtime",
+    "plugins/presenter-plugin",
+    "plugins/presenter-plugin-api",
     "packages/keybind",
     "packages/performance-state",
     "packages/presentation-state",
@@ -210,11 +210,11 @@ bmux_plugin_runtime = { version = "0.0.1-alpha.1", default-features = false, pat
 bmux_plugin_schema = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-schema" }
 bmux_plugin_schema_macros = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-schema-macros" }
 bmux_plugin_sdk = { version = "0.0.1-alpha.1", default-features = false, path = "packages/plugin-sdk" }
-bmux_presentation = { version = "0.0.1-alpha.1", default-features = false, path = "packages/presentation" }
-bmux_presentation_plugin = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/presentation-plugin" }
-bmux_presentation_plugin_api = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/presentation-plugin-api" }
-bmux_presentation_runtime = { version = "0.0.1-alpha.1", default-features = false, path = "packages/presentation-runtime" }
 bmux_presentation_state = { version = "0.0.1-alpha.1", default-features = false, path = "packages/presentation-state" }
+bmux_presenter = { version = "0.0.1-alpha.1", default-features = false, path = "packages/presenter" }
+bmux_presenter_plugin = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/presenter-plugin" }
+bmux_presenter_plugin_api = { version = "0.0.1-alpha.1", default-features = false, path = "plugins/presenter-plugin-api" }
+bmux_presenter_runtime = { version = "0.0.1-alpha.1", default-features = false, path = "packages/presenter-runtime" }
 bmux_recording_protocol = { version = "0.0.1-alpha.1", default-features = false, path = "packages/recording-protocol" }
 bmux_recording_runtime = { version = "0.0.1-alpha.1", default-features = false, path = "packages/recording-runtime" }
 bmux_sandbox_harness = { version = "0.0.1-alpha.1", default-features = false, path = "packages/sandbox-harness" }

@@ -572,7 +572,7 @@ mod platform_tests {
 
     fn mermaid() -> Value {
         json!({
-            "owner": "bmux.presentation", "id": "mermaid-worker",
+            "owner": "bmux.presenter", "id": "mermaid-worker",
             "cargo_package": "bmux_mermaid_render", "cargo_binary": "bmux-mermaid-worker",
             "relative_path": "bmux-mermaid-worker", "protocol_version": 1,
             "supported_platforms": ["unix", "windows"]

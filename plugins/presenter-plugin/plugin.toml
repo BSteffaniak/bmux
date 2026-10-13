@@ -1,0 +1,86 @@
+execution_class       = "native_fast"
+id                    = "bmux.presenter"
+name                  = "bmux Presenter"
+owns_namespaces       = ["present"]
+provided_capabilities = ["bmux.presenter.view.v2", "bmux.presenter.manage.v1"]
+provided_features     = ["bmux.presenter"]
+version               = "0.0.1-alpha.0"
+
+[native_abi]
+minimum = "1.1"
+
+[[auxiliary_executables]]
+cargo_binary        = "bmux-mermaid-worker"
+cargo_package       = "bmux_mermaid_render"
+id                  = "mermaid-worker"
+protocol_version    = 1
+relative_path       = "bmux-mermaid-worker"
+supported_platforms = ["unix", "windows"]
+
+[[services]]
+capability   = "bmux.presenter.view.v2"
+interface_id = "presenter-view-v2"
+kind         = "command"
+[[services]]
+capability   = "bmux.presenter.manage.v1"
+interface_id = "presenter-host-v1"
+kind         = "command"
+
+[[commands]]
+description   = "present play DECK [--presenter] [--no-reload]. Arrow/space navigation; q exits. Presenter notes never enter audience frames."
+execution     = "caller_process"
+expose_in_cli = true
+name          = "present-play"
+path          = ["present", "play"]
+summary       = "Play a Markdown or compiled Rust deck locally"
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+
+[[commands]]
+description   = "present host DECK --presenter-credential FILE (--audience-credential FILE | --public-read) [--managed | --cert FILE --key FILE [--listen ADDRESS]] [--no-reload]. Managed hosts run in BMUX; standalone hosts use TLS. Credentials are read from private files, not argv."
+execution     = "caller_process"
+expose_in_cli = true
+name          = "present-host"
+path          = ["present", "host"]
+summary       = "Host a deck with private presenter and audience scopes"
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+
+[[commands]]
+description   = "present join tls://HOST:PORT --ca FILE [--server-name NAME] [--credential FILE] [--presenter] [--mode receive-only|submit-only|shared|independent]. BMUX service hosts use bmux:HOST_ID and no TLS options. Reconnect is live-host only; uncertain actions are never replayed."
+execution     = "caller_process"
+expose_in_cli = true
+name          = "present-join"
+path          = ["present", "join"]
+summary       = "Join a live TLS or BMUX presentation host"
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "present-check"
+path          = ["present", "check"]
+summary       = "Parse and validate a deck without acquiring the terminal"
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
