@@ -30,8 +30,35 @@ diagrams are decoded/prepared outside update/paint; remote assets are opaque and
 fetched in bounded chunks. Private audience credentials grant navigation/demo
 input but never notes/effects; receive-only mode remains read-only.
 
-`examples/counter_deck.rs` exports a serialized linked counter fixture for local
-CLI playback. The runtime owner renders fixed 80×24 mirror scenes; viewers never
+## Runnable examples
+
+For Markdown playback, start with `packages/presentation/examples/quickstart.md`.
+For the bundled image/Mermaid deck, run from the repository root in the same dev
+shell and Cargo profile:
+
+```sh
+cargo build -p bmux_mermaid_render --bin bmux-mermaid-worker
+cargo run -p bmux_cli -- present check packages/presentation/examples/deck.md
+cargo run -p bmux_cli -- present play packages/presentation/examples/deck.md
+```
+
+The deck includes its image and uses no custom components. See the presentation
+crate README for helper discovery and image-terminal requirements.
+
+For a visible interactive counter deck:
+
+```sh
+cargo run -p bmux_presentation_plugin --example counter_deck > counter.json
+cargo run -p bmux_cli -- present play counter.json
+```
+
+Advance to the counter slide, use Tab to focus the counter, then `+`/`-` to change
+it. The CLI registers its trusted demo components; JSON never supplies executable
+code. `cargo run -p bmux_presentation_plugin --example linked_host` instead runs
+a headless host/input/reload demonstration and prints confirmation; it does not
+start a terminal player or a network listener.
+
+The runtime owner renders fixed 80×24 mirror scenes; remote viewers never
 reflow that canvas or instantiate the counter implementation.
 
 Native playback uses `bmux_tui_runtime` scheduling, terminal input admission,

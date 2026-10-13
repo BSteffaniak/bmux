@@ -42,9 +42,18 @@ let state = PresentationState::new(&deck);
 
 ---
 
-<!-- bmux:slide-id rich -->
+<!-- bmux:slide-id image -->
 
-![Authorized diagram](asset:architecture)
+# A bundled image
+
+![Two authoring paths feeding one presentation model](architecture.png)
+
+Blue and green inputs feed the shared purple model, then the orange viewer.
+
+---
+<!-- bmux:slide-id mermaid -->
+
+# Mermaid rendering
 
 ```mermaid
 flowchart LR
@@ -52,6 +61,3 @@ flowchart LR
   Rust --> Model
   Model --> BMUX
 ```
-
-<!-- bmux:pause -->
-<!-- bmux:component demo-button {} -->

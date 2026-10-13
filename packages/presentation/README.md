@@ -15,8 +15,24 @@ cargo run -p bmux_cli -- present play packages/presentation/examples/quickstart.
 
 Add `--presenter` to playback to show speaker notes. The quickstart includes
 code, columns, reveals, and live reload without images, Mermaid, or custom
-component registration. `examples/deck.md` is a richer authoring fixture that
-requires external assets and component registration; it is not self-contained.
+component registration. For the richer image/Mermaid deck, build the helper in
+this same dev shell, profile, and target directory, then check and play:
+
+```sh
+cargo build -p bmux_mermaid_render --bin bmux-mermaid-worker
+cargo run -p bmux_cli -- present check packages/presentation/examples/deck.md
+cargo run -p bmux_cli -- present play packages/presentation/examples/deck.md
+```
+
+`examples/deck.md` uses the bundled `architecture.png` beside it and requires no
+custom component registration. Keep that image beside the deck when copying it.
+The helper is discovered beside the BMUX executable; if you build it elsewhere,
+set `BMUX_MERMAID_WORKER_PATH` to its absolute executable path. Images need a
+terminal with a supported image protocol to display graphically.
+
+`cargo run -p bmux_presentation --example linked_deck` is a headless Rust
+embedding example: it builds and paints a canonical frame, then prints its
+viewport size. It does not open an interactive terminal player.
 
 ## Public interfaces
 
@@ -129,10 +145,10 @@ linked components need an explicitly reviewed public configuration projection.
 
 ## Examples and validation
 
-`examples/deck.md` is an authoring fixture covering metadata, reveals, notes, code,
-tables, columns, images, Mermaid, and a linked custom component. Its
-`asset:architecture` reference requires a caller-supplied authorized asset; it is
-not a standalone CLI deck. `examples/linked_deck.rs` builds a Rust
+`examples/deck.md` is a runnable CLI deck covering metadata, reveals, notes, code,
+tables, columns, a bundled image, and Mermaid. Build `bmux-mermaid-worker` as
+shown above before checking or playing it; no custom registration is needed.
+`examples/linked_deck.rs` builds a Rust
 deck, registers a canonical interactive button with caller-owned state, injects
 an authorized pixel asset, and stages an offscreen canonical frame. A runtime
 presents that frame and routes events against the same resolved layout.
