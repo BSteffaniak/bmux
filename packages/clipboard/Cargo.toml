@@ -11,14 +11,19 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-arboard   = { workspace = true }
-image     = { workspace = true }
-thiserror = { workspace = true }
-tracing   = { workspace = true }
+arboard    = { workspace = true }
+image      = { workspace = true }
+libc       = { workspace = true, optional = true }
+libloading = { workspace = true, optional = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
-default          = []
+default = []
+# Staged native implementation; the reference remains the default until all
+# platform interoperability gates have passed.
 fail-on-warnings = []
+native-clipboard = ["dep:libc", "dep:libloading"]

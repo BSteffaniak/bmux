@@ -1464,6 +1464,8 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "arboard",
  "image",
+ "libc",
+ "libloading",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",

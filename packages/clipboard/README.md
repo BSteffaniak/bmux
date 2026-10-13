@@ -21,6 +21,26 @@ scroll mode and other contexts.
   SSH or when a display is explicitly configured. Multiple desktops are not guessed.
 - Graceful error reporting including each attempted backend when copying fails
 
+## Native replacement (experimental)
+
+`native-clipboard` opts into the owned native backends for text and PNG image
+operations. Arboard remains the default/reference dependency until platform
+interoperability and availability gates pass; enabling this feature does not
+currently remove it from the dependency graph.
+
+The Unix implementation dynamically loads `libxcb.so.1` and
+`libwayland-client.so.0`. This is an additional availability requirement versus
+the pure-Rust reference transports, so it is not yet a drop-in replacement.
+Windows and macOS use native system APIs/frameworks. Clipboard payloads are
+bounded to 256 MiB with explicit errors rather than silent truncation.
+
+Tests must not overwrite a live user clipboard. The ignored `native_interop`
+test requires both a disposable display and `BMUX_CLIPBOARD_ISOLATED_TEST=1`.
+Native Windows/macOS interoperability, Wayland compositor interoperability,
+and exit-time clipboard persistence require separate acceptance evidence.
+Existing source/diagnostic names containing `arboard` remain compatibility
+labels while the backend is experimental.
+
 ## Core Types
 
 - **`Clipboard`**: Handle that holds the detected backend command
