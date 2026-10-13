@@ -178,7 +178,7 @@ fn corrupt(change: impl FnOnce(&mut TestMessage)) {
     let bytes = encode_binary(&frame(4, 2, 1)).unwrap();
     let mut message: TestMessage = bmux_codec::from_positional_bytes(&bytes[5..]).unwrap();
     change(&mut message);
-    let mut bytes = b"BMWP\x01".to_vec();
+    let mut bytes = b"BMWP\x02".to_vec();
     bytes.extend(bmux_codec::to_positional_vec(&message).unwrap());
     assert!(decode_binary(&bytes, None).is_err());
 }

@@ -128,6 +128,8 @@ pub fn visible_image_strips(
     Ok(rectangles
         .into_iter()
         .map(|rect| ImagePlacement {
+            fit: bmux_tui::image::ImageFit::Stretch,
+            allocation: None,
             key: ImageKey::new(if single {
                 key.to_owned()
             } else {

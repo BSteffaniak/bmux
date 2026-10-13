@@ -152,13 +152,13 @@ impl CanvasBackend {
             context.begin_path();
             self.rectangle(context, placement.clip.intersection(area), area);
             context.clip();
-            let destination = placement.destination;
+            let destination = placement.pixel_rect(self.cell_width, self.cell_height);
             let result = context.draw_image_with_image_bitmap_and_dw_and_dh(
                 &image.0,
-                (f64::from(destination.x) - f64::from(area.x)) * self.cell_width,
-                (f64::from(destination.y) - f64::from(area.y)) * self.cell_height,
-                f64::from(destination.width) * self.cell_width,
-                f64::from(destination.height) * self.cell_height,
+                destination.x - f64::from(area.x) * self.cell_width,
+                destination.y - f64::from(area.y) * self.cell_height,
+                destination.width,
+                destination.height,
             );
             context.restore();
             result?;

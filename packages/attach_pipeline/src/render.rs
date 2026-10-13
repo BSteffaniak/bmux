@@ -1325,6 +1325,8 @@ fn capture_graphic_overlay(surface_id: Uuid, instance_key: u64, graphic: &Termin
     };
     crate::projection::record(PaintOperation::Image(std::sync::Arc::new(
         bmux_tui::image::ImagePlacement {
+            fit: bmux_tui::image::ImageFit::Stretch,
+            allocation: None,
             key: bmux_tui::image::ImageKey::new(format!("{surface_id}:{instance_key}")),
             payload,
             destination: bmux_tui::geometry::Rect::new(

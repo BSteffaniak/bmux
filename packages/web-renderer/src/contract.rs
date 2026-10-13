@@ -461,6 +461,12 @@ impl BrowserFrame {
                 return Err(DecodeError::Invalid("image identity"));
             }
             valid_rect(placement.destination)?;
+            if placement
+                .allocation
+                .is_some_and(|bounds| !bounds.covers(placement.destination))
+            {
+                return Err(DecodeError::Invalid("image allocation"));
+            }
             within(placement.clip, area)?;
             let (bytes, width, height, channels) = match &placement.payload {
                 ImagePayload::Png {

@@ -319,6 +319,7 @@ pub struct ImageComponent {
     id: String,
     payload: bmux_tui::image::ImagePayload,
     rows: u16,
+    fit: bmux_tui::image::ImageFit,
 }
 impl ImageComponent {
     pub fn new(id: impl Into<String>, payload: bmux_tui::image::ImagePayload, rows: u16) -> Self {
@@ -326,7 +327,15 @@ impl ImageComponent {
             id: id.into(),
             payload,
             rows,
+            fit: bmux_tui::image::ImageFit::Contain,
         }
+    }
+
+    /// Override the default aspect-preserving fit for intentional stretching.
+    #[must_use]
+    pub const fn fit(mut self, fit: bmux_tui::image::ImageFit) -> Self {
+        self.fit = fit;
+        self
     }
 }
 impl Component for ImageComponent {
@@ -334,6 +343,7 @@ impl Component for ImageComponent {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.id.hash(&mut hasher);
         self.rows.hash(&mut hasher);
+        std::mem::discriminant(&self.fit).hash(&mut hasher);
         let layout = hasher.finish();
         match &self.payload {
             bmux_tui::image::ImagePayload::Png {
@@ -380,6 +390,8 @@ impl Component for ImageComponent {
         if cx.project_raster_rect(area).is_some() {
             cx.push_image(bmux_tui::image::ImageContribution::Present(
                 bmux_tui::image::ImagePlacement {
+                    fit: self.fit,
+                    allocation: None,
                     key: bmux_tui::image::ImageKey::new(self.id.clone()),
                     payload: self.payload.clone(),
                     destination,
@@ -538,6 +550,16 @@ mod tests {
         };
         assert_eq!(placement.destination, Rect::new(2, 1, 5, 3));
         assert_eq!(placement.clip, Rect::new(2, 1, 4, 2));
+        assert_eq!(placement.fit, bmux_tui::image::ImageFit::Contain);
+        assert_eq!(
+            placement.allocation,
+            Some(bmux_tui::image::ImageBounds {
+                x: 2,
+                y: 1,
+                width: 5,
+                height: 3
+            })
+        );
     }
     #[test]
     fn hidden_custom_content_emits_no_hits_or_events() {

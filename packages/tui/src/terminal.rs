@@ -381,6 +381,8 @@ mod tests {
             .draw(|frame| {
                 frame.push_hit(HitRegion::new("committed", frame.clip()));
                 frame.push_image(ImageContribution::Present(ImagePlacement {
+                    fit: crate::image::ImageFit::Stretch,
+                    allocation: None,
                     key: ImageKey::new("committed"),
                     payload: ImagePayload::Pixels {
                         bytes: vec![1, 2, 3, 4],
@@ -399,6 +401,8 @@ mod tests {
             |frame| {
                 frame.push_hit(HitRegion::new("speculative", frame.clip()));
                 frame.push_image(ImageContribution::Present(ImagePlacement {
+                    fit: crate::image::ImageFit::Stretch,
+                    allocation: None,
                     key: ImageKey::new("speculative"),
                     payload: ImagePayload::Pixels {
                         bytes: vec![5, 6, 7, 8],
@@ -790,6 +794,8 @@ mod tests {
     fn terminal_reconciles_frame_images_after_rendering() {
         let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
         let placement = ImagePlacement {
+            fit: crate::image::ImageFit::Stretch,
+            allocation: None,
             key: ImageKey::new("diagram"),
             payload: ImagePayload::Png {
                 bytes: vec![1, 2, 3],

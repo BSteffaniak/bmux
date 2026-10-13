@@ -29,6 +29,8 @@ mod tests {
                 2
             ],
             images: vec![WireImage {
+                fit: bmux_tui::image::ImageFit::Stretch,
+                allocation: None,
                 key: "i".into(),
                 destination: CanvasRect {
                     x: 0,

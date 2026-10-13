@@ -423,6 +423,22 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
                 let Some(clip) = self.project_rect(LocalRect::terminal(placement.clip)) else {
                     return;
                 };
+                if placement.fit == crate::image::ImageFit::Contain {
+                    let local = placement
+                        .allocation
+                        .unwrap_or_else(|| placement.destination.into());
+                    placement.allocation = Some(crate::image::ImageBounds {
+                        x: self.origin_x.saturating_add(local.x),
+                        y: i32::try_from(self.origin_y.saturating_add(i64::from(local.y)))
+                            .unwrap_or(if self.origin_y < 0 {
+                                i32::MIN
+                            } else {
+                                i32::MAX
+                            }),
+                        width: local.width,
+                        height: local.height,
+                    });
+                }
                 placement.destination = destination;
                 placement.clip = clip;
                 ImageContribution::Present(placement)
@@ -795,6 +811,8 @@ mod tests {
         let mut frame = Frame::new(&mut buffer);
         let mut paint = PaintCx::new(&mut frame);
         let placement = ImagePlacement {
+            fit: crate::image::ImageFit::Stretch,
+            allocation: None,
             key: ImageKey::new("offscreen"),
             payload: ImagePayload::Png {
                 bytes: vec![],
@@ -931,6 +949,8 @@ mod tests {
 
         paint.with_child(-1, 0, LocalRect::new(0, 0, 5, 2), |paint| {
             paint.push_image(ImageContribution::Present(ImagePlacement {
+                fit: crate::image::ImageFit::Contain,
+                allocation: None,
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Png {
                     bytes: vec![1],
@@ -948,6 +968,15 @@ mod tests {
         };
         assert_eq!(placement.destination, Rect::new(0, 0, 4, 2));
         assert_eq!(placement.clip, Rect::new(0, 0, 4, 2));
+        assert_eq!(
+            placement.allocation,
+            Some(crate::image::ImageBounds {
+                x: -1,
+                y: 0,
+                width: 5,
+                height: 2
+            })
+        );
     }
 
     #[test]

@@ -199,6 +199,13 @@ impl BrowserBackend for Recording {
 }
 fn image() -> ImagePlacement {
     ImagePlacement {
+        fit: bmux_tui::image::ImageFit::Contain,
+        allocation: Some(bmux_tui::image::ImageBounds {
+            x: 1,
+            y: -1,
+            width: 2,
+            height: 3,
+        }),
         key: ImageKey::new("pixels"),
         destination: Rect::new(1, 1, 2, 1),
         clip: Rect::new(0, 0, 8, 3),

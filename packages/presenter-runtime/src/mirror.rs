@@ -48,6 +48,10 @@ pub enum WireImagePayload {
 pub struct WireImage {
     pub key: String,
     pub destination: CanvasRect,
+    #[serde(default)]
+    pub fit: bmux_tui::image::ImageFit,
+    #[serde(default)]
+    pub allocation: Option<bmux_tui::image::ImageBounds>,
     pub clip: CanvasRect,
     pub payload: WireImagePayload,
 }
@@ -206,6 +210,8 @@ impl MirrorFrame {
                 key: placement.key.as_str().to_owned(),
                 payload,
                 destination: rect(placement.destination),
+                fit: placement.fit,
+                allocation: placement.allocation,
                 clip: rect(placement.clip.intersection(area)),
             });
         }
@@ -327,6 +333,14 @@ fn validate_images(frame: &MirrorFrame, max_bytes: usize) -> Result<(), HostErro
             || !keys.insert(&image.key)
             || !within(image.destination, frame.width, frame.height)
             || !within(image.clip, frame.width, frame.height)
+            || image.allocation.is_some_and(|bounds| {
+                !bounds.covers(bmux_tui::geometry::Rect::new(
+                    image.destination.x,
+                    image.destination.y,
+                    image.destination.width,
+                    image.destination.height,
+                ))
+            })
         {
             return Err(HostError::Invalid);
         }
@@ -499,6 +513,8 @@ impl MirrorFrame {
                     let destination = image.destination;
                     let clip = image.clip;
                     child.push_image(ImageContribution::Present(ImagePlacement {
+                        fit: image.fit,
+                        allocation: image.allocation,
                         key: ImageKey::new(format!("{}:{}", self.surface_id, image.key)),
                         payload,
                         destination: Rect::new(

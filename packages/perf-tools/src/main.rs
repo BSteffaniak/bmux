@@ -419,6 +419,8 @@ impl bmux_tui_runtime::Presenter<TuiBenchProgram> for TuiBenchPresenter {
             cx.push_hit(bmux_tui::hit::HitRegion::new("benchmark.action", localized));
             cx.push_image(bmux_tui::image::ImageContribution::Present(
                 bmux_tui::image::ImagePlacement {
+                    fit: bmux_tui::image::ImageFit::Stretch,
+                    allocation: None,
                     key: bmux_tui::image::ImageKey::new("benchmark.image"),
                     payload: bmux_tui::image::ImagePayload::Pixels {
                         bytes: vec![0, 128, 255, 255],

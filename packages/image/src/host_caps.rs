@@ -25,6 +25,17 @@ pub struct HostImageCapabilities {
 }
 
 impl HostImageCapabilities {
+    /// Cell metrics for fitting. Unknown hosts use an explicit 8x16 estimate,
+    /// not square cells; measured dimensions always take precedence.
+    #[must_use]
+    pub const fn fitting_cell_size(&self) -> (u16, u16) {
+        if self.cell_pixel_width != 0 && self.cell_pixel_height != 0 {
+            (self.cell_pixel_width, self.cell_pixel_height)
+        } else {
+            (8, 16)
+        }
+    }
+
     /// Returns the preferred image protocol based on detected capabilities.
     ///
     /// Preference order: Kitty > Sixel > iTerm2.
@@ -56,6 +67,11 @@ impl HostImageCapabilities {
 /// mode is active and before starting any competing input reader.
 pub fn detect_from_env() -> HostImageCapabilities {
     let mut caps = HostImageCapabilities::default();
+    let (width, height) = query_cell_pixel_size();
+    if width != 0 && height != 0 {
+        caps.cell_pixel_width = width;
+        caps.cell_pixel_height = height;
+    }
 
     // A BMUX pane is an emulated terminal boundary. Never inherit physical-host
     // capability hints such as TERM_PROGRAM=ghostty into the pane. BMUX

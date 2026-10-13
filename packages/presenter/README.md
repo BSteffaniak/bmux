@@ -124,7 +124,13 @@ only use already-authorized/resolved assets and remain deterministic/read-only.
 Returning `None` uses readable alt text or Mermaid code fallback, reserving at
 least the block's requested rows. `ImageComponent::new(id, ImagePayload, rows)`
 paints supplied PNG/raw pixels through scoped `PaintCx::push_image`, preserving
-canonical transforms, clipping, and frame lifecycle. Rasterized Mermaid may use
+canonical transforms, clipping, and frame lifecycle. Images default to centered
+`Contain`: requested rows reserve an allocation, not a forced aspect ratio.
+Output adapters fit using measured cell pixel dimensions, and scrolling clips
+that original fit without squeezing it. Unknown terminal metrics use an explicit
+8x16 estimate; exact sizing requires reported metrics. Use `.fit(ImageFit::Stretch)`
+for intentional distortion. Resize/font metric changes invalidate derived fits.
+Rasterized Mermaid may use
 that same component; text Mermaid output may use canonical `TextBlock`. Runtime
 owns rendering/decoding policy, limits, cancellation, and asset authorization.
 

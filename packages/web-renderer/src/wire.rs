@@ -1,6 +1,6 @@
 //! Compact presentation protocol, shared by native and WASM consumers.
 //!
-//! `BMWP\x01` freezes field order and enum indices below. Changing these types,
+//! `BMWP\x02` freezes field order and enum indices below. Changing these types,
 //! or the positional TUI metadata projection, requires a new binary version.
 //! Rows retain every cell, including explicit wide continuations. This is an
 //! output projection, not a compositor or an authoritative state installer.
@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{BrowserFrame, DecodeError, Limits};
 
-pub const BINARY_WIRE_VERSION: u8 = 1;
-const MAGIC: &[u8; 5] = b"BMWP\x01";
+pub const BINARY_WIRE_VERSION: u8 = 2;
+const MAGIC: &[u8; 5] = b"BMWP\x02";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Immutable content-addressed image payload; placement keys are independent.
@@ -113,6 +113,10 @@ struct Placement {
     key: ImageKey,
     resource: ResourceRequirement,
     destination: Rect,
+    #[serde(default)]
+    fit: bmux_tui::image::ImageFit,
+    #[serde(default)]
+    allocation: Option<bmux_tui::image::ImageBounds>,
     clip: Rect,
     lifecycle: ImageLifecycle,
 }
@@ -302,6 +306,8 @@ fn placements(frame: &BrowserFrame) -> Vec<Placement> {
             key: image.key.clone(),
             resource: requirement(&image.payload),
             destination: image.destination,
+            fit: image.fit,
+            allocation: image.allocation,
             clip: image.clip,
             lifecycle: image.lifecycle,
         })
@@ -708,6 +714,8 @@ pub fn decode_binary_with_resources(
                 // Reconcile in one batch: frame-scoped images must not expire
                 // while reconstructing other placements in the same snapshot.
                 let placement = ImagePlacement {
+                    fit: image.fit,
+                    allocation: image.allocation,
                     key: image.key,
                     payload,
                     destination: image.destination,

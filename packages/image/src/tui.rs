@@ -56,6 +56,13 @@ impl From<std::io::Error> for TuiImageError {
 }
 
 type RetainedSource = (Arc<TuiImagePayload>, usize, Arc<PaneImage>);
+type ContainSignature = (
+    u64,
+    bmux_tui::geometry::Rect,
+    Option<bmux_tui::image::ImageBounds>,
+    u16,
+    u16,
+);
 
 /// BMUX-owned adapter that assigns image IDs, validates payloads, clips
 /// placements, and delegates host protocol selection to the compositor.
@@ -63,6 +70,7 @@ type RetainedSource = (Arc<TuiImagePayload>, usize, Arc<PaneImage>);
 pub struct TuiImageCompositor {
     next_id: u64,
     sources: BTreeMap<ImageKey, RetainedSource>,
+    fitted: BTreeMap<ImageKey, (ContainSignature, Arc<PaneImage>)>,
     kitty_state: KittyHostState,
     reset_pending: bool,
     validations: usize,
@@ -174,6 +182,22 @@ impl TuiImageCompositor {
         let terminal_clip =
             bmux_tui::geometry::Rect::new(terminal.x, terminal.y, terminal.w, terminal.h);
         for placement in scene.placements() {
+            if placement
+                .allocation
+                .is_some_and(|bounds| !bounds.covers(placement.destination))
+            {
+                return Err(invalid(
+                    &placement.key,
+                    "allocation does not cover destination",
+                ));
+            }
+            let mut output_caps = host_caps.clone();
+            if placement.fit == bmux_tui::image::ImageFit::Contain {
+                let (width, height) = host_caps.fitting_cell_size();
+                output_caps.cell_pixel_width = width;
+                output_caps.cell_pixel_height = height;
+            }
+            let host_caps = &output_caps;
             let Some(_) = clipped_destination(placement.destination, placement.clip, terminal_clip)
             else {
                 continue;
@@ -212,25 +236,62 @@ impl TuiImageCompositor {
                     ),
                 );
             }
-            let image = &self.sources.get(&placement.key).expect("retained source").2;
+            let source = Arc::clone(&self.sources.get(&placement.key).expect("retained source").2);
+            let image = if placement.fit == bmux_tui::image::ImageFit::Contain {
+                let signature = (
+                    source.id,
+                    placement.destination,
+                    placement.allocation,
+                    host_caps.cell_pixel_width.max(1),
+                    host_caps.cell_pixel_height.max(1),
+                );
+                if !self
+                    .fitted
+                    .get(&placement.key)
+                    .is_some_and(|(previous, _)| *previous == signature)
+                {
+                    let payload = contain_payload(placement, &source.payload, host_caps, config)?;
+                    self.next_id = self
+                        .next_id
+                        .checked_add(1)
+                        .expect("TUI image ID space exhausted");
+                    let pixels = payload.pixels.as_ref().expect("contained pixels");
+                    let fitted = Arc::new(PaneImage {
+                        id: self.next_id,
+                        pixel_size: ImagePixelSize {
+                            width: pixels.width,
+                            height: pixels.height,
+                        },
+                        payload,
+                        ..(*source).clone()
+                    });
+                    self.fitted
+                        .insert(placement.key.clone(), (signature, fitted));
+                }
+                Arc::clone(&self.fitted[&placement.key].1)
+            } else {
+                self.fitted.remove(&placement.key);
+                source
+            };
             if host_caps.preferred_protocol() != Some(ImageProtocol::KittyGraphics) {
                 // Set before writes: even a partial raster sequence needs repair.
                 self.raster_pending = true;
             }
             render_image_clipped(
                 out,
-                image,
+                &image,
                 placement.destination,
                 placement.clip.intersection(terminal_clip),
                 &[],
                 host_caps,
                 &mut self.kitty_state,
-                Some(image),
+                Some(&image),
             )?;
             self.trim_sources();
         }
         self.kitty_state.finish_frame(out)?;
         self.sources.retain(|key, _| scene.get(key).is_some());
+        self.fitted.retain(|key, _| self.sources.contains_key(key));
         self.trim_sources();
         Ok(())
     }
@@ -240,25 +301,31 @@ impl TuiImageCompositor {
         // but are revalidated on their next frame rather than retained unboundedly.
         while self.sources.len() > 128
             || self
-                .sources
+                .fitted
                 .values()
-                .map(|(source, _, image)| {
-                    let source_bytes = match &**source {
-                        TuiImagePayload::Pixels { bytes, .. }
-                        | TuiImagePayload::Png { bytes, .. } => bytes.len(),
-                    };
-                    source_bytes
-                        + image.payload.raw.as_ref().map_or(0, Vec::len)
-                        + image
-                            .payload
-                            .pixels
-                            .as_ref()
-                            .map_or(0, |pixels| pixels.data.len())
-                })
+                .map(|(_, image)| image.payload.pixels.as_ref().map_or(0, |p| p.data.len()))
                 .sum::<usize>()
+                + self
+                    .sources
+                    .values()
+                    .map(|(source, _, image)| {
+                        let source_bytes = match &**source {
+                            TuiImagePayload::Pixels { bytes, .. }
+                            | TuiImagePayload::Png { bytes, .. } => bytes.len(),
+                        };
+                        source_bytes
+                            + image.payload.raw.as_ref().map_or(0, Vec::len)
+                            + image
+                                .payload
+                                .pixels
+                                .as_ref()
+                                .map_or(0, |pixels| pixels.data.len())
+                    })
+                    .sum::<usize>()
                 > 64 * 1024 * 1024
         {
             self.sources.pop_first();
+            self.fitted.retain(|key, _| self.sources.contains_key(key));
         }
     }
 
@@ -273,6 +340,7 @@ impl TuiImageCompositor {
     pub fn clear(&mut self) {
         self.reset_pending = true;
         self.sources.clear();
+        self.fitted.clear();
     }
 
     /// Emit queued removals and clear all compositor-owned host resources.
@@ -303,6 +371,71 @@ impl TuiImageCompositor {
             }
         }
     }
+}
+
+// Rasterize the allocated fit once per source/geometry/metric revision. Letterbox
+// pixels keep fractional-cell sizing exact; protocol emitters retain one geometry.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Values are bounded by the allocation and byte limit below.
+fn contain_payload(
+    placement: &bmux_tui::image::ImagePlacement,
+    source: &ImagePayload,
+    caps: &HostImageCapabilities,
+    config: &ImageConfig,
+) -> Result<ImagePayload, TuiImageError> {
+    let (cw, ch) = caps.fitting_cell_size();
+    let cw = u32::from(cw);
+    let ch = u32::from(ch);
+    let width = u32::from(placement.destination.width) * cw;
+    let height = u32::from(placement.destination.height) * ch;
+    let count = u64::from(width) * u64::from(height) * 4;
+    if count > u64::try_from(config.max_image_bytes).unwrap_or(u64::MAX) {
+        return Err(invalid(
+            &placement.key,
+            "contained output exceeds configured byte limit",
+        ));
+    }
+    let fit = placement.pixel_rect(f64::from(cw), f64::from(ch));
+    let fit_width = fit.width.round().max(1.0) as u32;
+    let fit_height = fit.height.round().max(1.0) as u32;
+    if u64::from(fit_width) * u64::from(fit_height) * 4
+        > u64::try_from(config.max_image_bytes).unwrap_or(u64::MAX)
+    {
+        return Err(invalid(
+            &placement.key,
+            "fitted image exceeds configured byte limit",
+        ));
+    }
+    let pixels = source.pixels.as_ref().expect("validated pixels");
+    let decoded = match pixels.format {
+        PixelFormat::Rgb8 => image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_raw(pixels.width, pixels.height, pixels.data.clone())
+                .expect("validated RGB"),
+        ),
+        PixelFormat::Rgba8 => image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(pixels.width, pixels.height, pixels.data.clone())
+                .expect("validated RGBA"),
+        ),
+        PixelFormat::Png => return Err(invalid(&placement.key, "expected decoded pixels")),
+    };
+    let fitted = decoded
+        .resize_exact(fit_width, fit_height, image::imageops::FilterType::Lanczos3)
+        .into_rgba8();
+    let mut canvas = image::RgbaImage::new(width, height);
+    image::imageops::overlay(
+        &mut canvas,
+        &fitted,
+        (fit.x - f64::from(placement.destination.x) * f64::from(cw)).round() as i64,
+        (fit.y - f64::from(placement.destination.y) * f64::from(ch)).round() as i64,
+    );
+    Ok(ImagePayload {
+        raw: None,
+        pixels: Some(PixelBuffer {
+            width,
+            height,
+            format: PixelFormat::Rgba8,
+            data: canvas.into_raw(),
+        }),
+    })
 }
 
 fn clipped_destination(
@@ -529,8 +662,155 @@ mod tests {
     use crate::config::ImageConfig;
     use crate::host_caps::HostImageCapabilities;
 
+    #[test]
+    fn contain_letterboxes_and_crops_without_refitting() {
+        let mut placed = placement(
+            "contain",
+            Rect::new(0, 0, 10, 6),
+            Rect::new(0, 0, 10, 6),
+            255,
+        );
+        placed.fit = bmux_tui::image::ImageFit::Contain;
+        let config = ImageConfig::default();
+        let mut caps = HostImageCapabilities {
+            cell_pixel_width: 4,
+            cell_pixel_height: 8,
+            ..HostImageCapabilities::default()
+        };
+        let source = super::decode_payload(&placed.key, &placed.payload, &config).unwrap();
+        let first = super::contain_payload(&placed, &source, &caps, &config).unwrap();
+        let pixels = first.pixels.unwrap();
+        assert_eq!((pixels.width, pixels.height), (40, 48));
+        // The 2:1 source fits at 40x20, centered with 14px letterboxes.
+        assert!(pixels.data[..40 * 14 * 4].iter().all(|byte| *byte == 0));
+        assert!(
+            pixels.data[40 * 14 * 4..40 * 34 * 4]
+                .iter()
+                .all(|byte| *byte == 255)
+        );
+        placed.allocation = Some(bmux_tui::image::ImageBounds {
+            x: 0,
+            y: -2,
+            width: 10,
+            height: 6,
+        });
+        placed.destination = Rect::new(0, 0, 10, 4);
+        let clipped = super::contain_payload(&placed, &source, &caps, &config)
+            .unwrap()
+            .pixels
+            .unwrap();
+        assert_eq!(clipped.data, pixels.data[40 * 16 * 4..]);
+        caps.cell_pixel_height = 4;
+        assert_eq!(
+            super::contain_payload(&placed, &source, &caps, &config)
+                .unwrap()
+                .pixels
+                .unwrap()
+                .height,
+            16
+        );
+    }
+
+    #[cfg(all(feature = "kitty", feature = "sixel", feature = "iterm2"))]
+    #[test]
+    fn contain_protocols_use_the_same_fitted_pixels() {
+        let mut scene = ImageScene::default();
+        let mut placed = placement(
+            "protocol-fit",
+            Rect::new(0, 0, 10, 6),
+            Rect::new(0, 0, 10, 6),
+            255,
+        );
+        placed.fit = bmux_tui::image::ImageFit::Contain;
+        scene.reconcile(&[ImageContribution::Present(placed)]);
+        let mut expected = None;
+        for (kitty_graphics, sixel, iterm2_inline, marker) in [
+            (true, false, false, "a=t"),
+            (false, true, false, "\u{1b}P"),
+            (false, false, true, "1337;File="),
+        ] {
+            let caps = HostImageCapabilities {
+                kitty_graphics,
+                sixel,
+                iterm2_inline,
+                cell_pixel_width: 4,
+                cell_pixel_height: 8,
+                ..Default::default()
+            };
+            let mut compositor = TuiImageCompositor::new();
+            let mut output = Vec::new();
+            compositor
+                .render(
+                    &mut output,
+                    &scene,
+                    PaneRect {
+                        x: 0,
+                        y: 0,
+                        w: 10,
+                        h: 6,
+                    },
+                    &caps,
+                    &ImageConfig::default(),
+                )
+                .unwrap();
+            assert!(String::from_utf8_lossy(&output).contains(marker));
+            let pixels = compositor
+                .fitted
+                .values()
+                .next()
+                .unwrap()
+                .1
+                .payload
+                .pixels
+                .as_ref()
+                .unwrap();
+            assert_eq!((pixels.width, pixels.height), (40, 48));
+            if let Some(previous) = &expected {
+                assert_eq!(pixels, previous);
+            }
+            expected = Some(pixels.clone());
+        }
+    }
+
+    #[test]
+    fn contain_reuses_geometry_until_metrics_change() {
+        let mut scene = ImageScene::default();
+        let mut placed = placement("fit", Rect::new(0, 0, 10, 6), Rect::new(0, 0, 10, 6), 255);
+        placed.fit = bmux_tui::image::ImageFit::Contain;
+        scene.reconcile(&[ImageContribution::Present(placed)]);
+        let mut compositor = TuiImageCompositor::new();
+        let mut caps = HostImageCapabilities {
+            kitty_graphics: true,
+            cell_pixel_width: 4,
+            cell_pixel_height: 8,
+            ..HostImageCapabilities::default()
+        };
+        let config = ImageConfig::default();
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 6,
+        };
+        compositor
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        let id = compositor.fitted.values().next().unwrap().1.id;
+        compositor
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        assert_eq!(id, compositor.fitted.values().next().unwrap().1.id);
+        caps.cell_pixel_height = 10;
+        compositor
+            .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+            .unwrap();
+        assert_ne!(id, compositor.fitted.values().next().unwrap().1.id);
+    }
+
     fn placement(key: &str, destination: Rect, clip: Rect, value: u8) -> ImagePlacement {
         ImagePlacement {
+            fit: bmux_tui::image::ImageFit::Stretch,
+            allocation: None,
             key: ImageKey::new(key),
             payload: ImagePayload::Pixels {
                 bytes: vec![value; 8 * 4 * 4],
@@ -717,6 +997,8 @@ mod tests {
         let mut scene = ImageScene::default();
         let bytes = (0_u8..32).collect::<Vec<_>>();
         scene.reconcile(&[ImageContribution::Present(ImagePlacement {
+            fit: bmux_tui::image::ImageFit::Stretch,
+            allocation: None,
             key: ImageKey::new("diagram"),
             payload: ImagePayload::Pixels {
                 bytes,
@@ -1115,6 +1397,8 @@ mod tests {
         for (payload, config) in cases {
             let mut scene = ImageScene::default();
             scene.reconcile(&[ImageContribution::Present(ImagePlacement {
+                fit: bmux_tui::image::ImageFit::Stretch,
+                allocation: None,
                 key: ImageKey::new("invalid"),
                 payload,
                 destination: Rect::new(0, 0, 1, 1),

@@ -107,6 +107,8 @@ mod tests {
 
     fn placement(key: &str, x: u16, lifecycle: ImageLifecycle) -> ImagePlacement {
         ImagePlacement {
+            fit: crate::image::ImageFit::Stretch,
+            allocation: None,
             key: ImageKey::new(key),
             payload: ImagePayload::Png {
                 bytes: vec![1, 2, 3],

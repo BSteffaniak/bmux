@@ -95,6 +95,15 @@ impl<W: Write, R> ImageTerminalPresenter<W, R, NoopPresentationCommit> {
 }
 
 impl<W: Write, R, C> ImageTerminalPresenter<W, R, C> {
+    /// Refresh pixel geometry without reading terminal input or changing protocols.
+    pub fn refresh_cell_metrics(&mut self) {
+        let (width, height) = bmux_image::host_caps::query_cell_pixel_size();
+        if width != 0 && height != 0 {
+            self.host_capabilities.cell_pixel_width = width;
+            self.host_capabilities.cell_pixel_height = height;
+        }
+    }
+
     /// Create an image-capable presenter with a successful-commit observer.
     #[must_use]
     pub fn with_commit(
@@ -205,6 +214,7 @@ where
     type Error = ImagePresentationError;
 
     fn resize(&mut self, size: Size) {
+        self.refresh_cell_metrics();
         self.terminal
             .resize(Rect::new(0, 0, size.width, size.height));
     }
@@ -235,6 +245,7 @@ where
     type Error = ImagePresentationError;
 
     fn resize(&mut self, size: Size) {
+        self.refresh_cell_metrics();
         self.terminal
             .resize(Rect::new(0, 0, size.width, size.height));
     }
@@ -346,6 +357,8 @@ mod tests {
             let render = |visible: &mut bool, frame: &mut PaintCx<'_, '_>| {
                 if *visible {
                     frame.push_image(ImageContribution::Present(ImagePlacement {
+                        fit: bmux_tui::image::ImageFit::Stretch,
+                        allocation: None,
                         key: ImageKey::new("raster"),
                         payload: ImagePayload::Pixels {
                             bytes: vec![255, 0, 0, 255],
@@ -396,6 +409,8 @@ mod tests {
         let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
         let render = |(): &mut (), frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
             frame.push_image(ImageContribution::Present(ImagePlacement {
+                fit: bmux_tui::image::ImageFit::Stretch,
+                allocation: None,
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
                     bytes: vec![1, 2, 3, 4],
@@ -433,6 +448,8 @@ mod tests {
         let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
         let render = |(): &mut (), frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
             frame.push_image(ImageContribution::Present(ImagePlacement {
+                fit: bmux_tui::image::ImageFit::Stretch,
+                allocation: None,
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
                     bytes: vec![1, 2, 3, 4],
@@ -463,6 +480,8 @@ mod tests {
         let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
         let render = |(): &mut (), frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
             frame.push_image(ImageContribution::Present(ImagePlacement {
+                fit: bmux_tui::image::ImageFit::Stretch,
+                allocation: None,
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
                     bytes: vec![1, 2, 3, 4],
@@ -496,6 +515,8 @@ mod tests {
         let terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
         let render = |(): &mut (), frame: &mut bmux_tui::paint::PaintCx<'_, '_>| {
             frame.push_image(ImageContribution::Present(ImagePlacement {
+                fit: bmux_tui::image::ImageFit::Stretch,
+                allocation: None,
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
                     bytes: vec![1, 2, 3, 4],

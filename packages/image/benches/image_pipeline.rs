@@ -107,6 +107,8 @@ fn encoder_cases(
 
 fn placement(pixels: &PixelBuffer) -> ImagePlacement {
     ImagePlacement {
+        fit: bmux_tui::image::ImageFit::Stretch,
+        allocation: None,
         key: ImageKey::new("fixed-image"),
         payload: TuiPayload::Pixels {
             bytes: pixels.data.clone(),

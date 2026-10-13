@@ -363,6 +363,8 @@ mod tests {
                 .all(|op| matches!(op, PaintOperation::Text { text, .. } if text.len() == 600))
         );
         let image = std::sync::Arc::new(ImagePlacement {
+            fit: bmux_tui::image::ImageFit::Stretch,
+            allocation: None,
             key: ImageKey::new("shared"),
             payload: ImagePayload::Pixels {
                 bytes: vec![0; 8 * 1024 * 1024],

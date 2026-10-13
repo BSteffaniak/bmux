@@ -42,6 +42,8 @@ fn rejects_bad_graphemes_continuations_and_controls() {
 #[test]
 fn images_reject_wrong_size_huge_dimensions_duplicate_keys_and_bad_bounds() {
     let image = WireImage {
+        fit: bmux_tui::image::ImageFit::Stretch,
+        allocation: None,
         key: "image".into(),
         destination: CanvasRect {
             x: 0,
@@ -65,6 +67,26 @@ fn images_reject_wrong_size_huge_dimensions_duplicate_keys_and_bad_bounds() {
     let mut value = frame();
     value.images.push(image.clone());
     assert!(value.validate(100, 8192).is_ok());
+    value.images[0].fit = bmux_tui::image::ImageFit::Contain;
+    value.images[0].allocation = Some(bmux_tui::image::ImageBounds {
+        x: 0,
+        y: -1,
+        width: 2,
+        height: 2,
+    });
+    let roundtrip: MirrorFrame =
+        serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(roundtrip.images[0].fit, bmux_tui::image::ImageFit::Contain);
+    assert_eq!(roundtrip.images[0].allocation, value.images[0].allocation);
+    assert!(roundtrip.validate(100, 8192).is_ok());
+    value.images[0].allocation = Some(bmux_tui::image::ImageBounds {
+        x: 1,
+        y: 0,
+        width: 1,
+        height: 1,
+    });
+    assert_eq!(value.validate(100, 8192), Err(HostError::Invalid));
+    value.images[0].allocation = None;
     value.images.push(image);
     assert_eq!(value.validate(100, 8192), Err(HostError::Invalid));
     value.images.pop();

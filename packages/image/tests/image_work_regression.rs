@@ -292,6 +292,8 @@ fn tui_scene_warm_movement_hide_reveal_replacement_and_cleanup() {
     };
     use bmux_tui::image_scene::ImageScene;
     let mut placement = ImagePlacement {
+        fit: bmux_tui::image::ImageFit::Stretch,
+        allocation: None,
         key: ImageKey::new("retained"),
         payload: ImagePayload::Pixels {
             bytes: support::pixels(17, 13).data,
