@@ -1261,6 +1261,23 @@ pub struct SelectableListComponent<'a, 'state> {
 }
 
 impl<'a, 'state> SelectableListComponent<'a, 'state> {
+    /// Reveal the current focus using the measured list viewport and shared
+    /// scroll controller. Call after semantic navigation, before painting the
+    /// same layout. No content measurement is performed here.
+    pub fn reveal_focus(&self, layout: &LayoutNode) {
+        if !self.list.layout_matches_items(layout) {
+            return;
+        }
+        let Some(viewport) = resolved_viewport(layout) else {
+            return;
+        };
+        let mut state = self.state.get();
+        if let Some(index) = state.focused() {
+            self.list.ensure_visible(viewport, &mut state, index);
+        }
+        self.state.set(state);
+    }
+
     /// Dispatch through resolved component geometry while retaining selection details.
     pub fn handle_event(
         &self,

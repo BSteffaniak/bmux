@@ -25,6 +25,14 @@ pub enum PickerFramePlacement {
     LowerThird,
     /// Place the picker at an explicit top-left point, clamped to the available area.
     Anchored(Point),
+    /// Attach to a measured scope-local field without overlapping it.
+    FieldAnchored {
+        /// Field rectangle in containing component coordinates.
+        field: Rect,
+        /// Prefer below when it fits; otherwise use above if it fits, then
+        /// the side with more space, shrinking to that side.
+        prefer_below: bool,
+    },
 }
 
 /// Behavior/layout policy for [`PickerFrame`].
@@ -221,7 +229,14 @@ impl<'a> PickerFrame<'a> {
     }
 
     fn resolved_layout(&self, area: Rect) -> PickerFrameLayout {
-        let available = area.inset(self.policy.margin);
+        let available = if matches!(
+            self.policy.placement,
+            PickerFramePlacement::FieldAnchored { .. }
+        ) {
+            bounded_inset(area, self.policy.margin)
+        } else {
+            area.inset(self.policy.margin)
+        };
         let panel = place_rect(
             available,
             desired_size(available, self.policy),
@@ -295,6 +310,29 @@ impl<'a> PickerFrameComponent<'a> {
         self
     }
 
+    fn field_panel(&self, outer: LogicalSize) -> Option<Rect> {
+        if !matches!(
+            self.frame.policy.placement,
+            PickerFramePlacement::FieldAnchored { .. }
+        ) {
+            return None;
+        }
+        let scope = bounded_inset(
+            Rect::new(
+                0,
+                0,
+                outer.width.try_into().unwrap_or(u16::MAX),
+                outer.height.try_into().unwrap_or(u16::MAX),
+            ),
+            self.frame.policy.margin,
+        );
+        Some(place_rect(
+            scope,
+            desired_size(scope, self.frame.policy),
+            self.frame.policy.placement,
+        ))
+    }
+
     fn panel_size(&self, constraints: Constraints) -> LogicalSize {
         let width = self
             .frame
@@ -337,6 +375,7 @@ impl<'a> PickerFrameComponent<'a> {
                 .x
                 .min(remaining_x.try_into().unwrap_or(u16::MAX))
                 .into(),
+            PickerFramePlacement::FieldAnchored { .. } => unreachable!("handled above"),
         };
         let y = match self.frame.policy.placement {
             PickerFramePlacement::Center => remaining_y / 2,
@@ -346,6 +385,7 @@ impl<'a> PickerFrameComponent<'a> {
                 .min(remaining_y.try_into().unwrap_or(usize::MAX))
                 .try_into()
                 .unwrap_or(u64::MAX),
+            PickerFramePlacement::FieldAnchored { .. } => unreachable!("handled above"),
         };
         (
             margin
@@ -358,6 +398,13 @@ impl<'a> PickerFrameComponent<'a> {
     fn local_layout(&self, size: LogicalSize) -> PickerFrameLayout {
         let mut frame = self.frame.clone();
         frame.policy.margin = Insets::all(0);
+        if matches!(
+            frame.policy.placement,
+            PickerFramePlacement::FieldAnchored { .. }
+        ) {
+            // Inner chrome belongs to the already-positioned panel.
+            frame.policy.placement = PickerFramePlacement::Center;
+        }
         frame.resolved_layout(Rect::new(
             0,
             0,
@@ -507,10 +554,19 @@ impl Component for PickerFrameComponent<'_> {
                 .max_height()
                 .unwrap_or_else(|| constraints.min_height()),
         ));
-        let panel_size = self.panel_size(constraints.inset(
-            self.frame.policy.margin.horizontal().into(),
-            u64::try_from(usize::from(self.frame.policy.margin.vertical())).unwrap_or(u64::MAX),
-        ));
+        let field_panel = self.field_panel(outer);
+        let panel_size = field_panel.map_or_else(
+            || {
+                self.panel_size(
+                    constraints.inset(
+                        self.frame.policy.margin.horizontal().into(),
+                        u64::try_from(usize::from(self.frame.policy.margin.vertical()))
+                            .unwrap_or(u64::MAX),
+                    ),
+                )
+            },
+            |panel| LogicalSize::new(panel.width.into(), panel.height.into()),
+        );
         let local = self.local_layout(panel_size);
         let mut children = Vec::with_capacity(2);
         if let (Some(input), Some(area)) = (&self.input, local.input) {
@@ -577,7 +633,10 @@ impl Component for PickerFrameComponent<'_> {
             panel_size,
             children,
         );
-        let (x, y) = self.panel_origin(outer, panel_size);
+        let (x, y) = field_panel.map_or_else(
+            || self.panel_origin(outer, panel_size),
+            |panel| (panel.x, usize::from(panel.y)),
+        );
         LayoutNode::with_children(
             self.id.clone(),
             outer,
@@ -672,6 +731,13 @@ fn desired_size(area: Rect, policy: PickerFramePolicy) -> Size {
 }
 
 fn place_rect(area: Rect, size: Size, placement: PickerFramePlacement) -> Rect {
+    if let PickerFramePlacement::FieldAnchored {
+        field,
+        prefer_below,
+    } = placement
+    {
+        return field_anchored_rect(area, size, field, prefer_below);
+    }
     let width = size.width.min(area.width);
     let height = size.height.min(area.height);
     let x = match placement {
@@ -681,6 +747,7 @@ fn place_rect(area: Rect, size: Size, placement: PickerFramePlacement) -> Rect {
             area.x.saturating_add(area.width.saturating_sub(width) / 2)
         }
         PickerFramePlacement::Anchored(point) => point.x.min(area.right().saturating_sub(width)),
+        PickerFramePlacement::FieldAnchored { .. } => unreachable!("handled above"),
     };
     let y = match placement {
         PickerFramePlacement::Center => area
@@ -693,8 +760,51 @@ fn place_rect(area: Rect, size: Size, placement: PickerFramePlacement) -> Rect {
             .y
             .saturating_add(area.height.saturating_sub(height) * 2 / 3),
         PickerFramePlacement::Anchored(point) => point.y.min(area.bottom().saturating_sub(height)),
+        PickerFramePlacement::FieldAnchored { .. } => unreachable!("handled above"),
     };
     Rect::new(x, y, width, height)
+}
+
+// Unlike Rect::inset, keep even an empty scope's origin inside its parent.
+fn bounded_inset(area: Rect, margin: Insets) -> Rect {
+    let inset = area.inset(margin);
+    Rect::new(
+        inset.x.min(area.right()),
+        inset.y.min(area.bottom()),
+        inset.width,
+        inset.height,
+    )
+}
+
+/// Placement only; content measurement belongs to the component tree.
+fn field_anchored_rect(scope: Rect, requested: Size, field: Rect, prefer_below: bool) -> Rect {
+    let top = field.y.clamp(scope.y, scope.bottom());
+    let bottom = field.bottom().clamp(scope.y, scope.bottom());
+    let above = top.saturating_sub(scope.y);
+    let below = scope.bottom().saturating_sub(bottom);
+    let preferred = if prefer_below { below } else { above };
+    let opposite = if prefer_below { above } else { below };
+    let use_below = if requested.height <= preferred {
+        prefer_below
+    } else if requested.height <= opposite {
+        !prefer_below
+    } else if above == below {
+        prefer_below
+    } else {
+        below > above
+    };
+    let height = requested.height.min(if use_below { below } else { above });
+    let width = requested.width.min(scope.right().saturating_sub(scope.x));
+    Rect::new(
+        field.x.clamp(scope.x, scope.right().saturating_sub(width)),
+        if use_below {
+            bottom
+        } else {
+            top.saturating_sub(height)
+        },
+        width,
+        height,
+    )
 }
 
 impl crate::theme::ComponentTheme {
@@ -732,6 +842,78 @@ mod tests {
 
     fn resolved_layout(frame: &PickerFrame<'_>, area: Rect) -> super::PickerFrameLayout {
         frame.resolved_layout(area)
+    }
+
+    #[test]
+    fn field_anchor_geometry_matches_measured_panel_and_stays_in_tiny_scope() {
+        for width in [0, 1, 2, 10, 20] {
+            for height in [0, 1, 2, 4, 10] {
+                for prefer_below in [false, true] {
+                    for margin in [Insets::all(0), Insets::all(2)] {
+                        let field = Rect::new(width / 2, height / 2, 1, 1);
+                        let scope = Rect::new(0, 0, width, height);
+                        let frame = PickerFrame::new().policy(PickerFramePolicy {
+                            placement: PickerFramePlacement::FieldAnchored {
+                                field,
+                                prefer_below,
+                            },
+                            min_size: Size::new(2, 2),
+                            max_size: Size::new(8, 5),
+                            input: false,
+                            margin,
+                            ..PickerFramePolicy::bare()
+                        });
+                        let expected = frame.resolved_layout(scope).panel;
+                        let component = PickerFrameComponent::new(
+                            "anchor",
+                            frame,
+                            TextBlock::new("界e\u{301}🦀"),
+                        );
+                        let node = component
+                            .layout(Constraints::tight(scope.size()), &mut LayoutCx::new());
+                        let mut buffer = Buffer::empty(scope);
+                        component.paint(&node, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+                        let panel = &node.children[0];
+                        assert_eq!(
+                            (
+                                panel.x,
+                                panel.y,
+                                panel.node.size.width,
+                                panel.node.size.height
+                            ),
+                            (
+                                u64::from(expected.x),
+                                u64::from(expected.y),
+                                u64::from(expected.width),
+                                u64::from(expected.height)
+                            )
+                        );
+                        assert!(expected.right() <= scope.right());
+                        assert!(expected.bottom() <= scope.bottom());
+                        if !expected.is_empty() {
+                            assert!(expected.bottom() <= field.y || expected.y >= field.bottom());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn field_anchor_prefers_fit_then_more_space_and_clamps_horizontal_edge() {
+        let scope = Rect::new(3, 4, 10, 10);
+        assert_eq!(
+            super::field_anchored_rect(scope, Size::new(6, 3), Rect::new(12, 8, 1, 1), true),
+            Rect::new(7, 9, 6, 3)
+        );
+        assert_eq!(
+            super::field_anchored_rect(scope, Size::new(6, 5), Rect::new(12, 11, 1, 1), true),
+            Rect::new(7, 6, 6, 5)
+        );
+        assert_eq!(
+            super::field_anchored_rect(scope, Size::new(20, 20), Rect::new(12, 8, 1, 1), true),
+            Rect::new(3, 9, 10, 5)
+        );
     }
 
     #[test]

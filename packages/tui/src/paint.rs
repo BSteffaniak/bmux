@@ -95,6 +95,37 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         self.frame.cursor()
     }
 
+    /// Return the visible cursor in this context's local logical coordinates.
+    ///
+    /// Read this after painting a child to anchor geometry in the enclosing
+    /// scope. The inverse uses the actual scoped origin, not the clipped edge,
+    /// so sliced documents retain their source row (including rows beyond
+    /// `u16::MAX`). No cursor, a hidden cursor, or a cursor outside this scope's
+    /// effective clip returns `None`. As with [`Self::set_cursor_logical`], the
+    /// right insertion edge is included and the bottom edge is excluded.
+    /// Negative or unrepresentable local coordinates also return `None`.
+    ///
+    /// This reads the current frame request, not a committed presentation or
+    /// proof that the cursor belongs to a particular child. Callers retain
+    /// ownership and commit geometry only after successful presentation.
+    #[must_use]
+    pub fn logical_cursor(&self) -> Option<(u64, u64)> {
+        let cursor = self.frame.cursor()?;
+        let position = cursor.position;
+        if !cursor.visible
+            || self.clip.is_empty()
+            || position.x < self.clip.x
+            || position.x > self.clip.right()
+            || position.y < self.clip.y
+            || position.y >= self.clip.bottom()
+        {
+            return None;
+        }
+        let x = i64::from(position.x).checked_sub(i64::from(self.origin_x))?;
+        let y = i64::from(position.y).checked_sub(self.origin_y)?;
+        Some((u64::try_from(x).ok()?, u64::try_from(y).ok()?))
+    }
+
     /// Paint one logical selection snapshot over content already rendered.
     ///
     /// This is the deterministic overlay stage a root presenter callback runs
@@ -580,6 +611,84 @@ mod tests {
             frame.focus_scope().map(crate::hit::HitId::as_str),
             Some("modal")
         );
+    }
+
+    #[test]
+    fn logical_cursor_round_trips_nested_sliced_source_coordinates() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 6));
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+        assert_eq!(paint.logical_cursor(), None);
+        paint.with_child(3, 1, LocalRect::new(0, 0, 6, 4), |owner| {
+            owner.with_child(-2, -70_000, LocalRect::new(2, 70_000, 6, 4), |source| {
+                source.with_child(4, 70_002, LocalRect::new(0, 0, 2, 1), |leaf| {
+                    leaf.set_cursor_logical(1, 0, true);
+                    assert_eq!(leaf.logical_cursor(), Some((1, 0)));
+                });
+                assert_eq!(source.logical_cursor(), Some((5, 70_002)));
+                assert_eq!(
+                    source.cursor().map(|cursor| cursor.position),
+                    Some(Point::new(6, 3))
+                );
+            });
+            assert_eq!(owner.logical_cursor(), Some((3, 2)));
+        });
+        assert_eq!(paint.logical_cursor(), Some((6, 3)));
+    }
+
+    #[test]
+    fn logical_cursor_obeys_visibility_and_insertion_edge_clipping() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 4));
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+        paint.with_child(2, 1, LocalRect::new(0, 0, 3, 2), |cx| {
+            cx.set_cursor_logical(3, 1, true);
+            assert_eq!(cx.logical_cursor(), Some((3, 1)));
+            cx.set_cursor_logical(1, 1, false);
+            assert!(cx.cursor().is_some());
+            assert_eq!(cx.logical_cursor(), None);
+        });
+        for position in [
+            Point::new(1, 1),
+            Point::new(6, 1),
+            Point::new(2, 0),
+            Point::new(2, 3),
+        ] {
+            paint.set_cursor(position, true);
+            paint.with_child(2, 1, LocalRect::new(0, 0, 3, 2), |cx| {
+                assert_eq!(cx.logical_cursor(), None);
+            });
+        }
+    }
+
+    #[test]
+    fn logical_cursor_checked_inverse_rejects_negative_overflow_and_empty_clip() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 4));
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+        paint.set_cursor(Point::new(1, 1), true);
+        // Signed local paint regions can extend left/up of their origin. They
+        // remain paintable, but are not unsigned logical cursor positions.
+        paint.with_child(2, 2, LocalRect::new(-2, -2, 10, 4), |cx| {
+            assert_eq!(cx.logical_cursor(), None);
+        });
+        paint.origin_y = i64::MIN;
+        assert_eq!(paint.logical_cursor(), None);
+        paint.origin_y = 0;
+        paint.clip.width = 0;
+        assert_eq!(paint.logical_cursor(), None);
+    }
+
+    #[test]
+    fn logical_cursor_retains_nonzero_frame_origin_and_tiny_right_edge() {
+        let mut buffer = Buffer::empty(Rect::new(5, 7, 1, 1));
+        let mut frame = Frame::new(&mut buffer);
+        let mut paint = PaintCx::new(&mut frame);
+        paint.with_child(5, 7, LocalRect::new(0, 0, 1, 1), |cx| {
+            cx.set_cursor_logical(1, 0, true);
+            assert_eq!(cx.logical_cursor(), Some((1, 0)));
+        });
+        assert_eq!(paint.logical_cursor(), Some((6, 7)));
     }
 
     #[test]

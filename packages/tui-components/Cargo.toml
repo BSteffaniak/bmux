@@ -36,6 +36,7 @@ canvas = []
 chart = ["dep:unicode-segmentation"]
 checkbox = ["keyboard-input"]
 compact = ["dep:unicode-segmentation", "dep:unicode-width"]
+completion = ["text-input", "selectable-list", "picker-frame"]
 dialog = ["action-row", "modal-frame"]
 diff-viewer = ["source-viewer", "dep:unicode-segmentation", "dep:unicode-width"]
 empty-state = []
@@ -78,6 +79,7 @@ keyboard-input = ["dep:bmux_keyboard"]
 
 # Optional ergonomic bundles.
 all = [
+    "completion",
     "action-row",
     "badge",
     "bar-chart",

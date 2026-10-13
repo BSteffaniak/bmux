@@ -32,6 +32,8 @@ pub mod checkbox;
 pub mod common;
 #[cfg(feature = "compact")]
 pub mod compact;
+#[cfg(feature = "completion")]
+pub mod completion;
 #[cfg(feature = "dialog")]
 pub mod dialog;
 #[cfg(feature = "diff-viewer")]
