@@ -350,9 +350,12 @@ pub enum Command {
         /// Listener IP (default 127.0.0.1); authentication is opt-in
         #[arg(long, requires = "web_assets")]
         web_host: Option<std::net::IpAddr>,
-        /// Browser-facing IP for wildcard binds (0.0.0.0 or ::)
+        /// Optional URL-display IP hint (not a request host restriction)
         #[arg(long, requires = "web_assets")]
         web_public_host: Option<std::net::IpAddr>,
+        /// Restrict exact HTTP Host authorities, including ports (repeat or comma-separate)
+        #[arg(long, value_delimiter = ',', requires = "web_assets")]
+        web_allowed_hosts: Option<Vec<String>>,
         /// Browser port (default 8080); zero selects an ephemeral port
         #[arg(long, requires = "web_assets")]
         web_port: Option<u16>,
@@ -3187,6 +3190,31 @@ mod tests {
             cli.command,
             Some(Command::KillAllSessions { force_local: true })
         ));
+    }
+
+    #[test]
+    fn parses_optional_allowed_hosts() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "attach",
+            "--web-assets",
+            "/assets",
+            "--web-host",
+            "0.0.0.0",
+            "--web-allowed-hosts",
+            "bmux.lan:8080,localhost:8080",
+            "--web-allowed-hosts",
+            "[::1]:8080",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Attach { web_public_host: None, web_allowed_hosts: Some(hosts), .. })
+            if hosts == vec!["bmux.lan:8080", "localhost:8080", "[::1]:8080"])
+        );
+        assert!(
+            Cli::try_parse_from(["bmux", "attach", "--web-allowed-hosts", "bmux.lan:8080"])
+                .is_err()
+        );
     }
 
     #[test]

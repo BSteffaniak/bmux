@@ -128,6 +128,7 @@ pub(super) struct WebOptions<'a> {
     pub auth: Option<&'a str>,
     pub host: Option<std::net::IpAddr>,
     pub public_host: Option<std::net::IpAddr>,
+    pub allowed_hosts: Option<&'a [String]>,
 }
 
 fn select_ip(
@@ -151,7 +152,7 @@ fn select_ip(
 fn resolve_web_settings(options: WebOptions<'_>) -> Result<bmux_config::WebConfig> {
     let config = bmux_config::BmuxConfig::load()?.web;
     let mut settings = select_web_settings(
-        config,
+        config.clone(),
         (options.port, options.auth),
         std::env::var("BMUX_WEB_PORT"),
         std::env::var("BMUX_WEB_AUTH"),
@@ -169,7 +170,32 @@ fn resolve_web_settings(options: WebOptions<'_>) -> Result<bmux_config::WebConfi
         config.public_host,
         "BMUX_WEB_PUBLIC_HOST",
     )?;
+    settings.allowed_hosts = select_allowed_hosts(
+        options.allowed_hosts,
+        std::env::var("BMUX_WEB_ALLOWED_HOSTS"),
+        config.allowed_hosts,
+    )?;
     Ok(settings)
+}
+
+fn select_allowed_hosts(
+    cli: Option<&[String]>,
+    env: std::result::Result<String, std::env::VarError>,
+    configured: Vec<String>,
+) -> Result<Vec<String>> {
+    match (cli, env) {
+        (Some(hosts), _) => Ok(hosts.to_vec()),
+        (None, Ok(value)) => Ok(if value.is_empty() {
+            Vec::new()
+        } else {
+            value
+                .split(',')
+                .map(|host| host.trim().to_owned())
+                .collect()
+        }),
+        (None, Err(std::env::VarError::NotPresent)) => Ok(configured),
+        (None, Err(error)) => Err(error.into()),
+    }
 }
 
 fn select_web_settings(
@@ -219,6 +245,7 @@ fn configure_browser_host(
     config.port = settings.port;
     config.host = settings.host;
     config.public_host = settings.public_host;
+    config.allowed_hosts = settings.allowed_hosts;
     config.auth_mode = match settings.auth {
         bmux_config::WebAuth::None => bmux_web_host::AuthMode::None,
         bmux_config::WebAuth::Token => bmux_web_host::AuthMode::Token,
@@ -267,6 +294,12 @@ pub(super) async fn run(
             cols: 80,
             rows: 24,
         })?;
+    if host.address().ip().is_unspecified() {
+        eprintln!(
+            "Listening on all interfaces at port {}. From another computer, replace the displayed URL host with this computer's IP or DNS name.",
+            host.address().port()
+        );
+    }
     eprintln!("Read-only browser view: {}", host.bootstrap_url());
     let attach = async {
         if web_only {
@@ -340,6 +373,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn allowed_host_precedence_and_explicit_empty_override() {
+        let configured = vec!["configured.example:8080".into()];
+        let cli = vec!["cli.example:8080".into()];
+        assert_eq!(
+            select_allowed_hosts(
+                Some(&cli),
+                Ok("env.example:8080".into()),
+                configured.clone()
+            )
+            .unwrap(),
+            cli
+        );
+        assert!(
+            select_allowed_hosts(Some(&[]), Ok("env.example:8080".into()), configured.clone())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            select_allowed_hosts(
+                None,
+                Ok(" a.example:8080, b.example:8080 ".into()),
+                configured.clone()
+            )
+            .unwrap(),
+            vec!["a.example:8080", "b.example:8080"]
+        );
+        assert!(
+            select_allowed_hosts(None, Ok(String::new()), configured.clone())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            select_allowed_hosts(
+                None,
+                Err(std::env::VarError::NotPresent),
+                configured.clone()
+            )
+            .unwrap(),
+            configured
+        );
+    }
+
+    #[test]
     fn web_ip_settings_precedence_and_validation() {
         let absent = || Err(std::env::VarError::NotPresent);
         let local = "127.0.0.1".parse().unwrap();
@@ -394,7 +470,7 @@ mod tests {
             ..bmux_config::WebConfig::default()
         };
         let env = select_web_settings(
-            configured,
+            configured.clone(),
             (None, None),
             Ok("8081".into()),
             Ok("none".into()),
@@ -403,7 +479,7 @@ mod tests {
         assert_eq!(env.port, 8081);
         assert_eq!(env.auth, bmux_config::WebAuth::None);
         let cli = select_web_settings(
-            configured,
+            configured.clone(),
             (Some(0), Some("token")),
             Ok("bad".into()),
             Ok("bad".into()),
@@ -412,9 +488,18 @@ mod tests {
         assert_eq!(cli.port, 0);
         assert_eq!(cli.auth, bmux_config::WebAuth::Token);
         assert!(
-            select_web_settings(configured, (None, None), Ok("65536".into()), absent()).is_err()
+            select_web_settings(
+                configured.clone(),
+                (None, None),
+                Ok("65536".into()),
+                absent()
+            )
+            .is_err()
         );
-        assert!(select_web_settings(configured, (None, None), absent(), Ok("bad".into())).is_err());
+        assert!(
+            select_web_settings(configured.clone(), (None, None), absent(), Ok("bad".into()))
+                .is_err()
+        );
         let inherited = select_web_settings(configured, (None, None), absent(), absent()).unwrap();
         assert_eq!(inherited.port, 9090);
         assert_eq!(inherited.auth, bmux_config::WebAuth::Token);

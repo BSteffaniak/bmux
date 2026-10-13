@@ -1054,14 +1054,16 @@ pub struct BmuxConfig {
 }
 
 /// Browser hosting with opt-in token authentication.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, ConfigDoc)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "web")]
 #[serde(default)]
 pub struct WebConfig {
     /// Listener IP (default 127.0.0.1); independent of authentication
     pub host: std::net::IpAddr,
-    /// Browser-facing IP; required when host is 0.0.0.0 or ::
+    /// Optional URL-display IP hint; does not restrict request hosts
     pub public_host: Option<std::net::IpAddr>,
+    /// Optional exact HTTP Host authorities including port; empty accepts any valid host
+    pub allowed_hosts: Vec<String>,
     /// HTTP port; zero requests an ephemeral port
     pub port: u16,
     /// Browser authentication: none (local users) or token (capability URL)
@@ -1072,6 +1074,7 @@ impl Default for WebConfig {
         Self {
             host: std::net::Ipv4Addr::LOCALHOST.into(),
             public_host: None,
+            allowed_hosts: Vec::new(),
             port: 8080,
             auth: WebAuth::None,
         }

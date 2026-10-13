@@ -61,15 +61,18 @@ bmux attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only \
   --web-host 192.168.1.188
 ```
 
-Or listen on all IPv4 interfaces with an explicit browser-facing address:
+Or listen on all IPv4 interfaces—no public-host setting needed:
 
 ```sh
 bmux attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only \
-  --web-host 0.0.0.0 --web-public-host 192.168.1.188
+  --web-host 0.0.0.0
 ```
 
-Replace the example IP with your serving computer's LAN IP. Open the printed
-plain URL on the other computer, not `0.0.0.0`. Refresh works normally.
+With a wildcard bind, the displayed URL uses loopback for local use. On another
+computer, use the serving computer's LAN IP or DNS name, e.g.
+`http://192.168.1.188:8080/` or `http://bmux.lan:8080/`. Never browse to `0.0.0.0`.
+Refresh works normally. `--web-public-host 192.168.1.188` optionally changes the
+printed URL only; it neither restricts hosts nor changes the listening interface.
 Authentication is independent of the bind address: add `--web-auth token` to opt
 in. With token mode, open the full printed capability URL including `#token=...`.
 Deployment owners can instead provide access controls at their network boundary.
@@ -79,18 +82,31 @@ Equivalent configuration:
 ```toml
 [web]
 host = "0.0.0.0"
-public_host = "192.168.1.188"
 port = 8080
 auth = "none" # default on any bind address; "token" opts in
 ```
 
 `BMUX_WEB_HOST` and `BMUX_WEB_PUBLIC_HOST` are the environment equivalents.
 All fields independently honor CLI → environment → config → defaults precedence.
-Hosts must be literal IPv4/IPv6 addresses, not DNS names. For IPv6 use
-`--web-host ::` and a concrete IPv6 `--web-public-host`; URLs bracket IPv6.
-Scoped link-local IPv6 addresses are unsupported. Wildcards require a concrete
-public IP in the same family. With concrete binds, public host must match host.
-Only the exact advertised Host/Origin is trusted, not arbitrary aliases.
+Bind and URL-display hosts must be literal IPv4/IPv6 addresses. Browser URLs can
+use DNS aliases or any reachable interface. For IPv6 use `--web-host ::`; displayed
+URLs bracket IPv6. Scoped link-local bind addresses are unsupported.
+
+By default any syntactically valid HTTP Host is accepted. A supplied Origin must
+match `http://<request Host>`; viewport mutations require that same Origin.
+Cross-site Fetch Metadata is still rejected. No forwarded host/proto headers are
+trusted. For optional exact host restrictions use:
+
+```sh
+--web-allowed-hosts bmux.lan:8080,192.168.1.188:8080
+```
+
+Or configure `allowed_hosts = ["bmux.lan:8080", "192.168.1.188:8080"]` under
+`[web]`, or set comma-separated `BMUX_WEB_ALLOWED_HOSTS`. The list includes ports;
+repeat the CLI flag to add entries. An empty list means unrestricted hosts (an
+empty environment value explicitly clears configured restrictions). This is
+independent of `public_host` and token authentication. DNS-rebinding host
+restrictions are opt-in, not implicit in the bind address.
 
 **Deployment policy:** token authentication is opt-in for every bind address.
 With `auth = "none"`, any client that can reach the listener and satisfy the

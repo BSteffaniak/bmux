@@ -92,11 +92,11 @@ Configured build directory and explicit allowlist are trusted caller input.
 * `405`: all non-GET methods, including terminal input, upgrades and mutations.
   Unknown GET paths are `404` and cannot invoke any operation.
 
-Only the exact configured browser-facing IP and bound port are accepted in Host
-(default `127.0.0.1:<bound-port>`, not localhost or arbitrary aliases).
-A supplied Origin must exactly equal that host's HTTP origin;
-supplied `Sec-Fetch-Site` must be `same-origin` or `none`. This blocks DNS rebinding,
-foreign-origin requests and sibling-origin fetches even if a capability leaks.
+By default any valid HTTP Host authority is accepted, including DNS aliases.
+Optional `allowed_hosts` restricts exact authorities including ports; empty means
+unrestricted. A supplied Origin must match `http://<request Host>`; mutations
+require that Origin. Supplied `Sec-Fetch-Site` must be `same-origin` or `none`.
+Cross-origin requests remain rejected; DNS-rebinding host restrictions are opt-in.
 Static bootstrap assets are public but host/origin guarded. Snapshots require a
 bearer only in explicit token mode; loopback defaults to port 8080 without a token.
 `HostConfig.port = 0` selects an ephemeral port; `auth_mode = AuthMode::Token`
@@ -105,9 +105,12 @@ external access controls are deployment-owned. Occupied fixed ports fail rather
 than selecting another.
 `HostConfig.host` accepts IPv4/IPv6, defaulting to `127.0.0.1`. Authentication is
 independent: `AuthMode::None` is the default on any bind; `AuthMode::Token` opts in.
-Wildcard binds require `public_host`, a concrete same-family IP for the bootstrap
-URL and exact Host/Origin policy. With concrete binds, `public_host` must equal
-`host`. HTTP is unencrypted. With no token, reachable clients can read output and
+Wildcard binds need no public host. Their printed URL uses loopback as a local
+example; remote users substitute their reachable IP or DNS alias. Optional
+`public_host` changes only the printed URL, never request restrictions or binding.
+`allowed_hosts` independently opts into exact Host restrictions (at most 64 valid
+authorities). Forwarded host/proto headers do not change the origin policy.
+HTTP is unencrypted. With no token, reachable clients can read output and
 acquire leased viewport controls; deployment owners provide any external access
 controls. Neither mode grants authority beyond this presentation/viewport scope.
 

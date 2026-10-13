@@ -474,6 +474,7 @@ pub(super) async fn dispatch_built_in_command(
                 web_auth,
                 web_host,
                 web_public_host,
+                web_allowed_hosts,
             },
         ) => {
             if let Some(assets) = web_assets {
@@ -488,6 +489,7 @@ pub(super) async fn dispatch_built_in_command(
                         auth: web_auth.as_deref(),
                         host: *web_host,
                         public_host: *web_public_host,
+                        allowed_hosts: web_allowed_hosts.as_deref(),
                     },
                     connection_context,
                 ))

@@ -4,16 +4,107 @@ use crate::AuthMode;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[test]
+fn authority_syntax_and_optional_host_policy() {
+    for host in [
+        "localhost",
+        "bmux.lan:8080",
+        "192.168.1.1:8080",
+        "[::1]:8080",
+        "[::1]",
+    ] {
+        assert!(crate::http::valid_authority(host), "{host}");
+    }
+    for host in [
+        "",
+        "a/b",
+        "user@host",
+        "host:0",
+        "host:65536",
+        "host:",
+        "host:80:90",
+        "::1",
+        "[bad]:80",
+        "a..b",
+        "-bad",
+        "bad-",
+        "a?b",
+        "host\\evil",
+        "host: 80",
+    ] {
+        assert!(!crate::http::valid_authority(host), "{host}");
+    }
+    let (_directory, mut config) = fixture();
+    config.host = Ipv4Addr::UNSPECIFIED.into();
+    crate::validate_network(&config).unwrap();
+    config.host = Ipv6Addr::UNSPECIFIED.into();
+    crate::validate_network(&config).unwrap();
+    config.allowed_hosts = vec!["bad/path".into()];
+    assert!(crate::validate_network(&config).is_err());
+}
+
+#[tokio::test]
+async fn request_hosts_accept_aliases_and_optional_allowlist_is_independent_of_display() {
+    for restricted in [false, true] {
+        let (_directory, mut config) = fixture();
+        config.host = Ipv4Addr::UNSPECIFIED.into();
+        config.public_host = Some("192.0.2.10".parse().unwrap());
+        config.auth_mode = AuthMode::None;
+        config.viewport_mode = crate::ViewportMode::Resizable;
+        if restricted {
+            config.allowed_hosts = vec!["bmux.lan:8080".into(), "[::1]:8080".into()];
+        }
+        let (publisher, feed) = snapshot_feed(128).unwrap();
+        let host = start(config, feed).await.unwrap();
+        host.set_generation("aliases").unwrap();
+        publisher.publish(1, Arc::from(*b"{}")).unwrap();
+        assert!(host.bootstrap_url().starts_with("http://192.0.2.10:"));
+        let address = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), host.address().port());
+        for authority in ["bmux.lan:8080", "[::1]:8080", "other.lan:8080"] {
+            let req = format!(
+                "GET /snapshot HTTP/1.1\r\nHost: {authority}\r\nOrigin: http://{authority}\r\n\r\n"
+            );
+            status(
+                &exchange(address, &req).await,
+                if restricted && authority == "other.lan:8080" {
+                    403
+                } else {
+                    200
+                },
+            );
+            status(
+                &exchange(
+                    address,
+                    &req.replace(
+                        &format!("Origin: http://{authority}"),
+                        "Origin: http://foreign.lan:8080",
+                    ),
+                )
+                .await,
+                403,
+            );
+        }
+        let claim =
+            "POST /view HTTP/1.1\r\nHost: bmux.lan:8080\r\nOrigin: http://bmux.lan:8080\r\n\r\n";
+        status(&exchange(address, claim).await, 200);
+        status(
+            &exchange(
+                address,
+                &claim.replace("Origin: http://bmux.lan:8080\r\n", ""),
+            )
+            .await,
+            403,
+        );
+        host.shutdown().await;
+    }
+}
+
+#[test]
 fn network_policy_rejects_unsafe_or_ambiguous_settings() {
     let (_directory, base) = fixture();
     for (bind, public, auth) in [
-        ("0.0.0.0", None, AuthMode::Token),
-        ("::", None, AuthMode::Token),
-        ("0.0.0.0", Some("::1"), AuthMode::Token),
         ("::", Some("0.0.0.0"), AuthMode::Token),
         ("0.0.0.0", Some("224.0.0.1"), AuthMode::Token),
         ("224.0.0.1", None, AuthMode::Token),
-        ("127.0.0.1", Some("192.0.2.1"), AuthMode::Token),
     ] {
         let mut config = base.clone();
         config.host = bind.parse().unwrap();
@@ -92,7 +183,7 @@ async fn verify_listener(bind: IpAddr, public: IpAddr) {
     }
     let bad_host = request(address, "GET", "/snapshot", &capability, "")
         .replace(&format!("Host: {address}"), "Host: evil.example");
-    status(&exchange(address, &bad_host).await, 403);
+    status(&exchange(address, &bad_host).await, 200);
     drop(requests);
     host.shutdown().await;
     assert!(TcpStream::connect(address).await.is_err());
@@ -143,7 +234,7 @@ async fn wildcard_token_free_serves_without_bearer_and_preserves_trust_checks() 
             &get.replace(&format!("Host: {address}"), "Host: evil.example"),
         )
         .await,
-        403,
+        200,
     );
     status(
         &exchange(

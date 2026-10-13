@@ -91,8 +91,10 @@ pub enum AuthMode {
 pub struct HostConfig {
     /// Bind IP; authentication is configured independently.
     pub host: IpAddr,
-    /// Browser-facing IP for exact Host/Origin checks. Required for wildcard binds.
+    /// Optional URL-display hint; independent of request host restrictions.
     pub public_host: Option<IpAddr>,
+    /// Optional exact HTTP Host authorities (including port). Empty accepts any valid host.
+    pub allowed_hosts: Vec<String>,
     /// HTTP port; zero requests an ephemeral port. Default is 8080.
     pub port: u16,
     pub auth_mode: AuthMode,
@@ -108,6 +110,7 @@ impl HostConfig {
         Self {
             host: Ipv4Addr::LOCALHOST.into(),
             public_host: None,
+            allowed_hosts: Vec::new(),
             port: 8080,
             auth_mode: AuthMode::None,
             asset_directory,
@@ -319,23 +322,25 @@ impl Drop for HostHandle {
 }
 
 fn validate_network(config: &HostConfig) -> io::Result<()> {
-    let public = config.public_host.unwrap_or(config.host);
-    if public.is_unspecified() || public.is_multicast() || config.host.is_multicast() {
+    if config.host.is_multicast()
+        || config
+            .public_host
+            .is_some_and(|ip| ip.is_unspecified() || ip.is_multicast())
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "wildcard binds require a concrete public_host IP; multicast is unsupported",
+            "multicast binds and unspecified/multicast public hosts are unsupported",
         ));
     }
-    if config.host.is_ipv4() != public.is_ipv4() {
+    if config.allowed_hosts.len() > 64
+        || config
+            .allowed_hosts
+            .iter()
+            .any(|host| !http::valid_authority(host))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "host and public_host must use the same IP family",
-        ));
-    }
-    if !config.host.is_unspecified() && config.host != public {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "public_host must match a concrete bind host",
+            "allowed_hosts must contain at most 64 valid HTTP Host authorities",
         ));
     }
     Ok(())
@@ -369,7 +374,18 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
     };
     let listener = TcpListener::bind((config.host, config.port)).await?;
     let address = listener.local_addr()?;
-    let public_address = SocketAddr::new(config.public_host.unwrap_or(config.host), address.port());
+    let display_host = config.public_host.unwrap_or_else(|| {
+        if config.host.is_unspecified() {
+            if config.host.is_ipv4() {
+                Ipv4Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            }
+        } else {
+            config.host
+        }
+    });
+    let public_address = SocketAddr::new(display_host, address.port());
     let (viewport, viewport_requests) = viewport::Viewport::new(config.viewport_mode);
     let viewport = Arc::new(viewport);
     let state = Arc::new(http::State {
@@ -378,8 +394,7 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
         limits: config.limits,
         auth_mode: config.auth_mode,
         token: token.clone().unwrap_or_default(),
-        authority: public_address.to_string(),
-        origin: format!("http://{public_address}"),
+        allowed_hosts: config.allowed_hosts,
     });
     let (stop, mut stopped) = watch::channel(false);
     let task = tokio::spawn(async move {

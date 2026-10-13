@@ -78,7 +78,7 @@ async fn tokenless_output_control_and_origin_guards() {
         }
         let wrong_host = no_auth_request(address, "GET", path, "")
             .replace(&format!("Host: {address}"), "Host: localhost:8080");
-        status(&exchange(address, &wrong_host).await, 403);
+        status(&exchange(address, &wrong_host).await, 200);
     }
     for headers in [
         origin.clone(),

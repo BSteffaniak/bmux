@@ -686,7 +686,7 @@ class Harness:
     def lan_host(self, session, auth):
         saved = self.origin, self.token
         owner = self.spawn("attach", session, "--web-assets", str(self.args.assets), "--web-only",
-                           "--web-host", "0.0.0.0", "--web-public-host", self.args.lan_host,
+                           "--web-host", "0.0.0.0",
                            "--web-port", "0", *(["--web-auth", "token"] if auth == "token" else []))
         def url_ready():
             require(owner.child.poll() is None, "LAN attach exited before bootstrap")
@@ -697,7 +697,9 @@ class Harness:
         try:
             url = wait_for("LAN capability URL", url_ready)
             parts = urllib.parse.urlsplit(url)
-            require(parts.hostname == self.args.lan_host, "wrong advertised LAN IP")
+            require(parts.hostname == "127.0.0.1", "wildcard local bootstrap should use loopback")
+            parts = parts._replace(netloc=f"{self.args.lan_host}:{parts.port}")
+            url = urllib.parse.urlunsplit(parts)
             self.origin = "http://" + parts.netloc
             self.token = urllib.parse.parse_qs(parts.fragment).get("token", [""])[0]
             if auth == "token":
@@ -713,7 +715,7 @@ class Harness:
             owner.child.send_signal(signal.SIGINT)
             wait_for("LAN Ctrl-C", lambda: owner.child.poll() is not None, 6)
             require(owner.child.returncode == 0, "LAN detach failed")
-            self.passed(f"wildcard LAN listener ({auth}): non-loopback TCP peer, WASM/Canvas, viewport and clean detach")
+            self.passed(f"wildcard LAN listener without public-host ({auth}): non-loopback TCP peer, WASM/Canvas, viewport and clean detach")
         finally:
             owner.stop()
             self.origin, self.token = saved

@@ -14,9 +14,41 @@ pub(crate) struct State {
     pub limits: Limits,
     pub auth_mode: crate::AuthMode,
     pub token: String,
-    pub authority: String,
-    pub origin: String,
+    pub allowed_hosts: Vec<String>,
     pub viewport: Arc<crate::viewport::Viewport>,
+}
+
+pub(crate) fn valid_authority(value: &str) -> bool {
+    if value.is_empty() || value.len() > 253 {
+        return false;
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let Some((ip, suffix)) = rest.split_once(']') else {
+            return false;
+        };
+        return ip.parse::<std::net::Ipv6Addr>().is_ok()
+            && (suffix.is_empty() || suffix.strip_prefix(':').is_some_and(valid_port));
+    }
+    let (host, port) = value
+        .split_once(':')
+        .map_or((value, None), |(host, port)| (host, Some(port)));
+    !host.is_empty()
+        && port.is_none_or(valid_port)
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+fn valid_port(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -173,13 +205,16 @@ fn parse<'a>(bytes: &'a [u8], state: &State) -> Result<Route<'a>, u16> {
             return Err(400);
         }
     }
-    if headers.get("host").copied() != Some(state.authority.as_str()) {
+    let authority = headers.get("host").copied().ok_or(400_u16)?;
+    if !valid_authority(authority) {
+        return Err(400);
+    }
+    if !state.allowed_hosts.is_empty() && !state.allowed_hosts.iter().any(|host| host == authority)
+    {
         return Err(403);
     }
-    if headers
-        .get("origin")
-        .is_some_and(|origin| *origin != state.origin)
-    {
+    let origin = format!("http://{authority}");
+    if headers.get("origin").is_some_and(|value| *value != origin) {
         return Err(403);
     }
     if headers
@@ -209,7 +244,7 @@ fn parse<'a>(bytes: &'a [u8], state: &State) -> Result<Route<'a>, u16> {
     if length > 512 {
         return Err(413);
     }
-    if mutation && headers.get("origin").copied() != Some(state.origin.as_str()) {
+    if mutation && headers.get("origin").copied() != Some(origin.as_str()) {
         return Err(403);
     }
     let route = if mutation {
@@ -545,8 +580,7 @@ mod tests {
             limits: Limits::default(),
             auth_mode: crate::AuthMode::Token,
             token: "a".repeat(64),
-            authority: "127.0.0.1:1234".into(),
-            origin: "http://127.0.0.1:1234".into(),
+            allowed_hosts: vec!["127.0.0.1:1234".into()],
             viewport: Arc::new(crate::viewport::Viewport::new(crate::ViewportMode::Observer).0),
         }
     }
