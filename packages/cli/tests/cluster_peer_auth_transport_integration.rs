@@ -1,5 +1,6 @@
 mod support;
 
+use serial_test::serial;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -88,6 +89,7 @@ fn assert_join_and_leave(issuer: &ServerEnv, joiner: &ServerEnv, token: &str, ta
 }
 
 #[test]
+#[serial]
 fn ssh_join_and_leave_require_real_mutual_peer_authentication() {
     if !Path::new("/usr/sbin/sshd").exists() {
         eprintln!("skipping SSH transport integration: /usr/sbin/sshd unavailable");
@@ -182,6 +184,7 @@ fn ssh_join_and_leave_require_real_mutual_peer_authentication() {
 }
 
 #[test]
+#[serial]
 #[ignore = "blocked on macOS iroh/netwatch CoreWLAN endpoint-bind stall"]
 fn iroh_join_and_leave_require_real_mutual_peer_authentication() {
     let mut issuer = ServerEnv::new("iroh-issuer");
@@ -293,6 +296,7 @@ fn tls_cluster_config(own_port: u16, ports: &[u16; 3]) -> String {
 }
 
 #[test]
+#[serial]
 fn three_real_tls_voters_form_membership_and_survive_one_node_restart() {
     let ports = [reserve_tcp_port(), reserve_tcp_port(), reserve_tcp_port()];
     let mut harness =
@@ -376,6 +380,7 @@ fn three_real_tls_voters_form_membership_and_survive_one_node_restart() {
 }
 
 #[test]
+#[serial]
 fn shared_process_harness_supports_three_isolated_lifecycles_and_log_capture() {
     let mut harness =
         support::ClusterProcessHarness::new(["lifecycle-a", "lifecycle-b", "lifecycle-c"]);
@@ -419,6 +424,7 @@ fn shared_process_harness_supports_three_isolated_lifecycles_and_log_capture() {
 }
 
 #[test]
+#[serial]
 fn tls_join_and_leave_require_real_mutual_peer_authentication() {
     let port = reserve_tcp_port();
     let mut issuer = ServerEnv::new("tls-issuer");

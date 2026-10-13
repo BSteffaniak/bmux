@@ -44,6 +44,10 @@ try:
     # Only retire this displayed frame after the real outer terminal sees it.
     if os.read(0, 1) != b'!':
         raise RuntimeError('missing visible final-frame acknowledgment')
+    if mode == 'gif':
+        # Preserve the acknowledged source frame across GIF sampling intervals;
+        # a fast retained renderer can otherwise retire it between samples.
+        time.sleep(0.2)
     if mode == 'pending-capture':
         root = sys.argv[2]
         descendant = os.fork()

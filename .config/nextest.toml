@@ -15,3 +15,10 @@ threads-required = "num-cpus"
 [[profile.default.overrides]]
 filter = 'package(bmux_pane_runtime_plugin)'
 threads-required = "num-cpus"
+
+# Mutual-authentication fixtures run multiple real servers and Raft voters.
+# Reserve host capacity just as for PTY fixtures; libtest serializes these in
+# the integration binary, while nextest runs each test in a separate process.
+[[profile.default.overrides]]
+filter = 'binary(cluster_peer_auth_transport_integration)'
+threads-required = "num-cpus"

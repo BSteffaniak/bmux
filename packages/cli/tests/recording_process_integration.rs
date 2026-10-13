@@ -214,8 +214,14 @@ impl RecordingEnv {
         let exports_gif = args.windows(2).any(|pair| pair == ["--export", "gif"])
             || args.contains(&"--format=gif")
             || args.windows(2).any(|pair| pair == ["--format", "gif"]);
+        // Launch also hashes the full debug executable before server readiness.
+        // Budget that bootstrap separately from the existing operation deadlines.
+        let launches_runtime = args.starts_with(&["recording", "process", "start"])
+            || args.starts_with(&["recording", "process", "run"]);
         let timeout = if exports_gif {
             Duration::from_secs(120)
+        } else if launches_runtime {
+            Duration::from_secs(60)
         } else {
             COMMAND_TIMEOUT
         };

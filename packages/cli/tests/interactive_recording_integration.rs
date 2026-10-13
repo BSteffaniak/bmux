@@ -454,7 +454,10 @@ def burst(phase, key, minimum_tick=0):
                            'output_ticks_at_consumption': consumed['ticks']}
     assert consumed['count'] == N and 0 <= consumed['consumed'] - start < BUDGET and visible < BUDGET, measurements
 try:
-    wait_for(lambda: screen.contains(b'BOOTGATE'), 'initial rendered readiness')
+    # This includes isolated server bootstrap and executable identity hashing
+    # (the debug executable can exceed 1 GiB), not renderer latency. Start the
+    # unchanged one-second input/render budgets only after native readiness.
+    wait_for(lambda: screen.contains(b'BOOTGATE'), 'initial rendered readiness', budget=60)
     send(b'!')
     wait_for(lambda: screen.contains(b'READYBURST'), 'isolated input readiness')
     steady_start = len(transcript)
