@@ -209,21 +209,45 @@ impl<W: Write> Terminal<W> {
         render: impl FnOnce(&mut PaintCx<'_, '_>),
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
+        self.draw_damage_with_output_hooks(damage, render, |_| Ok(false), overlay)
+    }
+
+    /// Draw with a pre-paint output hook and a post-paint overlay in one transaction.
+    /// A pre-paint hook returning `true` invalidates the backend's retained cells
+    /// and forces complete cell output without changing committed scene authority.
+    ///
+    /// # Errors
+    /// Returns output or hook errors; retained state commits only after flush.
+    pub fn draw_damage_with_output_hooks(
+        &mut self,
+        damage: Damage,
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
+        before: impl FnOnce(&mut W) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+    ) -> io::Result<DrawStats> {
         let writer = &mut self.writer;
         self.state
             .present(damage, render, |prepared, previous| {
                 writer.write_all(b"\x1b[?2026h")?;
-                let stats = if let Some(previous) = previous {
-                    write_ansi_frame_diff(writer, previous, prepared.buffer(), prepared.cursor())?
+                let output: io::Result<DrawStats> = (|| {
+                    let repaint = before(writer)?;
+                    let stats = if let Some(previous) = previous.filter(|_| !repaint) {
+                        write_ansi_frame_diff(
+                            writer,
+                            previous,
+                            prepared.buffer(),
+                            prepared.cursor(),
+                        )?
                         .into()
-                } else {
-                    write_ansi_frame(writer, prepared.buffer(), prepared.cursor())?;
-                    DrawStats::full(prepared.buffer().cells().len())
-                };
-                let overlay_result =
-                    overlay(writer, prepared.image_scene(), prepared.image_delta());
+                    } else {
+                        write_ansi_frame(writer, prepared.buffer(), prepared.cursor())?;
+                        DrawStats::full(prepared.buffer().cells().len())
+                    };
+                    overlay(writer, prepared.image_scene(), prepared.image_delta())?;
+                    Ok(stats)
+                })();
                 let end_result = writer.write_all(b"\x1b[?2026l");
-                overlay_result?;
+                let stats = output?;
                 end_result?;
                 writer.flush()?;
                 Ok(stats)

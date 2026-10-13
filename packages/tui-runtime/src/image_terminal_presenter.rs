@@ -173,10 +173,16 @@ impl<W: Write, R, C> ImageTerminalPresenter<W, R, C> {
     ///
     /// Returns an I/O error when protocol cleanup cannot be written or flushed.
     pub fn cleanup_images(&mut self) -> Result<(), ImagePresentationError> {
-        self.compositor
-            .cleanup(self.terminal.writer_mut(), &self.host_capabilities)?;
-        self.terminal.writer_mut().flush()?;
+        let mut candidate = self.compositor.clone();
+        let result = candidate
+            .cleanup(self.terminal.writer_mut(), &self.host_capabilities)
+            .and_then(|()| self.terminal.writer_mut().flush());
         self.terminal.reset();
+        if let Err(error) = result {
+            self.compositor.invalidate_after_failed_output(&candidate);
+            return Err(error.into());
+        }
+        self.compositor = candidate;
         Ok(())
     }
 
@@ -271,10 +277,13 @@ where
         w: terminal_area.width,
         h: terminal_area.height,
     };
-    let mut staged_compositor = compositor.clone();
-    let stats = terminal.draw_with_overlay(
+    let staged_compositor = std::cell::RefCell::new(compositor.clone());
+    let stats = terminal.draw_damage_with_output_hooks(
+        bmux_tui::damage::Damage::Full,
         |cx| render(program, cx),
+        |writer| staged_compositor.borrow_mut().prepare_output(writer),
         |writer, scene, delta| {
+            let mut staged_compositor = staged_compositor.borrow_mut();
             staged_compositor.apply_delta(delta);
             staged_compositor
                 .render(writer, scene, pane, capabilities, config)
@@ -289,11 +298,11 @@ where
     let stats = match stats {
         Ok(stats) => stats,
         Err(error) => {
-            compositor.invalidate_after_failed_output(&staged_compositor);
+            compositor.invalidate_after_failed_output(&staged_compositor.borrow());
             return Err(error.into());
         }
     };
-    *compositor = staged_compositor;
+    *compositor = staged_compositor.into_inner();
     Ok(PresentReport {
         changed_cells: stats.changed_cells,
         full_repaint: stats.full_repaint,
@@ -314,6 +323,71 @@ mod tests {
         bmux_image::HostImageCapabilities {
             kitty_graphics: true,
             ..bmux_image::HostImageCapabilities::default()
+        }
+    }
+
+    #[cfg(all(feature = "image-sixel", feature = "image-iterm2"))]
+    #[test]
+    fn raster_lifecycle_clears_before_complete_repaint() {
+        use bmux_image::HostImageCapabilities;
+        use bmux_tui::paint::PaintCx;
+        use bmux_tui::terminal::Terminal;
+        for caps in [
+            HostImageCapabilities {
+                sixel: true,
+                ..Default::default()
+            },
+            HostImageCapabilities {
+                iterm2_inline: true,
+                ..Default::default()
+            },
+        ] {
+            let terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 4, 2));
+            let render = |visible: &mut bool, frame: &mut PaintCx<'_, '_>| {
+                if *visible {
+                    frame.push_image(ImageContribution::Present(ImagePlacement {
+                        key: ImageKey::new("raster"),
+                        payload: ImagePayload::Pixels {
+                            bytes: vec![255, 0, 0, 255],
+                            width: 1,
+                            height: 1,
+                            format: ImagePixelFormat::Rgba8,
+                        },
+                        destination: Rect::new(0, 0, 1, 1),
+                        clip: frame.clip(),
+                        lifecycle: ImageLifecycle::Frame,
+                    }));
+                }
+            };
+            let mut presenter = ImageTerminalPresenter::new(
+                terminal,
+                render,
+                caps,
+                bmux_image::ImageConfig::default(),
+            );
+            let mut visible = true;
+            presenter.present(&mut visible).unwrap();
+            for next in [true, false, true, false, true] {
+                let before = presenter.terminal().writer().len();
+                let had_image = visible;
+                visible = next;
+                let report = presenter.present(&mut visible).unwrap();
+                let output = &presenter.terminal().writer()[before..];
+                assert_eq!(
+                    output.windows(4).any(|bytes| bytes == b"\x1b[2J"),
+                    had_image
+                );
+                if had_image {
+                    assert_eq!(report.changed_cells, 8);
+                }
+            }
+            let before = presenter.terminal().writer().len();
+            presenter.cleanup_images().unwrap();
+            assert!(
+                presenter.terminal().writer()[before..]
+                    .windows(4)
+                    .any(|bytes| bytes == b"\x1b[2J")
+            );
         }
     }
 

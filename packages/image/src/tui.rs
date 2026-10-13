@@ -66,6 +66,9 @@ pub struct TuiImageCompositor {
     kitty_state: KittyHostState,
     reset_pending: bool,
     validations: usize,
+    // Raster protocols have no reusable placement deletion. A prior footprint
+    // requires ED2 followed by a complete cell repaint before the next overlay.
+    raster_pending: bool,
 }
 
 impl TuiImageCompositor {
@@ -83,6 +86,9 @@ impl TuiImageCompositor {
     }
 
     /// Render the current TUI image scene as a terminal overlay.
+    /// Raster callers must first call [`Self::prepare_output`] on the same
+    /// candidate before painting cells, and repaint all cells when it returns
+    /// `true`. Commit the candidate only after the enclosing output flush.
     ///
     /// Host capability detection and protocol selection remain entirely inside
     /// BMUX. Unsupported hosts produce no image escape sequences.
@@ -115,8 +121,26 @@ impl TuiImageCompositor {
     /// Mark all potentially emitted host IDs for repair after write or flush failure.
     /// Call on committed state with the failed candidate; do not commit the candidate.
     pub fn invalidate_after_failed_output(&mut self, candidate: &Self) {
+        self.raster_pending |= candidate.raster_pending;
         self.kitty_state
             .invalidate_after_failed_output(&candidate.kitty_state);
+    }
+
+    /// Clear uncertain/prior raster footprints before painting cells.
+    /// Returns whether the caller must repaint its complete retained cell buffer.
+    /// Use a candidate and commit only after the enclosing frame flush succeeds.
+    ///
+    /// # Errors
+    /// Returns an output error; pending repair remains set on failure.
+    pub fn prepare_output(&mut self, out: &mut impl Write) -> std::io::Result<bool> {
+        if !self.raster_pending {
+            return Ok(false);
+        }
+        out.write_all(b"\x1b[2J")?;
+        self.raster_pending = false;
+        // ED2 may discard Kitty resources too, notably after a protocol switch.
+        self.kitty_state.reset(out)?;
+        Ok(true)
     }
 
     fn render_candidate(
@@ -189,6 +213,10 @@ impl TuiImageCompositor {
                 );
             }
             let image = &self.sources.get(&placement.key).expect("retained source").2;
+            if host_caps.preferred_protocol() != Some(ImageProtocol::KittyGraphics) {
+                // Set before writes: even a partial raster sequence needs repair.
+                self.raster_pending = true;
+            }
             render_image_clipped(
                 out,
                 image,
@@ -260,7 +288,10 @@ impl TuiImageCompositor {
         let _ = host_caps;
         let mut candidate = self.clone();
         candidate.clear();
-        match candidate.kitty_state.reset(out) {
+        match candidate
+            .prepare_output(out)
+            .and_then(|_| candidate.kitty_state.reset(out))
+        {
             Ok(()) => {
                 candidate.reset_pending = false;
                 *self = candidate;
@@ -510,6 +541,78 @@ mod tests {
             destination,
             clip,
             lifecycle: ImageLifecycle::Frame,
+        }
+    }
+
+    #[cfg(all(feature = "sixel", feature = "iterm2", feature = "kitty"))]
+    #[test]
+    fn raster_repair_survives_failed_output_and_protocol_switch() {
+        let mut scene = ImageScene::default();
+        scene.reconcile(&[ImageContribution::Present(placement(
+            "raster",
+            Rect::new(0, 0, 4, 2),
+            Rect::new(0, 0, 8, 4),
+            255,
+        ))]);
+        let pane = PaneRect {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 4,
+        };
+        for caps in [
+            HostImageCapabilities {
+                sixel: true,
+                ..Default::default()
+            },
+            HostImageCapabilities {
+                iterm2_inline: true,
+                ..Default::default()
+            },
+        ] {
+            let mut committed = super::TuiImageCompositor::new();
+            let mut failed = committed.clone();
+            failed
+                .render(
+                    &mut Vec::new(),
+                    &scene,
+                    pane,
+                    &caps,
+                    &ImageConfig::default(),
+                )
+                .unwrap();
+            // Model a failed enclosing flush after a complete raster write.
+            committed.invalidate_after_failed_output(&failed);
+            let mut retry = committed.clone();
+            let mut output = Vec::new();
+            assert!(retry.prepare_output(&mut output).unwrap());
+            retry
+                .render(
+                    &mut output,
+                    &scene,
+                    pane,
+                    &kitty_caps(),
+                    &ImageConfig::default(),
+                )
+                .unwrap();
+            assert!(output.starts_with(b"\x1b[2J"));
+            assert!(String::from_utf8_lossy(&output).contains("Ga=t"));
+            assert!(!retry.prepare_output(&mut Vec::new()).unwrap());
+            // A failed cleanup flush cannot discard committed raster repair.
+            let mut raster = super::TuiImageCompositor::new();
+            raster
+                .render(
+                    &mut Vec::new(),
+                    &scene,
+                    pane,
+                    &caps,
+                    &ImageConfig::default(),
+                )
+                .unwrap();
+            let mut cleanup = raster.clone();
+            cleanup.cleanup(&mut Vec::new(), &caps).unwrap();
+            raster.invalidate_after_failed_output(&cleanup);
+            assert!(raster.prepare_output(&mut Vec::new()).unwrap());
         }
     }
 
