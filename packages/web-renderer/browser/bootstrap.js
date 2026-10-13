@@ -239,6 +239,9 @@ async function run() {
     }
     if (controllerSecret !== next.controller) requestId = 0n;
     controllerSecret = next.viewport_allowed ? next.controller : null;
+    if (next.presentation_status) {
+      status.textContent = `Presentation paused · ${next.presentation_status} · showing last complete frame`;
+    }
     info = next;
     container.style.overflow = next.viewport_allowed ? 'hidden' : 'auto';
     pendingViewport = null;
@@ -266,7 +269,12 @@ async function run() {
         const path = requestCursor === null ? '/presentation?version=1'
           : `/presentation?version=1&after=${encodeURIComponent(requestCursor)}&base=${encodeURIComponent(requestCursor)}`;
         const response = await request(path, controller);
-        if (response.status === 204) continue;
+        if (response.status === 204) {
+          // Publication rejection does not advance snapshots; refresh its status
+          // on a bounded long-poll wake while keeping the committed Canvas intact.
+          await claim(controller);
+          continue;
+        }
         if (response.status === 503) {
           status.textContent = 'Source unavailable; waiting for a full snapshot.';
           pollCursor = null;

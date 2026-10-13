@@ -130,10 +130,30 @@ def producer(root):
                 emit("\x1b[1;1H" + command[5:])
             elif command == "sync-begin":
                 emit("\x1b[?2026h\x1b[1;1HWEB_ATOMIC_UPDATE")
-            elif command == "dense":
-                emit("\x1b[?2026h" + "".join(f"\x1b[{row};1H" + "X" * 600 for row in range(1, 301)) + "\x1b[?2026l")
+            elif command.startswith("dense"):
+                (root / "producer-last-command").write_text(command)
+                rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, bytes(8)))
+                emit("".join(f"\x1b[{row};1H" + ("X" if command.endswith("0") else "Y") * max(1, cols - 1) for row in range(1, rows)))
+                (root / "producer-dense-complete").write_text("complete")
             elif command == "sync-end":
                 emit("\x1b[?2026l")
+            elif command in ("four-k-image", "oversize-image"):
+                import struct
+                import zlib
+                width, height = (3840, 2160) if command == "four-k-image" else (5000, 4000)
+                def png_chunk(kind, data):
+                    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+                row = b"\x00" + b"\xf0\x20\x40\xff" * width
+                raw = zlib.compress(row * height)
+                png = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+                       + png_chunk(b"IDAT", raw) + png_chunk(b"IEND", b""))
+                encoded = base64.b64encode(png).decode()
+                for offset in range(0, len(encoded), 4096):
+                    chunk = encoded[offset:offset + 4096]
+                    more = int(offset + 4096 < len(encoded))
+                    header = f"a=t,f=100,i=77,s={width},v={height},q=2,m={more}"
+                    emit(f"\x1b_G{header};{chunk}\x1b\\")
+                place(5, 5)
             elif command == "create":
                 emit(f"\x1b_Ga=t,f=32,s=2,v=2,i=77,q=2;{rgba}\x1b\\")
                 place(5, 5)
@@ -365,6 +385,8 @@ class Harness:
             pixels = self.pixels()
             if not pixels:
                 return None
+            self.report["browser_render_status"] = pixels["status"]
+            self.report["browser_red_pixels"] = pixels["red"]
             if not rendered_status(pixels["status"], frame):
                 return None
             # Latest-only feeds may skip intermediate publications. Require at
@@ -599,6 +621,36 @@ class Harness:
         frame = self.frame_when("Kitty remove", lambda f: not placements(f))
         self.rendered(frame, False)
         self.passed("live Kitty clip/remove: no stale Canvas image resource")
+
+        before_large = self.snapshot()["revision"]
+        self.fixture_command("four-k-image")
+        large = self.frame_when("4K image admitted", lambda f: f["revision"] > before_large and bool(placements(f)))
+        self.rendered(large, image=True)
+        self.passed("lossless 4K image renders within bounded browser resources")
+        committed_large = large["revision"]
+        self.fixture_command("oversize-image")
+        def rejected_status():
+            code, body = http(self.origin, "/view", self.token, "POST", b"")
+            return code == 200 and json.loads(body).get("presentation_status")
+        reason = wait_for("oversize image specific admission status", rejected_status)
+        require("pixel" in reason or "image" in reason, "missing specific image rejection reason")
+        require(attach.child.poll() is None, "rejected frame terminated attachment")
+        retained_after_rejection = self.snapshot()["revision"]
+        time.sleep(0.3)
+        require(self.snapshot()["revision"] == retained_after_rejection, "rejected image advanced committed frame")
+        self.fixture_command("remove")
+        self.frame_when("recovery after image rejection", lambda f: f["revision"] > committed_large and not placements(f))
+        self.passed("resource rejection preserves committed frame, keeps attachment alive and recovers")
+
+        for iteration in range(6):
+            before = self.snapshot()["revision"]
+            glyph = "X" if iteration % 2 == 0 else "Y"
+            self.fixture_command(f"dense {iteration % 2}")
+            dense_live = self.frame_when("sustained dense PTY frame", lambda f:
+                f["revision"] > before and text(f).count(glyph) > 400)
+            self.rendered(dense_live)
+            require(attach.child.poll() is None, "dense PTY capture terminated attachment")
+        self.passed("sustained dense PTY updates commit live browser frames without disconnect")
 
         self.client.call("Network.setBlockedURLs", {"urls": [self.origin + "/snapshot*"]})
         self.client.call("Network.emulateNetworkConditions", {

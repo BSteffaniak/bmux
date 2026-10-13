@@ -127,6 +127,35 @@ refresh requires reopening the capability URL.
 
 The host defaults to IPv4 loopback port 8080 and supports IPv4/IPv6 listeners with opt-in token authentication. It restricts assets to an explicit allowlist, validates configured Host/Origin and optional capability headers, and bounds bodies, connections, requests and snapshots. Styles are external same-origin assets compatible with the strict CSP.
 
+## Presentation admission and recovery
+
+Wildcard startup distinguishes the listener (`0.0.0.0` / `::`), a local-use URL,
+and LAN access instructions. Loopback in the local URL does not mean the listener
+is loopback-only.
+
+Browser capture admits visible operations rather than terminal control-command
+count. Adjacent same-style text is coalesced, and captured image placements share
+owned resources instead of deep-cloning them on every capture read. Large raw
+pixel resources are losslessly PNG-compacted before placement expansion. Decoded
+image admission supports up to 16,777,216 pixels, including 4K images; encoded
+resource and aggregate memory limits still apply. Incompressible or heavily
+fragmented resources remain explicitly bounded rather than being silently dropped.
+
+Browser-enabled frame rejection keeps the attachment and HTTP listener alive. It
+retains the last complete frame, compositor and interaction metadata, reports the
+specific capture/admission stage and limits, and retries after a new source or
+viewport event. Identical rejection reports are deduplicated; the render loop does
+not spin on unchanged rejected content. `/view` exposes bounded
+`presentation_status`, independent of the committed output generation. The browser
+shows a paused status on its next claim/long-poll refresh without clearing Canvas.
+A successful complete publication clears the status. Terminal write failures and
+source closure retain their existing error/lifetime semantics.
+
+Regression coverage includes 600×300 per-cell command capture, sustained real PTY
+updates, 4K image rendering, oversized-image rejection/recovery, synchronized
+updates, and failed-publication rollback. This does not identify which branch
+caused a historical failure without its diagnostic evidence.
+
 ## Shared presentation boundaries
 
 - `bmux_tui::presentation` prepares owned cells, cursor, images and metadata. Only successful output commits retained authority.

@@ -74,7 +74,13 @@ pub(crate) fn validate(
     if let Some(binary) = binary {
         let valid_bytes = |bytes: &Arc<[u8]>| !bytes.is_empty() && bytes.len() <= max_bytes;
         if !valid_bytes(&binary.snapshot) {
-            return Err(invalid());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "browser binary snapshot bytes rejected: used={}, limit={max_bytes}",
+                    binary.snapshot.len()
+                ),
+            ));
         }
         if let Some((base, bytes)) = &binary.delta
             && (bytes.is_empty()
@@ -86,15 +92,29 @@ pub(crate) fn validate(
         }
     }
     if resources.len() > MAX_RESOURCES {
-        return Err(invalid());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "browser resource count budget exceeded: used={}, limit={MAX_RESOURCES}",
+                resources.len()
+            ),
+        ));
     }
     let mut total = current.map_or(0, |value| {
         value.resources.values().map(|r| r.bytes.len()).sum()
     });
     for (id, resource) in resources {
         let mime = &resource.mime_type;
+        if resource.bytes.len() > MAX_RESOURCE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "browser image resource bytes exceeded: used={}, limit={MAX_RESOURCE_BYTES}",
+                    resource.bytes.len()
+                ),
+            ));
+        }
         if !valid_id(id)
-            || resource.bytes.len() > MAX_RESOURCE_BYTES
             || mime.is_empty()
             || mime.len() > 128
             || !mime.contains('/')
@@ -115,7 +135,13 @@ pub(crate) fn validate(
         }
         total += resource.bytes.len();
         if total > MAX_RETAINED_BYTES {
-            return Err(invalid());
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "retained browser image resource budget exceeded: used={total}, limit={MAX_RETAINED_BYTES}, resources={}",
+                    resources.len()
+                ),
+            ));
         }
     }
     Ok(())

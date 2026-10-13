@@ -47,7 +47,7 @@ impl Default for Limits {
             regions: 4096,
             images: 128,
             image_bytes: 8 * 1024 * 1024,
-            image_pixels: 4 * 1024 * 1024,
+            image_pixels: 16 * 1024 * 1024,
             symbol_bytes: 128,
         }
     }

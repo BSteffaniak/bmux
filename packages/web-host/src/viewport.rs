@@ -28,6 +28,13 @@ impl ViewControl {
         self.viewport.set_generation(generation)
     }
 
+    /// Report bounded content-free publication status; does not change output authority.
+    pub fn set_presentation_status(&self, status: Option<&str>) {
+        if let Ok(mut control) = self.viewport.control.lock() {
+            control.presentation_status = status.map(|value| value.chars().take(1024).collect());
+        }
+    }
+
     /// Validates a queued request at the eventual authoritative sizing effect.
     /// Checks output generation, live controller ownership, latest ID and host lifetime.
     #[must_use]
@@ -154,6 +161,7 @@ pub(crate) struct Control {
     closed: bool,
     mode: ViewportMode,
     generation: Option<String>,
+    presentation_status: Option<String>,
     lease: Option<Lease>,
 }
 
@@ -167,6 +175,7 @@ struct ViewInfo<'a> {
     protocol_version: u8,
     presentation_versions: [u8; 1],
     generation: Option<&'a str>,
+    presentation_status: Option<&'a str>,
     viewport_allowed: bool,
     controller: Option<&'a str>,
     lease_ms: u64,
@@ -193,6 +202,7 @@ impl Viewport {
             closed: false,
             mode,
             generation: None,
+            presentation_status: None,
             lease: None,
         }));
         let (sender, receiver) = watch::channel(None);
@@ -252,7 +262,13 @@ impl Viewport {
         if control.closed {
             return Err(503);
         }
-        let generation = control.generation.clone().ok_or(503_u16)?;
+        let Some(generation) = control.generation.clone() else {
+            return if control.presentation_status.is_some() {
+                info(None, None, false, control.presentation_status.as_deref())
+            } else {
+                Err(503)
+            };
+        };
         if control
             .lease
             .as_ref()
@@ -274,7 +290,12 @@ impl Viewport {
                     last_request: None,
                 });
                 let lease = control.lease.as_ref().ok_or(503_u16)?;
-                return info(Some(lease), Some(&generation), true);
+                return info(
+                    Some(lease),
+                    Some(&generation),
+                    true,
+                    control.presentation_status.as_deref(),
+                );
             }
         }
         if self.sender.is_closed() {
@@ -284,7 +305,12 @@ impl Viewport {
             .lease
             .as_ref()
             .filter(|lease| controller == Some(lease.controller.as_str()));
-        info(owner, Some(&generation), owner.is_some())
+        info(
+            owner,
+            Some(&generation),
+            owner.is_some(),
+            control.presentation_status.as_deref(),
+        )
     }
 
     pub(crate) fn release(&self, controller: Option<&str>) -> Result<(), u16> {
@@ -350,11 +376,17 @@ impl Viewport {
     }
 }
 
-fn info(lease: Option<&Lease>, generation: Option<&str>, allowed: bool) -> Result<Vec<u8>, u16> {
+fn info(
+    lease: Option<&Lease>,
+    generation: Option<&str>,
+    allowed: bool,
+    presentation_status: Option<&str>,
+) -> Result<Vec<u8>, u16> {
     serde_json::to_vec(&ViewInfo {
         protocol_version: 1,
         presentation_versions: [1],
         generation,
+        presentation_status,
         viewport_allowed: allowed,
         controller: lease.map(|lease| lease.controller.as_str()),
         lease_ms: if allowed { 30_000 } else { 0 },
@@ -370,6 +402,24 @@ mod tests {
         let response: serde_json::Value =
             serde_json::from_slice(&view.claim(None).unwrap()).unwrap();
         response["controller"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn publication_status_is_bounded_and_independent_of_output_generation() {
+        let (viewport, _requests) = Viewport::new(ViewportMode::Resizable);
+        let control = ViewControl::new(Arc::new(viewport));
+        control.set_presentation_status(Some(&"x".repeat(2048)));
+        let info: serde_json::Value =
+            serde_json::from_slice(&control.viewport.claim(None).unwrap()).unwrap();
+        assert!(info["generation"].is_null());
+        assert!(!info["viewport_allowed"].as_bool().unwrap());
+        assert_eq!(info["presentation_status"].as_str().unwrap().len(), 1024);
+        control.set_generation("committed").unwrap();
+        control.set_presentation_status(None);
+        let info: serde_json::Value =
+            serde_json::from_slice(&control.viewport.claim(None).unwrap()).unwrap();
+        assert_eq!(info["generation"], "committed");
+        assert!(info["presentation_status"].is_null());
     }
 
     fn body(id: u64, generation: &str) -> Vec<u8> {

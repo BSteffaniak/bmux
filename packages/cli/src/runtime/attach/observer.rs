@@ -46,6 +46,8 @@ pub struct AttachSnapshot {
     pub unsupported_metadata: &'static [&'static str],
 }
 
+type RejectionHandler = dyn FnMut(Option<&str>) + Send + Sync;
+
 type SnapshotDelivery = dyn FnMut(&AttachSnapshot) -> anyhow::Result<()> + Send + Sync;
 
 /// Single publisher, owned and dropped by one attach view.
@@ -53,6 +55,8 @@ pub struct AttachObserverPublisher {
     epoch: Uuid,
     revision: u64,
     sender: watch::Sender<Option<Arc<AttachSnapshot>>>,
+    rejection: Option<Box<RejectionHandler>>,
+    last_rejection: Option<String>,
     delivery: Option<Box<SnapshotDelivery>>,
 }
 
@@ -82,6 +86,8 @@ pub fn attach_observer_channel() -> (AttachObserverPublisher, AttachObserver) {
             epoch,
             revision: 0,
             sender,
+            rejection: None,
+            last_rejection: None,
             delivery: None,
         },
         AttachObserver { epoch, receiver },
@@ -123,6 +129,22 @@ impl Drop for AttachObserverPublisher {
 }
 
 impl AttachObserverPublisher {
+    pub(crate) fn set_rejection(
+        &mut self,
+        handler: impl FnMut(Option<&str>) + Send + Sync + 'static,
+    ) {
+        self.rejection = Some(Box::new(handler));
+    }
+    pub(super) fn report_rejection(&mut self, message: Option<&str>) {
+        if self.last_rejection.as_deref() == message {
+            return;
+        }
+        if let Some(handler) = &mut self.rejection {
+            handler(message);
+        }
+        self.last_rejection = message.map(str::to_owned);
+    }
+
     /// Install synchronous bounded host admission/delivery before frame commit.
     pub fn set_delivery(
         &mut self,
@@ -220,9 +242,20 @@ impl AttachObserverPublisher {
         }
         self.sender.send_replace(Some(snapshot));
         self.revision = revision;
+        self.report_rejection(None);
         Ok(())
     }
 }
+
+/// A rejected complete browser frame, not a transport/process failure.
+#[derive(Debug)]
+pub(super) struct PresentationRejected(pub String);
+impl std::fmt::Display for PresentationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for PresentationRejected {}
 
 pub(super) fn deliver_prepared(
     view: &mut super::state::AttachViewState,
@@ -231,14 +264,57 @@ pub(super) fn deliver_prepared(
     operations: &[bmux_attach_pipeline::projection::PaintOperation],
     output: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    use bmux_tui::{image::ImageContribution, presentation::PresentationLimits};
-    if operations.iter().any(|op| {
-        matches!(
-            op,
-            bmux_attach_pipeline::projection::PaintOperation::Unsupported
+    let area = Rect::new(0, 0, geometry.cols, geometry.rows);
+    let previous = (view.presentation.area() != area).then(|| {
+        std::mem::replace(
+            &mut view.presentation,
+            bmux_tui::presentation::PresentationState::new(area),
         )
-    }) {
-        anyhow::bail!("unsupported or over-budget presentation");
+    });
+    let mut output_failed = false;
+    let result = deliver_prepared_inner(view, layout, geometry, operations, || {
+        let result = output();
+        output_failed = result.is_err();
+        result
+    });
+    if result.is_err()
+        && let Some(previous) = previous
+    {
+        view.presentation = previous;
+    }
+    result.map_err(|error| {
+        if output_failed {
+            error
+        } else {
+            PresentationRejected(format!(
+                "browser frame rejected (viewport={}x{}, captured_operations={}): {error:#}",
+                geometry.cols,
+                geometry.rows,
+                operations.len()
+            ))
+            .into()
+        }
+    })
+}
+
+fn deliver_prepared_inner(
+    view: &mut super::state::AttachViewState,
+    layout: &bmux_client::AttachLayoutState,
+    geometry: super::input::TerminalGeometry,
+    operations: &[bmux_attach_pipeline::projection::PaintOperation],
+    output: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use bmux_tui::{image::ImageContribution, presentation::PresentationLimits};
+    for op in operations {
+        match op {
+            bmux_attach_pipeline::projection::PaintOperation::Rejected(reason) => {
+                anyhow::bail!("{reason}")
+            }
+            bmux_attach_pipeline::projection::PaintOperation::Unsupported => anyhow::bail!(
+                "unsupported legacy imperative capture (no neutral retained representation)"
+            ),
+            _ => {}
+        }
     }
     let area = Rect::new(0, 0, geometry.cols, geometry.rows);
     let images = observed_images(view, layout, area).map_err(anyhow::Error::msg)?;
@@ -247,7 +323,7 @@ pub(super) fn deliver_prepared(
     view.presentation.resize(area);
     let limits = PresentationLimits {
         max_cells: 262_144,
-        max_entries: 131_072,
+        max_entries: 262_144,
         max_bytes: 32 * 1024 * 1024,
     };
     let metadata = super::metadata::project(&view.retained_compositor, area)?;
@@ -274,12 +350,15 @@ pub(super) fn deliver_prepared(
                 cx.set_cursor_local(cursor.x, cursor.y, cursor.visible);
             }
         })
-        .map_err(|error| anyhow::anyhow!("presentation admission failed: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("presentation admission failed: resource={error:?}, cells={}, cell_limit={}, entry_limit={}, byte_limit={}", usize::from(area.width) * usize::from(area.height), limits.max_cells, limits.max_entries, limits.max_bytes))?;
     prepared
         .set_selection_text(metadata.text)
         .map_err(|error| anyhow::anyhow!("logical source admission failed: {error:?}"))?;
     if view.retained_compositor.surfaces().len() > 4096 {
-        anyhow::bail!("surface budget exceeded");
+        anyhow::bail!(
+            "surface budget exceeded: used={}, limit=4096",
+            view.retained_compositor.surfaces().len()
+        );
     }
     let active = view
         .plugin_focus

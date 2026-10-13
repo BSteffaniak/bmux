@@ -1,12 +1,68 @@
 //! Bounded image projection using compositor visibility and authoritative content geometry.
 use bmux_tui::geometry::Rect;
 use bmux_tui::image::{ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement};
+use image::ImageEncoder;
 use std::collections::BTreeMap;
 
 /// Maximum decoded pixels for any one observed resource.
-pub const MAX_IMAGE_PIXELS: u64 = 4 * 1024 * 1024;
+pub const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 const MAX_PLACEMENTS: usize = 4096;
 const MAX_PROJECTED_BYTES: usize = 8 * 1024 * 1024;
+
+/// Losslessly compact large raw pixel resources before clip expansion/capture cloning.
+///
+/// # Errors
+/// Rejects inconsistent dimensions and resources outside decoded-pixel bounds.
+pub fn compact_payload(
+    payload: &ImagePayload,
+) -> Result<std::borrow::Cow<'_, ImagePayload>, String> {
+    let ImagePayload::Pixels {
+        bytes,
+        width,
+        height,
+        format,
+    } = payload
+    else {
+        return Ok(std::borrow::Cow::Borrowed(payload));
+    };
+    let pixels = u64::from(*width) * u64::from(*height);
+    let channels = match format {
+        ImagePixelFormat::Rgb8 => 3,
+        ImagePixelFormat::Rgba8 => 4,
+    };
+    if pixels == 0
+        || pixels > MAX_IMAGE_PIXELS
+        || pixels.checked_mul(channels) != Some(bytes.len() as u64)
+    {
+        return Err(format!(
+            "image dimensions/pixel admission failed: dimensions={width}x{height}, pixels={pixels}, pixel_limit={MAX_IMAGE_PIXELS}, payload_bytes={}",
+            bytes.len()
+        ));
+    }
+    if bytes.len() < 256 * 1024 {
+        return Ok(std::borrow::Cow::Borrowed(payload));
+    }
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            bytes,
+            *width,
+            *height,
+            match format {
+                ImagePixelFormat::Rgb8 => image::ExtendedColorType::Rgb8,
+                ImagePixelFormat::Rgba8 => image::ExtendedColorType::Rgba8,
+            },
+        )
+        .map_err(|_| "lossless image resource encoding failed".to_owned())?;
+    if png.len() >= bytes.len() {
+        return Ok(std::borrow::Cow::Borrowed(payload));
+    }
+    Ok(std::borrow::Cow::Owned(ImagePayload::Png {
+        bytes: png,
+        width: *width,
+        height: *height,
+    }))
+}
 
 /// Project a resource through compositor visibility.
 ///
@@ -22,7 +78,8 @@ pub fn visible_image_strips(
     clip: Rect,
     visible: impl Fn(u16, u16) -> bool,
 ) -> Result<Vec<ImagePlacement>, String> {
-    let byte_len = validate_projection_payload(payload)?;
+    let payload = compact_payload(payload)?;
+    let byte_len = validate_projection_payload(&payload)?;
     let clipped = destination.intersection(clip);
     if destination.is_empty() || clipped.is_empty() {
         return Ok(Vec::new());
@@ -48,7 +105,10 @@ pub fn visible_image_strips(
                 index
             } else {
                 if rectangles.len() == MAX_PLACEMENTS {
-                    return Err("image placement budget exceeded".to_owned());
+                    return Err(format!(
+                        "image placement budget exceeded: image={key}, placements={}, limit={MAX_PLACEMENTS}",
+                        rectangles.len() + 1
+                    ));
                 }
                 rectangles.push(Rect::new(start, y, x - start, 1));
                 rectangles.len() - 1
@@ -58,7 +118,11 @@ pub fn visible_image_strips(
         previous = current;
     }
     if byte_len.saturating_mul(rectangles.len()) > MAX_PROJECTED_BYTES {
-        return Err("image projection byte budget exceeded".to_owned());
+        return Err(format!(
+            "image projection byte budget exceeded: payload_bytes={byte_len}, placements={}, projected_bytes={}, limit={MAX_PROJECTED_BYTES}",
+            rectangles.len(),
+            byte_len.saturating_mul(rectangles.len())
+        ));
     }
     let single = rectangles.len() == 1;
     Ok(rectangles
@@ -75,7 +139,7 @@ pub fn visible_image_strips(
                     rect.height
                 )
             }),
-            payload: payload.clone(),
+            payload: payload.as_ref().clone(),
             destination,
             clip: rect,
             lifecycle: ImageLifecycle::Frame,
@@ -98,10 +162,16 @@ fn validate_projection_payload(payload: &ImagePayload) -> Result<usize, String> 
         } => (*width, *height, bytes),
     };
     if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
-        return Err("image pixel budget exceeded".to_owned());
+        return Err(format!(
+            "image pixel budget exceeded: dimensions={width}x{height}, pixels={}, limit={MAX_IMAGE_PIXELS}",
+            u64::from(width) * u64::from(height)
+        ));
     }
     if bytes.len() > MAX_PROJECTED_BYTES {
-        return Err("image projection byte budget exceeded".to_owned());
+        return Err(format!(
+            "image resource byte budget exceeded: used={}, limit={MAX_PROJECTED_BYTES}",
+            bytes.len()
+        ));
     }
     match payload {
         ImagePayload::Png { .. } => {
@@ -224,6 +294,37 @@ mod tests {
     }
 
     #[test]
+    fn four_k_pixels_compact_losslessly_before_clip_expansion() {
+        let original = ImagePayload::Pixels {
+            bytes: vec![255; 3840 * 2160 * 4],
+            width: 3840,
+            height: 2160,
+            format: ImagePixelFormat::Rgba8,
+        };
+        let compact = compact_payload(&original).unwrap();
+        let ImagePayload::Png { bytes, .. } = compact.as_ref() else {
+            panic!("4K resource was not compacted");
+        };
+        assert!(bytes.len() < 256 * 1024);
+        let decoded = image::load_from_memory(bytes).unwrap().to_rgba8();
+        assert_eq!(decoded.as_raw(), &vec![255; 3840 * 2160 * 4]);
+        let clips = visible_image_strips(
+            "4k",
+            &original,
+            Rect::new(0, 0, 5, 1),
+            Rect::new(0, 0, 5, 1),
+            |x, _| x % 2 == 0,
+        )
+        .unwrap();
+        assert_eq!(clips.len(), 3);
+        assert!(
+            clips
+                .iter()
+                .all(|clip| matches!(clip.payload, ImagePayload::Png { .. }))
+        );
+    }
+
+    #[test]
     fn projection_budgets_reject_fragmentation_before_payload_cloning() {
         let payload = tiny_payload();
         assert!(
@@ -250,7 +351,7 @@ mod tests {
                 Rect::new(0, 0, 5, 1),
                 |x, _| x % 2 == 0
             )
-            .is_err()
+            .is_ok()
         );
     }
 }

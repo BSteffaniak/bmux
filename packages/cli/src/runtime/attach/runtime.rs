@@ -8840,6 +8840,22 @@ fn retained_frame_sync_pending(view: &AttachViewState, layout: &AttachLayoutStat
         })
 }
 
+fn recover_browser_rejection(view: &mut AttachViewState, error: &anyhow::Error) -> bool {
+    if view.observer.is_none()
+        || error
+            .downcast_ref::<super::observer::PresentationRejected>()
+            .is_none()
+    {
+        return false;
+    }
+    if let Some(observer) = &mut view.observer {
+        observer.report_rejection(Some(&error.to_string()));
+    }
+    // Baselines were invalidated. Retry only on a new source/viewport event.
+    view.dirty.clear_frame_damage();
+    true
+}
+
 #[allow(clippy::too_many_arguments)] // Preserve the public render entry point while committing interaction only after flush.
 pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
     terminal_writer: &mut W,
@@ -8916,11 +8932,14 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
             Vec::new(),
         )
     };
-    if result.is_err() {
+    if let Err(error) = &result {
         view_state.retained_compositor = previous;
         view_state
             .dirty
             .mark_full_frame(AttachDirtySource::PluginCommand);
+        if recover_browser_rejection(view_state, error) {
+            return Ok(AttachFrameRenderStats::default());
+        }
         return result;
     }
     finish_presented_scroll_tracking(view_state);
@@ -16007,9 +16026,74 @@ mod tests {
                 TerminalGeometry { cols: 80, rows: 24 },
                 None
             )
-            .is_err()
+            .is_ok()
         );
         assert!(Arc::ptr_eq(&committed, &output.latest().unwrap()));
+    }
+
+    #[test]
+    fn headless_rejection_preserves_commit_deduplicates_status_and_recovers() {
+        let session = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+            context_id: None,
+            session_id: session,
+            can_write: true,
+        });
+        let layout = retry_test_layout(&mut state, pane, session);
+        state.presentation_only = true;
+        state.presentation_extensions = Arc::new(bmux_plugin::RenderExtensionRegistry::new());
+        let (mut publisher, observer) = super::super::observer::attach_observer_channel();
+        let reports = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let captured = Arc::clone(&reports);
+        publisher.set_rejection(move |message| {
+            captured.lock().unwrap().push(message.map(str::to_owned));
+        });
+        state.set_observer(publisher);
+        render_observed_test_frame(&mut state, &layout);
+        let committed = observer.latest().unwrap();
+        state
+            .observer
+            .as_mut()
+            .unwrap()
+            .set_delivery(|_| anyhow::bail!("resource bytes: used=9437184, limit=8388608"));
+        for _ in 0..3 {
+            state.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
+            render_observed_test_frame(&mut state, &layout);
+            assert!(Arc::ptr_eq(&committed, &observer.latest().unwrap()));
+        }
+        assert_eq!(reports.lock().unwrap().len(), 1);
+        let committed_area = state.presentation.area();
+        render_attach_frame_to_writer(
+            &mut Vec::new(),
+            &mut state,
+            &layout,
+            &RuntimeAppearance::default(),
+            &[],
+            0,
+            &bmux_config::DamageBehaviorConfig::default(),
+            u64::MAX,
+            &mut DisplayCaptureFanout::default(),
+            TerminalGeometry {
+                cols: 120,
+                rows: 40,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(state.presentation.area(), committed_area);
+        assert!(Arc::ptr_eq(&committed, &observer.latest().unwrap()));
+        assert!(
+            reports.lock().unwrap()[0]
+                .as_ref()
+                .unwrap()
+                .contains("9437184")
+        );
+        state.observer.as_mut().unwrap().set_delivery(|_| Ok(()));
+        state.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
+        render_observed_test_frame(&mut state, &layout);
+        assert!(observer.latest().unwrap().revision > committed.revision);
+        assert_eq!(reports.lock().unwrap().last().unwrap(), &None);
     }
 
     #[test]

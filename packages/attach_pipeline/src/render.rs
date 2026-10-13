@@ -255,8 +255,14 @@ fn capture_terminal_commands(commands: &[TerminalCommand]) {
             _ => 0,
         })
         .fold(0_usize, usize::saturating_add);
-    if bytes > 16 * 1024 * 1024 || commands.len() > 131_072 {
-        crate::projection::record(crate::projection::PaintOperation::Unsupported);
+    if bytes > 16 * 1024 * 1024 {
+        crate::projection::record(crate::projection::PaintOperation::Rejected(
+            crate::projection::ProjectionFailure::Budget {
+                resource: "terminal text bytes",
+                used: bytes,
+                limit: 16 * 1024 * 1024,
+            },
+        ));
         return;
     }
     for operation in terminal_command_operations(commands) {
@@ -274,14 +280,29 @@ fn terminal_command_operations(
             _ => 0,
         })
         .fold(0_usize, usize::saturating_add);
-    if bytes > 16 * 1024 * 1024 || commands.len() > 131_072 {
-        return vec![crate::projection::PaintOperation::Unsupported];
+    if bytes > 16 * 1024 * 1024 {
+        return vec![crate::projection::PaintOperation::Rejected(
+            crate::projection::ProjectionFailure::Budget {
+                resource: "terminal text bytes",
+                used: bytes,
+                limit: 16 * 1024 * 1024,
+            },
+        )];
     }
     let mut operations = Vec::new();
     let mut x = 0_u16;
     let mut y = 0_u16;
     let mut style = RenderStyle::default();
     for command in commands {
+        if operations.len() >= 262_144 {
+            return vec![crate::projection::PaintOperation::Rejected(
+                crate::projection::ProjectionFailure::Budget {
+                    resource: "visible terminal operations",
+                    used: operations.len() + 1,
+                    limit: 262_144,
+                },
+            )];
+        }
         match command {
             TerminalCommand::MoveTo {
                 x: next_x,
@@ -1276,6 +1297,54 @@ fn queue_terminal_graphic_overlay<W: io::Write>(
 }
 
 #[cfg(feature = "image-kitty")]
+fn capture_graphic_overlay(surface_id: Uuid, instance_key: u64, graphic: &TerminalGraphicOverlay) {
+    use crate::projection::{PaintOperation, ProjectionFailure};
+    let pixels = u64::from(graphic.pixel_width) * u64::from(graphic.pixel_height);
+    if pixels > crate::projection_images::MAX_IMAGE_PIXELS {
+        crate::projection::record(PaintOperation::Rejected(ProjectionFailure::Budget {
+            resource: "image pixels",
+            used: usize::try_from(pixels).unwrap_or(usize::MAX),
+            limit: usize::try_from(crate::projection_images::MAX_IMAGE_PIXELS)
+                .unwrap_or(usize::MAX),
+        }));
+        return;
+    }
+    let raw = bmux_tui::image::ImagePayload::Pixels {
+        bytes: terminal_graphic_pixels(graphic),
+        width: graphic.pixel_width,
+        height: graphic.pixel_height,
+        format: bmux_tui::image::ImagePixelFormat::Rgba8,
+    };
+    let payload = if let Ok(payload) = crate::projection_images::compact_payload(&raw) {
+        payload.into_owned()
+    } else {
+        crate::projection::record(PaintOperation::Rejected(ProjectionFailure::Unsupported {
+            reason: "invalid terminal image resource",
+        }));
+        return;
+    };
+    crate::projection::record(PaintOperation::Image(std::sync::Arc::new(
+        bmux_tui::image::ImagePlacement {
+            key: bmux_tui::image::ImageKey::new(format!("{surface_id}:{instance_key}")),
+            payload,
+            destination: bmux_tui::geometry::Rect::new(
+                graphic.cell_rect.x,
+                graphic.cell_rect.y,
+                graphic.cell_rect.w,
+                graphic.cell_rect.h,
+            ),
+            clip: bmux_tui::geometry::Rect::new(
+                graphic.cell_rect.x,
+                graphic.cell_rect.y,
+                graphic.cell_rect.w,
+                graphic.cell_rect.h,
+            ),
+            lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+        },
+    )));
+}
+
+#[cfg(feature = "image-kitty")]
 #[allow(clippy::too_many_arguments)] // Kitty reconciliation needs identity, payload, cache, capability, and stats state.
 fn queue_kitty_graphic_overlay<W: io::Write>(
     stdout: &mut W,
@@ -1291,36 +1360,7 @@ fn queue_kitty_graphic_overlay<W: io::Write>(
         return Ok(false);
     }
     if crate::projection::capturing() {
-        if u64::from(graphic.pixel_width) * u64::from(graphic.pixel_height)
-            > crate::projection_images::MAX_IMAGE_PIXELS
-        {
-            crate::projection::record(crate::projection::PaintOperation::Unsupported);
-        } else {
-            crate::projection::record(crate::projection::PaintOperation::Image(
-                bmux_tui::image::ImagePlacement {
-                    key: bmux_tui::image::ImageKey::new(format!("{surface_id}:{instance_key}")),
-                    payload: bmux_tui::image::ImagePayload::Pixels {
-                        bytes: terminal_graphic_pixels(graphic),
-                        width: graphic.pixel_width,
-                        height: graphic.pixel_height,
-                        format: bmux_tui::image::ImagePixelFormat::Rgba8,
-                    },
-                    destination: bmux_tui::geometry::Rect::new(
-                        graphic.cell_rect.x,
-                        graphic.cell_rect.y,
-                        graphic.cell_rect.w,
-                        graphic.cell_rect.h,
-                    ),
-                    clip: bmux_tui::geometry::Rect::new(
-                        graphic.cell_rect.x,
-                        graphic.cell_rect.y,
-                        graphic.cell_rect.w,
-                        graphic.cell_rect.h,
-                    ),
-                    lifecycle: bmux_tui::image::ImageLifecycle::Frame,
-                },
-            ));
-        }
+        capture_graphic_overlay(surface_id, instance_key, graphic);
     }
     if !crate::projection::encoding_terminal() {
         return Ok(true);
@@ -4406,7 +4446,11 @@ fn execute_imperative_extension<W: io::Write>(
     plan: &AfterContentExtensionOutputPlan,
     context: &RenderExtensionContext,
 ) {
-    crate::projection::record(crate::projection::PaintOperation::Unsupported);
+    crate::projection::record(crate::projection::PaintOperation::Rejected(
+        crate::projection::ProjectionFailure::Unsupported {
+            reason: "imperative render extension has no neutral output",
+        },
+    ));
     let snapshot = &plan.snapshot;
     if !crate::projection::encoding_terminal() {
         return;
@@ -4447,7 +4491,11 @@ fn capture_cached_extension(
             crate::projection::record_borrowed(operation);
         }
     } else {
-        crate::projection::record(crate::projection::PaintOperation::Unsupported);
+        crate::projection::record(crate::projection::PaintOperation::Rejected(
+            crate::projection::ProjectionFailure::Deferred {
+                reason: "extension projection cache not yet populated",
+            },
+        ));
     }
 }
 
@@ -5541,7 +5589,11 @@ fn queue_pane_content_for_surface<W: io::Write>(
         }
         if !stage.content_damage.requires_redraw() || stage.sync_deferred {
             if stage.sync_deferred {
-                crate::projection::record(crate::projection::PaintOperation::Unsupported);
+                crate::projection::record(crate::projection::PaintOperation::Rejected(
+                    crate::projection::ProjectionFailure::Deferred {
+                        reason: "pane synchronized update is unfinished",
+                    },
+                ));
             }
             if stage.sync_deferred
                 && let Some(stats) = render_stats.as_deref_mut()
@@ -7388,6 +7440,23 @@ mod tests {
     fn opaque_row_text_truncates_and_pads() {
         assert_eq!(opaque_row_text("help", 8), "help    ");
         assert_eq!(opaque_row_text("123456789", 5), "12345");
+    }
+
+    #[test]
+    fn dense_styled_terminal_commands_admit_visible_work_not_control_commands() {
+        let mut commands = Vec::new();
+        for y in 0..300 {
+            for x in 0..600 {
+                commands.push(TerminalCommand::MoveTo { x, y });
+                commands.push(TerminalCommand::ApplyStyle(RenderStyle::default()));
+                commands.push(TerminalCommand::Print("x".into()));
+            }
+        }
+        assert!(commands.len() > 131_072);
+        let ((), operations) =
+            crate::projection::capture_neutral(|| super::capture_terminal_commands(&commands));
+        assert_eq!(operations.len(), 300);
+        assert!(operations.iter().all(|op| matches!(op, crate::projection::PaintOperation::Text { text, .. } if text.len() == 600)));
     }
 
     #[test]

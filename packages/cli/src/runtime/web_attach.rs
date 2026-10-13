@@ -63,6 +63,11 @@ fn start_browser_observer(
     let epoch = observer.epoch();
     let mut revision = 0_u64;
     let mut previous: Option<BrowserFrame> = None;
+    let status_control = control.clone();
+    publisher.set_rejection(move |message| {
+        status_control.set_presentation_status(message);
+        if let Some(message) = message { eprintln!("{message}; retaining the last complete browser frame until the next source or viewport update"); }
+    });
     publisher.set_delivery(move |snapshot| {
         anyhow::ensure!(
             snapshot.epoch == epoch,
@@ -79,8 +84,11 @@ fn start_browser_observer(
                 base.generation() == frame.generation()
                     && base.buffer().area() == frame.buffer().area()
             })
-            .map(|base| bmux_web_renderer::wire::encode_delta_with_resources(&frame, base))
-            .transpose()?
+            // A full frame is already deliverable. Optional delta admission
+            // must not veto it; repair with the full representation instead.
+            .and_then(|base| {
+                bmux_web_renderer::wire::encode_delta_with_resources(&frame, base).ok()
+            })
             .filter(|bytes| bytes.len() < binary.len())
             .map(|bytes| (revision, Arc::<[u8]>::from(bytes)));
         let resources = bmux_web_renderer::wire::extract_resources(&frame)?
@@ -258,6 +266,26 @@ fn configure_browser_host(
     Ok(config)
 }
 
+fn print_browser_addresses(host: &bmux_web_host::HostHandle) {
+    if host.address().ip().is_unspecified() {
+        eprintln!(
+            "Listening on {} (all {} interfaces)",
+            host.address(),
+            if host.address().is_ipv4() {
+                "IPv4"
+            } else {
+                "IPv6"
+            }
+        );
+        eprintln!("Local browser URL: {}", host.bootstrap_url());
+        eprintln!(
+            "LAN access: replace the URL host with this computer's IP or DNS name (keep the port and any token fragment)."
+        );
+    } else {
+        eprintln!("Read-only browser view: {}", host.bootstrap_url());
+    }
+}
+
 pub(super) async fn run(
     target: Option<&str>,
     follow: Option<&str>,
@@ -294,13 +322,7 @@ pub(super) async fn run(
             cols: 80,
             rows: 24,
         })?;
-    if host.address().ip().is_unspecified() {
-        eprintln!(
-            "Listening on all interfaces at port {}. From another computer, replace the displayed URL host with this computer's IP or DNS name.",
-            host.address().port()
-        );
-    }
-    eprintln!("Read-only browser view: {}", host.bootstrap_url());
+    print_browser_addresses(&host);
     let attach = async {
         if web_only {
             Box::pin(

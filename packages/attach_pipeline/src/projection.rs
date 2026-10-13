@@ -11,9 +11,11 @@ use bmux_tui::text::{Line, Span};
 /// One already clipped operation from terminal output planning.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PaintOperation {
-    /// Unsupported imperative output must disconnect rather than claim a full view.
+    /// Legacy unsupported marker; new producers use a specific rejection.
     Unsupported,
-    Image(bmux_tui::image::ImagePlacement),
+    /// Specific, content-free rejection or transient deferral.
+    Rejected(ProjectionFailure),
+    Image(std::sync::Arc<bmux_tui::image::ImagePlacement>),
     Text {
         x: u16,
         y: u16,
@@ -24,6 +26,38 @@ pub enum PaintOperation {
         rect: Rect,
         style: Style,
     },
+}
+
+/// Content-free capture failure; never conflates unsupported output with admission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectionFailure {
+    Budget {
+        resource: &'static str,
+        used: usize,
+        limit: usize,
+    },
+    Unsupported {
+        reason: &'static str,
+    },
+    Deferred {
+        reason: &'static str,
+    },
+}
+impl std::fmt::Display for ProjectionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Budget {
+                resource,
+                used,
+                limit,
+            } => write!(
+                f,
+                "capture {resource} budget exceeded: used={used}, limit={limit}"
+            ),
+            Self::Unsupported { reason } => write!(f, "unsupported capture: {reason}"),
+            Self::Deferred { reason } => write!(f, "capture deferred: {reason}"),
+        }
+    }
 }
 
 thread_local! {
@@ -58,6 +92,8 @@ struct CaptureState {
     operations: Vec<PaintOperation>,
     bytes: usize,
     failed: bool,
+    image_resources: std::collections::BTreeSet<usize>,
+    text_end: Option<(u16, u16, Style)>,
 }
 thread_local! {
     static CAPTURE: RefCell<Option<CaptureState>> = const { RefCell::new(None) };
@@ -93,17 +129,37 @@ pub fn capture<T>(run: impl FnOnce() -> T) -> (T, Vec<PaintOperation>) {
     (result, operations)
 }
 
+fn capture_bytes(operation: &PaintOperation) -> usize {
+    if let PaintOperation::Image(image) = operation {
+        return CAPTURE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(state) = slot.as_mut() else {
+                return 0;
+            };
+            if state
+                .image_resources
+                .insert(std::sync::Arc::as_ptr(image) as usize)
+            {
+                operation_bytes(operation)
+            } else {
+                0
+            }
+        });
+    }
+    operation_bytes(operation)
+}
+
 /// Record bounded output; overflow explicitly invalidates the complete projection.
 pub fn record(operation: PaintOperation) {
-    record_with(operation_bytes(&operation), || operation);
+    record_with(capture_bytes(&operation), || operation);
 }
 
 /// Admit a borrowed operation before cloning it.
 pub fn record_borrowed(operation: &PaintOperation) {
-    record_with(operation_bytes(operation), || operation.clone());
+    record_with(capture_bytes(operation), || operation.clone());
 }
 
-const fn operation_bytes(operation: &PaintOperation) -> usize {
+fn operation_bytes(operation: &PaintOperation) -> usize {
     match operation {
         PaintOperation::Text { text, .. } => text.len(),
         PaintOperation::Image(image) => match &image.payload {
@@ -124,17 +180,62 @@ pub fn record_with(bytes: usize, make: impl FnOnce() -> PaintOperation) {
         if state.failed {
             return;
         }
-        if state.operations.len() >= 131_072
+        if state.operations.len() >= 262_144
             || bytes > (16 * 1024 * 1024_usize).saturating_sub(state.bytes)
         {
+            let operation_limit = state.operations.len() >= 262_144;
+            let used = if operation_limit {
+                state.operations.len().saturating_add(1)
+            } else {
+                state.bytes.saturating_add(bytes)
+            };
             state.operations.clear();
-            state.operations.push(PaintOperation::Unsupported);
+            state
+                .operations
+                .push(PaintOperation::Rejected(ProjectionFailure::Budget {
+                    resource: if operation_limit {
+                        "operations"
+                    } else {
+                        "payload bytes"
+                    },
+                    used,
+                    limit: if operation_limit {
+                        262_144
+                    } else {
+                        16 * 1024 * 1024
+                    },
+                }));
             state.failed = true;
             return;
         }
         state.bytes += bytes;
         let operation = make();
-        if matches!(operation, PaintOperation::Unsupported) {
+        let next_end = match &operation {
+            PaintOperation::Text { x, y, text, style } => Some((
+                x.saturating_add(bmux_plugin::render_text_width_u16(text)),
+                *y,
+                *style,
+            )),
+            _ => None,
+        };
+        if let Some(PaintOperation::Text { text, .. }) = state.operations.last_mut()
+            && let PaintOperation::Text {
+                x,
+                y,
+                text: next_text,
+                style,
+            } = &operation
+            && state.text_end == Some((*x, *y, *style))
+        {
+            text.push_str(next_text);
+            state.text_end = next_end;
+            return;
+        }
+        state.text_end = next_end;
+        if matches!(
+            operation,
+            PaintOperation::Unsupported | PaintOperation::Rejected(_)
+        ) {
             state.operations.clear();
             state.failed = true;
         }
@@ -162,9 +263,11 @@ pub fn capturing() -> bool {
 pub fn paint(cx: &mut PaintCx<'_, '_>, operations: &[PaintOperation]) {
     for operation in operations {
         match operation {
-            PaintOperation::Unsupported => {}
+            PaintOperation::Unsupported | PaintOperation::Rejected(_) => {}
             PaintOperation::Image(image) => {
-                cx.push_image(bmux_tui::image::ImageContribution::Present(image.clone()));
+                cx.push_image(bmux_tui::image::ImageContribution::Present(
+                    image.as_ref().clone(),
+                ));
             }
             PaintOperation::Text { x, y, text, style } => {
                 let width = bmux_plugin::render_text_width_u16(text);
@@ -237,6 +340,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dense_capture_coalesces_runs_and_shared_images_are_admitted_once() {
+        use bmux_tui::image::{
+            ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
+        };
+        let ((), operations) = capture_neutral(|| {
+            for y in 0..300 {
+                for x in 0..600 {
+                    record(PaintOperation::Text {
+                        x,
+                        y,
+                        text: "x".into(),
+                        style: Style::default(),
+                    });
+                }
+            }
+        });
+        assert_eq!(operations.len(), 300);
+        assert!(
+            operations
+                .iter()
+                .all(|op| matches!(op, PaintOperation::Text { text, .. } if text.len() == 600))
+        );
+        let image = std::sync::Arc::new(ImagePlacement {
+            key: ImageKey::new("shared"),
+            payload: ImagePayload::Pixels {
+                bytes: vec![0; 8 * 1024 * 1024],
+                width: 2048,
+                height: 1024,
+                format: ImagePixelFormat::Rgba8,
+            },
+            destination: Rect::new(0, 0, 10, 10),
+            clip: Rect::new(0, 0, 10, 10),
+            lifecycle: ImageLifecycle::Frame,
+        });
+        let ((), operations) = capture_neutral(|| {
+            for _ in 0..8 {
+                record_borrowed(&PaintOperation::Image(std::sync::Arc::clone(&image)));
+            }
+        });
+        assert_eq!(operations.len(), 8);
+        assert!(operations.iter().all(|op| matches!(op, PaintOperation::Image(captured) if std::sync::Arc::ptr_eq(&image, captured))));
+    }
+
+    #[test]
     fn nested_capture_preserves_outer_state_and_byte_admission_precedes_allocation() {
         let ((), operations) = capture(|| {
             assert!(std::panic::catch_unwind(|| capture(|| {})).is_err());
@@ -251,6 +398,13 @@ mod tests {
                 panic!("must not allocate rejected resource")
             });
         });
-        assert_eq!(operations, vec![PaintOperation::Unsupported]);
+        assert_eq!(
+            operations,
+            vec![PaintOperation::Rejected(ProjectionFailure::Budget {
+                resource: "payload bytes",
+                used: 17 * 1024 * 1024,
+                limit: 16 * 1024 * 1024,
+            })]
+        );
     }
 }

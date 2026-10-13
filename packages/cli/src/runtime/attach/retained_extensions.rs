@@ -127,7 +127,11 @@ impl AttachRenderExtension for RetainedExtension {
         _: &RenderDamage,
     ) -> std::io::Result<bool> {
         bmux_attach_pipeline::projection::record(
-            bmux_attach_pipeline::projection::PaintOperation::Unsupported,
+            bmux_attach_pipeline::projection::PaintOperation::Rejected(
+                bmux_attach_pipeline::projection::ProjectionFailure::Unsupported {
+                    reason: "retained extension requested imperative rendering without neutral output",
+                },
+            ),
         );
         Err(std::io::Error::other(
             "imperative presentation is unsupported by retained output",
