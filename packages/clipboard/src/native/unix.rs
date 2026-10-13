@@ -1,8 +1,7 @@
-//! Native Unix clipboard transports. No helper process or live display is used by tests.
+//! Native Unix clipboard transports over pure-Rust protocol clients.
 //!
-//! XCB ABI reviewed against libxcb 1.17 xcb.h/xproto.h (cookies are one u32,
-//! replies/events use the generated fixed-width X protocol layout). Wayland ABI
-//! references and protocol descriptors are in `wayland`.
+//! X11 uses x11rb's typed protocol; Wayland uses generated ext/wlr data-control
+//! protocols. Ignored interoperability tests require explicitly isolated displays.
 use super::NativeImage;
 use crate::ClipboardError;
 use std::io::Cursor;
@@ -119,6 +118,12 @@ fn checked_rgba_size(width: u32, height: u32) -> Result<usize, ClipboardError> {
         )),
     }
 }
+/// Explicit normal-exit clipboard persistence, also invoked by X11's exit hook.
+/// This does not promise persistence after SIGKILL, abort, or without a manager.
+pub fn shutdown() -> Result<(), ClipboardError> {
+    x11::shutdown()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

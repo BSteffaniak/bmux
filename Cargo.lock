@@ -1465,10 +1465,13 @@ dependencies = [
  "arboard",
  "image",
  "libc",
- "libloading",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+ "x11rb",
 ]
 
 [[package]]

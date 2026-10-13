@@ -1,319 +1,162 @@
-//! libwayland-client ABI reviewed against wayland-client-core.h/wayland-util.h
-//! 1.24.0. Descriptors follow ext-data-control-v1.xml and
-//! wlr-data-control-unstable-v1.xml from cached wayland-protocols 0.32.13 /
-//! wayland-protocols-wlr 0.3.12. We bind wlr v1 (regular clipboard only).
-//! All proxies, callbacks and descriptor allocations are confined to one thread.
+//! Generated data-control protocols over wayland-client's pure Rust transport.
+//! No libwayland ABI descriptors, library loading or blocking roundtrips.
+//! All proxies and bounded event/transfer state belong to one ownership worker.
 use super::{LIMIT, failure};
 use crate::ClipboardError;
-use libloading::Library;
 use std::{
     collections::HashMap,
-    ffi::{CStr, CString, c_char, c_int, c_void},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     ptr,
     sync::{Arc, Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
+use wayland_client::{
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
+    backend::{ObjectId, WaylandError},
+    protocol::{wl_callback, wl_registry, wl_seat},
+};
+use wayland_protocols::ext::data_control::v1::client::{
+    ext_data_control_device_v1 as ed, ext_data_control_manager_v1 as em,
+    ext_data_control_offer_v1 as eo, ext_data_control_source_v1 as es,
+};
+use wayland_protocols_wlr::data_control::v1::client::{
+    zwlr_data_control_device_v1 as wd, zwlr_data_control_manager_v1 as wm,
+    zwlr_data_control_offer_v1 as wo, zwlr_data_control_source_v1 as ws,
+};
 
-type Proxy = *mut c_void;
-#[repr(C)]
-struct Message {
-    name: *const c_char,
-    signature: *const c_char,
-    types: *const *const Interface,
+const TIMEOUT: Duration = Duration::from_secs(4);
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(8);
+const MIMES: [&str; 6] = [
+    "text/plain;charset=utf-8",
+    "text/plain;charset=UTF-8",
+    "text/plain",
+    "UTF8_STRING",
+    "TEXT",
+    "STRING",
+];
+const MAX_EVENTS: usize = 1024;
+const MAX_OFFERS: usize = 256;
+const MAX_SEATS: usize = 32;
+const MAX_SENDS: usize = 32;
+
+// Consuming errors permits use directly as a map_err callback at API boundaries.
+#[allow(clippy::needless_pass_by_value)]
+fn error(message: impl ToString) -> ClipboardError {
+    failure("native-wayland", message.to_string())
 }
-#[repr(C)]
-struct Interface {
-    name: *const c_char,
-    version: c_int,
-    method_count: c_int,
-    methods: *const Message,
-    event_count: c_int,
-    events: *const Message,
+#[derive(Clone)]
+enum Manager {
+    Ext(em::ExtDataControlManagerV1),
+    Wlr(wm::ZwlrDataControlManagerV1),
 }
-#[repr(C)]
-#[derive(Clone, Copy)]
-union Argument {
-    u: u32,
-    s: *const c_char,
-    o: Proxy,
-    h: c_int,
+#[derive(Clone)]
+enum Device {
+    Ext(ed::ExtDataControlDeviceV1),
+    Wlr(wd::ZwlrDataControlDeviceV1),
 }
-type Dispatcher =
-    unsafe extern "C" fn(*const c_void, Proxy, u32, *const Message, *mut Argument) -> c_int;
-type AddDispatcher = unsafe extern "C" fn(Proxy, Dispatcher, *const c_void, *mut c_void) -> c_int;
-macro_rules! api {
-    ($($name:ident:$ty:ty),+ $(,)?)=>{
-        struct Api {_library:Library,$($name:$ty),+,registry:*const Interface,callback:*const Interface,seat:*const Interface}
-        impl Api {unsafe fn load()->Result<Self,ClipboardError>{
-            let library=unsafe{Library::new("libwayland-client.so.0")}.map_err(|e|failure("native-wayland", e.to_string()))?;
-            $(let $name=*unsafe{library.get::<$ty>(concat!(stringify!($name),"\0").as_bytes())}.map_err(|e|failure("native-wayland", e.to_string()))?;)+
-            let registry=*unsafe{library.get::<*const Interface>(b"wl_registry_interface\0")}.map_err(|e|failure("native-wayland", e.to_string()))?;
-            let callback=*unsafe{library.get::<*const Interface>(b"wl_callback_interface\0")}.map_err(|e|failure("native-wayland", e.to_string()))?;
-            let seat=*unsafe{library.get::<*const Interface>(b"wl_seat_interface\0")}.map_err(|e|failure("native-wayland", e.to_string()))?;
-            Ok(Self{_library:library,$($name),+,registry,callback,seat})
-        }}
-    }
+#[derive(Clone)]
+enum Offer {
+    Ext(eo::ExtDataControlOfferV1),
+    Wlr(wo::ZwlrDataControlOfferV1),
 }
-api! {
-    wl_display_connect:unsafe extern "C" fn(*const c_char)->Proxy,
-    wl_display_disconnect:unsafe extern "C" fn(Proxy),
-    wl_display_get_fd:unsafe extern "C" fn(Proxy)->c_int,
-    wl_display_dispatch_pending:unsafe extern "C" fn(Proxy)->c_int,
-    wl_display_prepare_read:unsafe extern "C" fn(Proxy)->c_int,
-    wl_display_read_events:unsafe extern "C" fn(Proxy)->c_int,
-    wl_display_cancel_read:unsafe extern "C" fn(Proxy),
-    wl_display_flush:unsafe extern "C" fn(Proxy)->c_int,
-    wl_proxy_marshal_array_flags:unsafe extern "C" fn(Proxy,u32,*const Interface,u32,u32,*mut Argument)->Proxy,
-    wl_proxy_destroy:unsafe extern "C" fn(Proxy),
-    wl_proxy_add_dispatcher:AddDispatcher,
+#[derive(Clone)]
+enum Source {
+    Ext(es::ExtDataControlSourceV1),
+    Wlr(ws::ZwlrDataControlSourceV1),
 }
-// The boxed descriptor graph and its names/messages/type arrays outlive every
-// proxy. Heap addresses remain stable when the containing struct moves.
-struct Descriptors {
-    // Fixed heap storage keeps the descriptor graph stable across owner moves.
-    interfaces: Box<[Interface; 4]>,
-    names: Vec<CString>,
-    messages: Vec<Box<[Message]>>,
-    types: Vec<Box<[*const Interface]>>,
-}
-impl Descriptors {
-    fn new(ext: bool, seat: *const Interface) -> Self {
-        let prefix = if ext { "ext" } else { "zwlr" };
-        let names = ["manager", "device", "source", "offer"].map(|kind| {
-            CString::new(format!("{prefix}_data_control_{kind}_v1")).expect("protocol name")
-        });
-        let mut d = Self {
-            interfaces: Box::new(names.each_ref().map(|name| Interface {
-                name: name.as_ptr(),
-                version: 1,
-                method_count: 0,
-                methods: ptr::null(),
-                event_count: 0,
-                events: ptr::null(),
-            })),
-            names: names.into(),
-            messages: Vec::new(),
-            types: Vec::new(),
-        };
-        let device = d.interface(1);
-        let source = d.interface(2);
-        let offer = d.interface(3);
-        d.install(
-            0,
-            false,
-            &[
-                ("create_data_source", "n", vec![source]),
-                ("get_data_device", "no", vec![device, seat]),
-                ("destroy", "", vec![]),
-            ],
-        );
-        d.install(
-            1,
-            false,
-            &[
-                ("set_selection", "?o", vec![source]),
-                ("destroy", "", vec![]),
-            ],
-        );
-        // ext primary selection is part of v1. wlr primary selection is v2 and
-        // intentionally omitted because only v1 is negotiated here.
-        if ext {
-            d.install(
-                1,
-                true,
-                &[
-                    ("data_offer", "n", vec![offer]),
-                    ("selection", "?o", vec![offer]),
-                    ("finished", "", vec![]),
-                    ("primary_selection", "?o", vec![offer]),
-                ],
-            );
-            d.install(
-                1,
-                false,
-                &[
-                    ("set_selection", "?o", vec![source]),
-                    ("destroy", "", vec![]),
-                    ("set_primary_selection", "?o", vec![source]),
-                ],
-            );
-        } else {
-            d.install(
-                1,
-                true,
-                &[
-                    ("data_offer", "n", vec![offer]),
-                    ("selection", "?o", vec![offer]),
-                    ("finished", "", vec![]),
-                ],
-            );
+impl Manager {
+    fn device(&self, seat: &wl_seat::WlSeat, qh: &QueueHandle<State>) -> Device {
+        match self {
+            Self::Ext(m) => Device::Ext(m.get_data_device(seat, qh, ())),
+            Self::Wlr(m) => Device::Wlr(m.get_data_device(seat, qh, ())),
         }
-        d.install(
-            2,
-            false,
-            &[("offer", "s", vec![ptr::null()]), ("destroy", "", vec![])],
-        );
-        d.install(
-            2,
-            true,
-            &[
-                ("send", "sh", vec![ptr::null(), ptr::null()]),
-                ("cancelled", "", vec![]),
-            ],
-        );
-        d.install(
-            3,
-            false,
-            &[
-                ("receive", "sh", vec![ptr::null(), ptr::null()]),
-                ("destroy", "", vec![]),
-            ],
-        );
-        d.install(3, true, &[("offer", "s", vec![ptr::null()])]);
-        d
     }
-    fn interface(&self, index: usize) -> *const Interface {
-        &raw const self.interfaces[index]
-    }
-    fn install(
-        &mut self,
-        index: usize,
-        events: bool,
-        specs: &[(&str, &str, Vec<*const Interface>)],
-    ) {
-        let messages: Box<[Message]> = specs
-            .iter()
-            .map(|(name, signature, types)| {
-                self.names
-                    .push(CString::new(*name).expect("protocol message"));
-                let name = self.names.last().expect("inserted name").as_ptr();
-                self.names
-                    .push(CString::new(*signature).expect("protocol signature"));
-                let signature = self.names.last().expect("inserted signature").as_ptr();
-                self.types.push(types.clone().into_boxed_slice());
-                let types = self.types.last().expect("inserted types").as_ptr();
-                Message {
-                    name,
-                    signature,
-                    types,
-                }
-            })
-            .collect();
-        let interface = &mut self.interfaces[index];
-        if events {
-            interface.event_count = c_int::try_from(messages.len()).expect("small descriptor");
-            interface.events = messages.as_ptr();
-        } else {
-            interface.method_count = c_int::try_from(messages.len()).expect("small descriptor");
-            interface.methods = messages.as_ptr();
+    fn source(&self, qh: &QueueHandle<State>) -> Source {
+        match self {
+            Self::Ext(m) => Source::Ext(m.create_data_source(qh, ())),
+            Self::Wlr(m) => Source::Wlr(m.create_data_source(qh, ())),
         }
-        self.messages.push(messages);
     }
-}
-#[derive(Clone, Copy)]
-enum Role {
-    Registry,
-    Sync,
-    Seat,
-    Device,
-    Source,
-    Offer,
-}
-enum Event {
-    Global(u32, String, u32),
-    Remove(u32),
-    Synced(usize),
-    NewOffer(usize),
-    Mime(usize, String),
-    Selection(usize, usize),
-    Primary(usize),
-    Finished(usize),
-    Send(usize, String, OwnedFd),
-    Cancelled(usize),
-}
-struct Inbox {
-    roles: HashMap<usize, Role>,
-    events: Vec<Event>,
-    add: AddDispatcher,
-    failed: bool,
-}
-unsafe fn string(argument: Argument) -> String {
-    unsafe { CStr::from_ptr(argument.s) }
-        .to_string_lossy()
-        .into_owned()
-}
-unsafe extern "C" fn dispatch(
-    data: *const c_void,
-    proxy: Proxy,
-    opcode: u32,
-    _message: *const Message,
-    args: *mut Argument,
-) -> c_int {
-    // No Rust panic or unwind crosses the C ABI. Limits are checked before
-    // collecting variable peer data. All protocol fd arguments become OwnedFd.
-    unsafe {
-        let inbox = &mut *data.cast_mut().cast::<Inbox>();
-        let Some(role) = inbox.roles.get(&(proxy as usize)).copied() else {
-            return -1;
-        };
-        let event = match (role, opcode) {
-            (Role::Registry, 0) => Some(Event::Global(
-                (*args).u,
-                string(*args.add(1)),
-                (*args.add(2)).u,
-            )),
-            (Role::Registry, 1) => Some(Event::Remove((*args).u)),
-            (Role::Sync, 0) => Some(Event::Synced(proxy as usize)),
-            (Role::Device, 0) => {
-                let offer = (*args).o;
-                if offer.is_null() || inbox.roles.len() >= 512 {
-                    inbox.failed = true;
-                    return -1;
-                }
-                inbox.roles.insert(offer as usize, Role::Offer);
-                if (inbox.add)(offer, dispatch, data, ptr::null_mut()) != 0 {
-                    inbox.failed = true;
-                    return -1;
-                }
-                Some(Event::NewOffer(offer as usize))
-            }
-            (Role::Device, 1) => Some(Event::Selection(proxy as usize, (*args).o as usize)),
-            (Role::Device, 2) => Some(Event::Finished(proxy as usize)),
-            (Role::Device, 3) => Some(Event::Primary((*args).o as usize)),
-            (Role::Offer, 0) => Some(Event::Mime(proxy as usize, string(*args))),
-            (Role::Source, 0) => Some(Event::Send(
-                proxy as usize,
-                string(*args),
-                OwnedFd::from_raw_fd((*args.add(1)).h),
-            )),
-            (Role::Source, 1) => Some(Event::Cancelled(proxy as usize)),
-            (Role::Seat, _) => None,
-            _ => {
-                inbox.failed = true;
-                return -1;
-            }
-        };
-        if let Some(event) = event {
-            if inbox.events.len() >= 1024 {
-                inbox.failed = true;
-                return -1;
-            }
-            inbox.events.push(event);
+    fn destroy(&self) {
+        match self {
+            Self::Ext(m) => m.destroy(),
+            Self::Wlr(m) => m.destroy(),
         }
-        0
     }
 }
-struct Offer {
-    mimes: Vec<String>,
+impl Device {
+    fn id(&self) -> ObjectId {
+        match self {
+            Self::Ext(p) => p.id(),
+            Self::Wlr(p) => p.id(),
+        }
+    }
+    fn set(&self, source: &Source) {
+        match (self, source) {
+            (Self::Ext(p), Source::Ext(s)) => p.set_selection(Some(s)),
+            (Self::Wlr(p), Source::Wlr(s)) => p.set_selection(Some(s)),
+            _ => unreachable!("one negotiated protocol per connection"),
+        }
+    }
+    fn destroy(&self) {
+        match self {
+            Self::Ext(p) => p.destroy(),
+            Self::Wlr(p) => p.destroy(),
+        }
+    }
+}
+impl Offer {
+    fn id(&self) -> ObjectId {
+        match self {
+            Self::Ext(p) => p.id(),
+            Self::Wlr(p) => p.id(),
+        }
+    }
+    fn receive(&self, mime: String, fd: &OwnedFd) {
+        match self {
+            Self::Ext(p) => p.receive(mime, fd.as_fd()),
+            Self::Wlr(p) => p.receive(mime, fd.as_fd()),
+        }
+    }
+    fn destroy(&self) {
+        match self {
+            Self::Ext(p) => p.destroy(),
+            Self::Wlr(p) => p.destroy(),
+        }
+    }
+}
+impl Source {
+    fn id(&self) -> ObjectId {
+        match self {
+            Self::Ext(p) => p.id(),
+            Self::Wlr(p) => p.id(),
+        }
+    }
+    fn offer(&self, mime: String) {
+        match self {
+            Self::Ext(p) => p.offer(mime),
+            Self::Wlr(p) => p.offer(mime),
+        }
+    }
+    fn destroy(&self) {
+        match self {
+            Self::Ext(p) => p.destroy(),
+            Self::Wlr(p) => p.destroy(),
+        }
+    }
 }
 struct Seat {
     global: u32,
-    proxy: Proxy,
-    device: Proxy,
-    selection: usize,
+    proxy: wl_seat::WlSeat,
+    device: Device,
+    selection: Option<ObjectId>,
 }
-struct Source {
+struct Offered {
+    proxy: Offer,
+    mimes: Vec<String>,
+}
+struct OwnedSource {
+    proxy: Source,
     bytes: Arc<Vec<u8>>,
     image: bool,
 }
@@ -322,313 +165,321 @@ struct Send {
     bytes: Arc<Vec<u8>>,
     offset: usize,
     expires: Instant,
+    deadline: Instant,
 }
+enum Event {
+    Global(u32, String, u32),
+    Removed(u32),
+    Offer(Offer),
+    Mime(ObjectId, String),
+    Selection(ObjectId, Option<ObjectId>),
+    Primary(Option<Offer>),
+    Finished(ObjectId),
+    Cancelled(ObjectId),
+    Send(ObjectId, String, OwnedFd),
+    Sync(ObjectId),
+}
+#[derive(Default)]
+struct State {
+    events: Vec<Event>,
+    failed: bool,
+}
+impl State {
+    fn push(&mut self, event: Event) {
+        if self.events.len() >= MAX_EVENTS {
+            self.failed = true;
+        } else {
+            self.events.push(event);
+        }
+    }
+}
+impl Dispatch<wl_registry::WlRegistry, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => state.push(Event::Global(name, interface, version)),
+            wl_registry::Event::GlobalRemove { name } => state.push(Event::Removed(name)),
+            _ => {}
+        }
+    }
+}
+impl Dispatch<wl_callback::WlCallback, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        state.push(Event::Sync(proxy.id()));
+    }
+}
+wayland_client::delegate_noop!(State: ignore wl_seat::WlSeat);
+wayland_client::delegate_noop!(State: ignore em::ExtDataControlManagerV1);
+wayland_client::delegate_noop!(State: ignore wm::ZwlrDataControlManagerV1);
+macro_rules! dispatch_protocol {
+    ($device:ty, $de:path, $offer:ty, $oe:path, $source:ty, $se:path, $variant:ident) => {
+        impl Dispatch<$device, ()> for State {
+            fn event(state: &mut Self, proxy: &$device, event: <$device as Proxy>::Event, (): &(), _: &Connection, _: &QueueHandle<Self>) {
+                use $de as E;
+                match event {
+                    E::DataOffer { id } => state.push(Event::Offer(Offer::$variant(id))),
+                    E::Selection { id } => state.push(Event::Selection(proxy.id(), id.map(|p| p.id()))),
+                    E::PrimarySelection { id } => state.push(Event::Primary(id.map(Offer::$variant))),
+                    E::Finished => state.push(Event::Finished(proxy.id())), _ => {}
+                }
+            }
+            wayland_client::event_created_child!(State, $device, [0 => ($offer, ())]);
+        }
+        impl Dispatch<$offer, ()> for State {
+            fn event(state: &mut Self, proxy: &$offer, event: <$offer as Proxy>::Event, (): &(), _: &Connection, _: &QueueHandle<Self>) {
+                use $oe as E;
+                if let E::Offer { mime_type } = event { state.push(Event::Mime(proxy.id(), mime_type)); }
+            }
+        }
+        impl Dispatch<$source, ()> for State {
+            fn event(state: &mut Self, proxy: &$source, event: <$source as Proxy>::Event, (): &(), _: &Connection, _: &QueueHandle<Self>) {
+                use $se as E;
+                match event {
+                    E::Send { mime_type, fd } => state.push(Event::Send(proxy.id(), mime_type, fd)),
+                    E::Cancelled => state.push(Event::Cancelled(proxy.id())), _ => {}
+                }
+            }
+        }
+    };
+}
+dispatch_protocol!(
+    ed::ExtDataControlDeviceV1,
+    ed::Event,
+    eo::ExtDataControlOfferV1,
+    eo::Event,
+    es::ExtDataControlSourceV1,
+    es::Event,
+    Ext
+);
+dispatch_protocol!(
+    wd::ZwlrDataControlDeviceV1,
+    wd::Event,
+    wo::ZwlrDataControlOfferV1,
+    wo::Event,
+    ws::ZwlrDataControlSourceV1,
+    ws::Event,
+    Wlr
+);
+
 struct W {
-    api: Api,
-    display: Proxy,
-    registry: Proxy,
-    manager: Proxy,
-    descriptors: Option<Descriptors>,
-    inbox: Box<Inbox>,
+    connection: Connection,
+    queue: EventQueue<State>,
+    state: State,
+    registry: wl_registry::WlRegistry,
+    manager: Option<(u32, Manager)>,
     globals: Vec<(u32, String, u32)>,
     seats: Vec<Seat>,
-    offers: HashMap<usize, Offer>,
-    sources: HashMap<usize, Source>,
+    offers: HashMap<ObjectId, Offered>,
+    sources: HashMap<ObjectId, OwnedSource>,
     sends: Vec<Send>,
-    synced: Vec<usize>,
+    synced: Vec<ObjectId>,
+    seats_created: usize,
 }
-const TIMEOUT: Duration = Duration::from_secs(4);
-const MIMES: [&str; 4] = [
-    "text/plain;charset=utf-8",
-    "text/plain;charset=UTF-8",
-    "text/plain",
-    "UTF8_STRING",
-];
 impl Drop for W {
     fn drop(&mut self) {
-        // Local proxy teardown precedes display/library/descriptor destruction.
-        for (proxy, _) in self.inbox.roles.drain() {
-            unsafe {
-                (self.api.wl_proxy_destroy)(proxy as Proxy);
-            }
+        for (_, offer) in self.offers.drain() {
+            offer.proxy.destroy();
         }
-        if !self.manager.is_null() {
-            unsafe {
-                (self.api.wl_proxy_destroy)(self.manager);
-            }
+        for (_, source) in self.sources.drain() {
+            source.proxy.destroy();
         }
-        unsafe {
-            (self.api.wl_display_disconnect)(self.display);
+        for seat in self.seats.drain(..) {
+            seat.device.destroy();
         }
+        if let Some((_, manager)) = &self.manager {
+            manager.destroy();
+        }
+        // Dropping the Rust connection closes the socket and all remaining
+        // local proxy/seat state. No foreign pointers or library handles remain.
     }
 }
 impl W {
     fn new() -> Result<Self, ClipboardError> {
-        unsafe {
-            let api = Api::load()?;
-            let display = (api.wl_display_connect)(ptr::null());
-            if display.is_null() {
-                return Err(failure(
-                    "native-wayland",
-                    "cannot connect to WAYLAND_DISPLAY".to_string(),
-                ));
-            }
-            let inbox = Box::new(Inbox {
-                roles: HashMap::new(),
-                events: Vec::new(),
-                add: api.wl_proxy_add_dispatcher,
-                failed: false,
-            });
-            let mut w = Self {
-                api,
-                display,
-                registry: ptr::null_mut(),
-                manager: ptr::null_mut(),
-                descriptors: None,
-                inbox,
-                globals: Vec::new(),
-                seats: Vec::new(),
-                offers: HashMap::new(),
-                sources: HashMap::new(),
-                sends: Vec::new(),
-                synced: Vec::new(),
-            };
-            w.registry = w.marshal(
-                display,
-                1,
-                w.api.registry,
-                &mut [Argument { o: ptr::null_mut() }],
-                false,
-            )?;
-            w.listen(w.registry, Role::Registry)?;
-            w.sync()?;
-            let global = w
-                .globals
-                .iter()
-                .find(|(_, name, _)| name == "ext_data_control_manager_v1")
-                .or_else(|| {
-                    w.globals
-                        .iter()
-                        .find(|(_, name, _)| name == "zwlr_data_control_manager_v1")
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    failure(
-                        "native-wayland",
-                        "compositor has no data-control protocol".to_string(),
-                    )
-                })?;
-            w.descriptors = Some(Descriptors::new(global.1.starts_with("ext_"), w.api.seat));
-            w.manager = w.bind(
-                global.0,
-                w.descriptors.as_ref().expect("descriptors").interface(0),
-            )?;
-            let seats = w
-                .globals
-                .iter()
-                .filter(|(_, name, _)| name == "wl_seat")
-                .map(|(id, _, _)| *id)
-                .collect::<Vec<_>>();
-            if seats.is_empty() || seats.len() > 32 {
-                return Err(failure(
-                    "native-wayland",
-                    "missing or excessive seats".to_string(),
-                ));
-            }
-            for global in seats {
-                w.add_seat(global)?;
-            }
-            w.sync()?;
-            Ok(w)
-        }
-    }
-    fn marshal(
-        &self,
-        proxy: Proxy,
-        opcode: u32,
-        interface: *const Interface,
-        args: &mut [Argument],
-        destroy: bool,
-    ) -> Result<Proxy, ClipboardError> {
-        let result = unsafe {
-            (self.api.wl_proxy_marshal_array_flags)(
-                proxy,
-                opcode,
-                interface,
-                1,
-                u32::from(destroy),
-                args.as_mut_ptr(),
-            )
+        let connection = Connection::connect_to_env().map_err(error)?;
+        let queue = connection.new_event_queue();
+        let registry = connection.display().get_registry(&queue.handle(), ());
+        let mut w = Self {
+            connection,
+            queue,
+            registry,
+            state: State::default(),
+            manager: None,
+            globals: Vec::new(),
+            seats: Vec::new(),
+            offers: HashMap::new(),
+            sources: HashMap::new(),
+            sends: Vec::new(),
+            synced: Vec::new(),
+            seats_created: 0,
         };
-        if !interface.is_null() && result.is_null() {
-            return Err(failure(
-                "native-wayland",
-                "proxy allocation failed".to_string(),
-            ));
+        w.sync(Instant::now() + TOTAL_TIMEOUT)?;
+        let global = w
+            .globals
+            .iter()
+            .find(|(_, name, _)| name == "ext_data_control_manager_v1")
+            .or_else(|| {
+                w.globals
+                    .iter()
+                    .find(|(_, name, _)| name == "zwlr_data_control_manager_v1")
+            })
+            .cloned()
+            .ok_or_else(|| error("compositor provides neither ext nor wlr data-control"))?;
+        let qh = w.queue.handle();
+        let manager = if global.1 == "ext_data_control_manager_v1" {
+            Manager::Ext(w.registry.bind(global.0, 1, &qh, ()))
+        } else {
+            Manager::Wlr(w.registry.bind(global.0, 1, &qh, ()))
+        };
+        w.manager = Some((global.0, manager));
+        for (name, interface, _) in w.globals.clone() {
+            if interface == "wl_seat" {
+                w.add_seat(name)?;
+            }
         }
-        Ok(result)
-    }
-    fn listen(&mut self, proxy: Proxy, role: Role) -> Result<(), ClipboardError> {
-        self.inbox.roles.insert(proxy as usize, role);
-        if unsafe {
-            (self.api.wl_proxy_add_dispatcher)(
-                proxy,
-                dispatch,
-                (&raw const *self.inbox).cast(),
-                ptr::null_mut(),
-            )
-        } != 0
-        {
-            return Err(failure(
-                "native-wayland",
-                "dispatcher installation failed".to_string(),
-            ));
-        }
-        Ok(())
-    }
-    fn bind(&self, name: u32, interface: *const Interface) -> Result<Proxy, ClipboardError> {
-        self.marshal(
-            self.registry,
-            0,
-            interface,
-            &mut [
-                Argument { u: name },
-                Argument {
-                    s: unsafe { (*interface).name },
-                },
-                Argument { u: 1 },
-                Argument { o: ptr::null_mut() },
-            ],
-            false,
-        )
+        w.sync(Instant::now() + TOTAL_TIMEOUT)?;
+        Ok(w)
     }
     fn add_seat(&mut self, global: u32) -> Result<(), ClipboardError> {
-        if self.seats.len() >= 32 {
-            return Err(failure("native-wayland", "seat limit exceeded".to_string()));
+        if self.seats.iter().any(|s| s.global == global) {
+            return Ok(());
         }
-        let proxy = self.bind(global, self.api.seat)?;
-        self.listen(proxy, Role::Seat)?;
-        let device = self.marshal(
-            self.manager,
-            1,
-            self.descriptors.as_ref().expect("descriptors").interface(1),
-            &mut [Argument { o: ptr::null_mut() }, Argument { o: proxy }],
-            false,
-        )?;
-        self.listen(device, Role::Device)?;
+        if self.seats.len() >= MAX_SEATS || self.seats_created >= 256 {
+            return Err(error("seat limit exceeded"));
+        }
+        let qh = self.queue.handle();
+        let proxy = self.registry.bind(global, 1, &qh, ());
+        let device = self
+            .manager
+            .as_ref()
+            .ok_or_else(|| error("data-control manager unavailable"))?
+            .1
+            .device(&proxy, &qh);
+        self.seats_created += 1;
         self.seats.push(Seat {
             global,
             proxy,
             device,
-            selection: 0,
+            selection: None,
         });
         Ok(())
     }
-    fn destroy(&mut self, proxy: usize, opcode: u32) {
-        if proxy == 0 || self.inbox.roles.remove(&proxy).is_none() {
-            return;
+    fn discard_offer(&mut self, id: &ObjectId) {
+        if let Some(offer) = self.offers.remove(id) {
+            offer.proxy.destroy();
         }
-        let _ = self.marshal(proxy as Proxy, opcode, ptr::null(), &mut [], true);
-        self.offers.remove(&proxy);
-        self.sources.remove(&proxy);
     }
-    // The match is the protocol lifecycle state machine: keeping creation,
-    // replacement and destruction side by side makes proxy ownership auditable.
+    fn remove_device(&mut self, id: &ObjectId) {
+        if let Some(index) = self.seats.iter().position(|s| s.device.id() == *id) {
+            let seat = self.seats.remove(index);
+            if let Some(offer) = seat.selection {
+                self.discard_offer(&offer);
+            }
+            seat.device.destroy();
+            // Version-one wl_seat has no release request. Its local proxy is
+            // reclaimed with the worker connection; hotplug count is bounded.
+            drop(seat.proxy);
+        }
+    }
+    // Keep protocol lifecycle transitions together to make ownership reviewable.
     #[allow(clippy::too_many_lines)]
     fn events(&mut self) -> Result<(), ClipboardError> {
-        if self.inbox.failed {
-            return Err(failure(
-                "native-wayland",
-                "peer event resource limit or invalid event".to_string(),
-            ));
+        if self.state.failed {
+            return Err(error("event queue limit exceeded"));
         }
-        for event in std::mem::take(&mut self.inbox.events) {
+        for event in std::mem::take(&mut self.state.events) {
             match event {
                 Event::Global(id, name, version) => {
                     if self.globals.len() >= 256 || name.len() > 1024 {
-                        return Err(failure(
-                            "native-wayland",
-                            "global resource limit exceeded".to_string(),
-                        ));
+                        return Err(error("registry resource limit exceeded"));
                     }
-                    if self.descriptors.is_some() && name == "wl_seat" {
+                    if name == "wl_seat" && self.manager.is_some() {
                         self.add_seat(id)?;
                     }
                     self.globals.push((id, name, version));
                 }
-                Event::Remove(id) => {
-                    self.globals.retain(|(global, _, _)| *global != id);
-                    if let Some(index) = self.seats.iter().position(|seat| seat.global == id) {
-                        let seat = self.seats.remove(index);
-                        self.destroy(seat.selection, 1);
-                        self.destroy(seat.device as usize, 1);
-                        self.inbox.roles.remove(&(seat.proxy as usize));
-                        unsafe {
-                            (self.api.wl_proxy_destroy)(seat.proxy);
-                        }
+                Event::Removed(id) => {
+                    self.globals.retain(|g| g.0 != id);
+                    if self.manager.as_ref().is_some_and(|m| m.0 == id) {
+                        return Err(error("data-control manager removed"));
+                    }
+                    let devices: Vec<_> = self
+                        .seats
+                        .iter()
+                        .filter(|s| s.global == id)
+                        .map(|s| s.device.id())
+                        .collect();
+                    for device in devices {
+                        self.remove_device(&device);
                     }
                 }
-                Event::Synced(proxy) => {
-                    self.inbox.roles.remove(&proxy);
-                    unsafe {
-                        (self.api.wl_proxy_destroy)(proxy as Proxy);
+                Event::Offer(proxy) => {
+                    if self.offers.len() >= MAX_OFFERS {
+                        proxy.destroy();
+                        return Err(error("offer limit exceeded"));
                     }
-                    self.synced.push(proxy);
+                    self.offers.insert(
+                        proxy.id(),
+                        Offered {
+                            proxy,
+                            mimes: Vec::new(),
+                        },
+                    );
                 }
-                Event::NewOffer(proxy) => {
-                    if self.offers.len() >= 128 {
-                        return Err(failure(
-                            "native-wayland",
-                            "offer limit exceeded".to_string(),
-                        ));
+                Event::Mime(id, mime) => {
+                    if mime.len() > 4096 {
+                        return Err(error("MIME length limit exceeded"));
                     }
-                    self.offers.insert(proxy, Offer { mimes: Vec::new() });
-                }
-                Event::Mime(proxy, mime) => {
-                    if let Some(offer) = self.offers.get_mut(&proxy) {
-                        if mime.len() > 1024 || offer.mimes.len() >= 128 {
-                            return Err(failure(
-                                "native-wayland",
-                                "MIME limit exceeded".to_string(),
-                            ));
+                    if let Some(offer) = self.offers.get_mut(&id) {
+                        if offer.mimes.len() >= 128 {
+                            return Err(error("MIME count limit exceeded"));
                         }
                         offer.mimes.push(mime);
                     }
                 }
                 Event::Selection(device, offer) => {
-                    if let Some(seat) = self
-                        .seats
-                        .iter_mut()
-                        .find(|seat| seat.device as usize == device)
-                    {
-                        let old = seat.selection;
-                        seat.selection = offer;
-                        if old != offer {
-                            self.destroy(old, 1);
+                    if let Some(seat) = self.seats.iter_mut().find(|s| s.device.id() == device) {
+                        let previous = std::mem::replace(&mut seat.selection, offer.clone());
+                        if let Some(previous) = previous.filter(|p| Some(p) != offer.as_ref()) {
+                            self.discard_offer(&previous);
                         }
+                    } else if let Some(offer) = offer {
+                        self.discard_offer(&offer);
                     }
                 }
-                Event::Primary(offer) => self.destroy(offer, 1),
-                Event::Finished(device) => {
-                    if let Some(index) = self
-                        .seats
-                        .iter()
-                        .position(|seat| seat.device as usize == device)
-                    {
-                        let seat = self.seats.remove(index);
-                        self.destroy(seat.selection, 1);
-                        self.destroy(device, 1);
-                        self.inbox.roles.remove(&(seat.proxy as usize));
-                        unsafe {
-                            (self.api.wl_proxy_destroy)(seat.proxy);
-                        }
+                Event::Primary(Some(offer)) => {
+                    self.discard_offer(&offer.id());
+                }
+                Event::Primary(None) => {}
+                Event::Finished(device) => self.remove_device(&device),
+                Event::Cancelled(id) => {
+                    if let Some(source) = self.sources.remove(&id) {
+                        source.proxy.destroy();
                     }
                 }
-                Event::Cancelled(source) => self.destroy(source, 1),
-                Event::Send(source, mime, fd) => {
-                    if let Some(source) = self.sources.get(&source)
+                Event::Send(id, mime, fd) => {
+                    if mime.len() > 4096 {
+                        return Err(error("MIME length limit exceeded"));
+                    }
+                    if let Some(source) = self.sources.get(&id)
                         && supported(&mime, source.image)
-                        && self.sends.len() < 32
+                        && self.sends.len() < MAX_SENDS
                     {
                         nonblocking(&fd)?;
                         self.sends.push(Send {
@@ -636,55 +487,65 @@ impl W {
                             bytes: Arc::clone(&source.bytes),
                             offset: 0,
                             expires: Instant::now() + TIMEOUT,
+                            deadline: Instant::now() + TOTAL_TIMEOUT,
                         });
                     }
+                }
+                Event::Sync(id) => {
+                    if self.synced.len() >= 32 {
+                        return Err(error("sync callback limit exceeded"));
+                    }
+                    self.synced.push(id);
                 }
             }
         }
         Ok(())
     }
     fn pump(&mut self) -> Result<(), ClipboardError> {
-        unsafe {
-            while (self.api.wl_display_prepare_read)(self.display) != 0 {
-                if (self.api.wl_display_dispatch_pending)(self.display) < 0 {
-                    return Err(failure("native-wayland", "dispatch failed".to_string()));
-                }
-                self.events()?;
-            }
-            // No fallible operations occur between prepare_read and its paired
-            // read_events/cancel_read, so the display cannot remain read-locked.
-            let flushed = (self.api.wl_display_flush)(self.display);
-            let mut poll = libc::pollfd {
-                fd: (self.api.wl_display_get_fd)(self.display),
-                events: libc::POLLIN | if flushed < 0 { libc::POLLOUT } else { 0 },
-                revents: 0,
-            };
-            let ready = libc::poll(&raw mut poll, 1, 10);
-            if ready > 0 && poll.revents & libc::POLLIN != 0 {
-                if (self.api.wl_display_read_events)(self.display) < 0 {
-                    return Err(failure("native-wayland", "display read failed".to_string()));
-                }
-            } else {
-                (self.api.wl_display_cancel_read)(self.display);
-            }
-            if ready > 0 && poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-                return Err(failure(
-                    "native-wayland",
-                    "display disconnected".to_string(),
-                ));
-            }
-            if (self.api.wl_display_dispatch_pending)(self.display) < 0 {
-                return Err(failure("native-wayland", "dispatch failed".to_string()));
-            }
+        self.queue
+            .dispatch_pending(&mut self.state)
+            .map_err(error)?;
+        self.events()?;
+        let Some(guard) = self.queue.prepare_read() else {
+            return Ok(());
+        };
+        let writable = match self.connection.flush() {
+            Ok(()) => false,
+            Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(e) => return Err(error(e)), // guard cancellation is automatic
+        };
+        let mut poll = libc::pollfd {
+            fd: self.connection.as_fd().as_raw_fd(),
+            events: libc::POLLIN | if writable { libc::POLLOUT } else { 0 },
+            revents: 0,
+        };
+        // SAFETY: poll references one initialized descriptor and waits at most 10ms.
+        let ready = unsafe { libc::poll(&raw mut poll, 1, 10) };
+        if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(error(std::io::Error::last_os_error()));
         }
+        if poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(error("display disconnected"));
+        }
+        if ready > 0 && poll.revents & libc::POLLIN != 0 {
+            match guard.read() {
+                Ok(_) => {}
+                Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(error(e)),
+            }
+        } else {
+            drop(guard);
+        }
+        self.queue
+            .dispatch_pending(&mut self.state)
+            .map_err(error)?;
         self.events()?;
         self.sends.retain_mut(|send| {
-            if Instant::now() >= send.expires {
+            if transfer_expired(Instant::now(), send.expires, send.deadline) {
                 return false;
             }
-            // Bound one iteration per slow consumer. SIGPIPE is blocked on this
-            // worker thread only, so disconnected readers cannot kill bmux.
             let remaining = &send.bytes[send.offset..];
+            // SAFETY: fd is owned and nonblocking; SIGPIPE is blocked on worker.
             let written = unsafe {
                 libc::write(
                     send.fd.as_raw_fd(),
@@ -692,154 +553,121 @@ impl W {
                     remaining.len().min(64 * 1024),
                 )
             };
-            match written.cmp(&0) {
-                std::cmp::Ordering::Greater => {
-                    send.offset += written.cast_unsigned();
-                    send.expires = Instant::now() + TIMEOUT;
-                    send.offset < send.bytes.len()
-                }
-                std::cmp::Ordering::Equal => false,
-                std::cmp::Ordering::Less => {
-                    let error = std::io::Error::last_os_error();
-                    matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                    )
-                }
+            if written > 0 {
+                send.offset += usize::try_from(written).expect("positive write count");
+                send.expires = Instant::now() + TIMEOUT;
+            } else if written < 0
+                && !matches!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                )
+            {
+                return false;
             }
+            send.offset < send.bytes.len()
         });
         Ok(())
     }
-    fn sync(&mut self) -> Result<(), ClipboardError> {
-        let callback = self.marshal(
-            self.display,
-            0,
-            self.api.callback,
-            &mut [Argument { o: ptr::null_mut() }],
-            false,
-        )?;
-        self.listen(callback, Role::Sync)?;
-        let deadline = Instant::now() + TIMEOUT;
+    fn sync(&mut self, total: Instant) -> Result<(), ClipboardError> {
+        let callback = self.connection.display().sync(&self.queue.handle(), ());
+        let deadline = (Instant::now() + TIMEOUT).min(total);
         loop {
+            if Instant::now() >= deadline {
+                return Err(error("synchronization timed out"));
+            }
             self.pump()?;
-            if let Some(index) = self
-                .synced
-                .iter()
-                .position(|proxy| *proxy == callback as usize)
-            {
+            if let Some(index) = self.synced.iter().position(|id| *id == callback.id()) {
                 self.synced.remove(index);
                 return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(failure(
-                    "native-wayland",
-                    "synchronization timed out".to_string(),
-                ));
             }
         }
     }
     fn set(&mut self, bytes: Vec<u8>, image: bool) -> Result<(), ClipboardError> {
-        self.sync()?;
+        let total = Instant::now() + TOTAL_TIMEOUT;
+        if bytes.len() > LIMIT {
+            return Err(error("payload exceeds limit"));
+        }
+        self.sync(total)?;
         if self.seats.is_empty() {
-            return Err(failure("native-wayland", "no active seats".to_string()));
+            return Err(error("no active seats"));
         }
         let bytes = Arc::new(bytes);
-        let devices = self
-            .seats
-            .iter()
-            .map(|seat| seat.device)
-            .collect::<Vec<_>>();
-        for device in devices {
-            let source = self.marshal(
-                self.manager,
-                0,
-                self.descriptors.as_ref().expect("descriptors").interface(2),
-                &mut [Argument { o: ptr::null_mut() }],
-                false,
-            )?;
-            self.listen(source, Role::Source)?;
+        let manager = &self
+            .manager
+            .as_ref()
+            .ok_or_else(|| error("manager unavailable"))?
+            .1;
+        if self.sources.len() + self.seats.len() > MAX_SEATS * 2 {
+            return Err(error("source limit exceeded"));
+        }
+        for seat in &self.seats {
+            let source = manager.source(&self.queue.handle());
+            for mime in if image {
+                &["image/png"][..]
+            } else {
+                &MIMES[..]
+            } {
+                source.offer((*mime).into());
+            }
+            seat.device.set(&source);
             self.sources.insert(
-                source as usize,
-                Source {
+                source.id(),
+                OwnedSource {
+                    proxy: source,
                     bytes: Arc::clone(&bytes),
                     image,
                 },
             );
-            for mime in if image {
-                vec!["image/png"]
-            } else {
-                MIMES.to_vec()
-            } {
-                let mime = CString::new(mime).expect("static MIME");
-                self.marshal(
-                    source,
-                    0,
-                    ptr::null(),
-                    &mut [Argument { s: mime.as_ptr() }],
-                    false,
-                )?;
-            }
-            self.marshal(device, 0, ptr::null(), &mut [Argument { o: source }], false)?;
         }
-        self.sync()
+        self.sync(total)
     }
     fn get(&mut self, image: bool) -> Result<Option<Vec<u8>>, ClipboardError> {
-        self.sync()?;
+        let total = Instant::now() + TOTAL_TIMEOUT;
+        self.sync(total)?;
         if self.seats.is_empty() {
-            return Err(failure("native-wayland", "no active seats".to_string()));
+            return Err(error("no active seats"));
         }
         let choice = self.seats.iter().find_map(|seat| {
-            let offer = self.offers.get(&seat.selection)?;
-            choose(&offer.mimes, image).map(|mime| (seat.selection, mime.to_owned()))
+            let offer = self.offers.get(seat.selection.as_ref()?)?;
+            choose(&offer.mimes, image).map(|mime| (offer.proxy.clone(), mime.to_string()))
         });
         let Some((offer, mime)) = choice else {
             return Ok(None);
         };
         let (read, write) = pipe()?;
-        let mime = CString::new(mime).map_err(|e| failure("native-wayland", e.to_string()))?;
-        self.marshal(
-            offer as Proxy,
-            0,
-            ptr::null(),
-            &mut [
-                Argument { s: mime.as_ptr() },
-                Argument {
-                    h: write.as_raw_fd(),
-                },
-            ],
-            false,
-        )?;
+        offer.receive(mime, &write);
         drop(write);
         let mut bytes = Vec::new();
         let mut buffer = vec![0; 64 * 1024].into_boxed_slice();
-        let mut deadline = Instant::now() + TIMEOUT;
+        let mut idle = Instant::now() + TIMEOUT;
         loop {
+            if transfer_expired(Instant::now(), idle, total) {
+                return Err(error("data transfer deadline exceeded"));
+            }
             self.pump()?;
-            let length =
+            // SAFETY: buffer is writable and read is an owned nonblocking fd.
+            let count =
                 unsafe { libc::read(read.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
-            if length == 0 {
+            if count == 0 {
                 return Ok(Some(bytes));
             }
-            if length > 0 {
-                append(&mut bytes, &buffer[..length.cast_unsigned()])?;
-                deadline = Instant::now() + TIMEOUT;
-            } else {
-                let error = std::io::Error::last_os_error();
-                if !matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                ) {
-                    return Err(failure("native-wayland", error.to_string()));
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(failure(
-                    "native-wayland",
-                    "data transfer timed out".to_string(),
-                ));
+            if count > 0 {
+                append(
+                    &mut bytes,
+                    &buffer[..usize::try_from(count).expect("positive read count")],
+                )?;
+                idle = Instant::now() + TIMEOUT;
+            } else if !matches!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) {
+                return Err(error(std::io::Error::last_os_error()));
             }
         }
     }
+}
+fn transfer_expired(now: Instant, idle: Instant, total: Instant) -> bool {
+    now >= idle || now >= total
 }
 fn supported(mime: &str, image: bool) -> bool {
     if image {
@@ -863,21 +691,20 @@ fn choose(mimes: &[String], image: bool) -> Option<&str> {
         })
     }
 }
+fn transfer_fits(current: usize, additional: usize) -> bool {
+    current
+        .checked_add(additional)
+        .is_some_and(|length| length <= LIMIT)
+}
 fn append(bytes: &mut Vec<u8>, chunk: &[u8]) -> Result<(), ClipboardError> {
-    if bytes
-        .len()
-        .checked_add(chunk.len())
-        .is_none_or(|n| n > LIMIT)
-    {
-        return Err(failure(
-            "native-wayland",
-            "transfer exceeds limit".to_string(),
-        ));
+    if !transfer_fits(bytes.len(), chunk.len()) {
+        return Err(error("transfer exceeds limit"));
     }
     bytes.extend_from_slice(chunk);
     Ok(())
 }
 fn nonblocking(fd: &OwnedFd) -> Result<(), ClipboardError> {
+    // SAFETY: fcntl only changes flags on a live owned descriptor.
     unsafe {
         let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
         let descriptor = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
@@ -886,31 +713,23 @@ fn nonblocking(fd: &OwnedFd) -> Result<(), ClipboardError> {
             || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
             || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, descriptor | libc::FD_CLOEXEC) < 0
         {
-            return Err(failure(
-                "native-wayland",
-                std::io::Error::last_os_error().to_string(),
-            ));
+            return Err(error(std::io::Error::last_os_error()));
         }
     }
     Ok(())
 }
 fn pipe() -> Result<(OwnedFd, OwnedFd), ClipboardError> {
     let mut fds = [-1; 2];
+    // SAFETY: pipe writes two descriptors on success, both immediately owned.
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-        return Err(failure(
-            "native-wayland",
-            std::io::Error::last_os_error().to_string(),
-        ));
+        return Err(error(std::io::Error::last_os_error()));
     }
     let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     nonblocking(&read)?;
-    // O_NONBLOCK is shared by SCM_RIGHTS duplicates. External producers need
-    // a blocking write end; only our receive end may be nonblocking.
+    // External producers require a blocking write end: O_NONBLOCK is shared
+    // across SCM_RIGHTS duplicates. Set only close-on-exec on their endpoint.
     if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-        return Err(failure(
-            "native-wayland",
-            std::io::Error::last_os_error().to_string(),
-        ));
+        return Err(error(std::io::Error::last_os_error()));
     }
     Ok((read, write))
 }
@@ -921,33 +740,38 @@ enum Command {
 }
 static WORKER: OnceLock<Mutex<Option<mpsc::SyncSender<Command>>>> = OnceLock::new();
 fn request(bytes: Option<Vec<u8>>, image: bool) -> Result<Option<Vec<u8>>, ClipboardError> {
+    if bytes.as_ref().is_some_and(|bytes| bytes.len() > LIMIT) {
+        return Err(error("payload exceeds limit"));
+    }
     let mut worker = WORKER
         .get_or_init(|| Mutex::new(None))
-        .lock()
-        .map_err(|e| failure("native-wayland", e.to_string()))?;
+        .try_lock()
+        .map_err(error)?;
     if worker.is_none() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("clipboard-wayland".into())
             .spawn(move || {
+                // SAFETY: Block SIGPIPE on this ownership thread only; closed peer
+                // pipes must not terminate the process or change global handlers.
                 unsafe {
                     let mut signals = std::mem::zeroed();
                     libc::sigemptyset(&raw mut signals);
                     libc::sigaddset(&raw mut signals, libc::SIGPIPE);
-                    let error =
+                    let code =
                         libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, ptr::null_mut());
-                    if error != 0 {
-                        let _ = ready_tx.send(Err(failure(
-                            "native-wayland",
-                            format!("blocking SIGPIPE failed: {error}"),
-                        )));
+                    if code != 0 {
+                        let _ =
+                            ready_tx.send(Err(error(format!("blocking SIGPIPE failed: {code}"))));
                         return;
                     }
                 }
                 let mut w = match W::new() {
                     Ok(w) => {
-                        let _ = ready_tx.send(Ok(()));
+                        if ready_tx.send(Ok(())).is_err() {
+                            return;
+                        }
                         w
                     }
                     Err(e) => {
@@ -971,10 +795,10 @@ fn request(bytes: Option<Vec<u8>>, image: bool) -> Result<Option<Vec<u8>>, Clipb
                     }
                 }
             })
-            .map_err(|e| failure("native-wayland", e.to_string()))?;
+            .map_err(error)?;
         ready_rx
-            .recv_timeout(Duration::from_secs(12))
-            .map_err(|e| failure("native-wayland", e.to_string()))??;
+            .recv_timeout(Duration::from_secs(18))
+            .map_err(error)??;
         *worker = Some(sender);
     }
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -982,25 +806,24 @@ fn request(bytes: Option<Vec<u8>>, image: bool) -> Result<Option<Vec<u8>>, Clipb
         Some(bytes) => Command::Set(bytes, image, sender),
         None => Command::Get(image, sender),
     };
-    if worker
+    match worker
         .as_ref()
         .expect("initialized worker")
         .try_send(command)
-        .is_err()
     {
-        *worker = None;
-        drop(worker);
-        return Err(failure("native-wayland", "worker stopped".to_string()));
-    }
-    match receiver.recv_timeout(Duration::from_secs(12)) {
-        Ok(result) => {
-            drop(worker);
-            result
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => return Err(error("ownership worker busy")),
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            *worker = None;
+            return Err(error("ownership worker disconnected"));
         }
+    }
+    match receiver.recv_timeout(TOTAL_TIMEOUT + Duration::from_secs(1)) {
+        Ok(result) => result,
         Err(e) => {
             *worker = None;
             drop(worker);
-            Err(failure("native-wayland", e.to_string()))
+            Err(error(e))
         }
     }
 }
@@ -1010,40 +833,27 @@ pub fn write(bytes: Vec<u8>, image: bool) -> Result<(), ClipboardError> {
 pub fn read(image: bool) -> Result<Option<Vec<u8>>, ClipboardError> {
     request(None, image)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn abi_layouts() {
-        assert_eq!(
-            std::mem::size_of::<Argument>(),
-            std::mem::size_of::<*mut c_void>()
-        );
-        assert_eq!(
-            std::mem::size_of::<Message>(),
-            3 * std::mem::size_of::<*mut c_void>()
-        );
-        assert_eq!(
-            std::mem::offset_of!(Interface, version),
-            std::mem::size_of::<*mut c_void>()
-        );
+    fn aliases_are_explicit_not_arbitrary_text_formats() {
+        for alias in ["UTF8_STRING", "TEXT", "STRING"] {
+            assert_eq!(choose(&[alias.to_string()], false), Some(alias));
+            assert!(supported(alias, false));
+        }
+        assert_eq!(choose(&["text/html".to_string()], false), None);
     }
     #[test]
-    fn descriptors_match_negotiated_versions() {
-        for ext in [false, true] {
-            let d = Descriptors::new(ext, ptr::null());
-            unsafe {
-                assert_eq!((*d.interface(0)).method_count, 3);
-                assert_eq!((*d.interface(1)).event_count, if ext { 4 } else { 3 });
-                assert_eq!(
-                    CStr::from_ptr((*(*d.interface(2)).events).signature).to_bytes(),
-                    b"sh"
-                );
-                assert_eq!((*d.interface(3)).version, 1);
-                let first = &*(*d.interface(1)).events;
-                assert_eq!(*first.types, d.interface(3));
-            }
-        }
+    fn progress_cannot_extend_total_deadline() {
+        let now = Instant::now();
+        assert!(transfer_expired(
+            now + TOTAL_TIMEOUT,
+            now + TOTAL_TIMEOUT + TIMEOUT,
+            now + TOTAL_TIMEOUT
+        ));
+        assert!(!transfer_expired(now, now + TIMEOUT, now + TOTAL_TIMEOUT));
     }
     #[test]
     fn mime_preference_and_missing_format() {
@@ -1060,6 +870,8 @@ mod tests {
             unsafe { libc::read(read.as_raw_fd(), (&raw mut byte).cast(), 1) },
             -1
         );
+        let flags = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
         drop(write);
         assert_eq!(
             unsafe { libc::read(read.as_raw_fd(), (&raw mut byte).cast(), 1) },
@@ -1067,37 +879,38 @@ mod tests {
         );
     }
     #[test]
-    fn callback_selection_state() {
-        let mut inbox = Box::new(Inbox {
-            roles: HashMap::new(),
-            events: Vec::new(),
-            add: dummy_add,
-            failed: false,
-        });
-        inbox.roles.insert(12, Role::Device);
-        let mut args = [Argument {
-            o: 24usize as Proxy,
-        }];
-        unsafe {
-            assert_eq!(
-                dispatch(
-                    (&raw const *inbox).cast(),
-                    12usize as Proxy,
-                    1,
-                    ptr::null(),
-                    args.as_mut_ptr()
-                ),
-                0
-            );
+    fn event_queue_is_bounded() {
+        let mut state = State::default();
+        for id in 0..MAX_EVENTS {
+            state.push(Event::Removed(u32::try_from(id).unwrap()));
         }
-        assert!(matches!(inbox.events.pop(), Some(Event::Selection(12, 24))));
+        assert!(!state.failed);
+        state.push(Event::Removed(0));
+        assert!(state.failed);
+        assert_eq!(state.events.len(), MAX_EVENTS);
     }
-    unsafe extern "C" fn dummy_add(
-        _: Proxy,
-        _: Dispatcher,
-        _: *const c_void,
-        _: *mut c_void,
-    ) -> c_int {
-        0
+    #[test]
+    fn callback_selection_state() {
+        let mut state = State::default();
+        let device = ObjectId::null();
+        state.push(Event::Selection(device.clone(), None));
+        assert!(matches!(state.events.pop(), Some(Event::Selection(id, None)) if id == device));
+    }
+    #[test]
+    fn transfer_bounds_reject_overflow_without_allocating() {
+        assert!(transfer_fits(LIMIT - 1, 1));
+        assert!(!transfer_fits(LIMIT, 1));
+        assert!(!transfer_fits(usize::MAX, 1));
+        assert!(!transfer_fits(0, LIMIT + 1));
+        let mut bytes = vec![1, 2];
+        append(&mut bytes, &[3]).unwrap();
+        assert_eq!(bytes, [1, 2, 3]);
+    }
+    #[test]
+    fn generated_protocol_versions_and_signatures() {
+        assert_eq!(eo::ExtDataControlOfferV1::interface().version, 1);
+        assert_eq!(wo::ZwlrDataControlOfferV1::interface().version, 1);
+        assert_eq!(ed::ExtDataControlDeviceV1::interface().events.len(), 4);
+        assert_eq!(wd::ZwlrDataControlDeviceV1::interface().events.len(), 4);
     }
 }

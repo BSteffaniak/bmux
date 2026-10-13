@@ -217,10 +217,13 @@ impl ServerEnv {
 
     fn wait_until_ready(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
+        let mut last_probe = None;
         while Instant::now() < deadline {
-            if self.run(&["server", "status"]).status.success() {
+            let probe = self.run(&["server", "status"]);
+            if probe.status.success() {
                 return;
             }
+            last_probe = Some(probe);
             let child = self.server_child.as_mut().expect("server child retained");
             if let Some(status) = child.try_wait().expect("inspect isolated server") {
                 panic!(
@@ -232,7 +235,7 @@ impl ServerEnv {
             thread::sleep(POLL_INTERVAL);
         }
         panic!(
-            "isolated server did not become ready; root={}; output={}",
+            "isolated server did not become ready; root={}; last_probe={last_probe:?}; output={}",
             self.root().display(),
             self.server_output()
         );

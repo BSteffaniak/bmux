@@ -28,16 +28,20 @@ operations. Arboard remains the default/reference dependency until platform
 interoperability and availability gates pass; enabling this feature does not
 currently remove it from the dependency graph.
 
-The Unix implementation dynamically loads `libxcb.so.1` and
-`libwayland-client.so.0`. This is an additional availability requirement versus
-the pure-Rust reference transports, so it is not yet a drop-in replacement.
-Windows and macOS use native system APIs/frameworks. Clipboard payloads are
-bounded to 256 MiB with explicit errors rather than silent truncation.
+The Unix implementation uses pure-Rust `x11rb` and `wayland-client` transports,
+without requiring `libxcb.so.1` or `libwayland-client.so.0`. Windows and macOS use
+native system APIs/frameworks. Clipboard payloads are bounded to 256 MiB with
+explicit errors rather than silent truncation.
 
 Tests must not overwrite a live user clipboard. The ignored `native_interop`
-test requires both a disposable display and `BMUX_CLIPBOARD_ISOLATED_TEST=1`.
-Native Windows/macOS interoperability, Wayland compositor interoperability,
-and exit-time clipboard persistence require separate acceptance evidence.
+tests require both a disposable display and `BMUX_CLIPBOARD_ISOLATED_TEST=1`.
+Isolated Xvfb tests cover text/image roundtrips, large-text interoperability with
+xclip, and acknowledged clipboard-manager shutdown handoff. Isolated headless
+Sway tests cover text/image roundtrips and large-text interoperability with
+wl-copy/wl-paste. The X11 normal-exit hook requests a bounded manager handoff;
+persistence still requires a clipboard manager and is not promised after abort
+or SIGKILL. Native Windows/macOS interoperability, independent image transfers,
+and process-exit persistence need further acceptance evidence.
 Existing source/diagnostic names containing `arboard` remain compatibility
 labels while the backend is experimental.
 
