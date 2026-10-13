@@ -393,18 +393,23 @@ class Harness:
         image = items[0]
         require("Pixels" in image["payload"] or "Png" in image["payload"],
                 "snapshot image has no decoded resource")
-        pixels = self.rendered(frame, True)
-        area = frame["buffer"]["area"]
-        dest, clip = image["destination"], image["clip"]
-        x0, y0 = max(dest["x"], clip["x"], area["x"]), max(dest["y"], clip["y"], area["y"])
-        x1 = min(dest["x"] + dest["width"], clip["x"] + clip["width"], area["x"] + area["width"])
-        y1 = min(dest["y"] + dest["height"], clip["y"] + clip["height"], area["y"] + area["height"])
-        cw, ch = pixels["width"] / area["width"], pixels["height"] / area["height"]
-        for actual, expected in ((pixels["minX"], (x0-area["x"])*cw),
-                                 (pixels["minY"], (y0-area["y"])*ch),
-                                 (pixels["maxX"]+1, (x1-area["x"])*cw),
-                                 (pixels["maxY"]+1, (y1-area["y"])*ch)):
-            require(abs(actual-expected) <= 2, "image pixels disagree with retained destination/clip")
+        def matching_pixels():
+            pixels = self.rendered(frame, True)
+            area = frame["buffer"]["area"]
+            dest, clip = image["destination"], image["clip"]
+            x0, y0 = max(dest["x"], clip["x"], area["x"]), max(dest["y"], clip["y"], area["y"])
+            x1 = min(dest["x"] + dest["width"], clip["x"] + clip["width"], area["x"] + area["width"])
+            y1 = min(dest["y"] + dest["height"], clip["y"] + clip["height"], area["y"] + area["height"])
+            cw, ch = pixels["width"] / area["width"], pixels["height"] / area["height"]
+            pairs = ((pixels["minX"], (x0-area["x"])*cw),
+                     (pixels["minY"], (y0-area["y"])*ch),
+                     (pixels["maxX"]+1, (x1-area["x"])*cw),
+                     (pixels["maxY"]+1, (y1-area["y"])*ch))
+            return pixels if all(abs(actual-expected) <= 2 for actual, expected in pairs) else None
+        # A latest-only Canvas can commit between the status and pixel reads.
+        # Await the exact placement bounds, rather than treating that race as a
+        # fidelity failure. Persistent disagreement still fails the deadline.
+        pixels = wait_for("image pixels match retained destination/clip", matching_pixels)
         return image, pixels
 
     def bootstrap(self, process):
@@ -580,8 +585,9 @@ class Harness:
         self.geometry(frame)
         self.image_pixels(frame)
         self.passed("container/font measurement reaches retained cells and image pixels")
+        before_clip = placements(frame)[0]["destination"]
         self.fixture_command("clip")
-        frame = self.frame_when("Kitty edge clipping", lambda f: placements(f) and placements(f)[0]["destination"] != moved["destination"])
+        frame = self.frame_when("Kitty edge clipping", lambda f: placements(f) and placements(f)[0]["destination"] != before_clip)
         clipped, pixels = self.image_pixels(frame)
         require(pixels["red"] < clipped["destination"]["width"] * clipped["destination"]["height"] *
                 (pixels["width"]/frame["buffer"]["area"]["width"]) *
@@ -652,8 +658,11 @@ class Harness:
 
         self.old_generation(session, generation)
         self.standalone()
+        self.interrupt(session, attach)
         self.mirror(session)
-        self.interrupt(session)
+        attach = self.spawn("attach", session, "--web-assets", str(self.args.assets), "--web-only")
+        self.bootstrap(attach)
+        self.frame_when("source lifecycle test frame", lambda f: bool(f["generation"]))
         self.fixture_command("exit")
         # Stop exactly the foreground daemon in this fresh owned runtime: loss
         # of the native source must invalidate the feed, not retain stale output.
@@ -667,24 +676,63 @@ class Harness:
         require(b"\x1b" not in attach.bytes(), "headless shutdown emitted ANSI")
         self.passed("source termination closes feed and restores output-only lifecycle")
 
-    def interrupt(self, session):
+    def interrupt(self, session, owner):
         saved = self.origin, self.token
-        owner = self.spawn("attach", session, "--web-assets", str(self.args.assets), "--web-only")
         try:
+            self.client.call("Page.navigate", {"url": "about:blank"})
             self.bootstrap(owner)
             self.frame_when("interrupt test frame", lambda f: bool(f["generation"]))
             status, body = http(self.origin, "/view", self.token, "POST", b"")
             require(status == 200, "large viewport lease rejected")
             info = json.loads(body)
-            request = {"generation": info["generation"], "request_id": "1", "cols": 400, "rows": 200}
+            request = {"generation": info["generation"], "request_id": "1", "cols": 600, "rows": 300}
             require(http(self.origin, "/viewport", self.token, "POST", request, info["controller"])[0] == 204,
                     "large viewport rejected")
-            self.frame_when("large viewport geometry", lambda f: f["buffer"]["area"]["width"] == 400
-                            and f["buffer"]["area"]["height"] == 200)
-            self.fixture_command("dense")
-            self.frame_when("dense large viewport", lambda f: text(f).count("X") > 70000)
+            # Use the real shared WASM decoder: this frame is intentionally too
+            # large for the diagnostic JSON route. No Python binary parser.
+            self.client.call("Page.navigate", {"url": self.origin + "/bmux_web_renderer.js"})
+            wait_for("binary test document", lambda: self.client.evaluate(
+                "location.pathname === '/bmux_web_renderer.js' && document.readyState === 'complete'"))
+            self.client.evaluate("""(async()=>{const m=await import('/bmux_web_renderer.js');await m.default();
+              const c=document.createElement('canvas');c.id='large';document.body.append(c);
+              globalThis.largeRenderer=new m.CanvasRenderer('large',2,4);
+              globalThis.largeAuth=""" + json.dumps(self.token) + ";return true;})()")
+            def large_frame():
+                return self.client.evaluate("""(async()=>{try {
+                  const response=await fetch('/presentation?version=1',{headers:{Authorization:`Bearer ${largeAuth}`}});
+                  if(response.status!==200)return null;
+                  const bytes=new Uint8Array(await response.arrayBuffer());
+                  const inspected=JSON.parse(largeRenderer.inspect_binary(bytes));
+                  if(largeRenderer.revision()!==inspected.revision)await largeRenderer.present_binary(bytes);
+                  const c=document.getElementById('large');
+                  const data=c.getContext('2d').getImageData(0,0,c.width,c.height).data;
+                  let ink=0;for(let i=0;i<data.length;i+=4)if(data[i]>80&&data[i+1]>80&&data[i+2]>80)ink++;
+                  return {width:c.width,height:c.height,bytes:bytes.length,revision:largeRenderer.revision(),ink};
+                } catch(error) { return {failure: String(error)}; } })()""")
+            def sized_frame():
+                value = large_frame()
+                require(not value or "failure" not in value, "large WASM presentation: " + str(value.get("failure") if value else ""))
+                return value and value["width"] == 1200 and value["height"] == 1200
+            wait_for("large binary viewport", sized_frame)
+            status, body = http(self.origin, "/presentation?version=1", self.token)
+            require(status == 200, "large binary source unavailable")
+            converter = self.args.binary.parent / "examples" / "wire_frame"
+            result = subprocess.run([str(converter), "--dense"], input=body, capture_output=True, timeout=15)
+            require(result.returncode == 0, "dense conformance encoding failed")
+            dense_bytes = result.stdout
+            # The live viewport and a fully dense conformance frame are separate
+            # assertions: another attachment may constrain the shared PTY size.
+            dense = self.client.evaluate("""(async()=>{
+              const bytes=Uint8Array.from(""" + json.dumps(list(dense_bytes)) + """);
+              await largeRenderer.present_binary(bytes);
+              const c=document.getElementById('large');
+              return {width:c.width,height:c.height};
+            })()""")
+            require(dense["width"] == 1200 and dense["height"] == 1200, "dense conformance render failed")
+            require(len(dense_bytes) < 1024 * 1024, "dense binary snapshot is unexpectedly large")
             require(owner.child.poll() is None, "large viewport exceeded presentation budget")
-            self.passed("400x200 dense viewport remains within bounded presentation capture")
+            self.passed("600x300 live viewport and fully dense WASM conformance render below 1 MiB", bytes=len(dense_bytes))
+            self.client.evaluate("largeRenderer.reset();largeRenderer.free();true")
             origin, token = self.origin, self.token
             owner.child.send_signal(signal.SIGINT)
             wait_for("Ctrl-C closes independent attachment", lambda: owner.child.poll() is not None, 6)
@@ -742,6 +790,14 @@ class Harness:
                 "standalone snapshot must come from the existing snapshot example")
         source["revision"] = 10
         state = {"frame": source, "transport": 1}
+        converter = self.args.binary.parent / "examples" / "wire_frame"
+        require(converter.is_file(), "build bmux_web_renderer --example wire_frame for binary fixture")
+        def compact(frame):
+            result = subprocess.run([str(converter)], input=json.dumps(frame).encode(),
+                                    capture_output=True, timeout=15)
+            require(result.returncode == 0, "standalone binary encoding failed")
+            return result.stdout
+        state["binary"] = compact(source)
         capability = os.urandom(32).hex()
         assets = self.args.assets
         helper_content = self.args.canvas_conformance.read_text()
@@ -759,8 +815,14 @@ class Harness:
                     body, code, mime = b"", 403, "text/plain"
                 elif self.path == "/view" and self.command == "POST":
                     body = json.dumps({"generation": state["frame"]["generation"],
-                        "protocol_version": 1, "viewport_allowed": False, "controller": None, "lease_ms": 0}).encode()
+                        "protocol_version": 1, "presentation_versions": [1], "viewport_allowed": False, "controller": None, "lease_ms": 0}).encode()
                     code, mime = 200, "application/json"
+                elif self.path.startswith("/presentation") and self.command == "GET":
+                    after = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("after")
+                    if after == [str(state["transport"])]:
+                        body, code, mime = b"", 204, "application/vnd.bmux.presentation-v1"
+                    else:
+                        body, code, mime = state["binary"], 200, "application/vnd.bmux.presentation-v1"
                 elif self.path.startswith("/snapshot") and self.command == "GET":
                     after = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("after")
                     if after == [str(state["transport"])]:
@@ -772,7 +834,7 @@ class Harness:
                 self.send_response(code)
                 self.send_header("Content-Type", mime)
                 self.send_header("Content-Length", str(len(body)))
-                if self.path.startswith("/snapshot"):
+                if self.path.startswith(("/snapshot", "/presentation")):
                     self.send_header("X-Snapshot-Revision", str(state["transport"]))
                 self.end_headers()
                 try:
@@ -798,7 +860,7 @@ class Harness:
         replacement = copy.deepcopy(source)
         replacement.update(generation="replacement-example", revision=1)
         replacement["image_scene"]["active"] = {}
-        state.update(frame=replacement, transport=2)
+        state.update(frame=replacement, binary=compact(replacement), transport=2)
         # Lower revision must actually commit; a >= check would accidentally
         # accept the old generation's still-visible revision 10.
         wait_for("bootstrap replacement-generation commit", lambda:

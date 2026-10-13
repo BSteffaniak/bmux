@@ -13,6 +13,149 @@ use crate::{Asset, ContentType, HostConfig, HostHandle, SnapshotPublisher, snaps
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
+#[tokio::test]
+async fn negotiated_binary_resources_and_repair() {
+    use crate::{BinaryPresentation, Resource};
+    use sha2::Digest;
+    use std::collections::BTreeMap;
+    let (_directory, publisher, host) = host().await;
+    let address = host.address();
+    let bearer = token(&host);
+    let publish = |revision, delta, resources| {
+        publisher.publish_representations(
+            revision,
+            Some(Arc::from(b"{}".as_slice())),
+            BinaryPresentation {
+                snapshot: Arc::from(b"full".as_slice()),
+                delta,
+            },
+            resources,
+        )
+    };
+    let resource = Resource {
+        bytes: Arc::from(b"resource".as_slice()),
+        mime_type: "application/octet-stream".into(),
+    };
+    let id: String = sha2::Sha256::digest(&resource.bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let resource_path = format!("/resource/{id}");
+    publish(1, None, BTreeMap::from([(id.clone(), resource.clone())])).unwrap();
+    publish(
+        2,
+        Some((1, Arc::from(b"delta".as_slice()))),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    for (path, status, body) in [
+        ("/presentation?version=1&after=1&base=1", 200, "delta"),
+        ("/presentation?version=1&after=1&base=0", 200, "full"),
+        ("/presentation?version=1&after=2&base=0", 200, "full"),
+        ("/presentation?version=2", 400, ""),
+        ("/presentation", 400, ""),
+        ("/presentation?version=1&version=1", 400, ""),
+        (resource_path.as_str(), 200, "resource"),
+        ("/resource/%2e", 400, ""),
+        ("/snapshot", 200, "{}"),
+    ] {
+        let response = exchange(address, &request(address, "GET", path, &bearer, "")).await;
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{path}: {response}"
+        );
+        assert!(response.ends_with(body));
+        if path.starts_with("/presentation") && status == 200 {
+            assert!(response.contains("Content-Type: application/vnd.bmux.presentation-v1\r\n"));
+            assert!(response.contains("X-Snapshot-Revision: 2\r\n"));
+        }
+    }
+    for path in ["/presentation?version=1", resource_path.as_str()] {
+        let response = exchange(address, &request(address, "GET", path, "wrong", "")).await;
+        assert!(response.starts_with("HTTP/1.1 401"));
+        let response = exchange(
+            address,
+            &request(
+                address,
+                "GET",
+                path,
+                &bearer,
+                "Origin: http://evil.example\r\n",
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"));
+    }
+    host.set_generation("generation").unwrap();
+    let view = exchange(
+        address,
+        &request(
+            address,
+            "POST",
+            "/view",
+            &bearer,
+            &format!("Origin: http://{address}\r\n"),
+        ),
+    )
+    .await;
+    assert!(view.contains("\"presentation_versions\":[1]"));
+    let changed = Resource {
+        bytes: Arc::from(b"changed".as_slice()),
+        ..resource.clone()
+    };
+    assert!(publish(3, None, BTreeMap::from([(id.clone(), changed)])).is_err());
+    publish(3, None, BTreeMap::new()).unwrap();
+    let response = exchange(
+        address,
+        &request(address, "GET", &resource_path, &bearer, ""),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 404"));
+    publisher
+        .publish_representations(
+            4,
+            None,
+            BinaryPresentation {
+                snapshot: Arc::from(b"full".as_slice()),
+                delta: None,
+            },
+            BTreeMap::from([(id, resource)]),
+        )
+        .unwrap();
+    let response = exchange(address, &request(address, "GET", "/snapshot", &bearer, "")).await;
+    assert!(response.starts_with("HTTP/1.1 406"));
+    let response = exchange(
+        address,
+        &request(address, "GET", "/snapshot?after=4", &bearer, ""),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 406"));
+    let response = exchange(
+        address,
+        &request(address, "GET", "/presentation?version=1", &bearer, ""),
+    )
+    .await;
+    assert!(response.ends_with("full"));
+    let mut poll = connect(
+        address,
+        &request(
+            address,
+            "GET",
+            "/presentation?version=1&after=4&base=4",
+            &bearer,
+            "",
+        ),
+    )
+    .await;
+    assert_pending(&mut poll).await;
+    drop(publisher);
+    let response = read_response(&mut poll).await;
+    if !response.is_empty() {
+        assert!(response.starts_with("HTTP/1.1 503"));
+    }
+    host.shutdown().await;
+}
+
 fn fixture() -> (TempDir, HostConfig) {
     let directory = tempfile::tempdir().unwrap();
     for (filename, bytes) in [

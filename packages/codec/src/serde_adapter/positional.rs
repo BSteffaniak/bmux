@@ -21,3 +21,16 @@ pub fn to_positional_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
 pub fn from_positional_bytes<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, Error> {
     de::from_bytes_with_mode(bytes, EncodingMode::Positional)
 }
+
+/// Decode an untrusted positional value with entry and byte admission before
+/// serde visitors can reserve containers. Fixed schema recursion remains the
+/// caller's responsibility; these limits bound declared variable-size data.
+///
+/// # Errors
+/// Rejects excessive lengths, invalid data and trailing bytes.
+pub fn from_positional_bytes_bounded<'de, T: Deserialize<'de>>(
+    bytes: &'de [u8],
+    limits: crate::DecodeLimits,
+) -> Result<T, Error> {
+    de::from_bytes_bounded(bytes, limits)
+}

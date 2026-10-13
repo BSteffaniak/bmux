@@ -14,9 +14,11 @@ version     = { workspace = true }
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+bmux_codec    = { workspace = true }
 bmux_tui      = { workspace = true, features = ["serde"] }
 serde         = { workspace = true, features = ["derive"] }
 serde_json    = { workspace = true, features = ["std"] }
+sha2          = { workspace = true }
 unicode-width = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

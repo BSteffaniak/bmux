@@ -22,6 +22,11 @@ pub(crate) struct State {
 enum Route<'a> {
     Asset(&'a str),
     Snapshot(Option<u64>),
+    Presentation {
+        after: Option<u64>,
+        base: Option<u64>,
+    },
+    Resource(&'a str),
     View {
         controller: Option<&'a str>,
         release: bool,
@@ -33,6 +38,43 @@ enum Route<'a> {
 }
 
 fn route(target: &str) -> Result<Route<'_>, u16> {
+    if let Some(id) = target.strip_prefix("/resource/") {
+        return if crate::publication::valid_id(id) {
+            Ok(Route::Resource(id))
+        } else {
+            Err(400)
+        };
+    }
+    if target == "/presentation" || target.starts_with("/presentation?") {
+        let mut version = None;
+        let mut after = None;
+        let mut base = None;
+        for part in target
+            .strip_prefix("/presentation?")
+            .ok_or(400_u16)?
+            .split('&')
+        {
+            let (key, value) = part.split_once('=').ok_or(400_u16)?;
+            let slot = match key {
+                "version" => &mut version,
+                "after" => &mut after,
+                "base" => &mut base,
+                _ => return Err(400),
+            };
+            if slot.is_some()
+                || value.is_empty()
+                || value.len() > 20
+                || !value.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(400);
+            }
+            *slot = Some(value.parse::<u64>().map_err(|_| 400_u16)?);
+        }
+        if version != Some(1) {
+            return Err(400);
+        }
+        return Ok(Route::Presentation { after, base });
+    }
     if target == "/snapshot" {
         return Ok(Route::Snapshot(None));
     }
@@ -263,6 +305,7 @@ async fn response(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
         408 => "Request Timeout",
         409 => "Conflict",
         413 => "Content Too Large",
@@ -385,9 +428,82 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
                 error(&mut stream, &state, 404).await;
             }
         }
+        Ok(Route::Resource(id)) => {
+            if feed.receiver.has_changed().is_err() {
+                error(&mut stream, &state, 503).await;
+                return;
+            }
+            let resource = feed
+                .receiver
+                .borrow()
+                .as_ref()
+                .and_then(|value| {
+                    value
+                        .resources
+                        .get(id)
+                        .or_else(|| value.previous_resources.get(id))
+                })
+                .cloned();
+            if let Some(resource) = resource {
+                let _ = timeout(
+                    state.limits.write_timeout,
+                    response(&mut stream, 200, &resource.mime_type, &resource.bytes, None),
+                )
+                .await;
+            } else {
+                error(&mut stream, &state, 404).await;
+            }
+        }
+        Ok(Route::Presentation { after, base }) => {
+            match timeout(
+                state.limits.poll_timeout,
+                latest(&mut feed, if after == base { after } else { None }),
+            )
+            .await
+            {
+                Ok(Ok(snapshot)) => {
+                    if let Some(binary) = &snapshot.binary {
+                        let bytes = binary
+                            .delta
+                            .as_ref()
+                            .filter(|(revision, _)| Some(*revision) == base)
+                            .map_or(&binary.snapshot, |(_, bytes)| bytes);
+                        let _ = timeout(
+                            state.limits.write_timeout,
+                            response(
+                                &mut stream,
+                                200,
+                                "application/vnd.bmux.presentation-v1",
+                                bytes,
+                                Some(snapshot.revision),
+                            ),
+                        )
+                        .await;
+                    } else {
+                        error(&mut stream, &state, 503).await;
+                    }
+                }
+                Ok(Err(status)) => error(&mut stream, &state, status).await,
+                Err(_) => error(&mut stream, &state, 204).await,
+            }
+        }
         Ok(Route::Snapshot(after)) => {
+            if feed.receiver.has_changed().is_ok()
+                && feed
+                    .receiver
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|snapshot| !snapshot.json_available)
+            {
+                error(&mut stream, &state, 406).await;
+                return;
+            }
             match timeout(state.limits.poll_timeout, latest(&mut feed, after)).await {
                 Ok(Ok(snapshot)) => {
+                    if !snapshot.json_available {
+                        error(&mut stream, &state, 406).await;
+                        return;
+                    }
                     let _ = timeout(
                         state.limits.write_timeout,
                         response(

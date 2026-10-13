@@ -106,6 +106,31 @@ pub struct BrowserFrame {
     damage: Damage,
 }
 impl BrowserFrame {
+    // Binary metadata uses this exact positional v1 projection. Identity, grid
+    // and image resources are carried in dedicated wire sections.
+    pub(crate) fn wire_metadata(&self) -> Self {
+        let mut metadata = self.clone();
+        metadata.revision = 0;
+        metadata.generation.clear();
+        metadata.buffer = Buffer::empty(Rect::new(0, 0, 0, 0));
+        metadata.image_scene = ImageScene::default();
+        metadata
+    }
+
+    pub(crate) fn wire_restore(
+        mut self,
+        generation: String,
+        revision: u64,
+        buffer: Buffer,
+        images: ImageScene,
+    ) -> Self {
+        self.generation = generation;
+        self.revision = revision;
+        self.buffer = buffer;
+        self.image_scene = images;
+        self
+    }
+
     pub fn from_prepared(
         revision: u64,
         prepared: &PreparedPresentation,
@@ -490,27 +515,14 @@ impl BrowserFrame {
                 return Err(DecodeError::Limit("image resources"));
             }
         }
-        let mut budget = JsonBudget {
-            remaining: limits.json_bytes,
-        };
-        serde_json::to_writer(&mut budget, self)
-            .map_err(|_| DecodeError::Limit("snapshot bytes"))?;
-        Ok(())
-    }
-}
-
-struct JsonBudget {
-    remaining: usize,
-}
-impl std::io::Write for JsonBudget {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.remaining = self
-            .remaining
-            .checked_sub(bytes.len())
-            .ok_or_else(|| std::io::Error::other("snapshot byte limit"))?;
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
+        // Native output admission uses the shared positional representation,
+        // not expanded JSON cell objects. JSON input/output still enforces its
+        // independent byte budget in decode_json/encode_json.
+        let bytes = bmux_codec::to_positional_vec(self)
+            .map_err(|_| DecodeError::Invalid("snapshot encoding"))?;
+        if bytes.len() > limits.json_bytes {
+            return Err(DecodeError::Limit("snapshot bytes"));
+        }
         Ok(())
     }
 }

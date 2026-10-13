@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use bmux_tui::{
     geometry::Rect,
@@ -28,8 +29,8 @@ struct CanvasBackend {
     cell_height: f64,
     font: String,
     baseline: f64,
-    resources: BTreeMap<String, Bitmap>,
-    pending: Option<BTreeMap<String, Bitmap>>,
+    resources: BTreeMap<String, Rc<Bitmap>>,
+    pending: Option<BTreeMap<String, Rc<Bitmap>>>,
 }
 
 fn context(canvas: &HtmlCanvasElement) -> Result<CanvasRenderingContext2d, JsValue> {
@@ -74,7 +75,7 @@ impl CanvasBackend {
         &self,
         context: &CanvasRenderingContext2d,
         frame: &BrowserFrame,
-        resources: &BTreeMap<String, Bitmap>,
+        resources: &BTreeMap<String, Rc<Bitmap>>,
     ) -> Result<(), JsValue> {
         let area = frame.buffer().area();
         context.set_text_baseline("alphabetic");
@@ -243,10 +244,22 @@ impl BrowserBackend for CanvasBackend {
     }
 }
 
-async fn prepare_images(frame: &BrowserFrame) -> Result<BTreeMap<String, Bitmap>, JsValue> {
+async fn prepare_images(
+    frame: &BrowserFrame,
+    previous: Option<&BrowserFrame>,
+    cached: &BTreeMap<String, Rc<Bitmap>>,
+) -> Result<BTreeMap<String, Rc<Bitmap>>, JsValue> {
     let window = web_sys::window().ok_or_else(|| error("browser window unavailable"))?;
     let mut images = BTreeMap::new();
     for placement in frame.image_scene().placements() {
+        if let Some(bitmap) = cached.get(placement.key.as_str())
+            && previous
+                .and_then(|base| base.image_scene().get(&placement.key))
+                .is_some_and(|old| old.payload == placement.payload)
+        {
+            images.insert(placement.key.as_str().to_owned(), Rc::clone(bitmap));
+            continue;
+        }
         let promise = match &placement.payload {
             ImagePayload::Png { bytes, .. } => {
                 let parts = Array::new();
@@ -283,7 +296,7 @@ async fn prepare_images(frame: &BrowserFrame) -> Result<BTreeMap<String, Bitmap>
         if bitmap.0.width() != width || bitmap.0.height() != height {
             return Err(error("decoded image dimensions differ"));
         }
-        images.insert(placement.key.as_str().to_owned(), bitmap);
+        images.insert(placement.key.as_str().to_owned(), Rc::new(bitmap));
     }
     Ok(images)
 }
@@ -291,6 +304,7 @@ async fn prepare_images(frame: &BrowserFrame) -> Result<BTreeMap<String, Bitmap>
 /// Real browser Canvas 2D consumer. Calls must be serialized by the host.
 #[wasm_bindgen]
 pub struct CanvasRenderer {
+    resource_bytes: BTreeMap<String, Vec<u8>>,
     renderer: Renderer<CanvasBackend>,
 }
 #[wasm_bindgen]
@@ -317,6 +331,7 @@ impl CanvasRenderer {
             .dyn_into()?;
         let output = context(&canvas)?;
         Ok(Self {
+            resource_bytes: BTreeMap::new(),
             renderer: Renderer::new(
                 CanvasBackend {
                     canvas,
@@ -403,6 +418,70 @@ impl CanvasRenderer {
     pub async fn repair_json(&mut self, json: String) -> Result<(), JsValue> {
         self.present_snapshot(json, true).await
     }
+    /// Resource discovery is decoded by Rust; JavaScript only fetches opaque IDs.
+    pub fn binary_resources(bytes: &[u8]) -> Result<String, JsValue> {
+        serde_json::to_string(&crate::wire::resource_requirements(bytes).map_err(error)?)
+            .map_err(error)
+    }
+    /// Decode/validate a candidate without advancing visible authority.
+    pub fn inspect_binary(&self, bytes: &[u8]) -> Result<String, JsValue> {
+        let frame = self.decode_binary_frame(bytes)?;
+        let supported = self.renderer.backend().capabilities().check(&frame).is_ok();
+        serde_json::to_string(&serde_json::json!({ "generation": frame.generation(),
+            "revision": frame.revision().to_string(), "supported": supported,
+            "unsupported_metadata": frame.unsupported_metadata(), "selection_text_available": frame.selection_text_available(), "partial_metadata": frame.partial_metadata() })).map_err(error)
+    }
+    pub async fn present_binary(&mut self, bytes: Vec<u8>) -> Result<(), JsValue> {
+        let frame = self.decode_binary_frame(&bytes)?;
+        let repair = self
+            .renderer
+            .committed()
+            .is_some_and(|base| base.generation() != frame.generation());
+        self.present_frame(frame, repair).await?;
+        self.discard_binary_pending()
+    }
+
+    /// Install immutable bytes into the bounded pending/committed resource cache.
+    pub fn install_binary_resource(&mut self, id: String, bytes: Vec<u8>) -> Result<(), JsValue> {
+        if id.len() != 64
+            || !id.bytes().all(|b| b.is_ascii_hexdigit())
+            || bytes.len() > 8 * 1024 * 1024
+        {
+            return Err(error("invalid resource bounds"));
+        }
+        if let Some(existing) = self.resource_bytes.get(&id) {
+            if existing != &bytes {
+                return Err(error("immutable resource changed"));
+            }
+            return Ok(());
+        }
+        let total = self.resource_bytes.values().map(Vec::len).sum::<usize>();
+        if self.resource_bytes.len() >= 256 || total.saturating_add(bytes.len()) > 16 * 1024 * 1024
+        {
+            return Err(error("resource cache budget exceeded"));
+        }
+        self.resource_bytes.insert(id, bytes);
+        Ok(())
+    }
+    pub fn has_binary_resource(&self, id: &str) -> bool {
+        self.resource_bytes.contains_key(id)
+    }
+    /// Discard speculative resource loads while preserving committed references.
+    pub fn discard_binary_pending(&mut self) -> Result<(), JsValue> {
+        let ids = self
+            .renderer
+            .committed()
+            .map(crate::wire::extract_resources)
+            .transpose()
+            .map_err(error)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|resource| resource.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.resource_bytes.retain(|id, _| ids.contains(id));
+        Ok(())
+    }
+
     /// Revision as decimal text, avoiding JavaScript's lossy integer range.
     pub fn revision(&self) -> String {
         self.renderer
@@ -419,13 +498,34 @@ impl CanvasRenderer {
             "selection": frame.selection(), "selection_text": frame.selection_text(), "selection_text_available": frame.selection_text_available(), "semantics": frame.semantics() })).map_err(error)
     }
     pub fn reset(&mut self) -> Result<(), JsValue> {
+        self.resource_bytes.clear();
         self.renderer.reset()
     }
 }
 
 impl CanvasRenderer {
+    fn decode_binary_frame(&self, bytes: &[u8]) -> Result<BrowserFrame, JsValue> {
+        let resources = crate::wire::resource_requirements(bytes)
+            .map_err(error)?
+            .into_iter()
+            .map(|requirement| {
+                let bytes = self
+                    .resource_bytes
+                    .get(&requirement.id)
+                    .ok_or_else(|| error("missing image resource"))?;
+                requirement.with_bytes(bytes.clone()).map_err(error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        crate::wire::decode_binary_with_resources(bytes, self.renderer.committed(), &resources)
+            .map_err(error)
+    }
+
     async fn present_snapshot(&mut self, json: String, repair: bool) -> Result<(), JsValue> {
         let frame = decode_json(&json, Limits::default()).map_err(error)?;
+        self.present_frame(frame, repair).await
+    }
+
+    async fn present_frame(&mut self, frame: BrowserFrame, repair: bool) -> Result<(), JsValue> {
         if let Some(previous) = self.renderer.committed() {
             if !repair && frame.generation() != previous.generation() {
                 return Err(error("generation changed: explicit repair required"));
@@ -442,7 +542,12 @@ impl CanvasRenderer {
             .check(&frame)
             .map_err(|feature| error(format!("unsupported feature: {feature:?}")))?;
         self.renderer.backend().bounds(&frame)?;
-        let images = prepare_images(&frame).await?;
+        let images = prepare_images(
+            &frame,
+            self.renderer.committed(),
+            &self.renderer.backend().resources,
+        )
+        .await?;
         self.renderer.backend_mut().pending = Some(images);
         let result = if repair {
             self.renderer.repair(frame)

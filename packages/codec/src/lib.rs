@@ -14,6 +14,19 @@ pub mod tag;
 pub mod varint;
 pub mod wire;
 
+/// Allocation/work limits for decoding an untrusted positional message.
+/// Existing unbounded APIs remain unchanged for compatibility.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeLimits {
+    pub max_input_bytes: usize,
+    pub max_blob_bytes: usize,
+    pub max_container_entries: usize,
+    pub max_total_entries: usize,
+}
+
+#[cfg(all(feature = "serde", feature = "positional"))]
+pub use serde_adapter::positional::from_positional_bytes_bounded;
+
 pub use error::Error;
 
 #[cfg(all(feature = "serde", feature = "stable"))]
@@ -39,6 +52,33 @@ mod tests {
     use std::collections::BTreeMap;
 
     // ── Basic scalar types ───────────────────────────────────────────────────
+
+    #[test]
+    fn bounded_positional_rejects_declared_lengths_before_visiting() {
+        let limits = DecodeLimits {
+            max_input_bytes: 64,
+            max_blob_bytes: 8,
+            max_container_entries: 4,
+            max_total_entries: 6,
+        };
+        let empty_units = to_positional_vec(&vec![(); 5]).unwrap();
+        assert!(from_positional_bytes_bounded::<Vec<()>>(&empty_units, limits).is_err());
+        let nested = to_positional_vec(&vec![vec![(); 3], vec![(); 3]]).unwrap();
+        assert!(from_positional_bytes_bounded::<Vec<Vec<()>>>(&nested, limits).is_err());
+        let blob = to_positional_vec(&"123456789").unwrap();
+        assert!(from_positional_bytes_bounded::<String>(&blob, limits).is_err());
+        let ok = to_positional_vec(&vec![1_u32, 2, 3]).unwrap();
+        assert_eq!(
+            from_positional_bytes_bounded::<Vec<u32>>(&ok, limits).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            from_positional_bytes_bounded::<Vec<u32>>(&[ok, vec![0]].concat(), limits).is_err()
+        );
+        let excessive = vec![0; 65];
+        assert!(from_positional_bytes_bounded::<String>(&excessive, limits).is_err());
+        assert!(from_positional_bytes_bounded::<String>(&[255; 10], limits).is_err());
+    }
 
     #[test]
     fn roundtrip_bool() {

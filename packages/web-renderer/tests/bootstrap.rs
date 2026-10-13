@@ -36,13 +36,13 @@ fn transport_cursor_is_independent_from_native_presentation_revision() {
             "generation === nextGeneration && renderer.revision() === inspected.revision"
         )
     );
-    assert!(source.contains("await renderer.repair_json(json)"));
+    assert!(source.contains("await renderer.present_binary(bytes)"));
     assert!(!source.contains("nextGeneration !== generation) renderer.reset()"));
     assert!(!source.contains("inspected.revision !== announced"));
     assert!(!source.contains("renderer.revision() === announced"));
     assert!(!source.contains("encodeURIComponent(renderer.revision())"));
     let commit = source
-        .find("await renderer.present_json(json);")
+        .find("await renderer.present_binary(bytes);")
         .expect("backend commit");
     let advance = source[commit..]
         .find("pollCursor = announced;")

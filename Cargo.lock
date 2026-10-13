@@ -1166,7 +1166,7 @@ dependencies = [
  "bmux_scene_protocol",
  "bmux_scene_protocol_render",
  "bmux_terminal_grid",
- "bmux_tui",
+ "bmux_tui 0.0.1-alpha.1",
  "crossterm",
  "futures-util",
  "image",
@@ -2821,6 +2821,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
 ]
@@ -2829,10 +2830,12 @@ dependencies = [
 name = "bmux_web_renderer"
 version = "0.0.1-alpha.1"
 dependencies = [
- "bmux_tui",
+ "bmux_codec",
+ "bmux_tui 0.0.1-alpha.1",
  "js-sys",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "unicode-width",
  "wasm-bindgen",
  "wasm-bindgen-futures",

@@ -7,6 +7,8 @@
 mod acceptance;
 mod assets;
 mod http;
+mod publication;
+pub use publication::{BinaryPresentation, Resource};
 mod viewport;
 pub use viewport::{ViewControl, ViewportMode, ViewportRequest, ViewportRequests};
 
@@ -100,6 +102,10 @@ impl HostConfig {
 pub struct Snapshot {
     pub revision: u64,
     pub bytes: Arc<[u8]>,
+    pub(crate) json_available: bool,
+    pub(crate) binary: Option<BinaryPresentation>,
+    pub(crate) resources: std::collections::BTreeMap<String, Resource>,
+    pub(crate) previous_resources: std::collections::BTreeMap<String, Resource>,
 }
 
 /// Cloneable producer; serialized publication preserves strictly increasing revisions.
@@ -153,6 +159,32 @@ impl SnapshotPublisher {
                 "snapshot exceeds bounds",
             ));
         }
+        self.publish_inner(
+            revision,
+            Some(bytes),
+            None,
+            std::collections::BTreeMap::new(),
+        )
+    }
+
+    fn publish_inner(
+        &self,
+        revision: u64,
+        bytes: Option<Arc<[u8]>>,
+        binary: Option<BinaryPresentation>,
+        resources: std::collections::BTreeMap<String, Resource>,
+    ) -> io::Result<()> {
+        if bytes
+            .as_ref()
+            .is_some_and(|bytes| bytes.is_empty() || bytes.len() > self.max_bytes)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snapshot exceeds bounds",
+            ));
+        }
+        let json_available = bytes.is_some();
+        let bytes = bytes.unwrap_or_else(|| Arc::from([]));
         let sender = self
             .sender
             .lock()
@@ -167,8 +199,30 @@ impl SnapshotPublisher {
                 "snapshot revision did not advance",
             ));
         }
+        let previous_resources = {
+            let current = sender.borrow();
+            publication::validate(
+                self.max_bytes,
+                revision,
+                binary.as_ref(),
+                &resources,
+                current.as_deref(),
+            )?;
+            current
+                .as_ref()
+                .map_or_else(std::collections::BTreeMap::new, |value| {
+                    value.resources.clone()
+                })
+        };
         sender
-            .send(Some(Arc::new(Snapshot { revision, bytes })))
+            .send(Some(Arc::new(Snapshot {
+                revision,
+                bytes,
+                json_available,
+                binary,
+                resources,
+                previous_resources,
+            })))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "snapshot feed closed"))
     }
 }

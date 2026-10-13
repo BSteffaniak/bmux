@@ -30,6 +30,31 @@ caller/browser, not this library. `publish` rejects empty/oversized bytes,
 non-increasing revisions and a closed feed. Only the latest snapshot is retained;
 slow readers may miss intermediates but always receive a complete full snapshot.
 
+`publish_representations(revision, json: Option<Arc<[u8]>>, binary, resources)`
+atomically publishes all representations. `BinaryPresentation` contains a full
+`snapshot` and optional `delta: Option<(base_transport_revision, bytes)>`; the
+base must be the immediately preceding binary publication. JSON `None` leaves
+binary available and makes diagnostic `/snapshot` return `406`. Existing
+`publish(revision, json)` remains unchanged.
+
+* `GET /presentation?version=1&after=<u64>&base=<u64>` requires the bearer and
+  existing Host/Origin protection. Version is mandatory; unsupported versions,
+  unknown/duplicate fields and malformed cursors return `400`. `after` and `base`
+  are optional. A matching exact base selects the latest delta; all other bases
+  select the full snapshot. Polling waits only when `after == base == latest`;
+  a mismatched committed base repairs immediately. Responses use
+  `application/vnd.bmux.presentation-v1` and `X-Snapshot-Revision`.
+* `/view` advertises `presentation_versions: [1]` in addition to its existing
+  control protocol fields.
+* `GET /resource/<id>` requires the same auth/Origin checks. IDs are lowercase
+  SHA-256 hex of opaque bytes, verified on publication. `Resource` contains
+  `bytes: Arc<[u8]>` and `mime_type: String`; HTTP length derives from bytes.
+  Reusing a retained ID requires identical bytes and MIME. Complete manifests
+  are retained for only latest/previous publications; expired IDs return `404`.
+  There is no resource queue, discovery, or domain interpretation. Limits are
+  8 MiB/resource, 1,024 entries/manifest, and 32 MiB for both retained manifests
+  (shared entries count conservatively twice). Every rejection is atomic.
+
 `start` requires an active Tokio runtime. It always binds `127.0.0.1:0` and creates
 a fresh 256-bit OS-random capability per host. It never logs URLs, requests or tokens.
 `address()` has no credentials; `bootstrap_url()` returns a sensitive fragment-token

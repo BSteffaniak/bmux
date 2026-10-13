@@ -14,6 +14,8 @@ pub struct Deserializer<'de> {
     pos: usize,
     mode: EncodingMode,
     tagged_identifier: bool,
+    limits: Option<crate::DecodeLimits>,
+    remaining_entries: usize,
 }
 
 impl<'de> Deserializer<'de> {
@@ -23,6 +25,8 @@ impl<'de> Deserializer<'de> {
             pos: 0,
             mode,
             tagged_identifier: false,
+            limits: None,
+            remaining_entries: usize::MAX,
         }
     }
 
@@ -31,11 +35,12 @@ impl<'de> Deserializer<'de> {
     }
 
     fn consume(&mut self, n: usize) -> Result<&'de [u8], Error> {
-        if self.pos + n > self.input.len() {
+        let end = self.pos.checked_add(n).ok_or(Error::UnexpectedEof)?;
+        if end > self.input.len() {
             return Err(Error::UnexpectedEof);
         }
-        let slice = &self.input[self.pos..self.pos + n];
-        self.pos += n;
+        let slice = &self.input[self.pos..end];
+        self.pos = end;
         Ok(slice)
     }
 
@@ -108,6 +113,12 @@ impl<'de> Deserializer<'de> {
         let (value, consumed) =
             varint::decode_usize(self.remaining()).ok_or(Error::UnexpectedEof)?;
         self.pos += consumed;
+        if let Some(limits) = self.limits {
+            if value > limits.max_container_entries || value > self.remaining_entries {
+                return Err(Error::Message("container entry budget exceeded".to_owned()));
+            }
+            self.remaining_entries -= value;
+        }
         Ok(value)
     }
 
@@ -130,7 +141,14 @@ impl<'de> Deserializer<'de> {
     }
 
     fn read_bytes(&mut self) -> Result<&'de [u8], Error> {
-        let len = self.read_varint_usize()?;
+        let (len, consumed) = varint::decode_usize(self.remaining()).ok_or(Error::UnexpectedEof)?;
+        self.pos += consumed;
+        if self
+            .limits
+            .is_some_and(|limits| len > limits.max_blob_bytes)
+        {
+            return Err(Error::Message("blob byte budget exceeded".to_owned()));
+        }
         self.consume(len)
     }
 
@@ -138,6 +156,23 @@ impl<'de> Deserializer<'de> {
         let bytes = self.read_bytes()?;
         std::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)
     }
+}
+
+pub(crate) fn from_bytes_bounded<'de, T: Deserialize<'de>>(
+    bytes: &'de [u8],
+    limits: crate::DecodeLimits,
+) -> Result<T, Error> {
+    if bytes.len() > limits.max_input_bytes {
+        return Err(Error::Message("input byte budget exceeded".to_owned()));
+    }
+    let mut deserializer = Deserializer::new(bytes, EncodingMode::Positional);
+    deserializer.limits = Some(limits);
+    deserializer.remaining_entries = limits.max_total_entries;
+    let value = T::deserialize(&mut deserializer)?;
+    if deserializer.pos != deserializer.input.len() {
+        return Err(Error::TrailingBytes);
+    }
+    Ok(value)
 }
 
 pub(crate) fn from_bytes_with_mode<'de, T: Deserialize<'de>>(

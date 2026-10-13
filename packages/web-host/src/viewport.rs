@@ -165,6 +165,7 @@ pub(crate) struct Viewport {
 #[derive(Serialize)]
 struct ViewInfo<'a> {
     protocol_version: u8,
+    presentation_versions: [u8; 1],
     generation: Option<&'a str>,
     viewport_allowed: bool,
     controller: Option<&'a str>,
@@ -352,6 +353,7 @@ impl Viewport {
 fn info(lease: Option<&Lease>, generation: Option<&str>, allowed: bool) -> Result<Vec<u8>, u16> {
     serde_json::to_vec(&ViewInfo {
         protocol_version: 1,
+        presentation_versions: [1],
         generation,
         viewport_allowed: allowed,
         controller: lease.map(|lease| lease.controller.as_str()),

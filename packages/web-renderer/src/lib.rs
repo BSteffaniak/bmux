@@ -5,6 +5,12 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 
 mod contract;
+pub mod wire;
+pub use wire::{
+    BINARY_WIRE_VERSION, ImageResource, ResourceRequirement, decode_binary,
+    decode_binary_with_resources, encode_binary, encode_binary_with_resources, encode_delta,
+    encode_delta_with_resources, extract_resources, resource_requirements,
+};
 mod renderer;
 pub use contract::{
     BrowserFrame, DecodeError, Limits, MetadataKind, SurfaceProvenance, WIRE_VERSION, decode_json,

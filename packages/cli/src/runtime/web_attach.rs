@@ -12,7 +12,7 @@ fn generation(snapshot: &AttachSnapshot) -> String {
     format!("{}:{}", snapshot.epoch, snapshot.attached_id)
 }
 
-fn encode(snapshot: &AttachSnapshot) -> Result<Arc<[u8]>> {
+fn project_frame(snapshot: &AttachSnapshot) -> Result<BrowserFrame> {
     let surfaces = snapshot
         .surfaces
         .iter()
@@ -49,7 +49,7 @@ fn encode(snapshot: &AttachSnapshot) -> Result<Arc<[u8]>> {
             })
             .collect::<Result<Vec<_>>>()?,
     )?;
-    Ok(bmux_web_renderer::encode_json(&frame)?.into_bytes().into())
+    Ok(frame)
 }
 
 fn start_browser_observer(
@@ -62,17 +62,61 @@ fn start_browser_observer(
     let (mut publisher, observer) = attach_observer_channel();
     let epoch = observer.epoch();
     let mut revision = 0_u64;
+    let mut previous: Option<BrowserFrame> = None;
     publisher.set_delivery(move |snapshot| {
         anyhow::ensure!(
             snapshot.epoch == epoch,
             "browser observer epoch changed unexpectedly"
         );
-        let bytes = encode(snapshot).context("browser presentation rejected")?;
-        revision = revision
+        let frame = project_frame(snapshot).context("browser presentation rejected")?;
+        let next_revision = revision
             .checked_add(1)
             .context("browser transport revision exhausted")?;
-        feed_publisher.publish(revision, bytes)?;
+        let binary = bmux_web_renderer::wire::encode_binary_with_resources(&frame)?;
+        let delta = previous
+            .as_ref()
+            .filter(|base| {
+                base.generation() == frame.generation()
+                    && base.buffer().area() == frame.buffer().area()
+            })
+            .map(|base| bmux_web_renderer::wire::encode_delta_with_resources(&frame, base))
+            .transpose()?
+            .filter(|bytes| bytes.len() < binary.len())
+            .map(|bytes| (revision, Arc::<[u8]>::from(bytes)));
+        let resources = bmux_web_renderer::wire::extract_resources(&frame)?
+            .into_iter()
+            .map(|resource| {
+                let (bytes, mime_type) = match resource.payload {
+                    bmux_tui::image::ImagePayload::Png { bytes, .. } => (bytes, "image/png"),
+                    bmux_tui::image::ImagePayload::Pixels { bytes, .. } => {
+                        (bytes, "application/octet-stream")
+                    }
+                };
+                (
+                    resource.id,
+                    bmux_web_host::Resource {
+                        bytes: bytes.into(),
+                        mime_type: mime_type.to_owned(),
+                    },
+                )
+            })
+            .collect();
+        // The diagnostic JSON representation must not veto a deliverable binary view.
+        let json = bmux_web_renderer::encode_json(&frame)
+            .ok()
+            .map(|json| Arc::<[u8]>::from(json.into_bytes()));
+        feed_publisher.publish_representations(
+            next_revision,
+            json,
+            bmux_web_host::BinaryPresentation {
+                snapshot: binary.into(),
+                delta,
+            },
+            resources,
+        )?;
         control.set_generation(&generation(snapshot))?;
+        revision = next_revision;
+        previous = Some(frame);
         Ok(())
     });
     (publisher, observer)

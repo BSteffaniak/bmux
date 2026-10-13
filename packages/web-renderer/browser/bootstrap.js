@@ -57,9 +57,9 @@ function request(path, controller, options = {}) {
     cache: 'no-store', credentials: 'omit', redirect: 'error', signal: controller.signal,
   }).then(authorized);
 }
-async function boundedText(response) {
+async function boundedBytes(response, limit = MAX_JSON_BYTES) {
   const length = response.headers.get('Content-Length');
-  if (length !== null && Number(length) > MAX_JSON_BYTES) throw new Error('frame too large');
+  if (length !== null && Number(length) > limit) throw new Error('frame too large');
   const reader = response.body.getReader();
   const chunks = [];
   let size = 0;
@@ -68,7 +68,7 @@ async function boundedText(response) {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.length;
-      if (size > MAX_JSON_BYTES) throw new Error('frame too large');
+      if (size > limit) throw new Error('frame too large');
       chunks.push(value);
     }
   } catch (error) {
@@ -78,7 +78,10 @@ async function boundedText(response) {
   const bytes = new Uint8Array(size);
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
-  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  return bytes;
+}
+async function boundedText(response) {
+  return new TextDecoder('utf-8', { fatal: true }).decode(await boundedBytes(response));
 }
 function transportRevision(value) {
   if (typeof value !== 'string' || !/^[1-9][0-9]{0,19}$/.test(value)) {
@@ -213,6 +216,11 @@ async function run() {
     if (response.status !== 200) throw new Error('view claim unavailable');
     const next = JSON.parse(await boundedText(response));
     if (stopped) return;
+    if (!Array.isArray(next.presentation_versions) || !next.presentation_versions.includes(1)) {
+      expire();
+      status.textContent = 'Incompatible presentation protocol. Rebuild browser assets and native BMUX together.';
+      throw new Error('unsupported presentation protocol');
+    }
     if (next.protocol_version !== 1 || (next.generation !== null && (typeof next.generation !== 'string'
         || next.generation.length < 1 || next.generation.length > 128))
         || typeof next.viewport_allowed !== 'boolean'
@@ -255,7 +263,8 @@ async function run() {
       try {
         if (info === null) await refreshInfo(controller);
         const requestCursor = pollCursor;
-        const path = requestCursor === null ? '/snapshot' : `/snapshot?after=${encodeURIComponent(requestCursor)}`;
+        const path = requestCursor === null ? '/presentation?version=1'
+          : `/presentation?version=1&after=${encodeURIComponent(requestCursor)}&base=${encodeURIComponent(requestCursor)}`;
         const response = await request(path, controller);
         if (response.status === 204) continue;
         if (response.status === 503) {
@@ -273,8 +282,21 @@ async function run() {
           throw new Error('transport revision did not advance');
         }
         transportHighWater = transport;
-        const json = await boundedText(response);
-        const inspected = JSON.parse(CanvasRenderer.inspect_json(json));
+        if (response.headers.get('Content-Type') !== 'application/vnd.bmux.presentation-v1') {
+          throw new Error('unexpected presentation representation');
+        }
+        const bytes = await boundedBytes(response);
+        renderer.discard_binary_pending();
+        const requirements = JSON.parse(CanvasRenderer.binary_resources(bytes));
+        for (const resource of requirements) {
+          if (renderer.has_binary_resource(resource.id)) continue;
+          const loaded = await request(`/resource/${encodeURIComponent(resource.id)}`, controller);
+          if (loaded.status !== 200 || loaded.headers.get('Content-Type') !== resource.mime_type) {
+            throw new Error('image resource unavailable');
+          }
+          renderer.install_binary_resource(resource.id, await boundedBytes(loaded, 8 * 1024 * 1024));
+        }
+        const inspected = JSON.parse(renderer.inspect_binary(bytes));
         if (!inspected.supported) {
           status.textContent = 'Snapshot requires an unsupported Canvas feature.';
           expire();
@@ -290,11 +312,9 @@ async function run() {
           pollCursor = announced;
           continue;
         }
-        const replacement = generation !== null && nextGeneration !== generation;
         rendering = true;
         try {
-          if (replacement) await renderer.repair_json(json);
-          else await renderer.present_json(json);
+          await renderer.present_binary(bytes);
         }
         finally { rendering = false; }
         if (stopped) break;
@@ -308,6 +328,7 @@ async function run() {
         const sourceText = inspected.selection_text_available ? '' : ' · Selection source text unavailable';
         status.textContent = `Read-only · revision ${renderer.revision()}${unavailable}${partial}${sourceText}`;
       } catch {
+        renderer.discard_binary_pending();
         if (stopped) break;
         status.textContent = 'Snapshot failed; reconnecting with a full snapshot.';
         pollCursor = null;

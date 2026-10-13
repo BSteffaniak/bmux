@@ -52,6 +52,30 @@ Metadata availability is explicit in wire version 2. An empty scene does not imp
 
 Standalone TUI consumers can prepare the same presentation and use `BrowserFrame::from_prepared`; `packages/web-renderer/examples/snapshot.rs` demonstrates this without native attachment dependencies. Backends report supported features and fail explicitly on unsupported required output rather than silently omit it.
 
+## Compact presentation transport
+
+Live browser delivery negotiates binary presentation v1 through `/view` and
+`/presentation?version=1`. The native bridge and WASM use the same `bmux_codec`
+positional schema: message-local style/glyph tables, fill/ASCII/glyph row spans,
+exact generation/revision delta bases, and complete metadata projection. Only
+changed rows and changed metadata/image sections are sent in deltas. Missing or
+old transport bases receive the latest compact full snapshot; resize and
+replacement generations use snapshots. Browser transport cursors advance only
+after successful presentation.
+
+Image placements reference immutable SHA-256 resource IDs. Authenticated
+`/resource/<id>` responses carry raw bytes; the host pins bounded latest/previous
+manifests. WASM verifies resource digests and descriptions before committing,
+retains committed resources on failure, and evicts unreferenced resources after
+commit. JavaScript fetches bounded binary buffers and opaque resources; it does
+not implement the binary decoder. Unchanged placement payloads reuse decoded
+ImageBitmaps.
+
+JSON v2 remains a diagnostic representation at `/snapshot`, not the live wire.
+When expanded JSON exceeds its independent byte limit, that endpoint returns
+406 while the compact binary presentation remains available. Protocol version
+mismatches fail explicitly; rebuild native and WASM assets together.
+
 ## Acceptance testing
 
 `scripts/smoke-web-browser.sh` runs the real browser acceptance harness with explicit built artifacts and isolated owned runtime state. It requires Python, a Chromium executable, native BMUX, built WASM assets, and the snapshot example's JSON. Missing dependencies are failures, not successful skips. See `--help` for artifact arguments and credential-safe evidence output.
