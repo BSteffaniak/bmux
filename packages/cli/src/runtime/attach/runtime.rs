@@ -4920,7 +4920,7 @@ async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?S
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    {
+    if !terminal.presentation_only() {
         let mut candidate = view_state.kitty_host_state.clone();
         let cleanup = candidate
             .reset(&mut &mut *terminal)

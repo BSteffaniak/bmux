@@ -155,8 +155,9 @@ def producer(root):
 
 def http(origin, path, token, method="GET", body=None, controller=None,
          request_origin=None):
-    headers = {"Authorization": "Bearer " + token,
-               "Origin": request_origin or origin}
+    headers = {"Origin": request_origin or origin}
+    if token:
+        headers["Authorization"] = "Bearer " + token
     if controller:
         headers["X-Bmux-Controller"] = controller
     if isinstance(body, dict):
@@ -303,6 +304,8 @@ class Harness:
             "fresh_home_config_runtime_state": True, "ephemeral_loopback_ports": True}
 
     def argv(self, *args):
+        if args and args[0] == "attach" and "--web-assets" in args and "--web-port" not in args:
+            args = (*args, "--web-port", "0", "--web-auth", "token")
         return [str(self.args.binary), "--config", str(self.config), *args]
 
     def spawn(self, *args):
@@ -660,6 +663,7 @@ class Harness:
         self.standalone()
         self.interrupt(session, attach)
         self.mirror(session)
+        self.local_no_auth(session)
         attach = self.spawn("attach", session, "--web-assets", str(self.args.assets), "--web-only")
         self.bootstrap(attach)
         self.frame_when("source lifecycle test frame", lambda f: bool(f["generation"]))
@@ -675,6 +679,24 @@ class Harness:
             pass  # Closed listener is an explicit closed view, not a skipped case.
         require(b"\x1b" not in attach.bytes(), "headless shutdown emitted ANSI")
         self.passed("source termination closes feed and restores output-only lifecycle")
+
+    def local_no_auth(self, session):
+        owner = self.spawn("attach", session, "--web-assets", str(self.args.assets), "--web-only",
+                           "--web-port", "0", "--web-auth", "none")
+        def url_ready():
+            require(owner.child.poll() is None, "token-free attach exited")
+            match = re.search(rb"http://127\.0\.0\.1:\d+/", owner.bytes())
+            return match[0].decode() if match else None
+        url = wait_for("plain loopback URL", url_ready)
+        require(b"#token=" not in owner.bytes(), "token-free URL contained capability")
+        self.client.call("Page.navigate", {"url": url})
+        wait_for("token-free browser commit", lambda: (self.pixels() or {}).get("status", "").startswith("Read-only"))
+        self.client.call("Page.reload", {})
+        wait_for("token-free reload commit", lambda: (self.pixels() or {}).get("status", "").startswith("Read-only"))
+        owner.child.send_signal(signal.SIGINT)
+        wait_for("token-free Ctrl-C", lambda: owner.child.poll() is not None, 6)
+        require(owner.child.returncode == 0, "token-free detach failed")
+        self.passed("token-free plain URL opens and reloads, then closes cleanly")
 
     def interrupt(self, session, owner):
         saved = self.origin, self.token
@@ -736,7 +758,9 @@ class Harness:
             origin, token = self.origin, self.token
             owner.child.send_signal(signal.SIGINT)
             wait_for("Ctrl-C closes independent attachment", lambda: owner.child.poll() is not None, 6)
-            require(owner.child.returncode == 0, "Ctrl-C did not exit cleanly")
+            errors = [line for line in owner.bytes().decode(errors="replace").splitlines()
+                      if line.startswith("bmux error:")]
+            require(owner.child.returncode == 0, "Ctrl-C did not exit cleanly: " + "; ".join(errors)[:300])
             try:
                 status, _ = http(origin, "/snapshot", token)
                 require(status != 200, "interrupted attachment still serves healthy snapshot")

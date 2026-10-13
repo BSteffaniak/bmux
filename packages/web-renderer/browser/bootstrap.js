@@ -27,9 +27,9 @@ function expire() {
   wake?.();
 }
 addEventListener('pagehide', () => {
-  if (token && controllerSecret) {
+  if (!stopped && controllerSecret) {
     void fetch('/view', { method: 'DELETE', keepalive: true,
-      headers: { Authorization: `Bearer ${token}`, 'X-Bmux-Controller': controllerSecret },
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), 'X-Bmux-Controller': controllerSecret },
       credentials: 'omit', redirect: 'error' }).catch(() => {});
   }
   expire();
@@ -45,7 +45,7 @@ function pause() {
 function authorized(response) {
   if (response.status === 401 || response.status === 403) {
     expire();
-    status.textContent = 'Authorization expired. Reopen the bootstrap URL.';
+    status.textContent = 'Access denied. Token-protected views require the printed bootstrap URL.';
     throw new Error('authorization expired');
   }
   return response;
@@ -53,7 +53,7 @@ function authorized(response) {
 function request(path, controller, options = {}) {
   return fetch(path, {
     ...options,
-    headers: { Authorization: `Bearer ${token}`, ...options.headers },
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options.headers },
     cache: 'no-store', credentials: 'omit', redirect: 'error', signal: controller.signal,
   }).then(authorized);
 }
@@ -110,7 +110,7 @@ function measure() {
     baseline: Math.max(0, Math.min(height, (height - ascent - descent) / 2 + ascent)) * dpr };
 }
 async function run() {
-  if (!token || token.length > 4096 || /[\r\n]/.test(token)) {
+  if (token !== null && (!token || token.length > 4096 || /[\r\n]/.test(token))) {
     status.textContent = 'Missing or invalid bootstrap token.';
     token = null;
     return;

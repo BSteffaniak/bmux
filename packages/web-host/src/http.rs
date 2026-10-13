@@ -12,6 +12,7 @@ use crate::{Limits, Snapshot, SnapshotFeed};
 pub(crate) struct State {
     pub assets: BTreeMap<String, LoadedAsset>,
     pub limits: Limits,
+    pub auth_mode: crate::AuthMode,
     pub token: String,
     pub authority: String,
     pub origin: String,
@@ -238,7 +239,8 @@ fn parse<'a>(bytes: &'a [u8], state: &State) -> Result<Route<'a>, u16> {
         }
         route(target)?
     };
-    if !matches!(route, Route::Asset(_))
+    if state.auth_mode == crate::AuthMode::Token
+        && !matches!(route, Route::Asset(_))
         && !headers
             .get("authorization")
             .is_some_and(|value| token_matches(value, &state.token))
@@ -347,7 +349,8 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
         .ok()
         .and_then(|result| result.as_ref().ok())
         .map_or(&[][..], |bytes| &bytes[header_end..]);
-    if !matches!(route, Ok(Route::Viewport { .. })) && !body_prefix.is_empty() {
+    // Preserve authoritative policy errors even when a rejected request has a body.
+    if route.is_ok() && !matches!(route, Ok(Route::Viewport { .. })) && !body_prefix.is_empty() {
         error(&mut stream, &state, 400).await;
         return;
     }
@@ -540,6 +543,7 @@ mod tests {
         State {
             assets: BTreeMap::new(),
             limits: Limits::default(),
+            auth_mode: crate::AuthMode::Token,
             token: "a".repeat(64),
             authority: "127.0.0.1:1234".into(),
             origin: "http://127.0.0.1:1234".into(),

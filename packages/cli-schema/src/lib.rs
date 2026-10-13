@@ -347,6 +347,12 @@ pub enum Command {
         /// Serve this terminal view read-only in a local browser using these built WASM assets
         #[arg(long, value_name = "ASSET_DIRECTORY")]
         web_assets: Option<std::path::PathBuf>,
+        /// Loopback browser port (default 8080); zero selects an ephemeral port
+        #[arg(long, requires = "web_assets")]
+        web_port: Option<u16>,
+        /// Loopback browser access: none (default) or token
+        #[arg(long, value_parser = ["none", "token"], requires = "web_assets")]
+        web_auth: Option<String>,
         /// Attach without terminal input/output; the first browser controls this view's viewport
         #[arg(long, requires = "web_assets")]
         web_only: bool,
@@ -3178,6 +3184,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_web_listener_options_and_rejects_invalid_values() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "attach",
+            "dev",
+            "--web-assets",
+            "/assets",
+            "--web-port",
+            "0",
+            "--web-auth",
+            "token",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Attach { web_port: Some(0), web_auth: Some(ref auth), .. }) if auth == "token")
+        );
+        assert!(Cli::try_parse_from(["bmux", "attach", "--web-port", "8080"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "bmux",
+                "attach",
+                "--web-assets",
+                "/assets",
+                "--web-port",
+                "65536"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bmux",
+                "attach",
+                "--web-assets",
+                "/assets",
+                "--web-auth",
+                "public"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_top_level_attach_command() {
         let cli = Cli::try_parse_from(["bmux", "attach", "dev"]).expect("valid CLI args");
         let Some(Command::Attach {
@@ -3186,6 +3234,7 @@ mod tests {
             global,
             web_assets,
             web_only,
+            ..
         }) = cli.command
         else {
             panic!("expected attach command");

@@ -24,7 +24,33 @@ bash scripts/dev.sh cargo run -p bmux_cli --bin bmux -- attach --follow "<LAPTOP
 
 Omit `--web-only` to mirror an interactive terminal attachment. In mirror mode the terminal owns viewport dimensions; browser resizing only changes local pixel metrics, not terminal layout. Native provider-only attachment is explicitly unsupported by this entry point.
 
-The attachment prints an ephemeral loopback URL with an access capability in its fragment. Open it locally; do not share or record it. The browser removes the fragment before network requests and keeps credentials only in memory. Reloading requires reopening the original capability URL. The browser cannot send terminal input or invoke mutating plugin actions. Viewport changes are explicitly allowed for the controlling browser of an independent attachment.
+The default browser URL is **http://127.0.0.1:8080/**: fixed loopback port,
+no token, and ordinary reload works. Any local user/process can read this output.
+Host/Origin and Fetch Metadata checks still reject cross-site access; viewport
+control still requires the leased controller. No remote interface is exposed.
+
+Override settings in precedence order **CLI → environment → config → defaults**:
+
+```sh
+# Opt into the original ephemeral capability-URL behavior:
+bmux attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only --web-port 0 --web-auth token
+# Or choose another stable loopback port:
+BMUX_WEB_PORT=8081 BMUX_WEB_AUTH=none bmux attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only
+```
+
+```toml
+[web]
+port = 8080 # 0 selects a random available port
+auth = "none" # "token" requires the printed capability URL
+```
+
+An occupied fixed port is an explicit startup error, never a silent switch to
+another port. Token mode prints a capability in the URL fragment. Open it locally;
+do not share or record it. The browser removes the fragment before network
+requests and retains credentials only in memory. Reloading in token mode requires
+reopening the capability URL. The browser cannot send terminal input or invoke
+mutating plugin actions. Viewport changes are allowed only for the controlling
+browser of an independent attachment.
 
 ## Viewport ownership and lifecycle
 

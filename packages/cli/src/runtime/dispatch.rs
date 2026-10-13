@@ -470,6 +470,8 @@ pub(super) async fn dispatch_built_in_command(
                 global,
                 web_assets,
                 web_only,
+                web_port,
+                web_auth,
             },
         ) => {
             if let Some(assets) = web_assets {
@@ -479,6 +481,7 @@ pub(super) async fn dispatch_built_in_command(
                     *global,
                     assets,
                     *web_only,
+                    (*web_port, web_auth.as_deref()),
                     connection_context,
                 ))
                 .await;

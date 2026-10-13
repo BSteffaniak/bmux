@@ -13,6 +13,9 @@ use crate::{Asset, ContentType, HostConfig, HostHandle, SnapshotPublisher, snaps
 
 const DEADLINE: Duration = Duration::from_secs(10);
 
+#[path = "auth_acceptance.rs"]
+mod auth_tests;
+
 #[tokio::test]
 async fn negotiated_binary_resources_and_repair() {
     use crate::{BinaryPresentation, Resource};
@@ -170,6 +173,8 @@ fn fixture() -> (TempDir, HostConfig) {
     }
     // Canonicalize the fixture root because some Unix temp roots are symlinks.
     let mut config = HostConfig::new(directory.path().canonicalize().unwrap());
+    config.port = 0;
+    config.auth_mode = crate::AuthMode::Token;
     // Tests exercise explicit configured assets without fabricating renderer/WASM output.
     config.assets = vec![
         Asset {

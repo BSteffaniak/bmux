@@ -96,7 +96,11 @@ Only exact `Host: 127.0.0.1:<bound-port>` is accepted (not localhost or arbitrar
 loopback aliases). A supplied Origin must exactly equal that host's HTTP origin;
 supplied `Sec-Fetch-Site` must be `same-origin` or `none`. This blocks DNS rebinding,
 foreign-origin requests and sibling-origin fetches even if a capability leaks.
-Static bootstrap assets are public but host/origin guarded; snapshots require the token.
+Static bootstrap assets are public but host/origin guarded. Snapshots require a
+bearer only in explicit token mode; loopback defaults to port 8080 without a token.
+`HostConfig.port = 0` selects an ephemeral port; `auth_mode = AuthMode::Token`
+restores capability-URL access. Token-free mode exposes output to local users,
+never remote interfaces. Occupied fixed ports fail rather than selecting another.
 All responses disable caches/referrers, deny framing and MIME sniffing, and use CSP:
 external same-origin scripts plus `wasm-unsafe-eval`, same-origin connections/styles,
 self/blob/data images, no forms/base/frame ancestors. Browser lane must use external

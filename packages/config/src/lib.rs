@@ -1009,6 +1009,9 @@ pub struct BmuxConfig {
     /// Local server process and gateway listener settings
     #[config_doc(nested)]
     pub server: ServerConfig,
+    /// Local browser presentation listener and access policy
+    #[config_doc(nested)]
+    pub web: WebConfig,
     /// Visual styling: pane borders and window titles
     #[config_doc(nested)]
     pub appearance: AppearanceConfig,
@@ -1048,6 +1051,33 @@ pub struct BmuxConfig {
     /// Sandbox workflow defaults for cleanup and isolation operations
     #[config_doc(nested)]
     pub sandbox: SandboxConfig,
+}
+
+/// Loopback browser hosting. Token-free access exposes output to local users.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "web")]
+#[serde(default)]
+pub struct WebConfig {
+    /// Loopback HTTP port; zero requests an ephemeral port
+    pub port: u16,
+    /// Browser authentication: none (local users) or token (capability URL)
+    pub auth: WebAuth,
+}
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            port: 8080,
+            auth: WebAuth::None,
+        }
+    }
+}
+/// Authentication for the loopback-only browser listener.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum WebAuth {
+    #[default]
+    None,
+    Token,
 }
 
 /// Clipboard integration and remote sync behavior.

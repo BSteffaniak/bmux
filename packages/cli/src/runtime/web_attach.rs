@@ -122,12 +122,76 @@ fn start_browser_observer(
     (publisher, observer)
 }
 
+fn resolve_web_settings(options: (Option<u16>, Option<&str>)) -> Result<bmux_config::WebConfig> {
+    let config = bmux_config::BmuxConfig::load()?.web;
+    select_web_settings(
+        config,
+        options,
+        std::env::var("BMUX_WEB_PORT"),
+        std::env::var("BMUX_WEB_AUTH"),
+    )
+}
+
+fn select_web_settings(
+    config: bmux_config::WebConfig,
+    options: (Option<u16>, Option<&str>),
+    port_env: std::result::Result<String, std::env::VarError>,
+    auth_env: std::result::Result<String, std::env::VarError>,
+) -> Result<bmux_config::WebConfig> {
+    let port = match options.0 {
+        Some(port) => port,
+        None => match port_env {
+            Ok(value) => value
+                .parse()
+                .context("BMUX_WEB_PORT must be a port from 0 to 65535")?,
+            Err(std::env::VarError::NotPresent) => config.port,
+            Err(error) => return Err(error.into()),
+        },
+    };
+    let auth_value = match options.1 {
+        Some(value) => Some(value.to_owned()),
+        None => match auth_env {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error.into()),
+        },
+    };
+    let auth = match auth_value.as_deref() {
+        None => config.auth,
+        Some("none") => bmux_config::WebAuth::None,
+        Some("token") => bmux_config::WebAuth::Token,
+        Some(_) => anyhow::bail!("web authentication must be none or token"),
+    };
+    Ok(bmux_config::WebConfig { port, auth })
+}
+
+fn configure_browser_host(
+    assets: std::path::PathBuf,
+    web_only: bool,
+    options: (Option<u16>, Option<&str>),
+) -> Result<bmux_web_host::HostConfig> {
+    let settings = resolve_web_settings(options)?;
+    let mut config = bmux_web_host::HostConfig::new(assets);
+    config.port = settings.port;
+    config.auth_mode = match settings.auth {
+        bmux_config::WebAuth::None => bmux_web_host::AuthMode::None,
+        bmux_config::WebAuth::Token => bmux_web_host::AuthMode::Token,
+    };
+    config.viewport_mode = if web_only {
+        bmux_web_host::ViewportMode::Resizable
+    } else {
+        bmux_web_host::ViewportMode::Observer
+    };
+    Ok(config)
+}
+
 pub(super) async fn run(
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
     assets: &Path,
     web_only: bool,
+    web_options: (Option<u16>, Option<&str>),
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     let provider = super::attach::provider::resolve(target)?;
@@ -138,12 +202,7 @@ pub(super) async fn run(
     let assets = assets.canonicalize().context("browser asset directory")?;
     let limits = bmux_web_host::Limits::default();
     let (feed_publisher, feed) = bmux_web_host::snapshot_feed(limits.max_snapshot_bytes)?;
-    let mut config = bmux_web_host::HostConfig::new(assets);
-    config.viewport_mode = if web_only {
-        bmux_web_host::ViewportMode::Resizable
-    } else {
-        bmux_web_host::ViewportMode::Observer
-    };
+    let config = configure_browser_host(assets, web_only, web_options)?;
     let mut host = bmux_web_host::start(config, feed).await?;
     let mut requests = host
         .take_viewport_requests()
@@ -228,4 +287,52 @@ pub(super) async fn run(
     host.invalidate_view();
     host.shutdown().await;
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn web_settings_precedence_and_invalid_environment() {
+        let absent = || Err(std::env::VarError::NotPresent);
+        let defaults = select_web_settings(
+            bmux_config::WebConfig::default(),
+            (None, None),
+            absent(),
+            absent(),
+        )
+        .unwrap();
+        assert_eq!(defaults.port, 8080);
+        assert_eq!(defaults.auth, bmux_config::WebAuth::None);
+        let configured = bmux_config::WebConfig {
+            port: 9090,
+            auth: bmux_config::WebAuth::Token,
+        };
+        let env = select_web_settings(
+            configured,
+            (None, None),
+            Ok("8081".into()),
+            Ok("none".into()),
+        )
+        .unwrap();
+        assert_eq!(env.port, 8081);
+        assert_eq!(env.auth, bmux_config::WebAuth::None);
+        let cli = select_web_settings(
+            configured,
+            (Some(0), Some("token")),
+            Ok("bad".into()),
+            Ok("bad".into()),
+        )
+        .unwrap();
+        assert_eq!(cli.port, 0);
+        assert_eq!(cli.auth, bmux_config::WebAuth::Token);
+        assert!(
+            select_web_settings(configured, (None, None), Ok("65536".into()), absent()).is_err()
+        );
+        assert!(select_web_settings(configured, (None, None), absent(), Ok("bad".into())).is_err());
+        let inherited = select_web_settings(configured, (None, None), absent(), absent()).unwrap();
+        assert_eq!(inherited.port, 9090);
+        assert_eq!(inherited.auth, bmux_config::WebAuth::Token);
+    }
 }

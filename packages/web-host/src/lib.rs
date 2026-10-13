@@ -1,4 +1,4 @@
-//! Domain-neutral, bounded browser hosting on an ephemeral loopback port.
+//! Domain-neutral, bounded browser hosting on IPv4 loopback.
 //! Encoded snapshots are opaque: callers own presentation semantics and serialization.
 #![cfg(unix)]
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
@@ -76,9 +76,22 @@ impl Limits {
     }
 }
 
+/// Loopback HTTP authentication policy. Origin and Host checks apply in both modes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Local unauthenticated serving; never binds a remote interface.
+    #[default]
+    None,
+    /// Require an ephemeral bearer capability on non-asset routes.
+    Token,
+}
+
 /// Assets are explicit build output, never discovered recursively or built by this crate.
 #[derive(Clone, Debug)]
 pub struct HostConfig {
+    /// IPv4 loopback port; zero requests an ephemeral port. Default is 8080.
+    pub port: u16,
+    pub auth_mode: AuthMode,
     pub asset_directory: PathBuf,
     pub assets: Vec<Asset>,
     pub limits: Limits,
@@ -89,6 +102,8 @@ impl HostConfig {
     #[must_use]
     pub fn new(asset_directory: PathBuf) -> Self {
         Self {
+            port: 8080,
+            auth_mode: AuthMode::None,
             asset_directory,
             assets: Asset::browser_defaults(),
             limits: Limits::default(),
@@ -230,7 +245,7 @@ impl SnapshotPublisher {
 /// Owns all serving tasks. No Debug implementation: the capability is intentionally secret.
 pub struct HostHandle {
     address: SocketAddr,
-    token: String,
+    token: Option<String>,
     task: Option<JoinHandle<()>>,
     stop: watch::Sender<bool>,
     viewport_requests: Option<ViewportRequests>,
@@ -267,10 +282,13 @@ impl HostHandle {
         self.address
     }
 
-    /// Sensitive capability URL for explicit user delivery only. Never log this URL.
+    /// Local URL; in token mode includes a sensitive capability. Never log token URLs.
     #[must_use]
     pub fn bootstrap_url(&self) -> String {
-        format!("http://{}/#token={}", self.address, self.token)
+        self.token.as_ref().map_or_else(
+            || format!("http://{}/", self.address),
+            |token| format!("http://{}/#token={token}", self.address),
+        )
     }
 
     /// Stops accepting, cancels all in-flight reads/polls/writes, and waits for cleanup.
@@ -293,7 +311,7 @@ impl Drop for HostHandle {
     }
 }
 
-/// Requires an active Tokio runtime. Binds only IPv4 loopback, always on port zero.
+/// Requires an active Tokio runtime. Binds only IPv4 loopback on the configured port.
 ///
 /// # Errors
 /// Rejects invalid budgets/assets, unavailable OS entropy, and bind failures.
@@ -306,10 +324,19 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
         ));
     }
     let assets = assets::load(&config)?;
-    let mut entropy = [0_u8; 32];
-    getrandom::fill(&mut entropy).map_err(|_| io::Error::other("OS randomness unavailable"))?;
-    let token: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let token = if config.auth_mode == AuthMode::Token {
+        let mut entropy = [0_u8; 32];
+        getrandom::fill(&mut entropy).map_err(|_| io::Error::other("OS randomness unavailable"))?;
+        Some(
+            entropy
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+    } else {
+        None
+    };
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
     let address = listener.local_addr()?;
     let (viewport, viewport_requests) = viewport::Viewport::new(config.viewport_mode);
     let viewport = Arc::new(viewport);
@@ -317,7 +344,8 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
         viewport: Arc::clone(&viewport),
         assets,
         limits: config.limits,
-        token: token.clone(),
+        auth_mode: config.auth_mode,
+        token: token.clone().unwrap_or_default(),
         authority: address.to_string(),
         origin: format!("http://{address}"),
     });
