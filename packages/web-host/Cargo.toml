@@ -11,6 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+anyhow = { workspace = true, optional = true }
+bmux_tui = { workspace = true, optional = true }
+bmux_web_renderer = { workspace = true, optional = true }
 getrandom = "0.3.4"
 libc = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -31,3 +34,4 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
+presentation     = ["dep:anyhow", "dep:bmux_tui", "dep:bmux_web_renderer"]

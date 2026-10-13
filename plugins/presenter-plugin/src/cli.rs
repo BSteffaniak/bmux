@@ -1,13 +1,72 @@
 //! CLI syntax and policy. No terminal or host side effects during parsing.
 use anyhow::{Context, Result, bail, ensure};
 use bmux_presenter_runtime::protocol::InteractionMode;
-use std::path::PathBuf;
+use std::{net::IpAddr, path::PathBuf};
+
+/// CLI values only: shared configuration resolution owns environment/defaults.
+#[derive(Default, Debug)]
+pub(crate) struct WebOptions {
+    pub assets: Option<PathBuf>,
+    pub only: bool,
+    pub port: Option<u16>,
+    pub auth: Option<String>,
+    pub host: Option<IpAddr>,
+    pub public_host: Option<IpAddr>,
+    pub allowed_hosts: Option<Vec<String>>,
+}
+
+impl WebOptions {
+    fn parse(args: &mut Arguments<'_>) -> Result<Self> {
+        let assets = args.value("--web-assets")?.map(PathBuf::from);
+        let only = args.flag("--web-only")?;
+        let port = args
+            .value("--web-port")?
+            .map(|value| value.parse().context("--web-port must be 0..65535"))
+            .transpose()?;
+        let auth = args.value("--web-auth")?;
+        ensure!(
+            auth.as_deref()
+                .is_none_or(|auth| matches!(auth, "none" | "token")),
+            "--web-auth must be none or token"
+        );
+        let host = args
+            .value("--web-host")?
+            .map(|value| value.parse().context("--web-host must be an IP address"))
+            .transpose()?;
+        let public_host = args
+            .value("--web-public-host")?
+            .map(|value| {
+                value
+                    .parse()
+                    .context("--web-public-host must be an IP address")
+            })
+            .transpose()?;
+        let allowed_hosts = args.value("--web-allowed-hosts")?.map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_owned)
+                .collect()
+        });
+        Ok(Self {
+            assets,
+            only,
+            port,
+            auth,
+            host,
+            public_host,
+            allowed_hosts,
+        })
+    }
+}
 
 pub(crate) enum Command {
     Play {
         source: PathBuf,
         presenter: bool,
         reload: bool,
+        web: WebOptions,
     },
     Check {
         source: PathBuf,
@@ -26,6 +85,7 @@ pub(crate) struct HostOptions {
     pub audience_credential: Option<PathBuf>,
     pub public_read: bool,
     pub reload: bool,
+    pub web: WebOptions,
 }
 
 #[derive(Clone)]
@@ -53,11 +113,13 @@ impl Command {
             "play" => {
                 let presenter = args.flag("--presenter")?;
                 let reload = !args.flag("--no-reload")?;
+                let web = WebOptions::parse(&mut args)?;
                 args.finish()?;
                 Ok(Self::Play {
                     source: target.into(),
                     presenter,
                     reload,
+                    web,
                 })
             }
             "check" => {
@@ -82,6 +144,7 @@ impl Command {
                 let audience_credential = args.value("--audience-credential")?.map(PathBuf::from);
                 let public_read = args.flag("--public-read")?;
                 let reload = !args.flag("--no-reload")?;
+                let web = WebOptions::parse(&mut args)?;
                 ensure!(
                     public_read || audience_credential.is_some(),
                     "host requires --audience-credential FILE or explicit --public-read"
@@ -105,6 +168,7 @@ impl Command {
                     audience_credential,
                     public_read,
                     reload,
+                    web,
                 }))
             }
             "join" => {
@@ -284,6 +348,64 @@ mod tests {
             .is_err()
         );
         assert!(parse("play", &["deck.md", "--presenter", "--presenter"]).is_err());
+    }
+    #[test]
+    fn web_flags_are_play_and_host_only_and_preserve_explicit_overrides() {
+        let flags = [
+            "deck.md",
+            "--web-assets",
+            "browser",
+            "--web-only",
+            "--web-port",
+            "0",
+            "--web-auth",
+            "token",
+            "--web-host",
+            "127.0.0.1",
+            "--web-public-host",
+            "::1",
+            "--web-allowed-hosts",
+            "a.example,b.example",
+        ];
+        let Command::Play { web, .. } = parse("play", &flags).unwrap() else {
+            panic!("expected play");
+        };
+        assert!(web.only);
+        assert_eq!(web.assets, Some(PathBuf::from("browser")));
+        assert_eq!(web.port, Some(0));
+        assert_eq!(web.auth.as_deref(), Some("token"));
+        assert_eq!(web.host, Some("127.0.0.1".parse().unwrap()));
+        assert_eq!(web.public_host, Some("::1".parse().unwrap()));
+        assert_eq!(
+            web.allowed_hosts,
+            Some(vec!["a.example".into(), "b.example".into()])
+        );
+        let mut host = flags.to_vec();
+        host.extend(["--managed", "--presenter-credential", "p", "--public-read"]);
+        assert!(matches!(parse("host", &host).unwrap(), Command::Host(_)));
+        assert!(parse("join", &["bmux:host", "--web-only"]).is_err());
+        assert!(parse("check", &["deck.md", "--web-assets", "browser"]).is_err());
+        for invalid in [
+            vec!["--web-port", "65536"],
+            vec!["--web-auth", "password"],
+            vec!["--web-host", "localhost"],
+            vec!["--web-public-host", "example.com"],
+            vec!["--web-only", "--web-only"],
+            vec!["--web-assets"],
+        ] {
+            let mut args = vec!["deck.md"];
+            args.extend(invalid);
+            assert!(parse("play", &args).is_err());
+        }
+    }
+    #[test]
+    fn web_network_flags_do_not_imply_presenter_activation() {
+        let Command::Play { web, .. } = parse("play", &["deck.md", "--web-port", "8080"]).unwrap()
+        else {
+            panic!("expected play");
+        };
+        assert!(!web.only);
+        assert!(web.assets.is_none());
     }
     #[test]
     fn supports_all_four_modes() {

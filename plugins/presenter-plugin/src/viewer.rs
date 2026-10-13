@@ -15,6 +15,10 @@ pub(crate) struct RemoteUpdate {
 }
 
 pub(crate) enum Connection {
+    Local {
+        host: std::sync::Arc<std::sync::Mutex<bmux_presenter_runtime::Host>>,
+        participant: String,
+    },
     Tls(bmux_presenter_runtime::transport::Client),
     Bmux {
         client: bmux_client::BmuxClient,
@@ -23,8 +27,12 @@ pub(crate) enum Connection {
     },
 }
 impl Connection {
-    async fn snapshot(&mut self) -> Result<Snapshot> {
+    pub(crate) async fn snapshot(&mut self) -> Result<Snapshot> {
         match self {
+            Self::Local { host, participant } => Ok(host
+                .lock()
+                .map_err(|_| anyhow::anyhow!("host poisoned"))?
+                .snapshot(participant)?),
             Self::Tls(client) => match client.request(Request::Snapshot).await? {
                 Response::Poll(Poll::Snapshot { snapshot, .. }) => Ok(*snapshot),
                 Response::Error(e) => Err(e.into()),
@@ -42,8 +50,16 @@ impl Connection {
             }
         }
     }
-    async fn poll(&mut self, cursor: Cursor) -> Result<Option<Snapshot>> {
+    pub(crate) async fn poll(&mut self, cursor: Cursor) -> Result<Option<Snapshot>> {
         match self {
+            Self::Local { host, participant } => match host
+                .lock()
+                .map_err(|_| anyhow::anyhow!("host poisoned"))?
+                .poll(participant, Some(&cursor))?
+            {
+                Poll::Snapshot { snapshot, .. } => Ok(Some(*snapshot)),
+                Poll::Unchanged(_) => Ok(None),
+            },
             Self::Tls(client) => match client
                 .request(Request::Poll {
                     cursor: Some(cursor),
@@ -80,6 +96,23 @@ impl Connection {
         action: Action,
     ) -> Result<(Cursor, String)> {
         match self {
+            Self::Local { host, participant } => {
+                let ack = host
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("host poisoned"))?
+                    .submit(
+                        participant,
+                        Submission {
+                            expected: cursor,
+                            action_id,
+                            action,
+                        },
+                    )?;
+                Ok((
+                    ack.cursor,
+                    format!("ack {}: {}", ack.action_id, ack.outcome),
+                ))
+            }
             Self::Tls(client) => match client
                 .request(Request::Submit(Submission {
                     expected: cursor,
@@ -139,7 +172,14 @@ impl Connection {
             }
         }
     }
-    async fn prepare(&mut self, snapshot: Snapshot) -> Result<RemoteUpdate> {
+    pub(crate) async fn prepare(&mut self, snapshot: Snapshot) -> Result<RemoteUpdate> {
+        anyhow::ensure!(
+            snapshot
+                .surfaces
+                .iter()
+                .all(|surface| surface.validate(16_384, 512 * 1024).is_ok()),
+            "invalid audience mirror scene"
+        );
         anyhow::ensure!(
             snapshot.assets.len() <= 128,
             "remote asset count exceeds budget"
@@ -157,6 +197,14 @@ impl Connection {
             while bytes.len() < info.bytes {
                 let offset = bytes.len();
                 let chunk = match self {
+                    Self::Local { host, participant } => match host
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("host poisoned"))?
+                        .asset(participant, &info.id, offset, 64 * 1024)?
+                    {
+                        Response::Asset { bytes, .. } => bytes,
+                        _ => bail!("invalid local asset response"),
+                    },
                     Self::Tls(client) => match client
                         .request(Request::Asset {
                             id: info.id.clone(),
@@ -225,7 +273,12 @@ impl Connection {
             acknowledgment: None,
         })
     }
-    async fn leave(&mut self) {
+    pub(crate) async fn leave(&mut self) {
+        if let Self::Local { host, participant } = self
+            && let Ok(mut host) = host.lock()
+        {
+            host.disconnect(participant);
+        }
         if let Self::Bmux {
             client,
             host,
@@ -264,7 +317,7 @@ fn decode(s: view::Snapshot) -> Result<Snapshot> {
     })
 }
 
-async fn connect(
+pub(crate) async fn connect(
     options: &crate::cli::JoinOptions,
     paths: &bmux_config::ConfigPaths,
 ) -> Result<(Connection, Option<u64>)> {
@@ -333,7 +386,18 @@ pub(crate) async fn join(
     context: &NativeCommandContext,
 ) -> Result<()> {
     let paths = crate::commands::paths(context);
-    let (mut connection, next_action_id) = connect(&options, &paths).await?;
+    let (connection, next_action_id) = connect(&options, &paths).await?;
+    run_connected(options, paths, connection, next_action_id, None, None).await
+}
+
+pub(crate) async fn run_connected(
+    options: crate::cli::JoinOptions,
+    paths: bmux_config::ConfigPaths,
+    mut connection: Connection,
+    next_action_id: Option<u64>,
+    browser: Option<crate::web::Browser>,
+    external_stop: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<()> {
     let initial = connection.snapshot().await?;
     let prepared = connection.prepare(initial).await?;
     let initial = prepared.snapshot;
@@ -395,6 +459,12 @@ pub(crate) async fn join(
                     // Reauthenticate only this live host. Never resend the failed action.
                     // Even if its outcome was uncertain, next_action_id reconciles the ledger.
                     let run_id = cursor.run_id.clone();
+                    if matches!(&connection, Connection::Local { .. }) {
+                        let _ = updates
+                            .send(Err(format!("local host observation failed: {error}")))
+                            .await;
+                        break;
+                    }
                     let mut recovered = None;
                     for _ in 0..3 {
                         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -433,8 +503,18 @@ pub(crate) async fn join(
         }
         connection.leave().await;
     });
+    let browser = browser.map(|browser| std::sync::Arc::new(std::sync::Mutex::new(browser)));
+    player.browser = browser.clone();
+    player.stop = external_stop;
     let result = crate::player::run(player).await;
     let _ = stop.send(());
     let _ = network.await;
+    if let Some(browser) = browser {
+        let browser = std::sync::Arc::try_unwrap(browser)
+            .map_err(|_| anyhow::anyhow!("browser lifecycle still shared"))?
+            .into_inner()
+            .map_err(|_| anyhow::anyhow!("browser poisoned"))?;
+        browser.shutdown().await;
+    }
     result
 }

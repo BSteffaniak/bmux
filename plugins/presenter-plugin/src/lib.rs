@@ -11,6 +11,8 @@ mod services;
 mod source;
 mod tls;
 mod viewer;
+mod web;
+mod web_host;
 
 pub use demo::linked_registry as linked_demo_registry;
 pub use owner::LinkedOwner;

@@ -1505,6 +1505,7 @@ dependencies = [
 name = "bmux_config"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "anyhow",
  "bmux_config_doc",
  "bmux_config_doc_derive",
  "bmux_event_models",
@@ -2213,6 +2214,8 @@ dependencies = [
  "bmux_syntax_render",
  "bmux_tui 0.0.1-alpha.1",
  "bmux_tui_runtime",
+ "bmux_web_host",
+ "bmux_web_renderer",
  "clap",
  "crossterm",
  "image",
@@ -2817,6 +2820,9 @@ dependencies = [
 name = "bmux_web_host"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "anyhow",
+ "bmux_tui 0.0.1-alpha.1",
+ "bmux_web_renderer",
  "getrandom 0.3.4",
  "libc",
  "serde",

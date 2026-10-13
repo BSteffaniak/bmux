@@ -136,6 +136,9 @@ pub(crate) struct Player {
     source: Option<PathBuf>,
     last_source: Option<std::time::SystemTime>,
     pub status: Option<String>,
+    pub browser: Option<std::sync::Arc<std::sync::Mutex<crate::web::Browser>>>,
+    pub stop: Option<tokio::sync::watch::Receiver<bool>>,
+    audience_size: Size,
 }
 
 impl Player {
@@ -175,6 +178,9 @@ impl Player {
             source,
             last_source,
             status,
+            browser: None,
+            stop: None,
+            audience_size: Size::new(80, 24),
         }
     }
     fn registry(&self) -> CustomRegistry<'static> {
@@ -385,7 +391,8 @@ impl Player {
         self.painted_viewer.scroll.set(committed_scroll);
         outcome
     }
-    fn reload(&mut self) {
+    fn reload(&mut self) -> bool {
+        let mut changed = false;
         if let Some(updates) = &mut self.reloads {
             for _ in 0..16 {
                 let Ok(update) = updates.try_recv() else {
@@ -410,6 +417,7 @@ impl Player {
                         self.viewer.reset_scroll();
                         reduce(&self.deck, &mut self.state, NavigationAction::Reconcile);
                         self.status = None;
+                        changed = true;
                     }
                     Err(error) => {
                         self.status = Some(format!(
@@ -419,6 +427,7 @@ impl Player {
                 }
             }
         }
+        changed
     }
 }
 
@@ -438,6 +447,12 @@ impl Program for Player {
             .scroll
             .set(self.pending_viewer.scroll.get());
         self.mirror_geometry = std::mem::take(&mut self.pending_mirror_geometry);
+        if let Some(browser) = self.browser.clone() {
+            let size = self.audience_size;
+            if let Ok(mut browser) = browser.lock() {
+                let _ = browser.publish(self, size.width, size.height);
+            }
+        }
         Update::none()
     }
     fn update(&mut self, event: RuntimeEvent<Message>) -> Result<Update<Message>> {
@@ -448,8 +463,15 @@ impl Program for Player {
                 self.reload();
                 if let Some(remote) = &mut self.remote {
                     for _ in 0..16 {
-                        let Ok(update) = remote.updates.try_recv() else {
-                            break;
+                        let update = match remote.updates.try_recv() {
+                            Ok(update) => update,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                if self.browser.is_some() {
+                                    return Ok(Update::exit());
+                                }
+                                break;
+                            }
                         };
                         match update {
                             Ok(update) => {
@@ -596,12 +618,19 @@ fn paint(player: &mut Player, cx: &mut PaintCx<'_, '_>) {
     });
 }
 
-fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintCx<'_, '_>) {
+/// Paint only the audience tree into the supplied viewport. This deliberately
+/// does not call `paint_content`: speaker notes, focus decoration and local status
+/// are not audience content. Browser publication must start here, never by cropping
+/// the speaker's already-painted terminal frame.
+fn paint_audience(
+    player: &mut Player,
+    theme: &PresentationTheme,
+    size: Size,
+    show_local_focus: bool,
+    cx: &mut PaintCx<'_, '_>,
+) {
     let registry = player.registry();
     player.reconcile_focus(&registry);
-    let area = cx.area();
-    let notes_height = if player.presenter { area.height / 3 } else { 0 };
-    let slide_height = area.height.saturating_sub(notes_height).saturating_sub(1);
     let mirror_surface = player.selected_surface();
     let mirror = mirror_surface
         .and_then(|surface| crate::mirror::MirrorComponent::new(surface, 16_384, 512 * 1024).ok());
@@ -613,20 +642,17 @@ fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintC
         &registry,
     )
     .rich_content(&player.rich);
-    if let Some(id) = &player.focused_block {
+    if show_local_focus && let Some(id) = &player.focused_block {
         component = component.focused_block(id);
     }
     if let Some(mirror) = &mirror {
         component = component.content(mirror);
     }
-    let layout = component.layout(
-        Constraints::tight(Size::new(area.width, slide_height)),
-        &mut LayoutCx::default(),
-    );
+    let layout = component.layout(Constraints::tight(size), &mut LayoutCx::default());
     cx.with_child(
         0,
         0,
-        LocalRect::new(0, 0, area.width, slide_height),
+        LocalRect::new(0, 0, size.width, size.height),
         |child| component.paint(&layout, child),
     );
     let mut pending_mirror_geometry = vec![];
@@ -651,6 +677,15 @@ fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintC
     player.pending_mirror_geometry = pending_mirror_geometry;
     player.pending_viewer.scroll.set(player.viewer.scroll.get());
     player.pending_layout = Some(layout);
+}
+
+fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintCx<'_, '_>) {
+    let area = cx.area();
+    let notes_height = if player.presenter { area.height / 3 } else { 0 };
+    let slide_height = area.height.saturating_sub(notes_height).saturating_sub(1);
+    let audience_size = Size::new(area.width, slide_height);
+    player.audience_size = audience_size;
+    paint_audience(player, theme, audience_size, true, cx);
     let Some(slide) = player.state.current_slide(&player.deck) else {
         return;
     };
@@ -695,6 +730,31 @@ fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintC
     );
 }
 
+pub(crate) fn paint_browser_audience(player: &mut Player, cx: &mut PaintCx<'_, '_>) {
+    // Browser preparation cannot install pending geometry for local keyboard/mouse
+    // admission or alter the local speaker's scrolling/focus state.
+    let pending_layout = player.pending_layout.take();
+    let pending_geometry = std::mem::take(&mut player.pending_mirror_geometry);
+    let pending_scroll = player.pending_viewer.scroll.get();
+    let scroll = player.viewer.scroll.get();
+    let focused = player.focused_block.clone();
+    let theme = PresentationTheme::for_deck(&player.deck);
+    let area = cx.area();
+    cx.fill(area, " ", theme.background);
+    paint_audience(
+        player,
+        &theme,
+        Size::new(area.width, area.height),
+        false,
+        cx,
+    );
+    player.pending_layout = pending_layout;
+    player.pending_mirror_geometry = pending_geometry;
+    player.pending_viewer.scroll.set(pending_scroll);
+    player.viewer.scroll.set(scroll);
+    player.focused_block = focused;
+}
+
 pub(crate) async fn run(player: Player) -> Result<()> {
     ensure!(
         std::io::stdin().is_terminal() && stdout().is_terminal(),
@@ -709,7 +769,7 @@ pub(crate) async fn run(player: Player) -> Result<()> {
     }
 }
 
-async fn run_owned(mut player: Player) -> Result<()> {
+fn start_reloads(player: &mut Player) -> Option<tokio::task::JoinHandle<()>> {
     let mut reload_task = None;
     if let Some(source) = player.source.take() {
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
@@ -749,10 +809,57 @@ async fn run_owned(mut player: Player) -> Result<()> {
             }
         }));
     }
+    reload_task
+}
+
+pub(crate) async fn run_headless(
+    mut player: Player,
+    mut browser: crate::web::Browser,
+) -> Result<()> {
+    eprintln!(
+        "Static read-only audience view; browser navigation is disabled. Ctrl-C closes the listener."
+    );
+    let reload_task = start_reloads(&mut player);
+    let mut width = 80;
+    let mut height = 24;
+    let mut tick = tokio::time::interval(Duration::from_millis(300));
+    if let Err(error) = browser.publish(&mut player, width, height) {
+        eprintln!("Audience update rejected; committed scene retained: {error}");
+    }
+    let result = loop {
+        let changed = tokio::select! {
+            signal = tokio::signal::ctrl_c() => { break signal.map_err(anyhow::Error::from); }
+            request = browser.requests.recv() => {
+                if let Some(request) = request {
+                    if browser.requests.is_current(&request) {
+                        let changed = width != request.cols || height != request.rows;
+                        width = request.cols;
+                        height = request.rows;
+                        changed
+                    } else { false }
+                } else { break Ok(()); }
+            }
+            _ = tick.tick() => { player.reload() }
+        };
+        if changed && let Err(error) = browser.publish(&mut player, width, height) {
+            eprintln!("Audience update rejected; committed scene retained: {error}");
+        }
+    };
+    if let Some(task) = reload_task {
+        task.abort();
+        let _ = task.await;
+    }
+    browser.shutdown().await;
+    result
+}
+
+async fn run_owned(mut player: Player) -> Result<()> {
+    let reload_task = start_reloads(&mut player);
     let (cols, rows) = crossterm::terminal::size()?;
     let terminal = Terminal::new(stdout(), Rect::new(0, 0, cols, rows));
     let presenter =
         ImageTerminalPresenter::detect(terminal, paint, bmux_image::ImageConfig::default());
+    let stop = player.stop.take();
     let (runtime, handle) = Runtime::new(player, presenter, RuntimeConfig::default());
     let mut input = TerminalInput::start::<Player>(handle.clone(), Message::InputError);
     let tick_handle = handle.clone();
@@ -767,6 +874,20 @@ async fn run_owned(mut player: Player) -> Result<()> {
     });
     let signal_handle = handle.clone();
     let signals = tokio::spawn(async move {
+        let external_stop = async {
+            if let Some(mut stop) = stop {
+                while !*stop.borrow() {
+                    if stop.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            _ = external_stop => (),
+            _ = async {
         #[cfg(unix)]
         {
             if let Ok(mut terminate) =
@@ -780,6 +901,8 @@ async fn run_owned(mut player: Player) -> Result<()> {
         #[cfg(not(unix))]
         {
             let _ = tokio::signal::ctrl_c().await;
+        }
+            } => (),
         }
         let _ = signal_handle.send(Message::Interrupted).await;
     });
@@ -1040,6 +1163,125 @@ mod tests {
         assert_eq!(resized.input_point(12, 1), None);
         // Saved placement still describes the last committed frame, not the resize.
         assert_eq!(placement.input_point(21, 6), Some((23, 15)));
+    }
+    #[test]
+    fn browser_prepared_scene_and_transport_are_audience_only() {
+        use bmux_presenter::BlockKind;
+        use bmux_tui::presentation::{PresentationLimits, PresentationState as Scene};
+        let image = |destination: &str| BlockKind::Image {
+            destination: destination.into(),
+            alt: "public image".into(),
+            rows: 2,
+        };
+        let deck = DeckBuilder::new("d")
+            .slide(
+                SlideBuilder::new("s")
+                    .text("public", "PUBLIC")
+                    .custom("counter", "counter", serde_json::json!({}))
+                    .block("image", image("visible"))
+                    .pause()
+                    .text("hidden", "HIDDENSECRET")
+                    .block("hidden-image", image("hidden"))
+                    .notes("PRIVATESECRET")
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, true);
+        player.status = Some("PRIVATECONTROL".into());
+        for id in ["visible", "hidden"] {
+            player.rich.images.insert(
+                id.into(),
+                bmux_tui::image::ImagePayload::Pixels {
+                    bytes: vec![255, 0, 0, 255],
+                    width: 1,
+                    height: 1,
+                    format: bmux_tui::image::ImagePixelFormat::Rgba8,
+                },
+            );
+        }
+        let scene = Scene::new(Rect::new(0, 0, 60, 30));
+        let prepared = scene
+            .prepare_bounded(
+                PresentationLimits {
+                    max_cells: 262_144,
+                    max_entries: 262_144,
+                    max_bytes: 32 * 1024 * 1024,
+                },
+                bmux_tui::damage::Damage::Full,
+                |cx| paint_browser_audience(&mut player, cx),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            prepared.images().len(),
+            1,
+            "unrevealed images must not be exported"
+        );
+        let frame =
+            bmux_web_renderer::BrowserFrame::from_prepared_in_generation("audience", 1, &prepared)
+                .unwrap();
+        let json = bmux_web_renderer::encode_json(&frame).unwrap();
+        let all_metadata = format!("{prepared:?} {json}");
+        for private in [
+            "PRIVATESECRET",
+            "PRIVATECONTROL",
+            "HIDDENSECRET",
+            "hidden-image",
+        ] {
+            assert!(
+                !all_metadata.contains(private),
+                "browser payload leaked {private}"
+            );
+        }
+        let cells = (0..30)
+            .filter_map(|y| prepared.buffer().row_symbols(y))
+            .collect::<String>();
+        assert!(cells.contains("PUBLIC"));
+        assert!(
+            cells.contains("Counter"),
+            "linked custom factory must render directly"
+        );
+        assert!(player.presenter);
+    }
+    #[test]
+    fn audience_tree_excludes_private_status_notes_and_unrevealed_content() {
+        let deck = DeckBuilder::new("d")
+            .slide(
+                SlideBuilder::new("s")
+                    .text("public", "PUBLIC")
+                    .pause()
+                    .text("hidden", "HIDDENSECRET")
+                    .notes("PRIVATESECRET")
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, true);
+        player.status = Some("PRIVATECONTROL".into());
+        let theme = PresentationTheme::for_deck(&player.deck);
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 40, 20));
+        terminal
+            .draw(|cx| {
+                cx.fill(cx.area(), " ", theme.background);
+                paint_audience(&mut player, &theme, Size::new(40, 20), false, cx);
+            })
+            .unwrap();
+        let cells = (0..20)
+            .filter_map(|y| terminal.retained_buffer().unwrap().row_symbols(y))
+            .collect::<String>();
+        assert!(cells.contains("PUBLIC"));
+        for private in ["PRIVATESECRET", "PRIVATECONTROL", "HIDDENSECRET"] {
+            assert!(!cells.contains(private), "audience leaked {private}");
+        }
+        // Exporting the audience must not turn off the independent local speaker UI.
+        assert!(player.presenter);
+        terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+        let local = (0..20)
+            .filter_map(|y| terminal.retained_buffer().unwrap().row_symbols(y))
+            .collect::<String>();
+        assert!(local.contains("PRIVATESECRET"));
+        assert!(local.contains("PRIVATECONTROL"));
     }
     #[test]
     fn audience_hides_notes_and_theme_changes_affect_paint() {

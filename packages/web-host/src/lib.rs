@@ -7,7 +7,11 @@
 mod acceptance;
 mod assets;
 mod http;
+#[cfg(feature = "presentation")]
+mod presentation;
 mod publication;
+#[cfg(feature = "presentation")]
+pub use presentation::BrowserPublisher;
 pub use publication::{BinaryPresentation, Resource};
 mod viewport;
 pub use viewport::{ViewControl, ViewportMode, ViewportRequest, ViewportRequests};

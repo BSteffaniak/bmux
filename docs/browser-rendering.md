@@ -196,6 +196,16 @@ When expanded JSON exceeds its independent byte limit, that endpoint returns
 406 while the compact binary presentation remains available. Protocol version
 mismatches fail explicitly; rebuild native and WASM assets together.
 
+## Presenter audience output
+
+`present play` and `present host` use the same prepared TUI browser publisher for
+an explicit read-only audience projection. See [Presenter browser audience output](presenter-web.md)
+for mirror/web-only syntax, private-notes boundaries, configuration precedence,
+authorized host navigation, and the separate real-browser acceptance harness.
+Shared `[web]`/`BMUX_WEB_*` network settings do not opt presenter output in.
+Presenter browser acceptance requires coordinator-built artifacts; documentation
+of the contract is not evidence that the runtime suite has passed.
+
 ## Acceptance testing
 
 `scripts/smoke-web-browser.sh` runs the real browser acceptance harness with explicit built artifacts and isolated owned runtime state. It requires Python, a Chromium executable, native BMUX, built WASM assets, and the snapshot example's JSON. Missing dependencies are failures, not successful skips. See `--help` for artifact arguments and credential-safe evidence output.

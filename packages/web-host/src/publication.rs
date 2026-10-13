@@ -65,12 +65,7 @@ pub(crate) fn validate(
     resources: &BTreeMap<String, Resource>,
     current: Option<&Snapshot>,
 ) -> io::Result<()> {
-    let invalid = || {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid publication representations",
-        )
-    };
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
     if let Some(binary) = binary {
         let valid_bytes = |bytes: &Arc<[u8]>| !bytes.is_empty() && bytes.len() <= max_bytes;
         if !valid_bytes(&binary.snapshot) {
@@ -88,7 +83,9 @@ pub(crate) fn validate(
                 || *base >= revision
                 || !current.is_some_and(|value| value.revision == *base && value.binary.is_some()))
         {
-            return Err(invalid());
+            return Err(invalid(
+                "browser delta rejected: invalid size or predecessor revision",
+            ));
         }
     }
     if resources.len() > MAX_RESOURCES {
@@ -120,7 +117,9 @@ pub(crate) fn validate(
             || !mime.contains('/')
             || !mime.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
         {
-            return Err(invalid());
+            return Err(invalid(
+                "browser resource manifest rejected: invalid SHA-256 ID or MIME",
+            ));
         }
         let existing = current.and_then(|value| {
             value
@@ -131,7 +130,9 @@ pub(crate) fn validate(
         let digest = Sha256::digest(&resource.bytes);
         let expected: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
         if id != &expected || existing.is_some_and(|value| value != resource) {
-            return Err(invalid());
+            return Err(invalid(
+                "browser resource rejected: digest mismatch or changed retained content",
+            ));
         }
         total += resource.bytes.len();
         if total > MAX_RETAINED_BYTES {

@@ -139,6 +139,7 @@ impl ConfigLoadOverrides {
 
 pub mod keybind;
 pub mod paths;
+pub mod web;
 
 pub use bmux_config_doc::{ConfigDocSchema, FieldDoc};
 pub use keybind::{KeyBindingConfig, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, ResolvedTimeout};
@@ -1012,6 +1013,10 @@ pub struct BmuxConfig {
     /// Local browser presentation listener and access policy
     #[config_doc(nested)]
     pub web: WebConfig,
+    /// Presenter plugin browser output defaults (disabled unless explicitly selected)
+    #[config_doc(nested)]
+    #[serde(skip_serializing_if = "PresenterConfig::is_default")]
+    pub presenter: PresenterConfig,
     /// Visual styling: pane borders and window titles
     #[config_doc(nested)]
     pub appearance: AppearanceConfig,
@@ -1051,6 +1056,46 @@ pub struct BmuxConfig {
     /// Sandbox workflow defaults for cleanup and isolation operations
     #[config_doc(nested)]
     pub sandbox: SandboxConfig,
+}
+
+/// Declarative defaults consumed by the presenter plugin, not core runtime behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "presenter")]
+#[serde(default)]
+pub struct PresenterConfig {
+    /// Browser output configuration
+    #[config_doc(nested)]
+    pub web: PresenterWebConfig,
+}
+
+impl PresenterConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Browser output configuration for the presenter plugin.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "presenter.web")]
+#[serde(default)]
+pub struct PresenterWebConfig {
+    /// Browser output mode: off, mirror terminal output, or browser only
+    pub mode: PresenterWebMode,
+    /// Optional browser asset directory; environment/CLI may override it
+    pub assets: Option<std::path::PathBuf>,
+}
+
+/// Explicit presenter browser output mode; assets never implicitly enable output.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenterWebMode {
+    /// Terminal output only
+    #[default]
+    Off,
+    /// Terminal and browser output
+    Mirror,
+    /// Browser output only
+    Only,
 }
 
 /// Browser hosting with opt-in token authentication.

@@ -1,6 +1,5 @@
 //! Local read-only browser attachment and explicit terminal mirroring.
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bmux_web_renderer::{BrowserFrame, SurfaceProvenance};
@@ -61,9 +60,8 @@ fn start_browser_observer(
 ) {
     let (mut publisher, observer) = attach_observer_channel();
     let epoch = observer.epoch();
-    let mut revision = 0_u64;
-    let mut previous: Option<BrowserFrame> = None;
-    let status_control = control.clone();
+    let mut browser = bmux_web_host::BrowserPublisher::new(feed_publisher, control.clone());
+    let status_control = control;
     publisher.set_rejection(move |message| {
         status_control.set_presentation_status(message);
         if let Some(message) = message { eprintln!("{message}; retaining the last complete browser frame until the next source or viewport update"); }
@@ -74,181 +72,20 @@ fn start_browser_observer(
             "browser observer epoch changed unexpectedly"
         );
         let frame = project_frame(snapshot).context("browser presentation rejected")?;
-        let next_revision = revision
-            .checked_add(1)
-            .context("browser transport revision exhausted")?;
-        let binary = bmux_web_renderer::wire::encode_binary_with_resources(&frame)?;
-        let delta = previous
-            .as_ref()
-            .filter(|base| {
-                base.generation() == frame.generation()
-                    && base.buffer().area() == frame.buffer().area()
-            })
-            // A full frame is already deliverable. Optional delta admission
-            // must not veto it; repair with the full representation instead.
-            .and_then(|base| {
-                bmux_web_renderer::wire::encode_delta_with_resources(&frame, base).ok()
-            })
-            .filter(|bytes| bytes.len() < binary.len())
-            .map(|bytes| (revision, Arc::<[u8]>::from(bytes)));
-        let resources = bmux_web_renderer::wire::extract_resources(&frame)?
-            .into_iter()
-            .map(|resource| {
-                let (bytes, mime_type) = match resource.payload {
-                    bmux_tui::image::ImagePayload::Png { bytes, .. } => (bytes, "image/png"),
-                    bmux_tui::image::ImagePayload::Pixels { bytes, .. } => {
-                        (bytes, "application/octet-stream")
-                    }
-                };
-                (
-                    resource.id,
-                    bmux_web_host::Resource {
-                        bytes: bytes.into(),
-                        mime_type: mime_type.to_owned(),
-                    },
-                )
-            })
-            .collect();
-        // The diagnostic JSON representation must not veto a deliverable binary view.
-        let json = bmux_web_renderer::encode_json(&frame)
-            .ok()
-            .map(|json| Arc::<[u8]>::from(json.into_bytes()));
-        feed_publisher.publish_representations(
-            next_revision,
-            json,
-            bmux_web_host::BinaryPresentation {
-                snapshot: binary.into(),
-                delta,
-            },
-            resources,
-        )?;
-        control.set_generation(&generation(snapshot))?;
-        revision = next_revision;
-        previous = Some(frame);
+        browser.publish_frame(frame)?;
         Ok(())
     });
     (publisher, observer)
 }
 
-#[derive(Clone, Copy, Default)]
-pub(super) struct WebOptions<'a> {
-    pub port: Option<u16>,
-    pub auth: Option<&'a str>,
-    pub host: Option<std::net::IpAddr>,
-    pub public_host: Option<std::net::IpAddr>,
-    pub allowed_hosts: Option<&'a [String]>,
-}
-
-fn select_ip(
-    cli: Option<std::net::IpAddr>,
-    env: std::result::Result<String, std::env::VarError>,
-    configured: Option<std::net::IpAddr>,
-    name: &str,
-) -> Result<Option<std::net::IpAddr>> {
-    match (cli, env) {
-        (Some(ip), _) => Ok(Some(ip)),
-        (None, Ok(value)) => {
-            Ok(Some(value.parse().with_context(|| {
-                format!("{name} must be an IPv4 or IPv6 address")
-            })?))
-        }
-        (None, Err(std::env::VarError::NotPresent)) => Ok(configured),
-        (None, Err(error)) => Err(error.into()),
-    }
-}
-
-fn resolve_web_settings(options: WebOptions<'_>) -> Result<bmux_config::WebConfig> {
-    let config = bmux_config::BmuxConfig::load()?.web;
-    let mut settings = select_web_settings(
-        config.clone(),
-        (options.port, options.auth),
-        std::env::var("BMUX_WEB_PORT"),
-        std::env::var("BMUX_WEB_AUTH"),
-    )?;
-    settings.host = select_ip(
-        options.host,
-        std::env::var("BMUX_WEB_HOST"),
-        Some(config.host),
-        "BMUX_WEB_HOST",
-    )?
-    .context("missing browser bind host")?;
-    settings.public_host = select_ip(
-        options.public_host,
-        std::env::var("BMUX_WEB_PUBLIC_HOST"),
-        config.public_host,
-        "BMUX_WEB_PUBLIC_HOST",
-    )?;
-    settings.allowed_hosts = select_allowed_hosts(
-        options.allowed_hosts,
-        std::env::var("BMUX_WEB_ALLOWED_HOSTS"),
-        config.allowed_hosts,
-    )?;
-    Ok(settings)
-}
-
-fn select_allowed_hosts(
-    cli: Option<&[String]>,
-    env: std::result::Result<String, std::env::VarError>,
-    configured: Vec<String>,
-) -> Result<Vec<String>> {
-    match (cli, env) {
-        (Some(hosts), _) => Ok(hosts.to_vec()),
-        (None, Ok(value)) => Ok(if value.is_empty() {
-            Vec::new()
-        } else {
-            value
-                .split(',')
-                .map(|host| host.trim().to_owned())
-                .collect()
-        }),
-        (None, Err(std::env::VarError::NotPresent)) => Ok(configured),
-        (None, Err(error)) => Err(error.into()),
-    }
-}
-
-fn select_web_settings(
-    config: bmux_config::WebConfig,
-    options: (Option<u16>, Option<&str>),
-    port_env: std::result::Result<String, std::env::VarError>,
-    auth_env: std::result::Result<String, std::env::VarError>,
-) -> Result<bmux_config::WebConfig> {
-    let port = match options.0 {
-        Some(port) => port,
-        None => match port_env {
-            Ok(value) => value
-                .parse()
-                .context("BMUX_WEB_PORT must be a port from 0 to 65535")?,
-            Err(std::env::VarError::NotPresent) => config.port,
-            Err(error) => return Err(error.into()),
-        },
-    };
-    let auth_value = match options.1 {
-        Some(value) => Some(value.to_owned()),
-        None => match auth_env {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(error.into()),
-        },
-    };
-    let auth = match auth_value.as_deref() {
-        None => config.auth,
-        Some("none") => bmux_config::WebAuth::None,
-        Some("token") => bmux_config::WebAuth::Token,
-        Some(_) => anyhow::bail!("web authentication must be none or token"),
-    };
-    Ok(bmux_config::WebConfig {
-        port,
-        auth,
-        ..config
-    })
-}
+pub(super) use bmux_config::web::WebOptions;
 
 fn configure_browser_host(
     assets: std::path::PathBuf,
     web_only: bool,
     options: WebOptions<'_>,
 ) -> Result<bmux_web_host::HostConfig> {
-    let settings = resolve_web_settings(options)?;
+    let settings = bmux_config::web::resolve(bmux_config::BmuxConfig::load()?.web, options)?;
     let mut config = bmux_web_host::HostConfig::new(assets);
     config.port = settings.port;
     config.host = settings.host;
@@ -300,7 +137,10 @@ pub(super) async fn run(
         provider.requires_fallback_client(),
         "browser presentation currently requires a local retained attach"
     );
-    let assets = assets.canonicalize().context("browser asset directory")?;
+    let assets = bmux_config::web::assets(None, Some(assets.to_path_buf()))
+        .context("missing browser asset directory")?
+        .canonicalize()
+        .context("browser asset directory")?;
     let limits = bmux_web_host::Limits::default();
     let (feed_publisher, feed) = bmux_web_host::snapshot_feed(limits.max_snapshot_bytes)?;
     let config = configure_browser_host(assets, web_only, web_options)?;
@@ -388,142 +228,4 @@ pub(super) async fn run(
     host.invalidate_view();
     host.shutdown().await;
     outcome
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn allowed_host_precedence_and_explicit_empty_override() {
-        let configured = vec!["configured.example:8080".into()];
-        let cli = vec!["cli.example:8080".into()];
-        assert_eq!(
-            select_allowed_hosts(
-                Some(&cli),
-                Ok("env.example:8080".into()),
-                configured.clone()
-            )
-            .unwrap(),
-            cli
-        );
-        assert!(
-            select_allowed_hosts(Some(&[]), Ok("env.example:8080".into()), configured.clone())
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            select_allowed_hosts(
-                None,
-                Ok(" a.example:8080, b.example:8080 ".into()),
-                configured.clone()
-            )
-            .unwrap(),
-            vec!["a.example:8080", "b.example:8080"]
-        );
-        assert!(
-            select_allowed_hosts(None, Ok(String::new()), configured.clone())
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            select_allowed_hosts(
-                None,
-                Err(std::env::VarError::NotPresent),
-                configured.clone()
-            )
-            .unwrap(),
-            configured
-        );
-    }
-
-    #[test]
-    fn web_ip_settings_precedence_and_validation() {
-        let absent = || Err(std::env::VarError::NotPresent);
-        let local = "127.0.0.1".parse().unwrap();
-        let lan = "192.0.2.10".parse().unwrap();
-        let wildcard = "0.0.0.0".parse().unwrap();
-        assert_eq!(
-            select_ip(None, absent(), Some(local), "host").unwrap(),
-            Some(local)
-        );
-        assert_eq!(
-            select_ip(None, Ok("192.0.2.10".into()), Some(local), "host").unwrap(),
-            Some(lan)
-        );
-        assert_eq!(
-            select_ip(Some(wildcard), Ok("invalid".into()), Some(local), "host").unwrap(),
-            Some(wildcard)
-        );
-        assert_eq!(
-            select_ip(None, absent(), None, "public_host").unwrap(),
-            None
-        );
-        assert!(select_ip(None, Ok("hostname.example".into()), None, "host").is_err());
-        assert!(select_ip(None, Ok(String::new()), None, "public_host").is_err());
-        assert_eq!(
-            select_ip(None, Ok("::1".into()), None, "host").unwrap(),
-            Some("::1".parse().unwrap())
-        );
-        let config: bmux_config::WebConfig =
-            toml::from_str("host = '0.0.0.0'\npublic_host = '192.0.2.10'\nauth = 'token'").unwrap();
-        assert_eq!(config.host, wildcard);
-        assert_eq!(config.public_host, Some(lan));
-        assert_eq!(config.port, 8080);
-        assert_eq!(config.auth, bmux_config::WebAuth::Token);
-        assert!(toml::from_str::<bmux_config::WebConfig>("host = 'bad'").is_err());
-    }
-
-    #[test]
-    fn web_settings_precedence_and_invalid_environment() {
-        let absent = || Err(std::env::VarError::NotPresent);
-        let defaults = select_web_settings(
-            bmux_config::WebConfig::default(),
-            (None, None),
-            absent(),
-            absent(),
-        )
-        .unwrap();
-        assert_eq!(defaults.port, 8080);
-        assert_eq!(defaults.auth, bmux_config::WebAuth::None);
-        let configured = bmux_config::WebConfig {
-            port: 9090,
-            auth: bmux_config::WebAuth::Token,
-            ..bmux_config::WebConfig::default()
-        };
-        let env = select_web_settings(
-            configured.clone(),
-            (None, None),
-            Ok("8081".into()),
-            Ok("none".into()),
-        )
-        .unwrap();
-        assert_eq!(env.port, 8081);
-        assert_eq!(env.auth, bmux_config::WebAuth::None);
-        let cli = select_web_settings(
-            configured.clone(),
-            (Some(0), Some("token")),
-            Ok("bad".into()),
-            Ok("bad".into()),
-        )
-        .unwrap();
-        assert_eq!(cli.port, 0);
-        assert_eq!(cli.auth, bmux_config::WebAuth::Token);
-        assert!(
-            select_web_settings(
-                configured.clone(),
-                (None, None),
-                Ok("65536".into()),
-                absent()
-            )
-            .is_err()
-        );
-        assert!(
-            select_web_settings(configured.clone(), (None, None), absent(), Ok("bad".into()))
-                .is_err()
-        );
-        let inherited = select_web_settings(configured, (None, None), absent(), absent()).unwrap();
-        assert_eq!(inherited.port, 9090);
-        assert_eq!(inherited.auth, bmux_config::WebAuth::Token);
-    }
 }

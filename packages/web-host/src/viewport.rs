@@ -28,6 +28,15 @@ impl ViewControl {
         self.viewport.set_generation(generation)
     }
 
+    #[cfg(feature = "presentation")]
+    pub(crate) fn publish_generation<T>(
+        &self,
+        generation: &str,
+        publish: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.viewport.publish_generation(generation, publish)
+    }
+
     /// Report bounded content-free publication status; does not change output authority.
     pub fn set_presentation_status(&self, status: Option<&str>) {
         if let Ok(mut control) = self.viewport.control.lock() {
@@ -216,6 +225,16 @@ impl Viewport {
     }
 
     pub(crate) fn set_generation(&self, generation: &str) -> io::Result<()> {
+        self.publish_generation(generation, || Ok(()))
+    }
+
+    // Hold lifecycle/generation authority while committing a complete publication.
+    // A closed host or invalid generation must not advance the feed first.
+    fn publish_generation<T>(
+        &self,
+        generation: &str,
+        publish: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
         if generation.is_empty()
             || generation.len() > 128
             || !generation.bytes().all(|b| b.is_ascii_graphic())
@@ -232,11 +251,12 @@ impl Viewport {
         if control.closed {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "view closed"));
         }
+        let result = publish()?;
         if control.generation.as_deref() != Some(generation) {
             control.generation = Some(generation.to_owned());
             self.sender.send_replace(None);
         }
-        Ok(())
+        Ok(result)
     }
 
     pub(crate) fn close(&self) {
