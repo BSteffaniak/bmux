@@ -1053,11 +1053,15 @@ pub struct BmuxConfig {
     pub sandbox: SandboxConfig,
 }
 
-/// Loopback browser hosting. Token-free access exposes output to local users.
+/// Browser hosting. Unauthenticated access is loopback-only.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "web")]
 #[serde(default)]
 pub struct WebConfig {
+    /// Listener IP (default 127.0.0.1); non-loopback requires token auth
+    pub host: std::net::IpAddr,
+    /// Browser-facing IP; required when host is 0.0.0.0 or ::
+    pub public_host: Option<std::net::IpAddr>,
     /// Loopback HTTP port; zero requests an ephemeral port
     pub port: u16,
     /// Browser authentication: none (local users) or token (capability URL)
@@ -1066,12 +1070,14 @@ pub struct WebConfig {
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
+            host: std::net::Ipv4Addr::LOCALHOST.into(),
+            public_host: None,
             port: 8080,
             auth: WebAuth::None,
         }
     }
 }
-/// Authentication for the loopback-only browser listener.
+/// Authentication for the browser listener.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum WebAuth {

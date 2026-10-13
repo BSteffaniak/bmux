@@ -347,10 +347,16 @@ pub enum Command {
         /// Serve this terminal view read-only in a local browser using these built WASM assets
         #[arg(long, value_name = "ASSET_DIRECTORY")]
         web_assets: Option<std::path::PathBuf>,
-        /// Loopback browser port (default 8080); zero selects an ephemeral port
+        /// Listener IP (default 127.0.0.1); remote binds require --web-auth token
+        #[arg(long, requires = "web_assets")]
+        web_host: Option<std::net::IpAddr>,
+        /// Browser-facing IP for wildcard binds (0.0.0.0 or ::)
+        #[arg(long, requires = "web_assets")]
+        web_public_host: Option<std::net::IpAddr>,
+        /// Browser port (default 8080); zero selects an ephemeral port
         #[arg(long, requires = "web_assets")]
         web_port: Option<u16>,
-        /// Loopback browser access: none (default) or token
+        /// Browser access: none (loopback default) or token (required remotely)
         #[arg(long, value_parser = ["none", "token"], requires = "web_assets")]
         web_auth: Option<String>,
         /// Attach without terminal input/output; the first browser controls this view's viewport
@@ -3181,6 +3187,43 @@ mod tests {
             cli.command,
             Some(Command::KillAllSessions { force_local: true })
         ));
+    }
+
+    #[test]
+    fn web_network_options_parse_ipv4_ipv6_and_reject_hostnames() {
+        for ip in ["0.0.0.0", "192.0.2.10", "::", "::1"] {
+            let cli = Cli::try_parse_from([
+                "bmux",
+                "attach",
+                "--web-assets",
+                "/assets",
+                "--web-host",
+                ip,
+                "--web-public-host",
+                "192.0.2.10",
+                "--web-auth",
+                "token",
+            ])
+            .unwrap();
+            assert!(
+                matches!(cli.command, Some(Command::Attach { web_host: Some(host), web_public_host: Some(public), .. })
+                if host == ip.parse::<std::net::IpAddr>().unwrap() && public == "192.0.2.10".parse::<std::net::IpAddr>().unwrap())
+            );
+        }
+        assert!(Cli::try_parse_from(["bmux", "attach", "--web-host", "0.0.0.0"]).is_err());
+        for option in ["--web-host", "--web-public-host"] {
+            assert!(
+                Cli::try_parse_from([
+                    "bmux",
+                    "attach",
+                    "--web-assets",
+                    "/assets",
+                    option,
+                    "example.com"
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]

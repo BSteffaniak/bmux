@@ -1,4 +1,4 @@
-//! Domain-neutral, bounded browser hosting on IPv4 loopback.
+//! Domain-neutral, bounded browser hosting with explicit authenticated remote binding.
 //! Encoded snapshots are opaque: callers own presentation semantics and serialization.
 #![cfg(unix)]
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
@@ -13,7 +13,7 @@ mod viewport;
 pub use viewport::{ViewControl, ViewportMode, ViewportRequest, ViewportRequests};
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -79,7 +79,7 @@ impl Limits {
 /// Loopback HTTP authentication policy. Origin and Host checks apply in both modes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AuthMode {
-    /// Local unauthenticated serving; never binds a remote interface.
+    /// Unauthenticated loopback-only serving.
     #[default]
     None,
     /// Require an ephemeral bearer capability on non-asset routes.
@@ -89,7 +89,11 @@ pub enum AuthMode {
 /// Assets are explicit build output, never discovered recursively or built by this crate.
 #[derive(Clone, Debug)]
 pub struct HostConfig {
-    /// IPv4 loopback port; zero requests an ephemeral port. Default is 8080.
+    /// Bind IP; non-loopback requires token authentication.
+    pub host: IpAddr,
+    /// Browser-facing IP for exact Host/Origin checks. Required for wildcard binds.
+    pub public_host: Option<IpAddr>,
+    /// HTTP port; zero requests an ephemeral port. Default is 8080.
     pub port: u16,
     pub auth_mode: AuthMode,
     pub asset_directory: PathBuf,
@@ -102,6 +106,8 @@ impl HostConfig {
     #[must_use]
     pub fn new(asset_directory: PathBuf) -> Self {
         Self {
+            host: Ipv4Addr::LOCALHOST.into(),
+            public_host: None,
             port: 8080,
             auth_mode: AuthMode::None,
             asset_directory,
@@ -245,6 +251,7 @@ impl SnapshotPublisher {
 /// Owns all serving tasks. No Debug implementation: the capability is intentionally secret.
 pub struct HostHandle {
     address: SocketAddr,
+    public_address: SocketAddr,
     token: Option<String>,
     task: Option<JoinHandle<()>>,
     stop: watch::Sender<bool>,
@@ -282,12 +289,12 @@ impl HostHandle {
         self.address
     }
 
-    /// Local URL; in token mode includes a sensitive capability. Never log token URLs.
+    /// Browser-facing URL; in token mode includes a sensitive capability. Never log token URLs.
     #[must_use]
     pub fn bootstrap_url(&self) -> String {
         self.token.as_ref().map_or_else(
-            || format!("http://{}/", self.address),
-            |token| format!("http://{}/#token={token}", self.address),
+            || format!("http://{}/", self.public_address),
+            |token| format!("http://{}/#token={token}", self.public_address),
         )
     }
 
@@ -311,12 +318,42 @@ impl Drop for HostHandle {
     }
 }
 
-/// Requires an active Tokio runtime. Binds only IPv4 loopback on the configured port.
+fn validate_network(config: &HostConfig) -> io::Result<()> {
+    let public = config.public_host.unwrap_or(config.host);
+    if public.is_unspecified() || public.is_multicast() || config.host.is_multicast() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "wildcard binds require a concrete public_host IP; multicast is unsupported",
+        ));
+    }
+    if config.host.is_ipv4() != public.is_ipv4() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "host and public_host must use the same IP family",
+        ));
+    }
+    if !config.host.is_loopback() && config.auth_mode != AuthMode::Token {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "non-loopback hosting requires token authentication (--web-auth token)",
+        ));
+    }
+    if !config.host.is_unspecified() && config.host != public {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "public_host must match a concrete bind host",
+        ));
+    }
+    Ok(())
+}
+
+/// Requires an active Tokio runtime. Defaults to IPv4 loopback; remote binds require tokens.
 ///
 /// # Errors
 /// Rejects invalid budgets/assets, unavailable OS entropy, and bind failures.
 pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHandle> {
     config.limits.validate()?;
+    validate_network(&config)?;
     if feed.max_bytes > config.limits.max_snapshot_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -336,8 +373,9 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
     } else {
         None
     };
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
+    let listener = TcpListener::bind((config.host, config.port)).await?;
     let address = listener.local_addr()?;
+    let public_address = SocketAddr::new(config.public_host.unwrap_or(config.host), address.port());
     let (viewport, viewport_requests) = viewport::Viewport::new(config.viewport_mode);
     let viewport = Arc::new(viewport);
     let state = Arc::new(http::State {
@@ -346,8 +384,8 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
         limits: config.limits,
         auth_mode: config.auth_mode,
         token: token.clone().unwrap_or_default(),
-        authority: address.to_string(),
-        origin: format!("http://{address}"),
+        authority: public_address.to_string(),
+        origin: format!("http://{public_address}"),
     });
     let (stop, mut stopped) = watch::channel(false);
     let task = tokio::spawn(async move {
@@ -360,8 +398,8 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
                 result = feed.receiver.changed() => { if result.is_err() { break; } },
                 Some(_) = connections.join_next(), if !connections.is_empty() => {},
                 accepted = listener.accept() => {
-                    let Ok((stream, peer)) = accepted else { break; };
-                    if !peer.ip().is_loopback() || connections.len() >= state.limits.max_connections {
+                    let Ok((stream, _peer)) = accepted else { break; };
+                    if connections.len() >= state.limits.max_connections {
                         drop(stream);
                         continue;
                     }
@@ -379,6 +417,7 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
         viewport_requests: Some(viewport_requests),
         viewport,
         address,
+        public_address,
         token,
         task: Some(task),
         stop,

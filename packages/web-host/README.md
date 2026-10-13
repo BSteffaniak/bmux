@@ -1,6 +1,6 @@
 # bmux_web_host
 
-Reusable **Unix-native** loopback HTTP hosting for opaque immutable encoded
+Reusable **Unix-native** bounded HTTP hosting for opaque immutable encoded
 presentation snapshots. No renderer, terminal, attach, CLI or plugin dependencies.
 This crate neither builds browser code nor invents WASM output.
 
@@ -92,8 +92,9 @@ Configured build directory and explicit allowlist are trusted caller input.
 * `405`: all non-GET methods, including terminal input, upgrades and mutations.
   Unknown GET paths are `404` and cannot invoke any operation.
 
-Only exact `Host: 127.0.0.1:<bound-port>` is accepted (not localhost or arbitrary
-loopback aliases). A supplied Origin must exactly equal that host's HTTP origin;
+Only the exact configured browser-facing IP and bound port are accepted in Host
+(default `127.0.0.1:<bound-port>`, not localhost or arbitrary aliases).
+A supplied Origin must exactly equal that host's HTTP origin;
 supplied `Sec-Fetch-Site` must be `same-origin` or `none`. This blocks DNS rebinding,
 foreign-origin requests and sibling-origin fetches even if a capability leaks.
 Static bootstrap assets are public but host/origin guarded. Snapshots require a
@@ -101,6 +102,14 @@ bearer only in explicit token mode; loopback defaults to port 8080 without a tok
 `HostConfig.port = 0` selects an ephemeral port; `auth_mode = AuthMode::Token`
 restores capability-URL access. Token-free mode exposes output to local users,
 never remote interfaces. Occupied fixed ports fail rather than selecting another.
+`HostConfig.host` accepts IPv4/IPv6, defaulting to `127.0.0.1`. Every non-loopback
+bind requires `AuthMode::Token`. Wildcard binds require `public_host`, a concrete
+same-family IP for the bootstrap URL and exact Host/Origin policy. With concrete
+binds, `public_host` must equal `host`. This is direct HTTP, not TLS: observers can
+read output and steal tokens. Restrict serving to trusted LAN/VPN peers with a
+firewall; never expose this plaintext service to the Internet. The capability
+is scoped only to this presentation and its leased viewport controls.
+
 All responses disable caches/referrers, deny framing and MIME sniffing, and use CSP:
 external same-origin scripts plus `wasm-unsafe-eval`, same-origin connections/styles,
 self/blob/data images, no forms/base/frame ancestors. Browser lane must use external

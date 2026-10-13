@@ -15,6 +15,8 @@ const DEADLINE: Duration = Duration::from_secs(10);
 
 #[path = "auth_acceptance.rs"]
 mod auth_tests;
+#[path = "network_acceptance.rs"]
+mod network_tests;
 
 #[tokio::test]
 async fn negotiated_binary_resources_and_repair() {

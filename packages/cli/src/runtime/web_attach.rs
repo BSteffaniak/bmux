@@ -122,14 +122,54 @@ fn start_browser_observer(
     (publisher, observer)
 }
 
-fn resolve_web_settings(options: (Option<u16>, Option<&str>)) -> Result<bmux_config::WebConfig> {
+#[derive(Clone, Copy, Default)]
+pub(super) struct WebOptions<'a> {
+    pub port: Option<u16>,
+    pub auth: Option<&'a str>,
+    pub host: Option<std::net::IpAddr>,
+    pub public_host: Option<std::net::IpAddr>,
+}
+
+fn select_ip(
+    cli: Option<std::net::IpAddr>,
+    env: std::result::Result<String, std::env::VarError>,
+    configured: Option<std::net::IpAddr>,
+    name: &str,
+) -> Result<Option<std::net::IpAddr>> {
+    match (cli, env) {
+        (Some(ip), _) => Ok(Some(ip)),
+        (None, Ok(value)) => {
+            Ok(Some(value.parse().with_context(|| {
+                format!("{name} must be an IPv4 or IPv6 address")
+            })?))
+        }
+        (None, Err(std::env::VarError::NotPresent)) => Ok(configured),
+        (None, Err(error)) => Err(error.into()),
+    }
+}
+
+fn resolve_web_settings(options: WebOptions<'_>) -> Result<bmux_config::WebConfig> {
     let config = bmux_config::BmuxConfig::load()?.web;
-    select_web_settings(
+    let mut settings = select_web_settings(
         config,
-        options,
+        (options.port, options.auth),
         std::env::var("BMUX_WEB_PORT"),
         std::env::var("BMUX_WEB_AUTH"),
-    )
+    )?;
+    settings.host = select_ip(
+        options.host,
+        std::env::var("BMUX_WEB_HOST"),
+        Some(config.host),
+        "BMUX_WEB_HOST",
+    )?
+    .context("missing browser bind host")?;
+    settings.public_host = select_ip(
+        options.public_host,
+        std::env::var("BMUX_WEB_PUBLIC_HOST"),
+        config.public_host,
+        "BMUX_WEB_PUBLIC_HOST",
+    )?;
+    Ok(settings)
 }
 
 fn select_web_settings(
@@ -162,21 +202,32 @@ fn select_web_settings(
         Some("token") => bmux_config::WebAuth::Token,
         Some(_) => anyhow::bail!("web authentication must be none or token"),
     };
-    Ok(bmux_config::WebConfig { port, auth })
+    Ok(bmux_config::WebConfig {
+        port,
+        auth,
+        ..config
+    })
 }
 
 fn configure_browser_host(
     assets: std::path::PathBuf,
     web_only: bool,
-    options: (Option<u16>, Option<&str>),
+    options: WebOptions<'_>,
 ) -> Result<bmux_web_host::HostConfig> {
     let settings = resolve_web_settings(options)?;
     let mut config = bmux_web_host::HostConfig::new(assets);
     config.port = settings.port;
+    config.host = settings.host;
+    config.public_host = settings.public_host;
     config.auth_mode = match settings.auth {
         bmux_config::WebAuth::None => bmux_web_host::AuthMode::None,
         bmux_config::WebAuth::Token => bmux_web_host::AuthMode::Token,
     };
+    if !config.host.is_loopback() {
+        eprintln!(
+            "Warning: network browser hosting uses unencrypted HTTP. Use only a trusted LAN/VPN; protect the capability URL and restrict the port with your firewall."
+        );
+    }
     config.viewport_mode = if web_only {
         bmux_web_host::ViewportMode::Resizable
     } else {
@@ -191,7 +242,7 @@ pub(super) async fn run(
     global: bool,
     assets: &Path,
     web_only: bool,
-    web_options: (Option<u16>, Option<&str>),
+    web_options: WebOptions<'_>,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     let provider = super::attach::provider::resolve(target)?;
@@ -294,6 +345,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn web_ip_settings_precedence_and_validation() {
+        let absent = || Err(std::env::VarError::NotPresent);
+        let local = "127.0.0.1".parse().unwrap();
+        let lan = "192.0.2.10".parse().unwrap();
+        let wildcard = "0.0.0.0".parse().unwrap();
+        assert_eq!(
+            select_ip(None, absent(), Some(local), "host").unwrap(),
+            Some(local)
+        );
+        assert_eq!(
+            select_ip(None, Ok("192.0.2.10".into()), Some(local), "host").unwrap(),
+            Some(lan)
+        );
+        assert_eq!(
+            select_ip(Some(wildcard), Ok("invalid".into()), Some(local), "host").unwrap(),
+            Some(wildcard)
+        );
+        assert_eq!(
+            select_ip(None, absent(), None, "public_host").unwrap(),
+            None
+        );
+        assert!(select_ip(None, Ok("hostname.example".into()), None, "host").is_err());
+        assert!(select_ip(None, Ok(String::new()), None, "public_host").is_err());
+        assert_eq!(
+            select_ip(None, Ok("::1".into()), None, "host").unwrap(),
+            Some("::1".parse().unwrap())
+        );
+        let config: bmux_config::WebConfig =
+            toml::from_str("host = '0.0.0.0'\npublic_host = '192.0.2.10'\nauth = 'token'").unwrap();
+        assert_eq!(config.host, wildcard);
+        assert_eq!(config.public_host, Some(lan));
+        assert_eq!(config.port, 8080);
+        assert_eq!(config.auth, bmux_config::WebAuth::Token);
+        assert!(toml::from_str::<bmux_config::WebConfig>("host = 'bad'").is_err());
+    }
+
+    #[test]
     fn web_settings_precedence_and_invalid_environment() {
         let absent = || Err(std::env::VarError::NotPresent);
         let defaults = select_web_settings(
@@ -308,6 +396,7 @@ mod tests {
         let configured = bmux_config::WebConfig {
             port: 9090,
             auth: bmux_config::WebAuth::Token,
+            ..bmux_config::WebConfig::default()
         };
         let env = select_web_settings(
             configured,

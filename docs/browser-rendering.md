@@ -52,6 +52,53 @@ reopening the capability URL. The browser cannot send terminal input or invoke
 mutating plugin actions. Viewport changes are allowed only for the controlling
 browser of an independent attachment.
 
+## Native LAN access
+
+Loopback remains the default. Bind your LAN IP with token authentication:
+
+```sh
+bmux attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only \
+  --web-host 192.168.1.188 --web-auth token
+```
+
+Or listen on all IPv4 interfaces with an explicit browser-facing address:
+
+```sh
+bmux attach "<SESSION_UUID>" --web-assets "$PWD/target/web-assets" --web-only \
+  --web-host 0.0.0.0 --web-public-host 192.168.1.188 --web-auth token
+```
+
+Replace the example IP with your serving computer's LAN IP. Open the **printed
+capability URL**, including `#token=...`, on the other computer, not `0.0.0.0`.
+Allow the TCP port through your firewall only from trusted clients. Never forward
+this port through your router to the Internet.
+
+Equivalent configuration:
+
+```toml
+[web]
+host = "0.0.0.0"
+public_host = "192.168.1.188"
+port = 8080
+auth = "token"
+```
+
+`BMUX_WEB_HOST` and `BMUX_WEB_PUBLIC_HOST` are the environment equivalents.
+All fields independently honor CLI → environment → config → defaults precedence.
+Hosts must be literal IPv4/IPv6 addresses, not DNS names. For IPv6 use
+`--web-host ::` and a concrete IPv6 `--web-public-host`; URLs bracket IPv6.
+Scoped link-local IPv6 addresses are unsupported. Wildcards require a concrete
+public IP in the same family. With concrete binds, public host must match host.
+Only the exact advertised Host/Origin is trusted, not arbitrary aliases.
+
+**Security:** every non-loopback bind requires explicit token authentication.
+Tokens restrict access but **HTTP is unencrypted**: network observers can read
+terminal output and steal tokens. Use only a trusted LAN or encrypted VPN; use an
+SSH tunnel for untrusted networks. Native TLS and HTTPS reverse-proxy deployment
+are not provided by these options. This capability grants only read-only
+presentation and leased viewport control, not terminal input, plugin actions, or
+broader BMUX permissions. Token-mode refresh requires reopening the capability URL.
+
 ## Viewport ownership and lifecycle
 
 - The first browser claims a separate random controller lease; additional viewers mirror the same composed view.
@@ -60,7 +107,7 @@ browser of an independent attachment.
 - Native sizing uses the existing attachment/PTY policy and authoritative plugin layout; there is no browser-specific competing layout authority.
 - Temporary transport loss repairs from a complete snapshot. Source closure shuts down hosting rather than retaining a healthy-looking stale frame. The attachment host remains alive while an independent viewer disconnects; explicit shutdown closes it.
 
-The host binds an ephemeral IPv4 loopback port, restricts assets to an explicit allowlist, validates Host/Origin and capability headers, and bounds bodies, connections, requests and snapshots. Styles are external same-origin assets compatible with the strict CSP. There is no unauthenticated remote deployment mode.
+The host defaults to IPv4 loopback port 8080 and supports explicitly authenticated IPv4/IPv6 listeners. It restricts assets to an explicit allowlist, validates configured Host/Origin and capability headers, and bounds bodies, connections, requests and snapshots. Styles are external same-origin assets compatible with the strict CSP. There is no unauthenticated remote deployment mode.
 
 ## Shared presentation boundaries
 
