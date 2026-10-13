@@ -1,6 +1,6 @@
 # Presentation plugin API
 
-Stable generated BPDL contracts only. `presentation-view-v1` provides bounded
+Stable generated BPDL contracts only. `presentation-view-v2` provides bounded
 revision polling, explicit bootstrap snapshots (including submit-only),
 authentication, monotonic action submission/acknowledgment, asset reads, and leave.
 `presentation-host-v1` provides privileged managed host lifecycle operations.

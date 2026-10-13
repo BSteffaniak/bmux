@@ -94,6 +94,19 @@ pub struct OwnerUpdate {
 /// Effects run once on the owner, never during snapshot or polling. Failed calls are
 /// uncertain and their consumed revision must not be retried automatically.
 pub trait Owner: Send {
+    /// Construct isolated replacement state. Retain only compatible block ID,
+    /// linked component type and state version; never retain derived geometry or
+    /// shared mutable handles into the live owner. No effects may run here.
+    /// Existing owners can instead explicitly supply `reload_with_owner`.
+    fn prepare_reload(&self, _deck: &Deck, _assets: &[Asset]) -> Result<Box<dyn Owner>, HostError> {
+        Err(HostError::Invalid)
+    }
+    /// Rebuild geometry on the candidate for shared, connected independent and
+    /// disconnected cached instances before publication. Never called on the
+    /// active owner by reload; errors discard the entire candidate.
+    fn reconcile_reload(&mut self, context: OwnerContext<'_>) -> Result<Vec<MirrorFrame>, String> {
+        self.scene(context)
+    }
     fn scene(&mut self, _context: OwnerContext<'_>) -> Result<Vec<MirrorFrame>, String> {
         Ok(Vec::new())
     }
@@ -154,6 +167,13 @@ impl Host {
     pub fn new(deck: Deck, assets: Vec<Asset>, config: HostConfig) -> Result<Self, HostError> {
         let assets = validate_bundle(&deck, assets, &config.limits)?;
         let (public_deck, public_assets) = crate::projection::project(&deck, &assets)?;
+        if serde_json::to_vec(&public_deck)
+            .map_err(|_| HostError::Invalid)?
+            .len()
+            > config.limits.deck_bytes
+        {
+            return Err(HostError::Limit);
+        }
         if config.limits.message_bytes == 0
             || config.limits.message_bytes > 64 * 1024 * 1024
             || config.limits.requests_per_second == 0
@@ -837,6 +857,13 @@ impl Host {
     ) -> Result<(), HostError> {
         let assets = validate_bundle(&deck, assets, &self.config.limits)?;
         let (public_deck, public_assets) = crate::projection::project(&deck, &assets)?;
+        if serde_json::to_vec(&public_deck)
+            .map_err(|_| HostError::Invalid)?
+            .len()
+            > self.config.limits.deck_bytes
+        {
+            return Err(HostError::Limit);
+        }
         let deck_revision = self.deck_revision.checked_add(1).ok_or(HostError::Limit)?;
         let revision = self.revision.checked_add(1).ok_or(HostError::Limit)?;
         if self
@@ -862,8 +889,16 @@ impl Host {
         let mut shared_frames = BTreeMap::new();
         let mut independent_frames = BTreeMap::new();
         let mut cached_frames = BTreeMap::new();
-        if let Some(owner) = replacement.as_mut().or(self.owner.as_mut()) {
-            shared_frames = project_scene(
+        if replacement.is_none() {
+            let owner_assets: Vec<Asset> = assets.into_values().collect();
+            replacement = self
+                .owner
+                .as_ref()
+                .map(|owner| owner.prepare_reload(&deck, &owner_assets))
+                .transpose()?;
+        }
+        if let Some(owner) = replacement.as_mut() {
+            shared_frames = project_reload_scene(
                 owner.as_mut(),
                 &deck,
                 &self.config.limits,
@@ -882,7 +917,7 @@ impl Host {
                     revision: participant.revision + 1,
                     ..cursor.clone()
                 };
-                let frames = project_scene(
+                let frames = project_reload_scene(
                     owner.as_mut(),
                     &deck,
                     &self.config.limits,
@@ -906,7 +941,7 @@ impl Host {
                     };
                     cached_frames.insert(
                         grant.clone(),
-                        project_scene(
+                        project_reload_scene(
                             owner.as_mut(),
                             &deck,
                             &self.config.limits,
@@ -1035,6 +1070,35 @@ fn project_scene(
             cursor,
         })
         .map_err(|_| HostError::Invalid)?;
+    validate_scene(frames, deck, limits, state)
+}
+
+fn project_reload_scene(
+    owner: &mut dyn Owner,
+    deck: &Deck,
+    limits: &Limits,
+    participant: &str,
+    instance: &str,
+    state: &PresentationState,
+    cursor: &Cursor,
+) -> Result<BTreeMap<String, MirrorFrame>, HostError> {
+    let frames = owner
+        .reconcile_reload(OwnerContext {
+            participant,
+            instance,
+            state,
+            cursor,
+        })
+        .map_err(|_| HostError::Invalid)?;
+    validate_scene(frames, deck, limits, state)
+}
+
+fn validate_scene(
+    frames: Vec<MirrorFrame>,
+    deck: &Deck,
+    limits: &Limits,
+    state: &PresentationState,
+) -> Result<BTreeMap<String, MirrorFrame>, HostError> {
     if frames.len() > limits.surfaces {
         return Err(HostError::Limit);
     }
@@ -1087,6 +1151,7 @@ fn validate_bundle(
     assets: Vec<Asset>,
     limits: &Limits,
 ) -> Result<BTreeMap<String, Asset>, HostError> {
+    crate::projection::validate_theme(deck)?;
     if assets.len() > limits.assets {
         return Err(HostError::Limit);
     }

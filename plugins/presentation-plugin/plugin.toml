@@ -3,7 +3,7 @@ id = "bmux.presentation"
 name = "bmux Presentation"
 owns_namespaces = ["present"]
 provided_capabilities = [
-    "bmux.presentation.view.v1",
+    "bmux.presentation.view.v2",
     "bmux.presentation.manage.v1",
 ]
 provided_features = ["bmux.presentation"]
@@ -13,15 +13,16 @@ version = "0.0.1-alpha.0"
 minimum = "1.1"
 
 [[auxiliary_executables]]
-cargo_binary     = "bmux-mermaid-worker"
-cargo_package    = "bmux_mermaid_render"
-id               = "mermaid-worker"
-protocol_version = 1
-relative_path    = "bmux-mermaid-worker"
+cargo_binary        = "bmux-mermaid-worker"
+cargo_package       = "bmux_mermaid_render"
+id                  = "mermaid-worker"
+protocol_version    = 1
+relative_path       = "bmux-mermaid-worker"
+supported_platforms = ["unix", "windows"]
 
 [[services]]
-capability   = "bmux.presentation.view.v1"
-interface_id = "presentation-view-v1"
+capability   = "bmux.presentation.view.v2"
+interface_id = "presentation-view-v2"
 kind         = "command"
 [[services]]
 capability   = "bmux.presentation.manage.v1"

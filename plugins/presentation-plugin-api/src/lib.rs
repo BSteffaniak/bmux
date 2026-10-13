@@ -14,7 +14,7 @@ mod tests {
         let declarations = super::Contract::service_declarations().unwrap();
         assert_eq!(declarations.len(), 2);
         let debug = format!("{declarations:?}");
-        assert!(debug.contains("bmux.presentation.view.v1"));
+        assert!(debug.contains("bmux.presentation.view.v2"));
         assert!(debug.contains("bmux.presentation.manage.v1"));
     }
 }

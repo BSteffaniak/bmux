@@ -350,7 +350,8 @@ fn private_paths_and_unreferenced_assets_do_not_enter_audience_wire() {
             reveal_step: 0,
             source: None,
             kind: BlockKind::Text {
-                content: "[label](file:///private/home/secret) ![alt](/private/hidden.png)".into(),
+                content: "[label](file:///private/home/secret) ![alt](/private/home/image.png)"
+                    .into(),
                 format: bmux_presentation::TextFormat::Markdown,
             },
         },

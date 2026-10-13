@@ -1,10 +1,10 @@
 // Contract only. The implementation calls the authoritative runtime Host directly.
 plugin bmux.presentation version 1;
-capability PRESENTATION_VIEW = bmux.presentation.view.v1;
+capability PRESENTATION_VIEW = bmux.presentation.view.v2;
 capability PRESENTATION_MANAGE = bmux.presentation.manage.v1;
 
 @capability(PRESENTATION_VIEW)
-interface presentation-view-v1 {
+interface presentation-view-v2 {
     enum interaction-mode { receive-only, submit-only, shared, independent }
     record cursor { run_id: string, deck_revision: u64, revision: u64 }
     record participant { id: string, cursor: cursor, mode: interaction-mode, next_action_id: u64? }

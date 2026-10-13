@@ -4,7 +4,7 @@ use crate::{Asset, HostError, Limits};
 use bmux_mermaid_render::{
     IsolatedMermaidRenderer, MermaidCancellationToken, MermaidRenderRequest, MermaidRenderedOutput,
 };
-use bmux_presentation::{Block, BlockKind, Deck, parse_markdown};
+use bmux_presentation::{Block, BlockKind, Deck, TextFormat, parse_markdown};
 use std::{
     fs::File,
     io::Read,
@@ -33,6 +33,7 @@ impl SourceLoader {
     }
     /// Linked Rust decks use the same asset preparation and audience boundary.
     pub fn prepare(&self, mut deck: Deck, base: &Path) -> Result<LoadedDeck, HostError> {
+        crate::projection::validate_theme(&deck)?;
         let root = self.root.canonicalize().map_err(|_| HostError::NotFound)?;
         let base = bounded_path(&root, base)?;
         let mut assets = Vec::new();
@@ -63,6 +64,29 @@ impl SourceLoader {
                                 bytes: png,
                             },
                         )?;
+                    }
+                    BlockKind::Text {
+                        content,
+                        format: TextFormat::Markdown,
+                    } => {
+                        *content =
+                            crate::projection::remap_markdown_images(content, |destination| {
+                                let path = bounded_path(root, &base.join(destination))?;
+                                let bytes = read_bounded(&path, loader.limits.asset_bytes)?;
+                                let png = normalize_image(&bytes, loader.limits.asset_bytes)?;
+                                let id = uuid::Uuid::new_v4().to_string();
+                                push_asset(
+                                    loader,
+                                    assets,
+                                    total,
+                                    Asset {
+                                        id: id.clone(),
+                                        media_type: "image/png".into(),
+                                        bytes: png,
+                                    },
+                                )?;
+                                Ok(id)
+                            })?;
                     }
                     BlockKind::Mermaid { source, rows } => {
                         let worker = loader.mermaid.as_ref().ok_or(HostError::NotFound)?;

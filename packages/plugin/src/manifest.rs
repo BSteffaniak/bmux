@@ -81,6 +81,39 @@ pub struct AuxiliaryExecutableDeclaration {
     pub cargo_binary: String,
     pub relative_path: String,
     pub protocol_version: u32,
+    /// Explicit platform families. Omission preserves the legacy Unix-only contract.
+    #[serde(
+        default = "default_auxiliary_platforms",
+        skip_serializing_if = "is_default_auxiliary_platforms"
+    )]
+    pub supported_platforms: Vec<String>,
+}
+
+fn default_auxiliary_platforms() -> Vec<String> {
+    vec!["unix".into()]
+}
+
+fn is_default_auxiliary_platforms(platforms: &[String]) -> bool {
+    platforms == ["unix"]
+}
+
+impl AuxiliaryExecutableDeclaration {
+    pub(crate) fn supports_platform(&self, platform: &str) -> bool {
+        self.supported_platforms
+            .iter()
+            .any(|value| value == platform)
+    }
+
+    pub(crate) fn platform_filename(&self, platform: &str) -> Option<String> {
+        if !self.supports_platform(platform) {
+            return None;
+        }
+        match platform {
+            "unix" => Some(self.relative_path.clone()),
+            "windows" => Some(format!("{}.exe", self.relative_path)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,11 +311,26 @@ impl PluginManifest {
     pub(crate) fn validate_auxiliary_executables(&self) -> Result<()> {
         let mut ids = BTreeSet::new();
         for executable in &self.auxiliary_executables {
+            let platforms: BTreeSet<_> = executable.supported_platforms.iter().collect();
             if !safe_auxiliary_name(&executable.id)
                 || !safe_auxiliary_name(&executable.relative_path)
                 || !safe_auxiliary_name(&executable.cargo_package)
                 || !safe_auxiliary_name(&executable.cargo_binary)
                 || executable.protocol_version == 0
+                || platforms.is_empty()
+                || platforms.len() != executable.supported_platforms.len()
+                || platforms
+                    .iter()
+                    .any(|value| !matches!(value.as_str(), "unix" | "windows"))
+                || (executable.supports_platform("windows")
+                    && (executable
+                        .relative_path
+                        .to_ascii_lowercase()
+                        .ends_with(".exe")
+                        || executable
+                            .cargo_binary
+                            .to_ascii_lowercase()
+                            .ends_with(".exe")))
                 || !ids.insert(&executable.id)
             {
                 return Err(PluginError::ServiceProtocol {
@@ -351,6 +399,53 @@ relative_path = "{path}"
 protocol_version = 1
 "#
         )
+    }
+
+    #[test]
+    fn helper_platforms_default_to_unix_and_windows_opt_in_is_explicit() {
+        let source = source("example.first", "1.1", "worker", "worker");
+        let legacy = PluginManifest::from_toml_str(&source).unwrap();
+        let declaration = &legacy.auxiliary_executables[0];
+        assert_eq!(declaration.supported_platforms, ["unix"]);
+        assert!(
+            serde_json::to_value(declaration)
+                .unwrap()
+                .get("supported_platforms")
+                .is_none()
+        );
+        assert_eq!(
+            declaration.platform_filename("unix").as_deref(),
+            Some("worker")
+        );
+        assert_eq!(declaration.platform_filename("windows"), None);
+        let manifest = PluginManifest::from_toml_str(&format!(
+            "{source}\nsupported_platforms = [\"unix\", \"windows\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            manifest.auxiliary_executables[0]
+                .platform_filename("windows")
+                .as_deref(),
+            Some("worker.exe")
+        );
+        for platforms in ["[]", "[\"win32\"]", "[\"unix\", \"unix\"]"] {
+            assert!(
+                PluginManifest::from_toml_str(&format!(
+                    "{source}\nsupported_platforms = {platforms}\n"
+                ))
+                .is_err()
+            );
+        }
+        let suffixed = source.replace(
+            "relative_path = \"worker\"",
+            "relative_path = \"worker.exe\"",
+        );
+        assert!(
+            PluginManifest::from_toml_str(&format!(
+                "{suffixed}\nsupported_platforms = [\"windows\"]\n"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

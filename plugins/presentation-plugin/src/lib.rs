@@ -12,6 +12,9 @@ mod source;
 mod tls;
 mod viewer;
 
+pub use demo::linked_registry as linked_demo_registry;
+pub use owner::LinkedOwner;
+
 use bmux_plugin_sdk::{
     NativeCommandContext, NativeCommandInvocationSource, NativeServiceContext, PluginCommandError,
     RustPlugin, ServiceResponse,

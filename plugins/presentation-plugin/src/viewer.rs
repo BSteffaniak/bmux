@@ -2,7 +2,7 @@
 //! runtime models; neither creates a second domain IPC envelope.
 use anyhow::{Context, Result, bail};
 use bmux_plugin_sdk::NativeCommandContext;
-use bmux_presentation_plugin_api::presentation_view_v1 as view;
+use bmux_presentation_plugin_api::presentation_view_v2 as view;
 use bmux_presentation_runtime::{
     Action, Cursor, InteractionMode, Poll, Request, Response, Snapshot, Submission,
 };

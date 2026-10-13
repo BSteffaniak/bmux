@@ -52,6 +52,48 @@ pub fn unix_target(target: &str) -> Result<bool> {
     }
 }
 
+/// Platform opt-in is declaration-owned. Legacy declarations remain Unix-only.
+/// This mirrors `AuxiliaryExecutableDeclaration.supported_platforms` without
+/// changing the declaration stored in the inventory.
+pub(crate) fn supports_target(item: &Value, target: &str) -> Result<bool> {
+    let platform = if unix_target(target)? {
+        "unix"
+    } else {
+        "windows"
+    };
+    let Some(platforms) = item.get("supported_platforms") else {
+        return Ok(platform == "unix");
+    };
+    let platforms = platforms
+        .as_array()
+        .ok_or_else(|| error("invalid helper platforms"))?;
+    let mut seen = BTreeSet::new();
+    for value in platforms {
+        let value = value
+            .as_str()
+            .ok_or_else(|| error("invalid helper platform"))?;
+        if !matches!(value, "unix" | "windows") || !seen.insert(value) {
+            return Err(error("unknown or duplicate helper platform"));
+        }
+    }
+    if seen.is_empty() {
+        return Err(error("helper must support at least one platform"));
+    }
+    Ok(seen.contains(platform))
+}
+
+fn helper_name(name: &str, unix: bool) -> Result<String> {
+    if !safe_name(name) || reserved(name) || (!unix && name.to_ascii_lowercase().ends_with(".exe"))
+    {
+        return Err(error("unsafe or suffixed helper name"));
+    }
+    Ok(if unix {
+        name.to_owned()
+    } else {
+        format!("{name}.exe")
+    })
+}
+
 /// Reuse the host's manifest parser, including ABI opt-in and declaration validation.
 pub fn declarations(workspace: &Path) -> Result<Vec<Value>> {
     safe_path(workspace)?;
@@ -102,7 +144,19 @@ pub fn safe_path(path: &Path) -> Result<()> {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(error(format!("symlink path refused: {}", cursor.display())));
             }
-            Ok(_) => {}
+            Ok(metadata) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt as _;
+                    // FILE_ATTRIBUTE_REPARSE_POINT covers junctions and other
+                    // redirecting tags, not only Rust's symlink classification.
+                    if metadata.file_attributes() & 0x400 != 0 {
+                        return Err(error(format!("reparse path refused: {}", cursor.display())));
+                    }
+                }
+                #[cfg(not(windows))]
+                let _ = metadata;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
@@ -118,8 +172,23 @@ fn regular(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_FLAG_OPEN_REPARSE_POINT and FILE_SHARE_READ: do not follow the
+        // leaf or permit writes/deletes while digesting or copying it.
+        options.custom_flags(0x0020_0000).share_mode(1);
+    }
     let file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err(error("reparse artifact refused"));
+        }
+    }
+    if !metadata.is_file() {
         return Err(error("not a regular artifact"));
     }
     Ok(file)
@@ -239,26 +308,35 @@ pub fn stage(
 ) -> Result<()> {
     let unix = unix_target(target)?;
     let mut selected = vec![(
-        if unix { "bmux" } else { "bmux.exe" },
-        if unix { "bmux" } else { "bmux.exe" },
+        if unix { "bmux" } else { "bmux.exe" }.to_owned(),
+        if unix { "bmux" } else { "bmux.exe" }.to_owned(),
         None,
     )];
     selected.push((
-        if unix { "xtask" } else { "xtask.exe" },
+        if unix { "xtask" } else { "xtask.exe" }.to_owned(),
         if unix {
             "bmux-install"
         } else {
             "bmux-install.exe"
-        },
+        }
+        .to_owned(),
         None,
     ));
-    if unix {
-        for item in declarations {
-            selected.push((
-                field(item, "cargo_binary")?,
-                field(item, "relative_path")?,
-                Some(item.clone()),
-            ));
+    let mut unavailable = Vec::new();
+    let mut names = BTreeSet::new();
+    for (_, name, _) in &selected {
+        names.insert(name.to_ascii_lowercase());
+    }
+    for item in declarations {
+        if supports_target(item, target)? {
+            let source_name = helper_name(field(item, "cargo_binary")?, unix)?;
+            let name = helper_name(field(item, "relative_path")?, unix)?;
+            if !names.insert(name.to_ascii_lowercase()) {
+                return Err(error("colliding auxiliary destination"));
+            }
+            selected.push((source_name, name, Some(item.clone())));
+        } else {
+            unavailable.push(item.clone());
         }
     }
     for (name, _, _) in &selected {
@@ -274,16 +352,12 @@ pub fn stage(
         schema_version: 1,
         target: target.into(),
         artifacts: Vec::new(),
-        unavailable_auxiliary_executables: if unix {
-            Vec::new()
-        } else {
-            declarations.to_vec()
-        },
+        unavailable_auxiliary_executables: unavailable,
     };
     for (source_name, name, declaration) in selected {
-        let (bytes, sha256) = copy(&source.join(source_name), &payload.join(name))?;
+        let (bytes, sha256) = copy(&source.join(source_name), &payload.join(&name))?;
         inventory.artifacts.push(Artifact {
-            relative_path: name.into(),
+            relative_path: name,
             bytes,
             sha256,
             declaration,
@@ -315,10 +389,10 @@ pub fn verify(source: &Path) -> Result<Inventory> {
         return Err(error("unsupported artifact inventory"));
     }
     let unix = unix_target(&inventory.target)?;
-    if unix && !inventory.unavailable_auxiliary_executables.is_empty() {
-        return Err(error(
-            "Unix inventory cannot claim unavailable auxiliary executables",
-        ));
+    for item in &inventory.unavailable_auxiliary_executables {
+        if supports_target(item, &inventory.target)? {
+            return Err(error("available helper marked unavailable"));
+        }
     }
     let mut names = BTreeSet::new();
     for item in &inventory.artifacts {
@@ -373,8 +447,23 @@ pub fn verify(source: &Path) -> Result<Inventory> {
     }) {
         return Err(error("inventory contains no Rust installer"));
     }
-    if !unix && inventory.artifacts.len() != 2 {
-        return Err(error("Windows auxiliary executables are unavailable"));
+    if !unix {
+        for item in &inventory.artifacts {
+            if matches!(item.relative_path.as_str(), "bmux.exe" | "bmux-install.exe") {
+                continue;
+            }
+            let declaration = item
+                .declaration
+                .as_ref()
+                .ok_or_else(|| error("Windows helper lacks declaration"))?;
+            if !supports_target(declaration, &inventory.target)?
+                || helper_name(field(declaration, "relative_path")?, false)? != item.relative_path
+            {
+                return Err(error(
+                    "Windows helper does not match its platform declaration",
+                ));
+            }
+        }
     }
     Ok(inventory)
 }
@@ -474,4 +563,130 @@ pub fn activate(_source: &Path, _prefix: &Path, _version: &str) -> Result<()> {
     Err(error(
         "atomic symlink activation is Unix-only; use install for Windows",
     ))
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn mermaid() -> Value {
+        json!({
+            "owner": "bmux.presentation", "id": "mermaid-worker",
+            "cargo_package": "bmux_mermaid_render", "cargo_binary": "bmux-mermaid-worker",
+            "relative_path": "bmux-mermaid-worker", "protocol_version": 1,
+            "supported_platforms": ["unix", "windows"]
+        })
+    }
+
+    #[test]
+    fn platform_selection_is_explicit_and_legacy_helpers_remain_unix_only() {
+        let legacy = json!({});
+        assert!(supports_target(&legacy, "x86_64-unknown-linux-gnu").unwrap());
+        assert!(!supports_target(&legacy, "x86_64-pc-windows-msvc").unwrap());
+        assert!(supports_target(&mermaid(), "x86_64-pc-windows-msvc").unwrap());
+        for platforms in [
+            json!([]),
+            json!(["win32"]),
+            json!(["unix", "unix"]),
+            json!("windows"),
+        ] {
+            assert!(
+                supports_target(
+                    &json!({"supported_platforms": platforms}),
+                    "x86_64-pc-windows-msvc"
+                )
+                .is_err()
+            );
+        }
+        assert!(supports_target(&mermaid(), "unknown-target").is_err());
+    }
+
+    #[test]
+    fn windows_stages_and_installs_opted_in_exe_with_verified_identity() {
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let build = root.path().join("build");
+        fs::create_dir(&build).unwrap();
+        for name in ["bmux.exe", "xtask.exe", "bmux-mermaid-worker.exe"] {
+            fs::write(build.join(name), format!("fixture:{name}")).unwrap();
+        }
+        let legacy = json!({"relative_path": "unix-helper", "cargo_binary": "unix-helper"});
+        let declarations = vec![mermaid(), legacy.clone()];
+        let destination = root.path().join("stage");
+        stage(
+            &build,
+            &destination,
+            "x86_64-pc-windows-msvc",
+            &declarations,
+        )
+        .unwrap();
+        let inventory = verify(&destination).unwrap();
+        assert_eq!(inventory.artifacts.len(), 3);
+        assert_eq!(inventory.unavailable_auxiliary_executables, vec![legacy]);
+        let helper = inventory
+            .artifacts
+            .iter()
+            .find(|item| item.relative_path == "bmux-mermaid-worker.exe")
+            .unwrap();
+        assert_eq!(helper.declaration, Some(mermaid()));
+        assert!(!destination.join("bmux-mermaid-worker").exists());
+        let installed = root.path().join("installed");
+        install(&destination, &installed, None).unwrap();
+        assert_eq!(
+            fs::read(installed.join("bmux-mermaid-worker.exe")).unwrap(),
+            b"fixture:bmux-mermaid-worker.exe"
+        );
+        verify(&installed).unwrap();
+
+        let mut invalid = inventory;
+        invalid
+            .artifacts
+            .iter_mut()
+            .find(|item| item.relative_path == "bmux-mermaid-worker.exe")
+            .unwrap()
+            .declaration
+            .as_mut()
+            .unwrap()["supported_platforms"] = json!(["unix"]);
+        fs::write(
+            destination.join("artifacts.json"),
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        assert!(verify(&destination).is_err());
+        invalid
+            .artifacts
+            .iter_mut()
+            .find(|item| item.relative_path == "bmux-mermaid-worker.exe")
+            .unwrap()
+            .declaration = Some(mermaid());
+        fs::write(
+            destination.join("artifacts.json"),
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        fs::write(destination.join("bmux-mermaid-worker.exe"), b"tampered").unwrap();
+        assert!(verify(&destination).is_err());
+    }
+
+    #[test]
+    fn missing_windows_helper_preserves_last_valid_destination() {
+        let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let build = root.path().join("build");
+        fs::create_dir(&build).unwrap();
+        for name in ["bmux.exe", "xtask.exe"] {
+            fs::write(build.join(name), b"fixture").unwrap();
+        }
+        let destination = root.path().join("stage");
+        stage(&build, &destination, "x86_64-pc-windows-msvc", &[]).unwrap();
+        let previous = fs::read(destination.join("artifacts.json")).unwrap();
+        assert!(stage(&build, &destination, "x86_64-pc-windows-msvc", &[mermaid()]).is_err());
+        assert_eq!(
+            fs::read(destination.join("artifacts.json")).unwrap(),
+            previous
+        );
+        verify(&destination).unwrap();
+        let absent = root.path().join("absent");
+        assert!(stage(&build, &absent, "x86_64-pc-windows-msvc", &[mermaid()]).is_err());
+        assert!(!absent.exists());
+    }
 }

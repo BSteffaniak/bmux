@@ -8,7 +8,7 @@ pub(crate) fn arguments(
     profile: &str,
     declarations: &[Value],
 ) -> Result<Vec<String>> {
-    let unix = artifacts::unix_target(target)?;
+    artifacts::unix_target(target)?;
     let mut args: Vec<String> = [
         "build",
         "--locked",
@@ -28,8 +28,8 @@ pub(crate) fn arguments(
     .into_iter()
     .map(str::to_owned)
     .collect();
-    if unix {
-        for item in declarations {
+    for item in declarations {
+        if artifacts::supports_target(item, target)? {
             args.extend([
                 "-p".into(),
                 artifacts::field(item, "cargo_package")?.into(),
@@ -94,6 +94,21 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--profile", "release"])
         );
+    }
+
+    #[test]
+    fn windows_build_includes_opted_in_helpers_but_not_legacy_unix_helpers() {
+        let declarations = vec![
+            serde_json::json!({"cargo_package": "bmux_mermaid_render", "cargo_binary": "bmux-mermaid-worker", "supported_platforms": ["unix", "windows"]}),
+            serde_json::json!({"cargo_package": "unix_plugin", "cargo_binary": "unix-helper"}),
+        ];
+        let args = arguments("x86_64-pc-windows-msvc", "release", &declarations).unwrap();
+        assert!(args.iter().any(|arg| arg == "bmux-mermaid-worker"));
+        assert!(args.iter().any(|arg| arg == "bmux_mermaid_render"));
+        assert!(!args.iter().any(|arg| arg == "unix-helper"));
+        let unix = arguments("x86_64-apple-darwin", "release", &declarations).unwrap();
+        assert!(unix.iter().any(|arg| arg == "unix-helper"));
+        assert!(unix.iter().any(|arg| arg == "bmux-mermaid-worker"));
     }
 
     #[test]

@@ -438,6 +438,12 @@ fn spawn_worker(
 ) -> Result<(std::process::Child, WorkerMemoryGuard), MermaidRenderError> {
     let mut command = std::process::Command::new(worker_path);
     configure_worker_memory_limit(&mut command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // Do not allow worker code (or descendants) to run before job containment.
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -560,7 +566,11 @@ impl IsolatedMermaidRenderer {
             let mut target = std::fs::File::create(&executable)?;
             std::io::copy(source, &mut target)?;
             target.sync_all()?;
+            #[cfg(unix)]
             std::fs::set_permissions(&executable, source.metadata()?.permissions())?;
+            // Windows read-only attributes belong to the installed source, not
+            // the disposable private copy: retaining them prevents TempDir cleanup.
+            drop(target);
             let digest = worker_digest(&executable)?;
             Ok(Self {
                 executable,
@@ -936,7 +946,58 @@ fn attach_worker_memory_limit(
         if AssignProcessToJobObject(job, child.as_raw_handle().cast()) == 0 {
             return Err(std::io::Error::last_os_error());
         }
+        resume_contained_worker(child.id())?;
         Ok(guard)
+    }
+}
+
+#[cfg(windows)]
+fn resume_contained_worker(process_id: u32) -> std::io::Result<()> {
+    use std::mem::size_of;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    // Rust's supported Child API does not expose the initial thread handle.
+    // A suspended fresh process has exactly one thread; find it without running
+    // untrusted code. Bound enumeration even on hosts with many unrelated threads.
+    // SAFETY: handles are checked before adopting ownership; initialized entry
+    // storage has the API-required size. OwnedHandle closes on every return path.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        let snapshot = OwnedHandle::from_raw_handle(snapshot);
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize =
+            u32::try_from(size_of::<THREADENTRY32>()).expect("thread entry size fits u32");
+        if Thread32First(snapshot.as_raw_handle(), &raw mut entry) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for _ in 0..65_536 {
+            if entry.th32OwnerProcessID == process_id {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if thread.is_null() {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let thread = OwnedHandle::from_raw_handle(thread);
+                match ResumeThread(thread.as_raw_handle()) {
+                    1 => return Ok(()),
+                    u32::MAX => return Err(std::io::Error::last_os_error()),
+                    _ => return Err(std::io::Error::other("unexpected worker suspension state")),
+                }
+            }
+            if Thread32Next(snapshot.as_raw_handle(), &raw mut entry) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Err(std::io::Error::other(
+            "worker thread discovery limit exceeded",
+        ))
     }
 }
 
@@ -1191,6 +1252,184 @@ mod tests {
         let path = cloned.executable().to_path_buf();
         drop(cloned);
         assert!(!path.exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_read_only_installation_does_not_make_snapshot_read_only() {
+        let installation = tempfile::tempdir().unwrap();
+        let path = installation.path().join("worker.exe");
+        std::fs::write(&path, b"original").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let renderer = IsolatedMermaidRenderer::pin(&path).unwrap();
+        assert!(
+            !std::fs::metadata(renderer.executable())
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        let snapshot = renderer.executable().to_path_buf();
+        drop(renderer);
+        assert!(!snapshot.exists());
+        // The installation is not owned by the renderer and remains unchanged.
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_worker_lifecycle_fixture() {
+        let Some(marker) = std::env::var_os("BMUX_TEST_WORKER_MARKER") else {
+            return;
+        };
+        std::fs::write(&marker, b"started").unwrap();
+        if std::env::var_os("BMUX_TEST_WORKER_ALLOCATE").is_some() {
+            let bytes = usize::try_from(super::WORKER_MEMORY_BYTES).unwrap() + 64 * 1024 * 1024;
+            let allocation = vec![1_u8; bytes];
+            std::hint::black_box(&allocation);
+            std::fs::write(marker, b"allocation-succeeded").unwrap();
+            return;
+        }
+        if let Some(descendant) = std::env::var_os("BMUX_TEST_WORKER_DESCENDANT") {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::windows_worker_lifecycle_fixture"])
+                .env("BMUX_TEST_WORKER_MARKER", descendant)
+                .env_remove("BMUX_TEST_WORKER_DESCENDANT")
+                .spawn()
+                .unwrap();
+            // The parent test terminates this whole job during the sleep.
+            // If used independently, still reap the descendant before returning.
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            child.wait().unwrap();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_job_rejects_allocation_beyond_worker_memory_limit() {
+        use std::os::windows::process::CommandExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("allocation");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::windows_worker_lifecycle_fixture"])
+            .env("BMUX_TEST_WORKER_MARKER", &marker)
+            .env("BMUX_TEST_WORKER_ALLOCATE", "1")
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED)
+            .spawn()
+            .unwrap();
+        let guard = super::attach_worker_memory_limit(&mut child).unwrap_or_else(|error| {
+            super::terminate_uncontained_worker(&mut child);
+            panic!("failed to contain worker: {error}");
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    !status.success(),
+                    "allocation exceeded the configured job limit"
+                );
+                assert_eq!(std::fs::read(&marker).unwrap(), b"started");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                super::terminate_worker(&mut child, &guard);
+                panic!("memory-limited worker did not exit");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_worker_runs_only_after_job_assignment_and_descendants_are_terminated() {
+        use std::mem::size_of;
+        use std::os::windows::process::CommandExt as _;
+        use windows_sys::Win32::System::JobObjects::{
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("worker-started");
+        let descendant = directory.path().join("descendant-started");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::windows_worker_lifecycle_fixture"])
+            .env("BMUX_TEST_WORKER_MARKER", &marker)
+            .env("BMUX_TEST_WORKER_DESCENDANT", &descendant)
+            .creation_flags(CREATE_SUSPENDED)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!marker.exists(), "worker ran before containment");
+        let guard = super::attach_worker_memory_limit(&mut child).unwrap_or_else(|error| {
+            super::terminate_uncontained_worker(&mut child);
+            panic!("failed to contain worker: {error}");
+        });
+        // SAFETY: the guard owns the job; the structures and their sizes match
+        // the requested information classes and remain writable during each call.
+        unsafe {
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            assert_ne!(
+                QueryInformationJobObject(
+                    guard.0,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_mut(&mut limits).cast(),
+                    u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap(),
+                    std::ptr::null_mut(),
+                ),
+                0
+            );
+            assert_eq!(
+                u64::try_from(limits.ProcessMemoryLimit).unwrap(),
+                super::WORKER_MEMORY_BYTES
+            );
+            assert_eq!(
+                limits.BasicLimitInformation.LimitFlags,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !descendant.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "contained worker did not resume");
+        assert!(descendant.exists(), "worker did not spawn its descendant");
+        super::terminate_worker(&mut child, &guard);
+        // SAFETY: same owned job and initialized output-storage contract as above.
+        unsafe {
+            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                assert_ne!(
+                    QueryInformationJobObject(
+                        guard.0,
+                        JobObjectBasicAccountingInformation,
+                        std::ptr::from_mut(&mut accounting).cast(),
+                        u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>()).unwrap(),
+                        std::ptr::null_mut(),
+                    ),
+                    0
+                );
+                if accounting.ActiveProcesses == 0 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "descendant survived termination"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
     }
 
     #[test]

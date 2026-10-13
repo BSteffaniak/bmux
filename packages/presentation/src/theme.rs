@@ -55,11 +55,41 @@ impl PresentationTheme {
             margin: 1,
         }
     }
+    /// Resolve safe built-in deck themes consistently across local and host rendering.
+    /// Unknown names retain the existing default; custom themes require host policy.
+    pub fn for_deck(deck: &crate::model::Deck) -> Self {
+        deck.metadata
+            .theme
+            .as_deref()
+            .and_then(Self::named)
+            .unwrap_or_default()
+    }
     pub fn named(name: &str) -> Option<Self> {
         match name {
             "dark" => Some(Self::dark()),
             "light" => Some(Self::light()),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn deck_named_theme_switching_is_consistent() {
+        let mut deck = crate::builder::DeckBuilder::new("d").build().unwrap();
+        for name in ["light", "dark", "light"] {
+            deck.metadata.theme = Some(name.into());
+            let theme = PresentationTheme::for_deck(&deck);
+            assert_eq!(theme.name, name);
+            assert_eq!(
+                theme.background,
+                PresentationTheme::named(name).unwrap().background
+            );
+        }
+        deck.metadata.theme = None;
+        assert_eq!(PresentationTheme::for_deck(&deck).name, "dark");
+        assert!(PresentationTheme::named("unsupported").is_none());
     }
 }

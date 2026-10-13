@@ -16,6 +16,16 @@ struct Scenes {
     effects: Arc<AtomicUsize>,
 }
 impl Owner for Scenes {
+    fn prepare_reload(
+        &self,
+        _deck: &bmux_presentation::Deck,
+        _assets: &[bmux_presentation_runtime::Asset],
+    ) -> Result<Box<dyn Owner>, HostError> {
+        Ok(Box::new(Self {
+            scenes: self.scenes.clone(),
+            effects: self.effects.clone(),
+        }))
+    }
     fn scene(&mut self, cx: OwnerContext<'_>) -> Result<Vec<MirrorFrame>, String> {
         self.scenes.fetch_add(1, Ordering::SeqCst);
         Ok(vec![MirrorFrame {

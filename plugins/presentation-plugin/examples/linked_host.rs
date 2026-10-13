@@ -1,56 +1,36 @@
-//! A linked Rust application: DeckBuilder + authoritative Host + trusted Owner.
-//! No Rust compiler or viewer-supplied executable is activated by presentation IO.
-use bmux_presentation::{DeckBuilder, NavigationAction, SlideBuilder};
+//! Trusted Rust embedding: two named components, owner input, and staged reload.
+//! Run with `cargo run -p bmux_presentation_plugin --example linked_host`.
+use bmux_presentation::{DeckBuilder, SlideBuilder};
+use bmux_presentation_plugin::{LinkedOwner, linked_demo_registry};
 use bmux_presentation_runtime::{
-    Action, Credential, Host, HostConfig, HostError, InteractionMode, Owner, OwnerContext,
-    OwnerUpdate, PROTOCOL_VERSION, Scopes, Submission, SurfaceInput,
+    Action, Credential, Host, HostConfig, InteractionMode, PROTOCOL_VERSION, Scopes, Submission,
+    SurfaceInput,
 };
 use std::time::Duration;
 
-struct LinkedOwner;
-impl Owner for LinkedOwner {
-    fn demo_input(
-        &mut self,
-        _context: OwnerContext<'_>,
-        _input: &SurfaceInput,
-    ) -> Result<OwnerUpdate, HostError> {
-        Err(HostError::NotFound)
-    }
-    fn effect(
-        &mut self,
-        _context: OwnerContext<'_>,
-        name: &str,
-        input: &str,
-    ) -> Result<OwnerUpdate, HostError> {
-        if name != "announce" {
-            return Err(HostError::Unauthorized);
-        }
-        // Trusted application-owned effect, not performed by remote viewers.
-        Ok(OwnerUpdate {
-            outcome: format!("Announcement accepted: {input}"),
-            surfaces: vec![],
-        })
-    }
-}
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let deck = DeckBuilder::new("linked-rust")
+fn main() -> anyhow::Result<()> {
+    let deck = DeckBuilder::new("linked-host")
         .slide(
-            SlideBuilder::new("intro")
-                .text("title", "Linked Rust presentation")
-                .pause()
-                .text("reveal", "Pure reducer and authoritative runtime")
+            SlideBuilder::new("controls")
+                .custom("count", "counter", serde_json::json!({}))
+                .custom("switch", "toggle", serde_json::json!({}))
                 .build(),
         )
         .build()
-        .map_err(std::io::Error::other)?;
-    let mut host = Host::new(deck, vec![], HostConfig::default())?;
-    host.set_owner(Box::new(LinkedOwner))?;
+        .map_err(anyhow::Error::msg)?;
+    let assets = Vec::new();
+    // An embedding application can instead register its own trusted Rust
+    // LinkedComponentFactory implementations in a LinkedRegistry.
+    let registry = linked_demo_registry();
+    let owner = LinkedOwner::new(deck.clone(), &assets, registry)?;
+    let mut host = Host::new(deck.clone(), assets, HostConfig::default())?;
+    host.set_owner(Box::new(owner))?;
     let credential = Credential::generate(
         Scopes {
-            notes: true,
+            notes: false,
             navigate: true,
-            demo_input: false,
-            effects: true,
+            demo_input: true,
+            effects: false,
         },
         Duration::from_secs(60),
     );
@@ -58,17 +38,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     host.add_credential(credential)?;
     let participant =
         host.authenticate(PROTOCOL_VERSION, Some(&secret), InteractionMode::Shared)?;
-    let initial = host.snapshot(&participant)?;
-    let ack = host.submit(
+    let snapshot = host.snapshot(&participant)?;
+    // Select the stable block ID, not the first surface or its component type.
+    let toggle = snapshot
+        .surfaces
+        .iter()
+        .find(|surface| surface.surface_id == "switch")
+        .ok_or_else(|| anyhow::anyhow!("toggle surface missing"))?;
+    host.submit(
         &participant,
         Submission {
-            action_id: host.next_action_id(&participant)?.unwrap(),
-            expected: initial.cursor,
-            action: Action::Navigate(NavigationAction::Next),
+            action_id: host
+                .next_action_id(&participant)?
+                .ok_or_else(|| anyhow::anyhow!("input unavailable"))?,
+            expected: snapshot.cursor,
+            action: Action::DemoInput(SurfaceInput {
+                surface_id: toggle.surface_id.clone(),
+                surface_revision: toggle.revision,
+                x: 0,
+                y: 0,
+                input: " ".into(),
+            }),
         },
     )?;
-    assert_eq!(host.snapshot(&participant)?.state.reveal_step, 1);
-    println!("Linked host revision {}", ack.cursor.revision);
-    host.disconnect(&participant);
+    // Retains compatible values and prepares fresh geometry/assets atomically.
+    host.reload(deck, vec![])?;
+    let reloaded = host.snapshot(&participant)?;
+    assert_eq!(reloaded.surfaces.len(), 2);
+    println!("Linked counter and toggle hosted; toggle input and compatible reload accepted.");
     Ok(())
 }

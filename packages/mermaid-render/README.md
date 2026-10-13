@@ -38,6 +38,44 @@ The existing version-1 `BCMW`/`BCMR` byte framing and cache-key semantics are
 intentionally unchanged. Binary/crate/environment names are the only packaging
 migration: later Bcode integration must select/package the new worker explicitly.
 
+## Windows source handoff and external gate
+
+Windows discovery selects `bmux-mermaid-worker.exe` beside the application (or the
+captured explicit override) and snapshots it as `worker.exe`. The disposable copy
+keeps its own writable attributes even when the installation is read-only, so
+ordinary snapshot release can remove it. Digest checks still reject tampering.
+Worker startup uses `CREATE_SUSPENDED`: Job Object memory and kill-on-close limits
+are installed before the initial thread resumes. Thread discovery is bounded and
+fails closed; any containment/resume failure terminates the suspended child. No
+shell, PATH lookup, or breakaway flag is used. The protocol remains version 1.
+
+The manifest-owned `supported_platforms` contract defaults to Unix-only;
+presentation explicitly opts into Unix and Windows. `xtask` now builds opted-in
+helpers, stages their `.exe` source/destination names, and verifies/copies them
+with inventory identity. Unrelated Unix-only helpers remain unavailable on
+Windows. The existing release and npm workflows already call `cargo xtask build`
+and `cargo xtask auxiliary stage`; no workflow edits are needed for this wiring.
+This is source wiring, **not evidence of a working Windows release bundle**.
+
+External acceptance requires a native `x86_64-pc-windows-msvc` runner using the
+repository-selected Rust version:
+
+- Run `bmux_mermaid_render` unit/integration tests, including suspended containment,
+  memory-limit rejection, descendant termination, read-only snapshot cleanup,
+  native filename/override discovery, actual rendering, and tamper rejection.
+- Run `bmux_plugin` auxiliary Windows tests (handle identity, denied replacement,
+  junction/reparse rejection, installed inventory owner/digest/filename checks).
+- Run `xtask` platform build/stage/install/verification tests.
+- Build the complete release product, stage a Windows bundle, inspect
+  `artifacts.json` for the declared `bmux-mermaid-worker.exe` SHA-256/size, install
+  it, and exercise packaged rendering from that installed bundle, cancellation,
+  timeout, and bounded malformed/oversized worker responses. Confirm the unrelated
+  Unix-only supervisor remains listed unavailable.
+
+The followup lane only inspected source and used focused rustfmt/diff checks on
+Linux. It did not run Cargo builds/tests or produce/run a Windows bundle. Shared
+clippy, nextest, machete and plugin rebuild validation remain coordinator-owned.
+
 ## Validation
 
 All original verification/tampering, packaged snapshot lifecycle, cache, validation,

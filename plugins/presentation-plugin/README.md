@@ -12,16 +12,20 @@ Optional plugin-owned `bmux present` commands:
 Credential files must be private (Unix mode 0600), containing 32–256 bytes.
 TLS trust is explicit; no insecure or plaintext remote fallback exists. Public
 read access requires `--public-read`. Presenter notes are separately authorized.
-Linked Rust applications construct `Deck` with `DeckBuilder`, instantiate `Host`,
-and install a trusted runtime `Owner`; see `examples/linked_host.rs`. This scope
+Linked Rust applications construct `Deck` with `DeckBuilder`, register trusted
+factories in `LinkedRegistry`, and install `LinkedOwner::new(deck, assets, registry)`
+in the same runtime `Host`; see `examples/linked_host.rs`. Compatible component
+state survives atomic reload by block ID, component type, and state version.
+This scope
 excludes compiling `.rs` files through the CLI. JSON deck import is an optional
 serialized-data adapter, not a Rust source-loading convention. Remote viewers
 never execute Rust or Mermaid. Local reload retains the last valid deck on errors.
 
 Mermaid requires the packaged `bmux-mermaid-worker` beside bmux, or an explicit
 `BMUX_MERMAID_WORKER_PATH`. Worker identity is pinned before loading. Generic xtask auxiliary-executable
-packaging installs it on Unix; the current helper packaging path excludes Windows,
-so Windows installations do not yet provide bundled Mermaid rendering. Images and
+packaging builds/stages opted-in helpers on Unix and Windows (`.exe`). Native
+Windows bundle and containment validation is still required; see the worker README.
+Images and
 diagrams are decoded/prepared outside update/paint; remote assets are opaque and
 fetched in bounded chunks. Private audience credentials grant navigation/demo
 input but never notes/effects; receive-only mode remains read-only.

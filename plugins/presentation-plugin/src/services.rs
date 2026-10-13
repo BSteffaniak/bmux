@@ -2,7 +2,7 @@
 //! the authenticated BMUX connection, never accepted as bearer credentials.
 use bmux_plugin_sdk::{NativeServiceContext, ServiceResponse};
 use bmux_presentation::NavigationAction;
-use bmux_presentation_plugin_api::{presentation_host_v1 as manage, presentation_view_v1 as view};
+use bmux_presentation_plugin_api::{presentation_host_v1 as manage, presentation_view_v2 as view};
 use bmux_presentation_runtime::{
     Action, Credential, Cursor, Host, HostConfig, HostError, InteractionMode, PROTOCOL_VERSION,
     Poll, Response, Scopes, Submission,
@@ -35,9 +35,11 @@ pub(crate) fn build(
     audience: Option<String>,
 ) -> anyhow::Result<Host> {
     let loaded = crate::source::loaded(source)?;
-    let mut owner_rich = crate::rich::RichAssets::prepare(&loaded.assets)?;
-    owner_rich.code = crate::rich::highlight(&loaded.deck);
-    let owner = crate::owner::DemoOwner::new(loaded.deck.clone(), owner_rich);
+    let owner = crate::owner::LinkedOwner::new(
+        loaded.deck.clone(),
+        &loaded.assets,
+        crate::demo::linked_registry(),
+    )?;
     let mut host = Host::new(
         loaded.deck,
         loaded.assets,
@@ -77,10 +79,7 @@ pub(crate) fn reload(
     host: &mut Host,
     loaded: bmux_presentation_runtime::loader::LoadedDeck,
 ) -> anyhow::Result<()> {
-    let mut rich = crate::rich::RichAssets::prepare(&loaded.assets)?;
-    rich.code = crate::rich::highlight(&loaded.deck);
-    let owner = crate::owner::DemoOwner::new(loaded.deck.clone(), rich);
-    host.reload_with_owner(loaded.deck, loaded.assets, Box::new(owner))?;
+    host.reload(loaded.deck, loaded.assets)?;
     Ok(())
 }
 
@@ -172,7 +171,7 @@ pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
             let result = hosts().lock().map_err(|e| e.to_string()).and_then(|mut all| all.remove(&r.host_id).map(|_| ()).ok_or_else(|| "host not found".into()));
             Ok::<_, ServiceResponse>(result)
         },
-        "presentation-view-v1", "authenticate" => |r: view::client::AuthenticateRequest, ctx| {
+        "presentation-view-v2", "authenticate" => |r: view::client::AuthenticateRequest, ctx| {
             let result = (|| -> Result<view::Participant, view::Error> {
                 if ctx.caller_client_id.is_none() { return Err(view::Error::Authentication); }
                 let mut all = hosts().lock().map_err(|_| view::Error::Invalid)?;
@@ -186,25 +185,25 @@ pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
             })();
             Ok::<_, ServiceResponse>(result)
         },
-        "presentation-view-v1", "poll" => |r: view::client::PollRequest, ctx| {
+        "presentation-view-v2", "poll" => |r: view::client::PollRequest, ctx| {
             let previous = r.cursor.map(runtime_cursor);
             let result = access(ctx, &r.host_id, &r.participant_id, |host| host.poll(&r.participant_id, previous.as_ref())).and_then(project_poll);
             Ok::<_, ServiceResponse>(result)
         },
-        "presentation-view-v1", "snapshot" => |r: view::client::SnapshotRequest, ctx| {
+        "presentation-view-v2", "snapshot" => |r: view::client::SnapshotRequest, ctx| {
             let result = access(ctx, &r.host_id, &r.participant_id, |host| host.snapshot(&r.participant_id))
                 .and_then(|snapshot| match project_poll(Poll::Snapshot { resync: true, snapshot: Box::new(snapshot) })? {
                     view::Poll::Snapshot { snapshot, .. } => Ok(snapshot), _ => Err(view::Error::Invalid),
                 });
             Ok::<_, ServiceResponse>(result)
         },
-        "presentation-view-v1", "submit" => |r: view::client::SubmitRequest, ctx| {
+        "presentation-view-v2", "submit" => |r: view::client::SubmitRequest, ctx| {
             let submission = Submission { expected: runtime_cursor(r.expected), action: action(r.action), action_id: r.action_id };
             let result = access(ctx, &r.host_id, &r.participant_id, |host| host.submit(&r.participant_id, submission))
                 .map(|ack| view::Acknowledgment { action_id: ack.action_id, cursor: wire_cursor(ack.cursor), outcome: ack.outcome });
             Ok::<_, ServiceResponse>(result)
         },
-        "presentation-view-v1", "asset" => |r: view::client::AssetRequest, ctx| {
+        "presentation-view-v2", "asset" => |r: view::client::AssetRequest, ctx| {
             let result = access(ctx, &r.host_id, &r.participant_id, |host| {
                 host.asset(&r.participant_id, &r.id, usize::try_from(r.offset).map_err(|_| HostError::Limit)?, usize::try_from(r.length).map_err(|_| HostError::Limit)?)
             }).and_then(|response| match response {
@@ -213,7 +212,7 @@ pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
             });
             Ok::<_, ServiceResponse>(result)
         },
-        "presentation-view-v1", "leave" => |r: view::client::LeaveRequest, ctx| {
+        "presentation-view-v2", "leave" => |r: view::client::LeaveRequest, ctx| {
             let _ = access(ctx, &r.host_id, &r.participant_id, |host| { host.disconnect(&r.participant_id); Ok(()) });
             if let Ok(mut all) = hosts().lock() && let Some(h) = all.get_mut(&r.host_id) && h.participants.get(&r.participant_id) == Some(&ctx.caller_client_id) { h.participants.remove(&r.participant_id); }
             Ok::<_, ServiceResponse>(())

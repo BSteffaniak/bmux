@@ -7,8 +7,8 @@ use std::time::Duration;
 #[cfg(target_os = "linux")]
 use bmux_mermaid_render::WORKER_MEMORY_BYTES;
 use bmux_mermaid_render::{
-    MermaidCancellationToken, MermaidRenderError, MermaidRenderRequest, MermaidRenderedOutput,
-    render_mermaid_with_worker,
+    IsolatedMermaidRenderer, MermaidCancellationToken, MermaidRenderError, MermaidRenderRequest,
+    MermaidRenderedOutput, render_mermaid_with_worker,
 };
 
 const REQUEST_MAGIC: &[u8; 4] = b"BCMW";
@@ -251,6 +251,94 @@ fn public_worker_adapter_honors_pre_cancelled_request() {
         ),
         Err(MermaidRenderError::Cancelled)
     );
+}
+
+#[test]
+fn pinned_worker_runs_from_a_spaced_unicode_path_and_rejects_tampering() {
+    let installation = tempfile::tempdir().unwrap();
+    let directory = installation.path().join("worker installation ü");
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join(if cfg!(windows) {
+        "worker.exe"
+    } else {
+        "worker"
+    });
+    std::fs::copy(env!("CARGO_BIN_EXE_bmux-mermaid-worker"), &path).unwrap();
+    let renderer = IsolatedMermaidRenderer::pin(&path).unwrap();
+    let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
+    let rendered = renderer
+        .render(&request, &MermaidCancellationToken::default())
+        .unwrap();
+    let MermaidRenderedOutput::Svg(svg) = rendered.output;
+    assert!(String::from_utf8(svg).unwrap().contains("<svg"));
+    std::fs::write(renderer.executable(), b"changed").unwrap();
+    assert!(matches!(
+        renderer.render(&request, &MermaidCancellationToken::default()),
+        Err(MermaidRenderError::WorkerUnavailable { .. })
+    ));
+    let snapshot = renderer.executable().to_path_buf();
+    drop(renderer);
+    assert!(!snapshot.exists());
+}
+
+#[test]
+fn packaged_worker_discovery_fixture() {
+    let Some(directory) = std::env::var_os("BMUX_TEST_PACKAGED_WORKER_DIRECTORY") else {
+        return;
+    };
+    IsolatedMermaidRenderer::initialize_packaged(std::path::Path::new(&directory)).unwrap();
+    let renderer = IsolatedMermaidRenderer::packaged().unwrap();
+    assert_eq!(
+        renderer.executable().extension(),
+        if cfg!(windows) {
+            Some(std::ffi::OsStr::new("exe"))
+        } else {
+            None
+        }
+    );
+    let rendered = renderer
+        .render(
+            &MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600),
+            &MermaidCancellationToken::default(),
+        )
+        .unwrap();
+    let MermaidRenderedOutput::Svg(svg) = rendered.output;
+    assert!(String::from_utf8(svg).unwrap().contains("<svg"));
+    let snapshot = renderer.executable().to_path_buf();
+    drop(renderer);
+    assert!(!snapshot.exists());
+}
+
+#[test]
+fn packaged_worker_discovers_native_filename_and_explicit_override_without_a_shell() {
+    let installation = tempfile::tempdir().unwrap();
+    let directory = installation.path().join("packaged worker ü");
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join(if cfg!(windows) {
+        "bmux-mermaid-worker.exe"
+    } else {
+        "bmux-mermaid-worker"
+    });
+    std::fs::copy(env!("CARGO_BIN_EXE_bmux-mermaid-worker"), &path).unwrap();
+    for override_path in [None, Some(&path)] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "packaged_worker_discovery_fixture"])
+            .env(
+                "BMUX_TEST_PACKAGED_WORKER_DIRECTORY",
+                if override_path.is_some() {
+                    installation.path()
+                } else {
+                    &directory
+                },
+            );
+        if let Some(path) = override_path {
+            command.env(bmux_mermaid_render::MERMAID_RENDERER_PATH_ENV, path);
+        } else {
+            command.env_remove(bmux_mermaid_render::MERMAID_RENDERER_PATH_ENV);
+        }
+        assert!(command.status().unwrap().success());
+    }
 }
 
 #[test]

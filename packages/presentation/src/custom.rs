@@ -55,6 +55,61 @@ impl<'registry> CustomRegistry<'registry> {
     }
 }
 
+/// Caller-owned state for a trusted linked component. Owners clone the value into
+/// detached state during reload preparation; never share the live mutex with a candidate.
+pub type LinkedState = std::sync::Arc<std::sync::Mutex<serde_json::Value>>;
+
+/// Application-supplied Rust implementation, not a dynamic executable lookup.
+/// A version change explicitly resets state. Initialization and build are read-only
+/// with respect to existing state; only authorized component events may mutate it.
+pub trait LinkedComponentFactory: Send + Sync {
+    fn state_version(&self) -> u64;
+    fn initial_state(&self, block: &Block) -> Result<serde_json::Value, String>;
+    fn build<'a>(&'a self, block: &'a Block, state: LinkedState) -> Result<Element<'a>, String>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CompatibilityKey {
+    pub id: String,
+    pub component_type: String,
+    pub state_version: u64,
+}
+
+/// Explicit linked allowlist supplied by the embedding application.
+#[derive(Clone, Default)]
+pub struct LinkedRegistry {
+    factories: BTreeMap<String, std::sync::Arc<dyn LinkedComponentFactory>>,
+}
+impl LinkedRegistry {
+    pub fn register(
+        &mut self,
+        name: impl Into<String>,
+        factory: impl LinkedComponentFactory + 'static,
+    ) -> Result<(), String> {
+        let name = name.into();
+        if name.is_empty() || self.factories.contains_key(&name) {
+            return Err(format!(
+                "empty or already registered component name: {name}"
+            ));
+        }
+        self.factories.insert(name, std::sync::Arc::new(factory));
+        Ok(())
+    }
+    pub fn factory(&self, name: &str) -> Option<&std::sync::Arc<dyn LinkedComponentFactory>> {
+        self.factories.get(name)
+    }
+    pub fn compatibility_key(&self, block: &Block) -> Option<CompatibilityKey> {
+        let crate::model::BlockKind::Custom { name, .. } = &block.kind else {
+            return None;
+        };
+        Some(CompatibilityKey {
+            id: block.id.as_str().to_owned(),
+            component_type: name.clone(),
+            state_version: self.factory(name)?.state_version(),
+        })
+    }
+}
+
 /// Convenient factory for components that own their inputs.
 pub struct OwnedFactory<F, C> {
     build: F,

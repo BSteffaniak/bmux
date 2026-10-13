@@ -3,7 +3,9 @@ use crate::mirror::MirrorFrame;
 use bmux_presentation::{Deck, NavigationAction, PresentationState};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+// Version 2 preserves rich audience Markdown and validated theme names. V1
+// peers must not guess the new projection semantics; authentication rejects them.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InteractionMode {

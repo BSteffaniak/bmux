@@ -36,6 +36,7 @@ pub struct ViewerComponent<'a> {
     rich: Option<&'a dyn RichContent>,
     hidden: HiddenContent,
     focused_block: Option<&'a crate::model::BlockId>,
+    content: Option<&'a dyn Component>,
 }
 impl<'a> ViewerComponent<'a> {
     pub fn new(
@@ -54,6 +55,7 @@ impl<'a> ViewerComponent<'a> {
             rich: None,
             hidden: HiddenContent::ReserveSpace,
             focused_block: None,
+            content: None,
         }
     }
     pub fn focused_block(mut self, id: &'a crate::model::BlockId) -> Self {
@@ -68,9 +70,53 @@ impl<'a> ViewerComponent<'a> {
         self.hidden = hidden;
         self
     }
+    /// Host-prepared content uses the same viewport, scrolling and footer as slides.
+    pub fn content(mut self, content: &'a dyn Component) -> Self {
+        self.content = Some(content);
+        self
+    }
+    /// Measured content viewport and its unscrolled content from this viewer tree.
+    /// Pair with the scroll state retained by the successfully committed paint.
+    pub fn content_geometry<'layout>(
+        &self,
+        layout: &'layout LayoutNode,
+    ) -> Option<(LogicalRect, &'layout LayoutNode)> {
+        fn find<'a>(
+            node: &'a LayoutNode,
+            id: &LayoutId,
+            x: u64,
+            y: u64,
+        ) -> Option<(LogicalRect, &'a LayoutNode)> {
+            if node.id == *id {
+                return Some((
+                    LogicalRect::new(x, y, node.size.width, node.size.height),
+                    &node.children.first()?.node,
+                ));
+            }
+            node.children.iter().find_map(|child| {
+                find(
+                    &child.node,
+                    id,
+                    x.saturating_add(child.x),
+                    y.saturating_add(child.y),
+                )
+            })
+        }
+        find(
+            layout,
+            &LayoutId::new(format!(
+                "presentation/{}/viewer/viewport/content",
+                self.deck.id.as_str()
+            )),
+            0,
+            0,
+        )
+    }
     fn tree(&self) -> Element<'_> {
         let id = format!("presentation/{}/viewer", self.deck.id.as_str());
-        let content = if let Some(slide) = self.navigation.current_slide(self.deck) {
+        let content = if let Some(content) = self.content {
+            Element::new(BorrowedComponent(content))
+        } else if let Some(slide) = self.navigation.current_slide(self.deck) {
             let mut component =
                 SlideComponent::new(slide, self.navigation.reveal_step, self.theme, self.custom)
                     .hidden_content(self.hidden);
@@ -140,7 +186,9 @@ impl Component for ViewerComponent<'_> {
         self.tree().layout(constraints, cx)
     }
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        self.tree().paint(layout, cx);
+        // Fill clears the surface, but descendant text/chrome writes replace cells.
+        // Inherit the background so those writes preserve the selected deck theme.
+        cx.with_style(self.theme.background, |cx| self.tree().paint(layout, cx));
     }
     fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
         self.tree().event(event, layout, cx)
@@ -267,6 +315,8 @@ impl Component for ViewerViewport<'_> {
             layout.size.height,
         ));
         let mut state = self.state.scroll.get();
+        // The host chooses the viewer as keyboard target; child controls get first refusal.
+        state.interaction.focused = true;
         let outcome = ScrollView::new().handle_event(area, &child.node, &mut state, event);
         self.state.scroll.set(state);
         if outcome == ScrollViewOutcome::Ignored {
@@ -323,6 +373,78 @@ mod tests {
         state.scroll.set(scrolled);
         viewer.paint(&layout, &mut PaintCx::new(&mut frame));
         assert!(state.scroll.get().vertical_offset() > 0);
+    }
+    #[test]
+    fn wheel_scroll_and_content_geometry_follow_measured_viewport() {
+        let deck = DeckBuilder::new("d")
+            .slide(SlideBuilder::new("s").build())
+            .build()
+            .unwrap();
+        let navigation = PresentationState::new(&deck);
+        let state = ViewerState::new();
+        let theme = PresentationTheme::dark();
+        let custom = CustomRegistry::new();
+        let content = TextBlock::new(
+            (0..40)
+                .map(|n| format!("row {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let viewer =
+            ViewerComponent::new(&deck, &navigation, &state, &theme, &custom).content(&content);
+        let layout = viewer.layout(
+            Constraints::tight(Size::new(20, 8)),
+            &mut LayoutCx::default(),
+        );
+        let (clip, content) = viewer.content_geometry(&layout).unwrap();
+        assert!(content.size.height >= 40);
+        assert!(clip.height < layout.size.height);
+        let event = Event::Mouse(bmux_tui::event::MouseEvent::new(
+            bmux_tui::event::MouseEventKind::ScrollDown,
+            bmux_tui::geometry::Point::new(1, 1),
+        ));
+        assert!(
+            viewer
+                .event(&event, &layout, &mut EventCx::new(&layout))
+                .is_handled()
+        );
+        assert!(state.scroll.get().vertical_offset() > 0);
+        assert_eq!(viewer.content_geometry(&layout).unwrap().0, clip);
+        state.reset_scroll();
+        assert_eq!(state.scroll.get().vertical_offset(), 0);
+    }
+    #[test]
+    fn named_background_survives_text_footer_and_scrollbar_paint() {
+        let deck = DeckBuilder::new("d")
+            .slide(SlideBuilder::new("s").text("body", "public text").build())
+            .build()
+            .unwrap();
+        let navigation = PresentationState::new(&deck);
+        let state = ViewerState::new();
+        let custom = CustomRegistry::new();
+        for theme in [PresentationTheme::light(), PresentationTheme::dark()] {
+            let viewer = ViewerComponent::new(&deck, &navigation, &state, &theme, &custom);
+            let layout = viewer.layout(
+                Constraints::tight(Size::new(30, 8)),
+                &mut LayoutCx::default(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 30, 8));
+            viewer.paint(&layout, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+            for y in 0..8 {
+                for x in 0..30 {
+                    assert_eq!(
+                        buffer
+                            .get(bmux_tui::geometry::Point::new(x, y))
+                            .unwrap()
+                            .style
+                            .bg,
+                        theme.background.bg,
+                        "background at ({x}, {y}) for {}",
+                        theme.name
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn empty_deck_has_a_measurable_viewer() {

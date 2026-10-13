@@ -25,17 +25,24 @@ Plugin implementations call `Host` and expose generated BPDL operations; the
   run/deck/state cursor, rate, payload bounds, and committed surface geometry.
   Private navigation/demo/effect scopes are independent of speaker-note access.
 - `asset` distributes only audience-referenced opaque resources in bounded chunks.
-- `reload` validates/prepares a replacement before atomically changing deck/assets,
-  reconciling slide identities/reveal steps, and invalidating mirror geometry.
-  Use `reload_with_owner(deck, assets, Box<dyn Owner>)` when the owner captures
-  the deck/assets (for example `DemoOwner`). It prepares every shared, connected
-  independent and retained independent scene against the replacement owner before
-  swapping anything; any failure preserves the prior owner and complete host state.
+- `reload` validates the replacement bundle, then calls
+  `Owner::prepare_reload(&self, &Deck, &[Asset]) -> Result<Box<dyn Owner>, HostError>`
+  on the live owner with the new validated owner-local assets. The returned candidate
+  must be isolated: retain values only for matching `(block ID, linked component
+  type, state version)`, with no mutable handles shared with the active owner.
+  `Owner::reconcile_reload(&mut self, OwnerContext) -> Result<Vec<MirrorFrame>, String>`
+  rebuilds all shared, connected independent and retained independent geometry on
+  the candidate before publication. It defaults to `scene`; `prepare_reload`
+  defaults to `Invalid`, preserving source compatibility without inventing cloning.
+  `reload_with_owner(deck, assets, Box<dyn Owner>)` still accepts an app-prepared
+  candidate directly. Any preparation/scene failure preserves the active owner,
+  deck, assets, navigation, cursors and committed surfaces; no effects replay.
 - `Host::set_owner(Box<dyn Owner>) -> Result<(), HostError>` prepares and validates
   initial shared and connected independent scenes before installing the owner.
   `Owner::scene(&mut self, OwnerContext) -> Result<Vec<MirrorFrame>, String>` defaults
   to empty and is projection-only: it must never invoke effects. The host calls it
-  on independent join, navigation and reload, not on polling or viewer resize.
+  on independent join and navigation, not on polling or viewer resize. Reload
+  uses the candidate-only `reconcile_reload` hook (defaulting to `scene`).
   A reload owner must already understand the replacement deck identities; otherwise
   projection fails and the host retains the old bundle. Callback diagnostics are
   not exported. `MirrorComponent::new` validates a borrowed scene and implements
@@ -78,9 +85,16 @@ is uncertain. Polling/snapshots never invoke effects. The owner must return only
 public, bounded outcomes; private external diagnostics should stay owner-local.
 
 The audience projection strips notes, source locations, custom configuration,
-theme/extra metadata and Markdown link/image destinations/raw HTML. Markdown text
-is deliberately projected to plain portable text; links are not made clickable.
-Image destinations become random resource IDs; unreferenced assets are not served.
+extra metadata, Markdown link destinations/titles/references/autolinks and raw HTML.
+Markdown stays rich: source-range edits preserve shared renderer syntax for inline
+styles, lists, tables, code, math and footnotes; unsafe syntax exposed by reparsing
+fails closed. Inline and block images use only authorized opaque asset IDs;
+unreferenced assets are not served. Only exact `light`/`dark` theme names survive;
+unknown names reject preparation. The local loader normalizes inline image assets
+under the same bounded root policy as block images.
+Standalone transport version **2** explicitly selects these richer projection
+semantics; version 1 authentication is rejected. Plugin BPDL compatibility must be
+selected by the owning plugin; these standalone messages are not plugin IPC.
 Visible authored labels, code, Mermaid content, titles, authors, IDs, and custom
 names are public content: authors must not put secrets there. Custom configuration
 is never activated from an audience deck. Notes are a separately scoped field.
@@ -97,6 +111,10 @@ unbounded work; asynchronous demo lifecycle management belongs to the applicatio
 Behavior tests cover auth/modes, private wire projection, shared/independent state,
 reconnect action dedup and uncertainty, eviction, atomic reload, malformed mirrors,
 all style bits, clipped placement, real loopback TCP and TLS certificate validation.
-No cargo/build/fmt/test commands were run in the initial lane: the coordinator owns
-workspace manifests, lockfile, target serialization, formatting and validation.
+Follow-up coverage adds rich Markdown privacy/opaque inline images, immutable
+candidate preparation, compatibility-key retention/reset, shared/live/cached
+instance reconciliation, unknown theme and oversized asset atomicity, slow peer
+timeouts and snapshot resync. Existing uncertain-effect reconnect/eviction coverage
+is retained. Focused rustfmt and source/diff inspection only were run in this lane;
+all cargo builds, clippy, tests and dependency validation belong to the coordinator.
 The `bmux present` command/plugin adapters belong to their assigned integration lane.
