@@ -9011,7 +9011,16 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    if view_state.pane_images_presented || view_state.has_presented_images() {
+    let raster_image_protocol = view_state.host_image_caps.preferred_protocol()
+        != Some(bmux_image::model::ImageProtocol::KittyGraphics);
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    if view_state.pane_images_presented
+        || (raster_image_protocol && view_state.has_presented_images())
+    {
         // Non-persistent raster protocols require cell repair before replacing
         // or removing a prior image. Use an explicit full repair until damage
         // can retain protocol-specific raster footprints.
@@ -9481,7 +9490,10 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     ))]
     {
         view_state.kitty_host_state = pending_kitty_state;
-        view_state.pane_images_presented = view_state.has_presented_images();
+        // This flag tracks raster footprints requiring ED2, not persistent
+        // Kitty placements. ED2 can destroy cached Kitty uploads on the host.
+        view_state.pane_images_presented =
+            raster_image_protocol && view_state.has_presented_images();
     }
 
     // Capture only frames that were successfully written and flushed.
@@ -16706,6 +16718,66 @@ mod tests {
                 )],
             },
             zoomed: false,
+        }
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn kitty_pane_images_survive_idle_redraw_and_slide_navigation_without_ed2() {
+        let session = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
+            session_id: session,
+            context_id: None,
+            can_write: true,
+        });
+        let layout = retry_test_layout(&mut state, pane, session);
+        state.host_image_caps.kitty_graphics = true;
+        let image = bmux_attach_image_protocol::AttachPaneImage {
+            id: 42,
+            protocol: bmux_attach_image_protocol::AttachImageProtocol::KittyGraphics,
+            raw_data: include_bytes!("../../../../presenter/examples/architecture.png").to_vec(),
+            compression: bmux_attach_image_protocol::CompressionId::None,
+            position_row: 1,
+            position_col: 3,
+            cell_rows: 8,
+            cell_cols: 30,
+            pixel_width: 640,
+            pixel_height: 240,
+        };
+        let render = |state: &mut AttachViewState| {
+            let mut output = Vec::new();
+            render_attach_frame_to_writer(
+                &mut output,
+                state,
+                &layout,
+                &RuntimeAppearance::default(),
+                &[],
+                0,
+                &bmux_config::DamageBehaviorConfig::default(),
+                u64::MAX,
+                &mut DisplayCaptureFanout::default(),
+                TerminalGeometry { cols: 80, rows: 24 },
+                None,
+            )
+            .unwrap();
+            output
+        };
+        for visible in [true, true, false, true, false, true] {
+            state
+                .pane_images
+                .insert(pane, if visible { vec![image.clone()] } else { vec![] });
+            state.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
+            let output = render(&mut state);
+            assert!(
+                !output.windows(4).any(|bytes| bytes == b"\x1b[2J"),
+                "Kitty frame erased uploads"
+            );
+            assert_eq!(String::from_utf8_lossy(&output).contains("Ga=p"), visible);
+            assert!(
+                !state.pane_images_presented,
+                "Kitty marked as raster footprint"
+            );
         }
     }
 
