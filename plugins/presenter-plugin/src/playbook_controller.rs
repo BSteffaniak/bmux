@@ -616,17 +616,29 @@ impl Worker {
             return Err("attempt already started; stop and settle before Restart".into());
         }
         if control == Control::Restart {
-            let settled = state::client::settled(
-                self.client.as_mut().ok_or("service connection missing")?,
-                generation,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .map_err(|error| format!("{error:?}"))?;
-            if settled.generation != generation || !settled.cleanup_acknowledged {
-                return Err(
-                    "restart refused until previous attempt cleanup is acknowledged".into(),
-                );
+            // Restart explicitly authorizes stopping the retained live sandbox.
+            // Script completion alone never implies cleanup or permits reuse.
+            let client = self.client.as_mut().ok_or("service connection missing")?;
+            let stopped = commands::client::stop(client, generation)
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| format!("{error:?}"))?;
+            if stopped.generation != generation {
+                return Err("Stop returned another execution generation".into());
+            }
+            self.attempt = Some(stopped);
+            loop {
+                let settled = state::client::settled(client, generation)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| format!("{error:?}"))?;
+                if settled.generation != generation {
+                    return Err("settlement returned another execution generation".into());
+                }
+                if settled.cleanup_acknowledged {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
         if matches!(control, Control::Run | Control::Restart)

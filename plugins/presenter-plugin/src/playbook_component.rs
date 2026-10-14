@@ -73,7 +73,13 @@ impl<'a> PlaybookDemo<'a> {
         });
         let buttons = std::array::from_fn(|index| {
             let mut state = ButtonState::new();
-            state.set_disabled(index != 4 && (snapshot.unresolved || terminal && index < 3));
+            let inactive = terminal && index < 2
+                || index == 2
+                    && snapshot
+                        .attempt
+                        .as_ref()
+                        .is_none_or(|attempt| attempt.cleanup_acknowledged);
+            state.set_disabled(index != 4 && (snapshot.unresolved || inactive));
             Cell::new(state)
         });
         Self {
@@ -178,23 +184,23 @@ impl<'a> PlaybookDemo<'a> {
             }
         }
         column = column.child(TextBlock::new(status));
+        if !self.audience
+            && let Some(error) = &self.snapshot.error
+        {
+            column = column.child(TextBlock::new(bounded_diagnostic(error)));
+        }
         if let Some(surface) = self.surface {
             let controls_height = if self.audience {
                 5
             } else if width >= 58 {
-                7
+                7 + u64::from(self.snapshot.error.is_some()) * 3
             } else {
-                14
+                14 + u64::from(self.snapshot.error.is_some()) * 3
             };
             column = column.child(
                 SizeBox::new(EmbeddedSurface::new(surface))
                     .height(height.saturating_sub(controls_height)),
             );
-        }
-        if !self.audience
-            && let Some(error) = &self.snapshot.error
-        {
-            column = column.child(TextBlock::new(bounded_diagnostic(error)));
         }
         Element::new(
             SizeBox::new(Surface::new(column).border(bmux_tui::chrome::Border::new(

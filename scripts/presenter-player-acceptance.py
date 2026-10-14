@@ -54,7 +54,7 @@ class Acceptance(OWNED.Acceptance):
                          '@timeout 180000\nnew-session\n' + ''.join(
                              'send-keys keys=' + json.dumps(command + '\r') + '\n'
                              for command in commands) +
-                         'wait-for pattern="PLAYER_NEVER_COMPLETE" timeout=120000\n')
+                         'wait-for pattern="PLAYER_STEP_" timeout=120000\n')
         self.source.write_text(self.approved)
         # Navigating/hiding a reference must not cancel shared work.
         self.original = self.original.replace(',"on_leave":"stop"', '')
@@ -108,10 +108,13 @@ class Acceptance(OWNED.Acceptance):
         if self.active:
             attempt = self.attempt()
             rows = '\n'.join(frame["rows"])
+            if attempt.get("phase") not in rows:
+                return None
             paused = OWNED.bounded_json(self.active.parent / "control.json").get("paused", False)
             if bool(paused) != (" · paused" in rows):
                 return None
-            if attempt.get("current_action") and attempt["current_action"] not in rows:
+            if (attempt.get("current_action") and attempt.get("phase") != "script-complete"
+                    and attempt["current_action"] not in rows):
                 return None
             require(frame["demo"]["generation"] == OWNED.bounded_json(self.active)["generation"],
                     "Button belongs to stale generation")
@@ -373,13 +376,14 @@ class Acceptance(OWNED.Acceptance):
         require(self.frozen(first) == frozen and self.attempt()["generation"] == generation,
                 "rejected reload mutated frozen execution")
         self.source.write_text(self.approved)
-        self.click("stop")
-        wait_for("Stop acknowledges actual cleanup", lambda: self.cleaned(first), 25)
-        self.active = None
-        wait_for("settled controls committed", lambda: self.terminal() and
-                 "settled" in '\n'.join(self.terminal()["rows"]), 15)
+        wait_for("completed script retains live sandbox", lambda:
+                 self.attempt()["phase"] == "script-complete", 25)
+        require(not self.cleaned(first), "script completion destroyed retained execution")
+        # Restart itself must Stop, await cleanup, then create a fresh generation.
+        # Requiring an explicit Stop first hid the product bug this covers.
         self.click("restart")
         self.active = wait_for("Restart creates fresh attempt", lambda: self.started(2), 25)
+        require(self.cleaned(first), "Restart bypassed previous attempt cleanup")
         require(self.attempt()["generation"] != generation, "Restart reused generation")
         require(self.attempt()["session_id"] != before["session_id"], "Restart reused session")
         self.unrelated_alive()
