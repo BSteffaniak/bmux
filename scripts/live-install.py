@@ -221,7 +221,6 @@ class Tools:
         self.env = env
         self.tofu = shutil.which('tofu')
         self.node = shutil.which('node')
-        self.aws = shutil.which('aws')
         self.admission_args = []
 
     def run(self, args, cwd=None, codes=(0,), timeout=900):
@@ -242,8 +241,6 @@ class Tools:
         version = json.loads(self.run([self.tofu, 'version', '-json']).stdout)['terraform_version']
         if version != '1.10.9':
             raise InstallError('Use pinned OpenTofu 1.10.9; do not upgrade provider locks during deployment')
-        if not self.aws:
-            raise InstallError('Install AWS CLI v2 as an R2 S3-protocol client (no AWS account required)')
         if not bootstrap:
             if not self.node:
                 raise InstallError('Install Node.js 22 for pinned Wrangler Pages-only upload')

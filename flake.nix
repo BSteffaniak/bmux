@@ -122,8 +122,6 @@
             codeql
             python3
             gh
-            # S3-protocol client for R2 state archives; no AWS account is required.
-            awscli2
             liveOpenTofu
           ];
 

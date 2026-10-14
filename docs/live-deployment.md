@@ -4,7 +4,7 @@ BMUX uses the existing `bmux.dev` Cloudflare zone. Production combines PWMTF's
 local credential provisioner and separate approved infrastructure workflow with
 WWMTF/Bcode's OpenTofu state on Cloudflare R2. No AWS account, IAM role, GitHub
 OIDC customization, staging account, or staging deployment is required. The
-`aws` CLI is only an S3-protocol client for R2 state archives.
+R2 state operations use direct signed HTTPS requests from Python's standard library.
 Ordinary local BMUX operation needs none of this infrastructure.
 
 ## One-time setup
@@ -17,13 +17,12 @@ Enter the locked development shell from the repository root:
 nix develop --command bash
 python3 --version
 gh --version
-aws --version
 tofu version
 gh auth login
 ```
 
-The shell supplies Python, GitHub CLI, AWS CLI v2 (for R2), and pinned OpenTofu
-1.10.9. Do not run `aws configure`, AWS SSO login, or create an AWS account.
+The shell supplies Python, GitHub CLI, and pinned OpenTofu
+1.10.9. No AWS CLI, AWS SSO login, or AWS account is required.
 Authenticate `gh` for `BSteffaniak/bmux` with repository secret administration.
 
 Create these repository environments, restricted to branch `master` only:

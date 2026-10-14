@@ -47,7 +47,7 @@ def inventory(root):
 class MockTools:
     def __init__(self, artifact):
         self.artifact, self.env = artifact, {}
-        self.aws, self.node, self.tofu = '/mock/aws', '/mock/node', '/mock/tofu'
+        self.node, self.tofu = '/mock/node', '/mock/tofu'
         self.calls, self.fail, self.diff = [], None, 0
         self.found, self.attached = {}, []
 
@@ -531,7 +531,6 @@ class InstallerTests(unittest.TestCase):
         tools = unittest.mock.Mock()
         tools.admission_args = []
         tools.env = {}
-        tools.aws = '/mock/aws'
         tools.run.return_value = subprocess.CompletedProcess([], 0, b'{"Account":"123456789012"}', b'')
         tools.cf.side_effect = [{'result': {'status': 'expired'}}]
         with self.assertRaises(m.InstallError):

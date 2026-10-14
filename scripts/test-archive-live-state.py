@@ -219,5 +219,123 @@ class ArchiveTests(unittest.TestCase):
             self.assertNotIn(b'fixture-plaintext', root.joinpath('plan').read_bytes())
 
 
+class TransportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = object.__new__(m.Store)
+        self.store.config = dict(bucket='bmux-state', endpoint='https://' + 'a' * 32 + '.r2.cloudflarestorage.com')
+        self.store.access_key = 'offline-access'
+        self.store.secret_key = 'offline-secret'
+        self.store.directory = Path(self.temp.name)
+
+    def connection(self, body=b'', status=200, etag='"etag"'):
+        import io
+        from unittest.mock import Mock
+        response = Mock()
+        response.status = status
+        response.read.side_effect = io.BytesIO(body).read
+        response.getheader.side_effect = lambda name: etag if name == 'ETag' else None
+        connection = Mock()
+        connection.getresponse.return_value = response
+        return connection
+
+    def test_signed_https_preserves_conditions_and_encoding(self):
+        connection = self.connection(BODY)
+        with patch.object(m.http.client, 'HTTPSConnection', return_value=connection) as create:
+            data, etag = self.store.request('PUT', 'a b/+%ü', body=BODY, conditions={'if-none-match': '*'})
+        create.assert_called_once_with('a' * 32 + '.r2.cloudflarestorage.com', timeout=30)
+        args, kwargs = connection.request.call_args
+        self.assertEqual(args, ('PUT', '/bmux-state/a%20b/%2B%25%C3%BC'))
+        headers = kwargs['headers']
+        self.assertEqual(headers['if-none-match'], '*')
+        self.assertEqual(headers['x-amz-content-sha256'], hashlib.sha256(BODY).hexdigest())
+        self.assertIn('/auto/s3/aws4_request', headers['authorization'])
+        self.assertIn('SignedHeaders=host;if-none-match;x-amz-content-sha256;x-amz-date', headers['authorization'])
+        self.assertNotIn('offline-secret', str(connection.request.call_args))
+        self.assertEqual((data, etag), (BODY, '"etag"'))
+        connection.close.assert_called_once()
+
+    def test_sigv4_matches_independent_s3_signer_fixture(self):
+        from datetime import datetime, timezone
+        connection = self.connection()
+        with patch.object(m, 'datetime') as date, patch.object(m.http.client, 'HTTPSConnection', return_value=connection):
+            date.now.return_value = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+            self.store.request('PUT', 'a b/+%ü', body=b'offline', conditions={'if-none-match': '*'})
+        # Generated independently with botocore.auth.S3SigV4Auth, not this implementation.
+        signature = connection.request.call_args.kwargs['headers']['authorization'].split('Signature=')[1]
+        self.assertEqual(signature, '05a0538fc66a197fe2d014142a91c114c09b84da4d7c352b3ea8069cd3b8b035')
+
+    def test_truncated_and_oversized_content_length_rejects(self):
+        for length in ('10', str(33 * 1024 * 1024), 'invalid'):
+            connection = self.connection(b'abc')
+            connection.getresponse.return_value.getheader.side_effect = lambda name: length if name == 'Content-Length' else '"e"'
+            with patch.object(m.http.client, 'HTTPSConnection', return_value=connection), self.assertRaises(m.StateError):
+                self.store.request('GET', 'state')
+            connection.close.assert_called_once()
+
+    def test_errors_and_redirects_never_retry_or_leak(self):
+        for status in (301, 403, 404, 412, 500):
+            connection = self.connection(b'SECRET_PROVIDER_RESPONSE', status=status)
+            with patch.object(m.http.client, 'HTTPSConnection', return_value=connection):
+                with self.assertRaises(m.StateError) as error:
+                    self.store.request('DELETE', 'state', conditions={'if-match': '"expected"'})
+            self.assertNotIn('SECRET_PROVIDER_RESPONSE', str(error.exception))
+            connection.request.assert_called_once()
+            connection.close.assert_called_once()
+        self.store.config['endpoint'] = 'https://attacker.invalid'
+        with patch.object(m.http.client, 'HTTPSConnection') as create, self.assertRaises(m.StateError):
+            self.store.request('GET')
+        create.assert_not_called()
+
+    def test_response_bounds_and_deadline_close_without_retry(self):
+        from unittest.mock import Mock
+        connection = self.connection()
+        connection.getresponse.return_value.read.side_effect = lambda size: b'x' * size
+        with patch.object(m.http.client, 'HTTPSConnection', return_value=connection), self.assertRaises(m.StateError):
+            self.store.request('GET', 'state')
+        connection.close.assert_called_once()
+        connection = self.connection()
+        with patch.object(m.http.client, 'HTTPSConnection', return_value=connection), \
+                patch.object(m.time, 'monotonic', side_effect=[0, 121]), self.assertRaises(m.StateError):
+            self.store.request('GET', 'state')
+        connection.close.assert_called_once()
+        connection = self.connection()
+        connection.request.side_effect = TimeoutError('SECRET_TRANSPORT')
+        with patch.object(m.http.client, 'HTTPSConnection', return_value=connection):
+            with self.assertRaises(m.StateError) as error:
+                self.store.request('PUT', 'state', body=BODY)
+        self.assertNotIn('SECRET_TRANSPORT', str(error.exception))
+        connection.request.assert_called_once()
+        connection.close.assert_called_once()
+
+    def test_object_adapter_preserves_cas_and_requires_acknowledgement(self):
+        body = self.store.directory / 'body'
+        body.write_bytes(BODY)
+        with patch.object(self.store, 'request', return_value=(b'', '"committed"')) as request:
+            self.assertEqual(self.store.call('put-object', '--key', 'state', '--body', str(body),
+                                             '--if-match', '"original"'), {'ETag': '"committed"'})
+            self.assertEqual(request.call_args.kwargs['conditions'], {'if-match': '"original"'})
+        with patch.object(self.store, 'request', return_value=(b'', None)), self.assertRaises(m.StateError):
+            self.store.call('put-object', '--key', 'state', '--body', str(body), '--if-none-match', '*')
+        output = self.store.directory / 'download'
+        with patch.object(self.store, 'request', return_value=(BODY, '"expected"')):
+            self.store.call('get-object', '--key', 'state', '--if-match', '"expected"', str(output))
+        self.assertEqual(output.read_bytes(), BODY)
+
+    def test_xml_inventory_unknown_corrupt_and_truncated(self):
+        xml = (b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+               b'<Name>bmux-state</Name><IsTruncated>true</IsTruncated><Contents>'
+               b'<Key>state</Key><ETag>&quot;e&quot;</ETag><Size>12</Size></Contents></ListBucketResult>')
+        with patch.object(self.store, 'request', return_value=(xml, None)):
+            result = self.store.call('list-objects-v2', '--prefix', 'history/')
+        self.assertTrue(result['IsTruncated'])
+        self.assertEqual(result['Contents'], [dict(Key='state', ETag='"e"', Size=12)])
+        for bad in (b'{broken', xml.replace(b'bmux-state', b'foreign'), xml.replace(b'true', b'unknown'),
+                    b'<!DOCTYPE x [<!ENTITY y "boom">]>' + xml):
+            with patch.object(self.store, 'request', return_value=(bad, None)), self.assertRaises(m.StateError):
+                self.store.call('list-objects-v2')
+
+
 if __name__ == '__main__':
     unittest.main()

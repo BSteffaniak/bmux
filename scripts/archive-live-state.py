@@ -7,6 +7,11 @@ cooperates with OpenTofu; it is not a transaction with unrelated S3 writers.
 import argparse
 import base64
 import hashlib
+import hmac
+from datetime import datetime, timezone
+import http.client
+import xml.etree.ElementTree as ET
+import urllib.parse
 import importlib.util
 import json
 import os
@@ -165,21 +170,123 @@ class Store:
                                     os.environ.get('LIVE_STATE_REGION', 'auto'), os.environ['CLOUDFLARE_ACCOUNT_ID'])
         self.key = self.config['key']
         self.prefix = 'history/' + self.key + '/'
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith(('AWS_', 'TF_', 'TOFU_'))}
-        self.env.update(AWS_ACCESS_KEY_ID=os.environ['R2_STATE_ACCESS_KEY_ID'],
-                        AWS_SECRET_ACCESS_KEY=os.environ['R2_STATE_SECRET_ACCESS_KEY'],
-                        AWS_REGION='auto', AWS_DEFAULT_REGION='auto', AWS_EC2_METADATA_DISABLED='true',
-                        AWS_CONFIG_FILE='/dev/null', AWS_SHARED_CREDENTIALS_FILE='/dev/null', AWS_PAGER='')
+        self.access_key = os.environ['R2_STATE_ACCESS_KEY_ID']
+        self.secret_key = os.environ['R2_STATE_SECRET_ACCESS_KEY']
         self.temp = tempfile.TemporaryDirectory(prefix='bmux-state-')
         self.directory = Path(self.temp.name)
 
+    def request(self, method, key='', query=None, body=b'', conditions=None):
+        """One bounded SigV4 HTTPS request to the selected R2 authority; never retry writes."""
+        endpoint = urllib.parse.urlsplit(self.config['endpoint'])
+        if (endpoint.scheme != 'https' or endpoint.netloc != endpoint.hostname
+                or not re.fullmatch(r'[a-f0-9]{32}\.r2\.cloudflarestorage\.com', endpoint.hostname or '')
+                or endpoint.path or endpoint.query or endpoint.fragment):
+            raise StateError('Noncanonical R2 endpoint rejected')
+        if len(body) > 32 * 1024 * 1024:
+            raise StateError('R2 object exceeds bound')
+        path = '/' + urllib.parse.quote(self.config['bucket'], safe='')
+        if key:
+            path += '/' + urllib.parse.quote(key, safe='/~')
+        encoded_query = '&'.join(sorted(urllib.parse.quote(k, safe='~') + '=' + urllib.parse.quote(str(v), safe='~')
+                                        for k, v in (query or {}).items()))
+        now = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        payload_hash = hashlib.sha256(body).hexdigest()
+        headers = {'host': endpoint.hostname, 'x-amz-date': now, 'x-amz-content-sha256': payload_hash}
+        headers.update(conditions or {})
+        names = ';'.join(sorted(headers))
+        canonical_headers = ''.join(k + ':' + headers[k].strip() + '\n' for k in sorted(headers))
+        canonical = '\n'.join((method, path, encoded_query, canonical_headers, names, payload_hash))
+        scope = now[:8] + '/auto/s3/aws4_request'
+        to_sign = 'AWS4-HMAC-SHA256\n' + now + '\n' + scope + '\n' + hashlib.sha256(canonical.encode()).hexdigest()
+        signing_key = ('AWS4' + self.secret_key).encode()
+        for part in (now[:8], 'auto', 's3', 'aws4_request'):
+            signing_key = hmac.new(signing_key, part.encode(), hashlib.sha256).digest()
+        signature = hmac.new(signing_key, to_sign.encode(), hashlib.sha256).hexdigest()
+        headers['authorization'] = ('AWS4-HMAC-SHA256 Credential=' + self.access_key + '/' + scope
+                                    + ', SignedHeaders=' + names + ', Signature=' + signature)
+        connection = http.client.HTTPSConnection(endpoint.hostname, timeout=30)
+        deadline = time.monotonic() + 120
+        try:
+            connection.request(method, path + ('?' + encoded_query if encoded_query else ''), body=body, headers=headers)
+            response = connection.getresponse()
+            if response.status not in (200, 204):
+                raise StateError('R2 request rejected; reconcile exact identities before retry; response suppressed')
+            length = response.getheader('Content-Length')
+            if length is not None and (not length.isdigit() or int(length) > 32 * 1024 * 1024):
+                raise StateError('Invalid or oversized R2 response length')
+            blocks = bytearray()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise StateError('R2 deadline exceeded; mutation may be ambiguous')
+                if connection.sock:
+                    connection.sock.settimeout(min(30, remaining))
+                block = response.read(min(65536, 32 * 1024 * 1024 + 1 - len(blocks)))
+                blocks.extend(block)
+                if len(blocks) > 32 * 1024 * 1024:
+                    raise StateError('R2 response exceeds bound')
+                if not block:
+                    break
+            if length is not None and len(blocks) != int(length):
+                raise StateError('Truncated R2 response rejected')
+            return bytes(blocks), response.getheader('ETag')
+        except (OSError, http.client.HTTPException, ValueError):
+            raise StateError('R2 transport failed; mutation may be ambiguous; response suppressed') from None
+        finally:
+            connection.close()
+
     def call(self, operation, *args):
-        result = bounded_run(['aws', 's3api', operation, '--bucket', self.config['bucket'],
-                              '--endpoint-url', self.config['endpoint'], '--region', 'auto',
-                              '--output', 'json', *args], self.env)
-        if result.returncode or len(result.stdout) > 4 * 1024 * 1024:
-            raise StateError('R2 operation failed; output suppressed; reconcile exact identities before retry')
-        return json.loads(result.stdout or b'{}')
+        # Keep the private storage adapter contract shared by recovery/admission.
+        options = {}
+        destination = None
+        i = 0
+        while i < len(args):
+            if args[i].startswith('--') and i + 1 < len(args):
+                options[args[i]] = args[i + 1]
+                i += 2
+            elif operation == 'get-object' and i == len(args) - 1:
+                destination = Path(args[i])
+                i += 1
+            else:
+                raise StateError('Unsupported R2 operation arguments')
+        conditions = {name[2:]: options[name] for name in ('--if-match', '--if-none-match') if name in options}
+        if operation == 'list-objects-v2':
+            body, _ = self.request('GET', query={'list-type': '2', 'prefix': options.get('--prefix', ''),
+                                                'max-keys': options.get('--max-keys', '1000')})
+            try:
+                if b'<!DOCTYPE' in body.upper() or b'<!ENTITY' in body.upper():
+                    raise ValueError('Unsupported XML declarations')
+                root = ET.fromstring(body)
+                ns = '{http://s3.amazonaws.com/doc/2006-03-01/}'
+                if root.tag != ns + 'ListBucketResult' or root.findtext(ns + 'IsTruncated') not in ('true', 'false'):
+                    raise ValueError('Unsupported listing')
+                if root.findtext(ns + 'Name') != self.config['bucket']:
+                    raise ValueError('Wrong bucket')
+                contents = []
+                for item in root.findall(ns + 'Contents'):
+                    key, etag, size = (item.findtext(ns + name) for name in ('Key', 'ETag', 'Size'))
+                    if not key or not etag or size is None or int(size) < 0:
+                        raise ValueError('Corrupt listing')
+                    contents.append(dict(Key=key, ETag=etag, Size=int(size)))
+                return dict(Contents=contents, KeyCount=len(contents),
+                            IsTruncated=root.findtext(ns + 'IsTruncated') == 'true')
+            except (ET.ParseError, ValueError):
+                raise StateError('Corrupt R2 inventory rejected') from None
+        if operation not in ('get-object', 'put-object', 'delete-object') or '--key' not in options:
+            raise StateError('Unsupported R2 operation')
+        body = Path(options['--body']).read_bytes() if operation == 'put-object' else b''
+        data, etag = self.request({'get-object': 'GET', 'put-object': 'PUT', 'delete-object': 'DELETE'}[operation],
+                                  options['--key'], body=body, conditions=conditions)
+        if operation != 'delete-object' and not etag:
+            raise StateError('R2 object acknowledgement lacks identity; mutation may be ambiguous')
+        if operation == 'get-object':
+            if destination is None:
+                raise StateError('Missing private object destination')
+            with destination.open('xb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        return {'ETag': etag}
 
     def unlocked(self):
         result = self.call('list-objects-v2', '--prefix', self.key + '.tflock', '--max-keys', '2')
