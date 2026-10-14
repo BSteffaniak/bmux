@@ -43,6 +43,14 @@ impl RustPlugin for PresenterPlugin {
             .map(|()| bmux_plugin_sdk::EXIT_OK)
             .map_err(|error| PluginCommandError::failed(error.to_string()))
     }
+    fn deactivate(
+        &mut self,
+        _context: bmux_plugin_sdk::NativeLifecycleContext,
+    ) -> Result<i32, PluginCommandError> {
+        source::deactivate()
+            .map(|()| bmux_plugin_sdk::EXIT_OK)
+            .map_err(|error| PluginCommandError::failed(error.to_string()))
+    }
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         if context.invocation_source != NativeCommandInvocationSource::Cli {
             return Err(PluginCommandError::failed(

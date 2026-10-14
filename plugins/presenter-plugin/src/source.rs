@@ -4,7 +4,7 @@ use bmux_presenter::Deck;
 use std::path::Path;
 
 use std::sync::{Mutex, OnceLock};
-static WORKER: OnceLock<Mutex<Option<bmux_mermaid_render::IsolatedMermaidRenderer>>> =
+static WORKER: OnceLock<Mutex<Option<bmux_mermaid_render::CapturedMermaidWorker>>> =
     OnceLock::new();
 
 pub(crate) fn activate(context: &bmux_plugin_sdk::NativeLifecycleContext) -> Result<()> {
@@ -15,12 +15,39 @@ pub(crate) fn activate(context: &bmux_plugin_sdk::NativeLifecycleContext) -> Res
         helper.protocol_version == 1,
         "unsupported packaged Mermaid worker protocol"
     );
-    let worker = bmux_mermaid_render::IsolatedMermaidRenderer::pin(Path::new(&helper.path))?;
+    capture_worker(Path::new(&helper.path))
+}
+
+fn capture_worker(path: &Path) -> Result<()> {
+    let worker = bmux_mermaid_render::CapturedMermaidWorker::capture(path)?;
     *WORKER
         .get_or_init(Mutex::default)
         .lock()
         .map_err(|_| anyhow::anyhow!("Mermaid worker registry poisoned"))? = Some(worker);
     Ok(())
+}
+
+pub(crate) fn deactivate() -> Result<()> {
+    if let Some(registry) = WORKER.get() {
+        registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Mermaid worker registry poisoned"))?
+            .take();
+    }
+    Ok(())
+}
+
+fn acquire_worker() -> Result<Option<bmux_mermaid_render::IsolatedMermaidRenderer>> {
+    let Some(registry) = WORKER.get() else {
+        return Ok(None);
+    };
+    registry
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Mermaid worker registry poisoned"))?
+        .as_mut()
+        .map(bmux_mermaid_render::CapturedMermaidWorker::acquire)
+        .transpose()
+        .map_err(Into::into)
 }
 
 const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
@@ -32,10 +59,7 @@ pub(crate) fn load(path: &Path) -> Result<Deck> {
 pub(crate) fn loaded(path: &Path) -> Result<bmux_presenter_runtime::loader::LoadedDeck> {
     let path = std::fs::canonicalize(path)?;
     let base = path.parent().context("deck requires parent directory")?;
-    let mermaid = if let Some(worker) = WORKER
-        .get()
-        .and_then(|registry| registry.lock().ok()?.clone())
-    {
+    let mermaid = if let Some(worker) = acquire_worker()? {
         Some(worker)
     } else {
         std::env::var_os("BMUX_MERMAID_WORKER_PATH")
@@ -100,6 +124,59 @@ pub(crate) fn credential(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_lifecycle_fixture() {
+        let Some(path) = std::env::var_os("BMUX_PRESENTER_WORKER_FIXTURE") else {
+            return;
+        };
+        capture_worker(Path::new(&path)).unwrap();
+        if std::env::var_os("BMUX_PRESENTER_WORKER_RENDER").is_some() {
+            let first = acquire_worker().unwrap().unwrap();
+            let second = acquire_worker().unwrap().unwrap();
+            let snapshot = first.executable().to_owned();
+            assert_eq!(second.executable(), snapshot);
+            drop(first);
+            assert!(snapshot.exists());
+            drop(second);
+            assert!(!snapshot.exists());
+        }
+        if std::env::var_os("BMUX_PRESENTER_WORKER_DEACTIVATE").is_some() {
+            deactivate().unwrap();
+            assert!(acquire_worker().unwrap().is_none());
+        }
+        // Deliberately leave the registry alive: static destructors never run.
+    }
+
+    #[test]
+    fn activation_and_process_exit_do_not_leak_worker_snapshots() {
+        let installation = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let path = installation.path().join("worker");
+        std::fs::write(&path, b"fixture worker").unwrap();
+        for render in [false, true] {
+            for deactivate in [false, true] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["source::tests::worker_lifecycle_fixture", "--exact"])
+                    .env("BMUX_PRESENTER_WORKER_FIXTURE", &path)
+                    .env("TMPDIR", scratch.path())
+                    .env("TMP", scratch.path())
+                    .env("TEMP", scratch.path())
+                    .env_remove("BMUX_PRESENTER_WORKER_RENDER")
+                    .env_remove("BMUX_PRESENTER_WORKER_DEACTIVATE");
+                if render {
+                    child.env("BMUX_PRESENTER_WORKER_RENDER", "1");
+                }
+                if deactivate {
+                    child.env("BMUX_PRESENTER_WORKER_DEACTIVATE", "1");
+                }
+                let output = child.output().unwrap();
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
     #[test]
     fn rejects_missing_sources_without_terminal_io() {
         assert!(load(Path::new("/nonexistent/bmux-presentation-deck.md")).is_err());

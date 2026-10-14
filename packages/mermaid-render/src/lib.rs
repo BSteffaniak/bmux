@@ -503,7 +503,10 @@ fn worker_file_digest(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
     Ok(hash.finalize().to_vec())
 }
 
-struct PackagedWorker {
+/// Captured installation bytes with lazily acquired, render-owned snapshots.
+/// Keeping this handle alive does not keep temporary executables alive.
+#[derive(Debug)]
+pub struct CapturedMermaidWorker {
     // Keep the opened installation bytes, not a temporary snapshot, at bootstrap.
     source: std::fs::File,
     digest: Vec<u8>,
@@ -511,11 +514,35 @@ struct PackagedWorker {
     executable: std::path::PathBuf,
 }
 
-static PACKAGED_WORKER: OnceLock<Mutex<Result<PackagedWorker, MermaidRenderError>>> =
+static PACKAGED_WORKER: OnceLock<Mutex<Result<CapturedMermaidWorker, MermaidRenderError>>> =
     OnceLock::new();
 
-impl PackagedWorker {
-    fn acquire(&mut self) -> Result<IsolatedMermaidRenderer, MermaidRenderError> {
+impl CapturedMermaidWorker {
+    /// Capture an opened helper and its identity without creating a snapshot.
+    ///
+    /// # Errors
+    /// Returns unavailable if the helper cannot be opened or hashed.
+    pub fn capture(path: &std::path::Path) -> Result<Self, MermaidRenderError> {
+        let capture = || -> std::io::Result<Self> {
+            let mut source = std::fs::File::open(path)?;
+            let digest = worker_file_digest(&mut source)?;
+            Ok(Self {
+                source,
+                digest,
+                snapshot: std::sync::Weak::new(),
+                executable: std::path::PathBuf::new(),
+            })
+        };
+        capture().map_err(|error| MermaidRenderError::WorkerUnavailable {
+            message: error.to_string(),
+        })
+    }
+
+    /// Acquire a snapshot shared only while renderers own it.
+    ///
+    /// # Errors
+    /// Returns unavailable if copying fails or the captured bytes changed.
+    pub fn acquire(&mut self) -> Result<IsolatedMermaidRenderer, MermaidRenderError> {
         if let Some(pinned) = self.snapshot.upgrade() {
             return Ok(IsolatedMermaidRenderer {
                 executable: self.executable.clone(),
@@ -623,7 +650,9 @@ impl IsolatedMermaidRenderer {
         registry.as_ref().map(|_| ()).map_err(Clone::clone)
     }
 
-    fn capture_packaged(directory: &std::path::Path) -> Result<PackagedWorker, MermaidRenderError> {
+    fn capture_packaged(
+        directory: &std::path::Path,
+    ) -> Result<CapturedMermaidWorker, MermaidRenderError> {
         let path = std::env::var_os(MERMAID_RENDERER_PATH_ENV)
             .filter(|value| !value.is_empty())
             .map_or_else(
@@ -636,21 +665,7 @@ impl IsolatedMermaidRenderer {
                 },
                 std::path::PathBuf::from,
             );
-        let mut source =
-            std::fs::File::open(&path).map_err(|error| MermaidRenderError::WorkerUnavailable {
-                message: error.to_string(),
-            })?;
-        let digest = worker_file_digest(&mut source).map_err(|error| {
-            MermaidRenderError::WorkerUnavailable {
-                message: error.to_string(),
-            }
-        })?;
-        Ok(PackagedWorker {
-            source,
-            digest,
-            snapshot: std::sync::Weak::new(),
-            executable: std::path::PathBuf::new(),
-        })
+        CapturedMermaidWorker::capture(&path)
     }
 
     /// Use an explicit renderer executable path.
@@ -1437,12 +1452,7 @@ mod tests {
         let installation = tempfile::tempdir().unwrap();
         let path = installation.path().join("worker");
         std::fs::write(&path, b"original").unwrap();
-        let mut registry = super::PackagedWorker {
-            source: std::fs::File::open(&path).unwrap(),
-            digest: super::worker_digest(&path).unwrap(),
-            snapshot: std::sync::Weak::new(),
-            executable: std::path::PathBuf::new(),
-        };
+        let mut registry = super::CapturedMermaidWorker::capture(&path).unwrap();
         assert!(registry.executable.as_os_str().is_empty());
         let replacement = installation.path().join("replacement");
         std::fs::write(&replacement, b"replacement").unwrap();
