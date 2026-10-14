@@ -9,6 +9,38 @@ use std::collections::BTreeMap;
 use unicode_segmentation::UnicodeSegmentation;
 include!("highlight.rs");
 
+/// Cache font discovery once; every asset shares the immutable database.
+/// Bundled fonts keep labels available without host fonts. System fonts provide
+/// script/glyph fallback where installed; requested families retain precedence.
+fn diagram_svg_options() -> resvg::usvg::Options<'static> {
+    static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    let fonts = FONTS.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        bmux_fonts::register_preset_fonts(&mut db, bmux_fonts::FontPreset::GhosttyNerd);
+        db.load_system_fonts();
+        db.set_sans_serif_family("JetBrainsMono Nerd Font");
+        db.set_serif_family("JetBrainsMono Nerd Font");
+        db.set_monospace_family("JetBrainsMono Nerd Font");
+        std::sync::Arc::new(db)
+    });
+    let mut options = resvg::usvg::Options {
+        fontdb: fonts.clone(),
+        font_family: "JetBrainsMono Nerd Font".into(),
+        ..Default::default()
+    };
+    let select = resvg::usvg::FontResolver::default_font_selector();
+    options.font_resolver.select_font = Box::new(move |font, db| {
+        select(font, db).or_else(|| {
+            db.query(&resvg::usvg::fontdb::Query {
+                families: &[resvg::usvg::fontdb::Family::SansSerif],
+                ..Default::default()
+            })
+        })
+    });
+    options
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct RichAssets {
     pub images: std::sync::Arc<BTreeMap<String, ImagePayload>>,
@@ -23,7 +55,7 @@ impl RichAssets {
         for asset in assets {
             ensure!(asset.bytes.len() <= 8 * 1024 * 1024, "asset exceeds budget");
             let payload = if asset.media_type == "image/svg+xml" {
-                let options = resvg::usvg::Options::default();
+                let options = diagram_svg_options();
                 let tree = resvg::usvg::Tree::from_data(&asset.bytes, &options)
                     .context("invalid diagram SVG")?;
                 let size = tree.size().to_int_size();
@@ -280,6 +312,60 @@ mod tests {
     use super::*;
     use bmux_tui::component::{Constraints, LayoutCx};
     use bmux_tui::{geometry::Rect, terminal::Terminal};
+    #[test]
+    fn svg_labels_survive_unknown_font_families_without_system_fonts() {
+        let mut options = diagram_svg_options();
+        let db = options.fontdb_mut();
+        *db = resvg::usvg::fontdb::Database::new();
+        bmux_fonts::register_preset_fonts(db, bmux_fonts::FontPreset::GhosttyNerd);
+        db.set_sans_serif_family("JetBrainsMono Nerd Font");
+        let empty = br#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="80"/>"#;
+        let labelled = br#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="80"><text x="10" y="40" font-family="Unavailable Font" font-size="24">Hello world</text></svg>"#;
+        let render = |svg: &[u8]| {
+            let tree = resvg::usvg::Tree::from_data(svg, &options).unwrap();
+            let mut pixels = resvg::tiny_skia::Pixmap::new(400, 80).unwrap();
+            resvg::render(
+                &tree,
+                resvg::tiny_skia::Transform::identity(),
+                &mut pixels.as_mut(),
+            );
+            pixels
+        };
+        assert_ne!(render(empty).data(), render(labelled).data());
+    }
+
+    #[test]
+    fn wasm_corpus_rasterizes_with_visible_labels() {
+        let renderer = bmux_mermaid_render::WasmMermaidRenderer::new().unwrap();
+        let request = bmux_mermaid_render::MermaidRenderRequest::svg(
+            "flowchart LR\nA[Hello] --> B[World]",
+            800,
+            600,
+        );
+        let result = renderer
+            .render(
+                &request,
+                &bmux_mermaid_render::MermaidCancellationToken::default(),
+            )
+            .unwrap();
+        let bmux_mermaid_render::MermaidRenderedOutput::Svg(bytes) = result.output;
+        let options = diagram_svg_options();
+        let tree = resvg::usvg::Tree::from_data(&bytes, &options).unwrap();
+        let unlabelled =
+            resvg::usvg::Tree::from_data(&bytes, &resvg::usvg::Options::default()).unwrap();
+        let size = tree.size().to_int_size();
+        let render = |tree: &resvg::usvg::Tree| {
+            let mut pixels = resvg::tiny_skia::Pixmap::new(size.width(), size.height()).unwrap();
+            resvg::render(
+                tree,
+                resvg::tiny_skia::Transform::identity(),
+                &mut pixels.as_mut(),
+            );
+            pixels
+        };
+        assert_ne!(render(&tree).data(), render(&unlabelled).data());
+    }
+
     #[test]
     fn prepared_png_preserves_compact_bytes_and_dimensions() {
         let bytes = include_bytes!("../../../packages/presenter/examples/architecture.png");

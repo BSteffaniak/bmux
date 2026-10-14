@@ -35,22 +35,6 @@ use bmux_plugin_sdk::{
 pub struct PresenterPlugin;
 impl RustPlugin for PresenterPlugin {
     type Contract = bmux_presenter_plugin_api::Contract;
-    fn activate(
-        &mut self,
-        context: bmux_plugin_sdk::NativeLifecycleContext,
-    ) -> Result<i32, PluginCommandError> {
-        source::activate(&context)
-            .map(|()| bmux_plugin_sdk::EXIT_OK)
-            .map_err(|error| PluginCommandError::failed(error.to_string()))
-    }
-    fn deactivate(
-        &mut self,
-        _context: bmux_plugin_sdk::NativeLifecycleContext,
-    ) -> Result<i32, PluginCommandError> {
-        source::deactivate()
-            .map(|()| bmux_plugin_sdk::EXIT_OK)
-            .map_err(|error| PluginCommandError::failed(error.to_string()))
-    }
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         if context.invocation_source != NativeCommandInvocationSource::Cli {
             return Err(PluginCommandError::failed(
@@ -92,15 +76,7 @@ mod tests {
     fn manifest_declares_packaged_mermaid_and_caller_owned_commands() {
         let manifest =
             bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
-        let helper = manifest
-            .auxiliary_executables
-            .iter()
-            .find(|helper| helper.id == "mermaid-worker")
-            .unwrap();
-        assert_eq!(helper.cargo_package, "bmux_mermaid_render");
-        assert_eq!(helper.cargo_binary, "bmux-mermaid-worker");
-        assert_eq!(helper.relative_path, "bmux-mermaid-worker");
-        assert_eq!(helper.protocol_version, 1);
+        assert!(manifest.auxiliary_executables.is_empty());
         assert_eq!(manifest.commands.len(), 4);
         assert!(
             manifest

@@ -109,6 +109,11 @@ fn build() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "wasm")]
 fn precompile(wasm: &[u8], target: &str, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let destination = target
+        .parse()
+        .map_err(|error| format!("invalid Mermaid target {target}: {error}"))?;
+    cranelift_codegen::isa::lookup(destination)
+        .map_err(|error| format!("Mermaid destination compiler {target}: {error}"))?;
     for (fuel, filename) in [(false, "mermaid.cwasm"), (true, "mermaid-fuel.cwasm")] {
         let config = wasm_config::config(target, fuel)
             .map_err(|error| format!("Mermaid AOT target {target}: {error}"))?;

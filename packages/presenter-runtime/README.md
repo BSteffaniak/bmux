@@ -60,9 +60,10 @@ Plugin implementations call `Host` and expose generated BPDL operations; the
   run/deck/state cursor and committed surface revision.
 - `SourceLoader::{load_markdown, prepare}` accepts bounded local Markdown or
   linked decks, reads images beneath an explicit canonical root, normalizes image
-  payloads, and invokes `IsolatedMermaidRenderer` (never the synchronous backend).
-  Select a pinned/packaged worker and call source preparation outside the live
-  host lock. The renderer owns worker timeout/memory/concurrency limits.
+  payloads, and invokes `WasmMermaidRenderer` (never the native renderer).
+  Supply the embedded renderer and call source preparation outside the live
+  host lock. WASM enforces timeout/memory/concurrency limits without a helper
+  executable. Building this crate requires `wasm32-unknown-unknown`.
 - `transport::{serve_tls, serve_local}` accept owned Tokio listeners, shared host,
   bounded network settings, and watch-channel shutdown. TLS config helpers parse
   bounded explicit PEM chains/keys/roots. Local plaintext requires loopback on

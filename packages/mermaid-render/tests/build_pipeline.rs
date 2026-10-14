@@ -7,6 +7,7 @@ mod wasm_config;
 #[test]
 fn aot_configuration_uses_explicit_destination_and_rejects_unknown_targets() {
     let target = env!("BMUX_MERMAID_WASM_TARGET");
+    assert!(cranelift_codegen::isa::lookup(target.parse().unwrap()).is_ok());
     let engine = wasmtime::Engine::new(&wasm_config::config(target, false).unwrap()).unwrap();
     let tiny = wat::parse_str("(module (func (export \"run\")))").unwrap();
     assert!(!engine.precompile_module(&tiny).unwrap().is_empty());
@@ -14,7 +15,7 @@ fn aot_configuration_uses_explicit_destination_and_rejects_unknown_targets() {
 }
 
 #[test]
-fn cross_target_aot_is_rejected_without_destination_compiler_backend() {
+fn cross_target_aot_compiles_for_release_destination() {
     let native = env!("BMUX_MERMAID_WASM_TARGET");
     let destination = if native.starts_with("x86_64") {
         "aarch64-unknown-linux-gnu"
@@ -22,11 +23,9 @@ fn cross_target_aot_is_rejected_without_destination_compiler_backend() {
         "x86_64-unknown-linux-gnu"
     };
     let config = wasm_config::config(destination, false).unwrap();
-    let engine = wasmtime::Engine::new(&config);
-    assert!(
-        engine.is_err(),
-        "unsupported cross-architecture compilation must fail explicitly"
-    );
+    let engine = wasmtime::Engine::new(&config).expect("release destination compiler backend");
+    let tiny = wat::parse_str("(module (func (export \"run\")))").unwrap();
+    assert!(!engine.precompile_module(&tiny).unwrap().is_empty());
 }
 
 const GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mermaid.wasm"));

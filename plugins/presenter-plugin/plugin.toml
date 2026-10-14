@@ -16,14 +16,6 @@ version               = "0.0.1-alpha.0"
 [native_abi]
 minimum = "1.1"
 
-[[auxiliary_executables]]
-cargo_binary        = "bmux-mermaid-worker"
-cargo_package       = "bmux_mermaid_render"
-id                  = "mermaid-worker"
-protocol_version    = 1
-relative_path       = "bmux-mermaid-worker"
-supported_platforms = ["unix", "windows"]
-
 [[services]]
 capability   = "bmux.presenter.view.v2"
 interface_id = "presenter-view-v2"

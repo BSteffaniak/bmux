@@ -21,10 +21,13 @@ excludes compiling `.rs` files through the CLI. JSON deck import is an optional
 serialized-data adapter, not a Rust source-loading convention. Remote viewers
 never execute Rust or Mermaid. Local reload retains the last valid deck on errors.
 
-Mermaid requires the packaged `bmux-mermaid-worker` beside bmux, or an explicit
-`BMUX_MERMAID_WORKER_PATH`. Worker identity is pinned before loading. Generic xtask auxiliary-executable
-packaging builds/stages opted-in helpers on Unix and Windows (`.exe`). Native
-Windows bundle and containment validation is still required; see the worker README.
+Mermaid runs through the embedded, bounded WASM renderer; no worker executable
+or worker-path environment variable is required. The build automatically compiles
+and embeds the guest, so release toolchains must include `wasm32-unknown-unknown`.
+SVG rasterization uses bundled JetBrains fonts as the default/unknown-family
+fallback and installed system fonts for additional script coverage. Unsupported
+glyphs still depend on available fallback fonts; the bundled font is not a
+universal Unicode font.
 Images and
 diagrams are decoded/prepared outside update/paint; remote assets are opaque and
 fetched in bounded chunks. Private audience credentials grant navigation/demo

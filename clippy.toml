@@ -1,1 +1,6 @@
-
+# Postcard advertises optional embedded-io 0.4/0.6 adapters; neither is enabled
+# in our build. Cargo metadata still reports both to Clippy's cargo lint.
+# Wasmtime 38/Cranelift require hashbrown 0.15 (foldhash 0.1), while web/indexmap
+# dependencies require foldhash 0.2. These internal hashers share no public types
+# and cannot be unified without changing upstream semver requirements.
+allowed-duplicate-crates = ["embedded-io", "foldhash"]

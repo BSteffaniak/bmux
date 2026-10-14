@@ -2,7 +2,7 @@
 //! no network fetches, shell execution, or viewer-supplied Rust activation.
 use crate::{Asset, HostError, Limits};
 use bmux_mermaid_render::{
-    IsolatedMermaidRenderer, MermaidCancellationToken, MermaidRenderRequest, MermaidRenderedOutput,
+    MermaidCancellationToken, MermaidRenderRequest, MermaidRenderedOutput, WasmMermaidRenderer,
 };
 use bmux_presenter::{Block, BlockKind, Deck, TextFormat, parse_markdown};
 use std::{
@@ -18,7 +18,7 @@ pub struct LoadedDeck {
 pub struct SourceLoader {
     pub root: PathBuf,
     pub limits: Limits,
-    pub mermaid: Option<IsolatedMermaidRenderer>,
+    pub mermaid: Option<WasmMermaidRenderer>,
 }
 impl SourceLoader {
     pub fn load_markdown(&self, path: &Path) -> Result<LoadedDeck, HostError> {
@@ -89,16 +89,12 @@ impl SourceLoader {
                             })?;
                     }
                     BlockKind::Mermaid { source, rows } => {
-                        let worker = loader.mermaid.as_ref().ok_or(HostError::NotFound)?;
+                        let renderer = loader.mermaid.as_ref().ok_or(HostError::NotFound)?;
                         let mut request = MermaidRenderRequest::svg(source.clone(), 1280, 720);
                         request.limits.max_source_bytes = loader.limits.action_bytes.min(64 * 1024);
                         request.limits.max_output_bytes =
                             loader.limits.asset_bytes.min(4 * 1024 * 1024);
-                        // Snapshot explicit worker bytes before invocation even if the
-                        // application supplied a mutable from_path renderer.
-                        let pinned = IsolatedMermaidRenderer::pin(worker.executable())
-                            .map_err(|_| HostError::Invalid)?;
-                        let rendered = pinned
+                        let rendered = renderer
                             .render(&request, &MermaidCancellationToken::default())
                             .map_err(|_| HostError::Invalid)?;
                         let MermaidRenderedOutput::Svg(bytes) = rendered.output;

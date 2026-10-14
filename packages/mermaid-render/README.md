@@ -17,10 +17,12 @@ Async caller drop signals job-private cancellation without blocking the executor
 the admitted worker retains permits until it stops. See the guest README for
 build isolation and portability patches.
 
-This is not the production default: bundled font measurements differ from system
-fonts used by the process backend. See
-[performance and compatibility evidence](../../docs/mermaid-wasm-performance.md).
-The process worker remains unchanged pending migration gates.
+Presenter enables this backend in production and does not discover or spawn a
+process worker. Other consumers may still opt into the legacy process API.
+Bundled font measurements differ from the native backend; exact layout parity is
+not required, but script fallback depends on the rasterizer's available fonts.
+See [historical performance and compatibility evidence](../../docs/mermaid-wasm-performance.md).
+The standalone process worker remains available pending separate removal.
 
 ## API handoff
 

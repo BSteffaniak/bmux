@@ -19,10 +19,15 @@ tokio               = { workspace = true, optional = true, features = ["rt", "sy
 wasmtime            = { workspace = true, optional = true }
 
 [build-dependencies]
-wasmtime = { workspace = true, optional = true }
+# Enable destination backends directly: Wasmtime's all-arch feature resolves an
+# unpublished winch-codegen 38.0.4, though this renderer only uses Cranelift.
+cranelift-codegen = { workspace = true }
+wasmtime          = { workspace = true, optional = true }
 
 [dev-dependencies]
-wat = { workspace = true }
+# Exercise destination AOT generation with the same backends as the build script.
+cranelift-codegen = { workspace = true }
+wat               = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
