@@ -4,6 +4,24 @@ Bounded Mermaid rendering extracted from Bcode's mermaid-render crate. Public
 request/result/error/cache types own the contract; the concrete renderer backend
 is private. No sessions, providers, UI effects, or image installation live here.
 
+## Experimental embedded WASM
+
+The opt-in `wasm` feature builds a locked, import-free guest and embeds portable
+WASM plus destination-baseline AOT artifacts during ordinary Cargo builds. The
+selected compiler needs `wasm32-unknown-unknown`; no separate guest build command
+or runtime file is needed. `WasmMermaidRenderer::new()` loads trusted AOT;
+`new_jit()` explicitly compiles portable WASM. Fuel variants are explicit.
+
+Fresh bounded stores and epoch interruption settle execution before returning.
+Async caller drop signals job-private cancellation without blocking the executor;
+the admitted worker retains permits until it stops. See the guest README for
+build isolation and portability patches.
+
+This is not the production default: bundled font measurements differ from system
+fonts used by the process backend. See
+[performance and compatibility evidence](../../docs/mermaid-wasm-performance.md).
+The process worker remains unchanged pending migration gates.
+
 ## API handoff
 
 - `worker_main()` serves exactly one versioned request in a dedicated worker

@@ -1,0 +1,10 @@
+flowchart TD
+  subgraph Outer
+    subgraph Middle
+      subgraph Inner
+        A[Start] --> B[Work]
+      end
+      B --> C[Result]
+    end
+    C --> D[Publish]
+  end

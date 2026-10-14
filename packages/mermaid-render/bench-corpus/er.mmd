@@ -1,0 +1,10 @@
+erDiagram
+  DECK ||--o{ SLIDE : contains
+  SLIDE ||--o{ ASSET : uses
+  DECK {
+    int id
+    string title
+  }
+  SLIDE {
+    int index
+  }

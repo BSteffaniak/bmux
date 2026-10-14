@@ -1,0 +1,8 @@
+sequenceDiagram
+  participant U as User
+  participant P as Presenter
+  participant R as Renderer
+  U->>P: Open
+  P->>R: Render
+  R-->>P: SVG
+  P-->>U: Frame

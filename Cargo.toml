@@ -171,6 +171,12 @@ version    = "0.0.1-alpha.1"
 
 [workspace.dependencies]
 arc-swap = { version = "1.9", default-features = false }
+wasmtime = { version = "38", default-features = false, features = [
+    "cranelift",
+    "runtime",
+    "std",
+] }
+wat = "1"
 # Internal bmux packages
 bmux = { version = "0.0.1-alpha.1", default-features = false, path = "packages/bmux" }
 bmux_appearance = { version = "0.0.1-alpha.1", default-features = false, path = "packages/appearance" }

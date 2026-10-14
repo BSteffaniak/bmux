@@ -1,0 +1,9 @@
+classDiagram
+  class Deck {
+    +String title
+    +present()
+  }
+  class Slide {
+    +render()
+  }
+  Deck "1" --> "many" Slide

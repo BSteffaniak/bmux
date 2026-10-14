@@ -16,6 +16,11 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "wasm")]
+mod wasm;
+#[cfg(feature = "wasm")]
+pub use wasm::WasmMermaidRenderer;
+
 mod worker;
 
 /// Serve one versioned Mermaid worker request on standard input/output.

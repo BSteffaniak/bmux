@@ -1,0 +1,5 @@
+flowchart LR
+  A[Open deck] --> B{Cached?}
+  B -->|yes| C[Present]
+  B -->|no| D[Render]
+  D --> C

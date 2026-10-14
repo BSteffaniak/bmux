@@ -15,6 +15,14 @@ libc                = { workspace = true }
 mermaid-rs-renderer = { workspace = true }
 sha2                = { workspace = true }
 tempfile            = { workspace = true }
+tokio               = { workspace = true, optional = true, features = ["rt", "sync", "time"] }
+wasmtime            = { workspace = true, optional = true }
+
+[build-dependencies]
+wasmtime = { workspace = true, optional = true }
+
+[dev-dependencies]
+wat = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -32,3 +40,4 @@ path = "src/bin/worker.rs"
 [features]
 default          = []
 fail-on-warnings = []
+wasm             = ["dep:wasmtime", "dep:tokio"]

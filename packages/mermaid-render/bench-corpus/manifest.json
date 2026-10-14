@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "typical": ["flowchart", "sequence", "class", "state", "er", "pie", "unicode", "nesting"],
+  "diagnostic_native": ["flowchart", "sequence", "class", "state", "er", "pie"],
+  "stress": ["dense", "deep", "near-limit", "over-limit", "malformed", "directive"],
+  "generators": {
+    "dense": "flowchart LR: 32 nodes, edge i->j when i<j and (i+j)%3==0",
+    "deep": "flowchart TD: 24 nested subgraphs containing A-->B",
+    "near-limit": "valid small flowchart with comment padding to exactly 65535 UTF-8 bytes",
+    "over-limit": "same with padding to exactly 65537 UTF-8 bytes",
+    "directive": "%%{init: {}}%% followed by small flowchart"
+  },
+  "note": "Family support and errors must be established by correctness pass, not assumed. Native diagnostics exclude every generated/stress case."
+}
