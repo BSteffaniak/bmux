@@ -45,6 +45,49 @@
           };
           doCheck = false;
         };
+        # Match the bootstrap/install scripts and CI without updating locked nixpkgs.
+        liveOpenTofuRelease =
+          {
+            x86_64-linux = {
+              platform = "linux_amd64";
+              sha256 = "300afb3fc69a1fb9308503478f77b2c3f70f41b49938afdf1cc18f5cc99a96ed";
+            };
+            aarch64-linux = {
+              platform = "linux_arm64";
+              sha256 = "28138e507c4988d9df8a92dd7f38b049b28aa301aae3c8120e068c276f28f279";
+            };
+            x86_64-darwin = {
+              platform = "darwin_amd64";
+              sha256 = "950d347dfaddacb876231cf96acd8d762774211dc881011747f546b0eea8b524";
+            };
+            aarch64-darwin = {
+              platform = "darwin_arm64";
+              sha256 = "42bbe0932dd3482a0f605cc205d9dccfa11f45794f0755aa41b0e6e3a78af803";
+            };
+          }
+          .${system};
+        liveOpenTofu = pkgs.stdenvNoCC.mkDerivation {
+          pname = "opentofu";
+          version = "1.10.9";
+          src = pkgs.fetchurl {
+            url = "https://github.com/opentofu/opentofu/releases/download/v1.10.9/tofu_1.10.9_${liveOpenTofuRelease.platform}.zip";
+            inherit (liveOpenTofuRelease) sha256;
+          };
+          nativeBuildInputs = [ pkgs.unzip ];
+          sourceRoot = ".";
+          dontConfigure = true;
+          dontBuild = true;
+          installPhase = ''
+            runHook preInstall
+            install -Dm755 tofu "$out/bin/tofu"
+            runHook postInstall
+          '';
+          meta = {
+            description = "Pinned OpenTofu for BMUX live deployment";
+            license = pkgs.lib.licenses.mpl20;
+            mainProgram = "tofu";
+          };
+        };
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [
             "rustfmt"
@@ -77,6 +120,10 @@
             jdk21_headless
             fish
             codeql
+            python3
+            gh
+            awscli2
+            liveOpenTofu
           ];
 
           shellHook = ''
