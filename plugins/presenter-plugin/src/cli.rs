@@ -6,6 +6,7 @@ use std::{net::IpAddr, path::PathBuf};
 /// CLI values only: shared configuration resolution owns environment/defaults.
 #[derive(Default, Debug)]
 pub(crate) struct WebOptions {
+    pub enabled: bool,
     pub assets: Option<PathBuf>,
     pub only: bool,
     pub port: Option<u16>,
@@ -17,6 +18,7 @@ pub(crate) struct WebOptions {
 
 impl WebOptions {
     fn parse(args: &mut Arguments<'_>) -> Result<Self> {
+        let enabled = args.flag("--web")?;
         let assets = args.value("--web-assets")?.map(PathBuf::from);
         let only = args.flag("--web-only")?;
         let port = args
@@ -50,6 +52,7 @@ impl WebOptions {
                 .collect()
         });
         Ok(Self {
+            enabled,
             assets,
             only,
             port,
@@ -399,11 +402,40 @@ mod tests {
         }
     }
     #[test]
+    fn simple_web_flags_enable_without_assets() {
+        for verb in ["play", "host"] {
+            for flag in ["--web", "--web-only"] {
+                let mut flags = vec!["deck.md", flag];
+                if verb == "host" {
+                    flags.extend([
+                        "--managed",
+                        "--presenter-credential",
+                        "private",
+                        "--public-read",
+                    ]);
+                }
+                let web = match parse(verb, &flags).unwrap() {
+                    Command::Play { web, .. } => web,
+                    Command::Host(options) => options.web,
+                    _ => panic!("expected play or host"),
+                };
+                assert_eq!(web.enabled, flag == "--web");
+                assert_eq!(web.only, flag == "--web-only");
+                assert!(web.assets.is_none());
+            }
+        }
+        assert!(parse("join", &["bmux:host", "--web"]).is_err());
+        assert!(parse("check", &["deck.md", "--web"]).is_err());
+        assert!(parse("play", &["deck.md", "--web", "--web"]).is_err());
+    }
+
+    #[test]
     fn web_network_flags_do_not_imply_presenter_activation() {
         let Command::Play { web, .. } = parse("play", &["deck.md", "--web-port", "8080"]).unwrap()
         else {
             panic!("expected play");
         };
+        assert!(!web.enabled);
         assert!(!web.only);
         assert!(web.assets.is_none());
     }

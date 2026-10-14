@@ -468,6 +468,7 @@ pub(super) async fn dispatch_built_in_command(
                 target,
                 follow,
                 global,
+                web,
                 web_assets,
                 web_only,
                 web_port,
@@ -477,12 +478,12 @@ pub(super) async fn dispatch_built_in_command(
                 web_allowed_hosts,
             },
         ) => {
-            if let Some(assets) = web_assets {
+            if *web || *web_only || web_assets.is_some() {
                 return Box::pin(super::web_attach::run(
                     target.as_deref(),
                     follow.as_deref(),
                     *global,
-                    assets,
+                    web_assets.as_deref(),
                     *web_only,
                     super::web_attach::WebOptions {
                         port: *web_port,

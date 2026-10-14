@@ -23,7 +23,7 @@ pub(crate) fn mode(
     if options.only {
         return Ok(PresenterWebMode::Only);
     }
-    if options.assets.is_some() {
+    if options.enabled || options.assets.is_some() {
         return Ok(PresenterWebMode::Mirror);
     }
     match environment {
@@ -45,7 +45,7 @@ impl Browser {
     ) -> Result<Option<Self>> {
         let config = bmux_config::BmuxConfig::load_with_paths_and_overrides(
             paths,
-            &bmux_config::ConfigLoadOverrides::default(),
+            &bmux_config::ConfigLoadOverrides::for_process(),
         )?;
         let mode = mode(
             &options,
@@ -56,8 +56,8 @@ impl Browser {
             return Ok(None);
         }
         let only = mode == PresenterWebMode::Only;
-        let assets = bmux_config::web::assets(options.assets, config.presenter.web.assets)
-            .context("presenter web mode requires --web-assets DIR, BMUX_WEB_ASSETS or presenter.web.assets")?;
+        let assets = bmux_config::web::assets(options.assets, config.presenter.web.assets);
+        let cache_root = bmux_config::web::cache_root(paths);
         let settings = bmux_config::web::resolve(
             config.web,
             bmux_config::web::WebOptions {
@@ -68,7 +68,9 @@ impl Browser {
                 allowed_hosts: options.allowed_hosts.as_deref(),
             },
         )?;
-        let assets = assets.canonicalize().context("browser asset directory")?;
+        let assets = bmux_web_host::resolve_assets_with_cache(assets, cache_root)
+            .await
+            .context("presenter browser asset setup")?;
         let mut config = bmux_web_host::HostConfig::new(assets);
         config.port = settings.port;
         config.host = settings.host;
@@ -182,6 +184,9 @@ mod tests {
         let mut options = crate::cli::WebOptions {
             port: Some(8080),
             auth: Some("token".into()),
+            host: Some("0.0.0.0".parse().unwrap()),
+            public_host: Some("127.0.0.1".parse().unwrap()),
+            allowed_hosts: Some(vec!["localhost:8080".into()]),
             ..Default::default()
         };
         assert_eq!(
@@ -198,6 +203,19 @@ mod tests {
             PresenterWebMode::Only
         );
         assert!(mode(&options, PresenterWebMode::Off, Ok("invalid".into())).is_err());
+        options.enabled = true;
+        assert_eq!(
+            mode(&options, PresenterWebMode::Only, Ok("off".into())).unwrap(),
+            PresenterWebMode::Mirror
+        );
+        assert!(options.assets.is_none());
+        options.only = true;
+        assert_eq!(
+            mode(&options, PresenterWebMode::Off, Ok("invalid".into())).unwrap(),
+            PresenterWebMode::Only
+        );
+        options.enabled = false;
+        options.only = false;
         options.assets = Some("browser".into());
         assert_eq!(
             mode(&options, PresenterWebMode::Only, Ok("off".into())).unwrap(),

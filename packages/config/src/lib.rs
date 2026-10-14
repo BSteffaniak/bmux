@@ -1081,11 +1081,11 @@ impl PresenterConfig {
 pub struct PresenterWebConfig {
     /// Browser output mode: off, mirror terminal output, or browser only
     pub mode: PresenterWebMode,
-    /// Optional browser asset directory; environment/CLI may override it
+    /// Advanced asset directory override; absent assets are prepared lazily when enabled
     pub assets: Option<std::path::PathBuf>,
 }
 
-/// Explicit presenter browser output mode; assets never implicitly enable output.
+/// Explicit presenter browser output mode; configured assets never implicitly enable output.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum PresenterWebMode {

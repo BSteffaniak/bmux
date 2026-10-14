@@ -83,9 +83,8 @@ pub(super) use bmux_config::web::WebOptions;
 fn configure_browser_host(
     assets: std::path::PathBuf,
     web_only: bool,
-    options: WebOptions<'_>,
-) -> Result<bmux_web_host::HostConfig> {
-    let settings = bmux_config::web::resolve(bmux_config::BmuxConfig::load()?.web, options)?;
+    settings: bmux_config::WebConfig,
+) -> bmux_web_host::HostConfig {
     let mut config = bmux_web_host::HostConfig::new(assets);
     config.port = settings.port;
     config.host = settings.host;
@@ -100,7 +99,7 @@ fn configure_browser_host(
     } else {
         bmux_web_host::ViewportMode::Observer
     };
-    Ok(config)
+    config
 }
 
 fn print_browser_addresses(host: &bmux_web_host::HostHandle) {
@@ -123,11 +122,35 @@ fn print_browser_addresses(host: &bmux_web_host::HostHandle) {
     }
 }
 
+async fn resolve_selected_browser_config(
+    assets: Option<&Path>,
+    web_only: bool,
+    web_options: WebOptions<'_>,
+) -> Result<bmux_web_host::HostConfig> {
+    let paths = match super::slot::active_slot() {
+        super::slot::ActiveSlotState::Resolved { slot, .. } => {
+            bmux_config::ConfigPaths::for_slot(slot)
+        }
+        _ => bmux_config::ConfigPaths::default(),
+    };
+    let settings = bmux_config::BmuxConfig::load_with_paths_and_overrides(
+        &paths,
+        &bmux_config::ConfigLoadOverrides::for_process(),
+    )?;
+    let settings = bmux_config::web::resolve(settings.web, web_options)?;
+    let assets = bmux_config::web::assets(assets.map(Path::to_path_buf), None);
+    let assets =
+        bmux_web_host::resolve_assets_with_cache(assets, bmux_config::web::cache_root(&paths))
+            .await
+            .context("browser asset setup")?;
+    Ok(configure_browser_host(assets, web_only, settings))
+}
+
 pub(super) async fn run(
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
-    assets: &Path,
+    assets: Option<&Path>,
     web_only: bool,
     web_options: WebOptions<'_>,
     connection_context: ConnectionContext<'_>,
@@ -137,13 +160,9 @@ pub(super) async fn run(
         provider.requires_fallback_client(),
         "browser presentation currently requires a local retained attach"
     );
-    let assets = bmux_config::web::assets(None, Some(assets.to_path_buf()))
-        .context("missing browser asset directory")?
-        .canonicalize()
-        .context("browser asset directory")?;
+    let config = resolve_selected_browser_config(assets, web_only, web_options).await?;
     let limits = bmux_web_host::Limits::default();
     let (feed_publisher, feed) = bmux_web_host::snapshot_feed(limits.max_snapshot_bytes)?;
-    let config = configure_browser_host(assets, web_only, web_options)?;
     let mut host = bmux_web_host::start(config, feed).await?;
     let mut requests = host
         .take_viewport_requests()

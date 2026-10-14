@@ -6,6 +6,10 @@
 #[cfg(test)]
 mod acceptance;
 mod assets;
+mod resolver;
+pub use resolver::{
+    RELEASE_TAG, RENDERER_SHA256, WASM_BINDGEN_VERSION, resolve_assets, resolve_assets_with_cache,
+};
 mod http;
 #[cfg(feature = "presentation")]
 mod presentation;

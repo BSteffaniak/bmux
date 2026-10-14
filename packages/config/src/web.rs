@@ -121,11 +121,24 @@ fn select_web_settings(
     })
 }
 
-/// Resolves explicit caller assets: CLI > environment > configured location.
-/// Absence remains absence; assets do not implicitly enable browser output.
+/// Selects only an advanced override: CLI > environment > configured path.
+///
+/// Absence remains absence, requesting lazy setup only after the caller enables web output.
+/// Merely setting an override does not implicitly enable output except for CLI policy.
 #[must_use]
 pub fn assets(cli: Option<PathBuf>, configured: Option<PathBuf>) -> Option<PathBuf> {
     select_assets(cli, std::env::var_os("BMUX_WEB_ASSETS"), configured)
+}
+
+/// Durable ancillary browser cache root: explicit environment override, otherwise
+/// the caller's selected state root. Never infer ordinary paths here.
+#[must_use]
+pub fn cache_root(paths: &crate::ConfigPaths) -> PathBuf {
+    select_cache_root(std::env::var_os("BMUX_CACHE_DIR"), paths)
+}
+
+fn select_cache_root(explicit: Option<std::ffi::OsString>, paths: &crate::ConfigPaths) -> PathBuf {
+    explicit.map_or_else(|| paths.state_dir.join("cache"), PathBuf::from)
 }
 
 fn select_assets(
@@ -139,6 +152,31 @@ fn select_assets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_cache_honors_selected_state_and_explicit_override() {
+        for state in [
+            "ordinary/state",
+            "slot/state",
+            "runtime/state",
+            "sandbox/state",
+        ] {
+            let paths = crate::ConfigPaths::new(
+                "config".into(),
+                "ephemeral/runtime".into(),
+                "data".into(),
+                state.into(),
+            );
+            assert_eq!(
+                select_cache_root(None, &paths),
+                PathBuf::from(state).join("cache")
+            );
+            assert_eq!(
+                select_cache_root(Some("/isolated/cache".into()), &paths),
+                PathBuf::from("/isolated/cache")
+            );
+        }
+    }
 
     #[test]
     fn assets_precedence_does_not_imply_enablement() {

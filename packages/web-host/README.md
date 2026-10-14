@@ -1,8 +1,61 @@
 # bmux_web_host
 
 Reusable **Unix-native** bounded HTTP hosting for opaque immutable encoded
-presentation snapshots. No renderer, terminal, attach, CLI or plugin dependencies.
-This crate neither builds browser code nor invents WASM output.
+presentation snapshots. The optional `presentation` feature provides native renderer integration.
+Native compilation records source provenance only: it never compiles WASM. Web callers
+explicitly opt into first-use asset setup; terminal-only operation never needs setup.
+
+## First-use assets
+
+`resolve_assets(override_directory).await` returns a verified cached directory or
+performs setup once. `Some(path)` bypasses setup; `start` still validates and loads
+the configured asset allowlist before binding. Cached use is offline and silent;
+progress appears on stderr only during setup.
+
+Product callers use
+`resolve_assets_with_cache(override_directory, cache_root).await`, applying
+`BMUX_CACHE_DIR` precedence themselves, otherwise passing the authoritative
+selected `state_dir.join("cache")`. The resolver adds `web-assets/` beneath that
+root, and never mutates environment variables. Convenience resolution uses
+`BMUX_CACHE_DIR`, then `XDG_CACHE_HOME/bmux`, then `HOME/.cache/bmux`; non-default
+runtime/slot/target contexts require the explicit cache API or `BMUX_CACHE_DIR`.
+Roots must be absolute and real directories, not symlinks.
+
+Source builds capture an absolute root and SHA-256 in `build.rs`. Before executing
+`bash scripts/dev.sh`, runtime recomputes and compares the input identity. Missing
+or changed sources fail explicitly; an existing root is not sufficient authority.
+The pinned Nix environment owns compiler and target-directory selection. Matching
+`wasm-bindgen-cli` is installed only into a staged private cache root using its
+exact version and locked dependencies, never into a system or default Cargo bin
+location. Its cached binary hash and version are checked before reuse. Builds use
+`cargo build --locked -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown`.
+
+Release builds embed an exact CI-supplied `BMUX_WEB_RELEASE_TAG`; absent tags mean
+source provenance mode, and `latest` is rejected. Releases never fall back to
+source or another release. HTTPS downloads come from that exact GitHub release:
+`bmux-web-assets-{renderer_sha256}.json` and
+`bmux-web-assets-{renderer_sha256}-{name}`. The strict schema-1 manifest contains
+`version` (package version), `renderer_sha256`, `wasm_bindgen_version`, and exactly
+five `{name,size,sha256}` entries: `index.html`, `bootstrap.js`, `style.css`,
+`bmux_web_renderer.js`, `bmux_web_renderer_bg.wasm`. Limits are 16 KiB manifest,
+8 MiB per file, 24 MiB aggregate. SHA-256 and WASM magic/version are verified.
+
+The shared `src/provenance.rs` and `renderer-identity` example define release identity:
+recursively selected local normal/build dependencies (including target-specific),
+package manifests, `src/**`, `browser/**`, `build.rs`, plus workspace manifest/lock,
+`flake.nix`, `flake.lock`, `.cargo/config.toml`, and `scripts/dev.sh`. Paths are sorted
+UTF-8 relative paths normalized with `/` separators (including on Windows). Hash framing starts with `bmux-web-renderer-inputs-v1\0`, then
+for each input: LE-u64 path-byte length, path bytes, LE-u64 content-byte length,
+content bytes. Workspace manifest/lock changes conservatively invalidate identity,
+even for unrelated dependencies. The example accepts the source root and prints
+only the shared SHA-256.
+
+Bundles are keyed by package version, release tag (or source), and renderer hash.
+Interprocess locks serialize setup. Files, staging directories, rename parents,
+and newly created cache parents are synced before success. Existing corrupt or
+unsupported cache/tool state produces errors without deletion or automatic repair;
+explicitly move the affected cache aside before retrying. Incomplete temporary
+setup is never accepted as a published bundle.
 
 ## Integration
 

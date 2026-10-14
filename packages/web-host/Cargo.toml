@@ -16,9 +16,12 @@ bmux_tui = { workspace = true, optional = true }
 bmux_web_renderer = { workspace = true, optional = true }
 getrandom = "0.3.4"
 libc = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+rustls = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = [
     "io-util",
     "net",
@@ -27,9 +30,11 @@ tokio = { workspace = true, features = [
     "time",
     "macros",
 ] }
+toml = { workspace = true, features = ["parse"] }
 
-[dev-dependencies]
-tempfile = { workspace = true }
+[build-dependencies]
+sha2 = { workspace = true }
+toml = { workspace = true, features = ["parse"] }
 
 [features]
 default          = []

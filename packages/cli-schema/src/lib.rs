@@ -344,26 +344,29 @@ pub enum Command {
     Attach {
         /// Session name or UUID
         target: Option<String>,
-        /// Serve this terminal view read-only in a local browser using these built WASM assets
+        /// Mirror this terminal view read-only in a browser (assets are prepared lazily)
+        #[arg(long)]
+        web: bool,
+        /// Advanced asset-directory override; also enables browser mirroring
         #[arg(long, value_name = "ASSET_DIRECTORY")]
         web_assets: Option<std::path::PathBuf>,
         /// Listener IP (default 127.0.0.1); authentication is opt-in
-        #[arg(long, requires = "web_assets")]
+        #[arg(long)]
         web_host: Option<std::net::IpAddr>,
         /// Optional URL-display IP hint (not a request host restriction)
-        #[arg(long, requires = "web_assets")]
+        #[arg(long)]
         web_public_host: Option<std::net::IpAddr>,
         /// Restrict exact HTTP Host authorities, including ports (repeat or comma-separate)
-        #[arg(long, value_delimiter = ',', requires = "web_assets")]
+        #[arg(long, value_delimiter = ',')]
         web_allowed_hosts: Option<Vec<String>>,
         /// Browser port (default 8080); zero selects an ephemeral port
-        #[arg(long, requires = "web_assets")]
+        #[arg(long)]
         web_port: Option<u16>,
         /// Browser access: none (default) or token (opt-in)
-        #[arg(long, value_parser = ["none", "token"], requires = "web_assets")]
+        #[arg(long, value_parser = ["none", "token"])]
         web_auth: Option<String>,
         /// Attach without terminal input/output; the first browser controls this view's viewport
-        #[arg(long, requires = "web_assets")]
+        #[arg(long)]
         web_only: bool,
         /// Follow target client UUID and attach to its selected session
         #[arg(long)]
@@ -3211,10 +3214,18 @@ mod tests {
             matches!(cli.command, Some(Command::Attach { web_public_host: None, web_allowed_hosts: Some(hosts), .. })
             if hosts == vec!["bmux.lan:8080", "localhost:8080", "[::1]:8080"])
         );
-        assert!(
-            Cli::try_parse_from(["bmux", "attach", "--web-allowed-hosts", "bmux.lan:8080"])
-                .is_err()
-        );
+        let cli = Cli::try_parse_from(["bmux", "attach", "--web-allowed-hosts", "bmux.lan:8080"])
+            .expect("network-only options parse without enabling web output");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Attach {
+                web: false,
+                web_only: false,
+                web_assets: None,
+                web_allowed_hosts: Some(hosts),
+                ..
+            }) if hosts == vec!["bmux.lan:8080"]
+        ));
     }
 
     #[test]
@@ -3238,7 +3249,18 @@ mod tests {
                 if host == ip.parse::<std::net::IpAddr>().unwrap() && public == "192.0.2.10".parse::<std::net::IpAddr>().unwrap())
             );
         }
-        assert!(Cli::try_parse_from(["bmux", "attach", "--web-host", "0.0.0.0"]).is_err());
+        let cli = Cli::try_parse_from(["bmux", "attach", "--web-host", "0.0.0.0"])
+            .expect("network-only options parse without enabling web output");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Attach {
+                web: false,
+                web_only: false,
+                web_assets: None,
+                web_host: Some(host),
+                ..
+            }) if host == "0.0.0.0".parse::<std::net::IpAddr>().unwrap()
+        ));
         for option in ["--web-host", "--web-public-host"] {
             assert!(
                 Cli::try_parse_from([
@@ -3271,7 +3293,7 @@ mod tests {
         assert!(
             matches!(cli.command, Some(Command::Attach { web_port: Some(0), web_auth: Some(ref auth), .. }) if auth == "token")
         );
-        assert!(Cli::try_parse_from(["bmux", "attach", "--web-port", "8080"]).is_err());
+        assert!(Cli::try_parse_from(["bmux", "attach", "--web-port", "8080"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "bmux",
@@ -3303,6 +3325,7 @@ mod tests {
             target,
             follow,
             global,
+            web,
             web_assets,
             web_only,
             ..
@@ -3310,6 +3333,7 @@ mod tests {
         else {
             panic!("expected attach command");
         };
+        assert!(!web);
         assert!(web_assets.is_none());
         assert!(!web_only);
         assert_eq!(target.as_deref(), Some("dev"));
@@ -3371,7 +3395,50 @@ mod tests {
             cli.command,
             Some(Command::Attach { web_only: true, .. })
         ));
-        assert!(Cli::try_parse_from(["bmux", "attach", "dev", "--web-only"]).is_err());
+        assert!(Cli::try_parse_from(["bmux", "attach", "dev", "--web-only"]).is_ok());
+    }
+
+    #[test]
+    fn browser_activation_flags_do_not_require_assets() {
+        for (flag, mirror, only) in [("--web", true, false), ("--web-only", false, true)] {
+            let cli = Cli::try_parse_from(["bmux", "attach", "dev", flag]).unwrap();
+            let Some(Command::Attach {
+                web,
+                web_only,
+                web_assets,
+                ..
+            }) = cli.command
+            else {
+                panic!("expected attach command");
+            };
+            assert_eq!(web, mirror);
+            assert_eq!(web_only, only);
+            assert!(web_assets.is_none());
+        }
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "attach",
+            "--web-host",
+            "127.0.0.1",
+            "--web-public-host",
+            "127.0.0.1",
+            "--web-port",
+            "0",
+            "--web-auth",
+            "token",
+            "--web-allowed-hosts",
+            "localhost:8080",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Attach {
+                web: false,
+                web_only: false,
+                web_assets: None,
+                ..
+            })
+        ));
     }
 
     #[test]

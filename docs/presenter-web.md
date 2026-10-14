@@ -8,14 +8,15 @@ semantics. A local presenter can still see notes independently.
 
 ## Explicit opt-in
 
-With matching native BMUX, bundled presenter plugin, and built browser assets:
+With matching native BMUX and bundled presenter plugin:
 
 ```sh
-bmux present play deck.md --presenter --web-assets /absolute/web-assets
-bmux present play deck.md --web-assets /absolute/web-assets --web-only
+bmux present play deck.md --presenter --web
+bmux present play deck.md --web-only
 ```
 
-`--web-assets DIR` alone enables **mirror** mode: the local terminal remains
+`--web` enables **mirror** mode without requiring prebuilt assets. The advanced
+`--web-assets DIR` override also enables mirror mode: the local terminal remains
 interactive and its audience viewport controls composition. Notes and local
 controls are not mirrored. `--web-only` enables **only** mode without terminal
 input, raw mode, or ANSI output. The initial audience viewport is 80×24; the first
@@ -34,7 +35,7 @@ credential options. For example, using existing private credential and TLS files
 bmux present host deck.md --listen 127.0.0.1:7443 \
   --cert /absolute/cert.pem --key /absolute/key.pem \
   --presenter-credential /absolute/presenter-credential --public-read \
-  --web-assets /absolute/web-assets --web-only
+  --web-only
 ```
 
 The existing presenter-authorized host transport controls shared navigation and
@@ -49,7 +50,7 @@ Browser output defaults to off:
 ```toml
 [presenter.web]
 mode = "only" # off | mirror | only
-assets = "/absolute/web-assets"
+assets = "/absolute/web-assets" # optional advanced override
 
 [web]
 port = 8080
@@ -57,11 +58,31 @@ host = "127.0.0.1"
 auth = "token" # none | token
 ```
 
-Mode selection is `--web-only`, then explicit `--web-assets` (mirror), then
-`BMUX_PRESENTER_WEB_MODE`, then `[presenter.web].mode`. Asset location is explicit
-`--web-assets`, then `BMUX_WEB_ASSETS`, then `[presenter.web].assets`.
+Mode selection is `--web-only`, then `--web` or explicit `--web-assets` (mirror),
+then `BMUX_PRESENTER_WEB_MODE`, then `[presenter.web].mode`. Asset location is
+explicit `--web-assets`, then `BMUX_WEB_ASSETS`, then `[presenter.web].assets`,
+then implicit lazy setup. An explicit override is validated; it never triggers
+installation or silently falls back to a different bundle.
+
+Only enabled mirror/only output resolves assets. With no override, compatible
+assets are reused from durable cache or prepared on first use. A populated
+compatible cache supports offline use; a cache miss must complete setup before
+any listener, raw mode, or attachment starts. Setup failure is reported, not
+converted into partial web activation. The default off mode performs no browser
+setup and local terminal operation remains independent. Source-checkout first
+use builds with the pinned generator and caches the result; released binaries
+resolve a pinned-tag bundle manifest. Older releases without a compatible
+published bundle report an actionable error: upgrade or supply matching locally
+built assets with `--web-assets DIR`, rather than substituting another version.
+See [browser rendering](browser-rendering.md#attach-locally) for offline/cache
+behavior. Cache precedence here is `BMUX_CACHE_DIR`, otherwise the native caller's
+selected state directory joined with `cache`; the resolver adds `web-assets`.
+Slot, named-runtime, and sandbox paths retain their own durable cache root,
+without changing global environment or falling back to ordinary user state.
+
 Merely setting configured assets, `BMUX_WEB_ASSETS`, `[web]`, or shared
-`BMUX_WEB_*` network settings does **not** enable presenter web output.
+`BMUX_WEB_*` network settings (including CLI network flags) does **not** enable
+presenter web output.
 
 Network settings use the same resolver as browser attach: CLI flags override
 environment variables, which override `[web]` configuration:

@@ -2,9 +2,48 @@
 
 BMUX shares retained presentation primitives between terminal output and a Rust/WASM browser renderer. Canvas 2D is the initial browser backend; `BrowserBackend` keeps output replaceable without exposing Canvas, DOM, or GPU objects in the shared contract. HTML/WebGL and interactive browser input remain future work.
 
-## Build and attach locally
+## Attach locally
 
-Use the locked Nix shell throughout:
+Browser output is opt-in; ordinary terminal attachment needs no browser assets or
+network setup:
+
+```sh
+bmux attach "<SESSION_UUID>" --web
+bmux attach "<SESSION_UUID>" --web-only
+```
+
+`--web` mirrors an interactive terminal. `--web-only` enables browser output
+without a terminal. Neither requires `--web-assets`. With no asset override,
+BMUX lazily resolves compatible browser assets, reusing its durable cache or
+setting it up on first use. A compatible cached bundle supports offline use;
+a cache miss needs setup to succeed. Setup errors stop web activation before
+opening a listener, entering raw mode, or attaching. Terminal-only commands and
+network-only flags never trigger asset setup.
+
+For attach and presenter entrypoints, cache authority is explicit `BMUX_CACHE_DIR`
+first, otherwise the selected BMUX state root's `cache` directory. The resolver
+adds its `web-assets` namespace underneath that durable root. Attach honors
+slot-selected paths and named-runtime/sandbox path selection; presenter uses its
+native caller's selected state root. No global environment mutation is required,
+and the ephemeral socket/runtime directory is never used as the asset cache.
+The context-free resolver separately falls back from `BMUX_CACHE_DIR` to
+`XDG_CACHE_HOME` to `HOME`, rejecting unresolved isolated selections rather than
+crossing into ordinary cache.
+First use from a source checkout builds with the pinned generator and caches the
+result. Released binaries resolve a pinned-tag bundle manifest instead. Older
+releases without a published compatible bundle cannot silently use another
+version: follow the setup error, upgrade to a bundle-bearing release, or build
+matching assets and pass `--web-assets DIR`. Offline first use needs a populated
+compatible cache or an explicit matching asset directory.
+
+### Advanced: locally built assets
+
+`--web-assets DIR` remains an explicit advanced override and also enables mirror
+mode. Asset selection is CLI `--web-assets` → `BMUX_WEB_ASSETS` → implicit setup;
+an explicit path is validated, not silently replaced or installed over. Merely
+setting `BMUX_WEB_ASSETS` or network configuration does not enable web output.
+For source development, build matching native and WASM artifacts using the
+locked Nix shell:
 
 ```sh
 bash scripts/dev.sh cargo install wasm-bindgen-cli --version 0.2.126 --locked --root "$PWD/target/web-tools"
@@ -17,12 +56,12 @@ Replace `<SESSION_UUID>` with an ID from `bmux list-sessions --json`. `--web-onl
 An independent attachment does not follow another client's focused pane, zoom state, or selected tab. To follow your laptop view, identify that terminal client with `bmux list-clients --json`, then use its **client UUID** (not the session UUID):
 
 ```sh
-bash scripts/dev.sh cargo run -p bmux_cli --bin bmux -- attach --follow "<LAPTOP_CLIENT_UUID>" --global --web-assets "$PWD/target/web-assets" --web-only
+bmux attach --follow "<LAPTOP_CLIENT_UUID>" --global --web-only
 ```
 
 `--global` keeps following when that client switches sessions. Choose the client explicitly; BMUX does not guess among attached clients.
 
-Omit `--web-only` to mirror an interactive terminal attachment. In mirror mode the terminal owns viewport dimensions; browser resizing only changes local pixel metrics, not terminal layout. Native provider-only attachment is explicitly unsupported by this entry point.
+Use `--web` instead of `--web-only` to mirror an interactive terminal attachment. In mirror mode the terminal owns viewport dimensions; browser resizing only changes local pixel metrics, not terminal layout. Native provider-only attachment is explicitly unsupported by this entry point.
 
 The default browser URL is **http://127.0.0.1:8080/**: fixed loopback port,
 no token, and ordinary reload works. Any local user/process can read this output.

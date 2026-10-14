@@ -2825,11 +2825,14 @@ dependencies = [
  "bmux_web_renderer",
  "getrandom 0.3.4",
  "libc",
+ "reqwest 0.13.4",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
