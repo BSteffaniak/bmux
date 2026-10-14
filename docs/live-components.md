@@ -152,6 +152,17 @@ authority. Managed execution controls require presenter effects authority.
 authorize execution. See the [presenter plugin](../plugins/presenter-plugin/README.md)
 for transport and credential options.
 
+### Reusable executor
+
+`bmux_playbook` exposes the actual action dispatcher and sandbox/recording
+lifecycle behind its default-off `runtime` feature. CLI and managed external
+workers call that same executor. Non-CLI callers supply a required `HostAdapter`
+for pane transport, keyboard processing, attach/simulation primitives, terminal
+acquisition and executable selection; adapters do not receive whole playbooks or
+dispatch actions. Generic CLI input and pane/scrollback implementations remain
+CLI-owned. Parser/source consumers do not enable native execution dependencies.
+See [playbook API](../packages/playbook/README.md).
+
 ### Execution and display boundaries
 
 `bmux.playbook` exposes generated typed lifecycle contracts. The implementation
@@ -192,10 +203,13 @@ remaining uncertainty is reported rather than silently treated as completion.
 - Approval binds the bounded include closure by canonical relative names and bytes.
   Preparation verifies and freezes the same bytes before admitting execution;
   changed executable input requires explicit approval again.
-- Reload does not transfer active execution handles into a candidate. Active or
-  pending work blocks reload. A successful local reload discards demo controllers;
-  reopen with explicit approval to enable them again. Managed candidate preparation
-  retains the original approval rather than granting new executable-input trust.
+- Reload preparation is effect-free and detached. At commit, stable block IDs with
+  the same playbook path and unchanged approved source closure retain live
+  controllers, generation, overlay state, and retained output. Titles and slide
+  placement may change. New or changed executable bytes require fresh explicit
+  approval; a failed candidate leaves the old deck authoritative. Removed or
+  reconfigured active controllers request cancellation only at precommit and defer
+  replacement until settlement; retry reload after settlement.
 - The embedded raster does not export the producer's logical selection/semantics
   into the outer presenter scene. Do not infer source text from cells or claim
   complete logical metadata for the embedded region.
@@ -212,6 +226,35 @@ remaining uncertainty is reported rather than silently treated as completion.
 These are implementation boundaries, not benchmark or runtime-acceptance claims.
 
 ## Measuring publication work
+
+The finite `live-publication-performance` example measures real prepared-scene
+publication and full/delta encoding separately, with image/no-image,
+steady/changing, first-admission/reuse, and fast/slow-consumer cases:
+
+```sh
+bash scripts/dev.sh cargo run -p bmux_web_host --release --features presentation --example live-publication-performance -- /absolute/target/web-assets 128
+python3 scripts/live-components-performance.py --binary /absolute/live-publication-performance --assets /absolute/target/web-assets --browser /absolute/chromium --samples 32
+```
+
+The native harness counts successful allocation/reallocation calls, requested
+allocation bytes, outstanding requested heap and fixture-drop release. These are
+not RSS or publisher-exclusive memory. Preparation, HTTP and decoding are outside
+the synchronous measurement scope. Exact predecessor delta reconstruction,
+missed-base full repair, immutable-source retention and generation reset are
+asserted without timing thresholds. The browser driver correlates actual source
+revisions and Linux monotonic timestamps with Canvas API commit observations;
+clock-mapping uncertainty is reported. This is not physical paint latency.
+
+A coordinator debug-profile observation (80×24, 32 native samples, 8 browser
+samples per case, Linux Chromium 149) completed all cases and repair assertions.
+Browser source-to-Canvas commit p50/p95 was 21.6/22.4 ms without images and no
+content change, 22.2/32.4 ms without images with changes, 72.7/75.8 ms with images
+and no content change, and 79.2/82.1 ms with image changes. Clock calibration
+half-RTT uncertainty was 0.11–0.16 ms. These small debug samples are evidence,
+not release baselines, performance guarantees, or evidence of negligible cost.
+Native publication still allocates and encodes; immutable resource admission
+reuse does not make whole-publication work allocation-free. Re-run the commands
+above in the intended optimized environment before making comparative claims.
 
 An ignored source test measures resource admission only, comparing an unseen
 1 MiB payload, retained shared bytes, and retained equal bytes in a distinct

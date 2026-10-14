@@ -31,10 +31,7 @@ pub(crate) fn report_managed_prelaunch_failure(error: &anyhow::Error) -> Result<
 }
 
 /// Execution options for playbook runs.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RunOptions {
-    pub interactive: bool,
-}
+pub use bmux_playbook::RunOptions;
 
 pub use bmux_playbook::parser::{parse_file, parse_stdin};
 

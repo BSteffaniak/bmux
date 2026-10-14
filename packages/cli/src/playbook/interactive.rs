@@ -12,6 +12,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use bmux_playbook::transport::ExecutionClient as BmuxClient;
 use bmux_recording_plugin_api::recording_commands;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -774,7 +775,10 @@ async fn run_interactive_session_managed(
     info!("interactive client connected");
 
     // Connect to the sandbox server.
-    let mut client = sandbox.connect("bmux-playbook-interactive").await?;
+    let mut client = BmuxClient::new(
+        sandbox.connect("bmux-playbook-interactive").await?,
+        super::engine::host(),
+    );
     let mut inspector = ScreenInspector::new(viewport_cols, viewport_rows);
 
     // Session state.
@@ -844,8 +848,8 @@ enum ReplLoopEvent {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines, clippy::useless_let_if_seq)]
 async fn run_repl(
-    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-    client: &mut bmux_client::BmuxClient,
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    client: &mut bmux_playbook::transport::ExecutionClient,
     inspector: &mut ScreenInspector,
     session_id: &mut Option<Uuid>,
     attached: &mut bool,
@@ -1528,7 +1532,7 @@ async fn run_repl(
 /// Handle the `screen` special command — return all pane screen text.
 #[allow(clippy::ref_option)]
 async fn handle_screen_command(
-    client: &mut bmux_client::BmuxClient,
+    client: &mut bmux_playbook::transport::ExecutionClient,
     inspector: &mut ScreenInspector,
     session_id: &Option<Uuid>,
     attached: &bool,
@@ -1553,7 +1557,7 @@ async fn handle_screen_command(
 /// Handle the `status` special command — return session/pane metadata.
 #[allow(clippy::ref_option)]
 async fn handle_status_command(
-    client: &mut bmux_client::BmuxClient,
+    client: &mut bmux_playbook::transport::ExecutionClient,
     inspector: &mut ScreenInspector,
     session_id: &Option<Uuid>,
     attached: &bool,
@@ -1582,7 +1586,7 @@ async fn handle_status_command(
 
 /// Drain output and capture all pane screen text.
 async fn drain_and_capture(
-    client: &mut bmux_client::BmuxClient,
+    client: &mut bmux_playbook::transport::ExecutionClient,
     inspector: &mut ScreenInspector,
     session_id: Uuid,
 ) -> Result<Vec<PaneCapture>> {
@@ -1684,7 +1688,7 @@ async fn process_output_available_event<W: tokio::io::AsyncWrite + Unpin>(
     subscription: &LiveSubscription,
     budget_state: &mut EventBudgetState,
     watchpoints: &mut WatchpointRegistry,
-    client: &mut bmux_client::BmuxClient,
+    client: &mut bmux_playbook::transport::ExecutionClient,
     inspector: &mut ScreenInspector,
     session_id: &Option<Uuid>,
     attached: &bool,
@@ -1865,7 +1869,7 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
     sequencer: &mut MessageSequencer,
     event_buffer: &mut EventBuffer,
     budget_state: &mut EventBudgetState,
-    client: &mut bmux_client::BmuxClient,
+    client: &mut bmux_playbook::transport::ExecutionClient,
     inspector: &mut ScreenInspector,
     session_id: &Option<Uuid>,
     attached: &bool,
@@ -1901,7 +1905,7 @@ async fn emit_screen_events_with_refresh<W: tokio::io::AsyncWrite + Unpin>(
     sequencer: &mut MessageSequencer,
     event_buffer: &mut EventBuffer,
     budget_state: &mut EventBudgetState,
-    client: &mut bmux_client::BmuxClient,
+    client: &mut bmux_playbook::transport::ExecutionClient,
     inspector: &mut ScreenInspector,
     session_id: &Option<Uuid>,
     attached: &bool,
@@ -2039,7 +2043,7 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     sequencer: &mut MessageSequencer,
     event_buffer: &mut EventBuffer,
-    client: &mut bmux_client::BmuxClient,
+    client: &mut bmux_playbook::transport::ExecutionClient,
     inspector: &mut ScreenInspector,
     session_id: &Option<Uuid>,
     attached: &bool,

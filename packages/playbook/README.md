@@ -1,31 +1,40 @@
-# Playbook domain library
+# bmux_playbook
 
-`bmux_playbook` owns the existing playbook DSL/TOML parsers, include resolution,
-execution models, variable substitution, escaping and result comparison. The CLI
-executor and managed playbook plugin consume this one implementation.
+Playbook models, DSL/TOML parsing, include resolution, immutable source snapshots,
+substitution and result comparison are available with default features.
 
-This is explicitly a **product domain library**, not neutral core infrastructure.
-Moving models here does not authorize importing them into server/client/IPC,
-plugin SDK or other generic host layers. It has no dependency on CLI, plugin
-implementation, plugin API, attach runtime or compositor internals.
+The default-off `runtime` feature adds the real execution engine. This is a
+**product domain library**, not neutral core infrastructure. It does not depend
+on `bmux_cli` or plugin implementation crates.
 
-## Ownership
+## Execution boundary
 
-- `types`: playbook configuration, actions and result models.
-- `parse_dsl` / `parse_toml`: existing input formats; both produce the same model.
-- `parser`: file/include resolution and bounded immutable source snapshots for
-  explicitly trusted managed execution. Unix snapshots open each path component
-  relative to an owned root descriptor and reject symlinks and escapes.
-- `subst`: parse/runtime variable substitution.
-- `diff`: structured comparison of execution results.
+`run(playbook, target_server, options, Arc<dyn HostAdapter>)` owns step scheduling,
+deadlines, action dispatch, assertions, recording, sandbox lifecycle and result
+settlement. There is no default or no-op host. Non-CLI callers provide their own
+required primitive adapters:
 
-Executable-deck permission checks, process lifecycle, generation ownership and
-service registration remain in the execution plugin. Signal and interactive
-terminal acquisition remain CLI adapters. The public BPDL lifecycle contract
-remains in `bmux_playbook_plugin_api`; this crate does not replace it with a
-handwritten transport layer.
+- execution-scoped pane transport and grid capture;
+- typed `bmux_keyboard::KeyStroke` parsing and caller-owned key processing;
+- acknowledged real-attach input and retained output;
+- primitive operations on the caller's attach simulation pipeline;
+- terminal acquisition/painting/control input, executable selection and sandbox
+  manifest/index bookkeeping.
 
-Original parser/model/substitution/diff tests move with their source files.
-Source snapshot tests cover frozen includes and symlink/escape rejection.
-Validation is coordinator-owned for the current implementation lane; no test
-execution is claimed by this extraction.
+Adapters do not dispatch actions or receive a complete playbook. General CLI
+input/keymaps, pane clients and scrollback subsystems remain CLI-owned. CLI and
+its interactive REPL call the same library dispatcher. Signal cancellation is
+caller policy; dropping the run future triggers sandbox emergency cleanup.
+
+The managed plugin continues to launch an isolated external executable, which
+calls the same executor. Service authorization and attempt/generation ownership
+remain in the plugin; the library does not replace its generated BPDL contract.
+Terminal acquisition and signal handling remain CLI adapters.
+
+Parser/source consumers need not enable native execution dependencies. Source
+snapshot security and include semantics are unchanged. Existing capture, render
+assertion and sandbox regressions accompany the relocated implementation; native
+attach acknowledgement regressions remain with the CLI adapter.
+
+Validation is coordinator-owned for this source-only lane. No build, test,
+formatter, runtime or acceptance result is claimed here.

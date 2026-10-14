@@ -50,6 +50,41 @@ pub struct Controller {
     shutdown: watch::Sender<bool>,
 }
 impl Controller {
+    /// An inert snapshot endpoint for speculative owner projection. No task or
+    /// live sender is shared with the original controller.
+    pub(crate) fn detached(snapshot: LifecycleSnapshot) -> Self {
+        let (commands, _) = mpsc::channel(COMMAND_CAPACITY);
+        let (_, snapshots) = watch::channel(snapshot.clone());
+        let (shutdown, _) = watch::channel(false);
+        let (cancellation, _) = watch::channel(snapshot.cancellation_revision);
+        Self {
+            owner_epoch: snapshot.owner_epoch,
+            commands,
+            snapshots,
+            shutdown,
+            cancellation,
+            pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            task: None,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn test_endpoint(
+        snapshot: LifecycleSnapshot,
+    ) -> (
+        Self,
+        watch::Sender<LifecycleSnapshot>,
+        watch::Receiver<u64>,
+        watch::Receiver<bool>,
+    ) {
+        let mut controller = Self::detached(snapshot.clone());
+        let (updates, snapshots) = watch::channel(snapshot);
+        let (cancellation, cancelled) = watch::channel(0);
+        let (shutdown, stopped) = watch::channel(false);
+        controller.snapshots = snapshots;
+        controller.cancellation = cancellation;
+        controller.shutdown = shutdown;
+        (controller, updates, cancelled, stopped)
+    }
     /// Requires an explicit async runtime owner. Does not prepare/start until Run.
     pub fn spawn(
         runtime: &tokio::runtime::Handle,

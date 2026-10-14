@@ -10,6 +10,10 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
+[[example]]
+name              = "live-publication-performance"
+required-features = ["presentation"]
+
 [dependencies]
 anyhow = { workspace = true, optional = true }
 bmux_tui = { workspace = true, optional = true }

@@ -298,6 +298,44 @@ fn render_registry(
     Ok(registry)
 }
 impl Owner for LinkedOwner {
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+    fn commit_reload(&mut self, candidate: &mut dyn Owner) -> Result<(), HostError> {
+        if self.demos.is_empty() {
+            return Ok(());
+        }
+        // Reject unknown replacement ownership without touching live resources.
+        let candidate = candidate
+            .as_any_mut()
+            .and_then(|owner| owner.downcast_mut::<Self>())
+            .ok_or(HostError::Invalid)?;
+        if self
+            .demos
+            .keys()
+            .any(|instance| !candidate.demos.contains_key(instance))
+        {
+            return Err(HostError::Invalid);
+        }
+        let mut deferred = false;
+        for (instance, demos) in &mut self.demos {
+            if demos.admit_reload(&candidate.demos[instance]).is_err() {
+                deferred = true;
+            }
+        }
+        if deferred {
+            return Err(HostError::EffectUncertain);
+        }
+        for (instance, demos) in &mut self.demos {
+            demos.commit_reload(
+                candidate
+                    .demos
+                    .get_mut(instance)
+                    .expect("validated instance"),
+            );
+        }
+        Ok(())
+    }
     fn shutdown(
         &mut self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HostError>> + Send + '_>>
@@ -343,17 +381,17 @@ impl Owner for LinkedOwner {
         deck: &Deck,
         assets: &[bmux_presenter_runtime::Asset],
     ) -> Result<Box<dyn Owner>, HostError> {
-        if self.demos.values().any(|demos| !demos.settled()) {
-            // Candidate preparation remains effect-free. The owner must explicitly
-            // stop and settle before reload can retire live resources.
-            return Err(HostError::Invalid);
-        }
         let mut rich = crate::rich::RichAssets::prepare(assets).map_err(|_| HostError::Invalid)?;
         rich.code = crate::rich::highlight(deck);
         let mut candidate = LinkedOwner::prepare_candidate(self, deck.clone(), rich)?;
-        // No live handles/tasks in candidates. Approval is immutable; successful
-        // publication drops the old owner, whose controllers request settled stop.
+        // Detached snapshots only: no candidate tasks or live command handles.
         candidate.demo_environment = self.demo_environment.clone();
+        for (instance, demos) in &self.demos {
+            candidate.demos.insert(
+                instance.clone(),
+                demos.prepare_reload(deck).map_err(|_| HostError::Invalid)?,
+            );
+        }
         Ok(Box::new(candidate))
     }
     fn reconcile_reload(&mut self, context: OwnerContext<'_>) -> Result<Vec<MirrorFrame>, String> {
@@ -481,6 +519,76 @@ impl Owner for LinkedOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn managed_reload_handoff_preserves_active_epoch_surface_and_approval() {
+        use crate::playbook_live::reload_tests::{Fixture, deck, empty};
+        let fixture = Fixture::new();
+        let running = fixture.running();
+        let epoch = running.demos.entries["demo"].controller.owner_epoch();
+        let surface = running.demos.entries["demo"]
+            .snapshot
+            .surface
+            .clone()
+            .unwrap();
+        let mut owner =
+            LinkedOwner::new(deck("s", "old"), &[], crate::demo::linked_registry()).unwrap();
+        owner.demo_environment = Some(fixture.environment.clone());
+        owner.demos.insert("shared".into(), running.demos);
+        let mut candidate = owner
+            .prepare_reload(&deck("moved", "renamed"), &[])
+            .unwrap();
+        assert!(!*running.stopped.borrow());
+        assert_eq!(*running.cancelled.borrow(), 0);
+        owner.commit_reload(candidate.as_mut()).unwrap();
+        let candidate = candidate
+            .as_any_mut()
+            .unwrap()
+            .downcast_mut::<LinkedOwner>()
+            .unwrap();
+        let entry = &candidate.demos["shared"].entries["demo"];
+        assert_eq!(entry.controller.owner_epoch(), epoch);
+        assert_eq!(entry.snapshot.attempt.as_ref().unwrap().generation, 41);
+        assert!(Arc::ptr_eq(
+            entry.snapshot.surface.as_ref().unwrap(),
+            &surface
+        ));
+        assert_eq!(entry.slide, "moved");
+        assert!(!*running.stopped.borrow());
+        std::fs::write(
+            fixture.root.join("steps.dsl"),
+            "new-session\nsend-keys keys=changed\n",
+        )
+        .unwrap();
+        assert!(
+            candidate
+                .prepare_reload(&deck("moved", "renamed"), &[])
+                .is_err()
+        );
+        assert_eq!(
+            candidate.demos["shared"].entries["demo"]
+                .controller
+                .owner_epoch(),
+            epoch
+        );
+        assert_eq!(*running.cancelled.borrow(), 0);
+        // Removal's explicit commit admission requests cancellation, keeps owner.
+        let mut removed = candidate.prepare_reload(&empty(), &[]).unwrap();
+        assert_eq!(
+            candidate.commit_reload(removed.as_mut()),
+            Err(HostError::EffectUncertain)
+        );
+        assert!(candidate.demos["shared"].entries.contains_key("demo"));
+        assert!(*running.cancelled.borrow() > 0);
+        assert!(!*running.stopped.borrow());
+        running.updates.send_modify(|snapshot| {
+            snapshot.cancellation_revision = *running.cancelled.borrow();
+            let attempt = snapshot.attempt.as_mut().unwrap();
+            attempt.phase = "stopped".into();
+            attempt.cleanup_acknowledged = true;
+        });
+        candidate.commit_reload(removed.as_mut()).unwrap();
+    }
     fn controls() -> Deck {
         bmux_presenter::DeckBuilder::new("linked")
             .slide(

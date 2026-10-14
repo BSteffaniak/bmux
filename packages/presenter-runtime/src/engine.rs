@@ -94,6 +94,19 @@ pub struct OwnerUpdate {
 /// Effects run once on the owner, never during snapshot or polling. Failed calls are
 /// uncertain and their consumed revision must not be retried automatically.
 pub trait Owner: Send {
+    /// Optional concrete handoff target; existing owners need not implement it.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+    /// Explicit lifecycle boundary after every candidate scene has validated,
+    /// before host state changes. Validate all transfers before moving anything.
+    /// Errors retain the old owner and scene. Implementations may explicitly
+    /// request retirement and defer until settlement, but preparation/rendering
+    /// must never perform that operation. Successful moves must be infallible
+    /// after validation; never move resources and then return Err.
+    fn commit_reload(&mut self, _candidate: &mut dyn Owner) -> Result<(), HostError> {
+        Ok(())
+    }
     /// Construct isolated replacement state. Retain only compatible block ID,
     /// linked component type and state version; never retain derived geometry or
     /// shared mutable handles into the live owner. No effects may run here.
@@ -1049,6 +1062,9 @@ impl Host {
                     );
                 }
             }
+        }
+        if let (Some(current), Some(candidate)) = (self.owner.as_mut(), replacement.as_mut()) {
+            current.commit_reload(candidate.as_mut())?;
         }
         if let Some(owner) = replacement {
             self.owner = Some(owner);

@@ -1,0 +1,920 @@
+//! Sandbox server lifecycle for playbook execution.
+//!
+//! Provides an ephemeral, isolated bmux server instance that lives only for
+//! the duration of a playbook run. This is extracted from (and mirrors) the
+//! recording-verify sandbox pattern in `runtime/mod.rs`.
+
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use bmux_client::BmuxClient;
+use bmux_config::ConfigPaths;
+use tracing::warn;
+
+use super::types::PluginConfig;
+use crate::host::{HostAdapter, SandboxManifestUpdate};
+use std::sync::Arc;
+
+/// Handle to a running sandbox server.
+///
+/// Implements `Drop` as a defense-in-depth cleanup mechanism: if the struct is
+/// dropped without calling `shutdown()` (e.g. due to panic, early return, or
+/// signal), it will kill the server process and remove temp dirs.
+#[derive(Debug)]
+pub struct SandboxServer {
+    host: Arc<dyn HostAdapter>,
+    handle: ServerHandle,
+    root_dir: PathBuf,
+    cleaned_up: bool,
+}
+
+#[derive(Debug)]
+enum ServerHandle {
+    Foreground {
+        child: std::process::Child,
+        paths: ConfigPaths,
+        _stdout_log: PathBuf,
+        stderr_log: PathBuf,
+    },
+    Daemon {
+        paths: ConfigPaths,
+        _stdout_log: PathBuf,
+        stderr_log: PathBuf,
+    },
+}
+
+pub struct SandboxStartOptions<'a> {
+    pub shell: Option<&'a str>,
+    pub plugin_config: &'a PluginConfig,
+    pub startup_timeout: Duration,
+    pub env: &'a std::collections::BTreeMap<String, String>,
+    pub env_mode: super::types::SandboxEnvMode,
+    pub binary: Option<&'a Path>,
+    pub sandbox_config_file: Option<&'a Path>,
+    pub bundled_plugin_ids: &'a [String],
+}
+
+impl SandboxServer {
+    /// Create and start a new ephemeral sandbox server.
+    ///
+    /// - `binary`: path to the bmux binary. Falls back to `std::env::current_exe()`
+    ///   when `None`.
+    /// - `bundled_plugin_ids`: pre-computed list of bundled plugin IDs for the
+    ///   disable list. Pass an empty vec if plugin discovery is unavailable.
+    /// # Errors
+    ///
+    /// Returns an error if the sandbox server fails to start.
+    pub async fn start(
+        options: SandboxStartOptions<'_>,
+        host: Arc<dyn HostAdapter>,
+    ) -> Result<Self> {
+        let (paths, root_dir) = if let Some(root) = std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT") {
+            let root = PathBuf::from(root).join("sandbox");
+            anyhow::ensure!(root.is_absolute(), "managed sandbox root must be absolute");
+            std::fs::create_dir(&root)
+                .context("managed sandbox root already exists or cannot be created")?;
+            let runtime = std::env::var_os("BMUX_PLAYBOOK_MANAGED_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .context("managed runtime path missing")?;
+            anyhow::ensure!(
+                runtime.is_absolute(),
+                "managed runtime path must be absolute"
+            );
+            (
+                ConfigPaths::new(root.join("c"), runtime, root.join("d"), root.join("s")),
+                root,
+            )
+        } else {
+            create_temp_paths()
+        };
+        write_sandbox_config(
+            &paths,
+            options.shell,
+            options.plugin_config,
+            options.sandbox_config_file,
+            options.bundled_plugin_ids,
+        )
+        .context("failed writing sandbox config")?;
+
+        let bmux_binary = if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some() {
+            // Managed execution must use the already-selected isolated worker executable.
+            host.executable()?
+        } else {
+            options
+                .binary
+                .map_or_else(|| host.executable(), |path| Ok(path.to_path_buf()))?
+        };
+
+        write_playbook_manifest(
+            host.as_ref(),
+            &root_dir,
+            &paths,
+            &bmux_binary,
+            &["server".to_string(), "start".to_string()],
+            options.env_mode,
+            "running",
+            None,
+            true,
+        )?;
+        let _ = host.write_sandbox_lock(&root_dir, std::process::id());
+
+        let handle = start_sandbox_server(
+            &bmux_binary,
+            &paths,
+            &root_dir,
+            options.startup_timeout,
+            options.env,
+            options.env_mode,
+        )
+        .await
+        .context("failed starting sandbox server")?;
+
+        Ok(Self {
+            host,
+            handle,
+            root_dir,
+            cleaned_up: false,
+        })
+    }
+
+    /// Connect a new `BmuxClient` to this sandbox server.
+    /// # Errors
+    ///
+    /// Returns an error if the connection to the sandbox server fails.
+    pub async fn connect(&self, label: &str) -> Result<BmuxClient> {
+        BmuxClient::connect_with_paths(self.paths(), label)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed connecting to sandbox server: {e}"))
+    }
+
+    /// Return the `ConfigPaths` for this sandbox.
+    #[must_use]
+    pub const fn paths(&self) -> &ConfigPaths {
+        match &self.handle {
+            ServerHandle::Foreground { paths, .. } | ServerHandle::Daemon { paths, .. } => paths,
+        }
+    }
+
+    /// Return the root temp directory for this sandbox.
+    #[must_use]
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
+    /// Return the sandbox server stderr log path.
+    #[must_use]
+    pub fn stderr_log_path(&self) -> &Path {
+        match &self.handle {
+            ServerHandle::Foreground { stderr_log, .. }
+            | ServerHandle::Daemon { stderr_log, .. } => stderr_log,
+        }
+    }
+
+    /// Gracefully shut down the sandbox server and optionally clean up temp dirs.
+    /// # Errors
+    ///
+    /// Returns an error if the sandbox server fails to shut down cleanly.
+    pub async fn shutdown(mut self, retain_on_failure: bool) -> Result<()> {
+        self.cleaned_up = true;
+        let result = self.stop_server().await;
+        if result.is_ok()
+            && let Some(root) = std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT")
+        {
+            std::fs::remove_file(PathBuf::from(root).join("sandbox-child-owned"))
+                .context("failed recording sandbox child cleanup")?;
+        }
+        let status = if result.is_ok() {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        let keep = retain_sandbox_after_shutdown(retain_on_failure, result.is_ok());
+        let _ = write_playbook_manifest(
+            self.host.as_ref(),
+            &self.root_dir,
+            self.paths(),
+            &self.host.executable()?,
+            &["server".to_string(), "stop".to_string()],
+            super::types::SandboxEnvMode::Inherit,
+            status,
+            None,
+            keep,
+        );
+        let _ = self.host.clear_sandbox_lock(&self.root_dir);
+        if !keep {
+            let _ = std::fs::remove_dir_all(&self.root_dir);
+        }
+        result
+    }
+
+    async fn stop_server(&mut self) -> Result<()> {
+        // Try graceful IPC stop first.
+        if let Ok(mut client) =
+            BmuxClient::connect_with_paths(self.paths(), "bmux-playbook-sandbox-stop").await
+        {
+            let _ = client.stop_server().await;
+        }
+
+        match &mut self.handle {
+            ServerHandle::Foreground { child, .. } => {
+                if wait_for_child_exit(child, Duration::from_secs(3)).await? {
+                    return Ok(());
+                }
+                // Force kill
+                child
+                    .kill()
+                    .context("failed requesting sandbox termination")?;
+                anyhow::ensure!(
+                    wait_for_child_exit(child, Duration::from_secs(1)).await?,
+                    "sandbox termination not acknowledged"
+                );
+                Ok(())
+            }
+            ServerHandle::Daemon { paths, .. } => {
+                if wait_until_server_stopped(paths, Duration::from_secs(3)).await? {
+                    return Ok(());
+                }
+                // Try to kill via PID file
+                if let Some(pid) = read_pid_file(paths)? {
+                    anyhow::ensure!(try_kill_pid(pid)?, "sandbox termination request failed");
+                }
+                anyhow::bail!("daemon process termination is unacknowledged; retaining diagnostics")
+            }
+        }
+    }
+}
+
+const fn retain_sandbox_after_shutdown(retain_requested: bool, shutdown_succeeded: bool) -> bool {
+    retain_requested || !shutdown_succeeded
+}
+
+impl Drop for SandboxServer {
+    fn drop(&mut self) {
+        if self.cleaned_up {
+            return;
+        }
+        // Best-effort synchronous cleanup for abnormal termination (panic, signal, early return).
+        warn!("SandboxServer dropped without shutdown — performing emergency cleanup");
+        match &mut self.handle {
+            ServerHandle::Foreground { child, .. } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            ServerHandle::Daemon { paths, .. } => {
+                if let Ok(Some(pid)) = read_pid_file(paths) {
+                    let _ = try_kill_pid(pid);
+                }
+            }
+        }
+        if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_none() {
+            let _ = self.host.clear_sandbox_lock(&self.root_dir);
+            let _ = std::fs::remove_dir_all(&self.root_dir);
+        }
+    }
+}
+
+// ── Temp directory creation ──────────────────────────────────────────────────
+
+fn create_temp_paths() -> (ConfigPaths, PathBuf) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let root = std::env::temp_dir().join(format!("bpb-{nanos:x}-{}", std::process::id()));
+    let paths = ConfigPaths::new(
+        root.join("c"),
+        root.join("r"),
+        root.join("d"),
+        root.join("s"),
+    );
+    (paths, root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_playbook_manifest(
+    host: &dyn HostAdapter,
+    root_dir: &Path,
+    paths: &ConfigPaths,
+    bmux_binary: &Path,
+    command: &[String],
+    env_mode: super::types::SandboxEnvMode,
+    status: &str,
+    exit_code: Option<i32>,
+    kept: bool,
+) -> Result<()> {
+    host.write_sandbox_manifest(SandboxManifestUpdate {
+        root: root_dir,
+        paths,
+        executable: bmux_binary,
+        command,
+        env_mode,
+        status,
+        exit_code,
+        kept,
+    })?;
+    host.register_sandbox(root_dir)
+}
+
+/// Apply the sandbox environment to a server command.
+///
+/// - **Inherit mode** (default): keeps the parent environment, then overlays
+///   the `BMUX_*` path overrides and deterministic defaults for `TERM`, `LANG`,
+///   `LC_ALL`, and `HOME`. Any explicit `@env` entries are applied last.
+///
+/// - **Clean mode**: calls `env_clear()` first, then sets only `BMUX_*` paths,
+///   deterministic defaults, `PATH`/`USER`/`SHELL` from the parent, and
+///   explicit `@env` entries. Maximally deterministic.
+fn apply_sandbox_env(
+    cmd: &mut ProcessCommand,
+    paths: &ConfigPaths,
+    root_dir: &Path,
+    env: &std::collections::BTreeMap<String, String>,
+    env_mode: super::types::SandboxEnvMode,
+) {
+    if env_mode == super::types::SandboxEnvMode::Clean {
+        cmd.env_clear();
+    }
+
+    // BMUX isolation paths (always set).
+    cmd.env("BMUX_CONFIG_DIR", &paths.config_dir);
+    cmd.env("BMUX_RUNTIME_DIR", &paths.runtime_dir);
+    cmd.env("BMUX_DATA_DIR", &paths.data_dir);
+    cmd.env("BMUX_STATE_DIR", &paths.state_dir);
+    cmd.env("BMUX_LOG_DIR", root_dir.join("logs"));
+
+    // Deterministic defaults — override the parent value (Inherit) or provide
+    // the only value (Clean) for variables that affect terminal/locale behavior.
+    //
+    // HOME defaults to the sandbox temp dir so shells don't read the user's
+    // dotfiles (which could produce non-deterministic prompts/output).
+    if !env.contains_key("HOME") {
+        cmd.env("HOME", root_dir);
+    }
+    if !env.contains_key("TERM") {
+        cmd.env("TERM", "xterm-256color");
+    }
+    if !env.contains_key("LANG") {
+        cmd.env("LANG", "C.UTF-8");
+    }
+    if !env.contains_key("LC_ALL") {
+        cmd.env("LC_ALL", "C.UTF-8");
+    }
+
+    // In Clean mode, PATH/USER/SHELL must be explicitly inherited because
+    // env_clear() removed them. In Inherit mode they're already present.
+    if env_mode == super::types::SandboxEnvMode::Clean {
+        if !env.contains_key("PATH")
+            && let Ok(path) = std::env::var("PATH")
+        {
+            cmd.env("PATH", path);
+        }
+        if !env.contains_key("USER")
+            && let Ok(user) = std::env::var("USER")
+        {
+            cmd.env("USER", user);
+        }
+        if !env.contains_key("SHELL")
+            && let Ok(shell) = std::env::var("SHELL")
+        {
+            cmd.env("SHELL", shell);
+        }
+    }
+
+    // User-specified overrides (from @env directives or [playbook.env]).
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    // Explicit deck overrides cannot change the sandbox's runtime authority.
+    if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some() {
+        cmd.env("BMUX_NO_BASE_CONFIG", "1");
+        cmd.env_remove("BMUX_SLOT");
+        cmd.env_remove("BMUX_RUNTIME");
+        cmd.env_remove("BMUX_CONFIG");
+        cmd.env_remove("BMUX_PLAYBOOK_ALLOWED_ROOT");
+    }
+    cmd.env_remove("BMUX_PLAYBOOK_MANAGED_ROOT");
+    cmd.env_remove("BMUX_PLAYBOOK_MANAGED_GENERATION");
+    cmd.env_remove("BMUX_PLAYBOOK_MANAGED_RUNTIME_DIR");
+    cmd.env("BMUX_CONFIG_DIR", &paths.config_dir);
+    cmd.env("BMUX_RUNTIME_DIR", &paths.runtime_dir);
+    cmd.env("BMUX_DATA_DIR", &paths.data_dir);
+    cmd.env("BMUX_STATE_DIR", &paths.state_dir);
+    cmd.env("BMUX_LOG_DIR", root_dir.join("logs"));
+}
+
+// ── Config writing ───────────────────────────────────────────────────────────
+
+fn write_sandbox_config(
+    paths: &ConfigPaths,
+    shell: Option<&str>,
+    plugin_config: &PluginConfig,
+    sandbox_config_file: Option<&Path>,
+    bundled_plugin_ids: &[String],
+) -> Result<()> {
+    let config_path = paths.config_file();
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating config dir {}", parent.display()))?;
+    }
+
+    let mut toml = if let Some(source) = sandbox_config_file {
+        let source_toml = std::fs::read_to_string(source).with_context(|| {
+            format!("failed reading sandbox config source {}", source.display())
+        })?;
+        let mut copied = source_toml;
+        if !copied.ends_with('\n') {
+            copied.push('\n');
+        }
+        copied
+    } else {
+        String::new()
+    };
+
+    let explicit_plugin_directives =
+        !plugin_config.enable.is_empty() || !plugin_config.disable.is_empty();
+    let should_write_generated_plugin_config =
+        sandbox_config_file.is_none() || explicit_plugin_directives;
+    if sandbox_config_file.is_some()
+        && explicit_plugin_directives
+        && toml_contains_table(&toml, "plugins")
+    {
+        anyhow::bail!(
+            "@sandbox-config cannot be combined with @plugin directives when the copied config already contains a [plugins] table"
+        );
+    }
+
+    // Shell override. Avoid appending a duplicate [general] table when a copied
+    // config already contains one; the copied config is authoritative in that
+    // case.
+    if let Some(shell) = shell
+        && (sandbox_config_file.is_none() || !toml_contains_table(&toml, "general"))
+    {
+        write!(toml, "\n[general]\ndefault_shell = '{shell}'\n").unwrap();
+    }
+
+    // Plugin configuration — build disabled list. When an explicit sandbox
+    // config is supplied, preserve its plugin/theme settings unless the
+    // playbook also supplies explicit @plugin directives.
+    if should_write_generated_plugin_config {
+        let disabled = build_plugin_disabled_list(plugin_config, bundled_plugin_ids);
+        let enabled = build_plugin_enabled_list(plugin_config);
+
+        if !disabled.is_empty() || !enabled.is_empty() {
+            toml.push_str("\n[plugins]\n");
+            if !disabled.is_empty() {
+                let quoted: Vec<String> = disabled.iter().map(|id| format!("'{id}'")).collect();
+                let _ = writeln!(toml, "disabled = [{}]", quoted.join(", "));
+            }
+            if !enabled.is_empty() {
+                let quoted: Vec<String> = enabled.iter().map(|id| format!("'{id}'")).collect();
+                let _ = writeln!(toml, "enabled = [{}]", quoted.join(", "));
+            }
+        }
+    }
+
+    std::fs::write(&config_path, toml)
+        .with_context(|| format!("failed writing sandbox config {}", config_path.display()))
+}
+
+fn toml_contains_table(toml: &str, table: &str) -> bool {
+    let expected = format!("[{table}]");
+    let nested_prefix = format!("[{table}.");
+    toml.lines()
+        .map(str::trim)
+        .any(|line| line == expected || line.starts_with(&nested_prefix))
+}
+
+fn build_plugin_disabled_list(plugin_config: &PluginConfig, bundled_ids: &[String]) -> Vec<String> {
+    // If the user explicitly enabled specific plugins, disable everything else
+    // by using a blanket disable approach: disable all discovered bundled plugin IDs
+    // except those in the enable list.
+    if !plugin_config.enable.is_empty() {
+        let mut disabled: Vec<String> = bundled_ids
+            .iter()
+            .filter(|id| !plugin_config.enable.contains(id))
+            .cloned()
+            .collect();
+        // Also include explicitly disabled plugins
+        for id in &plugin_config.disable {
+            if !disabled.contains(id) {
+                disabled.push(id.clone());
+            }
+        }
+        disabled.sort();
+        disabled
+    } else if plugin_config.disable.is_empty() {
+        // Default: disable all bundled plugins for clean deterministic baseline
+        let mut all = bundled_ids.to_vec();
+        all.sort();
+        all
+    } else {
+        let mut list = plugin_config.disable.clone();
+        list.sort();
+        list
+    }
+}
+
+fn build_plugin_enabled_list(plugin_config: &PluginConfig) -> Vec<String> {
+    if plugin_config.enable.is_empty() {
+        Vec::new()
+    } else {
+        let mut list = plugin_config.enable.clone();
+        list.sort();
+        list
+    }
+}
+
+// ── Server startup ───────────────────────────────────────────────────────────
+
+async fn start_sandbox_server(
+    binary: &Path,
+    paths: &ConfigPaths,
+    root_dir: &Path,
+    timeout: Duration,
+    env: &std::collections::BTreeMap<String, String>,
+    env_mode: super::types::SandboxEnvMode,
+) -> Result<ServerHandle> {
+    match start_foreground(binary, paths, root_dir, timeout, env, env_mode).await {
+        Ok(handle) => Ok(handle),
+        Err(fg_error) => {
+            if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some() {
+                return Err(fg_error.context(
+                    "managed sandbox requires owned foreground child; daemon fallback disabled",
+                ));
+            }
+            warn!("playbook sandbox foreground startup failed, falling back to daemon: {fg_error}");
+            start_daemon(binary, paths, root_dir, timeout, env, env_mode)
+                .await
+                .with_context(|| {
+                    format!(
+                        "sandbox startup failed in foreground and daemon; foreground error: {fg_error:#}"
+                    )
+                })
+        }
+    }
+}
+
+async fn start_foreground(
+    binary: &Path,
+    paths: &ConfigPaths,
+    root_dir: &Path,
+    timeout: Duration,
+    env: &std::collections::BTreeMap<String, String>,
+    env_mode: super::types::SandboxEnvMode,
+) -> Result<ServerHandle> {
+    let logs_dir = root_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let stdout_log = logs_dir.join("sandbox-server.stdout.log");
+    let stderr_log = logs_dir.join("sandbox-server.stderr.log");
+
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stdout_log)?;
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_log)?;
+
+    let mut cmd = ProcessCommand::new(binary);
+    cmd.arg("server").arg("start");
+    if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some() {
+        cmd.arg("--foreground-internal");
+    }
+
+    apply_sandbox_env(&mut cmd, paths, root_dir, env, env_mode);
+
+    let ownership_marker = std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT")
+        .map(|root| PathBuf::from(root).join("sandbox-child-owned"));
+    if let Some(marker) = ownership_marker.as_ref() {
+        std::fs::write(marker, b"sandbox spawn pending; cleanup not acknowledged")?;
+    }
+    let spawned = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn();
+    let child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(marker) = ownership_marker.as_ref() {
+                std::fs::remove_file(marker)?;
+            }
+            return Err(error)
+                .with_context(|| format!("failed spawning sandbox server {}", binary.display()));
+        }
+    };
+
+    let mut handle = ServerHandle::Foreground {
+        child,
+        paths: paths.clone(),
+        _stdout_log: stdout_log,
+        stderr_log: stderr_log.clone(),
+    };
+
+    let managed = super::managed::ManagedRun::from_env()?;
+    let ready = tokio::select! {
+        ready = wait_for_server_ready(paths, timeout, handle.child_mut()) => ready,
+        () = super::managed::cancellation(managed.as_ref()) => Err(anyhow::anyhow!("managed startup cancelled")),
+    };
+    match ready {
+        Ok(()) => Ok(handle),
+        Err(error) => {
+            let excerpt = read_log_excerpt(&stderr_log);
+            if let ServerHandle::Foreground { ref mut child, .. } = handle {
+                let _ = child.kill();
+                child
+                    .wait()
+                    .context("sandbox startup cleanup could not reap child")?;
+                if let Some(marker) = ownership_marker.as_ref() {
+                    std::fs::remove_file(marker)?;
+                }
+            }
+            Err(error).with_context(|| format!("sandbox startup failed (stderr: {excerpt})"))
+        }
+    }
+}
+
+async fn start_daemon(
+    binary: &Path,
+    paths: &ConfigPaths,
+    root_dir: &Path,
+    timeout: Duration,
+    env: &std::collections::BTreeMap<String, String>,
+    env_mode: super::types::SandboxEnvMode,
+) -> Result<ServerHandle> {
+    let logs_dir = root_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let stdout_log = logs_dir.join("sandbox-server-daemon.stdout.log");
+    let stderr_log = logs_dir.join("sandbox-server-daemon.stderr.log");
+
+    let mut cmd = ProcessCommand::new(binary);
+    cmd.arg("server").arg("start").arg("--daemon");
+    apply_sandbox_env(&mut cmd, paths, root_dir, env, env_mode);
+
+    let output = cmd.output().context("failed starting sandbox daemon")?;
+
+    std::fs::write(&stdout_log, &output.stdout)?;
+    std::fs::write(&stderr_log, &output.stderr)?;
+
+    if !output.status.success() {
+        let excerpt = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("sandbox daemon start failed: {excerpt}");
+    }
+
+    wait_for_server_ready(paths, timeout, None).await?;
+
+    Ok(ServerHandle::Daemon {
+        paths: paths.clone(),
+        _stdout_log: stdout_log,
+        stderr_log,
+    })
+}
+
+// ── Server readiness and lifecycle helpers ────────────────────────────────────
+
+async fn wait_for_server_ready(
+    paths: &ConfigPaths,
+    timeout: Duration,
+    mut child: Option<&mut std::process::Child>,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut poll_delay = Duration::from_millis(50);
+
+    loop {
+        match BmuxClient::connect_with_paths(paths, "bmux-playbook-sandbox-ready").await {
+            Ok(_) => return Ok(()),
+            Err(_) if start.elapsed() < timeout => {
+                if let Some(ref mut child) = child
+                    && let Some(status) = child.try_wait()?
+                {
+                    anyhow::bail!("sandbox server exited before ready (status: {status})");
+                }
+                tokio::time::sleep(poll_delay).await;
+                poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "sandbox server not ready within {}s: {error}",
+                    timeout.as_secs()
+                ));
+            }
+        }
+    }
+}
+
+async fn wait_until_server_stopped(paths: &ConfigPaths, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match BmuxClient::connect_with_paths(paths, "bmux-playbook-sandbox-stop-check").await {
+            Ok(_) => tokio::time::sleep(Duration::from_millis(80)).await,
+            Err(_) => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+async fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    Ok(child.try_wait()?.is_some())
+}
+
+fn read_pid_file(paths: &ConfigPaths) -> Result<Option<u32>> {
+    let pid_file = paths.server_pid_file();
+    match std::fs::read_to_string(&pid_file) {
+        Ok(content) => Ok(content.trim().parse::<u32>().ok()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("failed reading {}", pid_file.display())),
+    }
+}
+
+fn try_kill_pid(pid: u32) -> Result<bool> {
+    if pid == 0 {
+        return Ok(false);
+    }
+
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .context("failed to execute kill command")?;
+        Ok(status.success())
+    }
+
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .arg("/T")
+            .arg("/F")
+            .status()
+            .context("failed to execute taskkill command")?;
+        Ok(status.success())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        Ok(false)
+    }
+}
+
+fn read_log_excerpt(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.lines().last().map(str::to_string))
+        .filter(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| "<empty>".to_string())
+}
+
+impl ServerHandle {
+    const fn child_mut(&mut self) -> Option<&mut std::process::Child> {
+        match self {
+            Self::Foreground { child, .. } => Some(child),
+            Self::Daemon { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_timestamp_millis() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
+    #[test]
+    fn shutdown_retains_requested_or_failed_sandbox_diagnostics() {
+        assert!(!retain_sandbox_after_shutdown(false, true));
+        assert!(retain_sandbox_after_shutdown(true, true));
+        assert!(retain_sandbox_after_shutdown(false, false));
+        assert!(retain_sandbox_after_shutdown(true, false));
+    }
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+
+    fn command_env_value(command: &ProcessCommand, key: &str) -> Option<std::ffi::OsString> {
+        command.get_envs().find_map(|(name, value)| {
+            if name == OsStr::new(key) {
+                value.map(std::ffi::OsStr::to_os_string)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn copied_sandbox_config_preserves_theme_settings_without_default_plugin_disable() {
+        let root = std::env::temp_dir().join(format!(
+            "bmux-playbook-config-preserve-test-{}-{}",
+            std::process::id(),
+            test_timestamp_millis()
+        ));
+        let paths = ConfigPaths::new(
+            root.join("c"),
+            root.join("r"),
+            root.join("d"),
+            root.join("s"),
+        );
+        let source = root.join("source.toml");
+        std::fs::create_dir_all(&root).expect("test root should be created");
+        std::fs::write(
+            &source,
+            "[plugins.settings.\"bmux.theme\"]\ncomponent_themes = [\"performance\", \"pong\"]\n",
+        )
+        .expect("source config should be written");
+
+        write_sandbox_config(
+            &paths,
+            None,
+            &PluginConfig::default(),
+            Some(&source),
+            &["bmux.theme".to_string()],
+        )
+        .expect("sandbox config should be written");
+
+        let written = std::fs::read_to_string(paths.config_file()).expect("config should read");
+        assert!(written.contains("component_themes"));
+        assert!(!written.contains("disabled"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn copied_sandbox_config_rejects_duplicate_plugin_table_generation() {
+        let root = std::env::temp_dir().join(format!(
+            "bmux-playbook-config-duplicate-test-{}-{}",
+            std::process::id(),
+            test_timestamp_millis()
+        ));
+        let paths = ConfigPaths::new(
+            root.join("c"),
+            root.join("r"),
+            root.join("d"),
+            root.join("s"),
+        );
+        let source = root.join("source.toml");
+        std::fs::create_dir_all(&root).expect("test root should be created");
+        std::fs::write(&source, "[plugins]\nenabled = [\"bmux.theme\"]\n")
+            .expect("source config should be written");
+
+        let error = write_sandbox_config(
+            &paths,
+            None,
+            &PluginConfig {
+                enable: vec!["bmux.theme".to_string()],
+                disable: Vec::new(),
+            },
+            Some(&source),
+            &["bmux.theme".to_string()],
+        )
+        .expect_err("duplicate [plugins] generation should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("@sandbox-config cannot be combined")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apply_sandbox_env_sets_log_dir_inside_sandbox_root() {
+        let root =
+            std::env::temp_dir().join(format!("bmux-playbook-env-test-{}", std::process::id()));
+        let paths = ConfigPaths::new(
+            root.join("c"),
+            root.join("r"),
+            root.join("d"),
+            root.join("s"),
+        );
+        let mut command = ProcessCommand::new("sh");
+
+        apply_sandbox_env(
+            &mut command,
+            &paths,
+            &root,
+            &BTreeMap::new(),
+            super::super::types::SandboxEnvMode::Inherit,
+        );
+
+        assert_eq!(
+            command_env_value(&command, "BMUX_LOG_DIR"),
+            Some(root.join("logs").into_os_string())
+        );
+    }
+}

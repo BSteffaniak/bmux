@@ -433,6 +433,15 @@ impl Player {
         self.painted_viewer.scroll.set(committed_scroll);
         outcome
     }
+    fn invalidate_committed_input(&mut self) {
+        self.painted_layout = None;
+        self.pending_layout = None;
+        self.painted_demo = None;
+        self.pending_demo = None;
+        self.focused_block = None;
+        self.mirror_geometry.clear();
+        self.pending_mirror_geometry.clear();
+    }
     fn reload(&mut self) -> bool {
         let mut changed = false;
         if let Some(updates) = &mut self.reloads {
@@ -442,14 +451,20 @@ impl Player {
                 };
                 match update {
                     Ok((deck, rich)) => {
-                        if self
+                        let mut demos = match self
                             .live_demos
                             .as_ref()
-                            .is_some_and(|demos| !demos.settled())
+                            .map(|demos| demos.prepare_reload(&deck))
+                            .transpose()
                         {
-                            self.status = Some("Reload deferred: stop and settle playbooks before replacing the deck".into());
-                            continue;
-                        }
+                            Ok(demos) => demos,
+                            Err(error) => {
+                                self.status = Some(format!(
+                                    "Reload rejected; retaining last valid deck: {error}"
+                                ));
+                                continue;
+                            }
+                        };
                         let states = match prepare_states(&deck, &self.linked, &self.instances) {
                             Ok(states) => states,
                             Err(error) => {
@@ -459,14 +474,25 @@ impl Player {
                                 continue;
                             }
                         };
-                        // Atomic deck reload never implicitly approves new executable
-                        // input. Retire old runs before installing replacement views.
-                        self.live_demos = None;
+                        if let (Some(current), Some(candidate)) = (&mut self.live_demos, &mut demos)
+                        {
+                            if let Err(error) = current.admit_reload(candidate) {
+                                self.status = Some(error);
+                                continue;
+                            }
+                            current.commit_reload(candidate);
+                        }
+                        self.live_demos = demos;
                         self.instances = states;
                         self.deck = deck;
                         self.rich = rich;
                         self.painted_layout = None;
+                        self.pending_layout = None;
+                        self.painted_demo = None;
+                        self.pending_demo = None;
+                        self.focused_block = None;
                         self.mirror_geometry.clear();
+                        self.pending_mirror_geometry.clear();
                         self.viewer.reset_scroll();
                         reduce(&self.deck, &mut self.state, NavigationAction::Reconcile);
                         self.status = None;
@@ -632,6 +658,8 @@ impl Program for Player {
                     self.cycle_focus(key.modifiers.shift);
                     // Focus changes invalidate input until the replacement frame commits.
                     self.painted_layout = None;
+                    self.painted_demo = None;
+                    self.pending_demo = None;
                     self.mirror_geometry.clear();
                     return Ok(Update::redraw());
                 }
@@ -1031,7 +1059,10 @@ async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> 
                             max_entries: 16_384,
                             max_bytes: 32 * 1024 * 1024,
                         })
-                        .map_err(|error| std::io::Error::other(error.to_string()))
+                        .map_err(|error| {
+                            player.invalidate_committed_input();
+                            std::io::Error::other(error.to_string())
+                        })
                 },
             );
     let stop = player.stop.take();
@@ -1116,6 +1147,8 @@ async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> 
             Err(error)
         }
         Err(bmux_tui_runtime::RuntimeError::Presenter { error, mut output }) => {
+            output.program.invalidate_committed_input();
+            output.program.focused_block = None;
             let images = output
                 .presenter
                 .cleanup_images()
@@ -1231,6 +1264,108 @@ mod tests {
     use super::*;
     use bmux_keyboard::KeyStroke;
     use bmux_presenter::builder::{DeckBuilder, SlideBuilder};
+
+    #[tokio::test]
+    async fn local_reload_retains_active_controller_and_rejects_changed_approval_atomically() {
+        use crate::playbook_live::reload_tests::{Fixture, deck, empty};
+        let fixture = Fixture::new();
+        let running = fixture.running();
+        let epoch = running.demos.entries["demo"].controller.owner_epoch();
+        let surface = running.demos.entries["demo"]
+            .snapshot
+            .surface
+            .clone()
+            .unwrap();
+        let mut player = Player::local(deck("s", "old"), None, true);
+        player.live_demos = Some(running.demos);
+        player.focused_block = Some("demo".into());
+        let (updates, receiver) = tokio::sync::mpsc::channel(4);
+        player.reloads = Some(receiver);
+        updates
+            .try_send(Ok((
+                deck("moved", "renamed"),
+                crate::rich::RichAssets::default(),
+            )))
+            .unwrap();
+        assert!(player.reload());
+        assert!(player.focused_block.is_none());
+        let entry = &player.live_demos.as_ref().unwrap().entries["demo"];
+        assert_eq!(entry.controller.owner_epoch(), epoch);
+        assert_eq!(entry.snapshot.attempt.as_ref().unwrap().generation, 41);
+        assert!(std::sync::Arc::ptr_eq(
+            entry.snapshot.surface.as_ref().unwrap(),
+            &surface
+        ));
+        assert_eq!(entry.slide, "moved");
+        assert!(!*running.stopped.borrow());
+        assert_eq!(*running.cancelled.borrow(), 0);
+        std::fs::write(
+            fixture.root.join("steps.dsl"),
+            "new-session\nsend-keys keys=changed\n",
+        )
+        .unwrap();
+        updates
+            .try_send(Ok((
+                deck("s", "changed"),
+                crate::rich::RichAssets::default(),
+            )))
+            .unwrap();
+        assert!(!player.reload());
+        assert_eq!(player.deck.slides[0].id.as_str(), "moved");
+        assert_eq!(
+            player.live_demos.as_ref().unwrap().entries["demo"]
+                .controller
+                .owner_epoch(),
+            epoch
+        );
+        assert!(!*running.stopped.borrow());
+        assert_eq!(*running.cancelled.borrow(), 0);
+        updates
+            .try_send(Ok((empty(), crate::rich::RichAssets::default())))
+            .unwrap();
+        assert!(!player.reload());
+        assert_eq!(player.deck.slides[0].id.as_str(), "moved");
+        assert!(*running.cancelled.borrow() > 0);
+        assert!(!*running.stopped.borrow());
+        running.updates.send_modify(|snapshot| {
+            snapshot.cancellation_revision = *running.cancelled.borrow();
+            let attempt = snapshot.attempt.as_mut().unwrap();
+            attempt.phase = "stopped".into();
+            attempt.cleanup_acknowledged = true;
+        });
+        updates
+            .try_send(Ok((empty(), crate::rich::RichAssets::default())))
+            .unwrap();
+        assert!(player.reload());
+        assert!(player.live_demos.as_ref().unwrap().entries.is_empty());
+        assert!(*running.stopped.borrow());
+    }
+
+    #[test]
+    fn failed_output_invalidation_clears_committed_and_pending_input_identity() {
+        let mut player = Player::local(
+            DeckBuilder::new("d")
+                .slide(SlideBuilder::new("s").build())
+                .build()
+                .unwrap(),
+            None,
+            true,
+        );
+        player.focused_block = Some("demo".into());
+        let identity = CommittedDemo {
+            id: "demo".into(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            generation: Some(41),
+        };
+        player.painted_demo = Some(identity.clone());
+        player.pending_demo = Some(identity);
+        player.invalidate_committed_input();
+        assert!(player.painted_demo.is_none());
+        assert!(player.pending_demo.is_none());
+        assert!(player.focused_block.is_none());
+        assert!(player.painted_layout.is_none());
+        assert!(player.pending_layout.is_none());
+    }
 
     #[test]
     fn publication_diagnostic_is_bounded_and_preserves_error_chain() {

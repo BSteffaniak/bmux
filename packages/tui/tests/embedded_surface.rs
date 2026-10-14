@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+// Reuse the executable's caller-owned producer and dashboard, not a separate
+// test-only renderer or transport implementation.
+#[path = "../examples/embedded_surface.rs"]
+mod live_dashboard;
+
 use bmux_tui::{
     buffer::Buffer,
     component::{Component, Constraints, LayoutCx},
@@ -313,4 +318,155 @@ fn persistent_source_images_are_frame_scoped_in_the_embedding() {
             },
         )
         .unwrap();
+}
+
+#[test]
+fn live_producer_advances_without_paint_and_slow_reader_gets_latest_full_repair() {
+    use std::time::Duration;
+    let mut producer = live_dashboard::Producer::start(Duration::from_millis(2));
+    let first = producer.latest_at_least(1).unwrap();
+    let first_revision = first.identity().revision;
+    // No consumer paint, acknowledgment, or producer step call occurs here.
+    let repaired = producer.latest_at_least(first_revision + 5).unwrap();
+    assert!(repaired.identity().revision >= first_revision + 5);
+    assert_eq!(repaired.identity().owner, first.identity().owner);
+    assert_eq!(repaired.identity().generation, first.identity().generation);
+    assert_eq!(repaired.buffer().area(), Rect::new(0, 0, 28, 3));
+    assert!(
+        repaired
+            .buffer()
+            .row_symbols(1)
+            .unwrap()
+            .contains(&format!("sample {}", repaired.identity().revision))
+    );
+    let (published, coalesced) = producer.counts();
+    assert!(published >= repaired.identity().revision);
+    assert!(coalesced >= 4);
+    // Acquired snapshots stay immutable after the producer has advanced.
+    assert!(
+        first
+            .buffer()
+            .row_symbols(1)
+            .unwrap()
+            .contains(&format!("sample {first_revision}"))
+    );
+    let mut dashboard = live_dashboard::Dashboard::new(std::io::sink());
+    dashboard.present(&first).unwrap();
+    assert!(dashboard.accepts_input(first.identity()));
+    dashboard.present(&repaired).unwrap();
+    assert_eq!(dashboard.committed_identity(), Some(repaired.identity()));
+    assert!(!dashboard.accepts_input(first.identity()));
+    assert!(dashboard.accepts_input(repaired.identity()));
+    // A delayed callback cannot roll the displayed identity back.
+    assert!(dashboard.present(&first).is_err());
+    assert_eq!(dashboard.committed_identity(), Some(repaired.identity()));
+    producer.stop().unwrap();
+    let stopped_counts = producer.counts();
+    assert!(producer.latest_at_least(published + 1).is_err());
+    std::thread::sleep(Duration::from_millis(8));
+    assert_eq!(producer.counts(), stopped_counts);
+    producer.stop().unwrap(); // owned join/cancel is idempotent
+}
+
+#[test]
+fn live_dashboard_failed_flush_keeps_commit_then_repairs_and_rejects_foreign_identity() {
+    use std::{
+        io::{self, Write},
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
+    struct FailingWriter(Arc<AtomicBool>);
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.0.load(Ordering::SeqCst) {
+                Err(io::Error::other("injected output failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let mut producer = live_dashboard::Producer::start(Duration::from_millis(2));
+    let first = producer.latest_at_least(1).unwrap();
+    let fail = Arc::new(AtomicBool::new(false));
+    let mut dashboard = live_dashboard::Dashboard::new(FailingWriter(Arc::clone(&fail)));
+    dashboard.present(&first).unwrap();
+    let next = producer
+        .latest_at_least(first.identity().revision + 3)
+        .unwrap();
+    fail.store(true, Ordering::SeqCst);
+    assert!(dashboard.present(&next).is_err());
+    assert_eq!(dashboard.committed_identity(), Some(first.identity()));
+    assert!(dashboard.accepts_input(first.identity()));
+    assert!(!dashboard.accepts_input(next.identity()));
+    // Acquisition continues even while the consumer's output is failing.
+    let repaired = producer
+        .latest_at_least(next.identity().revision + 3)
+        .unwrap();
+    fail.store(false, Ordering::SeqCst);
+    assert!(dashboard.present(&repaired).unwrap().full_repaint);
+    assert_eq!(dashboard.committed_identity(), Some(repaired.identity()));
+    assert!(!dashboard.accepts_input(next.identity()));
+    assert!(dashboard.present(&next).is_err());
+    assert!(dashboard.present(&repaired).is_err()); // duplicate revision
+    for changed_owner in [false, true] {
+        let mut foreign = repaired.identity().clone();
+        foreign.revision += 1;
+        if changed_owner {
+            foreign.owner = "sensor/other".into();
+        } else {
+            foreign.generation += 1;
+        }
+        let foreign = RetainedSurface::new(
+            foreign,
+            Arc::clone(repaired.buffer()),
+            Arc::clone(repaired.images()),
+            SurfaceLimits {
+                max_cells: 84,
+                max_bytes: 8192,
+            },
+        )
+        .unwrap();
+        assert!(dashboard.present(&foreign).is_err());
+        assert!(!dashboard.accepts_input(foreign.identity()));
+    }
+    assert_eq!(dashboard.committed_identity(), Some(repaired.identity()));
+    producer.stop().unwrap();
+}
+
+#[test]
+fn cancellation_drop_joins_even_a_long_interval_sleeper() {
+    use std::{sync::atomic::Ordering, time::Duration};
+    let producer = live_dashboard::Producer::start(Duration::from_secs(60));
+    producer.latest_at_least(1).unwrap();
+    let joined = producer.cleanup_probe();
+    assert!(!joined.load(Ordering::SeqCst));
+    drop(producer); // notification interrupts its sixty-second sample interval
+    assert!(joined.load(Ordering::SeqCst));
+}
+
+#[test]
+fn finite_headless_acceptance_uses_real_terminal_commit_path() {
+    let (published, coalesced) = live_dashboard::run(std::io::sink(), 3).unwrap();
+    assert!(published >= 3);
+    assert!(coalesced > 0);
+}
+
+#[test]
+fn output_failure_cancels_owned_producer_on_early_return() {
+    use std::io::{self, Write};
+    struct FailedOutput;
+    impl Write for FailedOutput {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("disconnected"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    // run's early error path drops its producer and joins before returning.
+    let error = live_dashboard::run(FailedOutput, 2).unwrap_err();
+    assert!(error.contains("dashboard output"));
 }

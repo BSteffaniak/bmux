@@ -1,7 +1,7 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Shared playbook domain models, parsers, source snapshots and result comparison"
+description = "Shared playbook domain models, parsers and reusable execution runtime"
 edition     = { workspace = true }
 keywords    = ["bmux", "playbook", "parser", "automation"]
 license     = { workspace = true }
@@ -11,6 +11,40 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_appearance = { workspace = true, optional = true }
+bmux_attach_layout_protocol = { workspace = true, optional = true }
+bmux_attach_pipeline = { workspace = true, optional = true }
+bmux_attach_token_state = { workspace = true, optional = true }
+bmux_client = { workspace = true, optional = true }
+bmux_clients_plugin_api = { workspace = true, optional = true }
+bmux_config = { workspace = true, optional = true }
+bmux_context_state = { workspace = true, optional = true }
+bmux_contexts_plugin_api = { workspace = true, optional = true }
+bmux_ipc = { workspace = true, optional = true }
+bmux_keybind = { workspace = true, optional = true }
+bmux_keyboard = { workspace = true, optional = true }
+bmux_pane_runtime_plugin_api = { workspace = true, optional = true }
+bmux_performance_plugin_api = { workspace = true, optional = true }
+bmux_performance_state = { workspace = true, optional = true }
+bmux_plugin_sdk = { workspace = true, optional = true }
+bmux_recording_plugin_api = { workspace = true, optional = true }
+bmux_recording_protocol = { workspace = true, optional = true }
+bmux_session_models = { workspace = true, optional = true }
+bmux_sessions_plugin_api = { workspace = true, optional = true }
+bmux_tabs_plugin_api = { workspace = true, optional = true }
+bmux_terminal_grid = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true, features = ["events"] }
+regex = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "rt",
+    "sync",
+    "time",
+] }
+
 anyhow  = { workspace = true, features = ["std"] }
 libc    = { workspace = true }
 serde   = { workspace = true, features = ["derive", "std"] }
@@ -20,7 +54,38 @@ tracing = { workspace = true }
 uuid    = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+# The render-cache regression constructs types owned by the plugin render contract.
+bmux_plugin = { workspace = true }
+tempfile    = { workspace = true }
 
 [features]
+default = []
 fail-on-warnings = []
+runtime = [
+    "dep:bmux_appearance",
+    "dep:bmux_attach_layout_protocol",
+    "dep:bmux_attach_pipeline",
+    "dep:bmux_attach_token_state",
+    "dep:bmux_client",
+    "dep:bmux_clients_plugin_api",
+    "dep:bmux_config",
+    "dep:bmux_contexts_plugin_api",
+    "dep:bmux_context_state",
+    "dep:bmux_ipc",
+    "dep:bmux_keybind",
+    "dep:bmux_keyboard",
+    "dep:bmux_pane_runtime_plugin_api",
+    "dep:bmux_performance_plugin_api",
+    "dep:bmux_performance_state",
+    "dep:bmux_plugin_sdk",
+    "dep:bmux_recording_plugin_api",
+    "dep:bmux_recording_protocol",
+    "dep:bmux_session_models",
+    "dep:bmux_sessions_plugin_api",
+    "dep:bmux_tabs_plugin_api",
+    "dep:bmux_terminal_grid",
+    "dep:crossterm",
+    "dep:regex",
+    "dep:serde_json",
+    "dep:tokio",
+]
