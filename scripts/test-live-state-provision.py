@@ -118,7 +118,7 @@ class ProvisionTests(unittest.TestCase):
         self.assertNotIn('token', path.read_text())
         self.assertNotIn('secret', path.read_text())
 
-    def test_completion_exact_private_and_new_only(self):
+    def test_completion_exact_private_idempotent_and_never_overwritten(self):
         obj = self.obj()
         op = obj.plan()['operation']
         file = self.root / 'completion.json'
@@ -129,6 +129,13 @@ class ProvisionTests(unittest.TestCase):
         binding = value.pop('binding')
         self.assertEqual(binding, p.local.identity(value))
         self.assertEqual(file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(obj.completion(op, file)['binding'], binding)
+        file.write_text('{}')
+        with self.assertRaises(p.Error):
+            obj.completion(op, file)
+        self.assertEqual(file.read_text(), '{}')
+        file.unlink()
+        file.symlink_to(self.root / 'missing')
         with self.assertRaises(p.Error):
             obj.completion(op, file)
         other = self.root / 'other'

@@ -9,7 +9,7 @@ Ordinary local BMUX operation needs none of this infrastructure.
 
 ## One-time setup
 
-### 1. Authenticate and protect GitHub environments
+### 1. Authenticate to GitHub
 
 Enter the locked development shell from the repository root:
 
@@ -23,17 +23,25 @@ gh auth login
 
 The shell supplies Python, GitHub CLI, and pinned OpenTofu
 1.10.9. No AWS CLI, AWS SSO login, or AWS account is required.
-Authenticate `gh` for `BSteffaniak/bmux` with repository secret administration.
+Authenticate `gh` for `BSteffaniak/bmux` with repository administration and
+Actions environment/secret write permissions.
 
-Create these repository environments, restricted to branch `master` only:
+No environment dashboard setup is needed. The helper's `--approval-reviewer`
+selects a GitHub user and includes both environments in the same state operation:
 
-* `Production`: deployment secrets; no required reviewers here.
-* `production-approval`: configure a required reviewer. The repository owner
-  may approve their own run; self-review need not be disabled. Disable
-  administrator bypass for this gate.
+* `Production`: deployment secrets; no required reviewers.
+* `production-approval`: the selected required reviewer, self-review allowed.
+* Both: exactly branch `master` (no tags/wildcards); administrator bypass disabled.
 
-The provisioner verifies protections and never silently replaces them. Existing
-credentials are skipped; replacement requires `--rotate` with explicit
+Plan/review only inspect remote configuration. Apply creates missing environments,
+leaves matching ones untouched, and verifies each change before proceeding to
+backend provisioning or secret writes. Existing conflicting protections are shown
+in the review and require `--approve-environment-changes` on apply. Existing wait
+timers are preserved; unknown/custom protection integrations are rejected rather
+than overwritten. API/permission failures never mean an environment is missing.
+Without `--approval-reviewer`, the helper retains its verification-only behavior.
+
+Existing credentials are skipped; replacement requires `--rotate` with explicit
 `--only NAME` selections. Keep the state encryption passphrase backed up securely;
 losing it prevents decrypting the state and its archives.
 
@@ -69,6 +77,7 @@ backend choices between these phases, since the operation is implementation-boun
 ```sh
 bootstrap_live() {
   python3 scripts/bootstrap-live-secrets.py --repo BSteffaniak/bmux \
+    --approval-reviewer BSteffaniak \
     --publisher-key-file "$HOME/.config/bmux/live/publisher-key" \
     --bootstrap-state --state-dir "$HOME/.local/state/bmux/live-bootstrap" "$@"
 }
@@ -93,6 +102,16 @@ export TOFU_STATE_ENCRYPTION_PASSPHRASE
 bootstrap_live --state-mode apply --state-operation OPERATION_ID --accept-cost \
   --state-completion-file "$HOME/.local/state/bmux/live-bootstrap/ready.json"
 ```
+
+If review reports conflicting existing GitHub environment settings, inspect the
+printed before/desired policies and explicitly add `--approve-environment-changes`
+to that apply command. It never grants approval to unplanned drift. Keep the same
+reviewer selection in every phase. Environment writes have private durable
+checkpoints: after an ambiguous response, explicitly rerun the **same** reviewed
+apply to accept only the exact expected effect or retry a confirmed absent effect.
+Unexpected remote changes require reconciliation, not a silent overwrite. GitHub
+does not offer atomic compare-and-swap for environment settings, so avoid concurrent
+administration during bootstrap; the helper rechecks before and after each write.
 
 The helper requires the original passphrase before bucket mutation; it never
 silently generates or replaces encryption material. For a confirmed new bucket,

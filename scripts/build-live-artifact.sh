@@ -10,6 +10,7 @@ OUTPUT="${1:?New output directory required}"
 mkdir -p "$OUTPUT"
 OUTPUT="$(cd "$OUTPUT" && pwd)"
 python3 scripts/test-live-bootstrap.py
+python3 scripts/test-live-github-environments.py
 python3 scripts/test-live-state.py
 python3 scripts/test-live-smoke.py
 (cd infra/live-relay && npm test)

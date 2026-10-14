@@ -6,6 +6,7 @@ binds approval to an exact --state-operation; apply also requires --accept-cost.
 Existing buckets require --approve-import. No AWS/OIDC bootstrap or automatic migration.
 Plan/review never install partial secrets. --dry-run is fully provider-free.
 """
+import importlib.util
 import argparse
 import hashlib
 import json
@@ -401,21 +402,31 @@ def state_bootstrap(args, run, pending, environ):
     mode, operation = args.state_mode, args.state_operation
     if mode in ('review', 'apply', 'reconcile') and not operation:
         raise BootstrapError('State review/apply/reconcile requires exact --state-operation')
+    if operation and not re.fullmatch(r'[a-f0-9]{32}', operation):
+        raise BootstrapError('Invalid state operation identity')
+    if (operation and (args.state_dir / 'github-environments' / (operation + '.json')).exists()
+            and not getattr(args, '_github', None)):
+        raise BootstrapError('This operation includes GitHub setup; retain --approval-reviewer selection')
     if mode == 'apply' and not args.accept_cost:
         raise BootstrapError('State apply requires explicit --accept-cost')
     fresh_backend = False
     if mode == 'plan':
         result = json.loads(run(base + ['--plan']))
         validate_state_result(result, args, result.get('operation'), ('planned',))
+        if getattr(args, '_github', None):
+            args._github.plan(result['operation'])
     else:
         review_base = base
-        if getattr(args, 'state_completion_file', None) and mode == 'apply':
-            # Planned review must not try to emit a completion before apply.
-            i = base.index('--completion-file')
-            review_base = base[:i] + base[i + 2:]
         reviewed = json.loads(run(review_base + ['--review', operation])) if mode != 'reconcile' else None
         if reviewed:
             validate_state_result(reviewed, args, operation, ('planned', 'complete'))
+        completion = getattr(args, 'state_completion_file', None) or args.state_dir / ('completion-' + operation + '.json')
+        if mode == 'apply' and completion.exists():
+            # An existing receipt must match the original completed operation before any GitHub mutation.
+            receipt = json.loads(run(base + ['--review', operation, '--completion-file', str(completion)]))
+            validate_state_result(receipt, args, operation, ('complete',))
+        if getattr(args, '_github', None):
+            args._github.execute(operation, mode)
         flags = ['--' + mode, operation]
         if mode == 'apply':
             flags.append('--accept-cost')
@@ -465,6 +476,25 @@ def r2_credentials(cf, account, bucket):
 
 
 def provision(args, run=command, environ=None, cloudflare=None):
+    if not getattr(args, 'approval_reviewer', None) or args.dry_run:
+        return provision_selected(args, run, environ, cloudflare)
+    if getattr(args, 'input_env', False) or not getattr(args, 'bootstrap_state', False):
+        raise BootstrapError('--approval-reviewer requires --bootstrap-state, not --input-env')
+    if not args.state_dir or not args.state_dir.is_absolute():
+        raise BootstrapError('Environment setup requires absolute private --state-dir')
+    spec = importlib.util.spec_from_file_location('live_github', Path(__file__).with_name('live-github-environments.py'))
+    github = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(github)
+    try:
+        github.local.private_dir(args.state_dir)
+        with github.local.lock(args.state_dir / 'github-environments'):
+            args._github = github.Environments(args, run)
+            return provision_selected(args, run, environ, cloudflare)
+    except github.Error as error:
+        raise BootstrapError(str(error)) from None
+
+
+def provision_selected(args, run=command, environ=None, cloudflare=None):
     environ = os.environ if environ is None else environ
     if getattr(args, 'input_env', False):
         return provision_env(args, run, environ)
@@ -479,13 +509,18 @@ def provision(args, run=command, environ=None, cloudflare=None):
         print(json.dumps({'repo': args.repo, 'environment': args.environment,
                           'mode': 'replace-selected' if args.rotate else 'skip-existing',
                           'secrets': selected, 'provider_requests': False,
-                          'protections': 'verify only; never weaken',
+                          'protections': ('plan/review/apply master-only environments; explicit conflict approval'
+                                          if getattr(args, 'approval_reviewer', None) else 'verify only; never weaken'),
+                          'approval_reviewer': getattr(args, 'approval_reviewer', None),
                           'state_mode': getattr(args, 'state_mode', 'plan')}))
         return
-    verify_environment(args.repo, args.environment, run)
-    verify_environment(args.repo, 'production-approval', run)
-    existing = {s['name'] for s in json.loads(run(['gh', 'secret', 'list', '--repo', args.repo,
-                                                '--env', args.environment, '--json', 'name']))}
+    github = getattr(args, '_github', None)
+    if github is None:
+        verify_environment(args.repo, args.environment, run)
+        verify_environment(args.repo, 'production-approval', run)
+    existing = ({s['name'] for s in json.loads(run(['gh', 'secret', 'list', '--repo', args.repo,
+                                                 '--env', args.environment, '--json', 'name']))}
+                if github is None or github.current[args.environment] is not None else set())
     pending = [name for name in selected if args.rotate or name not in existing]
     if any(name in existing or environ.get(name) for name in ('LIVE_STATE_ROLE_ARN', 'LIVE_STATE_ACCESS_KEY_ID', 'LIVE_STATE_SECRET_ACCESS_KEY')):
         raise BootstrapError('Legacy AWS backend configured; manual state migration required')
@@ -523,8 +558,12 @@ def provision(args, run=command, environ=None, cloudflare=None):
             if not isinstance(passphrase, str) or len(passphrase) < 32 or '\n' in passphrase or '\r' in passphrase:
                 raise BootstrapError('Before apply securely supply original/high-entropy TOFU_STATE_ENCRYPTION_PASSPHRASE; no provider mutation performed')
         completion = getattr(args, 'state_completion_file', None) or args.state_dir / ('completion-' + str(args.state_operation) + '.json')
-        if not completion.is_absolute() or completion.exists() or completion.is_symlink():
-            raise BootstrapError('Completion file must be new explicit private absolute file before apply')
+        if not completion.is_absolute() or completion.is_symlink():
+            raise BootstrapError('Completion file must be explicit private absolute file before apply')
+        if completion.exists():
+            info = completion.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise BootstrapError('Existing completion must be an owned private regular file')
         info = completion.parent.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise BootstrapError('Completion parent must be owned private directory before apply')
@@ -604,6 +643,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', required=True)
     parser.add_argument('--environment', default='Production')
+    parser.add_argument('--approval-reviewer', help='GitHub user login; manage environments in the state plan/review/apply')
+    parser.add_argument('--approve-environment-changes', action='store_true',
+                        help='Explicitly approve planned changes to existing GitHub environment protections')
     parser.add_argument('--zone', default='bmux.dev')
     parser.add_argument('--hostname')
     parser.add_argument('--pages-project', default='bmux')
@@ -627,6 +669,10 @@ def main():
         parser.error('--repo must be OWNER/REPO')
     if not re.fullmatch(r'[A-Za-z0-9_. -]{1,64}', args.environment):
         parser.error('invalid environment name')
+    if args.approval_reviewer and (not args.bootstrap_state or args.input_env):
+        parser.error('--approval-reviewer requires --bootstrap-state, not --input-env')
+    if args.approve_environment_changes and not args.approval_reviewer:
+        parser.error('--approve-environment-changes requires --approval-reviewer')
     try:
         provision(args)
     except BootstrapError as error:

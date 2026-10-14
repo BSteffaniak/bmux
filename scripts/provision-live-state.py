@@ -177,14 +177,18 @@ class Provision:
         self.exact(operation)
         if self.ledger['phase'] != 'complete' or self.ledger['expected'] is not None:
             raise Error('Completion admission requires exact confirmed new-bucket operation, never adopted bucket')
-        if not path.is_absolute() or path.exists() or path.is_symlink():
-            raise Error('Completion output must be a new explicit private absolute file')
+        if not path.is_absolute() or path.is_symlink():
+            raise Error('Completion output must be an explicit private absolute file')
         local.private_dir(path.parent)
         backend = self.result()['backend']
         backend = dict(backend, account_id=self.c['account_id'])
         value = dict(schema=1, kind='bmux-live-r2-bootstrap-completion', operation=operation,
                      backend=backend, created=True, bucket_identity=self.ledger['observed'])
         value['binding'] = local.identity(value)
+        if path.exists():
+            if local.private_read(path) != value:
+                raise Error('Existing completion differs from original operation; never overwrite')
+            return value
         # No overwrite, including a concurrent writer. The explicit descriptor
         # admits only a reviewed empty-backend bootstrap, not ordinary restores.
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
