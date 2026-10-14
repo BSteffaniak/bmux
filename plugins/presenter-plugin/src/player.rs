@@ -516,7 +516,7 @@ impl Player {
                         .is_none_or(|id| id.as_str() == surface.surface_id)
             })
             .and_then(|surface| {
-                crate::mirror::MirrorComponent::new(surface, 16_384, 512 * 1024).ok()
+                crate::mirror::MirrorComponent::new(surface, 16_384, 2 * 1024 * 1024).ok()
             });
         if let Some(mirror) = &mirror {
             component = component.content(mirror);
@@ -677,11 +677,9 @@ impl Program for Player {
                         match update {
                             Ok(update) => {
                                 let snapshot = update.snapshot;
-                                if snapshot
-                                    .surfaces
-                                    .iter()
-                                    .any(|surface| surface.validate(16_384, 512 * 1024).is_err())
-                                {
+                                if snapshot.surfaces.iter().any(|surface| {
+                                    surface.validate(16_384, 2 * 1024 * 1024).is_err()
+                                }) {
                                     self.status = Some("Update rejected; retaining last valid deck: invalid mirror scene".into());
                                     continue;
                                 }
@@ -950,16 +948,21 @@ fn paint_audience(
             .and_then(|surface| surface.private_scene.as_ref())
             .and_then(|scene| {
                 Some(crate::mirror::OperatorMirror {
-                    mirror: crate::mirror::MirrorComponent::new(&scene.frame, 16_384, 512 * 1024)
-                        .ok()?,
+                    mirror: crate::mirror::MirrorComponent::new(
+                        &scene.frame,
+                        16_384,
+                        2 * 1024 * 1024,
+                    )
+                    .ok()?,
                     scene,
                 })
             })
     } else {
         None
     };
-    let mirror = mirror_surface
-        .and_then(|surface| crate::mirror::MirrorComponent::new(surface, 16_384, 512 * 1024).ok());
+    let mirror = mirror_surface.and_then(|surface| {
+        crate::mirror::MirrorComponent::new(surface, 16_384, 2 * 1024 * 1024).ok()
+    });
     let mut component = ViewerComponent::new(
         content.deck,
         content.state,
@@ -1189,8 +1192,11 @@ pub(crate) fn audience_surfaces(
                     && ids.contains(&surface.surface_id)
             })
             .map(|surface| {
-                let retained =
-                    surface.retained_surface(player.producer_generation, 16_384, 512 * 1024)?;
+                let retained = surface.retained_surface(
+                    player.producer_generation,
+                    16_384,
+                    2 * 1024 * 1024,
+                )?;
                 let component = bmux_tui::embedded_surface::EmbeddedSurface::new(&retained);
                 let size = Size::new(surface.width, surface.height);
                 let layout = component.layout(Constraints::tight(size), &mut LayoutCx::default());
@@ -1257,7 +1263,7 @@ pub(crate) fn audience_surfaces(
                     bmux_tui::presentation::PresentationLimits {
                         max_cells: 16_384,
                         max_entries: 16_384,
-                        max_bytes: 512 * 1024,
+                        max_bytes: 2 * 1024 * 1024,
                     },
                     bmux_tui::damage::Damage::Full,
                     |cx| component.paint(&layout, cx),

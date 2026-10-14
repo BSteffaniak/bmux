@@ -141,7 +141,18 @@ impl LinkedOwner {
             &registry,
         )
         .rich_content(&self.rich);
-        let canvas_size = Size::new(80, 38);
+        let canvas_size = self
+            .demos
+            .get(context.instance)
+            .and_then(|demos| demos.visible(slide.id.as_str()))
+            .and_then(|(_, demo)| demo.snapshot.surface.as_ref())
+            .map_or(Size::new(80, 38), |capture| {
+                let area = capture.surface.buffer().area();
+                Size::new(
+                    area.width.saturating_add(2).clamp(80, 240),
+                    area.height.saturating_add(8).clamp(38, 128),
+                )
+            });
         let mut buffer = bmux_tui::buffer::Buffer::empty(bmux_tui::geometry::Rect::new(
             0,
             0,
@@ -180,7 +191,7 @@ impl LinkedOwner {
             let operator =
                 bmux_tui::composition::Overlay::new(TextBlock::new(""), demo.view(false))
                     .modal(bmux_tui::focus::FocusScopeId::new(format!("playbook-{id}")));
-            let operator_size = Size::new(80, 38);
+            let operator_size = canvas_size;
             let operator_layout =
                 operator.layout(Constraints::tight(operator_size), &mut LayoutCx::default());
             let mut operator_buffer = bmux_tui::buffer::Buffer::empty(
@@ -217,7 +228,7 @@ impl LinkedOwner {
                     &operator_frame,
                     &operator_images,
                     16_384,
-                    512 * 1024,
+                    2 * 1024 * 1024,
                 )?),
                 interactions,
                 identity: serde_json::json!({"id":id,"owner_epoch":demo.snapshot.owner_epoch.to_string(),
@@ -258,7 +269,7 @@ impl LinkedOwner {
                 &frame,
                 &images,
                 16_384,
-                512 * 1024,
+                2 * 1024 * 1024,
             )?;
             if overlay.is_some_and(|(active, _)| active == id) {
                 surface.private_scene = private_scene.clone();

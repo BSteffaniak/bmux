@@ -18,6 +18,7 @@ pub(crate) struct DemoEntry {
     pub controller: Controller,
     pub snapshot: LifecycleSnapshot,
     pub open: bool,
+    pub viewport: (u16, u16),
 }
 pub(crate) struct LiveDemos {
     pub entries: BTreeMap<String, DemoEntry>,
@@ -107,6 +108,7 @@ impl LiveDemos {
                 entry.snapshot = old.controller.latest();
                 entry.controller = Controller::detached(entry.snapshot.clone());
                 entry.open = old.open;
+                entry.viewport = old.viewport;
             }
         }
         Ok(candidate)
@@ -210,6 +212,7 @@ impl LiveDemos {
                             controller,
                             snapshot,
                             open: false,
+                            viewport: (0, 0),
                         },
                     );
                 }
@@ -313,6 +316,21 @@ impl LiveDemos {
     ) -> Result<String, String> {
         let entry = self.entries.get_mut(id).ok_or("playbook demo not found")?;
         match input {
+            "pan:left" | "pan:right" | "pan:up" | "pan:down" if entry.open => {
+                let (x, y) = &mut entry.viewport;
+                if let Some(capture) = &entry.snapshot.surface {
+                    let area = capture.surface.buffer().area();
+                    *x = (*x).min(area.width.saturating_sub(1));
+                    *y = (*y).min(area.height.saturating_sub(1));
+                }
+                match input {
+                    "pan:left" => *x = x.saturating_sub(8),
+                    "pan:right" => *x = x.saturating_add(8),
+                    "pan:up" => *y = y.saturating_sub(4),
+                    _ => *y = y.saturating_add(4),
+                }
+                return Ok("viewport moved; execution unchanged".into());
+            }
             "open" | "click" | "o" => {
                 entry.open = true;
                 return Ok("overlay opened; execution unchanged".into());
@@ -364,7 +382,8 @@ impl DemoEntry {
             &self.controller,
             &self.snapshot,
         )
-        .audience(audience);
+        .audience(audience)
+        .viewport(self.viewport);
         if let Some(capture) = &self.snapshot.surface {
             component = component.retained_surface(&capture.surface);
         }

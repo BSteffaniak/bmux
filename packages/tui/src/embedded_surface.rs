@@ -181,7 +181,32 @@ impl RetainedSurface {
         height: u16,
     ) -> SurfacePlacement {
         let placement = self.placement(width, height);
+        self.paint_placement(cx, width, height, placement)
+    }
+
+    /// Paint an explicitly selected, bounded source viewport (for local panning).
+    pub fn paint_placement(
+        &self,
+        cx: &mut PaintCx<'_, '_>,
+        width: u16,
+        height: u16,
+        mut placement: SurfacePlacement,
+    ) -> SurfacePlacement {
         let area = self.cells.area();
+        placement.width = placement.width.min(width).min(area.width);
+        placement.height = placement.height.min(height).min(area.height);
+        placement.source_x = placement
+            .source_x
+            .min(area.width.saturating_sub(placement.width));
+        placement.source_y = placement
+            .source_y
+            .min(area.height.saturating_sub(placement.height));
+        placement.destination_x = placement
+            .destination_x
+            .min(width.saturating_sub(placement.width));
+        placement.destination_y = placement
+            .destination_y
+            .min(height.saturating_sub(placement.height));
         // The viewport scope also bounds images when an ancestor has a larger clip.
         cx.with_child(0, 0, LocalRect::new(0, 0, width, height), |viewport| {
             viewport.declare_metadata_availability(

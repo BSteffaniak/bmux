@@ -1,19 +1,23 @@
 //! Presenter-owned controls. Geometry and clipping belong exclusively to the TUI scene.
 use crate::playbook_controller::{Control, Controller, LifecycleSnapshot};
 use bmux_tui::{
-    embedded_surface::{EmbeddedSurface, RetainedSurface},
+    component::LogicalSize,
+    style::{Color, Modifier, Style},
+};
+use bmux_tui::{
+    embedded_surface::RetainedSurface,
     prelude::{
         Column, Component, ComponentRevision, Constraints, Element, Event, EventCx, EventOutcome,
         LayoutCx, LayoutNode, PaintCx, Row, SizeBox, Surface, TextBlock,
     },
 };
-use bmux_tui_components::button::{ButtonComponent, ButtonState};
+use bmux_tui_components::button::{ButtonComponent, ButtonState, ButtonStyles};
 use std::{
     cell::Cell,
     hash::{Hash, Hasher},
 };
 
-pub(crate) const INPUTS: [&str; 9] = [
+pub(crate) const INPUTS: [&str; 13] = [
     "play-toggle",
     "step",
     "stop",
@@ -23,6 +27,10 @@ pub(crate) const INPUTS: [&str; 9] = [
     "speed:normal",
     "speed:double",
     "speed:instant",
+    "pan:left",
+    "pan:right",
+    "pan:up",
+    "pan:down",
 ];
 
 pub(crate) fn target_input(id: &str) -> Option<&'static str> {
@@ -60,7 +68,8 @@ pub struct PlaybookDemo<'a> {
     snapshot: &'a LifecycleSnapshot,
     audience: bool,
     surface: Option<&'a RetainedSurface>,
-    buttons: [Cell<ButtonState>; 9],
+    buttons: [Cell<ButtonState>; 13],
+    viewport: (u16, u16),
 }
 impl<'a> PlaybookDemo<'a> {
     pub fn new(
@@ -89,7 +98,12 @@ impl<'a> PlaybookDemo<'a> {
             audience: false,
             surface: None,
             buttons,
+            viewport: (0, 0),
         }
+    }
+    pub fn viewport(mut self, viewport: (u16, u16)) -> Self {
+        self.viewport = viewport;
+        self
     }
     pub fn audience(mut self, audience: bool) -> Self {
         self.audience = audience;
@@ -115,97 +129,163 @@ impl<'a> PlaybookDemo<'a> {
         )
     }
     fn button(&self, index: usize, label: &'static str) -> ButtonComponent<'_, '_> {
+        let speed = self
+            .snapshot
+            .attempt
+            .as_ref()
+            .map_or("normal", |a| a.playback_speed.as_str());
+        let selected = INPUTS[index].strip_prefix("speed:") == Some(speed);
+        let normal = Style::new().fg(Color::White).bg(Color::BrightBlack);
+        let active = Style::new()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
         ButtonComponent::new(
             format!("playbook-control/{}", INPUTS[index]),
             label,
             &self.buttons[index],
         )
-    }
-    fn tree(&self, width: u64, height: u64) -> Element<'_> {
-        let status = self.snapshot.attempt.as_ref().map_or_else(
-            || {
-                self.snapshot.acknowledgment.as_ref().map_or_else(
-                    || "Not running · speed normal".into(),
-                    |acknowledgment| bounded_diagnostic(acknowledgment),
-                )
-            },
-            |attempt| {
-                format!(
-                    "{}{} · action {}/{} · {}\n{}",
-                    attempt.phase,
-                    if attempt.paused { " · paused" } else { "" },
-                    attempt.step,
-                    attempt.action_count,
-                    attempt.playback_speed,
-                    bounded_diagnostic(&attempt.current_action)
-                )
-            },
-        );
-        let mut column = Column::new().child(TextBlock::new(self.title));
-        if !self.audience {
-            let play = if play_control(self.snapshot) == Control::Pause {
-                "Pause"
+        .filled()
+        .styles(ButtonStyles {
+            normal: if selected {
+                active.add_modifier(Modifier::UNDERLINE)
             } else {
-                "Play"
-            };
-            if width >= 58 {
+                normal
+            },
+            focused: active.add_modifier(Modifier::UNDERLINE),
+            hovered: active,
+            pressed: active.add_modifier(Modifier::REVERSED),
+            disabled: normal.add_modifier(Modifier::DIM),
+        })
+    }
+    fn toolbar(&self, width: u64) -> Element<'_> {
+        let play = if play_control(self.snapshot) == Control::Pause {
+            "Ⅱ Pause"
+        } else {
+            "▶ Play"
+        };
+        let mut column = Column::new();
+        if !self.audience {
+            if width >= 66 {
                 column = column
                     .child(
                         Row::new()
                             .child(self.button(0, play))
-                            .child(self.button(1, "Step"))
-                            .child(self.button(2, "Stop"))
-                            .child(self.button(3, "Restart"))
-                            .child(self.button(4, "Close")),
+                            .child(self.button(1, "▸ Step"))
+                            .child(self.button(2, "■ Stop"))
+                            .child(self.button(3, "↻ Restart"))
+                            .child(self.button(4, "× Close")),
                     )
                     .child(
                         Row::new()
-                            .child(self.button(5, "Half"))
-                            .child(self.button(6, "Normal"))
-                            .child(self.button(7, "Double"))
+                            .child(self.button(5, "Half 0.5×"))
+                            .child(self.button(6, "Normal 1×"))
+                            .child(self.button(7, "Double 2×"))
                             .child(self.button(8, "Instant")),
                     );
             } else {
-                // Genuine button leaves, never a textual approximation. Close remains first
-                // in the tiny fallback; clipped controls have no hit regions.
-                column = column.child(self.button(4, "Close"));
-                for (index, label) in [
+                column = column.child(self.button(4, "× Close"));
+                for (i, label) in [
                     (0, play),
-                    (1, "Step"),
-                    (2, "Stop"),
-                    (3, "Restart"),
-                    (5, "Half"),
-                    (6, "Normal"),
-                    (7, "Double"),
+                    (1, "▸ Step"),
+                    (2, "■ Stop"),
+                    (3, "↻ Restart"),
+                    (5, "Half 0.5×"),
+                    (6, "Normal 1×"),
+                    (7, "Double 2×"),
                     (8, "Instant"),
                 ] {
-                    column = column.child(self.button(index, label));
+                    column = column.child(self.button(i, label));
                 }
             }
         }
-        column = column.child(TextBlock::new(status));
+        Element::new(column)
+    }
+    fn header(&self) -> Element<'_> {
+        let status = self.snapshot.attempt.as_ref().map_or_else(
+            || {
+                self.snapshot
+                    .acknowledgment
+                    .clone()
+                    .unwrap_or_else(|| "Not running · speed normal".into())
+            },
+            |a| {
+                if a.phase == "script-complete" {
+                    format!(
+                        "Complete · {}/{} actions · session retained · {}",
+                        a.step, a.action_count, a.playback_speed
+                    )
+                } else {
+                    format!(
+                        "{}{} · action {}/{} · {} · {}",
+                        a.phase,
+                        if a.paused { " · paused" } else { "" },
+                        a.step,
+                        a.action_count,
+                        a.playback_speed,
+                        a.current_action
+                    )
+                }
+            },
+        );
+        let mut column = Column::new()
+            .child(TextBlock::new(self.title))
+            .child(TextBlock::new(bounded_diagnostic(&status)));
         if !self.audience
             && let Some(error) = &self.snapshot.error
         {
             column = column.child(TextBlock::new(bounded_diagnostic(error)));
         }
+        Element::new(column)
+    }
+    fn tree(&self, width: u64, height: u64) -> Element<'_> {
+        let inner = width.saturating_sub(2);
+        let measure = |element: Element<'_>| {
+            element
+                .layout(Constraints::for_width(inner), &mut LayoutCx::default())
+                .size
+                .height
+        };
+        let chrome = measure(self.header()) + measure(self.toolbar(inner)) + 2;
+        let mut column = Column::new().child(self.header());
         if let Some(surface) = self.surface {
-            let controls_height = if self.audience {
-                5
-            } else if width >= 58 {
-                7 + u64::from(self.snapshot.error.is_some()) * 3
+            let area = surface.buffer().area();
+            let clipped = u64::from(area.width) > inner
+                || u64::from(area.height) > height.saturating_sub(chrome);
+            let pan_height = if clipped {
+                if self.audience { 1 } else { 2 }
             } else {
-                14 + u64::from(self.snapshot.error.is_some()) * 3
+                0
             };
+            let available = height.saturating_sub(chrome + pan_height);
             column = column.child(
-                SizeBox::new(EmbeddedSurface::new(surface))
-                    .height(height.saturating_sub(controls_height)),
+                SizeBox::new(PlayerViewport {
+                    surface,
+                    offset: self.viewport,
+                })
+                .height(available),
             );
+            if clipped {
+                column = column.child(TextBlock::new(format!(
+                    "Viewport cropped · source {}×{} · pan to see edges",
+                    area.width, area.height
+                )));
+                if !self.audience {
+                    column = column.child(
+                        Row::new()
+                            .child(self.button(9, "←"))
+                            .child(self.button(10, "→"))
+                            .child(self.button(11, "↑"))
+                            .child(self.button(12, "↓")),
+                    );
+                }
+            }
         }
+        column = column.child(self.toolbar(inner));
         Element::new(
             SizeBox::new(Surface::new(column).border(bmux_tui::chrome::Border::new(
                 bmux_tui::chrome::BorderSet::ROUNDED,
-                bmux_tui::style::Style::new(),
+                Style::new(),
             )))
             .width(width)
             .height(height),
@@ -219,19 +299,33 @@ impl Component for PlaybookDemo<'_> {
         self.snapshot.revision.hash(&mut state);
         self.audience.hash(&mut state);
         self.title.hash(&mut state);
+        self.viewport.hash(&mut state);
         ComponentRevision::new(state.finish(), state.finish())
     }
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
-        self.tree(
-            constraints.max_width().saturating_sub(4).clamp(1, 88),
-            constraints
-                .max_height()
-                .unwrap_or(28)
-                .saturating_sub(2)
-                .clamp(1, 28),
-        )
-        .layout(constraints, cx)
+        let area = self.surface.map(|s| s.buffer().area());
+        let width = constraints
+            .max_width()
+            .min(area.map_or(88, |a| u64::from(a.width) + 2).max(70));
+        let chrome = self
+            .header()
+            .layout(Constraints::for_width(width.saturating_sub(2)), cx)
+            .size
+            .height
+            + self
+                .toolbar(width.saturating_sub(2))
+                .layout(Constraints::for_width(width.saturating_sub(2)), cx)
+                .size
+                .height
+            + 2;
+        let height = constraints
+            .max_height()
+            .unwrap_or(128)
+            .min(area.map_or(8, |a| u64::from(a.height)) + chrome);
+        self.tree(width, height)
+            .layout(Constraints::new(0, width, 0, Some(height)), cx)
     }
+
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         self.tree(layout.size.width, layout.size.height)
             .paint(layout, cx);
@@ -242,9 +336,100 @@ impl Component for PlaybookDemo<'_> {
     }
 }
 
+/// Presenter-local view transform. Never resizes or sends input to execution.
+struct PlayerViewport<'a> {
+    surface: &'a RetainedSurface,
+    offset: (u16, u16),
+}
+impl Component for PlayerViewport<'_> {
+    fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
+        let area = self.surface.buffer().area();
+        LayoutNode::leaf(
+            "playbook-viewport".into(),
+            constraints.constrain(LogicalSize::new(
+                u64::from(area.width),
+                u64::from(area.height),
+            )),
+        )
+    }
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let width = u16::try_from(layout.size.width).unwrap_or(u16::MAX);
+        let height = u16::try_from(layout.size.height).unwrap_or(u16::MAX);
+        let mut placement = self.surface.placement(width, height);
+        placement.source_x = self.offset.0;
+        placement.source_y = self.offset.1;
+        self.surface.paint_placement(cx, width, height, placement);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_viewport_keeps_all_corners_and_small_viewport_can_pan() {
+        use bmux_tui::{
+            buffer::Buffer,
+            embedded_surface::{SurfaceIdentity, SurfaceLimits},
+            geometry::{Rect, Size},
+            image_scene::ImageScene,
+        };
+        use std::sync::Arc;
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 24));
+        for (x, y, symbol) in [(0, 0, "A"), (79, 0, "B"), (0, 23, "C"), (79, 23, "D")] {
+            buffer.set_cell(bmux_tui::geometry::Point::new(x, y), symbol, Style::new());
+        }
+        let retained = RetainedSurface::new(
+            SurfaceIdentity {
+                owner: "test".into(),
+                generation: 1,
+                revision: 1,
+            },
+            Arc::new(buffer),
+            Arc::new(ImageScene::default()),
+            SurfaceLimits {
+                max_cells: 10000,
+                max_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        let snapshot = LifecycleSnapshot {
+            owner_epoch: uuid::Uuid::new_v4(),
+            revision: 0,
+            attempt: None,
+            acknowledgment: None,
+            surface: None,
+            cancellation_revision: 0,
+            unresolved: false,
+            error: None,
+        };
+        let controller = Controller::detached(snapshot.clone());
+        for (width, height, offset, expected) in [
+            (100, 40, (0, 0), "ABCD"),
+            (60, 24, (0, 0), "A"),
+            (60, 24, (u16::MAX, u16::MAX), "D"),
+        ] {
+            let demo = PlaybookDemo::new("Demo", &controller, &snapshot)
+                .retained_surface(&retained)
+                .viewport(offset);
+            let layout = demo.layout(
+                Constraints::loose(Size::new(width, height)),
+                &mut LayoutCx::default(),
+            );
+            let mut output = Buffer::empty(Rect::new(0, 0, width, height));
+            let mut frame = bmux_tui::frame::Frame::new(&mut output);
+            demo.paint(&layout, &mut PaintCx::new(&mut frame));
+            let text = output
+                .cells()
+                .iter()
+                .map(|c| c.symbol.as_str())
+                .collect::<String>();
+            for corner in expected.chars() {
+                assert!(text.contains(corner), "missing corner {corner}");
+            }
+            assert_eq!(text.contains("Viewport cropped"), width < 82);
+            assert!(!text.contains("[ Pause ]"));
+        }
+    }
     #[test]
     fn speed_targets_and_close_are_exact_not_generic_clicks() {
         for input in INPUTS {

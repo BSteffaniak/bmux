@@ -155,6 +155,7 @@ pub struct Button<'a> {
     label: &'a str,
     policy: ButtonPolicy,
     styles: ButtonStyles,
+    filled: bool,
 }
 
 /// Canonical component-lifecycle button leaf.
@@ -178,6 +179,13 @@ impl<'a, 'state> ButtonComponent<'a, 'state> {
             state,
         }
     }
+    /// Use padded, background-filled chrome instead of bracket decoration.
+    #[must_use]
+    pub const fn filled(mut self) -> Self {
+        self.button.filled = true;
+        self
+    }
+
     /// Set behavior policy.
     #[must_use]
     pub const fn policy(mut self, policy: ButtonPolicy) -> Self {
@@ -198,6 +206,7 @@ impl Component for ButtonComponent<'_, '_> {
         let mut layout = std::collections::hash_map::DefaultHasher::new();
         self.id.as_str().hash(&mut layout);
         self.button.label.hash(&mut layout);
+        self.button.filled.hash(&mut layout);
 
         let mut paint = std::collections::hash_map::DefaultHasher::new();
         let policy = self.button.policy;
@@ -229,7 +238,11 @@ impl Component for ButtonComponent<'_, '_> {
         }
         let state = self.state.get();
         let line = Line::from_spans(vec![Span::styled(
-            format!("[ {} ]", self.button.label),
+            if self.button.filled {
+                format!("  {}  ", self.button.label)
+            } else {
+                format!("[ {} ]", self.button.label)
+            },
             self.button.style_for(state),
         )]);
         cx.write_line(
@@ -295,6 +308,7 @@ impl<'a> Button<'a> {
     pub const fn new(label: &'a str) -> Self {
         Self {
             label,
+            filled: false,
             policy: ButtonPolicy::interactive(),
             styles: ButtonStyles {
                 normal: Style::new(),
@@ -928,6 +942,18 @@ mod tests {
         button.paint(&layout, &mut PaintCx::new(&mut frame));
 
         assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("[ Save ]  "));
+    }
+
+    #[test]
+    fn filled_button_preserves_geometry_and_removes_brackets() {
+        let state = Cell::new(ButtonState::new());
+        let button = ButtonComponent::new("save", "Save", &state).filled();
+        let layout = button.layout(Constraints::for_width(10), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let mut frame = Frame::new(&mut buffer);
+        button.paint(&layout, &mut PaintCx::new(&mut frame));
+        assert_eq!(frame.buffer().row_symbols(0).as_deref(), Some("  Save    "));
+        assert_eq!(layout.size.width, 10);
     }
 
     #[test]

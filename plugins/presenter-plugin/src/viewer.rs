@@ -208,7 +208,7 @@ impl Connection {
             snapshot
                 .surfaces
                 .iter()
-                .all(|surface| surface.validate(16_384, 512 * 1024).is_ok()),
+                .all(|surface| surface.validate(16_384, 2 * 1024 * 1024).is_ok()),
             "invalid audience mirror scene"
         );
         anyhow::ensure!(

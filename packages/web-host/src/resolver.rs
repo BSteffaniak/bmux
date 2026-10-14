@@ -267,9 +267,12 @@ fn read_regular(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > limit {
-        return Err(io::Error::other(
-            "web bundle file exceeds bounds or is not regular",
-        ));
+        return Err(io::Error::other(format!(
+            "web bundle file {}: size {} bytes, limit {limit} bytes; expected a nonempty regular file (regular={})",
+            path.display(),
+            metadata.len(),
+            metadata.is_file(),
+        )));
     }
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes)?;
@@ -480,7 +483,7 @@ fn build_source(root: &Path, output: &Path, cache: &Path) -> io::Result<()> {
     verify_source(root)?;
     // scripts/dev.sh owns compiler and target selection. The shell reads the Nix-selected
     // target directory; never override CARGO_TARGET_DIR or call a PATH compiler directly.
-    let script = "set -eu; test -n \"$BMUX_NIX_TOOLCHAIN\"; test -n \"$CARGO_TARGET_DIR\"; cargo build --locked -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown; cargo build --locked -p bmux_presenter --no-default-features --features wasm --target wasm32-unknown-unknown; \"$1\" \"$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/bmux_web_renderer.wasm\" --target web --out-dir \"$2\"; \"$1\" \"$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/bmux_presenter.wasm\" --target web --out-dir \"$2\"";
+    let script = "set -eu; test -n \"$BMUX_NIX_TOOLCHAIN\"; test -n \"$CARGO_TARGET_DIR\"; cargo build --locked --release -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown; cargo build --locked --release -p bmux_presenter --no-default-features --features wasm --target wasm32-unknown-unknown; \"$1\" \"$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/bmux_web_renderer.wasm\" --target web --out-dir \"$2\"; \"$1\" \"$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/bmux_presenter.wasm\" --target web --out-dir \"$2\"";
     run_dev(
         root,
         &[
@@ -575,6 +578,22 @@ fn check_bindgen_version(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bundle_file_errors_identify_path_size_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.wasm");
+        fs::write(&path, [0_u8; 9]).unwrap();
+        let error = read_regular(&path, 8).unwrap_err().to_string();
+        assert!(error.contains("oversized.wasm"));
+        assert!(error.contains("size 9 bytes, limit 8 bytes"));
+        fs::write(&path, []).unwrap();
+        assert!(
+            read_regular(&path, 8)
+                .unwrap_err()
+                .to_string()
+                .contains("size 0 bytes")
+        );
+    }
     #[test]
     fn hex_encoder_preserves_leading_zeroes_and_known_sha256() {
         assert_eq!(provenance::hex(&[0, 1, 15, 16, 255]), "00010f10ff");

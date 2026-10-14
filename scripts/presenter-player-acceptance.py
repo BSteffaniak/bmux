@@ -17,6 +17,7 @@ import base64
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -108,7 +109,7 @@ class Acceptance(OWNED.Acceptance):
         if self.active:
             attempt = self.attempt()
             rows = '\n'.join(frame["rows"])
-            if attempt.get("phase") not in rows:
+            if attempt.get("phase") not in rows and not (attempt.get("phase") == "script-complete" and "Complete ·" in rows):
                 return None
             paused = OWNED.bounded_json(self.active.parent / "control.json").get("paused", False)
             if bool(paused) != (" · paused" in rows):
@@ -247,8 +248,17 @@ class Acceptance(OWNED.Acceptance):
         require(host.child.pid != self.global_identity["pid"], "managed provider reused unrelated server")
         return command, host_env
 
+    def url(self, process):
+        def ready():
+            require(process.child.poll() is None, "presenter exited before browser URL")
+            match = re.search(rb"http://(?:\[[^\]]+\]|[^\s/:]+):\d+/[^\s\x1b]*", process.bytes())
+            return match[0].decode() if match else None
+        return wait_for("presenter browser URL", ready, 1200 if self.args.auto_assets else 30)
+
     def start_player(self):
-        web = ["--web", "--web-assets", self.args.assets, "--web-port", "0", "--web-auth", "none"]
+        web = ["--web", "--web-port", "0", "--web-auth", "none"]
+        if not self.args.auto_assets:
+            web += ["--web-assets", self.args.assets]
         if not self.args.managed:
             return self.spawn(["present", "play", self.deck, "--allow-playbooks", "--presenter", *web], mirror=True)
         command, env = self.separate_host()
@@ -421,6 +431,7 @@ def main():
     for name in ("binary", "plugins", "assets", "browser", "mermaid-worker"):
         parser.add_argument("--" + name, type=lambda value: Path(value).resolve(strict=True), required=True)
     parser.add_argument("--state-parent", type=lambda value: Path(value).resolve(strict=True), default=Path("/tmp"))
+    parser.add_argument("--auto-assets", action="store_true", help="exercise first-use resolver in owned isolated cache")
     parser.add_argument("--managed", action="store_true", help="distinct owned provider-enabled managed host")
     args = parser.parse_args()
     require(Path("/proc/self/stat").is_file(), "Linux process identity required")

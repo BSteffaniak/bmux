@@ -36,7 +36,7 @@ impl Default for Limits {
             asset_bytes: 8 * 1024 * 1024,
             total_asset_bytes: 32 * 1024 * 1024,
             assets: 128,
-            frame_bytes: 512 * 1024,
+            frame_bytes: 2 * 1024 * 1024,
             canvas_cells: 16_384,
             surfaces: 4,
             participants: 64,

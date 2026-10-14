@@ -463,6 +463,7 @@ impl Worker {
             if let Some(ObserverTask { task, .. }) = self.observer.take()
                 && let Ok(Err(error)) = task.await
             {
+                eprintln!("presenter retained observer failed: {error}");
                 self.publish_result(Err(error));
             }
             self.observer_failed = generation;
