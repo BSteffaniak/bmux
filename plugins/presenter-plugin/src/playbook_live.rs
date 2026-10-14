@@ -21,6 +21,7 @@ pub(crate) struct DemoEntry {
 }
 pub(crate) struct LiveDemos {
     pub entries: BTreeMap<String, DemoEntry>,
+    connection: crate::owned_runtime::ExecutionConnection,
     environment: DemoEnvironment,
 }
 #[derive(Clone)]
@@ -35,15 +36,45 @@ impl LiveDemos {
     pub fn prepare(deck: &Deck, environment: &DemoEnvironment) -> Result<Self, String> {
         let mut demos = Self::detached(deck, environment)?;
         for entry in demos.entries.values_mut() {
-            entry.controller = Self::spawn(environment, &entry.config);
+            entry.controller = Self::spawn(environment, &demos.connection, &entry.config);
             entry.snapshot = entry.controller.latest();
         }
         Ok(demos)
     }
-    fn spawn(environment: &DemoEnvironment, config: &DemoConfig) -> Controller {
-        Controller::spawn(
+    pub fn prepare_local(
+        deck: &Deck,
+        environment: &DemoEnvironment,
+        search_roots: Vec<PathBuf>,
+    ) -> Result<Self, String> {
+        let mut demos = Self::detached(deck, environment)?;
+        let selected = bmux_config::BmuxConfig::load_with_paths_and_overrides(
+            &environment.paths,
+            &bmux_config::ConfigLoadOverrides::for_process(),
+        )
+        .map_err(|error| error.to_string())?;
+        demos.connection = crate::owned_runtime::ExecutionConnection::Local(
+            crate::owned_runtime::OwnedRuntime::with_behavior(
+                environment.executable.clone(),
+                environment.attempts_root.clone(),
+                search_roots,
+                selected.general,
+                selected.behavior,
+            ),
+        );
+        for entry in demos.entries.values_mut() {
+            entry.controller = Self::spawn(environment, &demos.connection, &entry.config);
+            entry.snapshot = entry.controller.latest();
+        }
+        Ok(demos)
+    }
+    fn spawn(
+        environment: &DemoEnvironment,
+        connection: &crate::owned_runtime::ExecutionConnection,
+        config: &DemoConfig,
+    ) -> Controller {
+        Controller::spawn_connected(
             &environment.runtime,
-            environment.paths.clone(),
+            connection.clone(),
             environment.approval.clone(),
             config.clone(),
             environment.executable.clone(),
@@ -53,6 +84,7 @@ impl LiveDemos {
     fn detached(deck: &Deck, environment: &DemoEnvironment) -> Result<Self, String> {
         let mut demos = Self {
             entries: BTreeMap::new(),
+            connection: crate::owned_runtime::ExecutionConnection::Host(environment.paths.clone()),
             environment: environment.clone(),
         };
         for slide in &deck.slides {
@@ -64,6 +96,7 @@ impl LiveDemos {
     /// Title and slide placement are presentation metadata, not execution identity.
     pub fn prepare_reload(&self, deck: &Deck) -> Result<Self, String> {
         let mut candidate = Self::detached(deck, &self.environment)?;
+        candidate.connection = self.connection.clone();
         for (id, entry) in &mut candidate.entries {
             if let Some(old) = self.entries.get(id)
                 && old.compatible(entry)
@@ -107,7 +140,8 @@ impl LiveDemos {
                 old.snapshot = next.snapshot.clone();
                 *next = old;
             } else {
-                next.controller = Self::spawn(&candidate.environment, &next.config);
+                next.controller =
+                    Self::spawn(&candidate.environment, &candidate.connection, &next.config);
                 next.snapshot = next.controller.latest();
             }
         }
@@ -126,9 +160,9 @@ impl LiveDemos {
                     }
                     let config = DemoConfig::parse(config).map_err(|error| error.to_string())?;
                     // Validate original content approval without starting execution.
-                    let preparation = environment
+                    let (source, digest) = environment
                         .approval
-                        .preparation(&config, &environment.executable, &environment.attempts_root)
+                        .approved_identity(&config)
                         .map_err(|error| error.to_string())?;
                     let snapshot = LifecycleSnapshot {
                         owner_epoch: uuid::Uuid::new_v4(),
@@ -145,10 +179,7 @@ impl LiveDemos {
                         block.id.0.clone(),
                         DemoEntry {
                             slide: slide.into(),
-                            execution_key: (
-                                preparation.source,
-                                preparation.expected_closure_sha256,
-                            ),
+                            execution_key: (source.to_string_lossy().into_owned(), digest),
                             config,
                             controller,
                             snapshot,
@@ -167,11 +198,17 @@ impl LiveDemos {
         Ok(())
     }
     pub async fn shutdown(&mut self) -> Result<(), String> {
+        if let crate::owned_runtime::ExecutionConnection::Local(runtime) = &self.connection {
+            runtime.request_shutdown();
+        }
         for entry in self.entries.values() {
             entry.controller.request_shutdown();
         }
         for entry in self.entries.values_mut() {
             entry.controller.shutdown_settled().await?;
+        }
+        if let crate::owned_runtime::ExecutionConnection::Local(runtime) = &self.connection {
+            runtime.shutdown().await?;
         }
         Ok(())
     }
@@ -273,6 +310,7 @@ impl LiveDemos {
             .map(|(id, entry)| (id.as_str(), entry))
     }
 }
+
 impl DemoEntry {
     fn compatible(&self, next: &Self) -> bool {
         self.config.playbook == next.config.playbook && self.execution_key == next.execution_key
@@ -328,5 +366,30 @@ impl bmux_presenter::custom::LinkedComponentFactory for DemoFactory {
         Ok(Element::new(
             TextBlock::new(text).id(format!("playbook-demo/{}", block.id.as_str())),
         ))
+    }
+}
+
+#[cfg(test)]
+mod owned_runtime_tests {
+    use super::*;
+    #[tokio::test]
+    async fn overlays_and_reload_leave_local_runtime_untouched() {
+        let fixture = reload_tests::Fixture::new();
+        let deck = reload_tests::deck("s", "old");
+        let mut environment = fixture.environment.clone();
+        environment.attempts_root = fixture.root.join("untouched-attempts");
+        let mut demos = LiveDemos::prepare_local(&deck, &environment, vec![]).unwrap();
+        demos.input("demo", "open", true).unwrap();
+        demos.input("demo", "close", true).unwrap();
+        let candidate = demos.prepare_reload(&deck).unwrap();
+        assert!(!environment.attempts_root.exists());
+        assert!(
+            candidate
+                .entries
+                .values()
+                .all(|entry| entry.controller.latest().attempt.is_none())
+        );
+        demos.shutdown().await.unwrap();
+        assert!(!environment.attempts_root.exists());
     }
 }

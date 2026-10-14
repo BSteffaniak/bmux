@@ -1169,7 +1169,7 @@ async fn shutdown_local_demos(player: &mut Player) -> Result<()> {
     };
     // One deadline for all demos, not twenty seconds per failed controller.
     // The service remains authoritative for unresolved resources after UI exit.
-    match tokio::time::timeout(Duration::from_secs(2), demos.shutdown()).await {
+    match tokio::time::timeout(Duration::from_secs(30), demos.shutdown()).await {
         Ok(result) => result.map_err(anyhow::Error::msg),
         Err(_) => Err(anyhow::anyhow!(
             "Presenter closed; playbook cleanup is NOT acknowledged. Owned runner must reconcile; do not restart until settled."

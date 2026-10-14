@@ -4,6 +4,7 @@ mod cli;
 mod commands;
 mod demo;
 mod mirror;
+mod owned_runtime;
 mod owner;
 pub mod playbook;
 pub mod playbook_capture;

@@ -75,15 +75,20 @@ Using a bundled BMUX executable that supports managed playbooks and the private
 retained observer protocol:
 
 ```sh
-bmux present play plugins/presenter-plugin/examples/live-demo.md --allow-playbooks --presenter --no-reload
+bmux --target local present play plugins/presenter-plugin/examples/live-demo.md --allow-playbooks --presenter --web
 ```
 
 Tab focuses `live-demo`; `o` opens the overlay, `r` manually starts the run,
 `s` requests stop, and `R` restarts only after cleanup acknowledgment. `p`, `n`,
 and `c` pause, single-step, and resume at script boundaries. Escape hides the
-overlay without terminating its run. Leaving the slide requests stop. Add `--web`
-for a read-only browser audience showing the same fixed 80×24 retained output.
+overlay without terminating its run. Leaving the slide requests stop. `--web` adds
+a read-only browser audience showing the same fixed 80×24 retained output.
 Browser viewport changes clip/center the display; they do not reflow the producer.
+Local playback lazily starts its own private playbook service on `r`; no manual
+server startup or runtime switching is needed. `--target local` is explicit here:
+a selected remote target is not a local-execution shortcut. Managed hosts instead
+require `bmux.playbook` on their selected server and never fall back to local
+execution when that provider is missing.
 
 Managed creation uses the explicit versioned approval contract:
 
@@ -95,8 +100,25 @@ bmux present join bmux:HOST_ID --credential PRIVATE_FILE --presenter --mode shar
 Only presenter effects authority may run/control the demo. `present check` and
 joining an audience never authorize execution. Playbooks are executable input;
 approve only trusted sources. Approval binds to the canonical deck root and
-original source content; changed/new executable input is rejected. Reload retires
-owned controllers rather than transferring live execution handles into a candidate.
-The local and managed examples have coordinator-run isolated PTY and Chromium
-acceptance covering shared live output, Stop, Restart, and acknowledged cleanup.
-This is not a claim of crash recovery or arbitrary terminal-input support.
+original source content; changed/new executable input is rejected. Compatible
+reload retains the active attempt and frozen source; rejected executable changes
+retain the last approved deck and run. Stop/Restart and exit acknowledge owned
+cleanup. This is not a claim of crash recovery or arbitrary terminal-input support.
+
+### Isolated regression acceptance
+
+Use explicit coordinator-built artifacts (no build or installation in the harness):
+
+```sh
+python3 scripts/presenter-owned-runtime-acceptance.py --binary /absolute/path/to/bmux --plugins /absolute/path/to/staged/plugins --assets /absolute/path/to/web-assets --browser /absolute/path/to/chromium
+```
+
+Linux `/proc` and Chromium are required. The harness owns all config, default/local
+server, private runtimes, browser profiles and logs beneath a private temporary
+root; it never attaches to the user daemon. It deliberately omits `bmux.playbook`
+from the unrelated server, proves its principal/PID survives local playback, and
+requires managed creation to fail clearly without a hidden local fallback. It
+checks lazy startup, real shared shell output, compatible/rejected reloads, fresh
+Restart generations and active-run `q` cleanup, then emits one capability-safe
+summary pointing to retained private evidence. The existing coordinator managed
+passing harness remains separate.

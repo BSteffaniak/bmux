@@ -94,6 +94,23 @@ impl Controller {
         executable: PathBuf,
         attempts_root: PathBuf,
     ) -> Self {
+        Self::spawn_connected(
+            runtime,
+            crate::owned_runtime::ExecutionConnection::Host(paths),
+            approval,
+            config,
+            executable,
+            attempts_root,
+        )
+    }
+    pub(crate) fn spawn_connected(
+        runtime: &tokio::runtime::Handle,
+        connection: crate::owned_runtime::ExecutionConnection,
+        approval: Approval,
+        config: DemoConfig,
+        executable: PathBuf,
+        attempts_root: PathBuf,
+    ) -> Self {
         let owner_epoch = uuid::Uuid::new_v4();
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (snapshot_tx, snapshots) = watch::channel(LifecycleSnapshot {
@@ -116,7 +133,8 @@ impl Controller {
                 cancelled_through: 0,
                 preparation_request_id: uuid::Uuid::new_v4().to_string(),
                 pending: Arc::clone(&pending),
-                paths,
+                _service_guard: connection.worker_guard(),
+                connection,
                 approval,
                 config,
                 executable,
@@ -257,7 +275,8 @@ struct Worker {
     cancelled_through: u64,
     preparation_request_id: String,
     pending: Arc<std::sync::atomic::AtomicUsize>,
-    paths: bmux_config::ConfigPaths,
+    connection: crate::owned_runtime::ExecutionConnection,
+    _service_guard: Option<crate::owned_runtime::WorkerGuard>,
     approval: Approval,
     config: DemoConfig,
     executable: PathBuf,
@@ -366,20 +385,37 @@ impl Worker {
                 }
             }
         }
-        self.close_observer().await;
+        while !self.close_observer().await {
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
         self.pending.store(0, std::sync::atomic::Ordering::SeqCst);
     }
-    async fn close_observer(&mut self) {
-        if let Some(ObserverTask { stop, mut task, .. }) = self.observer.take() {
+    async fn close_observer(&mut self) -> bool {
+        if let Some(ObserverTask {
+            generation,
+            stop,
+            mut task,
+        }) = self.observer.take()
+        {
             stop.send_replace(true);
             if tokio::time::timeout(Duration::from_secs(8), &mut task)
                 .await
                 .is_err()
             {
-                task.abort();
-                let _ = task.await;
+                // The observer task owns the child. Never abort its reaping path
+                // because the presenter's enclosing UI deadline elapsed.
+                self.observer = Some(ObserverTask {
+                    generation,
+                    stop,
+                    task,
+                });
+                self.publish_result(Err(
+                    "observer cleanup pending; owned service retained".into()
+                ));
+                return false;
             }
         }
+        true
     }
     async fn reconcile_observer(&mut self) {
         let generation = self.attempt.as_ref().map(|attempt| attempt.generation);
@@ -388,7 +424,9 @@ impl Worker {
             .as_ref()
             .is_some_and(|observer| Some(observer.generation) != generation)
         {
-            self.close_observer().await;
+            if !self.close_observer().await {
+                return;
+            }
             self.capture_rx.borrow_and_update();
             self.capture_tx.send_replace(None);
             self.snapshots.send_modify(|snapshot| {
@@ -461,13 +499,11 @@ impl Worker {
     }
     async fn connect(&mut self) -> Result<(), String> {
         if self.client.is_none() {
+            let paths = self.connection.paths().await?;
             self.client = Some(
-                bmux_client::BmuxClient::connect_with_paths(
-                    &self.paths,
-                    "presenter playbook owner",
-                )
-                .await
-                .map_err(|error| error.to_string())?,
+                bmux_client::BmuxClient::connect_with_paths(&paths, "presenter playbook owner")
+                    .await
+                    .map_err(|error| error.to_string())?,
             );
         }
         Ok(())
@@ -487,6 +523,18 @@ impl Worker {
             return Err(
                 "previous command outcome uncertain; reconcile before further control".into(),
             );
+        }
+        if self.attempt.is_none() && !matches!(control, Control::Run) {
+            return Err("run must prepare an attempt first".into());
+        }
+        if matches!(control, Control::Run | Control::Restart) {
+            std::fs::create_dir_all(&self.attempts_root).map_err(|error| error.to_string())?;
+            self.approval
+                .preparation(&self.config, &self.executable, &self.attempts_root)
+                .map_err(|error| error.to_string())?;
+            if *self.cancellation.borrow() != self.cancelled_through || *self.shutdown.borrow() {
+                return Err("execution cancelled before service admission".into());
+            }
         }
         self.connect().await?;
         if matches!(control, Control::Run | Control::Restart)

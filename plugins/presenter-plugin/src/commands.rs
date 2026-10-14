@@ -42,7 +42,6 @@ pub(crate) async fn run(
                 crate::player::Player::local(loaded.deck, reload.then_some(source), presenter);
             if let Some(approval) = approval.clone() {
                 let attempts_root = paths(context).state_dir.join("presenter-playbooks");
-                std::fs::create_dir_all(&attempts_root)?;
                 let environment = crate::playbook_live::DemoEnvironment {
                     paths: paths(context),
                     approval,
@@ -51,8 +50,16 @@ pub(crate) async fn run(
                     runtime: tokio::runtime::Handle::current(),
                 };
                 player.live_demos = Some(
-                    crate::playbook_live::LiveDemos::prepare(&player.deck, &environment)
-                        .map_err(anyhow::Error::msg)?,
+                    crate::playbook_live::LiveDemos::prepare_local(
+                        &player.deck,
+                        &environment,
+                        context
+                            .plugin_search_roots
+                            .iter()
+                            .map(std::path::PathBuf::from)
+                            .collect(),
+                    )
+                    .map_err(anyhow::Error::msg)?,
                 );
             }
             player._playbook_approval = approval;
@@ -92,6 +99,15 @@ pub(crate) async fn run(
                     .to_string_lossy()
                     .into_owned();
                 let info = if options.allow_playbooks {
+                    let readiness = bmux_playbook_plugin_api::playbook_state::client::lookup_preparation(
+                        &mut client, "presenter-readiness".to_owned(),
+                    ).await.map_err(|error| anyhow::anyhow!(
+                        "managed presentation playbook provider unavailable; no local fallback: {error}"
+                    ))?;
+                    if let Err(bmux_playbook_plugin_api::playbook_types::PlaybookError::Rejected { message }) = readiness {
+                        anyhow::ensure!(message.starts_with("preparation identity not found"),
+                            "managed playbook provider unavailable: {message}");
+                    }
                     trusted_manage::client::start(
                         &mut client,
                         source,

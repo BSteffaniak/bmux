@@ -8,8 +8,10 @@ provided_capabilities = [
     "bmux.presenter.manage.v2",
 ]
 provided_features = ["bmux.presenter"]
-required_capabilities = ["bmux.playbook.read", "bmux.playbook.execute"]
-version = "0.0.1-alpha.0"
+# Local playback owns its provider; managed playback checks the selected host.
+optional_capabilities = ["bmux.playbook.read", "bmux.playbook.execute"]
+required_capabilities = []
+version               = "0.0.1-alpha.0"
 
 [native_abi]
 minimum = "1.1"

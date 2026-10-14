@@ -113,14 +113,7 @@ impl Approval {
         );
         Ok(source)
     }
-    /// Recheck the complete no-follow include closure before service preparation.
-    /// The service freezes the same digest-bound closure before execution.
-    pub fn preparation(
-        &self,
-        config: &DemoConfig,
-        executable: &Path,
-        attempts_root: &Path,
-    ) -> Result<bmux_playbook_plugin_api::playbook_types::Preparation> {
+    pub(crate) fn approved_identity(&self, config: &DemoConfig) -> Result<(PathBuf, String)> {
         let source = self.resolve(&config.playbook)?;
         let approved = self
             .sources
@@ -130,6 +123,17 @@ impl Approval {
             &bmux_playbook::parser::source_closure_sha256(&source, &self.root)? == approved,
             "playbook include closure changed since approval; explicit reapproval required"
         );
+        Ok((source, approved.clone()))
+    }
+    /// Recheck the complete no-follow include closure before service preparation.
+    /// The service freezes the same digest-bound closure before execution.
+    pub fn preparation(
+        &self,
+        config: &DemoConfig,
+        executable: &Path,
+        attempts_root: &Path,
+    ) -> Result<bmux_playbook_plugin_api::playbook_types::Preparation> {
+        let (source, approved) = self.approved_identity(config)?;
         let executable = std::fs::canonicalize(executable)?;
         ensure!(
             executable.is_file(),
@@ -143,7 +147,7 @@ impl Approval {
             executable: executable.to_string_lossy().into_owned(),
             attempts_root: attempts_root.to_string_lossy().into_owned(),
             request_id: String::new(),
-            expected_closure_sha256: approved.clone(),
+            expected_closure_sha256: approved,
             trusted_executable_input: true,
         })
     }

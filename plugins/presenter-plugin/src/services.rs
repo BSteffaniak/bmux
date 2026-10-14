@@ -196,6 +196,14 @@ pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
         "presenter-host-v2", "start" => |r: trusted_manage::client::StartRequest, ctx| {
             let result = (|| -> anyhow::Result<manage::HostInfo> {
+                if r.allow_playbooks {
+                    anyhow::ensure!(ctx.enabled_plugins.iter().any(|plugin| plugin == "bmux.playbook"),
+                        "managed presentation requires unavailable playbook provider; no local fallback");
+                    for interface in ["playbook-commands", "playbook-state"] {
+                        anyhow::ensure!(ctx.services.iter().any(|service| service.interface_id == interface),
+                            "managed presentation requires unavailable playbook service {interface}; no local fallback");
+                    }
+                }
                 let source = std::fs::canonicalize(&r.source)?;
                 let loaded = crate::source::loaded(&source)?;
                 let approval = r.allow_playbooks.then(|| crate::playbook::Approval::prepare(&source, &loaded.deck)).transpose()?;
