@@ -55,6 +55,10 @@ struct RunnerSnapshot {
     current_action: String,
     #[serde(default)]
     action_count: u64,
+    #[serde(default)]
+    typing_done: u64,
+    #[serde(default)]
+    typing_total: u64,
     session_id: Option<String>,
     cleanup_acknowledged: bool,
     diagnostic: Option<String>,
@@ -171,6 +175,10 @@ impl Owner {
             revision: 1,
             phase: "prepared".into(),
             step: 0,
+            typing_done: 0,
+            typing_total: 0,
+            viewport_cols: 80,
+            viewport_rows: 24,
             playback_speed: spec.playback_speed.clone(),
             current_action: String::new(),
             action_count: 0,
@@ -211,6 +219,8 @@ impl Owner {
             }
         }
         let mut snapshot = snapshot;
+        snapshot.viewport_cols = deck.config.viewport.cols;
+        snapshot.viewport_rows = deck.config.viewport.rows;
         snapshot.action_count = u64::try_from(deck.steps.len()).map_err(message)?;
         spec.source = frozen.to_string_lossy().into_owned();
         spec.allowed_root = root.join("sources").to_string_lossy().into_owned();
@@ -535,6 +545,11 @@ impl Run {
                 }
                 self.snapshot.phase = observed.phase;
                 self.snapshot.step = observed.step;
+                if observed.typing_done > observed.typing_total {
+                    return Err("invalid typing progress".into());
+                }
+                self.snapshot.typing_done = observed.typing_done;
+                self.snapshot.typing_total = observed.typing_total;
                 let expected_label = usize::try_from(observed.step)
                     .ok()
                     .and_then(|step| self.action_labels.get(step))

@@ -70,6 +70,7 @@ pub struct PlaybookDemo<'a> {
     surface: Option<&'a RetainedSurface>,
     buttons: [Cell<ButtonState>; 13],
     viewport: (u16, u16),
+    preview_size: bmux_tui::geometry::Size,
 }
 impl<'a> PlaybookDemo<'a> {
     pub fn new(
@@ -99,7 +100,12 @@ impl<'a> PlaybookDemo<'a> {
             surface: None,
             buttons,
             viewport: (0, 0),
+            preview_size: bmux_tui::geometry::Size::new(80, 24),
         }
+    }
+    pub fn preview_size(mut self, size: bmux_tui::geometry::Size) -> Self {
+        self.preview_size = size;
+        self
     }
     pub fn viewport(mut self, viewport: (u16, u16)) -> Self {
         self.viewport = viewport;
@@ -164,7 +170,34 @@ impl<'a> PlaybookDemo<'a> {
         } else {
             "▶ Play"
         };
-        let mut column = Column::new();
+        use bmux_tui_components::progress_bar::{
+            ProgressBarComponent, ProgressBarPolicy, ProgressBarStyles, ProgressBarValue,
+        };
+        let progress = self.snapshot.attempt.as_ref().map_or(0, |a| {
+            if a.phase == "script-complete" && a.diagnostic.is_none() {
+                return 10000;
+            }
+            let completed = a.step.min(a.action_count).saturating_mul(10000);
+            let fraction = a
+                .typing_done
+                .min(a.typing_total)
+                .saturating_mul(10000)
+                .checked_div(a.typing_total)
+                .unwrap_or(0);
+            (completed + fraction) / a.action_count.max(1)
+        });
+        let mut column = Column::new().child(
+            ProgressBarComponent::new(
+                "playbook-progress",
+                ProgressBarValue::ratio(progress, 10000),
+            )
+            .policy(ProgressBarPolicy::compact().symbols("━", "━", "╸"))
+            .styles(ProgressBarStyles {
+                filled: Style::new().fg(Color::Cyan),
+                empty: Style::new().fg(Color::BrightBlack),
+                ..ProgressBarStyles::default()
+            }),
+        );
         if !self.audience {
             if width >= 66 {
                 column = column
@@ -281,6 +314,20 @@ impl<'a> PlaybookDemo<'a> {
                 }
             }
         }
+        if self.surface.is_none() {
+            let available = height.saturating_sub(chrome);
+            column = column.child(
+                SizeBox::new(
+                    Surface::new(TextBlock::new("Preview · Run starts the terminal")).border(
+                        bmux_tui::chrome::Border::new(
+                            bmux_tui::chrome::BorderSet::ROUNDED,
+                            Style::new().fg(Color::BrightBlack),
+                        ),
+                    ),
+                )
+                .height(available),
+            );
+        }
         column = column.child(self.toolbar(inner));
         Element::new(
             SizeBox::new(Surface::new(column).border(bmux_tui::chrome::Border::new(
@@ -300,13 +347,18 @@ impl Component for PlaybookDemo<'_> {
         self.audience.hash(&mut state);
         self.title.hash(&mut state);
         self.viewport.hash(&mut state);
+        self.preview_size.width.hash(&mut state);
+        self.preview_size.height.hash(&mut state);
         ComponentRevision::new(state.finish(), state.finish())
     }
     fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
         let area = self.surface.map(|s| s.buffer().area());
-        let width = constraints
-            .max_width()
-            .min(area.map_or(88, |a| u64::from(a.width) + 2).max(70));
+        let width = constraints.max_width().min(
+            area.map_or(u64::from(self.preview_size.width) + 2, |a| {
+                u64::from(a.width) + 2
+            })
+            .max(70),
+        );
         let chrome = self
             .header()
             .layout(Constraints::for_width(width.saturating_sub(2)), cx)
@@ -318,10 +370,9 @@ impl Component for PlaybookDemo<'_> {
                 .size
                 .height
             + 2;
-        let height = constraints
-            .max_height()
-            .unwrap_or(128)
-            .min(area.map_or(8, |a| u64::from(a.height)) + chrome);
+        let height = constraints.max_height().unwrap_or(128).min(
+            area.map_or(u64::from(self.preview_size.height), |a| u64::from(a.height)) + chrome,
+        );
         self.tree(width, height)
             .layout(Constraints::new(0, width, 0, Some(height)), cx)
     }
@@ -429,6 +480,28 @@ mod tests {
             assert_eq!(text.contains("Viewport cropped"), width < 82);
             assert!(!text.contains("[ Pause ]"));
         }
+    }
+    #[test]
+    fn preview_reserves_terminal_height_without_starting_an_attempt() {
+        let snapshot = LifecycleSnapshot {
+            owner_epoch: uuid::Uuid::new_v4(),
+            revision: 0,
+            attempt: None,
+            acknowledgment: None,
+            surface: None,
+            cancellation_revision: 0,
+            unresolved: false,
+            error: None,
+        };
+        let controller = Controller::detached(snapshot.clone());
+        let demo = PlaybookDemo::new("Demo", &controller, &snapshot)
+            .preview_size(bmux_tui::geometry::Size::new(80, 24));
+        let layout = demo.layout(
+            Constraints::loose(bmux_tui::geometry::Size::new(120, 40)),
+            &mut LayoutCx::default(),
+        );
+        assert!(layout.size.height >= 30);
+        assert!(controller.latest().attempt.is_none());
     }
     #[test]
     fn speed_targets_and_close_are_exact_not_generic_clicks() {

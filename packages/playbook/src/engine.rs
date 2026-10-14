@@ -3743,6 +3743,9 @@ async fn execute_step_paced(
                     .map(|p| p.id)
                     .ok_or_else(|| anyhow::anyhow!("paced input target unavailable"))?;
                 let chunks = super::pacing::chunks(&resolved_keys);
+                if let Some(control) = managed {
+                    control.typing_progress(0, chunks.len())?;
+                }
                 for (position, chunk) in chunks.iter().enumerate() {
                     if position > 0 {
                         super::pacing::wait(managed, playback_speed, true, pacing_credit).await?;
@@ -3759,6 +3762,9 @@ async fn execute_step_paced(
                         .map_err(|_| anyhow::Error::new(super::pacing::UnresolvedInput))?;
                     if accepted != chunk.len() {
                         return Err(anyhow::Error::new(super::pacing::UnresolvedInput));
+                    }
+                    if let Some(control) = managed {
+                        control.typing_progress(position + 1, chunks.len())?;
                     }
                 }
             } else if let Some(target_index) = pane {

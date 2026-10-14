@@ -1251,13 +1251,41 @@ pub(crate) fn audience_surfaces(
                 .as_ref()
                 .and_then(|demos| demos.entries.get(&block_id))
             {
-                demo.view(true)
+                if demo.open {
+                    demo.view(true)
+                } else {
+                    registry.build(block).map_err(anyhow::Error::msg)?
+                }
             } else {
                 registry.build(block).map_err(anyhow::Error::msg)?
             };
-            let size = Size::new(80, 24);
+            let size = player
+                .live_demos
+                .as_ref()
+                .and_then(|demos| demos.entries.get(&block_id))
+                .filter(|demo| demo.open)
+                .map_or(Size::new(80, 24), |demo| {
+                    let area = demo
+                        .snapshot
+                        .surface
+                        .as_ref()
+                        .map(|c| c.surface.buffer().area());
+                    Size::new(
+                        area.map_or(demo.preview_size.width, |a| a.width)
+                            .saturating_add(2)
+                            .min(240),
+                        area.map_or(demo.preview_size.height, |a| a.height)
+                            .saturating_add(8)
+                            .min(128),
+                    )
+                });
             let layout = component.layout(Constraints::tight(size), &mut LayoutCx::default());
-            let scene = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 80, 24));
+            let scene = bmux_tui::presentation::PresentationState::new(Rect::new(
+                0,
+                0,
+                size.width,
+                size.height,
+            ));
             let prepared = scene
                 .prepare_bounded(
                     bmux_tui::presentation::PresentationLimits {
@@ -1679,6 +1707,46 @@ fn overlay_key_input(key: &bmux_keyboard::KeyStroke) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn audience_demo_tracks_open_close_without_execution() {
+        let fixture = crate::playbook_live::reload_tests::Fixture::new();
+        let deck = crate::playbook_live::reload_tests::deck("s", "old");
+        let mut player = Player::local(deck.clone(), None, true);
+        player.live_demos = Some(
+            crate::playbook_live::LiveDemos::prepare_local(&deck, &fixture.environment, vec![])
+                .unwrap(),
+        );
+        for (input, open) in [("close", false), ("open", true), ("close", false)] {
+            player
+                .live_demos
+                .as_mut()
+                .unwrap()
+                .input("demo", input, true)
+                .unwrap();
+            let surfaces = audience_surfaces(&mut player, "test", 1).unwrap();
+            let text = surfaces[0]
+                .frame
+                .buffer()
+                .cells()
+                .iter()
+                .map(|c| c.symbol.as_str())
+                .collect::<String>();
+            assert_eq!(text.contains("Preview"), open);
+            assert!(
+                player.live_demos.as_ref().unwrap().entries["demo"]
+                    .snapshot
+                    .attempt
+                    .is_none()
+            );
+        }
+        player
+            .live_demos
+            .as_mut()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+    }
     #[test]
     fn native_sources_follow_clipped_visible_fragments_and_preserve_prepared_code() {
         let deck = bmux_presenter::DeckBuilder::new("sources")

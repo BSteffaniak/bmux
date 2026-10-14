@@ -40,7 +40,12 @@ pub async fn observe(
         .env("BMUX_STATE_DIR", &attempt.state_dir)
         .args(["attach", &session.to_string(), "--observer-socket"])
         .arg(&socket)
-        .args(["--observer-cols", "80", "--observer-rows", "24"])
+        .args([
+            "--observer-cols",
+            &attempt.viewport_cols.to_string(),
+            "--observer-rows",
+            &attempt.viewport_rows.to_string(),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

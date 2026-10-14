@@ -19,6 +19,7 @@ pub(crate) struct DemoEntry {
     pub snapshot: LifecycleSnapshot,
     pub open: bool,
     pub viewport: (u16, u16),
+    pub preview_size: bmux_tui::geometry::Size,
 }
 pub(crate) struct LiveDemos {
     pub entries: BTreeMap<String, DemoEntry>,
@@ -192,6 +193,14 @@ impl LiveDemos {
                         .approval
                         .approved_identity(&config)
                         .map_err(|error| error.to_string())?;
+                    let parsed = environment
+                        .approval
+                        .preview(&config)
+                        .map_err(|e| e.to_string())?;
+                    let preview_size = bmux_tui::geometry::Size::new(
+                        parsed.config.viewport.cols,
+                        parsed.config.viewport.rows,
+                    );
                     let snapshot = LifecycleSnapshot {
                         owner_epoch: uuid::Uuid::new_v4(),
                         revision: 0,
@@ -213,6 +222,7 @@ impl LiveDemos {
                             snapshot,
                             open: false,
                             viewport: (0, 0),
+                            preview_size,
                         },
                     );
                 }
@@ -383,7 +393,8 @@ impl DemoEntry {
             &self.snapshot,
         )
         .audience(audience)
-        .viewport(self.viewport);
+        .viewport(self.viewport)
+        .preview_size(self.preview_size);
         if let Some(capture) = &self.snapshot.surface {
             component = component.retained_surface(&capture.surface);
         }

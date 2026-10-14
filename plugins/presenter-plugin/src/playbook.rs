@@ -125,6 +125,11 @@ impl Approval {
         );
         Ok((source, approved.clone()))
     }
+    /// Read approved metadata only; never executes or prepares a runtime.
+    pub(crate) fn preview(&self, config: &DemoConfig) -> Result<bmux_playbook::types::Playbook> {
+        let (source, _) = self.approved_identity(config)?;
+        bmux_playbook::parser::parse_file_scoped(&source, Some(&self.root))
+    }
     /// Recheck the complete no-follow include closure before service preparation.
     /// The service freezes the same digest-bound closure before execution.
     pub fn preparation(

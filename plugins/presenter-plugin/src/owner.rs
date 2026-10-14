@@ -145,9 +145,16 @@ impl LinkedOwner {
             .demos
             .get(context.instance)
             .and_then(|demos| demos.visible(slide.id.as_str()))
-            .and_then(|(_, demo)| demo.snapshot.surface.as_ref())
-            .map_or(Size::new(80, 38), |capture| {
-                let area = capture.surface.buffer().area();
+            .map_or(Size::new(80, 38), |(_, demo)| {
+                let area = demo.snapshot.surface.as_ref().map_or(
+                    bmux_tui::geometry::Rect::new(
+                        0,
+                        0,
+                        demo.preview_size.width,
+                        demo.preview_size.height,
+                    ),
+                    |capture| capture.surface.buffer().area(),
+                );
                 Size::new(
                     area.width.saturating_add(2).clamp(80, 240),
                     area.height.saturating_add(8).clamp(38, 128),

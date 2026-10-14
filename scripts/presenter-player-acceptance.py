@@ -291,6 +291,9 @@ class Acceptance(OWNED.Acceptance):
         self.player.send(b"\t")
         self.player.send(b"o")
         wait_for("opened committed modal", lambda: self.control("play-toggle", "Play"), 20)
+        initial_frame = self.terminal()
+        require("Preview" in '\n'.join(initial_frame["rows"]), "missing empty preview before Run")
+        self.audience_capture("Preview")
         baseline = self.observed_bmux()
         self.stable("overlay created execution before Run", lambda: not self.attempts()
                     and not list(self.root.rglob("runtime.json")) and not self.service_roots()
@@ -306,13 +309,27 @@ class Acceptance(OWNED.Acceptance):
         require(directory != self.root / "runtime", "execution reused unrelated runtime")
         require(self.control_speed() == "half", "initial half pace lost")
         wait_for("half speed incrementally types shell command", lambda: self.partial(0), 25)
+        wait_for("authoritative fractional typing progress", lambda:
+                 0 < self.attempt().get("typing_done", 0) < self.attempt().get("typing_total", 0), 15)
         half_prefix = len(self.typed_prefix(0))
         wait_for("half speed commits multiple incremental outputs", lambda:
                  half_prefix < len(self.typed_prefix(0)) < len(self.payloads[0]), 10)
         self.click("play-toggle", "Pause")
         wait_for("paused partial action", self.paused, 15)
         wait_for("Pause committed label", lambda: self.control("play-toggle", "Play"), 15)
-        paused_prefix = self.typed_prefix(0)
+        # Pause admission precedes observer delivery: drain already accepted
+        # input's echo before asserting the committed display is stable.
+        def paused_echo_settled():
+            prefix = self.typed_prefix(0)
+            done = self.attempt().get("typing_done", 0)
+            last = getattr(self, "pause_observation", None)
+            current = (prefix, done)
+            now = OWNED.time.monotonic()
+            if last is None or last[0] != current:
+                self.pause_observation = (current, now)
+                return None
+            return prefix if now - last[1] >= 0.3 else None
+        paused_prefix = wait_for("paused accepted echo drained", paused_echo_settled, 15)
         require(32 <= len(paused_prefix) < len(self.payloads[0]), "Pause missed partial command")
         progress = self.attempt()
         self.stable("Pause changed partial shell input", lambda: self.typed_prefix(0) == paused_prefix
@@ -360,6 +377,8 @@ class Acceptance(OWNED.Acceptance):
         self.audience_capture(self.payloads[2][:32])
         self.click("close")
         wait_for("navigation modal closed", lambda: self.terminal() and not self.terminal()["controls"], 15)
+        wait_for("audience modal hidden after Close", lambda:
+                 self.snapshot(self.audience_url) and "session retained" not in WEB.text(self.snapshot(self.audience_url)), 15)
         self.player.send(b"\x1b[C")
         self.audience_capture("Retained final view")
         require(self.attempt()["generation"] == generation and not self.attempt()["cleanup_acknowledged"],

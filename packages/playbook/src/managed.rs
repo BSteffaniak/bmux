@@ -30,6 +30,8 @@ struct Snapshot<'a> {
     playback_speed: &'a str,
     current_action: &'a str,
     action_count: usize,
+    typing_done: u64,
+    typing_total: u64,
     session_id: Option<String>,
     cleanup_acknowledged: bool,
     diagnostic: Option<&'a str>,
@@ -42,6 +44,9 @@ pub struct ManagedRun {
     stepping: AtomicBool,
     current_action: &'static str,
     action_count: usize,
+    typing_done: AtomicU64,
+    typing_total: AtomicU64,
+    progress_context: std::sync::Mutex<(usize, Option<uuid::Uuid>)>,
 }
 
 impl ManagedRun {
@@ -61,6 +66,9 @@ impl ManagedRun {
             stepping: AtomicBool::new(false),
             current_action: "",
             action_count: 0,
+            typing_done: AtomicU64::new(0),
+            typing_total: AtomicU64::new(0),
+            progress_context: std::sync::Mutex::new((0, None)),
         }))
     }
 
@@ -98,9 +106,21 @@ impl ManagedRun {
     }
 
     pub fn action(&mut self, label: &'static str, count: usize) {
+        self.typing_done.store(0, Ordering::Relaxed);
+        self.typing_total.store(0, Ordering::Relaxed);
         self.current_action = label;
         self.action_count = count;
         self.stepping.store(false, Ordering::Relaxed);
+    }
+
+    pub fn typing_progress(&self, done: usize, total: usize) -> Result<()> {
+        self.typing_done.store(done as u64, Ordering::Relaxed);
+        self.typing_total.store(total as u64, Ordering::Relaxed);
+        let (step, session) = *self
+            .progress_context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("progress context poisoned"))?;
+        self.publish("running", step, session, false, None)
     }
 
     pub fn speed(&self) -> Result<crate::PlaybackSpeed> {
@@ -157,6 +177,10 @@ impl ManagedRun {
         cleanup_acknowledged: bool,
         diagnostic: Option<&str>,
     ) -> Result<()> {
+        *self
+            .progress_context
+            .lock()
+            .map_err(|_| anyhow::anyhow!("progress context poisoned"))? = (step, session_id);
         let diagnostic = diagnostic.map(|value| value.chars().take(2048).collect::<String>());
         let speed = self.control()?.playback_speed;
         let snapshot = Snapshot {
@@ -166,6 +190,8 @@ impl ManagedRun {
             playback_speed: &speed,
             current_action: self.current_action,
             action_count: self.action_count,
+            typing_done: self.typing_done.load(Ordering::Relaxed),
+            typing_total: self.typing_total.load(Ordering::Relaxed),
             session_id: session_id.map(|id| id.to_string()),
             cleanup_acknowledged,
             diagnostic: diagnostic.as_deref(),
@@ -233,6 +259,9 @@ mod tests {
             stepping: AtomicBool::new(false),
             current_action: "send-keys",
             action_count: 1,
+            typing_done: AtomicU64::new(0),
+            typing_total: AtomicU64::new(0),
+            progress_context: std::sync::Mutex::new((0, None)),
         };
         write_control(&run, false, 0, false, 7, "normal");
         (root, run)
@@ -257,6 +286,23 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn typing_progress_preserves_session_and_action_context() {
+        let (_root, mut run) = fixture();
+        run.action("send-keys", 5);
+        let session = uuid::Uuid::new_v4();
+        run.publish("running", 2, Some(session), false, None)
+            .unwrap();
+        run.typing_progress(3, 10).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run.root.join("runner.json")).unwrap()).unwrap();
+        assert_eq!(value["typing_done"], 3);
+        assert_eq!(value["typing_total"], 10);
+        assert_eq!(value["step"], 2);
+        assert_eq!(value["session_id"], session.to_string());
+        run.action("wait-for", 5);
+        assert_eq!(run.typing_done.load(Ordering::Relaxed), 0);
+    }
     #[tokio::test(start_paused = true)]
     async fn partial_typing_pause_resume_never_replays_or_enters_early() {
         let (_root, mut run) = fixture();
