@@ -169,7 +169,9 @@ fn watch_source(id: String, source: PathBuf) {
                 let Some(host) = all.get_mut(&id) else {
                     break;
                 };
-                let _ = reload(&mut host.host, loaded);
+                if let Err(error) = reload(&mut host.host, loaded) {
+                    eprintln!("Reload rejected; retaining last valid deck: {error}");
+                }
             }
         }
     });

@@ -30,6 +30,27 @@ diagrams are decoded/prepared outside update/paint; remote assets are opaque and
 fetched in bounded chunks. Private audience credentials grant navigation/demo
 input but never notes/effects; receive-only mode remains read-only.
 
+## Playback modal
+
+The presenter player centers a bounded retained modal with genuine TUI controls:
+Play/Pause, Step, Stop, Restart, Close, and Half/Normal/Double/Instant speed.
+Normal is the preparation default. Status reports the current action and action
+count, not arbitrary seek progress. Close/Escape and slide navigation hide the
+view without stopping its attempt. Removed references retain execution ownership;
+compatible reinsertions reuse it, and whole-owner shutdown explicitly settles it.
+
+Local and authenticated managed presenter clicks use committed clipped button
+hits. Managed surface metadata is private to effects/demo-input authorized
+principals; browser/audience rendering remains read-only without controls.
+
+For explicit PTY test capture, set `BMUX_PRESENTER_FRAME_EVIDENCE` to an absolute
+file path. Successful native presentation commits atomically replace a private
+0600 JSON file with `revision`, `width`, `height`, rendered `rows`, clipped
+`controls` (`id`, `input`, `x`, `y`, `width`, `height`, `enabled`), and `demo`
+(`id`, `owner_epoch`, `generation`) or null. No evidence is written when unset;
+publication errors are reported, not treated as successful capture. Speaker notes
+are suppressed on the terminal while this explicit test evidence mode is enabled.
+
 ## Runnable examples
 
 For Markdown playback, start with `packages/presenter/examples/quickstart.md`.

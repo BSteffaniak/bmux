@@ -25,6 +25,7 @@ struct Run {
     child: Option<Child>,
     control: Control,
     last_snapshot: Vec<u8>,
+    action_labels: Vec<&'static str>,
     stop_requested: Option<Instant>,
 }
 
@@ -42,6 +43,7 @@ struct Control {
     permits: u64,
     stop: bool,
     finish: bool,
+    playback_speed: String,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +51,10 @@ struct RunnerSnapshot {
     generation: u64,
     phase: String,
     step: u64,
+    #[serde(default)]
+    current_action: String,
+    #[serde(default)]
+    action_count: u64,
     session_id: Option<String>,
     cleanup_acknowledged: bool,
     diagnostic: Option<String>,
@@ -77,6 +83,13 @@ impl Owner {
     pub(super) fn prepare(&mut self, mut spec: Preparation) -> Result<Attempt> {
         uuid::Uuid::parse_str(&spec.request_id).map_err(message)?;
         let original_request = serde_json::to_vec(&spec).map_err(message)?;
+        let speed = if spec.playback_speed.is_empty() {
+            bmux_playbook::PlaybackSpeed::Instant
+        } else {
+            bmux_playbook::PlaybackSpeed::parse(&spec.playback_speed)
+                .ok_or("invalid playback speed; expected instant, half, normal, double")?
+        };
+        spec.playback_speed = speed.as_str().into();
         if let Some(existing) = self
             .runs
             .values_mut()
@@ -158,6 +171,9 @@ impl Owner {
             revision: 1,
             phase: "prepared".into(),
             step: 0,
+            playback_speed: spec.playback_speed.clone(),
+            current_action: String::new(),
+            action_count: 0,
             paused: false,
             cleanup_acknowledged: true,
             root: root.to_string_lossy().into_owned(),
@@ -194,6 +210,8 @@ impl Owner {
                 ));
             }
         }
+        let mut snapshot = snapshot;
+        snapshot.action_count = u64::try_from(deck.steps.len()).map_err(message)?;
         spec.source = frozen.to_string_lossy().into_owned();
         spec.allowed_root = root.join("sources").to_string_lossy().into_owned();
         let manifest = serde_json::to_vec(&RuntimeOwnership {
@@ -207,6 +225,8 @@ impl Owner {
         // Ownership now transfers to Run; failed/unacknowledged attempts retain
         // the path rather than letting a temporary guard delete a live socket.
         let _runtime = temporary.keep();
+        let action_labels = deck.steps.iter().map(|step| step.action.name()).collect();
+        let playback_speed = spec.playback_speed.clone();
         let run = Run {
             spec,
             original_request,
@@ -215,9 +235,11 @@ impl Owner {
             child: None,
             control: Control {
                 generation: self.generation,
+                playback_speed,
                 ..Control::default()
             },
             last_snapshot: Vec::new(),
+            action_labels,
             stop_requested: None,
         };
         run.write_control()?;
@@ -300,6 +322,26 @@ impl Owner {
         }
         run.write_control()?;
         run.snapshot.paused = run.control.paused;
+        run.snapshot.revision += 1;
+        Ok(run.snapshot.clone())
+    }
+
+    pub(super) fn set_playback_speed(&mut self, generation: u64, speed: &str) -> Result<Attempt> {
+        let speed = bmux_playbook::PlaybackSpeed::parse(speed)
+            .ok_or("invalid playback speed; expected instant, half, normal, double")?;
+        let run = self.run(generation)?;
+        run.refresh()?;
+        if run.control.stop || (run.child.is_none() && run.snapshot.phase != "prepared") {
+            return Err("attempt is stopped or settled".into());
+        }
+        run.control.playback_speed = speed.as_str().into();
+        run.write_control()?;
+        run.spec
+            .playback_speed
+            .clone_from(&run.control.playback_speed);
+        run.snapshot
+            .playback_speed
+            .clone_from(&run.control.playback_speed);
         run.snapshot.revision += 1;
         Ok(run.snapshot.clone())
     }
@@ -493,6 +535,21 @@ impl Run {
                 }
                 self.snapshot.phase = observed.phase;
                 self.snapshot.step = observed.step;
+                let expected_label = usize::try_from(observed.step)
+                    .ok()
+                    .and_then(|step| self.action_labels.get(step))
+                    .copied()
+                    .unwrap_or("");
+                // Never project arbitrary worker text as an action label.
+                self.snapshot.current_action = if observed.current_action == expected_label {
+                    expected_label.into()
+                } else {
+                    String::new()
+                };
+                if observed.action_count != 0 && observed.action_count != self.snapshot.action_count
+                {
+                    return Err("worker action count differs from prepared deck".into());
+                }
                 self.snapshot.session_id = observed.session_id;
                 self.snapshot.diagnostic = observed.diagnostic;
                 // Cleanup ack is published by the runner only after child reaping.
@@ -609,6 +666,7 @@ mod tests {
                 .into_owned(),
             attempts_root: root.to_string_lossy().into_owned(),
             trusted_executable_input: true,
+            playback_speed: "instant".into(),
             expected_closure_sha256: bmux_playbook::parser::source_closure_sha256(
                 &root.join("deck.playbook"),
                 root,
@@ -716,6 +774,42 @@ mod tests {
         }
         owner.runs[&attempt.generation].cleanup_runtime().unwrap();
         assert!(!runtime.exists());
+    }
+
+    #[test]
+    fn playback_speed_is_validated_fenced_retained_and_cannot_revive_stop() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("deck.playbook"), "new-session\n").unwrap();
+        let mut owner = Owner::default();
+        let mut spec = specification(root.path());
+        spec.playback_speed = "fast".into();
+        assert!(owner.prepare(spec).is_err());
+        let attempt = owner.prepare(specification(root.path())).unwrap();
+        assert_eq!(attempt.playback_speed, "instant");
+        assert_eq!(attempt.action_count, 1);
+        assert!(owner.set_playback_speed(0, "normal").is_err());
+        assert!(
+            owner
+                .set_playback_speed(attempt.generation, "fast")
+                .is_err()
+        );
+        for speed in ["half", "normal", "double", "instant"] {
+            let updated = owner.set_playback_speed(attempt.generation, speed).unwrap();
+            assert_eq!(updated.playback_speed, speed);
+            let control: serde_json::Value = serde_json::from_slice(
+                &fs::read(Path::new(&attempt.root).join("control.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(control["playback_speed"], speed);
+            assert_eq!(control["generation"], attempt.generation);
+        }
+        owner.control(attempt.generation, Command::Stop).unwrap();
+        assert!(
+            owner
+                .set_playback_speed(attempt.generation, "normal")
+                .is_err()
+        );
+        owner.runs[&attempt.generation].cleanup_runtime().unwrap();
     }
 
     #[test]

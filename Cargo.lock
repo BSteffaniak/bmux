@@ -2181,6 +2181,7 @@ dependencies = [
  "tokio",
  "toml 1.1.4+spec-1.1.0",
  "tracing",
+ "unicode-segmentation",
  "uuid",
 ]
 
@@ -2342,6 +2343,7 @@ dependencies = [
  "bmux_presenter_runtime",
  "bmux_syntax_render",
  "bmux_tui 0.0.1-alpha.1",
+ "bmux_tui_components 0.0.1-alpha.1",
  "bmux_tui_runtime",
  "bmux_web_host",
  "bmux_web_renderer",

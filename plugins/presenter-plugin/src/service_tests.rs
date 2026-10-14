@@ -195,6 +195,8 @@ mod tests {
         let mut state = bmux_presenter::PresentationState::new(&deck);
         state.reveal_step = 1;
         let surfaces = vec![MirrorFrame {
+            interaction_revision: None,
+            private_scene: None,
             surface_id: "control".into(),
             slide_id: "slide".into(),
             revision: 81,

@@ -21,6 +21,8 @@ pub(crate) struct DemoEntry {
 }
 pub(crate) struct LiveDemos {
     pub entries: BTreeMap<String, DemoEntry>,
+    // References may disappear; execution ownership survives until explicit shutdown.
+    retained: Vec<(String, DemoEntry)>,
     connection: crate::owned_runtime::ExecutionConnection,
     environment: DemoEnvironment,
 }
@@ -84,6 +86,7 @@ impl LiveDemos {
     fn detached(deck: &Deck, environment: &DemoEnvironment) -> Result<Self, String> {
         let mut demos = Self {
             entries: BTreeMap::new(),
+            retained: Vec::new(),
             connection: crate::owned_runtime::ExecutionConnection::Host(environment.paths.clone()),
             environment: environment.clone(),
         };
@@ -108,25 +111,20 @@ impl LiveDemos {
         }
         Ok(candidate)
     }
-    /// Explicit retirement admission, only after all speculative validation.
-    /// A rejected candidate never receives a running handle. Retry after settlement.
+    /// Reload changes presentation references, never execution lifetime.
     pub fn admit_reload(&mut self, candidate: &Self) -> Result<(), String> {
-        let mut pending = false;
-        for (id, entry) in &self.entries {
-            let compatible = candidate
-                .entries
-                .get(id)
-                .is_some_and(|next| entry.compatible(next));
-            if !compatible && !entry.controller.settled() {
-                entry.controller.cancel_navigation();
-                pending = true;
-            }
-        }
-        if pending {
-            return Err(
-                "reload retirement pending: removed or changed playbooks must settle; retry reload"
-                    .into(),
-            );
+        let retiring = self
+            .entries
+            .iter()
+            .filter(|(id, entry)| {
+                !candidate
+                    .entries
+                    .get(*id)
+                    .is_some_and(|next| entry.compatible(next))
+            })
+            .count();
+        if self.retained.len() + retiring > 16 {
+            return Err("retained playbook owner limit reached; explicitly shut down the owner before replacing more demos".into());
         }
         Ok(())
     }
@@ -145,6 +143,34 @@ impl LiveDemos {
                 next.snapshot = next.controller.latest();
             }
         }
+        candidate.retained.append(&mut self.retained);
+        candidate
+            .retained
+            .retain(|(_, entry)| !entry.controller.settled());
+        for (id, next) in &mut candidate.entries {
+            if next.snapshot.attempt.is_none()
+                && let Some(index) = candidate
+                    .retained
+                    .iter()
+                    .position(|(old_id, old)| old_id == id && old.compatible(next))
+            {
+                let (_, mut old) = candidate.retained.remove(index);
+                old.slide.clone_from(&next.slide);
+                old.config.clone_from(&next.config);
+                old.open = false;
+                *next = old;
+            }
+        }
+        candidate
+            .retained
+            .extend(
+                std::mem::take(&mut self.entries)
+                    .into_iter()
+                    .map(|(id, mut entry)| {
+                        entry.open = false;
+                        (id, entry)
+                    }),
+            );
     }
     fn collect(
         &mut self,
@@ -201,10 +227,18 @@ impl LiveDemos {
         if let crate::owned_runtime::ExecutionConnection::Local(runtime) = &self.connection {
             runtime.request_shutdown();
         }
-        for entry in self.entries.values() {
+        for entry in self
+            .entries
+            .values()
+            .chain(self.retained.iter().map(|(_, entry)| entry))
+        {
             entry.controller.request_shutdown();
         }
-        for entry in self.entries.values_mut() {
+        for entry in self
+            .entries
+            .values_mut()
+            .chain(self.retained.iter_mut().map(|(_, entry)| entry))
+        {
             entry.controller.shutdown_settled().await?;
         }
         if let crate::owned_runtime::ExecutionConnection::Local(runtime) = &self.connection {
@@ -214,7 +248,11 @@ impl LiveDemos {
     }
     pub fn update(&mut self) -> bool {
         let mut dirty = false;
-        for entry in self.entries.values_mut() {
+        for entry in self
+            .entries
+            .values_mut()
+            .chain(self.retained.iter_mut().map(|(_, entry)| entry))
+        {
             if let Some(snapshot) = entry.controller.take_changed()
                 && snapshot.owner_epoch == entry.snapshot.owner_epoch
             {
@@ -230,7 +268,7 @@ impl LiveDemos {
             .values_mut()
             .filter(|entry| entry.slide == slide)
         {
-            entry.controller.cancel_navigation();
+            entry.open = false;
         }
         Ok(())
     }
@@ -292,6 +330,11 @@ impl LiveDemos {
             return Err("open the playbook overlay before controlling execution".into());
         }
         let control = match input {
+            "play-toggle" => crate::playbook_component::play_control(&entry.controller.latest()),
+            "speed:half" => Control::Speed(crate::playbook_controller::PlaybackSpeed::Half),
+            "speed:normal" => Control::Speed(crate::playbook_controller::PlaybackSpeed::Normal),
+            "speed:double" => Control::Speed(crate::playbook_controller::PlaybackSpeed::Double),
+            "speed:instant" => Control::Speed(crate::playbook_controller::PlaybackSpeed::Instant),
             "run" | "r" => Control::Run,
             "stop" | "s" => Control::Stop,
             "restart" | "R" => Control::Restart,

@@ -25,9 +25,43 @@ pub mod subst;
 pub mod transport;
 pub mod types;
 
+#[cfg(feature = "runtime")]
+mod pacing;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlaybackSpeed {
+    #[default]
+    Instant,
+    Half,
+    Normal,
+    Double,
+}
+
+impl PlaybackSpeed {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "instant" => Some(Self::Instant),
+            "half" => Some(Self::Half),
+            "normal" => Some(Self::Normal),
+            "double" => Some(Self::Double),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Instant => "instant",
+            Self::Half => "half",
+            Self::Normal => "normal",
+            Self::Double => "double",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunOptions {
     pub interactive: bool,
+    pub playback_speed: PlaybackSpeed,
 }
 
 /// Execute a real playbook using caller-owned infrastructure.

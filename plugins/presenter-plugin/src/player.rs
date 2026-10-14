@@ -116,6 +116,10 @@ struct CommittedDemo {
 struct PresentationView {
     painted_demo: Option<CommittedDemo>,
     pending_demo: Option<CommittedDemo>,
+    painted_hits: bmux_tui::hit::HitMap,
+    pending_hits: bmux_tui::hit::HitMap,
+    pending_evidence: Option<serde_json::Value>,
+    evidence_revision: u64,
     viewer: ViewerState,
     painted_viewer: ViewerState,
     pending_viewer: ViewerState,
@@ -146,6 +150,7 @@ impl PresentationView {
     fn commit(&mut self) {
         self.displayed = self.pending_content.take();
         self.painted_demo = self.pending_demo.take();
+        self.painted_hits = std::mem::take(&mut self.pending_hits);
         self.painted_layout = self.pending_layout.take();
         self.painted_focus = self.pending_focus.take();
         self.painted_viewer
@@ -297,12 +302,58 @@ impl Player {
         {
             return Ok(false);
         }
-        if self
-            .surfaces
-            .iter()
-            .all(|surface| surface.surface_id != *surface_id || surface.revision != *revision)
-        {
+        if self.surfaces.iter().all(|surface| {
+            surface.surface_id != *surface_id
+                || surface.private_scene.as_ref().map_or(
+                    surface.interaction_revision.unwrap_or(surface.revision),
+                    |scene| scene.frame.revision,
+                ) != *revision
+        }) {
             return Ok(false);
+        }
+        if self.local_view.painted_demo.is_some()
+            && let Some(scene) = self
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface_id == *surface_id)
+                .and_then(|surface| surface.private_scene.as_ref())
+            && let Event::Key(key) = event
+        {
+            let token = match overlay_key_input(key).as_deref() {
+                Some("r") => "run",
+                Some("p") => "pause",
+                Some("c") => "resume",
+                Some("s") => "stop",
+                Some("R") => "restart",
+                Some("n") => "step",
+                Some("escape") => "close",
+                _ => return Ok(false),
+            };
+            let target_token = if matches!(token, "run" | "pause" | "resume") {
+                "play-toggle"
+            } else {
+                token
+            };
+            let Some(target) = scene
+                .interactions
+                .iter()
+                .find(|target| target.input == target_token && target.enabled)
+            else {
+                return Ok(false);
+            };
+            remote
+                .actions
+                .try_send(bmux_presenter_runtime::Action::DemoInput(
+                    bmux_presenter_runtime::SurfaceInput {
+                        surface_id: surface_id.clone(),
+                        surface_revision: *revision,
+                        x: target.area.x,
+                        y: target.area.y,
+                        input: token.into(),
+                    },
+                ))
+                .context("managed modal key admission full or disconnected")?;
+            return Ok(true);
         }
         let (x, y, input) = match event {
             Event::Key(key) => {
@@ -334,10 +385,19 @@ impl Player {
             }
             remote
                 .actions
-                .try_send(bmux_presenter_runtime::Action::Effect {
-                    name: format!("playbook-demo:{surface_id}"),
-                    input: input.clone(),
-                })
+                .try_send(bmux_presenter_runtime::Action::DemoInput(
+                    bmux_presenter_runtime::SurfaceInput {
+                        surface_id: surface_id.clone(),
+                        surface_revision: *revision,
+                        x,
+                        y,
+                        input: if input == "o" {
+                            "open".into()
+                        } else {
+                            input.clone()
+                        },
+                    },
+                ))
                 .context("playbook effect admission full or disconnected")?;
             return Ok(true);
         }
@@ -477,6 +537,9 @@ impl Player {
         self.local_view.painted_layout = None;
         self.local_view.pending_layout = None;
         self.local_view.painted_demo = None;
+        self.local_view.painted_hits = bmux_tui::hit::HitMap::new();
+        self.local_view.pending_hits = bmux_tui::hit::HitMap::new();
+        self.local_view.pending_evidence = None;
         self.local_view.pending_demo = None;
         self.local_view.focused_block = None;
         self.local_view.mirror_geometry.clear();
@@ -559,6 +622,14 @@ impl Program for Player {
         _report: bmux_tui_runtime::PresentReport,
     ) -> Update<Message> {
         self.local_view.commit();
+        if let Some(mut evidence) = self.local_view.pending_evidence.take() {
+            self.local_view.evidence_revision = self.local_view.evidence_revision.saturating_add(1);
+            evidence["revision"] = self.local_view.evidence_revision.into();
+            if let Err(error) = crate::player_evidence::publish(&evidence) {
+                self.status = Some(format!("Presenter frame evidence failed: {error}"));
+                eprintln!("Presenter frame evidence failed: {error}");
+            }
+        }
         if let Some(browser) = self.browser.clone() {
             let size = self.audience_size;
             let result = match browser.lock() {
@@ -658,10 +729,11 @@ impl Program for Player {
                         return Ok(Update::redraw());
                     }
                 }
-                if self.local_view.painted_demo.is_some()
-                    && matches!(key.key, KeyCode::Tab | KeyCode::Enter)
-                {
-                    return Ok(Update::none());
+                if self.local_view.painted_demo.is_some() {
+                    if self.remote.is_some() {
+                        let _ = self.route_mirror(&Event::Key(key))?;
+                    }
+                    return Ok(Update::redraw());
                 }
                 if key.key == KeyCode::Char('o')
                     && self.remote.is_none()
@@ -741,7 +813,49 @@ impl Program for Player {
             RuntimeEvent::Terminal(event) => {
                 // A displayed local modal never forwards pointer/paste to its
                 // obscured slide. Closing takes effect after the next commit.
-                if self.local_view.painted_demo.is_some() {
+                if let Some(demo) = self.local_view.painted_demo.clone() {
+                    if let Event::Mouse(mouse) = &event
+                        && mouse.kind
+                            == bmux_tui::event::MouseEventKind::Down(
+                                bmux_tui::event::MouseButton::Left,
+                            )
+                        && let Some(hit) = self.local_view.painted_hits.hit_mouse(*mouse)
+                        && let Some(input) =
+                            crate::playbook_component::target_input(hit.id().as_str())
+                    {
+                        if let Some(demos) = &mut self.live_demos {
+                            self.status = Some(
+                                demos
+                                    .input_committed(
+                                        &demo.id,
+                                        demo.owner_epoch,
+                                        demo.generation,
+                                        input,
+                                    )
+                                    .unwrap_or_else(|error| error),
+                            );
+                        } else if let Some(remote) = &self.remote
+                            && !remote.receive_only
+                            && let Some((surface_id, revision, _, placement)) =
+                                self.local_view.mirror_geometry.first()
+                            && let Some((x, y)) =
+                                placement.input_point(mouse.position.x, mouse.position.y)
+                        {
+                            remote
+                                .actions
+                                .try_send(bmux_presenter_runtime::Action::DemoInput(
+                                    bmux_presenter_runtime::SurfaceInput {
+                                        surface_id: surface_id.clone(),
+                                        surface_revision: *revision,
+                                        x,
+                                        y,
+                                        input: input.into(),
+                                    },
+                                ))
+                                .context("managed modal input admission full or disconnected")?;
+                        }
+                        return Ok(Update::redraw());
+                    }
                     return Ok(Update::none());
                 }
                 let _ = self.route_mirror(&event)?;
@@ -831,6 +945,19 @@ fn paint_audience(
                     .is_none_or(|id| id.as_str() == surface.surface_id)
         })
     });
+    let operator = if show_local_focus {
+        mirror_surface
+            .and_then(|surface| surface.private_scene.as_ref())
+            .and_then(|scene| {
+                Some(crate::mirror::OperatorMirror {
+                    mirror: crate::mirror::MirrorComponent::new(&scene.frame, 16_384, 512 * 1024)
+                        .ok()?,
+                    scene,
+                })
+            })
+    } else {
+        None
+    };
     let mirror = mirror_surface
         .and_then(|surface| crate::mirror::MirrorComponent::new(surface, 16_384, 512 * 1024).ok());
     let mut component = ViewerComponent::new(
@@ -853,10 +980,54 @@ fn paint_audience(
         .as_ref()
         .and_then(|slide| content.live_demos.as_ref()?.visible(slide.as_str()));
     let mut pending_mirror_geometry = vec![];
-    let (layout, demo_id) = if let Some((id, demo)) = live {
-        let overlay = bmux_tui::composition::Overlay::new(component, demo.view(!show_local_focus))
-            .id(format!("playbook-overlay-{id}"))
+    let (layout, demo_id) = if let Some(operator) = &operator {
+        let id = operator.scene.identity["id"].as_str().unwrap_or_default();
+        let overlay = bmux_tui::composition::Overlay::new(component, operator)
             .modal(bmux_tui::focus::FocusScopeId::new(format!("playbook-{id}")));
+        let layout = overlay.layout(Constraints::tight(size), &mut LayoutCx::default());
+        cx.with_child(
+            0,
+            0,
+            LocalRect::new(0, 0, size.width, size.height),
+            |child| overlay.paint(&layout, child),
+        );
+        if let (Some(surface), Some(foreground)) = (mirror_surface, layout.children.get(1))
+            && let Some(mut placement) = operator.mirror.placement(&foreground.node)
+        {
+            placement.destination_x = placement
+                .destination_x
+                .saturating_add(u16::try_from(foreground.x).unwrap_or(u16::MAX));
+            placement.destination_y = placement
+                .destination_y
+                .saturating_add(u16::try_from(foreground.y).unwrap_or(u16::MAX));
+            pending_mirror_geometry.push((
+                surface.surface_id.clone(),
+                operator.scene.frame.revision,
+                surface.slide_id.clone(),
+                placement,
+            ));
+        }
+        (
+            layout,
+            Some(CommittedDemo {
+                id: id.into(),
+                owner_epoch: operator.scene.identity["owner_epoch"]
+                    .as_str()
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .unwrap_or_default(),
+                generation: operator.scene.identity["generation"].as_u64(),
+            }),
+        )
+    } else if let Some((id, demo)) = live {
+        let overlay = bmux_tui::composition::Overlay::new(
+            bmux_tui::composition::StyleScope::new(
+                component,
+                bmux_tui::style::Style::new().add_modifier(bmux_tui::style::Modifier::DIM),
+            ),
+            demo.view(!show_local_focus),
+        )
+        .id(format!("playbook-overlay-{id}"))
+        .modal(bmux_tui::focus::FocusScopeId::new(format!("playbook-{id}")));
         let layout = overlay.layout(Constraints::tight(size), &mut LayoutCx::default());
         cx.with_child(
             0,
@@ -897,7 +1068,7 @@ fn paint_audience(
         {
             pending_mirror_geometry.push((
                 surface.surface_id.clone(),
-                surface.revision,
+                surface.interaction_revision.unwrap_or(surface.revision),
                 surface.slide_id.clone(),
                 placement,
             ));
@@ -912,7 +1083,12 @@ fn paint_audience(
 
 fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintCx<'_, '_>) {
     let area = cx.area();
-    let notes_height = if player.presenter { area.height / 3 } else { 0 };
+    let notes_height =
+        if player.presenter && std::env::var_os("BMUX_PRESENTER_FRAME_EVIDENCE").is_none() {
+            area.height / 3
+        } else {
+            0
+        };
     let slide_height = area.height.saturating_sub(notes_height).saturating_sub(1);
     let audience_size = Size::new(area.width, slide_height);
     player.audience_size = audience_size;
@@ -1280,6 +1456,16 @@ async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> 
                         .into_iter()
                         .collect::<Vec<_>>();
                     prepared.set_modal_scopes(&scopes);
+                    player.local_view.pending_hits = prepared.hits().clone();
+                    player.local_view.pending_evidence = crate::player_evidence::capture(
+                        prepared, player.local_view.pending_demo.as_ref().map(|demo| {
+                            serde_json::json!({"id":demo.id,"owner_epoch":demo.owner_epoch.to_string(),"generation":demo.generation})
+                        }));
+                    if let Some(evidence) = &mut player.local_view.pending_evidence {
+                        evidence["surface_inputs"] = serde_json::json!(player.local_view.pending_mirror_geometry.iter().map(|(id, revision, _, p)| {
+                            serde_json::json!({"id":id,"revision":revision,"x":p.destination_x,"y":p.destination_y,"width":p.width,"height":p.height,"source_x":p.source_x,"source_y":p.source_y})
+                        }).collect::<Vec<_>>());
+                    }
                     install_native_selection_sources(player, prepared)
                         .map_err(|error| std::io::Error::other(error.to_string()))?;
                     prepared
@@ -1698,22 +1884,10 @@ mod tests {
         updates
             .try_send(Ok((empty(), crate::rich::RichAssets::default())))
             .unwrap();
-        assert!(!player.reload());
-        assert_eq!(player.deck.slides[0].id.as_str(), "moved");
-        assert!(*running.cancelled.borrow() > 0);
-        assert!(!*running.stopped.borrow());
-        running.updates.send_modify(|snapshot| {
-            snapshot.cancellation_revision = *running.cancelled.borrow();
-            let attempt = snapshot.attempt.as_mut().unwrap();
-            attempt.phase = "stopped".into();
-            attempt.cleanup_acknowledged = true;
-        });
-        updates
-            .try_send(Ok((empty(), crate::rich::RichAssets::default())))
-            .unwrap();
         assert!(player.reload());
         assert!(player.live_demos.as_ref().unwrap().entries.is_empty());
-        assert!(*running.stopped.borrow());
+        assert_eq!(*running.cancelled.borrow(), 0);
+        assert!(!*running.stopped.borrow());
     }
 
     #[test]
@@ -1814,6 +1988,8 @@ mod tests {
             .unwrap();
         let mut player = Player::local(deck, None, false);
         let surface = MirrorFrame {
+            interaction_revision: None,
+            private_scene: None,
             surface_id: "demo".into(),
             slide_id: "s".into(),
             revision: 4,
@@ -1851,13 +2027,13 @@ mod tests {
                 },
             );
             assert!(player.route_mirror(&Event::Key(key)).unwrap());
-            let bmux_presenter_runtime::Action::Effect { name, input } =
-                actions.try_recv().unwrap()
+            let bmux_presenter_runtime::Action::DemoInput(input) = actions.try_recv().unwrap()
             else {
-                panic!("playbook effect expected");
+                panic!("targeted playbook input expected");
             };
-            assert_eq!(name, "playbook-demo:demo");
-            assert_eq!(input, expected);
+            assert_eq!(input.surface_id, "demo");
+            assert_eq!(input.surface_revision, 4);
+            assert_eq!(input.input, expected);
         }
     }
 
@@ -1870,6 +2046,8 @@ mod tests {
             .unwrap();
         let mut player = Player::local(deck, None, false);
         let surface = MirrorFrame {
+            interaction_revision: None,
+            private_scene: None,
             surface_id: "demo".into(),
             slide_id: "s".into(),
             revision: 4,

@@ -2293,6 +2293,7 @@ async fn run_playbook_inner(
     // Execute each step
     let playbook_start = Instant::now();
     let deadline = playbook_start + playbook.config.timeout;
+    let pacing_credit = std::sync::atomic::AtomicU64::new(0);
     let total_steps = playbook.steps.len();
     let interactive_mode = resolve_interactive_mode(
         options.interactive,
@@ -2320,9 +2321,10 @@ async fn run_playbook_inner(
 
     for (step_position, step) in playbook.steps.iter().enumerate() {
         if let Some(control) = managed.as_mut() {
+            control.action(step.action.name(), total_steps);
             control.publish("running", step_position, session_id, false, None)?;
             if let Err(error) = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(deadline),
+                tokio::time::Instant::from_std(deadline + super::pacing::overhead(&pacing_credit)),
                 control.permission(),
             )
             .await
@@ -2332,6 +2334,7 @@ async fn run_playbook_inner(
                 break;
             }
         }
+        let deadline = deadline + super::pacing::overhead(&pacing_credit);
         if let Some(ref mut visual_state) = visual_interactive {
             let prompt_decision = visual_wait_for_step_permission(
                 visual_state,
@@ -2466,8 +2469,9 @@ async fn run_playbook_inner(
                 step.action.name()
             );
         }
+        let mut playbook_deadline_expired = false;
         let result = tokio::select! {
-            result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), execute_step(
+            result = execute_step_paced(
             step,
             &mut client,
             &mut inspector,
@@ -2485,7 +2489,14 @@ async fn run_playbook_inner(
             real_attach_runtime.as_ref(),
             step_position,
             total_steps,
-        )) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("playbook deadline exceeded"))),
+            managed.as_ref(),
+            options.playback_speed,
+            &pacing_credit,
+        ) => result,
+            () = super::pacing::deadline(playbook_start + playbook.config.timeout, &pacing_credit) => {
+                playbook_deadline_expired = true;
+                Err(anyhow::anyhow!("playbook deadline exceeded"))
+            },
             () = super::managed::cancellation(managed.as_ref()) => Err(anyhow::anyhow!("managed playbook stopped")),
         };
 
@@ -2575,6 +2586,9 @@ async fn run_playbook_inner(
                 }
             }
             Err(err) => {
+                let unresolved_input = err
+                    .downcast_ref::<super::pacing::UnresolvedInput>()
+                    .is_some();
                 if err.downcast_ref::<InteractiveAbort>().is_some() {
                     interactive_abort_from_step = Some(step_position);
                     let msg = format!(
@@ -2651,7 +2665,25 @@ async fn run_playbook_inner(
                         )
                         .await?;
                 }
-                if step.continue_on_error {
+                if playbook_deadline_expired {
+                    for remaining in playbook.steps.iter().skip(step_position + 1) {
+                        step_results.push(StepResult {
+                            index: remaining.index,
+                            action: remaining.action.name().to_string(),
+                            status: StepStatus::Skip,
+                            elapsed_ms: 0,
+                            detail: Some("skipped: playbook timeout".to_string()),
+                            expected: None,
+                            actual: None,
+                            failure_captures: None,
+                            render_summary: None,
+                            continue_on_error: remaining.continue_on_error,
+                        });
+                    }
+                    error_msg = Some(msg);
+                    break;
+                }
+                if step.continue_on_error && !unresolved_input {
                     // Record the failure but keep going.
                     warn!(
                         "step {} failed but continue_on_error is set, continuing",
@@ -3454,8 +3486,61 @@ pub async fn execute_step(
     runtime_vars: &mut RuntimeVars,
     visual_interactive: &mut Option<VisualInteractiveState>,
     real_attach_runtime: Option<&RealAttachPlaybookRuntime>,
+    step_position: usize,
+    total_steps: usize,
+) -> Result<Option<String>> {
+    execute_step_paced(
+        step,
+        client,
+        inspector,
+        session_id,
+        attached,
+        events_subscribed,
+        attach_runtime,
+        viewport_cols,
+        viewport_rows,
+        snapshots,
+        deadline,
+        display_track,
+        runtime_vars,
+        visual_interactive,
+        real_attach_runtime,
+        step_position,
+        total_steps,
+        None,
+        crate::PlaybackSpeed::Instant,
+        &std::sync::atomic::AtomicU64::new(0),
+    )
+    .await
+}
+
+// The same dispatcher is used by automated, interactive and managed execution.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
+async fn execute_step_paced(
+    step: &Step,
+    client: &mut BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: &mut Option<Uuid>,
+    attached: &mut bool,
+    events_subscribed: &mut bool,
+    attach_runtime: &mut Option<AttachInputRuntime>,
+    viewport_cols: &u16,
+    viewport_rows: &u16,
+    snapshots: &mut Vec<SnapshotCapture>,
+    deadline: Instant,
+    display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+    runtime_vars: &mut RuntimeVars,
+    visual_interactive: &mut Option<VisualInteractiveState>,
+    real_attach_runtime: Option<&RealAttachPlaybookRuntime>,
     _step_position: usize,
     _total_steps: usize,
+    managed: Option<&super::managed::ManagedRun>,
+    playback_speed: crate::PlaybackSpeed,
+    pacing_credit: &std::sync::atomic::AtomicU64,
 ) -> Result<Option<String>> {
     if let Some(runtime) = real_attach_runtime
         && let Some(observed) = runtime.0.attached_session_id()
@@ -3472,7 +3557,7 @@ pub async fn execute_step(
     )
     .await?;
 
-    match &step.action {
+    let result = match &step.action {
         Action::NewSession { name } => {
             let resolved_name = name.as_ref().map(|n| runtime_vars.resolve_opt(n));
             let sid = typed_new_session_playbook(client, resolved_name.clone()).await?;
@@ -3643,7 +3728,40 @@ pub async fn execute_step(
             }
             let resolved_keys = runtime_vars.resolve_bytes(keys);
 
-            if let Some(target_index) = pane {
+            let speed = managed.map_or(Ok(playback_speed), super::managed::ManagedRun::speed)?;
+            if speed != crate::PlaybackSpeed::Instant {
+                // Resolve once, even for the active pane. Focus changes while
+                // paused never retarget a partially entered command.
+                let layout = client
+                    .attach_layout(sid)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("layout for paced input failed: {e}"))?;
+                let pane_id = layout
+                    .panes
+                    .iter()
+                    .find(|p| pane.map_or(p.focused, |index| p.index == index))
+                    .map(|p| p.id)
+                    .ok_or_else(|| anyhow::anyhow!("paced input target unavailable"))?;
+                let chunks = super::pacing::chunks(&resolved_keys);
+                for (position, chunk) in chunks.iter().enumerate() {
+                    if position > 0 {
+                        super::pacing::wait(managed, playback_speed, true, pacing_credit).await?;
+                    }
+                    super::pacing::checkpoint(managed).await?;
+                    if let Some(real_attach) = real_attach_runtime {
+                        real_attach
+                            .ensure_input_resolved()
+                            .map_err(|_| anyhow::Error::new(super::pacing::UnresolvedInput))?;
+                    }
+                    let accepted = client
+                        .pane_direct_input(sid, pane_id, chunk.to_vec())
+                        .await
+                        .map_err(|_| anyhow::Error::new(super::pacing::UnresolvedInput))?;
+                    if accepted != chunk.len() {
+                        return Err(anyhow::Error::new(super::pacing::UnresolvedInput));
+                    }
+                }
+            } else if let Some(target_index) = pane {
                 // Pane-targeted send: resolve the pane index to a UUID and use
                 // PaneDirectInput to write bytes directly without focus changes.
                 let layout = client
@@ -4241,7 +4359,21 @@ pub async fn execute_step(
         | Action::SetConfig { .. } => {
             bail!("attach simulation actions require @driver attach-sim")
         }
+    };
+    if result.is_ok()
+        && matches!(
+            &step.action,
+            Action::NewSession { .. }
+                | Action::SendKeys { .. }
+                | Action::SendBytes { .. }
+                | Action::SplitPane { .. }
+                | Action::FocusPane { .. }
+                | Action::ClosePane { .. }
+        )
+    {
+        super::pacing::wait(managed, playback_speed, false, pacing_credit).await?;
     }
+    result
 }
 
 pub async fn reconcile_real_attach_target(

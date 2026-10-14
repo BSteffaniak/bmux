@@ -236,6 +236,9 @@ fn lease_expiry_and_unregister_never_revive_old_authority() {
 #[test]
 fn expired_uuid_rebinds_but_unauthorized_attempts_are_atomic() {
     let controller = Controller::new().unwrap();
+    // This tests synchronous authority transitions, not frame delivery. Stop
+    // the worker before staging pending data so it cannot consume the fixture.
+    controller.shutdown();
     let owner = Uuid::new_v4();
     let hostile = Uuid::new_v4();
     let id = Uuid::new_v4().to_string();

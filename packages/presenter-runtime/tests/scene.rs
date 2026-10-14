@@ -29,6 +29,8 @@ impl Owner for Scenes {
     fn scene(&mut self, cx: OwnerContext<'_>) -> Result<Vec<MirrorFrame>, String> {
         self.scenes.fetch_add(1, Ordering::SeqCst);
         Ok(vec![MirrorFrame {
+            interaction_revision: None,
+            private_scene: None,
             surface_id: "demo".into(),
             slide_id: cx.state.slide_id.as_ref().unwrap().as_str().into(),
             revision: cx.cursor.revision,

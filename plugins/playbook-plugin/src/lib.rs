@@ -42,6 +42,9 @@ impl RustPlugin for PlaybookPlugin {
             playbook_commands::client::PrepareEndpoint => |req, _ctx| {
                 Ok(self.with_owner(|owner| owner.prepare(req.input)))
             },
+            playbook_commands::client::SetPlaybackSpeedEndpoint => |req, _ctx| {
+                Ok(self.with_owner(|owner| owner.set_playback_speed(req.generation, &req.speed)))
+            },
             playbook_commands::client::StartEndpoint => |req, _ctx| {
                 Ok(self.with_owner(|owner| owner.start(req.generation)))
             },

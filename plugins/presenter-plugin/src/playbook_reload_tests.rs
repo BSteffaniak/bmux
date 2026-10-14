@@ -38,6 +38,9 @@ impl Fixture {
             revision: 3,
             phase: "running".into(),
             step: 2,
+            playback_speed: "normal".into(),
+            current_action: "send-keys".into(),
+            action_count: 4,
             paused: false,
             cleanup_acknowledged: false,
             root: String::new(),
@@ -169,7 +172,36 @@ async fn changed_include_rejects_without_touching_original_or_granting_trust() {
     assert!(!*running.stopped.borrow());
 }
 #[tokio::test]
-async fn discarded_candidate_does_not_stop_original_and_removal_waits_for_settlement() {
+async fn hide_and_navigation_retain_attempt_and_pause_truth() {
+    let fixture = Fixture::new();
+    let mut running = fixture.running();
+    let epoch = running.demos.entries["demo"].controller.owner_epoch();
+    assert_eq!(
+        crate::playbook_component::play_control(&running.demos.entries["demo"].snapshot),
+        Control::Pause
+    );
+    running
+        .updates
+        .send_modify(|snapshot| snapshot.attempt.as_mut().unwrap().paused = true);
+    running.demos.update();
+    assert_eq!(
+        crate::playbook_component::play_control(&running.demos.entries["demo"].snapshot),
+        Control::Resume
+    );
+    running
+        .demos
+        .input_committed("demo", epoch, Some(41), "close")
+        .unwrap();
+    running.demos.leave("s").unwrap();
+    let entry = &running.demos.entries["demo"];
+    assert!(!entry.open);
+    assert_eq!(entry.snapshot.attempt.as_ref().unwrap().generation, 41);
+    assert_eq!(*running.cancelled.borrow(), 0);
+    assert!(!*running.stopped.borrow());
+}
+
+#[tokio::test]
+async fn discarded_candidate_and_removed_reference_retain_execution_owner() {
     let fixture = Fixture::new();
     let mut running = fixture.running();
     drop(
@@ -181,19 +213,21 @@ async fn discarded_candidate_does_not_stop_original_and_removal_waits_for_settle
     assert!(!*running.stopped.borrow());
     assert_eq!(*running.cancelled.borrow(), 0);
     let mut next = running.demos.prepare_reload(&empty()).unwrap();
-    assert!(running.demos.admit_reload(&next).is_err());
-    assert!(running.demos.entries.contains_key("demo"));
-    assert!(*running.cancelled.borrow() > 0);
-    assert!(!*running.stopped.borrow());
-    running.updates.send_modify(|snapshot| {
-        snapshot.cancellation_revision = *running.cancelled.borrow();
-        let attempt = snapshot.attempt.as_mut().unwrap();
-        attempt.phase = "stopped".into();
-        attempt.cleanup_acknowledged = true;
-    });
     running.demos.admit_reload(&next).unwrap();
+    assert_eq!(*running.cancelled.borrow(), 0);
     running.demos.commit_reload(&mut next);
     assert!(next.entries.is_empty());
     drop(running.demos);
-    assert!(*running.stopped.borrow());
+    assert!(!*running.stopped.borrow());
+    assert_eq!(next.retained.len(), 1);
+    assert_eq!(
+        next.retained[0]
+            .1
+            .snapshot
+            .attempt
+            .as_ref()
+            .unwrap()
+            .generation,
+        41
+    );
 }

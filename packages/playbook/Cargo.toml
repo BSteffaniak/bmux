@@ -45,6 +45,8 @@ tokio = { workspace = true, optional = true, features = [
     "time",
 ] }
 
+unicode-segmentation = { workspace = true, optional = true }
+
 anyhow  = { workspace = true, features = ["std"] }
 libc    = { workspace = true }
 serde   = { workspace = true, features = ["derive", "std"] }
@@ -54,6 +56,7 @@ tracing = { workspace = true }
 uuid    = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # The render-cache regression constructs types owned by the plugin render contract.
 bmux_plugin = { workspace = true }
 tempfile    = { workspace = true }
@@ -62,6 +65,7 @@ tempfile    = { workspace = true }
 default = []
 fail-on-warnings = []
 runtime = [
+    "dep:unicode-segmentation",
     "dep:bmux_appearance",
     "dep:bmux_attach_layout_protocol",
     "dep:bmux_attach_pipeline",

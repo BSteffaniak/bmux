@@ -539,6 +539,15 @@ impl Host {
                         .is_some_and(|id| id.as_str() == frame.slide_id)
                 })
                 .cloned()
+                .map(|mut frame| {
+                    if !scopes.effects
+                        || !scopes.demo_input
+                        || participant.mode == InteractionMode::ReceiveOnly
+                    {
+                        frame.private_scene = None;
+                    }
+                    frame
+                })
                 .collect(),
             assets: self
                 .public_assets
@@ -629,12 +638,36 @@ impl Host {
         if participant.mode == InteractionMode::ReceiveOnly {
             return Err(HostError::Unauthorized);
         }
-        if submission.expected != self.cursor(id)? {
+        let current_cursor = self.cursor(id)?;
+        let stable_control_input = matches!(&submission.action, Action::DemoInput(input) if {
+            let surfaces = if participant.mode == InteractionMode::Independent { &participant.surfaces } else { &self.surfaces };
+            surfaces.get(&input.surface_id).is_some_and(|surface| surface.private_scene.as_ref().map_or(surface.interaction_revision.unwrap_or(surface.revision), |scene| scene.frame.revision) == input.surface_revision)
+        });
+        if submission.expected != current_cursor
+            && !(stable_control_input
+                && submission.expected.run_id == current_cursor.run_id
+                && submission.expected.deck_revision == current_cursor.deck_revision)
+        {
             return Err(HostError::Stale);
         }
         let independent = participant.mode == InteractionMode::Independent;
         match &submission.action {
             Action::Navigate(_) if !scopes.navigate => return Err(HostError::Unauthorized),
+            Action::DemoInput(input)
+                if !scopes.effects
+                    && self.participants.get(id).is_some_and(|participant| {
+                        let surfaces = if participant.mode == InteractionMode::Independent {
+                            &participant.surfaces
+                        } else {
+                            &self.surfaces
+                        };
+                        surfaces
+                            .get(&input.surface_id)
+                            .is_some_and(|surface| surface.private_scene.is_some())
+                    }) =>
+            {
+                return Err(HostError::Unauthorized);
+            }
             Action::DemoInput(_) if !scopes.demo_input => return Err(HostError::Unauthorized),
             Action::Effect { .. } if !scopes.effects => return Err(HostError::Unauthorized),
             _ => {}
@@ -651,9 +684,20 @@ impl Host {
         };
         if let Action::DemoInput(input) = &submission.action
             && (surfaces.get(&input.surface_id).is_none_or(|surface| {
-                surface.revision != input.surface_revision
-                    || input.x >= surface.width
-                    || input.y >= surface.height
+                surface.private_scene.as_ref().map_or(
+                    surface.interaction_revision.unwrap_or(surface.revision),
+                    |scene| scene.frame.revision,
+                ) != input.surface_revision
+                    || input.x
+                        >= surface
+                            .private_scene
+                            .as_ref()
+                            .map_or(surface.width, |scene| scene.frame.width)
+                    || input.y
+                        >= surface
+                            .private_scene
+                            .as_ref()
+                            .map_or(surface.height, |scene| scene.frame.height)
                     || state
                         .slide_id
                         .as_ref()

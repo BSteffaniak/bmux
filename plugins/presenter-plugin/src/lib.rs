@@ -14,6 +14,7 @@ pub mod playbook_controller;
 mod playbook_live;
 mod playbook_observer;
 mod player;
+mod player_evidence;
 mod rich;
 mod services;
 mod source;

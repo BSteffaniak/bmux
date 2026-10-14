@@ -855,6 +855,9 @@ pub enum PlaybookCommand {
         /// Run visual interactive live tour (TTY; non-TTY falls back to prompt controls)
         #[arg(long)]
         interactive: bool,
+        /// Deterministic presentation pacing; automation defaults to instant
+        #[arg(long, default_value = "instant", value_parser = ["instant", "half", "normal", "double"])]
+        playback_speed: String,
         /// Run against the live server instead of an ephemeral sandbox
         #[arg(long)]
         target_server: bool,
@@ -3948,6 +3951,47 @@ mod tests {
             panic!("expected external plugin command path");
         };
         assert_eq!(args, vec!["vendor", "roles", "dev"]);
+    }
+
+    #[test]
+    fn parses_playbook_playback_speed_and_automation_default() {
+        let cli = Cli::try_parse_from(["bmux", "playbook", "run", "demo.dsl"]).unwrap();
+        let Some(Command::Playbook {
+            command: PlaybookCommand::Run { playback_speed, .. },
+        }) = cli.command
+        else {
+            panic!("expected playbook run");
+        };
+        assert_eq!(playback_speed, "instant");
+        for speed in ["instant", "half", "normal", "double"] {
+            let cli = Cli::try_parse_from([
+                "bmux",
+                "playbook",
+                "run",
+                "demo.dsl",
+                "--playback-speed",
+                speed,
+            ])
+            .unwrap();
+            let Some(Command::Playbook {
+                command: PlaybookCommand::Run { playback_speed, .. },
+            }) = cli.command
+            else {
+                panic!("expected playbook run");
+            };
+            assert_eq!(playback_speed, speed);
+        }
+        assert!(
+            Cli::try_parse_from([
+                "bmux",
+                "playbook",
+                "run",
+                "demo.dsl",
+                "--playback-speed",
+                "fast"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -9,6 +9,9 @@ interface playbook-types {
         revision: u64,
         phase: string,
         step: u64,
+        playback_speed: string,
+        current_action: string,
+        action_count: u64,
         paused: bool,
         cleanup_acknowledged: bool,
         root: string,
@@ -27,6 +30,7 @@ interface playbook-types {
         attempts_root: string,
         trusted_executable_input: bool,
         expected_closure_sha256: string,
+        playback_speed: string,
     }
     variant playbook-error {
         rejected { message: string },
@@ -45,6 +49,7 @@ interface playbook-state {
 interface playbook-commands {
     command prepare(input: playbook-types.preparation) -> result<playbook-types.attempt, playbook-types.playbook-error>;
     command start(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    command set-playback-speed(generation: u64, speed: string) -> result<playbook-types.attempt, playbook-types.playbook-error>;
     command pause-script(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
     command next-step(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
     command resume-script(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;

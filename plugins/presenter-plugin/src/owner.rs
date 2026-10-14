@@ -7,7 +7,7 @@ use bmux_presenter_runtime::mirror::MirrorFrame;
 use bmux_presenter_runtime::{HostError, Owner, OwnerContext, OwnerUpdate, SurfaceInput};
 use bmux_tui::prelude::{
     Component, Constraints, Element, Event, EventCx, EventOutcome, LayoutCx, LayoutNode, PaintCx,
-    Size,
+    Size, TextBlock,
 };
 use std::{
     collections::BTreeMap,
@@ -20,7 +20,8 @@ struct Geometry {
     slide_id: String,
     reveal_step: u32,
     deck_revision: u64,
-    revision: u64,
+    interaction_revision: u64,
+    control_scene: Option<bmux_presenter_runtime::mirror::MirrorPrivateScene>,
 }
 /// Canonical fixed-canvas owner for trusted, application-registered components.
 /// Shared and independent host instance identities select separate state maps.
@@ -140,8 +141,13 @@ impl LinkedOwner {
             &registry,
         )
         .rich_content(&self.rich);
-        let mut buffer =
-            bmux_tui::buffer::Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 80, 24));
+        let canvas_size = Size::new(80, 38);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(bmux_tui::geometry::Rect::new(
+            0,
+            0,
+            canvas_size.width,
+            canvas_size.height,
+        ));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
         let overlay = self
             .demos
@@ -151,17 +157,12 @@ impl LinkedOwner {
             let overlay = bmux_tui::composition::Overlay::new(component, demo.view(true))
                 .id(format!("playbook-overlay-{id}"))
                 .modal(bmux_tui::focus::FocusScopeId::new(format!("playbook-{id}")));
-            let layout = overlay.layout(
-                Constraints::tight(Size::new(80, 24)),
-                &mut LayoutCx::default(),
-            );
+            let layout = overlay.layout(Constraints::tight(canvas_size), &mut LayoutCx::default());
             overlay.paint(&layout, &mut PaintCx::new(&mut frame));
             layout
         } else {
-            let layout = component.layout(
-                Constraints::tight(Size::new(80, 24)),
-                &mut LayoutCx::default(),
-            );
+            let layout =
+                component.layout(Constraints::tight(canvas_size), &mut LayoutCx::default());
             component.paint(&layout, &mut PaintCx::new(&mut frame));
             layout
         };
@@ -174,6 +175,75 @@ impl LinkedOwner {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(HostError::Limit)?;
+        let mut private_scene = None;
+        if let Some((id, demo)) = overlay {
+            let operator =
+                bmux_tui::composition::Overlay::new(TextBlock::new(""), demo.view(false))
+                    .modal(bmux_tui::focus::FocusScopeId::new(format!("playbook-{id}")));
+            let operator_size = Size::new(80, 38);
+            let operator_layout =
+                operator.layout(Constraints::tight(operator_size), &mut LayoutCx::default());
+            let mut operator_buffer = bmux_tui::buffer::Buffer::empty(
+                bmux_tui::geometry::Rect::new(0, 0, operator_size.width, operator_size.height),
+            );
+            let mut operator_frame = bmux_tui::frame::Frame::new(&mut operator_buffer);
+            operator.paint(&operator_layout, &mut PaintCx::new(&mut operator_frame));
+            let interactions = operator_frame
+                .hits()
+                .regions()
+                .iter()
+                .filter_map(|region| {
+                    let input = crate::playbook_component::target_input(region.id.as_str())?;
+                    Some(bmux_presenter_runtime::mirror::MirrorInteraction {
+                        id: region.id.as_str().into(),
+                        input: input.into(),
+                        enabled: region.enabled,
+                        area: bmux_presenter_runtime::mirror::CanvasRect {
+                            x: region.area.x,
+                            y: region.area.y,
+                            width: region.area.width,
+                            height: region.area.height,
+                        },
+                    })
+                })
+                .collect();
+            let mut operator_images = bmux_tui::image_scene::ImageScene::default();
+            operator_images.reconcile(operator_frame.images());
+            private_scene = Some(bmux_presenter_runtime::mirror::MirrorPrivateScene {
+                frame: Box::new(MirrorFrame::capture(
+                    id.into(),
+                    slide.id.as_str().into(),
+                    revision,
+                    &operator_frame,
+                    &operator_images,
+                    16_384,
+                    512 * 1024,
+                )?),
+                interactions,
+                identity: serde_json::json!({"id":id,"owner_epoch":demo.snapshot.owner_epoch.to_string(),
+                    "generation":demo.snapshot.attempt.as_ref().map(|attempt| attempt.generation),
+                    "paused":demo.snapshot.attempt.as_ref().map(|attempt| attempt.paused),
+                    "phase":demo.snapshot.attempt.as_ref().map(|attempt| attempt.phase.as_str())}),
+            });
+            if let Some(scene) = &mut private_scene
+                && let Some(previous) = self
+                    .layouts
+                    .get(&(context.instance.to_owned(), id.to_owned()))
+                && previous.deck_revision == context.cursor.deck_revision
+                && previous.slide_id == slide.id.as_str()
+                && previous.reveal_step == context.state.reveal_step
+                && let Some(old) = &previous.control_scene
+                && old.identity == scene.identity
+                && old.frame.width == scene.frame.width
+                && old.frame.height == scene.frame.height
+                && serde_json::to_vec(&old.interactions).ok()
+                    == serde_json::to_vec(&scene.interactions).ok()
+            {
+                // Output updates do not invalidate an unchanged authoritative
+                // control target. Lifecycle/control transitions always do.
+                scene.frame.revision = old.frame.revision;
+            }
+        }
         let mut surfaces = Vec::new();
         let mut geometries = BTreeMap::new();
         for block in blocks {
@@ -181,7 +251,7 @@ impl LinkedOwner {
                 continue;
             }
             let id = block.id.as_str().to_owned();
-            surfaces.push(MirrorFrame::capture(
+            let mut surface = MirrorFrame::capture(
                 id.clone(),
                 slide.id.as_str().into(),
                 revision,
@@ -189,7 +259,23 @@ impl LinkedOwner {
                 &images,
                 16_384,
                 512 * 1024,
-            )?);
+            )?;
+            if overlay.is_some_and(|(active, _)| active == id) {
+                surface.private_scene = private_scene.clone();
+            }
+            let interaction_revision = self
+                .layouts
+                .get(&(context.instance.to_owned(), id.clone()))
+                .filter(|old| {
+                    old.deck_revision == context.cursor.deck_revision
+                        && old.slide_id == slide.id.as_str()
+                        && old.reveal_step == context.state.reveal_step
+                        && old.control_scene.is_none()
+                        && private_scene.is_none()
+                })
+                .map_or(revision, |old| old.interaction_revision);
+            surface.interaction_revision = Some(interaction_revision);
+            surfaces.push(surface);
             geometries.insert(
                 (context.instance.to_owned(), id),
                 Geometry {
@@ -197,7 +283,8 @@ impl LinkedOwner {
                     slide_id: slide.id.as_str().into(),
                     reveal_step: context.state.reveal_step,
                     deck_revision: context.cursor.deck_revision,
-                    revision,
+                    interaction_revision,
+                    control_scene: private_scene.clone(),
                 },
             );
         }
@@ -413,7 +500,11 @@ impl Owner for LinkedOwner {
             .state
             .current_slide(&self.deck)
             .ok_or(HostError::Stale)?;
-        if geometry.revision != input.surface_revision
+        if geometry
+            .control_scene
+            .as_ref()
+            .map_or(geometry.interaction_revision, |scene| scene.frame.revision)
+            != input.surface_revision
             || geometry.deck_revision != context.cursor.deck_revision
             || geometry.slide_id != slide.id.as_str()
             || geometry.reveal_step != context.state.reveal_step
@@ -431,9 +522,32 @@ impl Owner for LinkedOwner {
                 .demos
                 .get_mut(context.instance)
                 .ok_or(HostError::Unauthorized)?;
-            let outcome = demos
-                .input(input.surface_id.as_str(), &input.input, false)
-                .map_err(|_| HostError::Unauthorized)?;
+            let outcome = if let Some(scene) = &geometry.control_scene {
+                scene
+                    .interactions
+                    .iter()
+                    .find(|target| {
+                        let area = target.area;
+                        target.enabled
+                            && input.x >= area.x
+                            && input.y >= area.y
+                            && u32::from(input.x) < u32::from(area.x) + u32::from(area.width)
+                            && u32::from(input.y) < u32::from(area.y) + u32::from(area.height)
+                            && (target.input == input.input
+                                || target.input == "play-toggle"
+                                    && matches!(input.input.as_str(), "run" | "pause" | "resume"))
+                    })
+                    .ok_or(HostError::Stale)?;
+                let epoch = scene.identity["owner_epoch"]
+                    .as_str()
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .ok_or(HostError::Stale)?;
+                let generation = scene.identity["generation"].as_u64();
+                demos.input_committed(input.surface_id.as_str(), epoch, generation, &input.input)
+            } else {
+                demos.input(input.surface_id.as_str(), &input.input, false)
+            }
+            .map_err(|_| HostError::Unauthorized)?;
             return Ok(OwnerUpdate {
                 outcome,
                 surfaces: self.scenes(context)?,
@@ -476,6 +590,8 @@ impl Owner for LinkedOwner {
                 bmux_tui::geometry::Rect::new(0, 0, 80, 24),
             ),
         );
+        self.layouts
+            .remove(&(context.instance.to_owned(), input.surface_id.clone()));
         Ok(OwnerUpdate {
             outcome: if outcome == EventOutcome::Ignored {
                 "input outside active control"
@@ -506,9 +622,22 @@ impl Owner for LinkedOwner {
             .demos
             .get_mut(context.instance)
             .ok_or(HostError::Unauthorized)?;
-        let outcome = demos
-            .input(id, input, true)
-            .map_err(|_| HostError::Invalid)?;
+        let outcome = if let Some(scene) = self
+            .layouts
+            .get(&(context.instance.to_owned(), id.to_owned()))
+            .and_then(|geometry| geometry.control_scene.as_ref())
+        {
+            let epoch = scene.identity["owner_epoch"]
+                .as_str()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .ok_or(HostError::Stale)?;
+            demos.input_committed(id, epoch, scene.identity["generation"].as_u64(), input)
+        } else if matches!(input, "open" | "o" | "click" | "close" | "escape") {
+            demos.input(id, input, true)
+        } else {
+            return Err(HostError::Stale);
+        }
+        .map_err(|_| HostError::Invalid)?;
         Ok(OwnerUpdate {
             outcome,
             surfaces: self.scenes(context)?,
@@ -572,22 +701,11 @@ mod tests {
             epoch
         );
         assert_eq!(*running.cancelled.borrow(), 0);
-        // Removal's explicit commit admission requests cancellation, keeps owner.
+        // Removing a reference transfers ownership without cancelling execution.
         let mut removed = candidate.prepare_reload(&empty(), &[]).unwrap();
-        assert_eq!(
-            candidate.commit_reload(removed.as_mut()),
-            Err(HostError::EffectUncertain)
-        );
-        assert!(candidate.demos["shared"].entries.contains_key("demo"));
-        assert!(*running.cancelled.borrow() > 0);
-        assert!(!*running.stopped.borrow());
-        running.updates.send_modify(|snapshot| {
-            snapshot.cancellation_revision = *running.cancelled.borrow();
-            let attempt = snapshot.attempt.as_mut().unwrap();
-            attempt.phase = "stopped".into();
-            attempt.cleanup_acknowledged = true;
-        });
         candidate.commit_reload(removed.as_mut()).unwrap();
+        assert_eq!(*running.cancelled.borrow(), 0);
+        assert!(!*running.stopped.borrow());
     }
     fn controls() -> Deck {
         bmux_presenter::DeckBuilder::new("linked")
@@ -984,7 +1102,7 @@ mod tests {
                 cursor: &cursor,
             })
             .unwrap();
-        assert_eq!((first[0].width, first[0].height), (80, 24));
+        assert_eq!((first[0].width, first[0].height), (80, 38));
         let changed = owner
             .demo_input(
                 OwnerContext {

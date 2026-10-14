@@ -2,7 +2,7 @@
 //!
 //! `watch` is bounded snapshot polling: clients retain the last revision and
 //! discard old generations. It is not a lossy event queue or a terminal surface.
-//! `paused` applies at the next action boundary; `next-step` executes one whole
+//! `paused` retains an in-progress typing cursor; `next-step` executes one whole
 //! action (including waits), never seeks through arbitrary side effects.
 //! `stop` records cancellation intent; only `cleanup_acknowledged` permits restart.
 //! Presentation attaches to the returned isolated BMUX runtime using its normal

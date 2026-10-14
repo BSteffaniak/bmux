@@ -56,6 +56,21 @@ pub struct WireImage {
     pub payload: WireImagePayload,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MirrorInteraction {
+    pub id: String,
+    pub input: String,
+    pub area: CanvasRect,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MirrorPrivateScene {
+    pub frame: Box<MirrorFrame>,
+    pub interactions: Vec<MirrorInteraction>,
+    pub identity: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MirrorFrame {
     pub surface_id: String,
     pub slide_id: String,
@@ -64,6 +79,12 @@ pub struct MirrorFrame {
     pub height: u16,
     pub cells: Vec<WireCell>,
     pub images: Vec<WireImage>,
+    /// Retained target revision, independent of output-only damage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_revision: Option<u64>,
+    /// Authenticated operator projection; never included in audience snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_scene: Option<MirrorPrivateScene>,
 }
 
 fn color(value: Color) -> WireColor {
@@ -223,6 +244,8 @@ impl MirrorFrame {
             height: area.height,
             cells,
             images: wire_images,
+            interaction_revision: None,
+            private_scene: None,
         };
         result.validate(max_cells, max_bytes)?;
         Ok(result)
@@ -238,6 +261,33 @@ impl MirrorFrame {
         max_bytes: usize,
         decode_png: bool,
     ) -> Result<(), HostError> {
+        if let Some(scene) = &self.private_scene {
+            if scene.frame.private_scene.is_some() || scene.interactions.len() > 64 {
+                return Err(HostError::Limit);
+            }
+            scene
+                .frame
+                .validate_wire(max_cells, max_bytes, decode_png)?;
+            if serde_json::to_vec(&scene.identity)
+                .map_err(|_| HostError::Invalid)?
+                .len()
+                > 1024
+            {
+                return Err(HostError::Limit);
+            }
+            for interaction in &scene.interactions {
+                let area = interaction.area;
+                if interaction.id.len() > 256
+                    || interaction.input.len() > 128
+                    || area.width == 0
+                    || area.height == 0
+                    || u32::from(area.x) + u32::from(area.width) > u32::from(scene.frame.width)
+                    || u32::from(area.y) + u32::from(area.height) > u32::from(scene.frame.height)
+                {
+                    return Err(HostError::Invalid);
+                }
+            }
+        }
         let count = usize::from(self.width) * usize::from(self.height);
         if count == 0
             || count > max_cells

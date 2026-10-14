@@ -149,6 +149,7 @@ impl Approval {
             request_id: String::new(),
             expected_closure_sha256: approved,
             trusted_executable_input: true,
+            playback_speed: "normal".into(),
         })
     }
 }

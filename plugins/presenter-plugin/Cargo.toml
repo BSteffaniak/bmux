@@ -29,6 +29,7 @@ bmux_presenter_plugin_api = { path = "../presenter-plugin-api" }
 bmux_presenter_runtime = { path = "../../packages/presenter-runtime" }
 bmux_syntax_render = { path = "../../packages/syntax-render" }
 bmux_tui = { workspace = true }
+bmux_tui_components = { workspace = true }
 bmux_tui_runtime = { workspace = true, features = [
     "crossterm",
     "images",

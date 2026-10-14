@@ -14,6 +14,7 @@ pub(super) async fn run_playbook_run(
     source: &str,
     json: bool,
     interactive: bool,
+    playback_speed: &str,
     target_server: bool,
     record: bool,
     export_gif: Option<&str>,
@@ -74,16 +75,17 @@ pub(super) async fn run_playbook_run(
     playbook.config.bundled_plugin_ids = discover_bundled_plugin_ids();
     playbook.config.verbose = verbose;
 
-    let result = if interactive {
-        crate::playbook::run_with_options(
-            playbook,
-            target_server,
-            crate::playbook::RunOptions { interactive: true },
-        )
-        .await?
-    } else {
-        crate::playbook::run(playbook, target_server).await?
-    };
+    let speed =
+        bmux_playbook::PlaybackSpeed::parse(playback_speed).context("invalid playback speed")?;
+    let result = crate::playbook::run_with_options(
+        playbook,
+        target_server,
+        crate::playbook::RunOptions {
+            interactive,
+            playback_speed: speed,
+        },
+    )
+    .await?;
 
     // Export GIF if requested and a recording was produced.
     if let Some(gif_path) = export_gif {

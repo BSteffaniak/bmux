@@ -11,6 +11,24 @@ const COMMAND_CAPACITY: usize = 8;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackSpeed {
+    Half,
+    Normal,
+    Double,
+    Instant,
+}
+impl PlaybackSpeed {
+    pub const fn token(self) -> &'static str {
+        match self {
+            Self::Half => "half",
+            Self::Normal => "normal",
+            Self::Double => "double",
+            Self::Instant => "instant",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
     Run,
     Pause,
@@ -18,6 +36,7 @@ pub enum Control {
     Resume,
     Stop,
     Restart,
+    Speed(PlaybackSpeed),
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +167,7 @@ impl Controller {
                 observer_failed: None,
                 client: None,
                 attempt: None,
+                playback_speed: PlaybackSpeed::Normal,
                 stop_requested: false,
                 uncertain: false,
             }
@@ -290,6 +310,7 @@ struct Worker {
     observer: Option<ObserverTask>,
     client: Option<bmux_client::BmuxClient>,
     attempt: Option<Attempt>,
+    playback_speed: PlaybackSpeed,
     stop_requested: bool,
     uncertain: bool,
 }
@@ -524,6 +545,15 @@ impl Worker {
                 "previous command outcome uncertain; reconcile before further control".into(),
             );
         }
+        if self.attempt.is_none()
+            && let Control::Speed(speed) = control
+        {
+            self.playback_speed = speed;
+            return Ok(format!(
+                "Playback speed: {} (next preparation)",
+                speed.token()
+            ));
+        }
         if self.attempt.is_none() && !matches!(control, Control::Run) {
             return Err("run must prepare an attempt first".into());
         }
@@ -547,6 +577,7 @@ impl Worker {
                 .approval
                 .preparation(&self.config, &self.executable, &self.attempts_root)
                 .map_err(|error| error.to_string())?;
+            preparation.playback_speed = self.playback_speed.token().into();
             preparation
                 .request_id
                 .clone_from(&self.preparation_request_id);
@@ -611,6 +642,9 @@ impl Worker {
             Control::Resume => commands::client::resume_script(client, generation).await,
             Control::Stop => commands::client::stop(client, generation).await,
             Control::Restart => commands::client::restart(client, generation).await,
+            Control::Speed(speed) => {
+                commands::client::set_playback_speed(client, generation, speed.token().into()).await
+            }
         };
         let next = match response {
             Ok(result) => result.map_err(|error| format!("{error:?}"))?,
