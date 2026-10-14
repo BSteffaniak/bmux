@@ -86,12 +86,11 @@ impl TuiImageCompositor {
         Self::default()
     }
 
-    /// Apply lifecycle removals produced by the TUI frame reconciler.
-    pub fn apply_delta(&mut self, delta: &ImageSceneDelta) {
-        for key in &delta.removed {
-            self.sources.remove(key);
-        }
-    }
+    /// Observe lifecycle removals without discarding bounded content preparation.
+    /// Visibility is owned by the complete scene passed to render; finish_frame
+    /// removes absent host placements. Inactive sources remain reusable until
+    /// the entry/byte budgets evict them, or clear resets the adapter.
+    pub fn apply_delta(&mut self, _delta: &ImageSceneDelta) {}
 
     /// Render the current TUI image scene as a terminal overlay.
     /// Raster callers must first call [`Self::prepare_output`] on the same
@@ -823,7 +822,12 @@ mod tests {
                         &config,
                     )
                     .unwrap();
-                let mut hidden = ImageScene::default();
+                let hidden = ImageScene::default();
+                let delta = bmux_tui::image_scene::ImageSceneDelta {
+                    removed: vec![ImageKey::new("deck-png")],
+                    ..Default::default()
+                };
+                compositor.apply_delta(&delta);
                 compositor
                     .render(
                         &mut Vec::new(),
@@ -838,7 +842,7 @@ mod tests {
                         &config,
                     )
                     .unwrap();
-                hidden = scene.clone();
+                let hidden = scene.clone();
                 let mut returned = Vec::new();
                 compositor
                     .render(
