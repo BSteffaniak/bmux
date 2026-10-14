@@ -1,0 +1,46 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities"]
+description = "Persistent plugin-owned output-only live broadcast publisher"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "broadcast", "terminal"]
+license     = { workspace = true }
+name        = "bmux_broadcast_plugin"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmux_broadcast_plugin_api = { path = "../broadcast-plugin-api" }
+bmux_client = { workspace = true }
+bmux_config = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
+bmux_web_renderer = { path = "../../packages/web-renderer" }
+libc = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+    "process",
+] }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+bmux_codec = { workspace = true }
+bmux_tui   = { workspace = true }
+tempfile   = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

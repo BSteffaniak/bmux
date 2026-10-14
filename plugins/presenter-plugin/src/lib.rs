@@ -1,5 +1,6 @@
 //! Optional plugin-owned presentation commands and authoritative managed hosts.
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+mod broadcast;
 mod cli;
 mod commands;
 mod demo;

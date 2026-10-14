@@ -111,6 +111,15 @@ pub fn nav_bar() -> Containers {
                     text-decoration="none"
                     font-family=(MONO_FONT)
                     font-size=14
+                    href="/live"
+                {
+                    "live"
+                }
+                anchor
+                    color=(text_secondary())
+                    text-decoration="none"
+                    font-family=(MONO_FONT)
+                    font-size=14
                     href="https://github.com/BSteffaniak/bmux"
                     target="_blank"
                 {
@@ -299,7 +308,7 @@ pub fn page(slot: &Containers) -> Containers {
     }
 }
 
-fn home_layout(body: &Containers) -> Containers {
+pub(crate) fn home_layout(body: &Containers) -> Containers {
     page(&container! {
         div
             flex-grow=1
@@ -377,9 +386,20 @@ fn docs_layout(ctx: &ShellContext<'_>) -> Containers {
 /// Bmux docs shell used for every page.
 #[must_use]
 pub fn shell(ctx: ShellContext<'_>) -> Containers {
-    if ctx.current_path == "/" || ctx.current_path == "/home" {
+    let body = if ctx.current_path == "/" || ctx.current_path == "/home" {
         home_layout(ctx.body)
     } else {
         docs_layout(&ctx)
+    };
+    with_live_module(body)
+}
+
+/// Include the immutable audience module on shell and custom entry routes.
+#[must_use]
+pub fn with_live_module(body: Containers) -> Containers {
+    // Trusted constant markup only: no user HTML or credential bootstrap.
+    container! {
+        raw { (concat!("<script type=\"module\" src=\"", env!("BMUX_LIVE_PAGE_MODULE"), "\"></script>")) }
+        (body)
     }
 }

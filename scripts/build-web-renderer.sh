@@ -26,5 +26,28 @@ cargo build --locked -p bmux_web_renderer --features wasm --target wasm32-unknow
 "$BINDGEN" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/bmux_web_renderer.wasm" \
   --target web --out-dir "$OUTPUT" --out-name bmux_web_renderer
 cp packages/web-renderer/browser/index.html packages/web-renderer/browser/bootstrap.js \
-  packages/web-renderer/browser/style.css "$OUTPUT/"
+  packages/web-renderer/browser/style.css packages/web-renderer/browser/canvas-viewer.js \
+  packages/web-renderer/browser/live-viewer.js packages/web-renderer/browser/live-page.js "$OUTPUT/"
 echo "Browser assets: $OUTPUT"
+# Stage immutable audience assets before docs compilation/static generation.
+# Native builds never invoke this script or depend on these files.
+DOCS_ASSETS="$ROOT/packages/docs-site/public/live-assets"
+ASSET_FILES=(canvas-viewer.js live-viewer.js live-page.js bmux_web_renderer.js bmux_web_renderer_bg.wasm)
+VERSION="$(for name in "${ASSET_FILES[@]}"; do sha256sum "$OUTPUT/$name" | cut -d ' ' -f 1; done | sha256sum | cut -d ' ' -f 1)"
+mkdir -p "$DOCS_ASSETS/$VERSION"
+for name in "${ASSET_FILES[@]}"; do cp "$OUTPUT/$name" "$DOCS_ASSETS/$VERSION/$name"; done
+python3 - "$DOCS_ASSETS/$VERSION" "$VERSION" "${ASSET_FILES[@]}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+files = []
+for name in sys.argv[3:]:
+    data = (root / name).read_bytes()
+    files.append({"name": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+(root / "manifest.json").write_text(json.dumps({"schema": 1, "protocol": 1,
+    "renderer": "bmwp-2", "bundle_sha256": sys.argv[2], "files": files}, indent=2) + "\n")
+PY
+printf '%s\n' "$VERSION" > "$DOCS_ASSETS/current-version"
+echo "Docs audience bundle: $DOCS_ASSETS/$VERSION"

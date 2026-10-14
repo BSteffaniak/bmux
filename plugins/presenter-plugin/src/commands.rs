@@ -139,15 +139,15 @@ pub(crate) async fn run(
                         // Host owner projection is authenticated using its existing credential;
                         // browser auth is independent and never sees this secret.
                         credential: Some(options.presenter_credential),
-                        mode: if browser.only {
+                        mode: if browser.only || browser.broadcast_only() {
                             bmux_presenter_runtime::InteractionMode::ReceiveOnly
                         } else {
                             bmux_presenter_runtime::InteractionMode::Shared
                         },
-                        presenter: !browser.only,
+                        presenter: !(browser.only || browser.broadcast_only()),
                     };
                     let (connection, next) = crate::viewer::connect(&join, &paths(context)).await?;
-                    if browser.only {
+                    if browser.only || browser.broadcast_only() {
                         let (_stop, receiver) = tokio::sync::watch::channel(false);
                         crate::web_host::run(connection, browser, receiver).await
                     } else {
@@ -219,7 +219,7 @@ pub(crate) async fn run(
                 let (shutdown, receiver) = tokio::sync::watch::channel(false);
                 let transport_stop = shutdown.clone();
                 let browser_task = if let Some(browser) = browser {
-                    let mode = if browser.only {
+                    let mode = if browser.only || browser.broadcast_only() {
                         bmux_presenter_runtime::InteractionMode::ReceiveOnly
                     } else {
                         bmux_presenter_runtime::InteractionMode::Shared
@@ -250,7 +250,7 @@ pub(crate) async fn run(
                     };
                     let paths = paths(context);
                     Some(async move {
-                        let result = if browser.only {
+                        let result = if browser.only || browser.broadcast_only() {
                             crate::web_host::run(connection, browser, stop).await
                         } else {
                             crate::viewer::run_connected(

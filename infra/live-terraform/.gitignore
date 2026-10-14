@@ -1,0 +1,8 @@
+# Provider lockfile is committed; caches/state and schema are not.
+.terraform/
+*.tfstate*
+*.tfplan
+.provider-schema.json
+backend.hcl
+*.auto.tfvars*
+tools/node_modules/

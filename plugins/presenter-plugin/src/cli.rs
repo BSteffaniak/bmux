@@ -7,6 +7,7 @@ use std::{net::IpAddr, path::PathBuf};
 #[derive(Default, Debug)]
 pub(crate) struct WebOptions {
     pub enabled: bool,
+    pub broadcast: Option<uuid::Uuid>,
     pub assets: Option<PathBuf>,
     pub only: bool,
     pub port: Option<u16>,
@@ -18,6 +19,10 @@ pub(crate) struct WebOptions {
 
 impl WebOptions {
     fn parse(args: &mut Arguments<'_>) -> Result<Self> {
+        let broadcast = args
+            .value("--broadcast")?
+            .map(|value| value.parse().context("--broadcast must be a source UUID"))
+            .transpose()?;
         let enabled = args.flag("--web")?;
         let assets = args.value("--web-assets")?.map(PathBuf::from);
         let only = args.flag("--web-only")?;
@@ -52,6 +57,7 @@ impl WebOptions {
                 .collect()
         });
         Ok(Self {
+            broadcast,
             enabled,
             assets,
             only,
@@ -300,6 +306,29 @@ mod tests {
             &args.iter().map(ToString::to_string).collect::<Vec<_>>(),
         )
     }
+    #[test]
+    fn broadcast_is_explicit_validated_and_independent_of_web() {
+        let source = "12345678-1234-4234-8234-123456789abc";
+        let Command::Play { web, .. } = parse("play", &["deck.md", "--broadcast", source]).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(web.broadcast.unwrap().to_string(), source);
+        assert!(!web.enabled && !web.only);
+        assert!(parse("play", &["deck.md", "--broadcast", "invalid"]).is_err());
+        assert!(parse("join", &["bmux:host", "--broadcast", source]).is_err());
+        assert!(parse("check", &["deck.md", "--broadcast", source]).is_err());
+        for flag in ["--web", "--web-only"] {
+            let Command::Play { web, .. } =
+                parse("play", &["deck.md", flag, "--broadcast", source]).unwrap()
+            else {
+                panic!()
+            };
+            assert!(web.broadcast.is_some());
+            assert_eq!(web.only, flag == "--web-only");
+        }
+    }
+
     #[test]
     fn explicit_play_only_and_namespace_is_not_a_leaf() {
         assert!(parse("present", &["deck.md"]).is_err());

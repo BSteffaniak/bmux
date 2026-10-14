@@ -4,6 +4,8 @@
 //!
 //! Uses the HyperChad framework to serve the bmux documentation as a web
 //! application with SPA-like navigation.
+//!
+//! Public broadcast build and browser acceptance: see `LIVE-VIEWER.md`.
 
 use std::sync::LazyLock;
 
@@ -31,11 +33,18 @@ static ASSETS_DIR: LazyLock<std::path::PathBuf> = LazyLock::new(|| {
 
 #[cfg(feature = "assets")]
 static ASSETS: LazyLock<Vec<hyperchad::renderer::assets::StaticAssetRoute>> = LazyLock::new(|| {
-    vec![
+    let mut routes = vec![
         #[cfg(feature = "vanilla-js")]
         hyperchad_docs_site::assets::vanilla_js_route(),
         hyperchad_docs_site::assets::public_dir_route("public", ASSETS_DIR.clone()),
-    ]
+    ];
+    if ASSETS_DIR.join("live-assets").is_dir() {
+        routes.push(hyperchad_docs_site::assets::public_dir_route(
+            "live-assets",
+            ASSETS_DIR.join("live-assets"),
+        ));
+    }
+    routes
 });
 
 /// Documentation site model with routes and navigation derived from the central
@@ -46,11 +55,16 @@ pub static SITE: LazyLock<DocsSite> = LazyLock::new(|| {
         .description("Documentation for bmux — a modern terminal multiplexer")
         .sections(bmux_docs_site_ui::doc_pages::DOC_SECTIONS)
         .pages(bmux_docs_site_ui::doc_pages::DOC_PAGES)
+        .page(
+            hyperchad_docs_site::DocPage::custom("/live", bmux_docs_site_ui::pages::live::live)
+                .title("Live broadcast"),
+        )
         .home(bmux_docs_site_ui::pages::home::home)
         .shell(bmux_docs_site_ui::home_layout::shell)
         .brand(">_ bmux", "/")
         .header_links([
             HeaderLink::new("docs", "/docs"),
+            HeaderLink::new("live", "/live"),
             HeaderLink::external("github", "https://github.com/BSteffaniak/bmux"),
         ])
         .global_font(bmux_docs_site_ui::home_layout::MONO_FONT)

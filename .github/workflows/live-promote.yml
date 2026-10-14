@@ -1,0 +1,111 @@
+name: Live immutable promotion
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    paths: ['infra/live-**', 'scripts/*live*', '.github/workflows/live-*.yml']
+permissions:
+  contents: read
+concurrency:
+  group: bmux-live-promotion
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22.16.0'
+      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1
+        with:
+          tofu_version: '1.10.9'
+          tofu_wrapper: false
+      - name: Offline infrastructure validation
+        run: |
+          tofu -chdir=infra/live-terraform init -backend=false -input=false -lockfile=readonly
+          tofu -chdir=infra/live-terraform fmt -check
+          tofu -chdir=infra/live-terraform validate
+      - name: Build and validate one candidate without secrets
+        run: |
+          bash scripts/dev.sh bash scripts/build-live-artifact.sh "$RUNNER_TEMP/live-candidate"
+          tar -C "$RUNNER_TEMP/live-candidate" -czf "$RUNNER_TEMP/live-candidate.tar.gz" .
+          cd "$RUNNER_TEMP"
+          sha256sum live-candidate.tar.gz > live-candidate.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: live-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/live-candidate.tar.gz
+            ${{ runner.temp }}/live-candidate.tar.gz.sha256
+          retention-days: 14
+          if-no-files-found: error
+  staging:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    needs: build
+    environment: staging
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '22.16.0'}
+      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f
+        with: {tofu_version: '1.10.9', tofu_wrapper: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: live-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/live-download
+      - name: Verify and apply staging candidate
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          LIVE_HOSTNAME: ${{ secrets.LIVE_HOSTNAME }}
+          LIVE_PAGES_PROJECT: ${{ secrets.LIVE_PAGES_PROJECT }}
+          LIVE_PUBLISHER_KEY_SHA256: ${{ secrets.LIVE_PUBLISHER_KEY_SHA256 }}
+          LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
+          LIVE_STATE_REGION: ${{ secrets.LIVE_STATE_REGION }}
+          LIVE_STATE_ACCESS_KEY_ID: ${{ secrets.LIVE_STATE_ACCESS_KEY_ID }}
+          LIVE_STATE_SECRET_ACCESS_KEY: ${{ secrets.LIVE_STATE_SECRET_ACCESS_KEY }}
+        run: |
+          cd "$RUNNER_TEMP/live-download"
+          sha256sum -c live-candidate.tar.gz.sha256
+          mkdir "$RUNNER_TEMP/live-candidate"
+          tar -xzf live-candidate.tar.gz -C "$RUNNER_TEMP/live-candidate"
+          test "$(cat "$RUNNER_TEMP/live-candidate/REVISION")" = "$GITHUB_SHA"
+          bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" staging "$RUNNER_TEMP/live-candidate"
+  production:
+    needs: [build, staging]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    environment: production
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '22.16.0'}
+      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f
+        with: {tofu_version: '1.10.9', tofu_wrapper: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: live-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/live-download
+      - name: Promote exactly staging candidate after environment approval
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          LIVE_HOSTNAME: ${{ secrets.LIVE_HOSTNAME }}
+          LIVE_PAGES_PROJECT: ${{ secrets.LIVE_PAGES_PROJECT }}
+          LIVE_PUBLISHER_KEY_SHA256: ${{ secrets.LIVE_PUBLISHER_KEY_SHA256 }}
+          LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
+          LIVE_STATE_REGION: ${{ secrets.LIVE_STATE_REGION }}
+          LIVE_STATE_ACCESS_KEY_ID: ${{ secrets.LIVE_STATE_ACCESS_KEY_ID }}
+          LIVE_STATE_SECRET_ACCESS_KEY: ${{ secrets.LIVE_STATE_SECRET_ACCESS_KEY }}
+        run: |
+          cd "$RUNNER_TEMP/live-download"
+          sha256sum -c live-candidate.tar.gz.sha256
+          mkdir "$RUNNER_TEMP/live-candidate"
+          tar -xzf live-candidate.tar.gz -C "$RUNNER_TEMP/live-candidate"
+          test "$(cat "$RUNNER_TEMP/live-candidate/REVISION")" = "$GITHUB_SHA"
+          bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" production "$RUNNER_TEMP/live-candidate"

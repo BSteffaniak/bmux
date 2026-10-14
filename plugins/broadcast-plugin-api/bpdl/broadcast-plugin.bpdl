@@ -1,0 +1,29 @@
+plugin bmux.broadcast version 1;
+capability BROADCAST_CONTROL = bmux.broadcast.control.v1;
+capability BROADCAST_OUTPUT = bmux.broadcast.output.v1;
+
+@capability(BROADCAST_CONTROL)
+interface broadcast-control-v1 {
+    record status { local: string, remote: string, source_id: string?, error_code: string? }
+    command prepare-local() -> bool;
+    command authorize(local_proof: bytes) -> bool;
+    command start(endpoint: string, channel: string, credential_file: string, source_id: string) -> status;
+    command pause() -> status;
+    command resume() -> status;
+    command stop() -> status;
+    command status() -> status;
+    command terminal(source_id: string, session_id: string, executable: string, sha256: string, runtime_version: string, cols: u32, rows: u32) -> status;
+    command source(source_id: string) -> status;
+}
+
+@capability(BROADCAST_OUTPUT)
+interface broadcast-output-v1 {
+    // Register/poll renew a six-second lease. Poll at least every two seconds.
+    // A changed selected refresh requires re-submission of the current committed
+    // complete inline BMWP2 frame, even when the scene revision has not changed.
+    record source-state { refresh: u64, selected: bool }
+    command register(source_id: string) -> source-state;
+    command poll(source_id: string) -> source-state;
+    command publish(source_id: string, refresh: u64, frame: bytes) -> bool;
+    command unregister(source_id: string) -> bool;
+}

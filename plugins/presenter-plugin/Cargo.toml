@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = { workspace = true }
+bmux_broadcast_plugin_api = { workspace = true }
 bmux_client = { workspace = true }
 bmux_config = { workspace = true }
 bmux_image = { workspace = true }
@@ -39,6 +40,7 @@ bmux_web_host = { path = "../../packages/web-host", features = [
 bmux_web_renderer = { path = "../../packages/web-renderer" }
 crossterm = { workspace = true }
 image = { workspace = true }
+libc = { workspace = true }
 resvg = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }
@@ -56,6 +58,7 @@ uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 bmux_cli_schema = { workspace = true }
+bmux_ipc        = { workspace = true }
 bmux_plugin     = { workspace = true }
 clap            = { workspace = true }
 

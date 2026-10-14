@@ -122,3 +122,44 @@ checks lazy startup, real shared shell output, compatible/rejected reloads, fres
 Restart generations and active-run `q` cleanup, then emits one capability-safe
 summary pointing to retained private evidence. The existing coordinator managed
 passing harness remains separate.
+
+## Opt-in live audience source
+
+`--broadcast SOURCE_UUID` on `present play` or `present host` registers only
+that command's audience output. It does not start a relay broadcast or an HTTP
+listener. Choose a stable UUID and select it separately:
+
+```sh
+bmux present play deck.md --broadcast 12345678-1234-4234-8234-123456789abc
+# In another terminal (controller-owned credentials, never passed to presenter):
+bmux broadcast start https://live.example.test main /private/publisher-key 12345678-1234-4234-8234-123456789abc
+bmux broadcast pause
+bmux broadcast resume
+bmux broadcast stop
+```
+
+Existing `--web` mirrors and `--web-only` listeners can also use `--broadcast`.
+Without a local listener, no assets are downloaded and no browser viewport lease
+exists. Interactive playback retains terminal geometry authority; host audience
+observation without a listener uses fixed 80×24 geometry. `--web-only` retains its
+existing viewport behavior. Host still requires its normal transport/credential
+flags (for example `--managed --presenter-credential FILE --public-read`). A
+managed broadcast source keeps the caller running until Ctrl-C; the persistent
+broadcast controller lives in the server plugin, not this caller process.
+
+Only the shared compositor's audience projection enters full inline BMWP2
+frames: private notes, speaker controls, and unrevealed material are excluded.
+The output task retains only the latest frame, polls the source lease every
+second, and republishes unchanged slides after controller refresh. It fences
+async completion against selection/refresh and newer local frames. The 8 MiB
+limit rejects oversized output rather than truncating it. Registration and
+controller failures print content-free source status and do not stop local
+playback; normal closure unregisters, connection cleanup/lease expiry covers
+failure. Before every source registration/reconnect, presenter calls the generated
+`prepare_local` service to prepare the server-owned proof, then reads the caller's
+selected runtime directory's `broadcast-local-proof` and authorizes the same
+connection through the generated control service. The proof must be an owned,
+private, regular, single-link 32-byte file; unavailable/rotated/rejected proof leaves
+local playback usable and retries without exposing proof bytes or filesystem
+errors. Unix opens pin the owned runtime directory and reject symlinks; platforms
+without this secure reader fail closed. A local source ID is not a publisher credential.

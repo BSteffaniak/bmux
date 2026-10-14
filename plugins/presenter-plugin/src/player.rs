@@ -1007,9 +1007,9 @@ pub(crate) async fn run_headless(
     let result = loop {
         let changed = tokio::select! {
             signal = tokio::signal::ctrl_c() => { break signal.map_err(anyhow::Error::from); }
-            request = browser.requests.recv() => {
+            request = browser.viewport_request() => {
                 if let Some(request) = request {
-                    if browser.requests.is_current(&request) {
+                    if browser.viewport_is_current(&request) {
                         let changed = width != request.cols || height != request.rows;
                         width = request.cols;
                         height = request.rows;
@@ -1706,7 +1706,10 @@ mod tests {
         let frame =
             bmux_web_renderer::BrowserFrame::from_prepared_in_generation("audience", 1, &prepared)
                 .unwrap();
-        let json = bmux_web_renderer::encode_json(&frame).unwrap();
+        let binary = bmux_web_renderer::encode_binary(&frame).unwrap();
+        assert!(binary.starts_with(b"BMWP\x02"));
+        let decoded = bmux_web_renderer::decode_binary(&binary, None).unwrap();
+        let json = bmux_web_renderer::encode_json(&decoded).unwrap();
         let all_metadata = format!("{prepared:?} {json}");
         for private in [
             "PRIVATESECRET",

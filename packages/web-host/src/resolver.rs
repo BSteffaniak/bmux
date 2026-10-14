@@ -17,9 +17,12 @@ use sha2::{Digest, Sha256};
 pub const RENDERER_SHA256: &str = env!("BMUX_WEB_RENDERER_SHA256");
 pub const WASM_BINDGEN_VERSION: &str = env!("BMUX_WEB_WASM_BINDGEN_VERSION");
 pub const RELEASE_TAG: &str = env!("BMUX_WEB_RELEASE_TAG");
-const FILES: [&str; 5] = [
+const FILES: [&str; 8] = [
     "index.html",
     "bootstrap.js",
+    "canvas-viewer.js",
+    "live-viewer.js",
+    "live-page.js",
     "style.css",
     "bmux_web_renderer.js",
     "bmux_web_renderer_bg.wasm",
@@ -487,7 +490,14 @@ fn build_source(root: &Path, output: &Path, cache: &Path) -> io::Result<()> {
         ],
     )?;
     verify_source(root)?;
-    for name in ["index.html", "bootstrap.js", "style.css"] {
+    for name in [
+        "index.html",
+        "bootstrap.js",
+        "style.css",
+        "canvas-viewer.js",
+        "live-viewer.js",
+        "live-page.js",
+    ] {
         let bytes = read_regular(
             &root.join("packages/web-renderer/browser").join(name),
             FILE_LIMIT,

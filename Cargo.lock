@@ -1200,6 +1200,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_broadcast_plugin"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_broadcast_plugin_api",
+ "bmux_client",
+ "bmux_codec",
+ "bmux_config",
+ "bmux_plugin_sdk",
+ "bmux_tui 0.0.1-alpha.1",
+ "bmux_web_renderer",
+ "libc",
+ "reqwest 0.13.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_broadcast_plugin_api"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "anyhow",
+ "bmux_codec",
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bmux_cli"
 version = "0.0.1-alpha.1"
 dependencies = [
@@ -1211,6 +1246,7 @@ dependencies = [
  "bmux_attach_pipeline",
  "bmux_attach_token_state",
  "bmux_attach_view_protocol",
+ "bmux_broadcast_plugin",
  "bmux_cli_schema",
  "bmux_client",
  "bmux_clients_plugin",
@@ -2267,10 +2303,12 @@ name = "bmux_presenter_plugin"
 version = "0.0.1-alpha.1"
 dependencies = [
  "anyhow",
+ "bmux_broadcast_plugin_api",
  "bmux_cli_schema",
  "bmux_client",
  "bmux_config",
  "bmux_image",
+ "bmux_ipc",
  "bmux_keyboard 0.0.1-alpha.1",
  "bmux_mermaid_render",
  "bmux_playbook",
@@ -2288,6 +2326,7 @@ dependencies = [
  "clap",
  "crossterm",
  "image",
+ "libc",
  "resvg",
  "rustls",
  "serde_json",

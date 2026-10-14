@@ -1,46 +1,32 @@
 name: Deploy Docs Site
-
 on:
-    push:
-        branches: [master]
-        paths:
-            - ".github/workflows/docs-deploy.yml"
-            - "packages/docs-site/**"
-            - "packages/cli-schema/**"
-            - "packages/config/**"
-            - "packages/config-doc/**"
-            - "packages/config-doc-derive/**"
-            - "docs/**"
-            - "README.md"
-            - "TESTING.md"
-            - "packages/cli/README.md"
-            - "packages/plugin/README.md"
-            - "examples/native-plugin/README.md"
-    workflow_dispatch:
-
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/docs-deploy.yml'
+      - '.github/workflows/live-*.yml'
+      - 'packages/docs-site/**'
+      - 'packages/web-renderer/**'
+      - 'packages/cli-schema/**'
+      - 'packages/config/**'
+      - 'packages/config-doc/**'
+      - 'packages/config-doc-derive/**'
+      - 'infra/live-**'
+      - 'scripts/*live*'
+      - 'scripts/build-web-renderer.sh'
+      - 'flake.lock'
+      - 'docs/**'
+      - 'README.md'
+      - 'TESTING.md'
+      - 'packages/cli/README.md'
+      - 'packages/plugin/README.md'
+      - 'examples/native-plugin/README.md'
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
-    rust-version:
-        uses: ./.github/workflows/rust-version.yml
-
-    deploy:
-        needs: [rust-version]
-        runs-on: ubuntu-latest
-        permissions:
-            contents: read
-        steps:
-            - uses: actions/checkout@v4
-
-            - name: Install Rust
-              uses: dtolnay/rust-toolchain@master
-              with:
-                  toolchain: ${{ needs.rust-version.outputs.version }}
-
-            - name: Generate static site
-              run: cargo run --release -p bmux_docs_site -- gen --output dist
-
-            - name: Deploy to Cloudflare Pages
-              uses: cloudflare/wrangler-action@v3
-              with:
-                  apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-                  accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-                  command: pages deploy dist --project-name=bmux
+  # Single Pages owner: live assets are copied BEFORE docs gen, then the same
+  # native/viewer/relay/site artifact goes through staging and protected prod.
+  promote:
+    uses: ./.github/workflows/live-promote.yml
+    secrets: inherit

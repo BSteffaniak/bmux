@@ -5,12 +5,13 @@ use bmux_tui::geometry::Rect;
 
 pub(crate) struct Browser {
     pub only: bool,
-    host: bmux_web_host::HostHandle,
-    pub requests: bmux_web_host::ViewportRequests,
-    publisher: bmux_web_host::BrowserPublisher,
+    host: Option<bmux_web_host::HostHandle>,
+    requests: Option<bmux_web_host::ViewportRequests>,
+    publisher: Option<bmux_web_host::BrowserPublisher>,
+    broadcast: Option<crate::broadcast::Source>,
     scene: bmux_tui::presentation::PresentationState,
     area: Rect,
-    control: bmux_web_host::ViewControl,
+    control: Option<bmux_web_host::ViewControl>,
     generation: String,
     revision: u64,
 }
@@ -53,7 +54,18 @@ impl Browser {
             std::env::var("BMUX_PRESENTER_WEB_MODE"),
         )?;
         if mode == PresenterWebMode::Off {
-            return Ok(None);
+            return Ok(options.broadcast.map(|source| Self {
+                only: false,
+                host: None,
+                requests: None,
+                publisher: None,
+                control: None,
+                broadcast: Some(crate::broadcast::Source::start(source, paths.clone())),
+                scene: bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 80, 24)),
+                area: Rect::new(0, 0, 80, 24),
+                generation: uuid::Uuid::new_v4().to_string(),
+                revision: 0,
+            }));
         }
         let only = mode == PresenterWebMode::Only;
         let assets = bmux_config::web::assets(options.assets, config.presenter.web.assets);
@@ -111,12 +123,15 @@ impl Browser {
         }
         Ok(Some(Self {
             only,
-            host,
-            requests,
-            publisher,
+            host: Some(host),
+            requests: Some(requests),
+            publisher: Some(publisher),
+            broadcast: options
+                .broadcast
+                .map(|source| crate::broadcast::Source::start(source, paths.clone())),
             scene: bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 80, 24)),
             area: Rect::new(0, 0, 80, 24),
-            control,
+            control: Some(control),
             generation: uuid::Uuid::new_v4().to_string(),
             revision: 0,
         }))
@@ -129,8 +144,9 @@ impl Browser {
         height: u16,
     ) -> Result<()> {
         if width == 0 || height == 0 || usize::from(width) * usize::from(height) > 262_144 {
-            self.control
-                .set_presentation_status(Some("browser presentation rejected"));
+            if let Some(control) = &self.control {
+                control.set_presentation_status(Some("browser presentation rejected"));
+            }
             anyhow::bail!("audience viewport exceeds cell budget");
         }
         let area = Rect::new(0, 0, width, height);
@@ -148,8 +164,9 @@ impl Browser {
                 |cx| crate::player::paint_browser_audience(player, cx),
             )
             .inspect_err(|_| {
-                self.control
-                    .set_presentation_status(Some("browser presentation rejected"))
+                if let Some(control) = &self.control {
+                    control.set_presentation_status(Some("browser presentation rejected"));
+                }
             })?;
         let revision = self
             .revision
@@ -157,8 +174,23 @@ impl Browser {
             .context("audience revision exhausted")?;
         // Publish before replacing retained authority, especially for a rejected resize.
         if let Some(prepared) = prepared.as_ref() {
-            self.publisher
-                .publish_prepared(&self.generation, revision, prepared)?;
+            if let Some(publisher) = &mut self.publisher {
+                publisher.publish_prepared(&self.generation, revision, prepared)?;
+            }
+            if let Some(source) = &self.broadcast {
+                // Conversion uses the exact audience-only prepared compositor scene.
+                // Encoding and all service IO happen in the asynchronous source task.
+                match bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
+                    &self.generation,
+                    revision,
+                    prepared,
+                ) {
+                    Ok(frame) => source.publish(frame),
+                    Err(_) => eprintln!(
+                        "Broadcast audience preparation rejected; local playback continues"
+                    ),
+                }
+            }
         }
         if let Some(staged) = staged {
             self.scene = staged;
@@ -170,14 +202,76 @@ impl Browser {
         Ok(())
     }
 
+    pub fn broadcast_only(&self) -> bool {
+        self.host.is_none()
+    }
+
+    pub async fn viewport_request(&mut self) -> Option<bmux_web_host::ViewportRequest> {
+        match &mut self.requests {
+            Some(requests) => requests.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    pub fn viewport_is_current(&self, request: &bmux_web_host::ViewportRequest) -> bool {
+        self.requests
+            .as_ref()
+            .is_some_and(|requests| requests.is_current(request))
+    }
+
     pub async fn shutdown(self) {
-        self.host.shutdown().await;
+        if let Some(source) = self.broadcast {
+            source.shutdown().await;
+        }
+        if let Some(host) = self.host {
+            host.shutdown().await;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn audience_without_listener_has_no_viewport_lease_and_retains_scene() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut audience = Browser {
+            only: false,
+            host: None,
+            requests: None,
+            publisher: None,
+            broadcast: None,
+            control: None,
+            scene: bmux_tui::presentation::PresentationState::new(area),
+            area,
+            generation: "broadcast-only-test".into(),
+            revision: 0,
+        };
+        assert!(audience.broadcast_only());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                audience.viewport_request()
+            )
+            .await
+            .is_err()
+        );
+        let deck = bmux_presenter::DeckBuilder::new("deck")
+            .slide(
+                bmux_presenter::SlideBuilder::new("slide")
+                    .text("body", "PUBLIC")
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = crate::player::Player::local(deck, None, true);
+        audience.publish(&mut player, 80, 24).unwrap();
+        assert_eq!(audience.revision, 1);
+        assert_eq!(audience.area, area);
+        assert!(player.presenter);
+        audience.shutdown().await;
+    }
 
     #[test]
     fn explicit_mode_precedence_and_network_only_nonactivation() {
@@ -252,10 +346,14 @@ mod tests {
         let requests = host.take_viewport_requests().unwrap();
         let mut browser = Browser {
             only: true,
-            publisher: bmux_web_host::BrowserPublisher::new(publisher, control.clone()),
-            host,
-            requests,
-            control,
+            publisher: Some(bmux_web_host::BrowserPublisher::new(
+                publisher,
+                control.clone(),
+            )),
+            host: Some(host),
+            requests: Some(requests),
+            control: Some(control),
+            broadcast: None,
             area: Rect::new(0, 0, 80, 24),
             scene: bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 80, 24)),
             generation: "test-audience".into(),

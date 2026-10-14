@@ -76,6 +76,9 @@ sshenv_vault = { workspace = true }
 bmux_application_resurrection_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
+bmux_broadcast_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
 bmux_clients_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -267,6 +270,7 @@ fail-on-warnings = [
     "bmux_decoration_plugin?/fail-on-warnings",
     "bmux_decoration_plugin_renderer?/fail-on-warnings",
     "bmux_playbook_plugin?/fail-on-warnings",
+    "bmux_broadcast_plugin?/fail-on-warnings",
     "bmux_presenter_plugin?/fail-on-warnings",
     "bmux_finder_plugin?/fail-on-warnings",
 ]
@@ -305,6 +309,7 @@ bundled-plugins = [
     "bundled-plugin-workspaces",
     "bundled-plugin-decoration",
     "bundled-plugin-playbook",
+    "bundled-plugin-broadcast",
     "bundled-plugin-presenter",
     "bundled-plugin-finder",
     "bundled-visual-adapters",
@@ -314,6 +319,7 @@ bundled-plugins = [
 bundled-plugin-application-resurrection = [
     "dep:bmux_application_resurrection_plugin",
 ]
+bundled-plugin-broadcast = ["dep:bmux_broadcast_plugin"]
 bundled-plugin-cli = ["dep:bmux_plugin_cli_plugin"]
 bundled-plugin-clients = ["dep:bmux_clients_plugin"]
 bundled-plugin-clipboard = ["dep:bmux_clipboard_plugin"]

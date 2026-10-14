@@ -18,7 +18,7 @@ import tomllib
 
 NAMES = (
     "index.html", "bootstrap.js", "style.css", "bmux_web_renderer.js",
-    "bmux_web_renderer_bg.wasm",
+    "bmux_web_renderer_bg.wasm", "canvas-viewer.js", "live-viewer.js", "live-page.js",
 )
 MAX_FILE = 8 * 1024 * 1024
 MAX_TOTAL = 24 * 1024 * 1024

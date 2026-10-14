@@ -39,9 +39,9 @@ pub(crate) async fn run(
                     if changed.is_err() || *stop.borrow() { break; }
                     false
                 }
-                request = browser.requests.recv() => {
+                request = browser.viewport_request() => {
                     let Some(request) = request else { break; };
-                    if browser.only && browser.requests.is_current(&request) {
+                    if browser.only && browser.viewport_is_current(&request) {
                         let changed = width != request.cols || height != request.rows;
                         width = request.cols;
                         height = request.rows;

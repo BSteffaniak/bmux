@@ -42,6 +42,13 @@ impl Asset {
             ("/", "index.html", ContentType::Html),
             ("/index.html", "index.html", ContentType::Html),
             ("/bootstrap.js", "bootstrap.js", ContentType::JavaScript),
+            (
+                "/canvas-viewer.js",
+                "canvas-viewer.js",
+                ContentType::JavaScript,
+            ),
+            ("/live-viewer.js", "live-viewer.js", ContentType::JavaScript),
+            ("/live-page.js", "live-page.js", ContentType::JavaScript),
             ("/style.css", "style.css", ContentType::TextCss),
             (
                 "/bmux_web_renderer.js",
@@ -182,7 +189,7 @@ mod tests {
     #[test]
     fn defaults_include_only_explicit_bounded_stylesheet() {
         let defaults = Asset::browser_defaults();
-        assert_eq!(defaults.len(), 6);
+        assert_eq!(defaults.len(), 9);
         let css = defaults
             .iter()
             .find(|asset| asset.url == "/style.css")
@@ -201,7 +208,7 @@ mod tests {
         std::fs::write(directory.path().join("unlisted.css"), b"hidden").unwrap();
         let mut config = HostConfig::new(directory.path().canonicalize().unwrap());
         let loaded = load(&config).unwrap();
-        assert_eq!(loaded.len(), 6);
+        assert_eq!(loaded.len(), 9);
         assert!(!loaded.contains_key("/unlisted.css"));
         assert_eq!(loaded["/style.css"].bytes.as_ref(), b"x");
         // Keep valid WASM within the per-file budget so only the stylesheet exceeds it.
@@ -209,10 +216,10 @@ mod tests {
         std::fs::write(directory.path().join("style.css"), b"123456789").unwrap();
         assert!(load(&config).is_err());
         std::fs::write(directory.path().join("style.css"), b"x").unwrap();
-        // Five one-byte mappings (including the index alias) plus eight WASM bytes.
-        config.limits.max_total_asset_bytes = 13;
+        // Eight one-byte mappings (including the index alias) plus eight WASM bytes.
+        config.limits.max_total_asset_bytes = 16;
         assert!(load(&config).is_ok());
-        config.limits.max_total_asset_bytes = 12;
+        config.limits.max_total_asset_bytes = 15;
         assert!(load(&config).is_err());
     }
 

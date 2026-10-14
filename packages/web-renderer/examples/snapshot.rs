@@ -87,7 +87,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     if let Some(json) = json {
-        println!("{json}");
+        match std::env::args().nth(1).as_deref() {
+            None => println!("{json}"),
+            Some("--binary") => {
+                use std::io::Write;
+                let frame =
+                    bmux_web_renderer::decode_json(&json, bmux_web_renderer::Limits::default())?;
+                std::io::stdout()
+                    .lock()
+                    .write_all(&bmux_web_renderer::encode_binary(&frame)?)?;
+            }
+            Some(_) => return Err("usage: snapshot [--binary]".into()),
+        }
     }
     Ok(())
 }

@@ -32,3 +32,5 @@ infra/terraform/.terraform/
 infra/terraform/*.tfstate
 infra/terraform/*.tfstate.backup
 infra/wrangler/.wrangler/
+
+__pycache__/
