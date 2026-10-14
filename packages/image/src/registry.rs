@@ -984,6 +984,29 @@ impl ImageRegistry {
                     };
                     let mut cell_size =
                         pixel_size_to_cells(pixel_size, cell_pixel_width, cell_pixel_height);
+                    if placement.cell_size.cols > 0 && placement.cell_size.rows == 0 {
+                        cell_size.rows = u16::try_from(
+                            (u64::from(placement.cell_size.cols)
+                                * u64::from(cell_pixel_width.max(1))
+                                * u64::from(pixel_size.height))
+                            .div_ceil(
+                                u64::from(pixel_size.width.max(1))
+                                    * u64::from(cell_pixel_height.max(1)),
+                            ),
+                        )
+                        .unwrap_or(u16::MAX);
+                    } else if placement.cell_size.rows > 0 && placement.cell_size.cols == 0 {
+                        cell_size.cols = u16::try_from(
+                            (u64::from(placement.cell_size.rows)
+                                * u64::from(cell_pixel_height.max(1))
+                                * u64::from(pixel_size.width))
+                            .div_ceil(
+                                u64::from(pixel_size.height.max(1))
+                                    * u64::from(cell_pixel_width.max(1)),
+                            ),
+                        )
+                        .unwrap_or(u16::MAX);
+                    }
                     if placement.cell_size.cols > 0 {
                         cell_size.cols = placement.cell_size.cols;
                     }
@@ -1374,6 +1397,34 @@ mod tests {
         // 100/8 = 12.5 -> 13 cols, 50/16 = 3.125 -> 4 rows
         assert_eq!(size.cols, 13);
         assert_eq!(size.rows, 4);
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn kitty_single_axis_placement_derives_other_axis_from_aspect() {
+        use crate::codec::kitty::parse_command;
+        let mut registry = ImageRegistry::default();
+        registry.handle_kitty_command(
+            crate::model::KittyCommand::Transmit {
+                image_id: 42,
+                format: crate::model::KittyFormat::Rgba,
+                data: vec![255; 100 * 50 * 4],
+                width: 100,
+                height: 50,
+                more_chunks: false,
+            },
+            8,
+            16,
+        );
+        for (body, cols, rows) in [
+            ("Ga=p,i=42,p=1,c=20", 20, 5),
+            ("Ga=p,i=42,p=2,r=10", 40, 10),
+        ] {
+            let command = parse_command(body.as_bytes(), ImagePosition { row: 0, col: 0 }).unwrap();
+            registry.handle_kitty_command(command, 8, 16);
+            let image = registry.images().last().unwrap();
+            assert_eq!(image.cell_size, ImageCellSize { cols, rows });
+        }
     }
 
     #[test]

@@ -53,6 +53,83 @@ pub struct KittyHostState {
 }
 
 impl KittyHostState {
+    /// Place an already-validated PNG with protocol-native aspect-preserving scaling.
+    /// One cell dimension is deliberately omitted so Kitty derives it from source
+    /// aspect ratio. No CPU resize, letterbox raster, or decoded upload is needed.
+    #[cfg(feature = "kitty")]
+    pub(crate) fn contain_png(
+        &mut self,
+        out: &mut impl Write,
+        image: &PaneImage,
+        placement: &bmux_tui::image::ImagePlacement,
+        caps: &HostImageCapabilities,
+        clip: bmux_tui::geometry::Rect,
+    ) -> std::io::Result<bool> {
+        use bmux_tui::geometry::Rect;
+        let bounds = placement
+            .allocation
+            .unwrap_or_else(|| placement.destination.into());
+        if bounds.x < 0 || bounds.y < 0 {
+            return Ok(false);
+        }
+        let (Ok(x), Ok(y)) = (u16::try_from(bounds.x), u16::try_from(bounds.y)) else {
+            return Ok(false);
+        };
+        let allocation = Rect::new(x, y, bounds.width, bounds.height);
+        if allocation.intersection(clip) != allocation {
+            return Ok(false);
+        }
+        let Some(pixels) = image
+            .payload
+            .pixels
+            .as_ref()
+            .filter(|p| p.format == crate::model::PixelFormat::Png)
+        else {
+            return Ok(false);
+        };
+        let (cw, ch) = caps.fitting_cell_size();
+        let width_limited = u64::from(allocation.width) * u64::from(cw) * u64::from(pixels.height)
+            <= u64::from(allocation.height) * u64::from(ch) * u64::from(pixels.width);
+        let (cols, rows, footprint_width, footprint_height) = if width_limited {
+            let height = (u64::from(allocation.width) * u64::from(cw) * u64::from(pixels.height))
+                .div_ceil(u64::from(pixels.width) * u64::from(ch));
+            (
+                allocation.width,
+                0,
+                allocation.width,
+                u16::try_from(height).unwrap_or(allocation.height),
+            )
+        } else {
+            let width = (u64::from(allocation.height) * u64::from(ch) * u64::from(pixels.width))
+                .div_ceil(u64::from(pixels.height) * u64::from(cw));
+            (
+                0,
+                allocation.height,
+                u16::try_from(width).unwrap_or(allocation.width),
+                allocation.height,
+            )
+        };
+        let x = x + allocation.width.saturating_sub(footprint_width) / 2;
+        let y = y + allocation.height.saturating_sub(footprint_height) / 2;
+        let fragment = PaneImage {
+            cell_size: crate::model::ImageCellSize { cols, rows },
+            ..image.clone()
+        };
+        write!(out, "\x1b[{};{}H", y + 1, x + 1)?;
+        emit_kitty_data(
+            out,
+            &fragment,
+            crate::model::KittyFormat::Png,
+            &pixels.data,
+            pixels.width,
+            pixels.height,
+            x,
+            y,
+            self,
+        )?;
+        Ok(true)
+    }
+
     /// Hide all compositor-owned Kitty placements while retaining reusable content.
     /// The caller must commit this candidate only after output and flush succeed.
     pub fn clear_placements(&mut self, out: &mut impl Write) -> std::io::Result<()> {

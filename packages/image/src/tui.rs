@@ -237,6 +237,20 @@ impl TuiImageCompositor {
                 );
             }
             let source = Arc::clone(&self.sources.get(&placement.key).expect("retained source").2);
+            #[cfg(feature = "kitty")]
+            if placement.fit == bmux_tui::image::ImageFit::Contain
+                && host_caps.preferred_protocol() == Some(ImageProtocol::KittyGraphics)
+                && self.kitty_state.contain_png(
+                    out,
+                    &source,
+                    placement,
+                    host_caps,
+                    placement.clip.intersection(terminal_clip),
+                )?
+            {
+                self.trim_sources();
+                continue;
+            }
             let image = if placement.fit == bmux_tui::image::ImageFit::Contain {
                 let signature = (
                     source.id,
@@ -290,7 +304,8 @@ impl TuiImageCompositor {
             self.trim_sources();
         }
         self.kitty_state.finish_frame(out)?;
-        self.sources.retain(|key, _| scene.get(key).is_some());
+        // Keep inactive preparation within trim_sources' entry/byte budgets so
+        // navigating away and back does not decode or resize the same resource.
         self.fitted.retain(|key, _| self.sources.contains_key(key));
         self.trim_sources();
         Ok(())
@@ -775,12 +790,25 @@ mod tests {
                     )
                     .unwrap();
                 assert!(!output.is_empty());
-                let fitted = &compositor.fitted.values().next().unwrap().1;
-                assert_eq!(
-                    fitted.payload.pixels.as_ref().unwrap().format,
-                    crate::model::PixelFormat::Rgba8
-                );
-                let id = fitted.id;
+                let id = if kitty_graphics {
+                    assert!(
+                        compositor.fitted.is_empty(),
+                        "native containment must not rasterize"
+                    );
+                    assert!(String::from_utf8_lossy(&output).contains("f=100"));
+                    assert!(
+                        output.len() < bytes.len() * 2 + 4096,
+                        "compact upload budget"
+                    );
+                    compositor.sources.values().next().unwrap().2.id
+                } else {
+                    let fitted = &compositor.fitted.values().next().unwrap().1;
+                    assert_eq!(
+                        fitted.payload.pixels.as_ref().unwrap().format,
+                        crate::model::PixelFormat::Rgba8
+                    );
+                    fitted.id
+                };
                 compositor
                     .render(
                         &mut Vec::new(),
@@ -795,7 +823,47 @@ mod tests {
                         &config,
                     )
                     .unwrap();
-                assert_eq!(compositor.fitted.values().next().unwrap().1.id, id);
+                let mut hidden = ImageScene::default();
+                compositor
+                    .render(
+                        &mut Vec::new(),
+                        &hidden,
+                        PaneRect {
+                            x: 0,
+                            y: 0,
+                            w: 40,
+                            h: 12,
+                        },
+                        &caps,
+                        &config,
+                    )
+                    .unwrap();
+                hidden = scene.clone();
+                let mut returned = Vec::new();
+                compositor
+                    .render(
+                        &mut returned,
+                        &hidden,
+                        PaneRect {
+                            x: 0,
+                            y: 0,
+                            w: 40,
+                            h: 12,
+                        },
+                        &caps,
+                        &config,
+                    )
+                    .unwrap();
+                if kitty_graphics {
+                    assert_eq!(compositor.sources.values().next().unwrap().2.id, id);
+                    assert!(
+                        !String::from_utf8_lossy(&returned).contains("a=t"),
+                        "return must only place retained upload"
+                    );
+                    assert_eq!(compositor.work_counts(), (1, 0, 0));
+                } else {
+                    assert_eq!(compositor.fitted.values().next().unwrap().1.id, id);
+                }
             }
         }
     }
