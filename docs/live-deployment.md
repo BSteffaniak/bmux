@@ -216,6 +216,20 @@ are rejected rather than silently reinterpreted as R2. Existing bucket selection
 must be explicit and consistent; never initialize a competing backend to bypass
 an error. Bootstrap metadata and operation reviews must not contain credentials.
 
+### Validation versus deployment
+
+`Live Validation` runs offline infrastructure/setup tests, relay tests, and native
+runtime/renderer acceptance on pull requests and relevant master pushes. General
+Rust tests and linting remain in `Build and Test`. These are separate from the
+configure/release workflow: deployment builds/packages the candidate without
+rerunning test/lint suites. `test-live-deployment-boundary.py` guards that separation.
+
+Artifact inventory/checksums, exact revision, production approval, encrypted backend
+locking, bootstrap admission/import ownership checks, plan policy and public
+post-deploy health checks remain part of deployment. They are operational safeguards,
+not duplicate unit tests. Separate validation workflows are not implicitly a deploy
+dependency; use repository branch protection to require their results before merge.
+
 ### 3. Configure production infrastructure in CI
 
 Merge the implementation/workflows into `master`, then run **Configure Production

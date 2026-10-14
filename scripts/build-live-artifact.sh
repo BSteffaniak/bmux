@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Explicit CI/operator artifact build, never part of local bmux startup.
+# Build/package only. Validation runs in CI and Live Validation, not deployment.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -9,20 +9,6 @@ OUTPUT="${1:?New output directory required}"
 [[ ! -e "$OUTPUT" ]] || { echo 'Output already exists' >&2; exit 2; }
 mkdir -p "$OUTPUT"
 OUTPUT="$(cd "$OUTPUT" && pwd)"
-python3 scripts/test-live-bootstrap.py
-python3 scripts/test-live-github-environments.py
-python3 scripts/test-setup-live.py
-python3 scripts/test-live-state-recovery.py
-python3 scripts/test-live-state.py
-python3 scripts/test-live-smoke.py
-(cd infra/live-relay && npm test)
-cargo clippy --all-targets -- -D warnings
-cargo nextest run --no-fail-fast
-cargo machete --with-metadata
-cargo test -p bmux_cli
-cargo check -p bmux_cli
-bash scripts/smoke-pty-runtime.sh
-bash scripts/compat-matrix.sh
 cargo build --locked --release -p bmux_cli
 # Rebuild plugin bundles through the explicitly built test version, isolated state.
 ISOLATED="$(mktemp -d "${TMPDIR:-/tmp}/bmux-live-build.XXXXXXXX")"
@@ -40,9 +26,7 @@ done
 # public assets BEFORE docs compilation. Do not add an unversioned second copy.
 test -s packages/docs-site/public/live-assets/current-version
 VERSION="$(cat packages/docs-site/public/live-assets/current-version)"
-# Produce an actual retained Rust presentation; no fabricated binary fixture.
-cargo run --locked --quiet -p bmux_web_renderer --example snapshot -- --binary > "$OUTPUT/native-frame.bmwp"
-python3 scripts/smoke-live-local.py --assets "packages/docs-site/public/live-assets/$VERSION" --frame "$OUTPUT/native-frame.bmwp"
+test -d "packages/docs-site/public/live-assets/$VERSION"
 cargo run --locked --release -p bmux_docs_site -- gen --output "$OUTPUT/site"
 mkdir "$OUTPUT/native" "$OUTPUT/relay" "$OUTPUT/tools"
 cp "$CARGO_TARGET_DIR/release/bmux" "$OUTPUT/native/bmux"
@@ -67,7 +51,6 @@ for path in root.rglob('*'):
         path.unlink()
         path.write_bytes(payload)
 PY
-python3 scripts/test-live-install.py
 # The inventory file is explicitly excluded from find's input set.
 # shellcheck disable=SC2094
 (cd "$OUTPUT" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)

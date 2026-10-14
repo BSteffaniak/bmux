@@ -33,21 +33,6 @@ jobs:
       - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: {node-version: '22.16.0'}
-      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1
-        with: {tofu_version: '1.10.9', tofu_wrapper: false}
-      - name: Offline infrastructure validation
-        run: |
-          tofu -chdir=infra/live-terraform init -backend=false -input=false -lockfile=readonly
-          tofu -chdir=infra/live-terraform fmt -check
-          tofu -chdir=infra/live-terraform validate
-          python3 scripts/test-live-bootstrap.py
-          python3 scripts/test-live-github-environments.py
-          python3 scripts/test-setup-live.py
-          python3 scripts/test-live-state-recovery.py
-          python3 scripts/test-live-state-provision.py
-          python3 scripts/test-live-imports.py
-          python3 scripts/test-live-plan-policy.py
-          python3 scripts/test-live-deploy.py
       - name: Build one immutable candidate without deployment secrets
         run: |
           bash scripts/dev.sh bash scripts/build-live-artifact.sh "$RUNNER_TEMP/live-candidate"
