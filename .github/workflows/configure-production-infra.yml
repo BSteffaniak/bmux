@@ -1,0 +1,26 @@
+name: Configure Production Infrastructure
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed_imports:
+        description: 'Exact reviewed JSON address-to-provider-ID map; leave {} for discovery. Confirm old state ownership is transferred before import.'
+        required: false
+        type: string
+        default: '{}'
+      approve_import:
+        description: 'Approve adopting exactly the reviewed existing resources into BMUX state'
+        required: true
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  configure:
+    if: github.ref == 'refs/heads/master'
+    uses: ./.github/workflows/live-promote.yml
+    with:
+      configure: true
+      reviewed_imports: ${{ inputs.reviewed_imports }}
+      approve_import: ${{ inputs.approve_import }}
+    secrets: inherit

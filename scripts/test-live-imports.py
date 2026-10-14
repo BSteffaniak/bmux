@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Offline import-discovery tests. Never contacts Cloudflare or invokes OpenTofu."""
+import contextlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+SPEC = importlib.util.spec_from_file_location('live_imports', Path(__file__).with_name('configure-live-imports.py'))
+MODULE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(MODULE)
+ACCOUNT = 'a' * 32
+ZONE = 'b' * 32
+DNS = 'c' * 32
+ENV = {'CLOUDFLARE_ACCOUNT_ID': ACCOUNT, 'CLOUDFLARE_ZONE_ID': ZONE,
+       'LIVE_HOSTNAME': 'bmux.dev', 'LIVE_PAGES_PROJECT': 'bmux',
+       'LIVE_ENVIRONMENT': 'production', 'CLOUDFLARE_API_TOKEN': 'SECRET_TOKEN'}
+
+
+class FakeAPI:
+    def __init__(self):
+        self.data = {
+            f'accounts/{ACCOUNT}/pages/projects': [{'name': 'bmux'}],
+            f'accounts/{ACCOUNT}/pages/projects/bmux/domains': [{'name': 'bmux.dev'}],
+            f'zones/{ZONE}/dns_records?name=bmux.dev': [{'id': DNS, 'name': 'bmux.dev', 'type': 'CNAME', 'content': 'bmux.pages.dev'}],
+            f'accounts/{ACCOUNT}/workers/workers': [],
+            f'accounts/{ACCOUNT}/workers/scripts': [],
+            f'zones/{ZONE}/workers/routes': [],
+        }
+
+    def listing(self, endpoint):
+        return self.data[endpoint]
+
+
+class Response(io.BytesIO):
+    status = 200
+
+    def __init__(self, data, url):
+        super().__init__(data)
+        self.url = url
+
+    def geturl(self):
+        return self.url
+
+
+class Opener:
+    def __init__(self, answers):
+        self.answers = iter(answers)
+        self.requests = []
+
+    def open(self, request, timeout):
+        self.requests.append((request, timeout))
+        answer = next(self.answers)
+        if isinstance(answer, Exception):
+            raise answer
+        data = answer if isinstance(answer, bytes) else json.dumps(answer).encode()
+        return Response(data, request.full_url)
+
+
+class Tests(unittest.TestCase):
+    def test_exact_discovery_and_managed_filter(self):
+        found = MODULE.discover(FakeAPI(), MODULE.configuration(ENV), set())
+        self.assertEqual(found, {
+            'cloudflare_pages_project.live': ACCOUNT + '/bmux',
+            'cloudflare_pages_domain.live': ACCOUNT + '/bmux/bmux.dev',
+            'cloudflare_dns_record.live': ZONE + '/' + DNS,
+        })
+        self.assertEqual(MODULE.discover(FakeAPI(), MODULE.configuration(ENV), set(found)), {})
+
+    def test_approval_and_exact_mapping_required_no_file_on_denial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'imports.tf.json'
+            found = MODULE.discover(FakeAPI(), MODULE.configuration(ENV), set())
+            for approved, reviewed in [(False, found), (True, {}), (True, {'cloudflare_worker.live': ACCOUNT + '/wrong'})]:
+                with self.assertRaises(MODULE.ImportErrorSafe):
+                    MODULE.generate(output, found, reviewed, approved)
+                self.assertFalse(output.exists())
+            MODULE.generate(output, found, found, True)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            document = json.loads(output.read_text())
+            self.assertEqual({block['to']: block['id'] for block in document['import']}, found)
+            with self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.generate(output, found, found, True)
+
+    def test_ambiguity_foreign_pages_and_dns(self):
+        cases = [
+            (f'accounts/{ACCOUNT}/pages/projects', [{'name': 'bmux'}, {'name': 'bmux'}]),
+            (f'accounts/{ACCOUNT}/pages/projects/bmux/domains', [{'name': 'bmux.dev'}, {'name': 'bmux.dev'}]),
+            (f'zones/{ZONE}/dns_records?name=bmux.dev', [{'name': 'bmux.dev', 'type': 'A', 'content': '1.2.3.4'}]),
+            (f'zones/{ZONE}/dns_records?name=bmux.dev', [{'name': 'bmux.dev', 'type': 'CNAME', 'content': 'foreign.pages.dev'}]),
+            (f'zones/{ZONE}/dns_records?name=bmux.dev', [{'name': 'bmux.dev', 'type': 'CNAME', 'content': 'bmux.pages.dev', 'id': 'SECRET_TOKEN\n::error::injection'}]),
+        ]
+        for endpoint, data in cases:
+            api = FakeAPI()
+            api.data[endpoint] = data
+            with self.subTest(endpoint=endpoint), self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.discover(api, MODULE.configuration(ENV), set())
+        api = FakeAPI()
+        api.data[f'accounts/{ACCOUNT}/pages/projects'].append({'name': 'other'})
+        api.data[f'accounts/{ACCOUNT}/pages/projects/other/domains'] = [{'name': 'bmux.dev'}]
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.discover(api, MODULE.configuration(ENV), set())
+
+    def test_worker_and_route_ownership_never_guessed(self):
+        api = FakeAPI()
+        api.data[f'accounts/{ACCOUNT}/workers/scripts'] = [{'id': 'bmux-live-production'}]
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.discover(api, MODULE.configuration(ENV), set())
+        api = FakeAPI()
+        api.data[f'accounts/{ACCOUNT}/workers/workers'] = [{'name': 'bmux-live-production', 'id': 'd' * 32}]
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.discover(api, MODULE.configuration(ENV), set())
+        managed = set(MODULE.ADDRESSES[3:6])
+        api.data[f'zones/{ZONE}/workers/routes'] = [{'pattern': 'bmux.dev/api/live/*', 'script': 'foreign', 'id': DNS}]
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.discover(api, MODULE.configuration(ENV), managed)
+        api.data[f'zones/{ZONE}/workers/routes'][0]['script'] = 'bmux-live-production'
+        found = MODULE.discover(api, MODULE.configuration(ENV), managed)
+        self.assertEqual(found['cloudflare_workers_route.live'], ZONE + '/' + DNS)
+        self.assertNotIn('cloudflare_worker.live', found)
+
+    def test_configuration_hostile_values_are_not_echoed(self):
+        for key in ENV:
+            env = dict(ENV, **{key: 'SECRET_TOKEN\n::error::injection'})
+            with self.subTest(key=key), self.assertRaises(MODULE.ImportErrorSafe) as error:
+                MODULE.configuration(env)
+            self.assertNotIn('SECRET_TOKEN', str(error.exception))
+
+    def test_transport_get_only_bounds_and_pagination(self):
+        opener = Opener([
+            {'success': True, 'result': [{'id': 1}], 'result_info': {'page': 1, 'total_pages': 2}},
+            {'success': True, 'result': [{'id': 2}], 'result_info': {'page': 2, 'total_pages': 2}},
+        ])
+        api = MODULE.Cloudflare('SECRET_TOKEN', opener)
+        self.assertEqual(api.listing('accounts/test/pages/projects'), [{'id': 1}, {'id': 2}])
+        for request, timeout in opener.requests:
+            self.assertEqual(request.get_method(), 'GET')
+            self.assertTrue(request.full_url.startswith(MODULE.BASE))
+            self.assertLessEqual(timeout, 5)
+        for answer in [b'x' * (MODULE.MAX_BYTES + 1), b'{truncated',
+                       {'success': False, 'errors': ['SECRET_TOKEN']},
+                       {'success': True, 'result': [{}] * 100},
+                       {'success': True, 'result': [], 'result_info': {'page': 1, 'total_pages': 21}},
+                       {'success': True, 'result': 'SECRET_TOKEN'},
+                       OSError('SECRET_TOKEN')]:
+            with self.subTest(answer=type(answer)), self.assertRaises(MODULE.ImportErrorSafe) as error:
+                MODULE.Cloudflare('SECRET_TOKEN', Opener([answer])).listing('test')
+            self.assertNotIn('SECRET_TOKEN', str(error.exception))
+
+    def test_redirect_and_deadline_fail_closed(self):
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.NoRedirect().redirect_request(None, None, 302, 'SECRET_TOKEN', {}, 'https://evil.invalid')
+        ticks = iter([0, 31])
+        api = MODULE.Cloudflare('SECRET_TOKEN', Opener([]), clock=lambda: next(ticks))
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            api.listing('test')
+        opener = Opener([{'success': True, 'result': [], 'result_info': {'page': 2, 'total_pages': 2}}])
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.Cloudflare('SECRET_TOKEN', opener).listing('test')
+
+    def test_private_output_and_input_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / 'artifact'
+            artifact.mkdir()
+            source = Path(__file__).resolve().parent.parent / 'infra/live-terraform/main.tf'
+            (artifact / 'main.tf').write_text(source.read_text())
+            output = root / 'imports.tf.json'
+            self.assertEqual(MODULE.paths(str(artifact), str(output)), output)
+            root.chmod(0o755)
+            with self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.paths(str(artifact), str(output))
+            root.chmod(0o700)
+            target = root / 'target'
+            target.write_text('keep')
+            output.symlink_to(target)
+            with self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.paths(str(artifact), str(output))
+            with self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.generate(output, {}, {}, False)
+            self.assertEqual(target.read_text(), 'keep')
+            input_path = root / 'managed.json'
+            input_path.write_text('{"a":1,"a":2}')
+            with self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.read_json(input_path)
+            with self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.managed_addresses(['x', 'x'])
+            with self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.reviewed_imports({'evil\n::error::': 'SECRET_TOKEN'})
+
+    def test_empty_paginated_list_and_changing_pages(self):
+        empty = {'success': True, 'result': [], 'result_info': {'page': 1, 'total_pages': 0}}
+        self.assertEqual(MODULE.Cloudflare('SECRET_TOKEN', Opener([empty])).listing('test'), [])
+        changed = [
+            {'success': True, 'result': [], 'result_info': {'page': 1, 'total_pages': 2}},
+            {'success': True, 'result': [], 'result_info': {'page': 2, 'total_pages': 3}},
+        ]
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.Cloudflare('SECRET_TOKEN', Opener(changed)).listing('test')
+
+    def test_no_existing_resources_needs_no_approval(self):
+        api = FakeAPI()
+        api.data[f'accounts/{ACCOUNT}/pages/projects'] = []
+        api.data[f'zones/{ZONE}/dns_records?name=bmux.dev'] = []
+        found = MODULE.discover(api, MODULE.configuration(ENV), set())
+        self.assertEqual(found, {})
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'imports.tf.json'
+            MODULE.generate(output, found, {}, False)
+            self.assertEqual(json.loads(output.read_text()), {'import': []})
+
+    def test_hostile_discovered_project_never_reaches_output(self):
+        api = FakeAPI()
+        api.data[f'accounts/{ACCOUNT}/pages/projects'] = [{'name': 'SECRET_TOKEN\n::error::'}]
+        with self.assertRaises(MODULE.ImportErrorSafe) as error:
+            MODULE.discover(api, MODULE.configuration(ENV), set())
+        self.assertNotIn('SECRET_TOKEN', str(error.exception))
+
+    def test_cli_denial_prints_safe_review_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            managed = root / 'managed.json'
+            managed.write_text('[]')
+            output = root / 'imports.tf.json'
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.dict(os.environ, ENV, clear=True), patch.object(MODULE, 'Cloudflare', return_value=FakeAPI()), patch.object(MODULE, 'paths', return_value=output), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                result = MODULE.main(['--artifact', str(root), '--output', str(output), '--managed', str(managed)])
+            self.assertEqual(result, 1)
+            self.assertFalse(output.exists())
+            summary = json.loads(stdout.getvalue())
+            self.assertRegex(summary['fingerprint'], '^[a-f0-9]{64}$')
+            self.assertNotIn('SECRET_TOKEN', stdout.getvalue() + stderr.getvalue())
+
+
+if __name__ == '__main__':
+    unittest.main()

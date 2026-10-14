@@ -10,10 +10,73 @@ terraform {
 }
 variable "region" { type = string }
 variable "bucket_prefix" { type = string }
+variable "environments" {
+  type    = set(string)
+  default = ["staging", "production"]
+  validation {
+    condition     = length(var.environments) > 0 && length(setsubtract(var.environments, toset(["staging", "production"]))) == 0
+    error_message = "Only explicit staging/production environments are supported."
+  }
+}
+variable "existing_buckets" {
+  type    = map(string)
+  default = {}
+}
+variable "github_repository" {
+  type    = string
+  default = ""
+  validation {
+    condition     = var.github_repository == "" || can(regex("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", var.github_repository))
+    error_message = "Supply one exact GitHub owner/repository."
+  }
+}
+variable "github_oidc_provider_arn" {
+  type    = string
+  default = ""
+}
+variable "github_role_name" {
+  type    = string
+  default = "bmux-live-state-production"
+}
 provider "aws" { region = var.region }
+locals {
+  oidc_enabled = var.github_repository != ""
+  provider_arn = var.github_oidc_provider_arn != "" ? var.github_oidc_provider_arn : try(aws_iam_openid_connect_provider.github[0].arn, "")
+}
+resource "aws_iam_openid_connect_provider" "github" {
+  count          = local.oidc_enabled && var.github_oidc_provider_arn == "" ? 1 : 0
+  url            = "https://token.actions.githubusercontent.com"
+  client_id_list = ["sts.amazonaws.com"]
+  lifecycle { prevent_destroy = true }
+}
+resource "aws_iam_role" "github_production" {
+  count                = local.oidc_enabled ? 1 : 0
+  name                 = var.github_role_name
+  max_session_duration = 3600
+  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{
+    Effect    = "Allow", Action = "sts:AssumeRoleWithWebIdentity",
+    Principal = { Federated = local.provider_arn },
+    Condition = { StringEquals = {
+      "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub" = "repo:${var.github_repository}:environment:Production:ref:refs/heads/master"
+    } }
+  }] })
+  lifecycle {
+    prevent_destroy = true
+    precondition {
+      condition     = contains(var.environments, "production")
+      error_message = "OIDC role requires the production backend."
+    }
+  }
+}
+resource "aws_iam_role_policy_attachment" "github_production" {
+  count      = local.oidc_enabled ? 1 : 0
+  role       = aws_iam_role.github_production[0].name
+  policy_arn = aws_iam_policy.state["production"].arn
+}
 resource "aws_s3_bucket" "state" {
-  for_each = toset(["staging", "production"])
-  bucket   = "${var.bucket_prefix}-${each.key}"
+  for_each = var.environments
+  bucket   = lookup(var.existing_buckets, each.key, "${var.bucket_prefix}-${each.key}")
   lifecycle { prevent_destroy = true }
 }
 resource "aws_s3_bucket_versioning" "state" {
@@ -60,5 +123,7 @@ resource "aws_iam_policy" "state" {
 }
 # Do not create long-lived access keys in state. Attach these policies to separately
 # managed environment identities; operator provides their credentials privately.
+output "github_role_arn" { value = try(aws_iam_role.github_production[0].arn, null) }
+output "github_oidc_subject" { value = local.oidc_enabled ? "repo:${var.github_repository}:environment:Production:ref:refs/heads/master" : null }
 output "buckets" { value = { for env, bucket in aws_s3_bucket.state : env => bucket.id } }
 output "state_policy_arns" { value = { for env, policy in aws_iam_policy.state : env => policy.arn } }
