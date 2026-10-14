@@ -24,7 +24,6 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-  id-token: write
 jobs:
   # Single Pages owner: live assets are copied BEFORE docs gen, then the same
   # native/viewer/relay/site artifact goes directly through protected production.

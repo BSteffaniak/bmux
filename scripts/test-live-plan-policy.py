@@ -57,7 +57,10 @@ class PlanPolicyTests(unittest.TestCase):
         self.assertIn('group: bmux-production-infrastructure', release)
         self.assertIn('configure: true', configure)
         self.assertIn('uses: ./.github/workflows/live-promote.yml', configure)
-        self.assertIn('id-token: write', release)
+        self.assertNotIn('id-token: write', release)
+        self.assertNotIn('configure-aws-credentials', release)
+        for name in ('R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY', 'TOFU_STATE_ENCRYPTION_PASSPHRASE'):
+            self.assertIn(name, release)
 
 
 if __name__ == '__main__':

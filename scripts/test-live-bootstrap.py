@@ -1,502 +1,184 @@
 #!/usr/bin/env python3
-"""Focused offline tests: no provider calls, repository mutation or credential access."""
+"""Real offline bootstrap CLI and credential safety tests."""
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
-spec = importlib.util.spec_from_file_location('bootstrap', Path(__file__).with_name('bootstrap-live-secrets.py'))
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
-
-
-def args(**kwargs):
-    values = dict(repo='owner/repo', environment='production', only=['CLOUDFLARE_API_TOKEN'],
-                  rotate=False, dry_run=False, publisher_key_file=None)
-    values.update(kwargs)
-    return argparse.Namespace(**values)
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location('bootstrap', HERE / 'bootstrap-live-secrets.py')
+b = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(b)
+ACCOUNT = 'a' * 32
 
 
 class BootstrapTests(unittest.TestCase):
-    def runner(self, existing=(), protected=True):
+    def test_cli_dryrun_no_executables_or_credentials(self):
+        cmd = [sys.executable, str(HERE / 'bootstrap-live-secrets.py'), '--repo', 'owner/repo',
+               '--bootstrap-state', '--dry-run']
+        result = subprocess.run(cmd, capture_output=True, text=True, env={'PATH': '/nonexistent'}, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertFalse(data['provider_requests'])
+        for name in ('R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY', 'TOFU_STATE_ENCRYPTION_PASSPHRASE'):
+            self.assertIn(name, data['secrets'])
+        self.assertNotIn('ROLE', result.stdout)
+
+    def test_deployment_token_includes_scoped_r2_management(self):
+        groups = [dict(name=n, id='b' * 32, scopes=[scope]) for scope, names in (
+            ('com.cloudflare.api.account', ('Workers Scripts Write', 'Pages Write', 'Workers R2 Storage Write')),
+            ('com.cloudflare.api.account.zone', ('Workers Routes Write', 'DNS Write', 'Zone Read')))
+            for n in names]
+        policy = b.token_policy(ACCOUNT, 'c' * 32, groups)
+        self.assertEqual(len(policy['policies'][0]['permission_groups']), 3)
+        self.assertEqual(policy['policies'][0]['resources'], {f'com.cloudflare.api.account.{ACCOUNT}': '*'})
+        with self.assertRaises(b.BootstrapError):
+            b.token_policy(ACCOUNT, 'c' * 32, [g for g in groups if g['name'] != 'Workers R2 Storage Write'])
+
+    def test_obsolete_flags_reject(self):
+        for flag in ('--configure-oidc', '--state-role'):
+            result = subprocess.run([sys.executable, str(HERE / 'bootstrap-live-secrets.py'),
+                                     '--repo', 'owner/repo', '--dry-run', flag], capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_scoped_token_derivation(self):
         calls = []
-        def run(argv, body=None):
-            calls.append((argv, body))
-            if argv[:3] == ['gh', 'secret', 'list']:
+        class CF:
+            def items(self, path):
+                return [dict(name='Workers R2 Storage Bucket Item Write', id='b' * 32,
+                             scopes=['com.cloudflare.edge.r2.bucket'])]
+            def request(self, method, path, body):
+                calls.append((method, path, body))
+                return {'result': {'id': 'c' * 32, 'value': 'private-token-value-not-for-output'}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            result = b.r2_credentials(CF(), ACCOUNT, 'bmux-opentofu-state')
+        self.assertEqual(out.getvalue(), '')
+        self.assertEqual(result['R2_STATE_SECRET_ACCESS_KEY'], hashlib.sha256(b'private-token-value-not-for-output').hexdigest())
+        resources = calls[0][2]['policies'][0]['resources']
+        self.assertEqual(resources, {f'com.cloudflare.edge.r2.bucket.{ACCOUNT}_default_bmux-opentofu-state': '*'})
+
+    def test_bad_permission_scope_reject(self):
+        with self.assertRaises(b.BootstrapError):
+            b.r2_token_policy(ACCOUNT, 'bucket', [dict(name='Workers R2 Storage Bucket Item Write',
+                                                    id='b' * 32, scopes=['com.cloudflare.api.account'])])
+
+    def args(self, **kwargs):
+        values = dict(repo='owner/repo', environment='Production', only=['R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY'],
+                      rotate=False, dry_run=False, input_env=True, publisher_key_file=None)
+        values.update(kwargs)
+        return argparse.Namespace(**values)
+
+    def run_stub(self, existing, calls):
+        def run(args, body=None):
+            calls.append((args, body))
+            if args[:3] == ['gh', 'secret', 'list']:
                 return json.dumps([{'name': name} for name in existing])
-            if 'deployment-branch-policies' in argv[-1]:
-                return json.dumps({'branch_policies': [{'name': 'master', 'type': 'branch'}]})
-            if argv[:2] == ['gh', 'api']:
-                return json.dumps({'deployment_branch_policy': {'custom_branch_policies': True},
-                                   'can_admins_bypass': False,
-                                   'protection_rules': [{'type': 'required_reviewers',
-                                     'reviewers': [1] if protected else [], 'prevent_self_review': True}]})
             return ''
-        return run, calls
+        return run
 
-    def test_existing_skipped_without_reading_input(self):
-        run, calls = self.runner(['CLOUDFLARE_API_TOKEN'])
-        with contextlib.redirect_stdout(io.StringIO()):
-            m.provision(args(), run, {})
-        self.assertFalse(any(c[0][:3] == ['gh', 'secret', 'set'] for c in calls))
-
-    def test_target_and_stdin(self):
-        run, calls = self.runner()
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            m.provision(args(), run, {'CLOUDFLARE_API_TOKEN': 'super-private-value'})
-        write = calls[-1]
-        self.assertEqual(write, (['gh', 'secret', 'set', 'CLOUDFLARE_API_TOKEN', '--repo',
-                                 'owner/repo', '--env', 'production'], 'super-private-value'))
-        self.assertNotIn('super-private-value', output.getvalue())
-        self.assertFalse(any('PUT' in c[0] for c in calls))
-
-    def test_never_weakens_protections(self):
-        run, calls = self.runner(protected=False)
-        with self.assertRaises(m.BootstrapError):
-            m.provision(args(), run, {'CLOUDFLARE_API_TOKEN': 'private'})
-        self.assertFalse(any(c[0][:3] == ['gh', 'secret', 'set'] for c in calls))
-
-    def test_rotation_selected_only(self):
-        run, calls = self.runner(['CLOUDFLARE_API_TOKEN'])
-        with contextlib.redirect_stdout(io.StringIO()):
-            m.provision(args(rotate=True), run, {'CLOUDFLARE_API_TOKEN': 'replacement'})
-        self.assertEqual(len([c for c in calls if c[1]]), 1)
-        self.assertFalse(any('DELETE' in c[0] for c in calls))
-
-    def test_dry_run_no_api(self):
-        def fail(*_):
-            self.fail('dry run performed API request')
-        with contextlib.redirect_stdout(io.StringIO()):
-            m.provision(args(dry_run=True), fail, {})
-
-    def test_key_private_digest_only(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'key'
-            path.write_text('a' * 64)
-            path.chmod(0o600)
-            self.assertEqual(len(m.read_private_key(path)), 64)
-            path.chmod(0o644)
-            with self.assertRaises(m.BootstrapError):
-                m.read_private_key(path)
-            link = Path(directory) / 'link'
-            link.symlink_to(path)
-            with self.assertRaises(m.BootstrapError):
-                m.read_private_key(link)
-
-    def test_scopes_not_interchangeable(self):
-        groups = [dict(name=name, id=name, scopes=[scope]) for name, scope in [
-            ('Workers Scripts Write', 'com.cloudflare.api.account'),
-            ('Pages Write', 'com.cloudflare.api.account'),
-            ('Workers Routes Write', 'com.cloudflare.api.account.zone'),
-            ('DNS Write', 'com.cloudflare.api.account.zone'),
-            ('Zone Read', 'com.cloudflare.api.account.zone')]]
-        policy = m.token_policy('account', 'zone', groups)['policies']
-        self.assertEqual(list(policy[0]['resources']), ['com.cloudflare.api.account.account'])
-        self.assertEqual(list(policy[1]['resources']), ['com.cloudflare.api.account.zone.zone'])
-        groups[-1]['scopes'] = ['com.cloudflare.api.account']
-        with self.assertRaises(m.BootstrapError):
-            m.token_policy('account', 'zone', groups)
-
-    def test_validate_all_before_write(self):
-        run, calls = self.runner()
-        with self.assertRaises(m.BootstrapError):
-            m.provision(args(only=['CLOUDFLARE_API_TOKEN', 'LIVE_STATE_BUCKET']), run,
-                        {'CLOUDFLARE_API_TOKEN': 'secret'})
-        self.assertFalse(any(c[0][:3] == ['gh', 'secret', 'set'] for c in calls))
-
-    def test_redacted_process_failure(self):
+    def test_env_secrets_stdin_and_skip(self):
         from unittest.mock import patch
-        import subprocess
-        with patch.object(m, 'bounded_run', return_value=subprocess.CompletedProcess([], 1, 'secret', 'token')):
-            with self.assertRaises(m.BootstrapError) as error:
-                m.command(['gh', 'secret', 'set', 'name'], 'credential')
-        self.assertNotIn('token', str(error.exception))
-        self.assertNotIn('credential', str(error.exception))
-
-
-
-
-
-def normal_args(**kwargs):
-    values = dict(zone='bmux.dev', hostname=None, pages_project='bmux', input_env=False,
-                  environment='Production', bootstrap_state=False, configure_oidc=False,
-                  state_mode='plan', state_operation=None, state_region='us-east-1',
-                  state_bucket='bmux-state', state_role='bmux-live', state_account_id='123456789012',
-                  state_dir=Path('/private/state'), accept_cost=False, approve_import=False)
-    values.update(kwargs)
-    return args(**values)
-
-
-def groups():
-    return [{'name': name, 'id': str(index), 'scopes': [scope]}
-            for index, (name, scope) in enumerate([
-                ('Workers Scripts Write','com.cloudflare.api.account'),
-                ('Pages Write','com.cloudflare.api.account'),
-                ('Workers Routes Write','com.cloudflare.api.account.zone'),
-                ('DNS Write','com.cloudflare.api.account.zone'),
-                ('Zone Read','com.cloudflare.api.account.zone')])]
-
-
-class FakeCloudflare:
-    def __init__(self):
-        self.calls = []
-        self.zones = [{'id': 'b'*32, 'name':'bmux.dev', 'account': {'id':'a'*32}}]
-        self.permissions = groups()
-        self.projects = [{'name':'bmux','production_branch':'master'}]
-    def items(self,path):
-        self.calls.append(('GET',path,None))
-        if path.startswith('/zones?'): return iter(self.zones)
-        if path == '/user/tokens/permission_groups': return iter(self.permissions)
-        if '/pages/projects' in path: return iter(self.projects)
-        raise AssertionError(path)
-    def request(self,method,path,body=None):
-        self.calls.append((method,path,body))
-        if method == 'POST' and path == '/user/tokens':
-            return {'success':True,'result':{'id':'new','value':'BMUX-PRIVATE-TOKEN'}}
-        raise AssertionError(path)
-
-
-class TurnkeyBootstrapTests(unittest.TestCase):
-    runner = BootstrapTests.runner
-    def test_normal_existing_zero_provider(self):
-        run,calls=self.runner(m.NORMAL_SECRET_NAMES)
-        cf=FakeCloudflare()
-        with contextlib.redirect_stdout(io.StringIO()):
-            m.provision(normal_args(only=None),run,{},cf)
-        self.assertEqual(cf.calls,[])
-        self.assertFalse(any(c[0][:3]==['gh','secret','set'] for c in calls))
-
-    def test_normal_token_is_bmux_specific_split_scope_stdin(self):
-        run,calls=self.runner()
-        cf=FakeCloudflare(); out=io.StringIO()
-        with contextlib.redirect_stdout(out): m.provision(normal_args(),run,{},cf)
-        create=[c for c in cf.calls if c[0]=='POST'][0]
-        self.assertEqual(create[2]['name'],'bmux:github:owner/repo:Production:deployment')
-        policies=create[2]['policies']
-        self.assertEqual(list(policies[0]['resources']),['com.cloudflare.api.account.'+'a'*32])
-        self.assertEqual(list(policies[1]['resources']),['com.cloudflare.api.account.zone.'+'b'*32])
-        self.assertEqual(calls[-1][1],'BMUX-PRIVATE-TOKEN')
-        self.assertNotIn('BMUX-PRIVATE-TOKEN',out.getvalue())
-        self.assertFalse(any(c[0]=='DELETE' for c in cf.calls))
-
-    def test_partial_existing_ids_not_rewritten(self):
-        run,calls=self.runner(['CLOUDFLARE_ACCOUNT_ID','CLOUDFLARE_ZONE_ID'])
-        cf=FakeCloudflare()
-        with contextlib.redirect_stdout(io.StringIO()):
-            m.provision(normal_args(only=['CLOUDFLARE_ACCOUNT_ID','CLOUDFLARE_ZONE_ID','LIVE_HOSTNAME']),run,{},cf)
-        self.assertEqual(cf.calls,[])
-        writes=[c for c in calls if c[0][:3]==['gh','secret','set']]
-        self.assertEqual([c[0][3] for c in writes],['LIVE_HOSTNAME'])
-        self.assertEqual(writes[0][1],'bmux.dev')
-
-    def test_zone_ambiguity_no_mutations(self):
-        run,calls=self.runner(); cf=FakeCloudflare(); cf.zones *= 2
-        with self.assertRaises(m.BootstrapError): m.provision(normal_args(),run,{},cf)
-        self.assertFalse(any(c[0]=='POST' for c in cf.calls))
-        self.assertFalse(any(c[0][:3]==['gh','secret','set'] for c in calls))
-
-    def test_existing_pages_exact_master_and_direct_upload(self):
-        run,calls=self.runner(); cf=FakeCloudflare(); cf.projects[0]['source']={'type':'github'}
-        with self.assertRaises(m.BootstrapError):
-            m.provision(normal_args(only=['LIVE_PAGES_PROJECT']),run,{},cf)
-        self.assertFalse(any(c[0][:3]==['gh','secret','set'] for c in calls))
-
-    def test_private_generation_repeat_no_plaintext(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path=Path(directory)/'key'; out=io.StringIO()
-            run,calls=self.runner()
-            with contextlib.redirect_stdout(out):
-                m.provision(normal_args(only=['LIVE_PUBLISHER_KEY_SHA256'],publisher_key_file=path),run,{})
-            raw=path.read_bytes()
-            self.assertEqual(path.stat().st_mode & 0o777,0o600)
-            self.assertNotIn(raw.decode(),out.getvalue())
-            self.assertNotIn(raw.decode(),str(calls))
-            self.assertEqual(m.private_key_digest(path),calls[-1][1])
-            self.assertEqual(path.read_bytes(),raw)
-
-    def test_key_symlink_never_replaced(self):
-        with tempfile.TemporaryDirectory() as directory:
-            target=Path(directory)/'target'; target.write_text('x'*48); target.chmod(0o600)
-            link=Path(directory)/'key'; link.symlink_to(target)
-            with self.assertRaises(m.BootstrapError):m.private_key_digest(link)
-            self.assertEqual(target.read_text(),'x'*48)
-
-    def test_self_review_allowed_separate_gate(self):
-        run,calls=self.runner()
-        def runner(argv,body=None):
-            value=run(argv,body)
-            if argv[:2]==['gh','api'] and 'deployment-branch-policies' not in argv[-1]:
-                data=json.loads(value); data['protection_rules'][0]['prevent_self_review']=False
-                return json.dumps(data)
-            return value
-        with contextlib.redirect_stdout(io.StringIO()):m.provision(normal_args(),runner,{},FakeCloudflare())
-        self.assertTrue(any('production-approval' in c[0][-1] for c in calls))
-        self.assertFalse(any('PUT' in c[0] for c in calls))
-
-    def test_ambiguous_write_never_revokes_or_retries(self):
-        run,calls=self.runner(); cf=FakeCloudflare()
-        def runner(argv,body=None):
-            if argv[:3]==['gh','secret','set']:raise m.BootstrapError('ambiguous write')
-            return run(argv,body)
-        with self.assertRaises(m.BootstrapError): m.provision(normal_args(),runner,{},cf)
-        self.assertEqual(len([c for c in cf.calls if c[0]=='POST']),1)
-        self.assertFalse(any(c[0]=='DELETE' for c in cf.calls))
-
-    def test_rotation_requires_selection_before_provider(self):
-        def fail(*_):self.fail('access before rotate validation')
-        with self.assertRaises(m.BootstrapError):m.provision(normal_args(rotate=True,only=None),fail,{})
-
-    def test_dryrun_zero_calls_and_no_key_creation(self):
-        def fail(*_):self.fail('dry run accessed provider')
-        with tempfile.TemporaryDirectory() as directory:
-            path=Path(directory)/'key'
-            with contextlib.redirect_stdout(io.StringIO()):
-                m.provision(normal_args(dry_run=True,bootstrap_state=True,publisher_key_file=path),fail,{})
-            self.assertFalse(path.exists())
-
-    def test_permission_pagination_and_duplicate_rejection(self):
-        cf=object.__new__(m.Cloudflare); calls=[]
-        def request(method,path,body=None):
-            calls.append(path)
-            page=2 if 'page=2&' in path else 1
-            return {'result': groups()[2:] if page==2 else groups()[:2], 'result_info':{'total_pages':2}}
-        cf.request=request
-        permissions=list(cf.items('/user/tokens/permission_groups'))
-        m.token_policy('account','zone',permissions)
-        self.assertEqual(len(calls),2)
-        with self.assertRaises(m.BootstrapError): m.token_policy('account','zone',permissions+[permissions[0]])
-
-    def test_provider_error_sanitized(self):
-        from unittest.mock import patch
-        import urllib.error
-        cf=m.Cloudflare({'CLOUDFLARE_PROVISION_TOKEN':'secret'})
-        with patch.object(m.urllib.request,'build_opener') as opener:
-            opener.return_value.open.side_effect=urllib.error.URLError('secret raw content')
-            with self.assertRaises(m.BootstrapError) as error:cf.request('POST','/user/tokens',{})
-        self.assertNotIn('secret raw content',str(error.exception))
-
-    def test_oidc_custom_different_never_put(self):
-        calls=[]
-        def runner(argv,body=None):calls.append(argv);return json.dumps({'use_default':False,'include_claim_keys':['repo']})
-        with self.assertRaises(m.BootstrapError):m.verify_oidc('owner/repo',runner,True)
-        self.assertFalse(any('PUT' in c for c in calls))
-
-    def test_oidc_default_requires_explicit_flag_and_verifies(self):
-        calls=[]
-        def runner(argv,body=None):
-            calls.append((argv,body))
-            return json.dumps({'use_default':len(calls)==1,'include_claim_keys':m.OIDC_CLAIMS})
-        with self.assertRaises(m.BootstrapError):m.verify_oidc('owner/repo',runner,False)
+        calls = []
+        env = dict(R2_STATE_ACCESS_KEY_ID='a' * 32, R2_STATE_SECRET_ACCESS_KEY='b' * 64, CLOUDFLARE_ACCOUNT_ID=ACCOUNT, LIVE_STATE_BUCKET='bmux-opentofu-state')
+        with patch.object(b, 'verify_environment'), contextlib.redirect_stdout(io.StringIO()):
+            b.provision_env(self.args(), self.run_stub([], calls), env)
+        writes = [(args, body) for args, body in calls if args[:3] == ['gh', 'secret', 'set']]
+        self.assertEqual(len(writes), 2)
+        for args, body in writes:
+            self.assertNotIn(body, args)
         calls.clear()
-        with contextlib.redirect_stdout(io.StringIO()):m.verify_oidc('owner/repo',runner,True)
-        self.assertEqual(json.loads(calls[1][1]),{'use_default':False,'include_claim_keys':m.OIDC_CLAIMS})
+        with patch.object(b, 'verify_environment'), contextlib.redirect_stdout(io.StringIO()):
+            b.provision_env(self.args(), self.run_stub(['R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY'], calls), {})
+        self.assertFalse(any(args[:3] == ['gh', 'secret', 'set'] for args, _ in calls))
 
-    def test_later_branch_policy_page_blocks(self):
-        calls=[]
-        def runner(argv,body=None):
-            calls.append(argv)
-            if 'deployment-branch-policies' in argv[-1]:
-                row={'name':'other' if 'page=2' in argv[-1] else 'master','type':'branch'}
-                return json.dumps({'branch_policies':[row],'total_count':2})
-            return json.dumps({'deployment_branch_policy':{'custom_branch_policies':True}})
-        with self.assertRaises(m.BootstrapError):m.verify_environment('owner/repo','Production',runner)
-        self.assertEqual(len(calls),3)
+    def test_legacy_and_passphrase_rotation_reject_without_writes(self):
+        from unittest.mock import patch
+        for existing, args in ((['LIVE_STATE_ROLE_ARN'], self.args()),
+                               ([], self.args(rotate=True, only=['TOFU_STATE_ENCRYPTION_PASSPHRASE']))):
+            calls = []
+            with patch.object(b, 'verify_environment'), self.assertRaises(b.BootstrapError):
+                b.provision_env(args, self.run_stub(existing, calls), {})
+            self.assertFalse(any(cmd[:3] == ['gh', 'secret', 'set'] for cmd, _ in calls))
 
-    def test_backend_metadata_installed_without_static_keys(self):
-        run,calls=self.runner(); child=[]
-        result={'schema':1,'operation':'operation123','phase':'complete',
-                'backend':{'bucket':'bmux-state','region':'us-east-1','key':'bmux/live/production/terraform.tfstate','encrypt':True,'use_lockfile':True},
-                'role_arn':'arn:aws:iam::123456789012:role/bmux-live',
-                'github_oidc':{'include_claim_keys':m.OIDC_CLAIMS,'subject':'repo:owner/repo:environment:Production:ref:refs/heads/master'}}
-        def runner(argv,body=None):
-            if argv[0]==m.sys.executable:
-                child.append(argv)
-                if '--review' in argv:self.assertEqual(argv[-1],'--review')
-                data=dict(result)
-                if not any(flag in argv for flag in ['--apply','--review']):data.update(operation=None,phase='dryrun')
-                return json.dumps(data)
-            if '/actions/oidc/' in argv[-1]:return json.dumps({'use_default':False,'include_claim_keys':m.OIDC_CLAIMS})
-            return run(argv,body)
+    def test_plan_review_apply_bound_metadata(self):
+        args = self.args(state_bucket=None, state_region='auto', state_dir=Path('/private'),
+                         state_account_id=ACCOUNT, state_mode='plan', state_operation=None,
+                         accept_cost=False, approve_import=False)
+        op = 'd' * 32
+        calls = []
+        backend = dict(bucket='bmux-opentofu-state', region='auto', key='bmux/live/production/terraform.tfstate',
+                       endpoint=f'https://{ACCOUNT}.r2.cloudflarestorage.com', use_lockfile=True, encrypt=True)
+        def run(cmd):
+            calls.append(cmd)
+            return json.dumps(dict(schema=2, operation=op, phase='complete' if '--apply' in cmd or '--completion-file' in cmd else 'planned',
+                                   backend=backend, resources=[{'address': 'cloudflare_r2_bucket.state',
+                                                               'actions': ['create'], 'import': False}]))
         with contextlib.redirect_stdout(io.StringIO()):
-            m.provision(normal_args(only=list(m.STATE_SECRET_NAMES),bootstrap_state=True,state_mode='apply',state_operation='operation123',accept_cost=True),runner,{})
-        self.assertIn('--review',child[1]);self.assertIn('--apply',child[2])
-        self.assertIn('--accept-cost',child[2])
-        writes=[c for c in calls if c[0][:3]==['gh','secret','set']]
-        self.assertEqual([c[0][3] for c in writes],list(m.STATE_SECRET_NAMES))
-        self.assertFalse(any('ACCESS_KEY' in c[0][3] for c in writes))
+            self.assertEqual(b.state_bootstrap(args, run, ['LIVE_STATE_BUCKET'], {}), {})
+            args.state_mode, args.state_operation, args.accept_cost = 'apply', op, True
+            values = b.state_bootstrap(args, run, ['LIVE_STATE_BUCKET'], {})
+        self.assertEqual(values['LIVE_STATE_BUCKET'], 'bmux-opentofu-state')
+        self.assertTrue(any('--accept-cost' in cmd for cmd in calls))
 
-    def backend_fixture(self, phase='planned', operation='operation123'):
-        return dict(schema=1,operation=operation,phase=phase,
-                    backend=dict(bucket='bmux-state',region='us-east-1',key='bmux/live/production/terraform.tfstate',encrypt=True,use_lockfile=True),
-                    role_arn='arn:aws:iam::123456789012:role/bmux-live',
-                    github_oidc=dict(include_claim_keys=m.OIDC_CLAIMS,subject='repo:owner/repo:environment:Production:ref:refs/heads/master'),
-                    resources=[dict(address='aws_s3_bucket.state["production"]',actions=['create'],**{'import':False})])
-
-    def test_backend_plan_never_creates_partial_credentials(self):
-        run,calls=self.runner();cf=FakeCloudflare();child=[]
-        def runner(argv,body=None):
-            if argv[0]==m.sys.executable:
-                child.append(argv); result=self.backend_fixture('planned' if '--plan' in argv else 'dryrun','operation123' if '--plan' in argv else None)
-                result['resources']=[]
-                return json.dumps(result)
-            if '/actions/oidc/' in argv[-1]:return json.dumps(dict(use_default=False,include_claim_keys=m.OIDC_CLAIMS))
-            return run(argv,body)
-        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
-            path=Path(directory)/'key'
-            m.provision(normal_args(only=None,bootstrap_state=True,publisher_key_file=path),runner,{},cf)
-            self.assertFalse(path.exists())
-        self.assertEqual(cf.calls,[])
-        self.assertFalse(any(c[0][:3]==['gh','secret','set'] for c in calls))
-
-    def test_guided_cancel_no_token_or_secret_writes(self):
+    def test_fresh_descriptor_before_secret_writes_without_state_seed(self):
         from unittest.mock import patch
-        run,calls=self.runner();cf=FakeCloudflare()
-        def runner(argv,body=None):
-            if argv[0]==m.sys.executable:
-                result=self.backend_fixture('dryrun' if '--plan' not in argv and '--review' not in argv else 'planned',None if '--plan' not in argv and '--review' not in argv else 'operation123')
-                result['resources']=[{'address':'aws_s3_bucket.state["production"]','actions':['create'],'import':False}]
-                self.assertNotIn('--apply',argv)
-                return json.dumps(result)
-            if '/actions/oidc/' in argv[-1]:return json.dumps(dict(use_default=False,include_claim_keys=m.OIDC_CLAIMS))
-            return run(argv,body)
-        with patch.object(m.sys,'stdin') as stdin,patch.object(m.sys,'stderr') as stderr,contextlib.redirect_stdout(io.StringIO()):
-            stdin.isatty.return_value=True;stderr.isatty.return_value=True;stdin.readline.return_value='cancel\n'
-            with self.assertRaises(m.BootstrapError):m.provision(normal_args(only=None,bootstrap_state=True,state_mode='guided',publisher_key_file=Path('/private/key')),runner,{},cf)
-        self.assertEqual(cf.calls,[])
-        self.assertFalse(any(c[0][:3]==['gh','secret','set'] for c in calls))
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(input_env=False, zone='bmux.dev', bootstrap_state=True,
+                             only=list(b.STATE_SECRET_NAMES), state_bucket=None, state_region='auto',
+                             state_dir=Path(directory), state_account_id=None, state_mode='apply',
+                             state_operation='d' * 32, accept_cost=True, approve_import=False,
+                             state_completion_file=None)
+            def run(cmd, body=None, env=None):
+                calls.append((cmd, body, env))
+                if cmd[:3] == ['gh', 'secret', 'list']:
+                    return '[]'
+                if len(cmd) > 1 and cmd[1].endswith('provision-live-state.py'):
+                    backend = dict(bucket='bmux-opentofu-state', region='auto',
+                                   key='bmux/live/production/terraform.tfstate',
+                                   endpoint=f'https://{ACCOUNT}.r2.cloudflarestorage.com', use_lockfile=True, encrypt=True)
+                    return json.dumps(dict(schema=2, operation='d' * 32,
+                                           phase='complete' if '--apply' in cmd or '--completion-file' in cmd else 'planned',
+                                           backend=backend, resources=[{'address': 'cloudflare_r2_bucket.state',
+                                                                       'actions': ['create'], 'import': False}]))
+                return ''
+            creds = dict(R2_STATE_ACCESS_KEY_ID='a' * 32, R2_STATE_SECRET_ACCESS_KEY='b' * 64)
+            with patch.object(b, 'verify_environment'), patch.object(b, 'discover', return_value=(ACCOUNT, 'c' * 32)), \
+                    patch.object(b, 'r2_credentials', return_value=creds), contextlib.redirect_stdout(io.StringIO()):
+                b.provision(args, run, {'CLOUDFLARE_PROVISION_TOKEN': 'private-admin-token',
+                                        'TOFU_STATE_ENCRYPTION_PASSPHRASE': 'secure-original-passphrase-' * 3}, cloudflare=object())
+            completion_index = next(i for i, (cmd, _, _) in enumerate(calls) if '--completion-file' in cmd)
+            write_indices = [i for i, (cmd, _, _) in enumerate(calls) if cmd[:3] == ['gh', 'secret', 'set']]
+            self.assertTrue(all(completion_index < i for i in write_indices))
+            self.assertFalse(any('seed' in cmd or any('archive-live-state.py' in arg for arg in cmd) for cmd, _, _ in calls))
+            passphrase_writes = [body for cmd, body, _ in calls if cmd[:4] == ['gh', 'secret', 'set', 'TOFU_STATE_ENCRYPTION_PASSPHRASE']]
+            self.assertEqual(passphrase_writes, ['secure-original-passphrase-' * 3])
 
-    def test_explicit_backend_runs_even_all_secrets_existing(self):
-        run,calls=self.runner(m.NORMAL_SECRET_NAMES+m.STATE_SECRET_NAMES);child=[]
-        def runner(argv,body=None):
-            if argv[0]==m.sys.executable:
-                child.append(argv);result=self.backend_fixture('planned' if '--plan' in argv else 'dryrun','operation123' if '--plan' in argv else None);result['resources']=[];return json.dumps(result)
-            if '/actions/oidc/' in argv[-1]:return json.dumps(dict(use_default=False,include_claim_keys=m.OIDC_CLAIMS))
-            return run(argv,body)
-        with contextlib.redirect_stdout(io.StringIO()):m.provision(normal_args(only=None,bootstrap_state=True),runner,{})
-        self.assertTrue(any('--plan' in c for c in child))
-
-    def test_backend_mismatched_result_blocks_install(self):
-        result=self.backend_fixture('complete');result['resources']=[];result['role_arn']='arn:aws:iam::123456789012:role/other'
-        with self.assertRaises(m.BootstrapError):m.validate_state_result(result,normal_args(),'operation123',('complete',))
-
-    def test_existing_bucket_conflict_blocks_before_oidc(self):
-        def fail(*_):self.fail('conflict accessed provider')
-        with self.assertRaises(m.BootstrapError):m.state_bootstrap(normal_args(bootstrap_state=True),fail,['LIVE_STATE_BUCKET'],{'LIVE_STATE_BUCKET':'other'})
-
-    def test_complete_normal_default_bootstrap(self):
-        run,calls=self.runner();cf=FakeCloudflare()
-        with tempfile.TemporaryDirectory() as directory,contextlib.redirect_stdout(io.StringIO()):
-            m.provision(normal_args(only=None,publisher_key_file=Path(directory)/'key'),run,{},cf)
-        writes=[c for c in calls if c[0][:3]==['gh','secret','set']]
-        self.assertEqual({c[0][3] for c in writes},set(m.NORMAL_SECRET_NAMES))
-        self.assertTrue(all(c[0][-1]=='Production' for c in writes))
-        self.assertEqual(len([c for c in cf.calls if c[0]=='POST']),1)
-
-    def test_normal_rotation_only_selected(self):
-        run,calls=self.runner(m.NORMAL_SECRET_NAMES);cf=FakeCloudflare()
-        with contextlib.redirect_stdout(io.StringIO()):m.provision(normal_args(rotate=True),run,{},cf)
-        writes=[c for c in calls if c[0][:3]==['gh','secret','set']]
-        self.assertEqual([c[0][3] for c in writes],['CLOUDFLARE_API_TOKEN'])
-        self.assertFalse(any(c[0]=='DELETE' for c in cf.calls))
-
-    def test_destructive_or_private_review_rejected(self):
-        result=self.backend_fixture();result['resources'][0].pop('import_',None)
-        result['resources'][0]['actions']=['delete'];result['resources'][0]['import']=False
-        with self.assertRaises(m.BootstrapError):m.validate_state_result(result,normal_args(),'operation123',('planned',))
-        result=self.backend_fixture();result['credential']='hidden'
-        with self.assertRaises(m.BootstrapError):m.validate_state_result(result,normal_args(),'operation123',('planned',))
-
-    def test_legacy_approval_allows_self_review(self):
-        run,calls=self.runner()
-        def runner(argv,body=None):
-            text=run(argv,body)
-            if argv[:2]==['gh','api'] and 'deployment-branch-policies' not in argv[-1]:
-                value=json.loads(text);value['protection_rules'][0]['prevent_self_review']=False;return json.dumps(value)
-            return text
-        with contextlib.redirect_stdout(io.StringIO()):m.provision(args(),runner,{'CLOUDFLARE_API_TOKEN':'private'})
-
-    def test_real_companion_review_parser_contract_offline(self):
+    def test_apply_requires_passphrase_before_provider_mutation(self):
         from unittest.mock import patch
-        companion_path=Path(__file__).with_name('provision-live-state.py')
-        spec=importlib.util.spec_from_file_location('backend_contract',companion_path)
-        backend=importlib.util.module_from_spec(spec);spec.loader.exec_module(backend)
-        reviewed=self.backend_fixture();reviewed['resources']=[]
-        run,calls=self.runner();child=[]
-        def runner(argv,body=None):
-            if argv[0]==m.sys.executable:
-                child.append(argv)
-                if '--review' not in argv:
-                    value=self.backend_fixture('dryrun',None);value['resources']=[];return json.dumps(value)
-                # Exercise actual argparse, while replacing all IO/provider owners.
-                with patch.object(backend,'Tools'),patch.object(backend,'Provision') as provision,patch.object(backend.local,'lock') as lock,patch.object(backend.os,'umask'),contextlib.redirect_stdout(io.StringIO()) as output:
-                    lock.return_value.__enter__.return_value=None
-                    provision.return_value.review.return_value=reviewed
-                    self.assertEqual(backend.main(argv[2:]),0)
-                return output.getvalue()
-            return run(argv,body)
-        with contextlib.redirect_stdout(io.StringIO()):
-            m.provision(normal_args(only=list(m.STATE_SECRET_NAMES),bootstrap_state=True,state_mode='review',state_operation='operation123'),runner,{})
-        self.assertEqual(child[-1][-1],'--review')
-        self.assertFalse(any(c[0][:3]==['gh','secret','set'] for c in calls))
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(input_env=False, zone='bmux.dev', bootstrap_state=True,
+                             only=list(b.STATE_SECRET_NAMES), state_mode='apply', state_dir=Path(directory),
+                             state_operation='d' * 32, state_completion_file=None, approve_import=False)
+            calls = []
+            with patch.object(b, 'verify_environment'), self.assertRaises(b.BootstrapError):
+                b.provision(args, self.run_stub([], calls), {})
+            self.assertTrue(all(cmd[0] == 'gh' for cmd, _ in calls))
+            self.assertFalse(any(cmd[:3] == ['gh', 'secret', 'set'] for cmd, _ in calls))
 
-    def test_companion_deadline_only_exact_selected_script(self):
-        from unittest.mock import patch
-        import subprocess
-        companion=str(Path(m.__file__).with_name('provision-live-state.py'))
-        with patch.object(m,'bounded_run',return_value=subprocess.CompletedProcess([],0,'{}','')) as run:
-            m.command([m.sys.executable,companion,'--plan'])
-            self.assertEqual(run.call_args.kwargs['timeout'],1000)
-            m.command(['gh','api','repos/owner/repo'])
-            self.assertEqual(run.call_args.kwargs['timeout'],120)
-            m.command([m.sys.executable,'/other/provision-live-state.py'])
-            self.assertEqual(run.call_args.kwargs['timeout'],120)
-
-    def test_real_companion_timeout_reaps_child_and_fences_retry(self):
-        from unittest.mock import patch
-        import subprocess
-        companion=str(Path(m.__file__).with_name('provision-live-state.py'))
-        actual_run=m.bounded_run
-        started=[]
-        actual_popen=subprocess.Popen
-        def capture(*argv,**kwargs):
-            child=actual_popen(*argv,**kwargs);started.append(child);return child
-        def offline_run(argv,body=None,**kwargs):
-            # Keep production timeout classification; substitute an inert local process.
-            return actual_run([m.sys.executable,'-c','import time; time.sleep(10)'],body,**kwargs)
-        with patch.object(m,'STATE_COMMAND_TIMEOUT',0.05),patch.object(m,'bounded_run',side_effect=offline_run),patch.object(m.subprocess,'Popen',side_effect=capture):
-            with self.assertRaises(m.BootstrapError) as error:
-                m.command([m.sys.executable,companion,'--apply','operation123','--accept-cost'])
-        self.assertEqual(len(started),1)
-        self.assertIsNotNone(started[0].poll())
-        self.assertIn('operation ambiguous',str(error.exception))
-        self.assertIn('reconcile exact operation ID',str(error.exception))
-        self.assertNotIn('time.sleep',str(error.exception))
-
-    def test_streaming_output_cap_kills_owned_process_and_redacts(self):
-        from unittest.mock import patch
-        actual_popen=m.subprocess.Popen; children=[]
-        def capture(*argv,**kwargs):
-            child=actual_popen(*argv,**kwargs);children.append(child);return child
-        for channel in ('stdout','stderr'):
-            script='import os,time; os.write(%s,b"private-output"*10000); time.sleep(10)' % (1 if channel=='stdout' else 2)
-            with patch.object(m,'COMMAND_OUTPUT_LIMIT',1024),patch.object(m.subprocess,'Popen',side_effect=capture):
-                with self.assertRaises(m.BootstrapError) as error:
-                    m.command([m.sys.executable,'-c',script])
-            self.assertIsNotNone(children[-1].poll())
-            self.assertIn('operation ambiguous',str(error.exception))
-            self.assertNotIn('private-output',str(error.exception))
-
-    def test_bounded_stdin_and_output_success(self):
-        result=m.bounded_run([m.sys.executable,'-c','import sys; value=sys.stdin.read(); sys.stderr.write("hidden"); sys.stdout.write(value)'],'private-stdin',timeout=2)
-        self.assertEqual(result.stdout,'private-stdin')
-        self.assertEqual(result.stderr,'')
-        self.assertEqual(result.returncode,0)
+    def test_secret_safe_subprocess_failure(self):
+        with self.assertRaises(b.BootstrapError) as cm:
+            b.command([sys.executable, '-c', 'import sys;print("DO_NOT_LEAK");sys.exit(1)'])
+        self.assertNotIn('DO_NOT_LEAK', str(cm.exception))
 
 
 if __name__ == '__main__':

@@ -5,6 +5,12 @@ on:
       configure:
         type: boolean
         default: false
+      bootstrap_completion:
+        type: string
+        default: ''
+      bootstrap_completion_sha256:
+        type: string
+        default: ''
       reviewed_imports:
         type: string
         default: '{}'
@@ -16,7 +22,6 @@ on:
     paths: ['infra/live-**', 'scripts/*live*', '.github/workflows/live-*.yml']
 permissions:
   contents: read
-  id-token: write
 jobs:
   build:
     permissions:
@@ -70,28 +75,19 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
-      id-token: write
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      LIVE_STATE_ROLE_ARN: ${{ secrets.LIVE_STATE_ROLE_ARN }}
-      LIVE_STATE_REGION: ${{ secrets.LIVE_STATE_REGION }}
-      LIVE_STATE_ACCESS_KEY_ID: ${{ secrets.LIVE_STATE_ACCESS_KEY_ID }}
-      LIVE_STATE_SECRET_ACCESS_KEY: ${{ secrets.LIVE_STATE_SECRET_ACCESS_KEY }}
+      LIVE_STATE_REGION: auto
+      R2_STATE_ACCESS_KEY_ID: ${{ secrets.R2_STATE_ACCESS_KEY_ID }}
+      R2_STATE_SECRET_ACCESS_KEY: ${{ secrets.R2_STATE_SECRET_ACCESS_KEY }}
+      TOFU_STATE_ENCRYPTION_PASSPHRASE: ${{ secrets.TOFU_STATE_ENCRYPTION_PASSPHRASE }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with: {node-version: '22.16.0'}
       - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f
         with: {tofu_version: '1.10.9', tofu_wrapper: false}
-      - name: Assume repository-branch-environment scoped state role
-        if: env.LIVE_STATE_ROLE_ARN != ''
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
-        with:
-          role-to-assume: ${{ env.LIVE_STATE_ROLE_ARN }}
-          aws-region: ${{ env.LIVE_STATE_REGION }}
-          mask-aws-account-id: true
-          role-session-name: bmux-live-${{ github.run_id }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: live-candidate-${{ github.sha }}
@@ -105,6 +101,8 @@ jobs:
           LIVE_PAGES_PROJECT: ${{ secrets.LIVE_PAGES_PROJECT }}
           LIVE_PUBLISHER_KEY_SHA256: ${{ secrets.LIVE_PUBLISHER_KEY_SHA256 }}
           LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
+          LIVE_BOOTSTRAP_COMPLETION: ${{ inputs.bootstrap_completion || '' }}
+          LIVE_BOOTSTRAP_COMPLETION_SHA256: ${{ inputs.bootstrap_completion_sha256 || '' }}
           LIVE_CONFIGURE: ${{ inputs.configure || false }}
           LIVE_REVIEWED_IMPORTS: ${{ inputs.reviewed_imports || '{}' }}
           LIVE_APPROVE_IMPORT: ${{ inputs.approve_import || false }}
@@ -116,4 +114,27 @@ jobs:
           test "$(cat "$RUNNER_TEMP/live-candidate/REVISION")" = "$GITHUB_SHA"
           mode=release
           if [[ "$LIVE_CONFIGURE" == true ]]; then mode=configure; fi
-          bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" production "$RUNNER_TEMP/live-candidate" "$mode"
+          bootstrap_args=()
+          if [[ -n "$LIVE_BOOTSTRAP_COMPLETION$LIVE_BOOTSTRAP_COMPLETION_SHA256" ]]; then
+            test "$mode" = configure
+            python3 - <<'PY'
+          import hashlib, json, os, re
+          from pathlib import Path
+          raw = os.environ['LIVE_BOOTSTRAP_COMPLETION'].encode()
+          expected = os.environ['LIVE_BOOTSTRAP_COMPLETION_SHA256']
+          if not 0 < len(raw) <= 65536 or not re.fullmatch('[a-f0-9]{64}', expected):
+              raise SystemExit('Invalid bootstrap completion input')
+          if hashlib.sha256(raw).hexdigest() != expected:
+              raise SystemExit('Bootstrap completion checksum mismatch')
+          if not isinstance(json.loads(raw), dict):
+              raise SystemExit('Invalid bootstrap completion JSON')
+          path = Path(os.environ['RUNNER_TEMP']) / 'bmux-bootstrap-completion.json'
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+          with os.fdopen(fd, 'wb') as stream:
+              stream.write(raw)
+              stream.flush()
+              os.fsync(stream.fileno())
+          PY
+            bootstrap_args=(--bootstrap-completion "$RUNNER_TEMP/bmux-bootstrap-completion.json")
+          fi
+          bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" production "$RUNNER_TEMP/live-candidate" "$mode" "${bootstrap_args[@]}"

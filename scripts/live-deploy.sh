@@ -7,32 +7,38 @@ ENVIRONMENT="${1:?Usage: live-deploy.sh production ARTIFACT_DIRECTORY [configure
 ARTIFACT="$(cd "${2:?Artifact directory required}" && pwd)"
 MODE="${3:-release}"
 [[ "$MODE" == release || "$MODE" == configure ]] || exit 2
+BOOTSTRAP_COMPLETION=''
+if [[ $# -gt 3 ]]; then
+  [[ $# == 5 && "$MODE" == configure && "$4" == --bootstrap-completion ]] || { echo 'Bootstrap completion is only supported for explicit first configure' >&2; exit 2; }
+  BOOTSTRAP_COMPLETION="$5"
+fi
 : "${CLOUDFLARE_API_TOKEN:?Scoped deployment credential required}"
 : "${CLOUDFLARE_ACCOUNT_ID:?}"
 : "${CLOUDFLARE_ZONE_ID:?}"
 : "${LIVE_HOSTNAME:?}"
 : "${LIVE_PUBLISHER_KEY_SHA256:?Digest only; never publisher key}"
 : "${LIVE_PAGES_PROJECT:?Selected Pages project required}"
-if [[ -n "${LIVE_STATE_ACCESS_KEY_ID:-}" || -n "${LIVE_STATE_SECRET_ACCESS_KEY:-}" ]]; then
-  : "${LIVE_STATE_ACCESS_KEY_ID:?Both legacy state credentials required}"
-  : "${LIVE_STATE_SECRET_ACCESS_KEY:?Both legacy state credentials required}"
-  [[ -z "${LIVE_STATE_ROLE_ARN:-}" ]] || { echo 'Choose OIDC or legacy state credentials, not both' >&2; exit 2; }
-  export AWS_ACCESS_KEY_ID="$LIVE_STATE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$LIVE_STATE_SECRET_ACCESS_KEY"
-  unset AWS_SESSION_TOKEN
-else
-  : "${LIVE_STATE_ROLE_ARN:?Configure the production state OIDC role}"
-  : "${AWS_ACCESS_KEY_ID:?CI must assume the configured state role first}"
-  : "${AWS_SECRET_ACCESS_KEY:?}"
-  : "${AWS_SESSION_TOKEN:?Short-lived OIDC session required}"
-fi
-unset AWS_PROFILE AWS_ENDPOINT_URL AWS_ENDPOINT_URL_S3
+: "${R2_STATE_ACCESS_KEY_ID:?Private R2 state access key required}"
+: "${R2_STATE_SECRET_ACCESS_KEY:?Private R2 state secret required}"
+: "${TOFU_STATE_ENCRYPTION_PASSPHRASE:?Private client-side encryption passphrase required}"
+[[ -z "${LIVE_STATE_ROLE_ARN:-}${LIVE_STATE_ACCESS_KEY_ID:-}${LIVE_STATE_SECRET_ACCESS_KEY:-}" ]] || { echo 'Legacy AWS state configuration rejected; manual migration required' >&2; exit 2; }
+# Clear ambient AWS/Tofu configuration before binding the single R2 authority.
+for name in $(compgen -e); do
+  case "$name" in AWS_*|TF_*|TOFU_*) [[ "$name" == TOFU_STATE_ENCRYPTION_PASSPHRASE ]] || unset "$name" ;; esac
+done
+export AWS_ACCESS_KEY_ID="$R2_STATE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_STATE_SECRET_ACCESS_KEY"
+export AWS_REGION=auto AWS_DEFAULT_REGION=auto AWS_EC2_METADATA_DISABLED=true
+export AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_PAGER=''
+export TF_VAR_state_bucket_name="${LIVE_STATE_BUCKET:?}"
+export TF_VAR_state_encryption_passphrase="$TOFU_STATE_ENCRYPTION_PASSPHRASE"
+export LIVE_ENVIRONMENT="$ENVIRONMENT" LIVE_STATE_REGION="${LIVE_STATE_REGION:-auto}"
 [[ "$(tofu version -json | python3 -c 'import json,sys; print(json.load(sys.stdin)["terraform_version"])')" == 1.10.9 ]] || exit 2
 (cd "$ARTIFACT" && sha256sum --check SHA256SUMS)
 WORK="$(mktemp -d)"
 chmod 700 "$WORK"
 IMPORT_FILE="$ARTIFACT/infrastructure/approved-imports.tf.json"
 [[ ! -e "$IMPORT_FILE" && ! -L "$IMPORT_FILE" ]] || { echo 'Unexpected import file in immutable candidate' >&2; exit 2; }
-trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/deploy.log" "$IMPORT_FILE"' EXIT
+trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$IMPORT_FILE"' EXIT
 export TF_DATA_DIR="$WORK/tofu"
 python3 "$ROOT/scripts/live-state.py" --environment "$ENVIRONMENT" --output "$WORK/backend.json"
 export TF_VAR_environment="$ENVIRONMENT" TF_VAR_account_id="$CLOUDFLARE_ACCOUNT_ID"
@@ -46,6 +52,12 @@ run_private() {
     exit 1
   fi
 }
+ADMISSION_ARGS=()
+if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
+  python3 "$ROOT/scripts/archive-live-state.py" admit --bootstrap-completion "$BOOTSTRAP_COMPLETION" --admission-file "$WORK/admission.json" > "$WORK/state-check.json"
+  ADMISSION_ARGS=(--admission-file "$WORK/admission.json")
+fi
+python3 "$ROOT/scripts/archive-live-state.py" check "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
 run_private tofu init -input=false -lockfile=readonly -backend-config="$WORK/backend.json"
 if [[ "$MODE" == configure ]]; then
   run_private tofu state list
@@ -62,6 +74,7 @@ if [[ "$MODE" == configure ]]; then
     --output "$ARTIFACT/infrastructure/approved-imports.tf.json" --managed "$WORK/managed.json" \
     --imports "$WORK/imports.json" "${IMPORT_ARGS[@]}"
 fi
+python3 "$ROOT/scripts/archive-live-state.py" archive "${ADMISSION_ARGS[@]}" > "$WORK/archive-before.json"
 run_private tofu plan -input=false -lock-timeout=5m -out="$WORK/plan"
 if ! tofu show -json "$WORK/plan" > "$WORK/plan.json" 2> "$WORK/deploy.log"; then
   echo 'Plan inspection failed; provider output suppressed' >&2; exit 1
@@ -69,7 +82,11 @@ fi
 POLICY_ARGS=()
 [[ "$MODE" != configure ]] || POLICY_ARGS+=(--configure)
 python3 "$ROOT/scripts/live-plan-policy.py" "$WORK/plan.json" "${POLICY_ARGS[@]}"
+if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
+  python3 "$ROOT/scripts/archive-live-state.py" begin "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
+fi
 run_private tofu apply -input=false -lock-timeout=5m "$WORK/plan"
+python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-after.json"
 # Pages uploads use the same immutable candidate; Worker deployment remains OpenTofu-owned.
 run_private node "$ARTIFACT/tools/node_modules/wrangler/bin/wrangler.js" pages deploy "$ARTIFACT/site" \
   --project-name="$LIVE_PAGES_PROJECT" --branch=master --commit-hash="$(cat "$ARTIFACT/REVISION")"

@@ -34,8 +34,8 @@ class DeployTests(unittest.TestCase):
                         TEST_EFFECTS=str(self.log), TEST_PLAN=json.dumps({'resource_changes': []}),
                         CLOUDFLARE_API_TOKEN='private-cf-token', CLOUDFLARE_ACCOUNT_ID='a' * 32,
                         CLOUDFLARE_ZONE_ID='b' * 32, LIVE_HOSTNAME='bmux.dev', LIVE_PAGES_PROJECT='bmux',
-                        LIVE_PUBLISHER_KEY_SHA256='c' * 64, LIVE_STATE_ROLE_ARN='arn:aws:iam::123456789012:role/bmux',
-                        LIVE_STATE_BUCKET='bmux-live-production', LIVE_STATE_REGION='us-east-1',
+                        LIVE_PUBLISHER_KEY_SHA256='c' * 64, R2_STATE_ACCESS_KEY_ID='private-access', R2_STATE_SECRET_ACCESS_KEY='private-secret', TOFU_STATE_ENCRYPTION_PASSPHRASE='private-secret',
+                        LIVE_STATE_BUCKET='bmux-live-production', LIVE_STATE_REGION='auto',
                         AWS_ACCESS_KEY_ID='private-access', AWS_SECRET_ACCESS_KEY='private-secret',
                         AWS_SESSION_TOKEN='private-session')
         for key in ('LIVE_STATE_ACCESS_KEY_ID', 'LIVE_STATE_SECRET_ACCESS_KEY', 'LIVE_REVIEWED_IMPORTS',
@@ -55,7 +55,9 @@ else:
         self.tool('python3', '''import json,os,sys
 from pathlib import Path
 args=sys.argv[1:]
-if args and args[0].endswith('configure-live-imports.py'):
+if args and args[0].endswith('archive-live-state.py'):
+ with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('state '+args[1]+'\\n')
+elif args and args[0].endswith('configure-live-imports.py'):
  output=Path(args[args.index('--output')+1]); output.write_text('{"import": []}')
  reviewed=Path(args[args.index('--imports')+1]); assert json.loads(reviewed.read_text())=={}
  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('imports checked\\n')
@@ -70,14 +72,14 @@ else:
         path.write_text('#!' + sys.executable + '\n' + source)
         path.chmod(0o700)
 
-    def run_deploy(self, mode='release'):
+    def run_deploy(self, mode='release', extra=()):
         result = subprocess.run([shutil.which('bash'), str(ROOT / 'scripts/live-deploy.sh'),
-                                 'production', str(self.artifact), mode], env=self.env,
+                                 'production', str(self.artifact), mode, *extra], env=self.env,
                                 capture_output=True, text=True, timeout=15)
         self.assertNotIn('private-secret', result.stdout + result.stderr)
         return result, self.log.read_text() if self.log.exists() else ''
 
-    def test_release_uses_oidc_and_uploads_after_apply(self):
+    def test_release_uses_r2_and_uploads_after_apply(self):
         result, effects = self.run_deploy()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(effects.index('tofu apply'), effects.index('pages upload'))
@@ -104,6 +106,19 @@ else:
         result, effects = self.run_deploy()
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('pages upload', effects)
+
+    def test_explicit_first_configure_fences_before_apply(self):
+        receipt = self.root / 'completion.json'
+        receipt.write_text('{}')
+        result, effects = self.run_deploy('configure', ('--bootstrap-completion', str(receipt)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(effects.index('state admit'), effects.index('tofu init'))
+        self.assertLess(effects.index('state begin'), effects.index('tofu apply'))
+        self.assertLess(effects.index('tofu apply'), effects.rindex('state archive'))
+        self.log.unlink()
+        result, effects = self.run_deploy('release', ('--bootstrap-completion', str(receipt)))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(effects, '')
 
     def test_ambiguous_auth_and_tampered_candidate_fail_before_provider(self):
         self.env.update(LIVE_STATE_ACCESS_KEY_ID='legacy', LIVE_STATE_SECRET_ACCESS_KEY='legacy-secret')

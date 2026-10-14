@@ -1,91 +1,150 @@
 # Live production deployment
 
-BMUX uses the existing `bmux.dev` Cloudflare zone. Production follows the PWMTF
-pattern: one local credential provisioner, a separate infrastructure workflow,
-and immutable CI releases with a `production-approval` gate. No staging account,
-hostname, or deployment is required. Ordinary local BMUX operation needs none
-of this infrastructure.
+BMUX uses the existing `bmux.dev` Cloudflare zone. Production combines PWMTF's
+local credential provisioner and separate approved infrastructure workflow with
+WWMTF/Bcode's OpenTofu state on Cloudflare R2. No AWS account, IAM role, GitHub
+OIDC customization, staging account, or staging deployment is required. The
+`aws` CLI is only an S3-protocol client for R2 state archives.
+Ordinary local BMUX operation needs none of this infrastructure.
 
 ## One-time setup
 
 ### 1. Authenticate and protect GitHub environments
 
-Authenticate `gh` for `BSteffaniak/bmux` and use your existing AWS SSO/bootstrap
-identity locally. Never use AWS root credentials. Supply
-`CLOUDFLARE_PROVISION_TOKEN` through a credential manager or protected environment,
-not command arguments. This is a **provisioning** token with API Tokens Read/Edit,
-read access to `bmux.dev`, and authority to grant the required account/zone
-permissions. It is never installed in GitHub.
+Enter the locked development shell from the repository root:
+
+```sh
+nix develop --command bash
+python3 --version
+gh --version
+aws --version
+tofu version
+gh auth login
+```
+
+The shell supplies Python, GitHub CLI, AWS CLI v2 (for R2), and pinned OpenTofu
+1.10.9. Do not run `aws configure`, AWS SSO login, or create an AWS account.
+Authenticate `gh` for `BSteffaniak/bmux` with repository secret administration.
 
 Create these repository environments, restricted to branch `master` only:
 
-* `Production`: deployment secrets; no required reviewers here (the build/deploy
-  job needs the credentials after the separate gate).
-* `production-approval`: configure a required reviewer, following PWMTF. The
-  repository owner may approve their own run; self-review need not be disabled.
-  Disable administrator bypass for this gate.
+* `Production`: deployment secrets; no required reviewers here.
+* `production-approval`: configure a required reviewer. The repository owner
+  may approve their own run; self-review need not be disabled. Disable
+  administrator bypass for this gate.
 
 The provisioner verifies protections and never silently replaces them. Existing
-credentials are skipped before provider access; replacement requires `--rotate`
-and can be limited with `--only NAME`.
+credentials are skipped; replacement requires `--rotate` with explicit
+`--only NAME` selections. Keep the state encryption passphrase backed up securely;
+losing it prevents decrypting the state and its archives.
 
-### 2. Run the provisioner once
+### 2. Provision Cloudflare and R2 credentials
 
-Create private directories for the local publisher key and bootstrap ledger.
-Replace the public AWS account/bucket choices below with your account and a
-unique bucket name; reuse an existing selected backend instead of creating a
-competing one.
+Supply `CLOUDFLARE_PROVISION_TOKEN` through a credential manager or protected
+environment, not command arguments. This provisioning token needs API Tokens
+Read/Edit, read access to `bmux.dev`, and authority to grant the required scoped
+Workers/Pages, DNS/routes, and R2 permissions. It is never installed in GitHub.
+Use BMUX-specific credentials, not PWMTF/WWMTF/Bcode deployment tokens.
+
+For Bash, securely enter the provisioning token and create private directories:
 
 ```sh
-python3 scripts/bootstrap-live-secrets.py --repo BSteffaniak/bmux \
-  --publisher-key-file /ABSOLUTE/PRIVATE/publisher-key \
-  --bootstrap-state --configure-oidc \
-  --state-account-id YOUR_12_DIGIT_AWS_ACCOUNT \
-  --state-region us-east-1 \
-  --state-bucket YOUR_UNIQUE_PRODUCTION_STATE_BUCKET \
-  --state-role bmux-live-production \
-  --state-dir /ABSOLUTE/PRIVATE/bmux-state-bootstrap
+read -r -s -p 'Cloudflare provisioning token: ' CLOUDFLARE_PROVISION_TOKEN
+printf '\n'
+export CLOUDFLARE_PROVISION_TOKEN
+umask 077
+mkdir -p "$HOME/.config/bmux/live" "$HOME/.local/state/bmux/live-bootstrap"
+chmod 700 "$HOME/.config/bmux/live" "$HOME/.local/state/bmux/live-bootstrap"
 ```
 
-The provisioner discovers the existing zone/account, defaults to hostname
-`bmux.dev` and Pages project `bmux`, generates a publisher key only at the explicit
-private path if absent, and installs **only its digest** in GitHub. It creates a
-BMUX-specific Cloudflare deployment token with separately scoped account
-Workers/Pages permissions and zone DNS/routes permissions. PWMTF's project token
-is not reused. Token values go to GitHub on stdin, never in logs or argv. After
-rotation, verify deployment before manually retiring old credentials.
+Do not enable shell tracing or print secret environment variables. Use the
+provider-free `--dry-run` before performing provisioning. The helper discovers
+the existing zone/account, defaults to hostname `bmux.dev` and Pages project
+`bmux`, and generates a publisher key only at its explicit private path if absent.
+Only the publisher key digest is installed in GitHub.
 
-The optional AWS companion guides a pinned OpenTofu plan, review, explicit cost
-acceptance and exact operation-ID approval. It provisions a production-only
-private/versioned/encrypted/TLS-only S3 backend and scoped GitHub OIDC role, then
-installs public backend/role metadata automatically. **No long-lived AWS access
-keys are needed in the normal path.** Retain the private local bootstrap state;
-it is the root of ownership, not disposable cache. Existing resource imports
-require explicit approval. Planning and ambiguous apply recovery never blindly
-replay a mutation.
+Use the helper in explicit plan/review/apply phases. The plan prints a public
+operation ID; substitute it for `OPERATION_ID` below. Do not change checkout or
+backend choices between these phases, since the operation is implementation-bound.
 
-`--configure-oidc` explicitly approves a repository-wide subject-template change;
-review other OIDC consumers first. The template is `[repo,context,ref]`, so AWS
-trust matches exactly
-`repo:BSteffaniak/bmux:environment:Production:ref:refs/heads/master`, audience
-`sts.amazonaws.com`. An incompatible existing custom template is rejected, not
-overwritten. Production branch restrictions and the separate approval gate
-remain required.
+```sh
+bootstrap_live() {
+  python3 scripts/bootstrap-live-secrets.py --repo BSteffaniak/bmux \
+    --publisher-key-file "$HOME/.config/bmux/live/publisher-key" \
+    --bootstrap-state --state-dir "$HOME/.local/state/bmux/live-bootstrap" "$@"
+}
+bootstrap_live --dry-run
+bootstrap_live --state-mode plan
+bootstrap_live --state-mode review --state-operation OPERATION_ID
+```
 
-Use `--dry-run` to see intent with **zero GitHub, provider, or child provisioning
-calls**. Advanced noninteractive backend operation uses `--state-mode
-plan|review|apply|reconcile` and `--state-operation ID`; only complete backend
-results are eligible for installing secrets. `--input-env` retains explicit
-legacy supplied-value/static-key support. See `--help` for selected-secret and
-recovery controls. Local setup needs Python 3.12+, AWS CLI and OpenTofu 1.10.9;
-CI installs its pinned tools.
+If a bucket is already designated for this backend, set `LIVE_STATE_BUCKET`
+before planning; adopting it additionally requires `--approve-import` and its
+original encryption material. The default for a new backend is
+`bmux-opentofu-state`. Existing/adopted buckets cannot use new-bucket admission.
+Missing state there is a recovery error, never permission to reset it.
 
-### 3. Configure infrastructure in GitHub Actions
+Before apply, generate a high-entropy encryption passphrase in your credential
+manager and back it up independently. Load it securely without shell history:
 
-After the changes are on `master`, run **Configure Production Infrastructure**.
-CI builds and verifies an immutable candidate, waits for `production-approval`,
-assumes the exact production OIDC role, and configures infrastructure under the
-production backend lock.
+```sh
+read -r -s -p 'State encryption passphrase: ' TOFU_STATE_ENCRYPTION_PASSPHRASE
+printf '\n'
+export TOFU_STATE_ENCRYPTION_PASSPHRASE
+bootstrap_live --state-mode apply --state-operation OPERATION_ID --accept-cost \
+  --state-completion-file "$HOME/.local/state/bmux/live-bootstrap/ready.json"
+```
+
+The helper requires the original passphrase before bucket mutation; it never
+silently generates or replaces encryption material. For a confirmed new bucket,
+it writes a private completion receipt for first-deployment admission. It does
+not upload synthetic empty state. The first actual OpenTofu infrastructure apply
+creates the canonical encrypted state. Keep the receipt and independent passphrase
+backup; neither receipt nor operation metadata contains credentials.
+After success, verify names only and remove the bootstrap token from this shell:
+
+```sh
+gh secret list --repo BSteffaniak/bmux --env Production
+unset CLOUDFLARE_PROVISION_TOKEN
+```
+
+The R2 backend contract is:
+
+* `LIVE_STATE_BUCKET`: the explicitly selected R2 bucket.
+* `LIVE_STATE_REGION`: `auto`.
+* `CLOUDFLARE_ACCOUNT_ID`: selects the canonical
+  `https://ACCOUNT.r2.cloudflarestorage.com` endpoint.
+* `R2_STATE_ACCESS_KEY_ID` and `R2_STATE_SECRET_ACCESS_KEY`: dedicated bucket-scoped
+  S3-protocol credentials, not AWS IAM keys.
+* `TOFU_STATE_ENCRYPTION_PASSPHRASE`: high-entropy private encryption material,
+  mapped to `TF_VAR_state_encryption_passphrase` only for OpenTofu.
+
+Endpoint overrides, old AWS role/backend choices, and old AWS operation ledgers
+are rejected rather than silently reinterpreted as R2. Existing bucket selection
+must be explicit and consistent; never initialize a competing backend to bypass
+an error. Bootstrap metadata and operation reviews must not contain credentials.
+
+### 3. Configure production infrastructure in CI
+
+Merge the implementation/workflows into `master`, then run **Configure Production
+Infrastructure**. CI builds and verifies one immutable candidate, waits for
+`production-approval`, and configures infrastructure under the selected R2
+backend lock. For the first configure only, supply the exact `ready.json` contents
+in `bootstrap_completion` and its file SHA-256 in `bootstrap_completion_sha256`:
+
+```sh
+sha256sum "$HOME/.local/state/bmux/live-bootstrap/ready.json"
+```
+
+The checksum covers the exact file bytes, including any trailing newline; do not
+reformat the JSON. The workflow writes a private local receipt and passes
+`--bootstrap-completion` to configure. Admission verifies the exact backend and
+remote bucket creation identity and emptiness, then consumes a conditional remote
+marker before effects. An interrupted or ambiguous admission/apply requires
+explicit recovery; replaying the receipt must not create another state lineage.
+Subsequent configure/release runs leave both inputs empty and require existing
+canonical encrypted state. OpenTofu state and saved plans use enforced client-side AES-GCM
+encryption, matching WWMTF; native S3-protocol lockfiles remain enabled.
 
 For existing Pages/domain/DNS/route resources, the first discovery reports a
 validated public `imports` map and fingerprint, then stops without adoption.
@@ -100,23 +159,22 @@ immutable Worker version/deployment, SQLite Durable Object migration/binding,
 and exact `bmux.dev/api/live/*` route. OpenTofu is the only Worker owner; pinned
 Wrangler is used only for Pages static uploads. All approved infrastructure
 changes and deployment uploads share the same non-cancelling CI concurrency
-lock. S3 conditional state locking is always enabled; R2/custom S3 endpoints are
-not interchangeable without independent locking proof.
+lock. State archives preserve encrypted remote bytes, not plaintext state dumps.
 
 ## Subsequent releases
 
 Docs pushes on `master` call **Live production release**, or dispatch that
 workflow manually. CI builds once without deployment secrets, verifies the
 artifact checksum and revision, waits for production approval, updates Worker
-code/version deployment and uploads the matching website/viewer assets. It
-**rejects infrastructure creation, imports, DNS/project changes, and destructive
-changes**; run Configure Production Infrastructure for deliberate topology
-changes. Immutable Worker-version replacement is the expected release exception.
+code/version deployment and uploads matching website/viewer assets. It rejects
+infrastructure creation, imports, DNS/project changes, and destructive changes;
+run Configure Production Infrastructure for deliberate topology changes.
+Immutable Worker-version replacement is the expected release exception.
 No local frontend build, candidate upload, or staging promotion is required.
 
 The normal native installer also supports `bmux broadcast deploy` for separately
-hosted installations; that is not the normal bmux.dev CI deployment path. Seven
-installer/provider assets are embedded and verified in a private cache, not
+hosted installations; that is not the normal bmux.dev CI deployment path.
+Installer/provider assets are embedded and verified in a private cache, not
 installed as mutable sidecars. Candidate precedence is explicit absolute
 `--artifact`, then approved saved/explicit release URL plus independently trusted
 archive digest, then optional `live-candidate` beside the selected executable.
@@ -135,17 +193,25 @@ Verify terminal/presenter output, pause/resume/stop, offline state, reconnects,
 and audience privacy after deployment. Public read-only smoke does not prove
 native/Canvas visual correctness or private-note exclusion by itself.
 
-## Recovery and validation boundaries
+## Recovery and migration
 
 Do not cancel an active apply, disable backend locking, force-unlock, or restore
 old state over active work. Reconcile actual resources and state lineage before
-explicit recovery. Bootstrap state/ledgers contain ownership metadata, never
-reusable credentials. Keep provider diagnostics, Terraform plans and state
-private; CI suppresses provider output.
+explicit recovery. Keep diagnostics, plans, state, credentials and encryption
+material private. CI suppresses provider output.
+
+If an earlier AWS backend was actually deployed, this change does not migrate it
+or destroy AWS resources. Stop all writers; preserve the original state and
+credentials, establish its lineage/serial, and arrange a separately reviewed
+OpenTofu backend/encryption migration with recoverable backups before enabling
+R2 writers. Do not merely remove the old environment variables and initialize
+empty R2 state. Resume descriptors from AWS operations are not R2 authority.
+Likewise, changing the R2 account, bucket, state key, or encryption passphrase is
+an explicit migration, not ordinary credential rotation.
 
 Offline mocks, policy tests, formatting and OpenTofu validation establish local
-contracts, not actual account entitlement, provider import endpoint behavior,
-S3 concurrent lock exclusion, billing, SQLite migration, DNS/TLS activation, or
-real cloud deployment success. Those remain explicit authorized production
-acceptance checks. Infrastructure, token creation and secret writes are not run
-by coding-agent tests.
+contracts, not actual account entitlement, provider import behavior, live R2
+concurrent lock exclusion, retention enforcement, billing, SQLite migration,
+DNS/TLS activation, or real cloud deployment success. These remain explicit
+authorized production acceptance checks. Infrastructure, token creation and
+secret writes are not run by coding-agent tests.

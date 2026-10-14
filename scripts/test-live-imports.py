@@ -18,12 +18,16 @@ ZONE = 'b' * 32
 DNS = 'c' * 32
 ENV = {'CLOUDFLARE_ACCOUNT_ID': ACCOUNT, 'CLOUDFLARE_ZONE_ID': ZONE,
        'LIVE_HOSTNAME': 'bmux.dev', 'LIVE_PAGES_PROJECT': 'bmux',
-       'LIVE_ENVIRONMENT': 'production', 'CLOUDFLARE_API_TOKEN': 'SECRET_TOKEN'}
+       'LIVE_ENVIRONMENT': 'production', 'CLOUDFLARE_API_TOKEN': 'SECRET_TOKEN',
+       'LIVE_STATE_BUCKET': 'bmux-opentofu-state'}
 
 
 class FakeAPI:
     def __init__(self):
         self.data = {
+            f'accounts/{ACCOUNT}/r2/buckets': [{'name': 'bmux-opentofu-state', 'storage_class': 'Standard', 'creation_date': '2026-01-01'}],
+            f'accounts/{ACCOUNT}/r2/buckets/bmux-opentofu-state/lock': [],
+            f'accounts/{ACCOUNT}/r2/buckets/bmux-opentofu-state/lifecycle': [],
             f'accounts/{ACCOUNT}/pages/projects': [{'name': 'bmux'}],
             f'accounts/{ACCOUNT}/pages/projects/bmux/domains': [{'name': 'bmux.dev'}],
             f'zones/{ZONE}/dns_records?name=bmux.dev': [{'id': DNS, 'name': 'bmux.dev', 'type': 'CNAME', 'content': 'bmux.pages.dev'}],
@@ -65,6 +69,7 @@ class Tests(unittest.TestCase):
     def test_exact_discovery_and_managed_filter(self):
         found = MODULE.discover(FakeAPI(), MODULE.configuration(ENV), set())
         self.assertEqual(found, {
+            'cloudflare_r2_bucket.state': ACCOUNT + '/bmux-opentofu-state/default',
             'cloudflare_pages_project.live': ACCOUNT + '/bmux',
             'cloudflare_pages_domain.live': ACCOUNT + '/bmux/bmux.dev',
             'cloudflare_dns_record.live': ZONE + '/' + DNS,
@@ -162,6 +167,32 @@ class Tests(unittest.TestCase):
         with self.assertRaises(MODULE.ImportErrorSafe):
             MODULE.Cloudflare('SECRET_TOKEN', opener).listing('test')
 
+    def test_r2_bucket_and_unmanaged_policy_guards(self):
+        config = MODULE.configuration(ENV)
+        endpoint = f'accounts/{ACCOUNT}/r2/buckets'
+        for rows in ([], [{'name': config['bucket']}]):
+            api = FakeAPI()
+            api.data[endpoint] = rows
+            with self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.discover(api, config, set())
+        for suffix, address in (('lock', 'cloudflare_r2_bucket_lock.state'),
+                                ('lifecycle', 'cloudflare_r2_bucket_lifecycle.state')):
+            api = FakeAPI()
+            api.data[f'{endpoint}/{config["bucket"]}/{suffix}'] = [{'id': 'unrelated'}]
+            with self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.discover(api, config, set())
+            self.assertIn('cloudflare_r2_bucket.state', MODULE.discover(api, config, {address}))
+
+    def test_r2_inventory_and_rules_response_shapes(self):
+        for suffix, result in (('', {'buckets': [{'name': 'bmux-opentofu-state'}]}),
+                               ('/bmux-opentofu-state/lock', {'rules': []}),
+                               ('/bmux-opentofu-state/lifecycle', {'rules': []})):
+            api = MODULE.Cloudflare('SECRET_TOKEN', Opener([{'success': True, 'result': result}]))
+            self.assertIsInstance(api.listing(f'accounts/{ACCOUNT}/r2/buckets{suffix}'), list)
+        api = MODULE.Cloudflare('SECRET_TOKEN', Opener([{'success': True, 'result': {'buckets': [], 'cursor': 'more'}}]))
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            api.listing(f'accounts/{ACCOUNT}/r2/buckets')
+
     def test_private_output_and_input_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -169,6 +200,7 @@ class Tests(unittest.TestCase):
             artifact.mkdir()
             source = Path(__file__).resolve().parent.parent / 'infra/live-terraform/main.tf'
             (artifact / 'main.tf').write_text(source.read_text())
+            (artifact / 'state.tf').write_text(source.with_name('state.tf').read_text())
             output = root / 'imports.tf.json'
             self.assertEqual(MODULE.paths(str(artifact), str(output)), output)
             root.chmod(0o755)
@@ -206,7 +238,7 @@ class Tests(unittest.TestCase):
         api = FakeAPI()
         api.data[f'accounts/{ACCOUNT}/pages/projects'] = []
         api.data[f'zones/{ZONE}/dns_records?name=bmux.dev'] = []
-        found = MODULE.discover(api, MODULE.configuration(ENV), set())
+        found = MODULE.discover(api, MODULE.configuration(ENV), set(MODULE.STATE_ADDRESSES))
         self.assertEqual(found, {})
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'imports.tf.json'

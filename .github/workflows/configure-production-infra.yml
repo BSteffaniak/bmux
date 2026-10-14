@@ -2,6 +2,16 @@ name: Configure Production Infrastructure
 on:
   workflow_dispatch:
     inputs:
+      bootstrap_completion:
+        description: 'First configure only: exact public new-bucket completion JSON; leave empty for existing state'
+        required: false
+        type: string
+        default: ''
+      bootstrap_completion_sha256:
+        description: 'SHA-256 of the exact completion JSON file bytes'
+        required: false
+        type: string
+        default: ''
       reviewed_imports:
         description: 'Exact reviewed JSON address-to-provider-ID map; leave {} for discovery. Confirm old state ownership is transferred before import.'
         required: false
@@ -14,13 +24,14 @@ on:
         default: false
 permissions:
   contents: read
-  id-token: write
 jobs:
   configure:
     if: github.ref == 'refs/heads/master'
     uses: ./.github/workflows/live-promote.yml
     with:
       configure: true
+      bootstrap_completion: ${{ inputs.bootstrap_completion }}
+      bootstrap_completion_sha256: ${{ inputs.bootstrap_completion_sha256 }}
       reviewed_imports: ${{ inputs.reviewed_imports }}
       approve_import: ${{ inputs.approve_import }}
     secrets: inherit

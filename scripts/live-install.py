@@ -29,11 +29,11 @@ FIELDS = {
     'pages_project': 'LIVE_PAGES_PROJECT', 'publisher_key_sha256': 'LIVE_PUBLISHER_KEY_SHA256',
     'bucket': 'LIVE_STATE_BUCKET', 'region': 'LIVE_STATE_REGION',
 }
-SECRETS = ('CLOUDFLARE_API_TOKEN', 'LIVE_STATE_ACCESS_KEY_ID', 'LIVE_STATE_SECRET_ACCESS_KEY')
+SECRETS = ('CLOUDFLARE_API_TOKEN', 'R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY', 'TOFU_STATE_ENCRYPTION_PASSPHRASE')
 ADDRESSES = ('cloudflare_pages_project.live', 'cloudflare_pages_domain.live',
              'cloudflare_dns_record.live', 'cloudflare_worker.live',
              'cloudflare_worker_version.live', 'cloudflare_workers_deployment.live',
-             'cloudflare_workers_route.live')
+             'cloudflare_workers_route.live', 'cloudflare_r2_bucket.state')
 
 
 class InstallError(Exception):
@@ -112,13 +112,13 @@ def lock(root):
 
 
 def validate_profile(value):
-    if set(value) != {'schema', 'choices'} or value['schema'] != 1 or set(value['choices']) != set(FIELDS):
+    if set(value) != {'schema', 'choices'} or value['schema'] != 2 or set(value['choices']) != set(FIELDS):
         raise InstallError('Unsupported/corrupt deployment profile; credentials never belong here')
     c = value['choices']
     patterns = {'environment': r'staging|production', 'account_id': r'[a-f0-9]{32}',
                 'zone_id': r'[a-f0-9]{32}', 'hostname': r'(?=.{1,253}$)[a-z0-9]+(?:[.-][a-z0-9]+)*\.[a-z]{2,63}',
                 'pages_project': r'[a-z0-9][a-z0-9-]{0,57}', 'publisher_key_sha256': r'[a-f0-9]{64}',
-                'bucket': r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', 'region': r'[a-z]{2}-[a-z]+-\d'}
+                'bucket': r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', 'region': r'auto'}
     for key, pattern in patterns.items():
         if not isinstance(c[key], str) or not re.fullmatch(pattern, c[key]):
             raise InstallError('Invalid deployment choice: ' + key)
@@ -160,15 +160,15 @@ def setup(path, interactive=True):
     choices = {}
     discovered = select_provider_defaults() if interactive and not old and not os.environ.get('CLOUDFLARE_ACCOUNT_ID') else {}
     for key, env_key in FIELDS.items():
-        default = os.environ.get(env_key, old.get(key, discovered.get(key, '')))
+        default = os.environ.get(env_key, old.get(key, discovered.get(key, 'auto' if key == 'region' else '')))
         if interactive:
-            defaults = {'environment': 'staging', 'pages_project': 'bmux-live-staging', 'region': 'us-east-1'}
+            defaults = {'environment': 'staging', 'pages_project': 'bmux-live-staging', 'region': 'auto'}
             default = default or defaults.get(key, '')
             answer = input(f'{key} [{default}]: ').strip()
             choices[key] = answer or default
         else:
             choices[key] = default
-    value = {'schema': 1, 'choices': choices}
+    value = {'schema': 2, 'choices': choices}
     validate_profile(value)
     save(path, value)
     return choices
@@ -201,7 +201,7 @@ def verify_artifact(root):
         if actual != files:
             raise InstallError('Artifact has unlisted or missing files')
         for required in ('REVISION', 'infrastructure/main.tf', 'infrastructure/.terraform.lock.hcl',
-                         'infrastructure/bootstrap/main.tf', 'infrastructure/bootstrap/.terraform.lock.hcl',
+                         'infrastructure/encryption.tf', 'infrastructure/state.tf',
                          'tools/node_modules/wrangler/bin/wrangler.js'):
             if required not in files:
                 raise InstallError('Candidate missing required asset: ' + required)
@@ -222,13 +222,16 @@ class Tools:
         self.tofu = shutil.which('tofu')
         self.node = shutil.which('node')
         self.aws = shutil.which('aws')
+        self.admission_args = []
 
     def run(self, args, cwd=None, codes=(0,), timeout=900):
         try:
-            result = subprocess.run(args, cwd=cwd, env=self.env, stdin=subprocess.DEVNULL,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
-        except (OSError, subprocess.TimeoutExpired):
-            raise InstallError('Tool unavailable/timed out; interrupted mutations require reconciliation') from None
+            spec = importlib.util.spec_from_file_location('archive_state', HERE / 'archive-live-state.py')
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            result = module.bounded_run(args, self.env, cwd=cwd, timeout=timeout)
+        except Exception:
+            raise InstallError('Tool unavailable/timed out/output exceeded; interrupted mutations require reconciliation') from None
         if len(result.stdout) > 32 * 1024 * 1024 or result.returncode not in codes:
             raise InstallError('Provider operation failed; output suppressed; check authentication, scope and locked state')
         return result
@@ -240,7 +243,7 @@ class Tools:
         if version != '1.10.9':
             raise InstallError('Use pinned OpenTofu 1.10.9; do not upgrade provider locks during deployment')
         if not self.aws:
-            raise InstallError('Install AWS CLI v2 for account/bucket/IAM preflight and secure bootstrap identity attachment')
+            raise InstallError('Install AWS CLI v2 as an R2 S3-protocol client (no AWS account required)')
         if not bootstrap:
             if not self.node:
                 raise InstallError('Install Node.js 22 for pinned Wrangler Pages-only upload')
@@ -274,9 +277,13 @@ class Tools:
         for page in range(1, 101):
             body = self.cf(path + ('&' if '?' in path else '?') + f'per_page=100&page={page}')
             items = body['result']
+            if '/r2/buckets' in path and isinstance(items, dict):
+                if items.get('cursor') or body.get('result_info', {}).get('cursor'):
+                    raise InstallError('R2 inventory incomplete; reconcile manually')
+                items = items.get('rules') if path.endswith(('/lock', '/lifecycle')) else items.get('buckets')
             if isinstance(items, dict) and 'workers' in items:
                 items = items['workers']
-            if not isinstance(items, list):
+            if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
                 raise InstallError('Unsupported provider inventory response; refusing guessed empty state')
             result.extend(items)
             info = body.get('result_info', {})
@@ -288,97 +295,61 @@ class Tools:
 
 
 def preflight(tools, choices, bootstrap=False):
-    tools.check(bootstrap)
-    region = choices['region']
-    tools.env['AWS_REGION'] = region
-    tools.env['AWS_DEFAULT_REGION'] = region
-    account = json.loads(tools.run([tools.aws, 'sts', 'get-caller-identity', '--output', 'json']).stdout).get('Account')
-    if not isinstance(account, str) or not re.fullmatch(r'\d{12}', account):
-        raise InstallError('AWS authoritative account identity unavailable')
     if bootstrap:
-        return account
+        raise InstallError('Use provision-live-state.py for explicit R2 bootstrap; legacy AWS requires manual migration')
+    tools.check()
+    if choices['region'] != 'auto':
+        raise InstallError('Legacy AWS state rejected; manual migration required')
     token = tools.cf('user/tokens/verify')['result']
     if token.get('status') != 'active':
-        raise InstallError('Cloudflare token is not active; create a scoped deployment token')
+        raise InstallError('Cloudflare token is not active')
     tools.cf('accounts/' + choices['account_id'])
     zone = tools.cf('zones/' + choices['zone_id'])['result']
     if zone.get('account', {}).get('id') != choices['account_id'] or zone.get('status') != 'active':
-        raise InstallError('Zone must be active and belong to selected account; complete registrar delegation')
+        raise InstallError('Zone must be active and belong to selected account')
     if choices['hostname'] != zone['name'] and not choices['hostname'].endswith('.' + zone['name']):
-        raise InstallError('Hostname is outside the selected zone')
-    for command in (
-        ['get-bucket-location'], ['get-bucket-versioning'], ['get-public-access-block'], ['get-bucket-encryption']
-    ):
-        answer = json.loads(tools.run([tools.aws, 's3api', *command, '--bucket', choices['bucket'], '--output', 'json']).stdout)
-        if command[0] == 'get-bucket-location' and (answer.get('LocationConstraint') or 'us-east-1') != choices['region']:
-            raise InstallError('State bucket region mismatch')
-        if command[0] == 'get-bucket-versioning' and answer.get('Status') != 'Enabled':
-            raise InstallError('State bucket must have versioning enabled; use --bootstrap plan/review/apply')
-        if command[0] == 'get-public-access-block' and not all(answer.get('PublicAccessBlockConfiguration', {}).get(k) is True for k in
-                ('BlockPublicAcls', 'IgnorePublicAcls', 'BlockPublicPolicy', 'RestrictPublicBuckets')):
-            raise InstallError('State bucket must block all public access')
-        if command[0] == 'get-bucket-encryption' and not answer.get('ServerSideEncryptionConfiguration'):
-            raise InstallError('State bucket encryption required')
-    return account
+        raise InstallError('Hostname is outside selected zone')
+    tools.run([sys.executable, '-I', str(HERE / 'archive-live-state.py'), 'check', *tools.admission_args])
+    return choices['account_id']
 
 
-def discover(tools, c):
-    account, zone = c['account_id'], c['zone_id']
-    specifications = [
-        ('cloudflare_pages_project.live', f'accounts/{account}/pages/projects', 'name', c['pages_project']),
-        ('cloudflare_dns_record.live', f'zones/{zone}/dns_records?name={c["hostname"]}', 'name', c['hostname']),
-        ('cloudflare_worker.live', f'accounts/{account}/workers/workers', 'name', 'bmux-live-' + c['environment']),
-        ('cloudflare_workers_route.live', f'zones/{zone}/workers/routes', 'pattern', c['hostname'] + '/api/live/*'),
-    ]
-    found = {}
-    for address, endpoint, field, expected in specifications:
-        matches = [item for item in tools.cf_list(endpoint) if item.get(field) == expected]
-        if len(matches) > 1:
-            raise InstallError('Multiple matching provider resources; reconcile explicitly before planning')
-        if matches:
-            item = matches[0]
-            if address == 'cloudflare_pages_project.live':
-                provider_id = f'{account}/{c["pages_project"]}'
-            elif address in ('cloudflare_dns_record.live', 'cloudflare_workers_route.live'):
-                provider_id = f'{zone}/{item["id"]}'
-            else:
-                provider_id = f'{account}/{item["id"]}'
-            if not re.fullmatch(r'[a-zA-Z0-9_:/.-]{1,512}', provider_id):
-                raise InstallError('Unsupported provider resource identity')
-            found[address] = provider_id
-    if 'cloudflare_pages_project.live' in found:
-        items = tools.cf_list(f'accounts/{account}/pages/projects/{c["pages_project"]}/domains')
-        if any(item.get('name') == c['hostname'] for item in items):
-            found['cloudflare_pages_domain.live'] = f'{account}/{c["pages_project"]}/{c["hostname"]}'
-    return found
+def discover(tools, c, managed=()):
+    spec = importlib.util.spec_from_file_location('configure_imports', HERE / 'configure-live-imports.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    config = dict(account=c['account_id'], zone=c['zone_id'], hostname=c['hostname'],
+                  pages=c['pages_project'], worker='bmux-live-' + c['environment'], bucket=c['bucket'])
+    class Api:
+        def listing(self, endpoint):
+            return tools.cf_list(endpoint)
+    try:
+        return module.discover(Api(), config, set(managed))
+    except module.ImportErrorSafe:
+        raise InstallError('Provider ownership differs or unmanaged R2 policy exists; reconcile before import') from None
 
 
 def environment(choices, bootstrap=False, interactive=False):
-    env = dict(os.environ)
-    # TF_CLI_ARGS can weaken locking or alter plan/apply; provider logging can leak secrets.
-    for key in list(env):
-        if key.startswith(('TF_', 'TOFU_')) or key in ('AWS_ENDPOINT_URL', 'AWS_ENDPOINT_URL_S3'):
-            del env[key]
-    env['TF_IN_AUTOMATION'] = '1'
-    env['CHECKPOINT_DISABLE'] = '1'
-    env['WRANGLER_LOG'] = 'none'
-    env['WRANGLER_SEND_METRICS'] = 'false'
-    env['AWS_REGION'] = choices['region']
-    env['AWS_DEFAULT_REGION'] = choices['region']
-    if not bootstrap:
-        for name in SECRETS:
-            if not env.get(name) and interactive:
-                env[name] = getpass.getpass(name + ' (used only in memory): ')
-            if not env.get(name):
-                raise InstallError('Missing ' + name + '; provide private environment or run interactively')
-        env['AWS_ACCESS_KEY_ID'] = env['LIVE_STATE_ACCESS_KEY_ID']
-        env['AWS_SECRET_ACCESS_KEY'] = env['LIVE_STATE_SECRET_ACCESS_KEY']
-        for key in ('AWS_PROFILE', 'AWS_SESSION_TOKEN', 'AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE'):
-            env.pop(key, None)
-        if env.get('LIVE_STATE_SESSION_TOKEN'):
-            env['AWS_SESSION_TOKEN'] = env['LIVE_STATE_SESSION_TOKEN']
-        for key in ('environment', 'account_id', 'zone_id', 'hostname', 'pages_project', 'publisher_key_sha256'):
-            env['TF_VAR_' + key] = choices[key]
+    if bootstrap:
+        raise InstallError('Use provision-live-state.py for R2 bootstrap; AWS bootstrap is unsupported')
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('TF_', 'TOFU_', 'AWS_'))}
+    env.update(TF_IN_AUTOMATION='1', CHECKPOINT_DISABLE='1', WRANGLER_LOG='none', WRANGLER_SEND_METRICS='false')
+    for name in SECRETS:
+        value = os.environ.get(name)
+        if not value and interactive:
+            value = getpass.getpass(name + ' (used only in memory): ')
+        if not value:
+            raise InstallError('Missing ' + name + '; provide private environment')
+        env[name] = value
+    env.update(AWS_ACCESS_KEY_ID=env['R2_STATE_ACCESS_KEY_ID'],
+               AWS_SECRET_ACCESS_KEY=env['R2_STATE_SECRET_ACCESS_KEY'],
+               AWS_REGION='auto', AWS_DEFAULT_REGION='auto', AWS_EC2_METADATA_DISABLED='true',
+               AWS_CONFIG_FILE='/dev/null', AWS_SHARED_CREDENTIALS_FILE='/dev/null',
+               TF_VAR_state_encryption_passphrase=env['TOFU_STATE_ENCRYPTION_PASSPHRASE'],
+               TF_VAR_state_bucket_name=choices['bucket'])
+    for key, name in FIELDS.items():
+        env[name] = choices[key]
+    for key in ('environment', 'account_id', 'zone_id', 'hostname', 'pages_project', 'publisher_key_sha256'):
+        env['TF_VAR_' + key] = choices[key]
     return env
 
 
@@ -386,8 +357,7 @@ def imports(values, bootstrap=False):
     result = {}
     for value in values:
         address, separator, provider_id = value.partition('=')
-        allowed = address in ADDRESSES if not bootstrap else bool(re.fullmatch(
-            r'aws_(?:s3_bucket|s3_bucket_versioning|s3_bucket_server_side_encryption_configuration|s3_bucket_public_access_block|s3_bucket_policy|iam_policy)\.(?:state|tls)\["(?:staging|production)"\]', address))
+        allowed = address in ADDRESSES and not bootstrap
         if not separator or not allowed or address in result or not re.fullmatch(r'[a-zA-Z0-9_:/.-]{1,512}', provider_id):
             raise InstallError('Invalid explicit import ADDRESS=PROVIDER_ID')
         result[address] = provider_id
@@ -411,22 +381,27 @@ def review_summary(plan):
 
 
 class Deployment:
-    def __init__(self, root, artifact, choices, bootstrap, tools):
+    def __init__(self, root, artifact, choices, bootstrap, tools, bootstrap_completion=None):
+        if bootstrap:
+            raise InstallError('Use provision-live-state.py; legacy AWS bootstrap is unsupported')
         self.root, self.artifact, self.choices = root, artifact, choices
         self.bootstrap, self.tools = bootstrap, tools
         self.guided = False
+        self.bootstrap_completion = bootstrap_completion
+        self.admission_path = root / 'bootstrap-admission.json'
+        self.tools.admission_args = []
         self.ledger_path = root / ('bootstrap-ledger.json' if bootstrap else 'ledger.json')
         self.artifact_id = verify_artifact(artifact)
-        self.binding = identity({'choices': choices, 'artifact': self.artifact_id, 'bootstrap': bootstrap})
+        self.binding = identity({'choices': choices, 'artifact': self.artifact_id, 'bootstrap': bootstrap, 'state_backend': 'r2-encrypted-v1'})
         self.ledger = private_read(self.ledger_path) if self.ledger_path.exists() else None
         if self.ledger is not None:
             phases = {'planning', 'planned', 'reviewed', 'applying', 'applied', 'pages-uploading', 'published', 'complete'}
             allowed = {'schema', 'operation', 'binding', 'phase', 'imports', 'started', 'cost_accepted', 'provider_account',
-                       'plan_sha256', 'summary', 'outputs', 'abandoned', 'pages_operator_ack',
-                       'policy_attachment', 'policy_attachment_confirmed'}
+                       'plan_sha256', 'summary', 'abandoned', 'pages_operator_ack',
+                       'state_backend', 'bootstrap_receipt_sha256'}
             if not isinstance(self.ledger, dict) or set(self.ledger) - allowed or self.ledger.get('phase') not in phases:
                 raise InstallError('Unsupported/corrupt deployment operation ledger')
-            if self.ledger.get('schema') != 1 or (self.ledger.get('binding') != self.binding and self.ledger['phase'] != 'complete'):
+            if self.ledger.get('schema') != 2 or self.ledger.get('state_backend') != 'r2-encrypted-v1' or (self.ledger.get('binding') != self.binding and self.ledger['phase'] != 'complete'):
                 raise InstallError('Resume choices/candidate differ from operation; restore original profile/artifact')
             if not re.fullmatch(r'[a-f0-9]{32}', self.ledger.get('operation', '')):
                 raise InstallError('Corrupt operation identity')
@@ -434,7 +409,7 @@ class Deployment:
             if not isinstance(imported, dict) or imports([k + '=' + v for k, v in imported.items()], bootstrap) != imported:
                 raise InstallError('Corrupt saved import identities')
             if self.ledger['phase'] != 'planning' and not (self.ledger['phase'] == 'complete' and self.ledger.get('abandoned')):
-                if not re.fullmatch(r'[a-f0-9]{64}', self.ledger.get('plan_sha256', '')) or not re.fullmatch(r'\d{12}', self.ledger.get('provider_account', '')):
+                if not re.fullmatch(r'[a-f0-9]{64}', self.ledger.get('plan_sha256', '')) or not re.fullmatch(r'[a-f0-9]{32}', self.ledger.get('provider_account', '')):
                     raise InstallError('Corrupt plan/provider identity')
                 summary = self.ledger.get('summary')
                 if not isinstance(summary, list):
@@ -459,16 +434,8 @@ class Deployment:
         private_dir(self.workspace)
         self.tools.env['TF_DATA_DIR'] = str(self.workspace / '.tofu')
         source = self.artifact / 'infrastructure'
-        if self.bootstrap:
-            source /= 'bootstrap'
-            self.tools.env['TF_VAR_region'] = self.choices['region']
-            suffix = '-' + self.choices['environment']
-            if not self.choices['bucket'].endswith(suffix):
-                raise InstallError('Bootstrap bucket must end in -staging or -production; both environments are created')
-            self.tools.env['TF_VAR_bucket_prefix'] = self.choices['bucket'][:-len(suffix)]
-        else:
-            self.tools.env['TF_VAR_relay_directory'] = str(self.artifact / 'relay')
-        for name in ('main.tf', '.terraform.lock.hcl'):
+        self.tools.env['TF_VAR_relay_directory'] = str(self.artifact / 'relay')
+        for name in ('main.tf', 'encryption.tf', 'state.tf', '.terraform.lock.hcl'):
             embedded = HERE / (('bootstrap.tf' if name == 'main.tf' else 'bootstrap.lock.hcl') if self.bootstrap else name)
             if embedded.exists() and digest(source / name) != digest(embedded):
                 raise InstallError('Candidate provider module/lock differs from installed authoritative identity; use matching release')
@@ -479,8 +446,14 @@ class Deployment:
             spec = importlib.util.spec_from_file_location('live_state', HERE / 'live-state.py')
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            save(self.workspace / 'backend.json', module.config(self.choices['environment'], self.choices['bucket'], self.choices['region']))
+            save(self.workspace / 'backend.json', module.config(self.choices['environment'], self.choices['bucket'], self.choices['region'], self.choices['account_id']))
             args += ['-backend-config=' + str(self.workspace / 'backend.json')]
+        metadata = self.workspace / '.tofu' / 'terraform.tfstate'
+        if metadata.exists():
+            cached = private_read(metadata).get('backend', {}).get('config', {})
+            expected = module.config(self.choices['environment'], self.choices['bucket'], self.choices['region'], self.choices['account_id'])
+            if any(cached.get(k) != v for k, v in expected.items()):
+                raise InstallError('Unexpected/legacy backend cache; manual migration required')
         self.tools.tofu_run(self.workspace, *args)
         if self.ledger and 'imports' in self.ledger:
             save(self.workspace / 'approved-imports.tf.json', {'import': [
@@ -492,14 +465,19 @@ class Deployment:
             raise InstallError('Existing operation must be reviewed/applied or reconciled; refusing replacement')
         if requested_imports and not approved_imports:
             raise InstallError('Import requires explicit --approve-import; review exact plan before apply')
-        if self.bootstrap and not accept_cost:
-            raise InstallError('AWS bootstrap creates billable resources; explicit --accept-cost required for plan')
         if self.ledger and self.ledger['phase'] == 'complete':
             save(self.root / ('completed-' + self.ledger['operation'] + '.json'), self.ledger)
-        self.ledger = {'schema': 1, 'operation': uuid.uuid4().hex, 'binding': self.binding,
+        self.ledger = {'schema': 2, 'state_backend': 'r2-encrypted-v1', 'operation': uuid.uuid4().hex, 'binding': self.binding,
                        'phase': 'planning', 'imports': requested_imports, 'started': time.time(),
                        'cost_accepted': bool(accept_cost)}
         self.phase('planning')
+        if self.bootstrap_completion:
+            if self.choices['environment'] != 'production' or self.admission_path.exists() or self.admission_path.is_symlink():
+                raise InstallError('Bootstrap receipt already consumed or not production; explicit recovery required')
+            self.phase('planning', bootstrap_receipt_sha256=digest(self.bootstrap_completion))
+            self.tools.run([sys.executable, '-I', str(HERE / 'archive-live-state.py'), 'admit',
+                            '--bootstrap-completion', str(self.bootstrap_completion), '--admission-file', str(self.admission_path)])
+            self.tools.admission_args = ['--admission-file', str(self.admission_path)]
         provider_account = preflight(self.tools, self.choices, self.bootstrap)
         self.phase('planning', provider_account=provider_account)
         self.init()
@@ -508,7 +486,7 @@ class Deployment:
         save(import_file, {'import': [{'to': '${' + address + '}', 'id': value} for address, value in requested_imports.items()]})
         state = self.tools.tofu_run(self.workspace, 'state', 'list').stdout.decode().splitlines()
         if not self.bootstrap:
-            found = discover(self.tools, self.choices)
+            found = discover(self.tools, self.choices, state)
             conflicts = [address for address in found if address in requested_imports and requested_imports[address] != found[address]]
             if conflicts:
                 raise InstallError('Approved import ID does not match provider discovery: ' + ', '.join(conflicts))
@@ -524,23 +502,9 @@ class Deployment:
             if missing:
                 raise InstallError('Existing resources outside state: ' + json.dumps({k: found[k] for k in missing}, sort_keys=True) +
                                    '; select exact provider import IDs with --import and --approve-import (no duplication)')
-        else:
-            # HeadBucket is ambiguous on 403; never interpret unauthorized resources as absent.
-            for env in ('staging', 'production'):
-                bucket = self.tools.env['TF_VAR_bucket_prefix'] + '-' + env
-                answer = self.tools.run([self.tools.aws, 's3api', 'list-buckets', '--output', 'json'])
-                listed = json.loads(answer.stdout).get('Buckets')
-                if not isinstance(listed, list):
-                    raise InstallError('AWS bucket inventory unavailable')
-                address = f'aws_s3_bucket.state["{env}"]'
-                if any(item['Name'] == bucket for item in listed) and address not in state and address not in requested_imports:
-                    raise InstallError('Existing bootstrap bucket requires explicit approved import: ' + address)
-            policies = json.loads(self.tools.run([self.tools.aws, 'iam', 'list-policies', '--scope', 'Local', '--output', 'json']).stdout)
-            for env in ('staging', 'production'):
-                address = f'aws_iam_policy.state["{env}"]'
-                if any(p['PolicyName'] == 'bmux-live-state-' + env for p in policies.get('Policies', [])) and address not in state and address not in requested_imports:
-                    raise InstallError('Existing state policy requires explicit approved import: ' + address)
         plan_path = self.workspace / 'reviewed.plan'
+        self.tools.run([sys.executable, '-I', str(HERE / 'archive-live-state.py'), 'archive'])
+        self.tools.run([sys.executable, '-I', str(HERE / 'archive-live-state.py'), 'archive', *self.tools.admission_args])
         self.tools.tofu_run(self.workspace, 'plan', '-input=false', '-lock-timeout=5m', '-out=' + str(plan_path))
         os.chmod(plan_path, 0o600)
         sync_file(plan_path)
@@ -564,8 +528,6 @@ class Deployment:
 
     def apply(self, operation, accept_cost):
         self.exact(operation)
-        if self.bootstrap and not accept_cost:
-            raise InstallError('Explicit --accept-cost required again to apply AWS bootstrap')
         phase = self.ledger['phase']
         if phase == 'complete':
             if self.ledger.get('abandoned'):
@@ -575,20 +537,21 @@ class Deployment:
             raise InstallError('Prior mutation outcome ambiguous; use --reconcile exact operation, never blind reapply')
         if phase not in ('reviewed', 'applied', 'published'):
             raise InstallError('Review exact saved plan before applying')
+        if self.ledger.get('bootstrap_receipt_sha256') and self.ledger['phase'] == 'reviewed':
+            self.tools.admission_args = ['--admission-file', str(self.admission_path)]
         if preflight(self.tools, self.choices, self.bootstrap) != self.ledger['provider_account']:
-            raise InstallError('AWS account differs from planned authoritative identity')
+            raise InstallError('Cloudflare account differs from planned authoritative identity')
         self.init()
         if phase == 'reviewed':
             if digest(self.workspace / 'reviewed.plan') != self.ledger['plan_sha256']:
                 raise InstallError('Plan content differs from reviewed identity')
+            if self.ledger.get('bootstrap_receipt_sha256'):
+                self.tools.run([sys.executable, '-I', str(HERE / 'archive-live-state.py'), 'begin', *self.tools.admission_args])
             self.phase('applying')  # durable BEFORE spawn, even if spawn/timeout fails
             self.tools.tofu_run(self.workspace, 'apply', '-input=false', '-lock-timeout=5m', str(self.workspace / 'reviewed.plan'))
+            self.tools.admission_args = []
+            self.tools.run([sys.executable, '-I', str(HERE / 'archive-live-state.py'), 'archive'])
             self.phase('applied')
-        if self.bootstrap:
-            outputs = json.loads(self.tools.tofu_run(self.workspace, 'output', '-json').stdout)
-            self.phase('complete', outputs={'buckets': outputs['buckets']['value'],
-                                           'state_policy_arns': outputs['state_policy_arns']['value']})
-            return
         if self.ledger['phase'] == 'applied':
             self.phase('pages-uploading')
             self.tools.run([self.tools.node, str(self.artifact / 'tools/node_modules/wrangler/bin/wrangler.js'),
@@ -605,13 +568,14 @@ class Deployment:
         if self.ledger['phase'] != 'applying':
             raise InstallError('Only ambiguous OpenTofu apply can be auto-reconciled; Pages ambiguity needs explicit --ack-pages OP after public smoke')
         if preflight(self.tools, self.choices, self.bootstrap) != self.ledger['provider_account']:
-            raise InstallError('AWS account differs from ambiguous operation identity')
+            raise InstallError('Cloudflare account differs from ambiguous operation identity')
         self.init()
         # Never apply a reconciliation plan. Zero diff proves desired state, not a replay.
         result = self.tools.tofu_run(self.workspace, 'plan', '-input=false', '-lock-timeout=5m',
                                      '-detailed-exitcode', codes=(0, 2))
         if result.returncode != 0:
             raise InstallError('Provider state differs after ambiguous apply; inspect protected state and explicitly --abandon OP before a fresh reviewed plan')
+        self.tools.run([sys.executable, '-I', str(HERE / 'archive-live-state.py'), 'archive'])
         self.phase('applied')
 
     def abandon(self, operation):
@@ -621,31 +585,6 @@ class Deployment:
         # Preserve the old identity permanently; a fresh plan gets a new operation ID.
         save(self.root / ('abandoned-' + operation + '.json'), self.ledger)
         self.phase('complete', abandoned=True)
-
-    def attach_policy(self, operation, role, approved):
-        self.exact(operation)
-        if not self.bootstrap or self.ledger['phase'] != 'complete' or not approved:
-            raise InstallError('Bootstrap complete and --approve-policy-attachment required for state role attachment')
-        if not re.fullmatch(r'[A-Za-z0-9+=,.@_-]{1,64}', role):
-            raise InstallError('Invalid existing AWS role name')
-        if preflight(self.tools, self.choices, True) != self.ledger['provider_account']:
-            raise InstallError('AWS account differs from bootstrap identity; refusing policy attachment')
-        policy = self.ledger['outputs']['state_policy_arns'][self.choices['environment']]
-        if not re.fullmatch(r'arn:aws:iam::' + self.ledger['provider_account'] + r':policy/[A-Za-z0-9+=,.@_/-]{1,512}', policy):
-            raise InstallError('Corrupt bootstrap policy identity')
-        intent = {'role': role, 'policy': policy}
-        previous = self.ledger.get('policy_attachment')
-        if previous and previous != intent:
-            raise InstallError('Conflicting role/policy reuse of bootstrap operation')
-        self.phase('complete', policy_attachment=intent)
-        # AttachRolePolicy is idempotent; prove current state before retrying its exact identity.
-        attached = json.loads(self.tools.run([self.tools.aws, 'iam', 'list-attached-role-policies', '--role-name', role, '--output', 'json']).stdout)
-        if not any(p['PolicyArn'] == policy for p in attached.get('AttachedPolicies', [])):
-            self.tools.run([self.tools.aws, 'iam', 'attach-role-policy', '--role-name', role, '--policy-arn', policy])
-        attached = json.loads(self.tools.run([self.tools.aws, 'iam', 'list-attached-role-policies', '--role-name', role, '--output', 'json']).stdout)
-        if not any(p['PolicyArn'] == policy for p in attached.get('AttachedPolicies', [])):
-            raise InstallError('State policy attachment not confirmed; retry exact bootstrap identity')
-        self.phase('complete', policy_attachment_confirmed=True)
 
     def ack_pages(self, operation):
         self.exact(operation)
@@ -751,7 +690,7 @@ def guided_operation(deployment, requested_imports, approved_imports=False, acce
         raise InstallError('Interrupted mutation requires explicit reconciliation; operation ' + deployment.ledger['operation'])
     if not deployment.ledger or deployment.ledger['phase'] in ('planning', 'complete'):
         if deployment.bootstrap:
-            accepted_cost = accepted_cost or input('AWS bootstrap creates billable resources. Type ACCEPT COST to plan: ') == 'ACCEPT COST'
+            accepted_cost = accepted_cost or input('R2 bootstrap requires explicit provisioning. Type ACCEPT COST to plan: ') == 'ACCEPT COST'
         if input('Contact providers and create a read-only locked plan? Type PLAN: ') != 'PLAN':
             return False
         deployment.plan(requested_imports, approved_imports, accepted_cost)
@@ -779,7 +718,7 @@ def main(argv=None):
     parser.add_argument('--default-artifact', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--candidate-url', help='Explicit approved release archive HTTPS URL (saved without credentials)')
     parser.add_argument('--candidate-sha256', help='Independently approved release archive SHA-256')
-    parser.add_argument('--state-role', help='Existing AWS role to attach the bootstrap environment policy to; requires explicit --approve-policy-attachment')
+    parser.add_argument('--state-role', help='Rejected legacy AWS role option; manual migration required')
     parser.add_argument('--approve-policy-attachment', action='store_true')
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument('--setup', action='store_true')
@@ -790,7 +729,8 @@ def main(argv=None):
     actions.add_argument('--reconcile', metavar='OPERATION_ID')
     actions.add_argument('--abandon', metavar='OPERATION_ID')
     actions.add_argument('--ack-pages', metavar='OPERATION_ID')
-    parser.add_argument('--bootstrap', action='store_true', help='Authoritative AWS state bucket bootstrap, separate operation ledger')
+    parser.add_argument('--bootstrap-completion', type=Path, help='Exact private confirmed-new-bucket receipt for one-shot first production plan')
+    parser.add_argument('--bootstrap', action='store_true', help='Rejected legacy bootstrap; use provision-live-state.py for explicit R2 provisioning')
     parser.add_argument('--accept-cost', action='store_true')
     parser.add_argument('--import', dest='imports', action='append', default=[])
     parser.add_argument('--approve-import', action='store_true')
@@ -804,6 +744,8 @@ def main(argv=None):
         raise InstallError('Choose either explicit --artifact or approved release URL/digest, not both')
     if not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', args.profile):
         raise InstallError('Profile name must be 1-64 letters, digits, underscore or hyphen')
+    if args.bootstrap or args.state_role or args.approve_policy_attachment:
+        raise InstallError('Legacy AWS bootstrap/role options rejected; use provision-live-state.py for R2')
     os.umask(0o077)
     root = args.state_dir.absolute() / args.profile
     with lock(root):
@@ -830,7 +772,7 @@ def main(argv=None):
                 validate_profile(private_read(profile_path))
             else:
                 raise InstallError('Run deploy --setup to save account/domain/state choices; doctor never contacts providers')
-            print('Local packaging/tools/profile valid. Provider auth, delegated zone, DO entitlement, state IAM access and billing remain online plan preflight gates.')
+            print('Local packaging/tools/profile valid. Provider auth, delegated zone, DO entitlement, R2 state access and billing remain online plan preflight gates.')
             return 0
         if not profile_path.exists():
             if not interactive:
@@ -849,30 +791,16 @@ def main(argv=None):
         if args.artifact is None:
             raise InstallError('No installed candidate or approved release identity; run guided deploy to select a trusted immutable release')
         choices = validate_profile(private_read(profile_path))
-        no_action = not any((args.plan, args.review, args.apply, args.reconcile, args.abandon, args.ack_pages))
-        if interactive and no_action and not args.bootstrap and not (root / 'ledger.json').exists():
-            if input('Need new AWS state buckets/policies first? Type BOOTSTRAP, or Enter to use existing protected backend: ') == 'BOOTSTRAP':
-                print('Bootstrap uses your separately authenticated AWS administrator identity (AWS SSO/profile or private temporary environment). No long-lived access keys are created or saved.')
-                bootstrap_env = environment(choices, True, True)
-                bootstrap = Deployment(root, args.artifact, choices, True, Tools(args.artifact, bootstrap_env))
-                if not guided_operation(bootstrap, {}):
-                    return 0
-                role = input('Existing AWS state role name to attach the environment-scoped policy (Enter to skip): ').strip()
-                if role:
-                    print('Policy: ' + bootstrap.ledger['outputs']['state_policy_arns'][choices['environment']])
-                    if input('Approve attachment to ' + role + '? Type ATTACH: ') == 'ATTACH':
-                        bootstrap.attach_policy(bootstrap.ledger['operation'], role, True)
-                print('State bootstrap completed. Supply the selected environment identity credentials privately for live plan; keep bootstrap local state backed up securely.')
         env = environment(choices, args.bootstrap, interactive) if (args.plan or args.apply or args.reconcile or args.ack_pages or (interactive and not (args.review or args.abandon))) else dict(os.environ)
-        deployment = Deployment(root, args.artifact, choices, args.bootstrap, Tools(args.artifact, env))
+        if args.bootstrap_completion and not args.plan:
+            raise InstallError('--bootstrap-completion is only admitted by an explicit first --plan')
+        deployment = Deployment(root, args.artifact, choices, args.bootstrap, Tools(args.artifact, env), args.bootstrap_completion)
         if args.plan:
             print('Operation ' + deployment.plan(imports(args.imports, args.bootstrap), args.approve_import, args.accept_cost) + '; run --review then --apply OPERATION_ID')
         elif args.review:
             print(json.dumps(deployment.review(), indent=2))
         elif args.apply:
             deployment.apply(args.apply, args.accept_cost)
-            if args.state_role:
-                deployment.attach_policy(args.apply, args.state_role, args.approve_policy_attachment)
             print('Deployment phase: ' + deployment.ledger['phase'])
         elif args.reconcile:
             deployment.reconcile(args.reconcile)

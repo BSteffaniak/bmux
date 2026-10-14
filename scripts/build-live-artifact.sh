@@ -49,9 +49,7 @@ cp infra/live-terraform/tools/package*.json "$OUTPUT/tools/"
 git rev-parse HEAD > "$OUTPUT/REVISION"
 # Lock and infrastructure are part of the same immutable candidate as code/assets.
 mkdir "$OUTPUT/infrastructure"
-cp infra/live-terraform/main.tf infra/live-terraform/.terraform.lock.hcl "$OUTPUT/infrastructure/"
-mkdir "$OUTPUT/infrastructure/bootstrap"
-cp infra/live-terraform/bootstrap/main.tf infra/live-terraform/bootstrap/.terraform.lock.hcl "$OUTPUT/infrastructure/bootstrap/"
+cp infra/live-terraform/*.tf infra/live-terraform/.terraform.lock.hcl "$OUTPUT/infrastructure/"
 # Normalize npm-created executable links to ordinary inventory-covered files.
 python3 - "$OUTPUT/tools" <<'PY'
 from pathlib import Path
@@ -67,5 +65,7 @@ for path in root.rglob('*'):
         path.write_bytes(payload)
 PY
 python3 scripts/test-live-install.py
+# The inventory file is explicitly excluded from find's input set.
+# shellcheck disable=SC2094
 (cd "$OUTPUT" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 echo "Immutable live candidate: $OUTPUT"

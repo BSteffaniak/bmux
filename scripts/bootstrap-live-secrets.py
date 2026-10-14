@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
-"""Bootstrap BMUX Production secrets without displaying credentials.
+"""Bootstrap scoped Cloudflare/R2 secrets without displaying credentials.
 
-Normal: --repo OWNER/REPO --publisher-key-file /PRIVATE/KEY (securely create if absent).
-Optional guided AWS: --bootstrap-state --configure-oidc --state-account-id EXPECTED12
---state-dir /PRIVATE/STATE; region us-east-1, deterministic account bucket, bmux-live-production role.
-Existing LIVE_STATE_BUCKET is authoritative; conflicts reject. Requires local AWS bootstrap
-credentials and separate CLOUDFLARE_PROVISION_TOKEN; never reuses another project's token.
-Preconfigure Production and production-approval with master-only custom branch policies;
-only production-approval needs reviewers/no admin bypass; self-review is permitted.
-Environment protections are inspected only. OIDC customization is repo-wide and explicit.
---state-mode plan/review performs no partial secret installation; apply requires exact
---state-operation plus --accept-cost. --dry-run makes zero subprocess/provider requests.
-Advanced --input-env retains supplied values/static backend credentials.
+--bootstrap-state --state-dir /PRIVATE/STATE --state-mode plan/review/apply/reconcile
+binds approval to an exact --state-operation; apply also requires --accept-cost.
+Existing buckets require --approve-import. No AWS/OIDC bootstrap or automatic migration.
+Plan/review never install partial secrets. --dry-run is fully provider-free.
 """
 import argparse
 import hashlib
@@ -35,11 +28,9 @@ class BootstrapError(Exception):
     """Sanitized error; provider diagnostics are never printed."""
 
 
-LEGACY_SECRET_NAMES = (
+NORMAL_SECRET_NAMES = (
     'CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_ZONE_ID',
     'LIVE_HOSTNAME', 'LIVE_PAGES_PROJECT', 'LIVE_PUBLISHER_KEY_SHA256',
-    'LIVE_STATE_BUCKET', 'LIVE_STATE_REGION', 'LIVE_STATE_ACCESS_KEY_ID',
-    'LIVE_STATE_SECRET_ACCESS_KEY',
 )
 
 
@@ -153,14 +144,14 @@ def token_policy(account, zone, permission_groups):
     policies = []
     for scope, resource, names in (
         ('com.cloudflare.api.account', f'com.cloudflare.api.account.{account}',
-         ('Workers Scripts Write', 'Pages Write')),
+         ('Workers Scripts Write', 'Pages Write', 'Workers R2 Storage Write')),
         ('com.cloudflare.api.account.zone', f'com.cloudflare.api.account.zone.{zone}',
          ('Workers Routes Write', 'DNS Write', 'Zone Read')),
     ):
         ids = []
         for name in names:
             matches = [g for g in permission_groups if g.get('name') == name and scope in g.get('scopes', [])]
-            if len(matches) != 1:
+            if len(matches) != 1 or not isinstance(matches[0].get('id'), str) or not re.fullmatch(r'[a-f0-9]{32}', matches[0]['id']):
                 raise BootstrapError('Cannot uniquely resolve required scoped Cloudflare permission')
             ids.append({'id': matches[0]['id']})
         policies.append({'effect': 'allow', 'resources': {resource: '*'}, 'permission_groups': ids})
@@ -204,7 +195,7 @@ def verify_environment(repo, environment, run=command):
 
 def provision_env(args, run=command, environ=None):
     environ = os.environ if environ is None else environ
-    selected = args.only or list(LEGACY_SECRET_NAMES)
+    selected = args.only or list(SECRET_NAMES)
     if len(selected) != len(set(selected)):
         raise BootstrapError('Duplicate --only selections rejected')
     if args.rotate and not args.only:
@@ -220,6 +211,12 @@ def provision_env(args, run=command, environ=None):
     existing = {s['name'] for s in json.loads(run([
         'gh', 'secret', 'list', '--repo', args.repo, '--env', args.environment, '--json', 'name']))}
     pending = [name for name in selected if args.rotate or name not in existing]
+    if any(name in existing or environ.get(name) for name in ('LIVE_STATE_ROLE_ARN', 'LIVE_STATE_ACCESS_KEY_ID', 'LIVE_STATE_SECRET_ACCESS_KEY')):
+        raise BootstrapError('Legacy AWS backend configured; manual state migration required')
+    if environ.get('LIVE_STATE_REGION', 'auto') != 'auto':
+        raise BootstrapError('Legacy backend region configured; manual migration required')
+    if args.rotate and 'TOFU_STATE_ENCRYPTION_PASSPHRASE' in selected:
+        raise BootstrapError('Passphrase rotation requires explicit encrypted state migration')
     values = {}
     # Validate every input before any mutation; publisher key never goes to GitHub.
     for name in pending:
@@ -234,6 +231,23 @@ def provision_env(args, run=command, environ=None):
         values[name] = value
     if args.rotate and not args.only:
         raise BootstrapError('Rotation requires explicit --only selections; no blanket rotation')
+    # Validate coupled credentials and backend choices before any mutation.
+    pair = [n for n in ('R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY') if n in pending]
+    if pair and len(pair) != 2:
+        raise BootstrapError('R2 credentials must be installed/rotated together')
+    if any(n in pending for n in STATE_SECRET_NAMES):
+        account = environ.get('CLOUDFLARE_ACCOUNT_ID')
+        bucket = environ.get('LIVE_STATE_BUCKET')
+        if not isinstance(account, str) or not re.fullmatch(r'[a-f0-9]{32}', account):
+            raise BootstrapError('R2 state inputs require exact Cloudflare account identity')
+        if not isinstance(bucket, str) or not re.fullmatch(r'[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', bucket):
+            raise BootstrapError('R2 state inputs require selected bucket identity')
+        for name, pattern in (('R2_STATE_ACCESS_KEY_ID', r'[a-f0-9]{32}'),
+                              ('R2_STATE_SECRET_ACCESS_KEY', r'[a-f0-9]{64}')):
+            if name in values and not re.fullmatch(pattern, values[name]):
+                raise BootstrapError('Invalid R2 S3 credential format')
+        if 'TOFU_STATE_ENCRYPTION_PASSPHRASE' in values and len(values['TOFU_STATE_ENCRYPTION_PASSPHRASE']) < 32:
+            raise BootstrapError('State encryption passphrase must be at least 32 characters')
     for name, value in values.items():
         run(['gh', 'secret', 'set', name, '--repo', args.repo, '--env', args.environment], value)
         print(f'Set {name} in selected environment')
@@ -247,10 +261,9 @@ def provision_env(args, run=command, environ=None):
 
 # Normal bootstrap creates only project-scoped credentials. Backend credentials belong
 # to the separate explicitly authorized state provisioner.
-NORMAL_SECRET_NAMES = LEGACY_SECRET_NAMES[:6]
-STATE_SECRET_NAMES = ('LIVE_STATE_BUCKET', 'LIVE_STATE_REGION', 'LIVE_STATE_ROLE_ARN')
+STATE_SECRET_NAMES = ('LIVE_STATE_BUCKET', 'LIVE_STATE_REGION', 'R2_STATE_ACCESS_KEY_ID',
+                      'R2_STATE_SECRET_ACCESS_KEY', 'TOFU_STATE_ENCRYPTION_PASSPHRASE')
 SECRET_NAMES = NORMAL_SECRET_NAMES + STATE_SECRET_NAMES
-OIDC_CLAIMS = ['repo', 'context', 'ref']
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -331,7 +344,7 @@ def discover(cf, args):
     account_id, zone_id = zone['account']['id'], zone['id']
     if not all(re.fullmatch('[a-fA-F0-9]{32}', value) for value in (account_id, zone_id)):
         raise BootstrapError('Invalid discovered Cloudflare identity')
-    return account_id, zone_id
+    return account_id.lower(), zone_id.lower()
 
 
 def pages_project(cf, account, name):
@@ -348,133 +361,112 @@ def pages_project(cf, account, name):
     return name
 
 
-def verify_oidc(repo, run, configure=False):
-    endpoint = f'repos/{repo}/actions/oidc/customization/sub'
-    current = json.loads(run(['gh', 'api', endpoint]))
-    desired = {'use_default': False, 'include_claim_keys': OIDC_CLAIMS}
-    if not isinstance(current, dict) or not isinstance(current.get('use_default'), bool):
-        raise BootstrapError('Invalid existing OIDC template; no modification authorized')
-    if current.get('use_default') is False:
-        if current.get('include_claim_keys') != OIDC_CLAIMS:
-            raise BootstrapError('Existing custom OIDC subject differs; do not overwrite other consumers; explicit migration required')
-        return
-    if not configure:
-        raise BootstrapError('OIDC subject template needed; --configure-oidc explicitly authorizes repo-wide change affecting existing consumers')
-    print('WARNING: configuring repo-wide OIDC subject template changes all existing OIDC consumers')
-    run(['gh', 'api', '--method', 'PUT', endpoint, '--input', '-'], json.dumps(desired))
-    verified = json.loads(run(['gh', 'api', endpoint]))
-    if verified.get('use_default') is not False or verified.get('include_claim_keys') != OIDC_CLAIMS:
-        raise BootstrapError('OIDC template write not verified; inspect before retry')
-
-
 def validate_state_result(result, args, operation, phases, allow_empty_operation=False):
-    allowed = {'schema', 'operation', 'phase', 'backend', 'role_arn', 'github_oidc', 'resources'}
-    if not isinstance(result, dict) or set(result) - allowed or not (allow_empty_operation and operation is None or isinstance(operation, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', operation)):
-        raise BootstrapError('Invalid public backend response schema')
-    resources = result.get('resources', [])
-    if not isinstance(resources, list) or len(resources) > 64:
+    backend = result.get('backend') if isinstance(result, dict) else None
+    expected = dict(bucket=args.state_bucket, region='auto', key='bmux/live/production/terraform.tfstate',
+                    endpoint=f'https://{args.state_account_id}.r2.cloudflarestorage.com', use_lockfile=True, encrypt=True)
+    if (not isinstance(result, dict) or set(result) != {'schema', 'operation', 'phase', 'backend', 'resources'}
+            or result['schema'] != 2 or result['operation'] != operation or result['phase'] not in phases
+            or backend != expected or not (allow_empty_operation and operation is None
+                or isinstance(operation, str) and re.fullmatch(r'[a-f0-9]{32}', operation))):
+        raise BootstrapError('Invalid/incompatible R2 backend public response')
+    rows = result['resources']
+    if rows not in ([], [{'address': 'cloudflare_r2_bucket.state', 'actions': ['create'], 'import': False}],
+                    [{'address': 'cloudflare_r2_bucket.state', 'actions': ['no-op'], 'import': True}]):
         raise BootstrapError('Invalid backend resource review')
-    for item in resources:
-        if (not isinstance(item, dict) or set(item) != {'address', 'actions', 'import'}
-                or not re.fullmatch(r'[A-Za-z0-9_.\[\]\"-]{1,256}', item.get('address', ''))
-                or not isinstance(item.get('import'), bool)
-                or not isinstance(item.get('actions'), list)
-                or not item['actions'] or 'delete' in item['actions']
-                or any(action not in ('no-op', 'read', 'create', 'update') for action in item['actions'])):
-            raise BootstrapError('Invalid backend resource review')
-    expected_subject = f'repo:{args.repo}:environment:Production:ref:refs/heads/master'
-    backend = result.get('backend', {})
-    if not isinstance(backend, dict) or set(backend) != {'bucket', 'region', 'key', 'use_lockfile', 'encrypt'} or not isinstance(result.get('github_oidc'), dict) or set(result['github_oidc']) != {'include_claim_keys', 'subject'}:
-        raise BootstrapError('Invalid backend public metadata shape')
-    if (result.get('schema') != 1 or result.get('operation') != operation
-            or result.get('phase') not in phases
-            or backend.get('bucket') != args.state_bucket or backend.get('region') != args.state_region
-            or backend.get('key') != 'bmux/live/production/terraform.tfstate'
-            or backend.get('encrypt') is not True or backend.get('use_lockfile') is not True
-            or result.get('github_oidc', {}).get('subject') != expected_subject
-            or result.get('github_oidc', {}).get('include_claim_keys') != OIDC_CLAIMS
-            or result.get('role_arn') != f'arn:aws:iam::{args.state_account_id}:role/{args.state_role}'):
-        raise BootstrapError('State result does not match approved backend/OIDC identity; no secrets installed')
 
 
-def state_bootstrap(args, run, pending, environ=None):
-    environ = os.environ if environ is None else environ
-    if not getattr(args, 'bootstrap_state', False) or not pending:
+def state_bootstrap(args, run, pending, environ):
+    if not pending and not getattr(args, 'bootstrap_state', False):
         return {}
-    if args.environment != 'Production':
-        raise BootstrapError('OIDC backend requires exact Production environment subject')
-    args.state_region = getattr(args, 'state_region', None) or 'us-east-1'
-    configured_bucket = environ.get('LIVE_STATE_BUCKET')
-    if configured_bucket and args.state_bucket and configured_bucket != args.state_bucket:
-        raise BootstrapError('Explicit bucket conflicts with authoritative LIVE_STATE_BUCKET')
-    args.state_bucket = args.state_bucket or configured_bucket or f'bmux-live-state-{args.state_account_id}-production'
-    args.state_role = args.state_role or 'bmux-live-production'
-    required = ('state_region', 'state_bucket', 'state_role', 'state_account_id', 'state_dir')
-    if any(not getattr(args, key, None) for key in required):
-        raise BootstrapError('--bootstrap-state requires --state-region/bucket/role/account-id/dir')
-    if not args.state_dir.is_absolute() or not re.fullmatch(r'[0-9]{12}', args.state_account_id):
-        raise BootstrapError('Backend requires private absolute --state-dir and expected 12-digit account')
-    base = [sys.executable, str(Path(__file__).with_name('provision-live-state.py')),
-            '--repo', args.repo, '--region', args.state_region, '--bucket', args.state_bucket,
-            '--role', args.state_role, '--account-id', args.state_account_id,
+    configured = environ.get('LIVE_STATE_BUCKET')
+    if args.state_bucket and configured and args.state_bucket != configured:
+        raise BootstrapError('Configured bucket differs; refusing competing backend')
+    args.state_bucket = args.state_bucket or configured or 'bmux-opentofu-state'
+    if args.state_region != 'auto' or environ.get('LIVE_STATE_REGION', 'auto') != 'auto':
+        raise BootstrapError('Legacy AWS region configured; manual state migration required')
+    if not args.state_dir or not args.state_dir.is_absolute():
+        raise BootstrapError('--bootstrap-state requires absolute private --state-dir')
+    base = [sys.executable, str(Path(__file__).with_name('provision-live-state.py')), '--repo', args.repo,
+            '--region', 'auto', '--bucket', args.state_bucket, '--account-id', args.state_account_id,
             '--state-dir', str(args.state_dir)]
-    if getattr(args, 'approve_import', False):
+    if args.approve_import:
         base.append('--approve-import')
-    operation = getattr(args, 'state_operation', None)
-    mode = getattr(args, 'state_mode', 'guided')
-    if mode in ('apply', 'review', 'reconcile') and not operation:
+    if getattr(args, 'state_completion_file', None):
+        base.extend(['--completion-file', str(args.state_completion_file)])
+    completion_base = base
+    if '--completion-file' in base:
+        i = base.index('--completion-file')
+        base = base[:i] + base[i + 2:]
+    mode, operation = args.state_mode, args.state_operation
+    if mode in ('review', 'apply', 'reconcile') and not operation:
         raise BootstrapError('State review/apply/reconcile requires exact --state-operation')
-    if mode == 'apply' and not getattr(args, 'accept_cost', False):
+    if mode == 'apply' and not args.accept_cost:
         raise BootstrapError('State apply requires explicit --accept-cost')
-    if mode == 'guided' and (not sys.stdin.isatty() or not sys.stderr.isatty()):
-        raise BootstrapError('Guided backend setup requires TTY; use --state-mode plan then exact apply')
-    dry = json.loads(run(base))
-    validate_state_result(dry, args, dry.get('operation'), ('dryrun',), allow_empty_operation=True)
-    if mode != 'review':
-        verify_oidc(args.repo, run, getattr(args, 'configure_oidc', False))
-    if mode == 'guided':
-        if not sys.stdin.isatty() or not sys.stderr.isatty():
-            raise BootstrapError('Guided backend setup requires TTY; use explicit --state-mode plan then apply --state-operation ID --accept-cost')
-        planned = json.loads(run(base + ['--plan']))
-        operation = planned.get('operation')
-        if planned.get('schema') != 1 or not isinstance(operation, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', operation):
-            raise BootstrapError('Invalid backend plan identity; output suppressed')
-        reviewed = json.loads(run(base + ['--review']))
-        if reviewed.get('schema') != 1 or reviewed.get('operation') != operation:
-            raise BootstrapError('Backend review does not match planned operation')
-        validate_state_result(reviewed, args, operation, ('planned', 'complete'))
-        print(json.dumps({key: reviewed[key] for key in ('schema', 'operation', 'phase', 'backend', 'role_arn', 'github_oidc', 'resources')}))
-        print('Backend apply creates billable infrastructure. Review above; type exact operation ID to approve cost and apply:', file=sys.stderr)
-        confirmed = sys.stdin.readline(130).strip()
-        if confirmed != operation:
-            raise BootstrapError('Backend apply cancelled; no mutation authorized')
-        mode = 'apply'
-        args.accept_cost = True
-    flags = ['--' + mode] + ([operation] if mode in ('apply', 'reconcile') else [])
-    if mode == 'apply':
-        if not getattr(args, 'accept_cost', False):
-            raise BootstrapError('State apply requires explicit --accept-cost')
-        # Read exact retained plan first; apply only the same operation identity.
-        reviewed = json.loads(run(base + ['--review']))
-        validate_state_result(reviewed, args, operation, ('planned', 'complete'))
-        flags.append('--accept-cost')
-    result = json.loads(run(base + flags))
+    fresh_backend = False
+    if mode == 'plan':
+        result = json.loads(run(base + ['--plan']))
+        validate_state_result(result, args, result.get('operation'), ('planned',))
+    else:
+        review_base = base
+        if getattr(args, 'state_completion_file', None) and mode == 'apply':
+            # Planned review must not try to emit a completion before apply.
+            i = base.index('--completion-file')
+            review_base = base[:i] + base[i + 2:]
+        reviewed = json.loads(run(review_base + ['--review', operation])) if mode != 'reconcile' else None
+        if reviewed:
+            validate_state_result(reviewed, args, operation, ('planned', 'complete'))
+        flags = ['--' + mode, operation]
+        if mode == 'apply':
+            flags.append('--accept-cost')
+        if mode == 'apply' and reviewed['phase'] == 'complete':
+            result = json.loads(run(base + ['--review', operation])) if getattr(args, 'state_completion_file', None) else reviewed
+        else:
+            result = reviewed if mode == 'review' else json.loads(run(base + flags))
+            fresh_backend = (mode == 'apply' and reviewed['phase'] == 'planned'
+                             and reviewed['resources'] == [{'address': 'cloudflare_r2_bucket.state', 'actions': ['create'], 'import': False}])
+        validate_state_result(result, args, operation, ('planned', 'complete') if mode == 'review' else ('complete',))
+    # Public metadata only; no credentials are ever returned by the companion.
+    print(json.dumps(result, sort_keys=True))
     if mode in ('plan', 'review'):
-        validate_state_result(result, args, result.get('operation') if mode == 'plan' else operation, ('planned', 'complete'))
-        print(json.dumps(result))
-    if mode not in ('apply', 'reconcile'):
-        print('State plan/review completed; review exact operation and explicitly --state-mode apply --state-operation ID --accept-cost')
         return {}
-    validate_state_result(result, args, operation, ('complete',))
-    backend = result['backend']
-    return {'LIVE_STATE_BUCKET': backend['bucket'], 'LIVE_STATE_REGION': backend['region'],
-            'LIVE_STATE_ROLE_ARN': result['role_arn']}
+    if fresh_backend:
+        completion = getattr(args, 'state_completion_file', None) or args.state_dir / ('completion-' + operation + '.json')
+        receipt = json.loads(run(base + ['--review', operation, '--completion-file', str(completion)]))
+        validate_state_result(receipt, args, operation, ('complete',))
+        args._completion_file = completion
+    elif getattr(args, 'state_completion_file', None) and mode == 'review':
+        receipt = json.loads(run(completion_base + ['--review', operation]))
+        validate_state_result(receipt, args, operation, ('complete',))
+    return dict(LIVE_STATE_BUCKET=args.state_bucket, LIVE_STATE_REGION='auto', _fresh_backend=fresh_backend)
+
+
+def r2_token_policy(account, bucket, groups):
+    # Cloudflare documented R2 bucket object read/write scope, not account-admin.
+    matches = [g for g in groups if g.get('name') == 'Workers R2 Storage Bucket Item Write'
+               and 'com.cloudflare.edge.r2.bucket' in g.get('scopes', [])]
+    if len(matches) != 1 or not re.fullmatch(r'[a-f0-9]{32}', matches[0].get('id', '')):
+        raise BootstrapError('Missing/ambiguous bucket-scoped R2 object permission')
+    return [dict(effect='allow', resources={f'com.cloudflare.edge.r2.bucket.{account}_default_{bucket}': '*'},
+                 permission_groups=[dict(id=matches[0]['id'])])]
+
+
+def r2_credentials(cf, account, bucket):
+    policy = r2_token_policy(account, bucket, list(cf.items('/user/tokens/permission_groups')))
+    data = cf.request('POST', '/user/tokens', dict(name='bmux-live-production-state', policies=policy))
+    result = data.get('result', {})
+    key, value = result.get('id'), result.get('value')
+    if (not isinstance(key, str) or not re.fullmatch(r'[a-f0-9]{32}', key)
+            or not isinstance(value, str) or not 20 <= len(value) <= 1024 or any(c.isspace() for c in value)):
+        raise BootstrapError('Invalid R2 token result; output suppressed; inspect tokens before retry')
+    # https://developers.cloudflare.com/r2/api/tokens/ : Access key=token ID,
+    # secret key=SHA-256 of token value. Raw token is never retained or printed.
+    return dict(R2_STATE_ACCESS_KEY_ID=key, R2_STATE_SECRET_ACCESS_KEY=hashlib.sha256(value.encode()).hexdigest())
 
 
 def provision(args, run=command, environ=None, cloudflare=None):
     environ = os.environ if environ is None else environ
-    # Older direct API callers retain explicit environment-value behavior.
-    if getattr(args, 'input_env', not hasattr(args, 'zone')):
+    if getattr(args, 'input_env', False):
         return provision_env(args, run, environ)
     selected = args.only or list(NORMAL_SECRET_NAMES)
     if len(selected) != len(set(selected)):
@@ -495,13 +487,17 @@ def provision(args, run=command, environ=None, cloudflare=None):
     existing = {s['name'] for s in json.loads(run(['gh', 'secret', 'list', '--repo', args.repo,
                                                 '--env', args.environment, '--json', 'name']))}
     pending = [name for name in selected if args.rotate or name not in existing]
+    if any(name in existing or environ.get(name) for name in ('LIVE_STATE_ROLE_ARN', 'LIVE_STATE_ACCESS_KEY_ID', 'LIVE_STATE_SECRET_ACCESS_KEY')):
+        raise BootstrapError('Legacy AWS backend configured; manual state migration required')
+    if environ.get('LIVE_STATE_REGION', 'auto') != 'auto':
+        raise BootstrapError('Legacy backend region configured; manual migration required')
+    if args.rotate and 'TOFU_STATE_ENCRYPTION_PASSPHRASE' in selected:
+        raise BootstrapError('Passphrase rotation requires explicit encrypted state migration')
     explicit_state = getattr(args, 'bootstrap_state', False)
     if not pending and not explicit_state:
         for name in selected:
             print(f'Skipped existing {name}')
         return
-    if any(name in ('LIVE_STATE_ACCESS_KEY_ID', 'LIVE_STATE_SECRET_ACCESS_KEY') for name in pending):
-        raise BootstrapError('Static backend credentials require explicit --input-env; normal setup uses --bootstrap-state OIDC')
     hostname = getattr(args, 'hostname', None) or 'bmux.dev'
     project = getattr(args, 'pages_project', None) or 'bmux'
     zone_name = getattr(args, 'zone', 'bmux.dev')
@@ -514,15 +510,60 @@ def provision(args, run=command, environ=None, cloudflare=None):
     state_pending = [name for name in pending if name in STATE_SECRET_NAMES]
     if state_pending and not getattr(args, 'bootstrap_state', False):
         raise BootstrapError('State metadata requires --bootstrap-state or advanced --input-env')
-    state_values = state_bootstrap(args, run, list(STATE_SECRET_NAMES) if explicit_state else state_pending, environ)
-    if explicit_state and not state_values:
-        return  # Plan/review cannot create tokens, keys or install partial secrets.
+    if getattr(args, 'state_completion_file', None) and args.state_mode == 'plan':
+        raise BootstrapError('Completion file requires a completed exact operation, not plan')
+    pair = [n for n in ('R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY') if n in pending]
+    if pair and len(pair) != 2:
+        raise BootstrapError('R2 credentials must be installed/rotated together; select both with --only')
+    if getattr(args, 'approve_import', False) and 'TOFU_STATE_ENCRYPTION_PASSPHRASE' in pending:
+        raise BootstrapError('Existing backend requires original passphrase via --input-env, never replacement generation')
+    if args.state_mode == 'apply':
+        if 'TOFU_STATE_ENCRYPTION_PASSPHRASE' in pending:
+            passphrase = environ.get('TOFU_STATE_ENCRYPTION_PASSPHRASE')
+            if not isinstance(passphrase, str) or len(passphrase) < 32 or '\n' in passphrase or '\r' in passphrase:
+                raise BootstrapError('Before apply securely supply original/high-entropy TOFU_STATE_ENCRYPTION_PASSPHRASE; no provider mutation performed')
+        completion = getattr(args, 'state_completion_file', None) or args.state_dir / ('completion-' + str(args.state_operation) + '.json')
+        if not completion.is_absolute() or completion.exists() or completion.is_symlink():
+            raise BootstrapError('Completion file must be new explicit private absolute file before apply')
+        info = completion.parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise BootstrapError('Completion parent must be owned private directory before apply')
+    state_values = {}
+    cf = cloudflare
+    account = zone = None
+    if explicit_state or state_pending:
+        cf = cf or Cloudflare(environ)
+        account, zone = discover(cf, args)
+        configured_account = environ.get('CLOUDFLARE_ACCOUNT_ID')
+        if (args.state_account_id and args.state_account_id != account
+                or configured_account and configured_account != account):
+            raise BootstrapError('Discovered account differs from selected backend identity')
+        args.state_account_id = account
+        state_values = state_bootstrap(args, run, list(STATE_SECRET_NAMES), environ)
+        if not state_values:
+            return  # Plan/review cannot create tokens, keys or install partial secrets.
+        if 'TOFU_STATE_ENCRYPTION_PASSPHRASE' in pending:
+            passphrase = environ.get('TOFU_STATE_ENCRYPTION_PASSPHRASE')
+            if passphrase:
+                if len(passphrase) < 32 or '\n' in passphrase or '\r' in passphrase:
+                    raise BootstrapError('Invalid supplied original encryption passphrase')
+            else:
+                raise BootstrapError('Original encryption passphrase required; never generate replacement')
+            if len(passphrase) < 32 or '\n' in passphrase or '\r' in passphrase:
+                raise BootstrapError('Invalid original encryption passphrase')
+            state_values['TOFU_STATE_ENCRYPTION_PASSPHRASE'] = passphrase
+        credential_pending = [n for n in ('R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY') if n in pending]
+        if credential_pending:
+            if len(credential_pending) != 2:
+                raise BootstrapError('R2 credentials must be installed/rotated together; select both with --only')
+            state_values.update(r2_credentials(cf, account, args.state_bucket))
     values = {}
     if 'LIVE_PUBLISHER_KEY_SHA256' in pending:
         values['LIVE_PUBLISHER_KEY_SHA256'] = private_key_digest(args.publisher_key_file)
     if any(name in pending for name in ('CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_ZONE_ID', 'LIVE_PAGES_PROJECT')):
-        cf = cloudflare or Cloudflare(environ)
-        account, zone = discover(cf, args)
+        cf = cf or Cloudflare(environ)
+        if account is None:
+            account, zone = discover(cf, args)
         if 'LIVE_PAGES_PROJECT' in pending:
             values['LIVE_PAGES_PROJECT'] = pages_project(cf, account, project)
         if 'CLOUDFLARE_ACCOUNT_ID' in pending:
@@ -547,7 +588,7 @@ def provision(args, run=command, environ=None, cloudflare=None):
     values.update({key: value for key, value in state_values.items() if key in pending})
     # Plan/review intentionally leaves backend metadata pending until explicit apply.
     for name in pending:
-        if name not in values and name not in STATE_SECRET_NAMES:
+        if name not in values:
             raise BootstrapError('Selected secret has no validated input; no writes performed')
     for name in selected:
         if name in values:
@@ -566,20 +607,19 @@ def main():
     parser.add_argument('--zone', default='bmux.dev')
     parser.add_argument('--hostname')
     parser.add_argument('--pages-project', default='bmux')
-    parser.add_argument('--only', action='append', choices=tuple(dict.fromkeys(SECRET_NAMES + LEGACY_SECRET_NAMES)))
+    parser.add_argument('--only', action='append', choices=SECRET_NAMES)
     parser.add_argument('--publisher-key-file', type=Path)
     parser.add_argument('--rotate', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
-    parser.add_argument('--input-env', action='store_true', help='Advanced supplied environment values (legacy static backend keys)')
+    parser.add_argument('--input-env', action='store_true', help='Advanced supplied R2 environment values')
     parser.add_argument('--bootstrap-state', action='store_true')
-    parser.add_argument('--configure-oidc', action='store_true', help='Approve repo-wide OIDC subject customization; affects existing consumers')
-    parser.add_argument('--state-mode', choices=('guided', 'plan', 'review', 'apply', 'reconcile'), default='guided')
+    parser.add_argument('--state-mode', choices=('plan', 'review', 'apply', 'reconcile'), default='plan')
     parser.add_argument('--state-operation')
-    parser.add_argument('--state-region', default='us-east-1')
+    parser.add_argument('--state-region', default='auto')
     parser.add_argument('--state-bucket')
-    parser.add_argument('--state-role')
     parser.add_argument('--state-account-id')
     parser.add_argument('--state-dir', type=Path)
+    parser.add_argument('--state-completion-file', type=Path)
     parser.add_argument('--accept-cost', action='store_true')
     parser.add_argument('--approve-import', action='store_true')
     args = parser.parse_args()

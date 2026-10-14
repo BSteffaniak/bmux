@@ -9,6 +9,10 @@ const ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../../../scripts/live-install.py"),
     ),
     (
+        "configure-live-imports.py",
+        include_bytes!("../../../scripts/configure-live-imports.py"),
+    ),
+    (
         "live-state.py",
         include_bytes!("../../../scripts/live-state.py"),
     ),
@@ -25,12 +29,16 @@ const ASSETS: &[(&str, &[u8])] = &[
         include_bytes!("../../../infra/live-terraform/.terraform.lock.hcl"),
     ),
     (
-        "bootstrap.tf",
-        include_bytes!("../../../infra/live-terraform/bootstrap/main.tf"),
+        "state.tf",
+        include_bytes!("../../../infra/live-terraform/state.tf"),
     ),
     (
-        "bootstrap.lock.hcl",
-        include_bytes!("../../../infra/live-terraform/bootstrap/.terraform.lock.hcl"),
+        "encryption.tf",
+        include_bytes!("../../../infra/live-terraform/encryption.tf"),
+    ),
+    (
+        "archive-live-state.py",
+        include_bytes!("../../../scripts/archive-live-state.py"),
     ),
 ];
 

@@ -24,6 +24,7 @@ import urllib.request
 BASE = 'https://api.cloudflare.com/client/v4/'
 MAX_BYTES = 1024 * 1024
 MAX_PAGES = 20
+STATE_ADDRESSES = ('cloudflare_r2_bucket.state',)
 ADDRESSES = (
     'cloudflare_pages_project.live', 'cloudflare_pages_domain.live',
     'cloudflare_dns_record.live', 'cloudflare_worker.live',
@@ -49,8 +50,9 @@ def configuration(env):
     pages = checked(env.get('LIVE_PAGES_PROJECT'), r'[a-z0-9][a-z0-9-]{0,57}', 'Invalid Pages project name')
     environment = checked(env.get('LIVE_ENVIRONMENT'), r'staging|production', 'Invalid environment')
     token = checked(env.get('CLOUDFLARE_API_TOKEN'), r'[A-Za-z0-9_.-]{1,512}', 'Missing or invalid API token')
+    bucket = checked(env.get('LIVE_STATE_BUCKET'), r'[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', 'Invalid R2 state bucket')
     return dict(account=account, zone=zone, hostname=hostname, pages=pages,
-                worker='bmux-live-' + environment, token=token)
+                worker='bmux-live-' + environment, token=token, bucket=bucket)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -95,6 +97,10 @@ class Cloudflare:
         if not isinstance(answer, dict) or answer.get('success') is not True:
             raise ImportErrorSafe('Provider discovery rejected')
         items = answer.get('result')
+        if '/r2/buckets' in url and isinstance(items, dict):
+            if items.get('cursor'):
+                raise ImportErrorSafe('R2 inventory truncated; reconcile manually')
+            items = items.get('rules') if url.split('?')[0].endswith(('/lock', '/lifecycle')) else items.get('buckets')
         if not isinstance(items, list) or len(items) > 100 or any(not isinstance(item, dict) for item in items):
             raise ImportErrorSafe('Unsupported provider list response')
         info = answer.get('result_info')
@@ -139,6 +145,19 @@ def discover(api, config, managed):
     projects = api.listing(f'accounts/{account}/pages/projects')
     project = unique(projects, 'name', config['pages'])
     found = {}
+    bucket = unique(api.listing(f'accounts/{account}/r2/buckets'), 'name', config['bucket'])
+    if bucket is None:
+        raise ImportErrorSafe('Selected R2 backend bucket missing; finish explicit bootstrap first')
+    if bucket.get('storage_class') != 'Standard' or not isinstance(bucket.get('creation_date'), str):
+        raise ImportErrorSafe('Unsupported R2 backend bucket identity')
+    found[STATE_ADDRESSES[0]] = account + '/' + config['bucket'] + '/default'
+    # These two provider resources cannot be imported. Never overwrite a shared
+    # bucket policy while adopting the bucket into this stack.
+    for suffix, address in (('lock', 'cloudflare_r2_bucket_lock.state'),
+                            ('lifecycle', 'cloudflare_r2_bucket_lifecycle.state')):
+        rules = api.listing(f'accounts/{account}/r2/buckets/{config["bucket"]}/{suffix}')
+        if rules and address not in managed:
+            raise ImportErrorSafe('Existing unmanaged R2 policy requires explicit ownership reconciliation')
     if project is not None:
         found[ADDRESSES[0]] = account + '/' + config['pages']
     # Prove the hostname is not already attached to a different Pages project.
@@ -207,7 +226,7 @@ def managed_addresses(value):
 
 
 def reviewed_imports(value):
-    if not isinstance(value, dict) or set(value) - set(ADDRESSES):
+    if not isinstance(value, dict) or set(value) - set(ADDRESSES + STATE_ADDRESSES):
         raise ImportErrorSafe('Unsupported reviewed import addresses')
     for provider_id in value.values():
         checked(provider_id, r'[a-z0-9.-]+(?:/[a-z0-9.-]+){1,2}', 'Invalid reviewed provider identity')
@@ -226,6 +245,11 @@ def paths(artifact, output):
         text = main.read_text()
         if '5.17.0' not in text or any('"' + address.split('.')[0] + '" "live"' not in text for address in ADDRESSES):
             raise ImportErrorSafe('Artifact is not the supported Cloudflare 5.17 live module')
+        state = artifact / 'state.tf'
+        if (state.is_symlink() or not state.is_file() or state.stat().st_size > MAX_BYTES
+                or any('"' + kind + '" "state"' not in state.read_text()
+                       for kind in ('cloudflare_r2_bucket', 'cloudflare_r2_bucket_lock', 'cloudflare_r2_bucket_lifecycle'))):
+            raise ImportErrorSafe('Artifact lacks the supported R2 state authority')
         parent = output.parent
         info = parent.lstat()
         if parent.resolve(strict=True) != parent or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:

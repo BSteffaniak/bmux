@@ -20,7 +20,7 @@ spec.loader.exec_module(m)
 
 CHOICES = dict(environment='staging', account_id='a' * 32, zone_id='b' * 32,
                hostname='live.example.com', pages_project='bmux-staging', publisher_key_sha256='c' * 64,
-               bucket='bmux-test-state-staging', region='us-east-1')
+               bucket='bmux-test-state-staging', region='auto')
 SECRET = 'PRIVATE_REUSABLE_TOKEN_DO_NOT_PRINT'
 
 
@@ -29,7 +29,7 @@ def candidate(root):
     files = {'REVISION': 'd' * 40 + '\n', 'site/index.html': '<html>test fixture</html>',
              'relay/worker.js': '// offline fixture', 'tools/node_modules/wrangler/bin/wrangler.js': '// mock'}
     infra = Path(__file__).resolve().parent.parent / 'infra/live-terraform'
-    for name in ('main.tf', '.terraform.lock.hcl', 'bootstrap/main.tf', 'bootstrap/.terraform.lock.hcl'):
+    for name in ('main.tf', 'encryption.tf', 'state.tf', '.terraform.lock.hcl'):
         files['infrastructure/' + name] = (infra / name).read_text()
     for name, value in files.items():
         path = root / name
@@ -101,8 +101,8 @@ class InstallerTests(unittest.TestCase):
         m.private_dir(self.root)
         self.artifact = candidate(self.base / 'candidate')
         self.tools = MockTools(self.artifact)
-        self.preflight = patch.object(m, 'preflight', return_value='123456789012')
-        self.discovery = patch.object(m, 'discover', side_effect=lambda tools, c: tools.found)
+        self.preflight = patch.object(m, 'preflight', return_value=CHOICES['account_id'])
+        self.discovery = patch.object(m, 'discover', side_effect=lambda tools, c, managed=(): tools.found)
         self.preflight.start()
         self.discovery.start()
         self.addCleanup(self.preflight.stop)
@@ -209,7 +209,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(data['import'][0]['to'], '${cloudflare_worker.live}')
 
     def test_profile_secrets_rejected_and_no_secret_ledger(self):
-        profile = {'schema': 1, 'choices': CHOICES}
+        profile = {'schema': 2, 'choices': CHOICES}
         m.validate_profile(profile)
         with self.assertRaises(m.InstallError):
             m.validate_profile(profile | {'api_token': SECRET})
@@ -224,7 +224,7 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaises(m.InstallError):
             self.deploy()
         with self.assertRaises(m.InstallError):
-            m.validate_profile({'schema': 2, 'choices': CHOICES})
+            m.validate_profile({'schema': 1, 'choices': CHOICES})
 
     def test_private_files_and_symlinks_rejected(self):
         file = self.root / 'public.json'
@@ -265,22 +265,39 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn('AWS_SESSION_TOKEN', result)
         self.assertEqual(result['AWS_ACCESS_KEY_ID'], SECRET)
 
-    def test_bootstrap_cost_and_separate_ledger_and_role_attachment(self):
-        d = self.deploy(True)
+    def test_bootstrap_legacy_rejected(self):
         with self.assertRaises(m.InstallError):
-            d.plan({}, False, False)
-        operation = d.plan({}, False, True)
-        d.review()
-        with self.assertRaises(m.InstallError):
-            d.apply(operation, False)
-        d.apply(operation, True)
-        self.assertTrue((self.root / 'bootstrap-ledger.json').exists())
-        self.assertFalse((self.root / 'ledger.json').exists())
-        with self.assertRaises(m.InstallError):
-            d.attach_policy(operation, 'existing-role', False)
-        d.attach_policy(operation, 'existing-role', True)
-        d.attach_policy(operation, 'existing-role', True)
-        self.assertEqual(sum('attach-role-policy' in c for c in self.tools.calls), 1)
+            self.deploy(True)
+
+    def test_bootstrap_completion_bound_and_fenced_before_apply(self):
+        receipt = self.root / 'completion.json'
+        receipt.write_text('{"offline": "receipt validated by archive subprocess"}')
+        receipt.chmod(0o600)
+        choices = dict(CHOICES, environment='production')
+        deployment = m.Deployment(self.root, self.artifact, choices, False, self.tools, receipt)
+        operation = deployment.plan({}, False, False)
+        self.assertEqual(deployment.ledger['bootstrap_receipt_sha256'], m.digest(receipt))
+        self.assertTrue(any('admit' in args for args in self.tools.calls))
+        deployment.review()
+        deployment.apply(operation, False)
+        begin = next(i for i, args in enumerate(self.tools.calls) if 'begin' in args)
+        apply = next(i for i, args in enumerate(self.tools.calls) if args[0] == 'apply')
+        self.assertLess(begin, apply)
+        self.assertEqual(deployment.ledger['phase'], 'complete')
+
+    def test_r2_inventory_shapes_and_cursor_fail_closed(self):
+        tools = m.Tools(self.artifact, {})
+        row = {'name': CHOICES['bucket']}
+        with patch.object(tools, 'cf', return_value={'result': {'buckets': [row]}}):
+            self.assertEqual(tools.cf_list('accounts/id/r2/buckets'), [row])
+        with patch.object(tools, 'cf', return_value={'result': {'rules': []}}):
+            self.assertEqual(tools.cf_list('accounts/id/r2/buckets/name/lock'), [])
+            self.assertEqual(tools.cf_list('accounts/id/r2/buckets/name/lifecycle'), [])
+        for value in ({'result': {'buckets': [], 'cursor': 'more'}},
+                      {'result': {'buckets': []}, 'result_info': {'cursor': 'more'}}):
+            with patch.object(tools, 'cf', return_value=value):
+                with self.assertRaises(m.InstallError):
+                    tools.cf_list('accounts/id/r2/buckets')
 
     def test_provider_account_changed_rejects_apply(self):
         d, operation = self.reviewed()
@@ -347,7 +364,7 @@ class InstallerTests(unittest.TestCase):
     def interactive_main(self, responses):
         root = self.root / 'default'
         m.private_dir(root)
-        m.save(root / 'profile.json', {'schema': 1, 'choices': CHOICES})
+        m.save(root / 'profile.json', {'schema': 2, 'choices': CHOICES})
         self.addCleanup(lambda: None)
         def factory(artifact, env):
             self.tools.env = env
@@ -371,34 +388,18 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(sum(args[0] == 'apply' for args in self.tools.calls), 1)
 
     def test_interactive_cancel_after_review_retains_plan_no_apply(self):
-        self.assertEqual(self.interactive_main(['', 'PLAN', 'cancel']), 0)
+        self.assertEqual(self.interactive_main(['PLAN', 'cancel']), 0)
         self.assertEqual(m.private_read(self.root / 'default/ledger.json')['phase'], 'reviewed')
         self.assertFalse(any(args[0] == 'apply' for args in self.tools.calls))
 
     def test_interactive_cancel_before_plan_no_provider_calls(self):
-        self.assertEqual(self.interactive_main(['', 'cancel']), 0)
+        self.assertEqual(self.interactive_main(['cancel']), 0)
         self.assertEqual(self.tools.calls, [])
 
-    def test_interactive_bootstrap_then_live_in_one_invocation(self):
-        def answer(prompt):
-            if 'Need new AWS' in prompt:
-                return 'BOOTSTRAP'
-            if 'ACCEPT COST' in prompt:
-                return 'ACCEPT COST'
-            if 'read-only locked plan' in prompt:
-                return 'PLAN'
-            if 'type operation ' in prompt:
-                return prompt.split('type operation ')[1].split(':')[0]
-            if 'Existing AWS state role' in prompt:
-                return 'existing-role'
-            if 'Approve attachment' in prompt:
-                return 'ATTACH'
-            raise AssertionError(prompt)
-        self.assertEqual(self.interactive_main(answer), 0)
-        self.assertEqual(m.private_read(self.root / 'default/bootstrap-ledger.json')['phase'], 'complete')
-        self.assertEqual(m.private_read(self.root / 'default/ledger.json')['phase'], 'complete')
-        self.assertEqual(sum('attach-role-policy' in args for args in self.tools.calls), 1)
-        self.assertEqual(sum(args[0] == 'apply' for args in self.tools.calls), 2)
+    def test_explicit_legacy_bootstrap_rejected_before_provider(self):
+        with self.assertRaises(m.InstallError):
+            m.main(['--bootstrap', '--non-interactive'])
+        self.assertEqual(self.tools.calls, [])
 
     def test_interactive_setup_release_and_cancel_without_secret_persistence(self):
         root = self.root / 'fresh-profile'
@@ -448,6 +449,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_discovery_uses_prompt_token_without_env_or_profile_persistence(self):
         tools = unittest.mock.Mock()
+        tools.admission_args = []
         tools.cf_list.side_effect = [[{'id': 'a' * 32, 'name': SECRET}],
                                     [{'id': 'b' * 32, 'name': 'example.com', 'status': 'active'}]]
         output = io.StringIO()
@@ -515,25 +517,19 @@ class InstallerTests(unittest.TestCase):
         with self.assertRaises(m.InstallError):
             m.acquire_candidate('https://example.com/a', expected, self.root / 'downloads')
 
-    def test_real_provider_discovery_maps_exact_import_ids(self):
+    def test_real_discovery_uses_shared_ownership_policy(self):
         self.discovery.stop()
         tools = unittest.mock.Mock()
-        tools.cf_list.side_effect = [
-            [{'id': 'project-uuid', 'name': CHOICES['pages_project']}],
-            [{'id': 'dns-uuid', 'name': CHOICES['hostname']}],
-            [{'id': 'worker-uuid', 'name': 'bmux-live-staging'}],
-            [{'id': 'route-uuid', 'pattern': CHOICES['hostname'] + '/api/live/*'}],
-            [{'name': CHOICES['hostname']}],
-        ]
+        tools.admission_args = []
+        tools.cf_list.side_effect = [[], [{'name': CHOICES['bucket'], 'storage_class': 'Standard', 'creation_date': '2026-01-01'}],
+                                     [], [], [], [], [], []]
         result = m.discover(tools, CHOICES)
-        self.assertEqual(result['cloudflare_pages_project.live'], CHOICES['account_id'] + '/' + CHOICES['pages_project'])
-        self.assertEqual(result['cloudflare_worker.live'], CHOICES['account_id'] + '/worker-uuid')
-        self.assertEqual(result['cloudflare_dns_record.live'], CHOICES['zone_id'] + '/dns-uuid')
-        self.assertEqual(result['cloudflare_pages_domain.live'], CHOICES['account_id'] + '/' + CHOICES['pages_project'] + '/' + CHOICES['hostname'])
+        self.assertEqual(result, {'cloudflare_r2_bucket.state': CHOICES['account_id'] + '/' + CHOICES['bucket'] + '/default'})
 
     def test_real_preflight_rejects_wrong_zone_account_and_expired_token(self):
         self.preflight.stop()
         tools = unittest.mock.Mock()
+        tools.admission_args = []
         tools.env = {}
         tools.aws = '/mock/aws'
         tools.run.return_value = subprocess.CompletedProcess([], 0, b'{"Account":"123456789012"}', b'')
@@ -544,7 +540,7 @@ class InstallerTests(unittest.TestCase):
                                 {'result': {'account': {'id': '0' * 32}, 'status': 'active', 'name': 'example.com'}}]
         with self.assertRaises(m.InstallError):
             m.preflight(tools, CHOICES)
-        self.assertEqual(tools.run.call_count, 2)  # no bucket calls after rejected CF auth
+        self.assertEqual(tools.run.call_count, 0)  # no state calls after rejected CF auth
 
     def test_provider_inventory_unknown_shape_never_appears_empty(self):
         tools = m.Tools(self.artifact, {})
@@ -555,16 +551,13 @@ class InstallerTests(unittest.TestCase):
     def test_real_preflight_locked_backend_security(self):
         self.preflight.stop()
         tools = unittest.mock.Mock()
-        tools.env = {}
-        tools.aws = '/mock/aws'
+        tools.admission_args = []
         tools.cf.side_effect = [{'result': {'status': 'active'}}, {'result': {}},
-                                {'result': {'account': {'id': CHOICES['account_id']}, 'status': 'active', 'name': 'example.com'}}]
-        responses = [{'Account': '123456789012'}, {'LocationConstraint': None}, {'Status': 'Enabled'},
-                     {'PublicAccessBlockConfiguration': {k: True for k in ('BlockPublicAcls', 'IgnorePublicAcls', 'BlockPublicPolicy', 'RestrictPublicBuckets')}},
-                     {'ServerSideEncryptionConfiguration': {'Rules': []}}]
-        tools.run.side_effect = [subprocess.CompletedProcess([], 0, json.dumps(value).encode(), b'') for value in responses]
-        self.assertEqual(m.preflight(tools, CHOICES), '123456789012')
-        self.assertEqual(tools.run.call_count, 5)
+                                {'result': {'status': 'active', 'account': {'id': CHOICES['account_id']}, 'name': 'example.com'}}]
+        self.assertEqual(m.preflight(tools, CHOICES), CHOICES['account_id'])
+        self.assertEqual(tools.run.call_count, 1)
+        self.assertIn('archive-live-state.py', tools.run.call_args.args[0][-2])
+        self.assertEqual(tools.run.call_args.args[0][-1], 'check')
 
     def test_completed_operation_archived_before_new_release_plan(self):
         d, operation = self.reviewed()
@@ -591,7 +584,7 @@ class InstallerTests(unittest.TestCase):
     def test_default_candidate_precedence_explicit_artifact_and_saved_release(self):
         root = self.root / 'default'
         m.private_dir(root)
-        m.save(root / 'profile.json', {'schema': 1, 'choices': CHOICES})
+        m.save(root / 'profile.json', {'schema': 2, 'choices': CHOICES})
         m.save(root / 'release.json', {'schema': 1, 'url': 'https://example.com/release.tar.gz', 'sha256': 'a' * 64})
         common = ['--state-dir', str(self.root), '--default-artifact', str(self.base / 'absent-default'), '--non-interactive']
         with patch.object(m, 'acquire_candidate', return_value=self.artifact) as acquire, contextlib.redirect_stdout(io.StringIO()):
@@ -620,7 +613,7 @@ class InstallerTests(unittest.TestCase):
     def test_no_cache_relative_candidate_fallback(self):
         root = self.root / 'default'
         m.private_dir(root)
-        m.save(root / 'profile.json', {'schema': 1, 'choices': CHOICES})
+        m.save(root / 'profile.json', {'schema': 2, 'choices': CHOICES})
         with self.assertRaisesRegex(m.InstallError, 'No installed candidate'):
             m.main(['--state-dir', str(self.root), '--non-interactive'])
 
