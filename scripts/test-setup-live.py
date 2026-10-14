@@ -191,6 +191,38 @@ class SetupTests(unittest.TestCase):
                              environ={'OFFLINE_SETUP_TEST': 'passed'})
         self.assertEqual(result.strip(), 'passed')
 
+    def test_audit_recovery_then_setup_finishes_without_second_bucket_create(self):
+        from datetime import datetime, timezone
+        import os
+        self.fail_secret = 'LIVE_HOSTNAME'
+        with self.assertRaises(s.Error):
+            self.setup.execute()
+        ledger = s.local.private_read(self.root / 'operation.json')
+        original_binding, operation = ledger['binding'], ledger['operation']
+        ledger.update(phase='applying', observed=None)
+        s.local.save(self.root / 'operation.json', ledger)
+        created = s.r.instant(self.cf.row['creation_date'])
+        start = created.timestamp() - 1
+        os.utime(self.root / 'operation.json', (start, start))
+        (self.root / 'ready.json').unlink()
+        audit_id = '4aa591f0-6e2b-4083-9516-dacb6cc4e684'
+        audit_time = created.isoformat()
+        audit = dict(id=audit_id, when=audit_time, action=dict(type='create', result=True),
+                     interface='API', owner=dict(id=ACCOUNT), resource=dict(type='r2.bucket', id=self.args.bucket))
+        class Reader:
+            def get(inner, path, stage):
+                return dict(result=[audit] if '/audit_logs?' in path else self.cf.row)
+        self.args.recover_creation_audit, self.args.creation_time = audit_id, audit_time
+        before = len([v for v in self.cf.calls if v[0] == 'POST'])
+        with patch.object(s.r, 'Reader', return_value=Reader()):
+            self.setup.execute()
+        recovered = s.local.private_read(self.root / 'operation.json')
+        self.assertEqual((recovered['binding'], recovered['operation']), (original_binding, operation))
+        self.assertEqual(recovered['phase'], 'complete')
+        self.assertEqual(len([v for v in self.cf.calls if v[0] == 'POST']), before)
+        self.assertEqual(s.local.private_read(self.root / 'setup.json')['phase'], 'complete')
+        self.assertEqual(self.creations, ['r2', 'deployment'])
+
     def test_setup_does_not_dispatch_workflows(self):
         self.setup.execute()
         self.assertFalse(any('workflow' in cmd for cmd, _ in self.gh.calls))

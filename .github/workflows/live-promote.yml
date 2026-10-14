@@ -43,6 +43,7 @@ jobs:
           python3 scripts/test-live-bootstrap.py
           python3 scripts/test-live-github-environments.py
           python3 scripts/test-setup-live.py
+          python3 scripts/test-live-state-recovery.py
           python3 scripts/test-live-state-provision.py
           python3 scripts/test-live-imports.py
           python3 scripts/test-live-plan-policy.py

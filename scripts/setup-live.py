@@ -26,6 +26,7 @@ def load(name, filename):
 b = load('setup_bootstrap', 'bootstrap-live-secrets.py')
 p = load('setup_state', 'provision-live-state.py')
 g = load('setup_github', 'live-github-environments.py')
+r = load('setup_recovery', 'live-state-recovery.py')
 local = p.local
 Error = b.BootstrapError
 
@@ -48,12 +49,30 @@ class Setup:
         self.env = dict(os.environ if environ is None else environ)
         self.env['GH_HOST'] = 'github.com'
         if run is b.command:
-            self.run = lambda cmd, body=None: b.command(cmd, body, environ=self.env)
+            self.run = self.command
         self.root = args.state_dir
         self.credential_path = self.root / 'credentials.json'
         self.record_path = self.root / 'setup.json'
         self.binding = dict(repo=args.repo, reviewer=args.approval_reviewer, bucket=args.bucket,
                             publisher_key_file=str(args.publisher_key_file))
+
+    def command(self, cmd, body=None):
+        stage = 'GitHub setup'
+        companion = len(cmd) > 1 and cmd[1] == str(HERE / 'provision-live-state.py')
+        if companion:
+            stage = 'R2 backend ' + next((flag[2:] for flag in ('--plan', '--review', '--apply', '--reconcile') if flag in cmd), 'operation')
+        try:
+            return b.command(cmd, body, environ=self.env)
+        except b.BootstrapError:
+            # Companion owns sanitized errors but arbitrary stderr may contain credentials.
+            # Never forward it: inspect only authoritative public checkpoints for safe context.
+            phase = 'unknown'
+            if companion and (self.root / 'operation.json').is_file():
+                value = local.private_read(self.root / 'operation.json').get('phase')
+                if value in ('planned', 'applying', 'complete'):
+                    phase = value
+            raise Error(stage + ' failed; saved backend phase=' + phase
+                        + '. Provider output suppressed. Preserve original state; if applying, verify creation audit before recovery.') from None
 
     def names(self):
         inventory = g.pages(self.run, f'repos/{self.args.repo}/environments', 'environments')
@@ -166,7 +185,20 @@ class Setup:
             with local.lock(self.root):
                 ledger = p.Provision(choices, self.root, cf).ledger
         if ledger['phase'] == 'applying':
-            raise Error('Backend apply outcome ambiguous; explicitly reconcile the saved backend operation before rerunning setup')
+            if not getattr(self.args, 'recover_creation_audit', None):
+                raise Error('Backend apply ambiguous. Use --recover-creation-audit AUDIT_UUID --creation-time RFC3339 to verify and explicitly reconcile original creation')
+            r.recover(p, choices, self.root, ledger['operation'], self.args.recover_creation_audit,
+                      self.args.creation_time, r.Reader(self.env['CLOUDFLARE_PROVISION_TOKEN'], b.NoRedirect), confirm)
+            with local.lock(self.root):
+                obj = p.Provision(choices, self.root, None)
+                obj.completion(ledger['operation'], self.root / 'ready.json')
+                ledger = obj.ledger
+        elif getattr(self.args, 'recover_creation_audit', None):
+            r.recover(p, choices, self.root, ledger['operation'], self.args.recover_creation_audit,
+                      self.args.creation_time, r.Reader(self.env['CLOUDFLARE_PROVISION_TOKEN'], b.NoRedirect), confirm)
+            with local.lock(self.root):
+                obj = p.Provision(choices, self.root, None)
+                obj.completion(ledger['operation'], self.root / 'ready.json')
         operation = ledger['operation']
         if record and record['operation'] != operation:
             raise Error('Setup and backend operation identities differ')
@@ -246,7 +278,11 @@ def main():
     parser.add_argument('--bucket', default='bmux-opentofu-state')
     parser.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/bmux/live-bootstrap')
     parser.add_argument('--publisher-key-file', type=Path, default=Path.home() / '.config/bmux/live/publisher-key')
+    parser.add_argument('--recover-creation-audit', help='Explicit recovery: original successful Cloudflare audit UUID')
+    parser.add_argument('--creation-time', help='Exact original audit event RFC3339 timestamp')
     args = parser.parse_args()
+    if bool(args.recover_creation_audit) != bool(args.creation_time):
+        parser.error('Recovery requires both --recover-creation-audit and --creation-time')
     if (not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repo)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}', args.approval_reviewer)
             or not re.fullmatch(r'[a-z0-9][a-z0-9-]{1,61}[a-z0-9]', args.bucket)
@@ -262,7 +298,7 @@ def main():
         local.private_dir(args.publisher_key_file.parent)
         Setup(args).execute()
         return 0
-    except (Error, local.InstallError, g.Error) as error:
+    except (Error, local.InstallError, g.Error, r.RecoveryError) as error:
         print('ERROR: ' + str(error), file=sys.stderr)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
         print('ERROR: Setup failed; diagnostics suppressed. Retain private state and reconcile before retry.', file=sys.stderr)

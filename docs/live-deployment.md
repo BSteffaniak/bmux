@@ -44,6 +44,43 @@ names and original local authority; it does not prove remote credential validity
 or cloud deployment acceptance. Keep existing backend/adoption/recovery workflows
 explicit rather than using setup to reset an existing installation.
 
+## Interrupted bucket creation recovery
+
+If bucket creation succeeded remotely but setup stopped with backend phase
+`applying`, retain the original private bootstrap directory and passphrase. Do not
+delete/recreate the bucket, start another operation, or edit its phase manually.
+Use its successful Cloudflare account audit UUID and exact event timestamp:
+
+```sh
+bash scripts/setup-live.sh \
+  --recover-creation-audit AUDIT_RECORD_UUID \
+  --creation-time '2026-10-14T16:38:01-04:00'
+```
+
+Use the original timestamp, not the date you run recovery. The dashboard may omit
+fractional seconds: if verification reports a mismatch, use the exact normalized
+`API=` timestamp shown for the verified audit UUID. The check remains exact and
+still requires the original operation window. The provisioning token
+additionally needs **Account → Account Settings → Read** for the selected account.
+Recovery reads the exact audit through `/accounts/ACCOUNT/audit_logs?id=UUID` and
+reads live bucket metadata; it never writes to Cloudflare. It checks successful
+API creation, account/resource identity, event time within five minutes after the
+original durable applying checkpoint, and live bucket creation time within five
+seconds of that event. Unsupported/missing fields and replacement buckets fail
+closed. It displays evidence and requires explicit confirmation, then verifies
+again before saving private evidence and an original checkpoint backup. Only then
+does it acknowledge creation in the original operation; reviewed choices, binding,
+operation ID and resource plan are unchanged. It never accepts a changed bound
+implementation to get past an error. If those implementation files changed, restore
+the original verified implementation or arrange explicit migration, never rebind.
+
+Recovery resumes ordinary setup (with its separate setup approval) and produces the
+original completion receipt without a second bucket creation request. Interrupted
+local reconciliation can be repeated with the same arguments. Audit visibility
+and timestamp correlation are required evidence, not a claim of atomic provider
+transactions. CI's first-use admission still verifies the bucket is empty and
+rejects consumed/changed authority before first state creation.
+
 ## Advanced setup / explicit phases
 
 ### 1. Authenticate to GitHub

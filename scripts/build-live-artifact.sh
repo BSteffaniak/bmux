@@ -12,6 +12,7 @@ OUTPUT="$(cd "$OUTPUT" && pwd)"
 python3 scripts/test-live-bootstrap.py
 python3 scripts/test-live-github-environments.py
 python3 scripts/test-setup-live.py
+python3 scripts/test-live-state-recovery.py
 python3 scripts/test-live-state.py
 python3 scripts/test-live-smoke.py
 (cd infra/live-relay && npm test)
