@@ -7,7 +7,44 @@ OIDC customization, staging account, or staging deployment is required. The
 R2 state operations use direct signed HTTPS requests from Python's standard library.
 Ordinary local BMUX operation needs none of this infrastructure.
 
-## One-time setup
+## One-time setup (one command)
+
+From this repository, run:
+
+```sh
+bash scripts/setup-live.sh
+```
+
+The command enters the pinned Nix shell, reuses GitHub login (or opens login),
+prompts privately for a Cloudflare provisioning token when needed, discovers the
+account, and shows one combined plan for environments, backend and missing secrets.
+Defaults are `BSteffaniak/bmux`, reviewer `BSteffaniak`, and bucket
+`bmux-opentofu-state`; `--help` lists explicit overrides.
+
+Approve the displayed changes/costs. For a new backend, supply and confirm a
+high-entropy encryption passphrase from your password manager and confirm its
+independent backup. There are no manual environment settings, exported secrets,
+operation IDs, or JSON/checksum copying. The provisioning token is process-local,
+not saved or installed in GitHub. Do not run with tracing or record secret input.
+
+Rerun the **same command** to resume or verify. Existing secrets are skipped;
+original generated credentials are retained in an owned 0600 `credentials.json`
+inside the private bootstrap directory so interrupted secret uploads reuse them.
+Protect/back up that directory and publisher key; neither is a public resume
+artifact. An uncertain token creation is checkpointed and blocks automatic retry;
+an ambiguous backend apply requires explicit reconciliation, never a replacement
+backend or new credentials. The wrapper never adopts an existing bucket or changes
+an operation's bound implementation/selection. Remote drift fails closed.
+
+After success it saves private `configure-inputs.json` and prints a ready-to-run
+`gh workflow run ... --json < ...` command. **It does not dispatch CI.** That input
+file is for the first configure only; after canonical state exists, omit bootstrap
+inputs on subsequent runs. A successful rerun verifies GitHub protections, secret
+names and original local authority; it does not prove remote credential validity
+or cloud deployment acceptance. Keep existing backend/adoption/recovery workflows
+explicit rather than using setup to reset an existing installation.
+
+## Advanced setup / explicit phases
 
 ### 1. Authenticate to GitHub
 

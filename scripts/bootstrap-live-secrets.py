@@ -39,13 +39,13 @@ STATE_COMMAND_TIMEOUT = 1000  # Backend tools own <=900s deadlines and cleanup f
 COMMAND_OUTPUT_LIMIT = 32 * 1024 * 1024
 
 
-def bounded_run(args, body=None, timeout=120):
+def bounded_run(args, body=None, timeout=120, environ=None):
     """Pipe-only bounded capture; secrets never touch diagnostic files or argv."""
     payload = (body or '').encode('utf-8')
     if len(payload) > 65536:
         raise BootstrapError('Command input exceeds bound; no operation started')
     process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, start_new_session=True)
+                               stderr=subprocess.PIPE, start_new_session=True, env=environ)
     deadline = time.monotonic() + timeout
     output = bytearray()
     retained = 0
@@ -105,12 +105,12 @@ def bounded_run(args, body=None, timeout=120):
             stream.close()
 
 
-def command(args, body=None):
+def command(args, body=None, environ=None):
     companion = (len(args) >= 2 and args[0] == sys.executable
                  and args[1] == str(Path(__file__).with_name('provision-live-state.py')))
     timeout = STATE_COMMAND_TIMEOUT if companion else 120
     try:
-        result = bounded_run(args, body, timeout=timeout)
+        result = bounded_run(args, body, timeout=timeout, environ=environ)
     except subprocess.TimeoutExpired:
         if companion:
             raise BootstrapError('Backend operation timed out; operation ambiguous; inspect durable state and reconcile exact operation ID before any retry; backend owns descendant cleanup') from None
@@ -475,6 +475,12 @@ def r2_credentials(cf, account, bucket):
     return dict(R2_STATE_ACCESS_KEY_ID=key, R2_STATE_SECRET_ACCESS_KEY=hashlib.sha256(value.encode()).hexdigest())
 
 
+def retained_credential(args, name, create):
+    """Interactive setup may durably retain private credentials across interrupted secret uploads."""
+    store = getattr(args, '_credential_store', None)
+    return store(name, create) if store else create()
+
+
 def provision(args, run=command, environ=None, cloudflare=None):
     if not getattr(args, 'approval_reviewer', None) or args.dry_run:
         return provision_selected(args, run, environ, cloudflare)
@@ -548,7 +554,7 @@ def provision_selected(args, run=command, environ=None, cloudflare=None):
     if getattr(args, 'state_completion_file', None) and args.state_mode == 'plan':
         raise BootstrapError('Completion file requires a completed exact operation, not plan')
     pair = [n for n in ('R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY') if n in pending]
-    if pair and len(pair) != 2:
+    if pair and len(pair) != 2 and not getattr(args, '_credential_store', None):
         raise BootstrapError('R2 credentials must be installed/rotated together; select both with --only')
     if getattr(args, 'approve_import', False) and 'TOFU_STATE_ENCRYPTION_PASSPHRASE' in pending:
         raise BootstrapError('Existing backend requires original passphrase via --input-env, never replacement generation')
@@ -593,9 +599,9 @@ def provision_selected(args, run=command, environ=None, cloudflare=None):
             state_values['TOFU_STATE_ENCRYPTION_PASSPHRASE'] = passphrase
         credential_pending = [n for n in ('R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY') if n in pending]
         if credential_pending:
-            if len(credential_pending) != 2:
+            if len(credential_pending) != 2 and not getattr(args, '_credential_store', None):
                 raise BootstrapError('R2 credentials must be installed/rotated together; select both with --only')
-            state_values.update(r2_credentials(cf, account, args.state_bucket))
+            state_values.update(retained_credential(args, 'r2', lambda: r2_credentials(cf, account, args.state_bucket)))
     values = {}
     if 'LIVE_PUBLISHER_KEY_SHA256' in pending:
         values['LIVE_PUBLISHER_KEY_SHA256'] = private_key_digest(args.publisher_key_file)
@@ -610,15 +616,16 @@ def provision_selected(args, run=command, environ=None, cloudflare=None):
         if 'CLOUDFLARE_ZONE_ID' in pending:
             values['CLOUDFLARE_ZONE_ID'] = zone
         if 'CLOUDFLARE_API_TOKEN' in pending:
-            groups = list(cf.items('/user/tokens/permission_groups'))
-            policy = token_policy(account, zone, groups)
-            policy['name'] = f'bmux:github:{args.repo}:{args.environment}:deployment'
-            # No DELETE, including uncertain gh writes; never reuse an unrelated project token.
-            result = cf.request('POST', '/user/tokens', policy)['result']
-            value = result.get('value')
-            if not isinstance(value, str) or not value or any(c.isspace() for c in value):
-                raise BootstrapError('Token creation returned no valid credential; inspect provider state before retry')
-            values['CLOUDFLARE_API_TOKEN'] = value
+            def create_deployment_token():
+                groups = list(cf.items('/user/tokens/permission_groups'))
+                policy = token_policy(account, zone, groups)
+                policy['name'] = f'bmux:github:{args.repo}:{args.environment}:deployment'
+                result = cf.request('POST', '/user/tokens', policy)['result']
+                value = result.get('value')
+                if not isinstance(value, str) or not value or any(c.isspace() for c in value):
+                    raise BootstrapError('Token creation returned no valid credential; inspect provider state before retry')
+                return value
+            values['CLOUDFLARE_API_TOKEN'] = retained_credential(args, 'deployment', create_deployment_token)
     if 'LIVE_HOSTNAME' in pending:
         values['LIVE_HOSTNAME'] = hostname
     state_pending = [name for name in pending if name in STATE_SECRET_NAMES]
