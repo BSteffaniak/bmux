@@ -202,6 +202,7 @@ bmux_context_state = { version = "0.0.1-alpha.1", default-features = false, path
 bmux_diagnostic_log = { version = "0.0.1-alpha.1", default-features = false, path = "packages/diagnostic-log" }
 bmux_env = { version = "0.0.1-alpha.1", default-features = false, path = "packages/bmux-env" }
 bmux_event_models = { version = "0.0.1-alpha.1", default-features = false, path = "packages/event/models" }
+bmux_example_native_plugin = { version = "0.0.1-alpha.1", default-features = false, path = "examples/native-plugin" }
 bmux_fonts = { version = "0.0.1-alpha.1", default-features = false, path = "packages/fonts" }
 bmux_image = { version = "0.0.1-alpha.1", default-features = false, path = "packages/image" }
 bmux_ipc = { version = "0.0.1-alpha.1", default-features = false, path = "packages/ipc" }

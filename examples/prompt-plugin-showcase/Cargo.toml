@@ -16,7 +16,7 @@ anyhow                     = { workspace = true, features = ["std"] }
 bmux_cli                   = { workspace = true }
 bmux_client                = { workspace = true }
 bmux_codec                 = { workspace = true }
-bmux_example_native_plugin = { path = "../native-plugin" }
+bmux_example_native_plugin = { workspace = true }
 bmux_ipc                   = { workspace = true }
 bmux_sandbox_harness       = { workspace = true }
 bmux_sessions_plugin_api   = { workspace = true }

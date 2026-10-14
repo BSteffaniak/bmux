@@ -11,9 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_mermaid_render = { path = "../mermaid-render" }
-bmux_presenter = { path = "../presenter" }
-bmux_tui = { path = "../tui", features = ["serde"] }
+bmux_mermaid_render = { workspace = true }
+bmux_presenter = { workspace = true }
+bmux_tui = { workspace = true, features = ["serde"] }
 image = { workspace = true }
 pulldown-cmark = { workspace = true }
 rustls = { workspace = true }

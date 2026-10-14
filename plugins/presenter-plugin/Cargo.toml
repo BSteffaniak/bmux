@@ -20,14 +20,14 @@ bmux_client = { workspace = true }
 bmux_config = { workspace = true }
 bmux_image = { workspace = true }
 bmux_keyboard = { workspace = true }
-bmux_mermaid_render = { path = "../../packages/mermaid-render" }
-bmux_playbook = { path = "../../packages/playbook" }
-bmux_playbook_plugin_api = { path = "../playbook-plugin-api" }
+bmux_mermaid_render = { workspace = true }
+bmux_playbook = { workspace = true }
+bmux_playbook_plugin_api = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
-bmux_presenter = { path = "../../packages/presenter" }
-bmux_presenter_plugin_api = { path = "../presenter-plugin-api" }
-bmux_presenter_runtime = { path = "../../packages/presenter-runtime" }
-bmux_syntax_render = { path = "../../packages/syntax-render" }
+bmux_presenter = { workspace = true }
+bmux_presenter_plugin_api = { workspace = true }
+bmux_presenter_runtime = { workspace = true }
+bmux_syntax_render = { workspace = true }
 bmux_tui = { workspace = true }
 bmux_tui_components = { workspace = true, features = ["progress-bar"] }
 bmux_tui_runtime = { workspace = true, features = [
@@ -35,10 +35,8 @@ bmux_tui_runtime = { workspace = true, features = [
     "images",
     "all-protocols",
 ] }
-bmux_web_host = { path = "../../packages/web-host", features = [
-    "presentation",
-] }
-bmux_web_renderer = { path = "../../packages/web-renderer" }
+bmux_web_host = { workspace = true, features = ["presentation"] }
+bmux_web_renderer = { workspace = true }
 crossterm = { workspace = true }
 image = { workspace = true }
 libc = { workspace = true }

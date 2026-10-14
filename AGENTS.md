@@ -95,6 +95,14 @@ Key rules when fixing clippy issues:
 - Never use `cargo clippy --fix` without verifying it compiles and tests pass afterward -- auto-fixes can break code in macro contexts and async functions.
 - Wildcard imports (`use something::*`) are not allowed in production code. They are acceptable in `#[cfg(test)] mod tests` blocks with `use super::*`.
 
+## Workspace Dependencies (REQUIRED)
+
+Local package dependency paths belong in the root `[workspace.dependencies]` table.
+Consuming manifests must use `workspace = true`, retaining any required features.
+After changing Cargo manifests, run:
+
+- `bash scripts/check-workspace-dependencies.sh`
+
 ## Cargo Machete (REQUIRED)
 
 For any code change anywhere in the repo, run:
