@@ -48,7 +48,7 @@ class SetupTests(unittest.TestCase):
         self.cf.original_request = self.cf.request
         self.cf.request = token
         self.cf.items = lambda path: []
-        patches = [patch.object(s.b, 'Cloudflare', return_value=self.cf),
+        patches = [patch.object(s, 'DiagnosticCloudflare', return_value=self.cf),
                    patch.object(s.b, 'discover', return_value=(ACCOUNT, 'c' * 32)),
                    patch.object(s.b, 'r2_credentials', side_effect=r2),
                    patch.object(s.b, 'token_policy', return_value={}),
@@ -93,7 +93,7 @@ class SetupTests(unittest.TestCase):
         self.gh.calls.clear()
         self.setup.env.clear()
         with patch.object(s, 'secret', side_effect=AssertionError('unexpected prompt')), \
-                patch.object(s.b, 'Cloudflare', side_effect=AssertionError('unexpected cloudflare')):
+                patch.object(s, 'DiagnosticCloudflare', side_effect=AssertionError('unexpected cloudflare')):
             self.setup.execute()
         self.assertEqual(self.gh.writes(), [])
         self.assertEqual(self.creations, ['r2', 'deployment'])
@@ -226,6 +226,84 @@ class SetupTests(unittest.TestCase):
     def test_setup_does_not_dispatch_workflows(self):
         self.setup.execute()
         self.assertFalse(any('workflow' in cmd for cmd, _ in self.gh.calls))
+
+
+class DiagnosticTests(unittest.TestCase):
+    def client(self):
+        return s.DiagnosticCloudflare({'CLOUDFLARE_PROVISION_TOKEN': 'SECRET_TOKEN'})
+
+    def test_http_status_and_codes_without_raw_credentials_or_provider_messages(self):
+        import urllib.error
+        for path, method, label in [('/accounts/' + ACCOUNT + '/pages/projects?page=1', 'GET', 'List Pages projects'),
+                                    ('/user/tokens', 'POST', 'Create scoped token')]:
+            error = urllib.error.HTTPError('https://SECRET_URL', 403, 'SECRET_REASON', {},
+                io.BytesIO(b'{"errors":[{"code":10000,"message":"SECRET_TOKEN SECRET_BODY"}]}'))
+            opener = unittest.mock.Mock()
+            opener.open.side_effect = error
+            with patch.object(s.urllib.request, 'build_opener', return_value=opener), self.assertRaises(s.Error) as caught:
+                self.client().request(method, path, {'secret': 'SECRET_INPUT'} if method == 'POST' else None)
+            message = str(caught.exception)
+            self.assertIn(label, message)
+            self.assertIn('HTTP 403', message)
+            self.assertIn('[10000]', message)
+            self.assertNotIn('SECRET', message)
+            self.assertIn('ambiguous' if method == 'POST' else 'read-only', message)
+            opener.open.assert_called_once()
+
+    def test_successful_http_error_envelope_and_invalid_bodies_fail_closed(self):
+        for raw in (b'{"success":false,"errors":[{"code":123,"message":"SECRET"}]}', b'not json', b'x' * 1048577):
+            response = unittest.mock.MagicMock()
+            response.status = 200
+            response.read.return_value = raw
+            response.__enter__.return_value = response
+            opener = unittest.mock.Mock()
+            opener.open.return_value = response
+            with patch.object(s.urllib.request, 'build_opener', return_value=opener), self.assertRaises(s.Error) as caught:
+                self.client().request('GET', '/accounts/' + ACCOUNT + '/pages/projects')
+            self.assertIn('List Pages projects', str(caught.exception))
+            self.assertNotIn('SECRET', str(caught.exception))
+            opener.open.assert_called_once()
+
+    def test_pages_specific_pagination_matches_wrangler_and_reads_all_pages(self):
+        client = self.client()
+        projects = [dict(name=f'project-{i}') for i in range(20)]
+        with patch.object(client, 'request', side_effect=[dict(result=projects[:10]), dict(result=projects[10:]), dict(result=[])]) as request:
+            self.assertEqual(list(client.items('/accounts/' + ACCOUNT + '/pages/projects')), projects)
+        self.assertEqual([call.args for call in request.call_args_list],
+                         [('GET', '/accounts/' + ACCOUNT + f'/pages/projects?page={page}&per_page=10') for page in (1, 2, 3)])
+
+    def test_pages_short_page_stops_and_other_endpoints_keep_original_pagination(self):
+        client = self.client()
+        with patch.object(client, 'request', return_value=dict(result=[dict(name='bmux')])) as request:
+            self.assertEqual(list(client.items('/accounts/' + ACCOUNT + '/pages/projects')), [dict(name='bmux')])
+            request.assert_called_once()
+        with patch.object(client, 'request', return_value=dict(result=[])) as request:
+            self.assertEqual(list(client.items('/user/tokens/permission_groups')), [])
+            request.assert_called_once_with('GET', '/user/tokens/permission_groups?page=1&per_page=50')
+
+    def test_pages_inventory_corruption_and_bound_fail_closed(self):
+        client = self.client()
+        for rows in (None, {}, ['invalid'], [{}] * 11):
+            with patch.object(client, 'request', return_value=dict(result=rows)), self.assertRaises(s.Error):
+                list(client.items('/accounts/' + ACCOUNT + '/pages/projects'))
+        with patch.object(client, 'request', return_value=dict(result=[{}] * 10)) as request, self.assertRaises(s.Error):
+            list(client.items('/accounts/' + ACCOUNT + '/pages/projects'))
+        self.assertEqual(request.call_count, 100)
+
+    def test_success_and_transport_failure(self):
+        response = unittest.mock.MagicMock()
+        response.status = 200
+        response.read.return_value = b'{"success":true,"result":[]}'
+        response.__enter__.return_value = response
+        opener = unittest.mock.Mock()
+        opener.open.return_value = response
+        with patch.object(s.urllib.request, 'build_opener', return_value=opener):
+            self.assertEqual(self.client().request('GET', '/zones')['result'], [])
+        opener.open.side_effect = OSError('SECRET_NETWORK_DETAIL')
+        with patch.object(s.urllib.request, 'build_opener', return_value=opener), self.assertRaises(s.Error) as caught:
+            self.client().request('GET', '/zones')
+        self.assertIn('transport failure', str(caught.exception))
+        self.assertNotIn('SECRET', str(caught.exception))
 
 
 if __name__ == '__main__':

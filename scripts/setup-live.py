@@ -12,6 +12,8 @@ import re
 import shlex
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 HERE = Path(__file__).resolve().parent
 
@@ -43,6 +45,78 @@ def secret(prompt):
     return value
 
 
+class DiagnosticCloudflare(b.Cloudflare):
+    """Setup-only transport: preserve bound bootstrap code while reporting safe request evidence."""
+    def items(self, path):
+        if not re.fullmatch(r'/accounts/[a-f0-9]{32}/pages/projects', path):
+            yield from super().items(path)
+            return
+        # Match Wrangler's Pages-specific page size; generic bootstrap uses 50.
+        # Do not rely on optional total_pages: a full page requires another read.
+        for page in range(1, 101):
+            data = self.request('GET', path + f'?page={page}&per_page=10')
+            rows = data.get('result')
+            if not isinstance(rows, list) or len(rows) > 10 or any(not isinstance(row, dict) for row in rows):
+                raise Error('Invalid Pages project inventory; no adoption or secret writes')
+            yield from rows
+            if len(rows) < 10:
+                return
+        raise Error('Pages project inventory exceeds bound; no adoption or secret writes')
+
+    def request(self, method, path, body=None):
+        if method not in ('GET', 'POST') or not path.startswith('/') or path.startswith('//'):
+            raise Error('Unsupported Cloudflare setup request')
+        # Labels are constants, never raw paths, query values, request bodies or provider messages.
+        endpoint = path.split('?', 1)[0]
+        if re.fullmatch(r'/accounts/[a-f0-9]{32}/pages/projects', endpoint):
+            stage = 'List Pages projects'
+        elif endpoint == '/user/tokens/permission_groups':
+            stage = 'List token permission groups'
+        elif endpoint == '/user/tokens':
+            stage = 'Create scoped token' if method == 'POST' else 'List scoped tokens'
+        elif endpoint == '/zones':
+            stage = 'Discover zone/account'
+        else:
+            stage = 'Cloudflare setup request'
+        request = urllib.request.Request('https://api.cloudflare.com/client/v4' + path,
+            data=None if body is None else json.dumps(body).encode(), method=method,
+            headers={'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'})
+
+        def codes(data):
+            if not isinstance(data, dict) or not isinstance(data.get('errors'), list):
+                return []
+            return [v['code'] for v in data['errors'] if isinstance(v, dict) and type(v.get('code')) is int][:8]
+
+        hint = ('; mutation may be ambiguous; do not retry token creation blindly'
+                if method == 'POST' else '; read-only request failed; no automatic retry')
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({}), b.NoRedirect).open(request, timeout=30) as response:
+                status = response.status
+                raw = response.read(1048577)
+                if len(raw) > 1048576:
+                    raise Error(stage + ': response exceeds bound' + hint)
+                data = json.loads(raw)
+                if status != 200 or not isinstance(data, dict) or data.get('success') is not True:
+                    raise Error(stage + ': HTTP ' + str(status) + '; Cloudflare codes ' + json.dumps(codes(data)) + hint)
+                return data
+        except urllib.error.HTTPError as error:
+            safe_codes = []
+            try:
+                raw = error.read(65537)
+                if len(raw) <= 65536:
+                    safe_codes = codes(json.loads(raw))
+            except (OSError, ValueError, TypeError):
+                pass
+            finally:
+                error.close()
+            raise Error(stage + ': HTTP ' + str(error.code) + '; Cloudflare codes ' + json.dumps(safe_codes)
+                        + hint + '; provider messages suppressed') from None
+        except (urllib.error.URLError, OSError):
+            raise Error(stage + ': transport failure' + hint + '; diagnostics suppressed') from None
+        except (ValueError, TypeError, KeyError):
+            raise Error(stage + ': invalid response' + hint + '; response suppressed') from None
+
+
 class Setup:
     def __init__(self, args, run=b.command, environ=None):
         self.args, self.run = args, run
@@ -51,6 +125,7 @@ class Setup:
         if run is b.command:
             self.run = self.command
         self.root = args.state_dir
+        self.cloudflare = None
         self.credential_path = self.root / 'credentials.json'
         self.record_path = self.root / 'setup.json'
         self.binding = dict(repo=args.repo, reviewer=args.approval_reviewer, bucket=args.bucket,
@@ -135,7 +210,7 @@ class Setup:
     def invoke(self, args):
         # Only bootstrap's public operation reports are captured; never subprocess/provider diagnostics.
         with contextlib.redirect_stdout(io.StringIO()):
-            b.provision(args, self.run, self.env)
+            b.provision(args, self.run, self.env, cloudflare=self.cloudflare)
 
     def execute(self):
         with local.lock(self.root / 'setup-lock'):
@@ -168,7 +243,8 @@ class Setup:
         if not self.env.get('CLOUDFLARE_PROVISION_TOKEN'):
             self.env['CLOUDFLARE_PROVISION_TOKEN'] = secret('Cloudflare provisioning token')
         args = self.bootstrap_args()
-        cf = b.Cloudflare(self.env)
+        cf = DiagnosticCloudflare(self.env)
+        self.cloudflare = cf
         account, _ = b.discover(cf, args)
         args.state_account_id = account
         choices = self.choices(account)
