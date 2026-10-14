@@ -17,7 +17,7 @@ use bmux_web_renderer::{
 };
 
 #[test]
-fn metadata_availability_is_required_bounded_and_strict_in_v2() {
+fn metadata_availability_is_required_bounded_and_strict_in_v3() {
     use bmux_web_renderer::MetadataKind;
     let state = PresentationState::new(Rect::new(0, 0, 8, 3));
     let prepared = state.prepare(Damage::Full, |_| {}).expect("prepared");
@@ -126,7 +126,11 @@ fn selection_text_is_source_owned_bounded_and_utf8_checked() {
             "{field}"
         );
     }
-    for field in ["selection_text", "selection_text_available"] {
+    for field in [
+        "selection_text",
+        "selection_text_available",
+        "metadata_availability",
+    ] {
         let mut missing = value.clone();
         missing.as_object_mut().expect("object").remove(field);
         assert!(decode_json(&missing.to_string(), Limits::default()).is_err());
@@ -479,7 +483,14 @@ fn duplicate_fields_and_aggregate_native_byte_limits_are_rejected() {
     let mut state = PresentationState::new(Rect::new(0, 0, 8, 3));
     let frame = first(&mut state);
     let json = encode_json(&frame).expect("encode");
-    let duplicate = json.replacen("\"version\":2", "\"version\":2,\"version\":2", 1);
+    let version_field = format!("\"version\":{}", bmux_web_renderer::WIRE_VERSION);
+    assert!(json.contains(&version_field));
+    let duplicate = json.replacen(
+        &version_field,
+        &format!("{version_field},{version_field}"),
+        1,
+    );
+    assert_ne!(duplicate, json);
     assert!(decode_json(&duplicate, Limits::default()).is_err());
     let mut renderer = Renderer::new(
         Recording::default(),

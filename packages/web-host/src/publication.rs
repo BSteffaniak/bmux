@@ -54,7 +54,7 @@ impl SnapshotPublisher {
         binary: BinaryPresentation,
         resources: BTreeMap<String, Resource>,
     ) -> io::Result<()> {
-        self.publish_inner(revision, json, Some(binary), resources)
+        self.publish_inner(revision, json, Some(binary), resources, None)
     }
 }
 

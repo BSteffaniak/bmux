@@ -10,11 +10,13 @@ mod resolver;
 pub use resolver::{
     RELEASE_TAG, RENDERER_SHA256, WASM_BINDGEN_VERSION, resolve_assets, resolve_assets_with_cache,
 };
+mod document;
 mod http;
 #[cfg(feature = "presentation")]
 mod presentation;
 mod publication;
 mod subscription;
+pub use document::DocumentPublication;
 #[cfg(feature = "presentation")]
 pub use presentation::BrowserPublisher;
 pub use publication::{BinaryPresentation, Resource};
@@ -137,6 +139,7 @@ pub struct Snapshot {
     pub revision: u64,
     pub bytes: Arc<[u8]>,
     pub(crate) json_available: bool,
+    pub(crate) document: Option<document::EncodedDocument>,
     pub(crate) binary: Option<BinaryPresentation>,
     pub(crate) resources: std::collections::BTreeMap<String, Resource>,
     pub(crate) previous_resources: std::collections::BTreeMap<String, Resource>,
@@ -198,6 +201,7 @@ impl SnapshotPublisher {
             Some(bytes),
             None,
             std::collections::BTreeMap::new(),
+            None,
         )
     }
 
@@ -207,6 +211,7 @@ impl SnapshotPublisher {
         bytes: Option<Arc<[u8]>>,
         binary: Option<BinaryPresentation>,
         resources: std::collections::BTreeMap<String, Resource>,
+        document: Option<document::EncodedDocument>,
     ) -> io::Result<()> {
         if bytes
             .as_ref()
@@ -235,6 +240,7 @@ impl SnapshotPublisher {
         }
         let previous_resources = {
             let current = sender.borrow();
+            document::validate(document.as_ref(), current.as_deref())?;
             publication::validate(
                 self.max_bytes,
                 revision,
@@ -253,6 +259,7 @@ impl SnapshotPublisher {
                 revision,
                 bytes,
                 json_available,
+                document,
                 binary,
                 resources,
                 previous_resources,

@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 pub const RENDERER_SHA256: &str = env!("BMUX_WEB_RENDERER_SHA256");
 pub const WASM_BINDGEN_VERSION: &str = env!("BMUX_WEB_WASM_BINDGEN_VERSION");
 pub const RELEASE_TAG: &str = env!("BMUX_WEB_RELEASE_TAG");
-const FILES: [&str; 8] = [
+const FILES: [&str; 11] = [
     "index.html",
     "bootstrap.js",
     "canvas-viewer.js",
@@ -26,6 +26,9 @@ const FILES: [&str; 8] = [
     "style.css",
     "bmux_web_renderer.js",
     "bmux_web_renderer_bg.wasm",
+    "presenter-adapter.js",
+    "bmux_presenter.js",
+    "bmux_presenter_bg.wasm",
 ];
 const MANIFEST_LIMIT: u64 = 16 * 1024;
 const FILE_LIMIT: u64 = 8 * 1024 * 1024;
@@ -477,7 +480,7 @@ fn build_source(root: &Path, output: &Path, cache: &Path) -> io::Result<()> {
     verify_source(root)?;
     // scripts/dev.sh owns compiler and target selection. The shell reads the Nix-selected
     // target directory; never override CARGO_TARGET_DIR or call a PATH compiler directly.
-    let script = "set -eu; test -n \"$BMUX_NIX_TOOLCHAIN\"; test -n \"$CARGO_TARGET_DIR\"; cargo build --locked -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown; \"$1\" \"$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/bmux_web_renderer.wasm\" --target web --out-dir \"$2\"";
+    let script = "set -eu; test -n \"$BMUX_NIX_TOOLCHAIN\"; test -n \"$CARGO_TARGET_DIR\"; cargo build --locked -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown; cargo build --locked -p bmux_presenter --no-default-features --features wasm --target wasm32-unknown-unknown; \"$1\" \"$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/bmux_web_renderer.wasm\" --target web --out-dir \"$2\"; \"$1\" \"$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/bmux_presenter.wasm\" --target web --out-dir \"$2\"";
     run_dev(
         root,
         &[
@@ -504,6 +507,8 @@ fn build_source(root: &Path, output: &Path, cache: &Path) -> io::Result<()> {
         )?;
         durable_file(&output.join(name), &bytes)?;
     }
+    let adapter = read_regular(&root.join("scripts/presenter-adapter.js"), FILE_LIMIT)?;
+    durable_file(&output.join("presenter-adapter.js"), &adapter)?;
     Ok(())
 }
 fn utf8(path: &Path) -> io::Result<&str> {
@@ -746,6 +751,7 @@ mod tests {
             "flake.nix",
             "flake.lock",
             "scripts/dev.sh",
+            "scripts/presenter-adapter.js",
             ".cargo/config.toml",
         ] {
             let path = directory.path().join(name);
@@ -754,20 +760,61 @@ mod tests {
         }
         fs::write(
             directory.path().join("Cargo.toml"),
-            "[workspace.dependencies]\n",
+            "[workspace.dependencies]\nshared = { path = 'packages/shared' }\n",
         )
         .unwrap();
-        let renderer = directory.path().join("packages/web-renderer");
-        fs::create_dir_all(renderer.join("src")).unwrap();
-        fs::write(renderer.join("Cargo.toml"), "[dependencies]\n").unwrap();
-        fs::write(renderer.join("src/lib.rs"), b"original").unwrap();
+        for (name, manifest) in [
+            (
+                "web-renderer",
+                "[dependencies]\nshared = {workspace = true}\n",
+            ),
+            (
+                "presenter",
+                "[dependencies]\nrenderer = {path = '../web-renderer'}\nshared = {workspace = true}\n",
+            ),
+            ("shared", "[dependencies]\n"),
+        ] {
+            let package = directory.path().join("packages").join(name);
+            fs::create_dir_all(package.join("src")).unwrap();
+            fs::write(package.join("Cargo.toml"), manifest).unwrap();
+            fs::write(package.join("src/lib.rs"), b"original").unwrap();
+        }
+        let browser = directory.path().join("packages/web-renderer/browser");
+        fs::create_dir_all(&browser).unwrap();
+        fs::write(browser.join("bootstrap.js"), b"bootstrap").unwrap();
         let inputs = provenance::inputs(directory.path()).unwrap();
         let original = provenance::identity(directory.path(), &inputs).unwrap();
-        fs::write(renderer.join("src/lib.rs"), b"changed").unwrap();
-        assert_ne!(
+        for name in [
+            "packages/web-renderer/src/lib.rs",
+            "packages/presenter/src/lib.rs",
+            "packages/shared/src/lib.rs",
+            "packages/web-renderer/browser/bootstrap.js",
+            "scripts/presenter-adapter.js",
+        ] {
+            let path = directory.path().join(name);
+            assert!(inputs.contains(&PathBuf::from(name)), "{name}");
+            let previous = fs::read(&path).unwrap();
+            fs::write(&path, b"changed").unwrap();
+            assert_ne!(
+                original,
+                provenance::identity(directory.path(), &inputs).unwrap(),
+                "{name}"
+            );
+            fs::write(path, previous).unwrap();
+        }
+        assert_eq!(
             original,
             provenance::identity(directory.path(), &inputs).unwrap()
         );
+        use std::os::unix::fs::symlink;
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), directory.path().join("packages/escaped")).unwrap();
+        fs::write(
+            directory.path().join("packages/presenter/Cargo.toml"),
+            "[dependencies]\nescaped = {path = '../escaped'}\n",
+        )
+        .unwrap();
+        assert!(provenance::inputs(directory.path()).is_err());
         assert!(verify_source(directory.path()).is_err());
     }
     #[test]

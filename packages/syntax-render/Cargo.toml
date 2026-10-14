@@ -12,8 +12,14 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_tui = { workspace = true }
-syntect  = { workspace = true }
-two-face = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+syntect  = { workspace = true, features = ["regex-onig"] }
+two-face = { workspace = true, features = ["syntect-onig"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+syntect  = { workspace = true, features = ["regex-fancy"] }
+two-face = { workspace = true, features = ["syntect-fancy"] }
 
 [features]
 default          = []

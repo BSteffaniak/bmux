@@ -5,9 +5,66 @@ Native transport, clients, CLI, plugin loading, and product state are not depend
 The compositor remains the only authority; browsers consume its final buffer and
 shared cursor/hit/focus/selection/semantic/image/damage vocabulary.
 
-## Host API and wire v2
+## Opaque document adapter hook
 
-Wire v2 requires `unsupported_metadata`: a bounded list of the typed
+Fixed-frame bootstrap is unchanged by default. Explicit
+`?delivery=document&adapter=/application-adapter.js` selects generic full-document
+polling, not product-specific dispatch. The module exports:
+
+```js
+export async function createDocumentRenderer({canvas}) {
+  return {
+    capability: 'application.content.v1',
+    async prepare(document, viewport, {requestResource, signal}) {
+      // Product owns content parsing and shared BMUX component composition.
+      // viewport = {width, height, device_pixel_ratio} in CSS pixel units.
+      // document.content is a frozen byte array; revisions are decimal strings.
+      // await requestResource(id) fetches only a declared manifest resource and
+      // validates MIME, exact length, SHA-256, and aggregate cache bounds.
+      return {commit() {/* synchronous atomic pixels + metadata */},
+              discard() {/* release staged state */}};
+    },
+    reset() {},
+    free() {},
+  };
+}
+```
+
+Preparation must not mutate committed pixels/interaction state; failed preparation
+or commit preserves the last good output. `commit` is synchronous and atomic and
+`discard` releases staged resources. The adapter must honor the lifetime abort
+signal and own bounded local composition through the retained BMUX compositor,
+not an alternate browser layout/hit scene. Generations may replace content only
+through a successful transaction. Resize during preparation discards the obsolete
+transaction and prepares again; failed delivery repairs by fetching a full document.
+Generic bootstrap never interprets deck/navigation state. Document mode does not
+call `/view` or `/viewport`; browser geometry is independent per audience member.
+Fixed raster adapters must continue to declare partial/unsupported metadata rather
+than infer semantics or selection source text from pixels.
+
+`?inspect=1` additionally exposes `window.__bmuxDocumentInspection()` with only
+committed public identity, viewport, and an optional adapter `inspectCommittedFrame()`
+result. That hook must return public committed compositor/Canvas metadata only,
+never source content, credentials, or private product state. Failed transactions
+leave inspection unchanged; teardown removes the hook.
+
+`node packages/web-renderer/tests/document-bootstrap.js` executes the actual bootstrap
+with a mock product-neutral adapter at two independent widths, checking admission,
+resource integrity/cache, superseded layouts, commit failure/repair and teardown.
+The Rust bootstrap integration test runs this executable check as well.
+
+## Host API and wire v3
+
+Required `metadata_availability` contains clipped `{area, selection, semantics}`
+producer declarations from the retained compositor. Regional unavailability does
+not remove available outer prose metadata. `partial_metadata` includes categories
+unavailable in a region or surface; whole-frame `unsupported_metadata` stays
+reserved for adapters that supply no logical category at all. Declarations are
+bounded and viewport-validated. JSON v2 and binary `BMWP\\x02` are rejected; rebuild
+matching native/WASM consumers after this positional schema upgrade.
+
+
+Wire v3 requires `unsupported_metadata`: a bounded list of the typed
 `MetadataKind::{Selection, Semantics}` values, serialized as `selection` and
 `semantics`. V1 is explicitly rejected: it cannot establish whether an empty
 metadata scene means available-but-empty or absent producer support. Unknown,
@@ -23,9 +80,9 @@ logical content or reject cells/images merely because metadata is unavailable.
 the producer; no text is reconstructed from output cells. Use
 `with_selection_text(&source_map)?` to declare text available. Mandatory
 `selection_text_available` distinguishes absent source text from an empty supplied
-map. Prepared standalone frames with selection fragments initially declare text
-unavailable until this builder runs; standalone frames without fragments have a
-complete empty map. The example supplies its real title source and fragments.
+map. Prepared frames copy only source-map entries referenced by visible selection
+fragments; unrelated/private entries are never automatically projected. Missing
+source text remains explicitly unavailable; no text is inferred from raster cells. The example supplies its real title source and fragments.
 Keys are bounded to 1024 bytes; maps have at most 4096 entries, 1 MiB aggregate
 UTF-8 text and 64 KiB per value. Duplicate wire keys, missing referenced content,
 and out-of-range/non-UTF-8-boundary source/word/line ranges are rejected when text
@@ -115,8 +172,8 @@ already belong to the final buffer. Metadata is read-only; no remote input API.
 Image placements default to `Contain`; `Stretch` is explicit opt-in. Placements
 carry the policy and optional signed original
 allocation. Canvas containment uses browser cell pixel metrics before clipping;
-terminal adapters use their own cell metrics. Binary transport is `BMWP\\x02`
-(version 2): rebuild matching browser assets when upgrading from version 1,
+terminal adapters use their own cell metrics. Binary transport is `BMWP\\x03`
+(version 3): rebuild matching browser assets when upgrading from versions 1 or 2,
 rather than decoding the changed positional placement schema as v1.
 
 Serve exactly these assets at the same localhost origin:

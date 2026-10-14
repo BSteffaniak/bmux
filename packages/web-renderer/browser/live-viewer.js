@@ -7,7 +7,7 @@ export function revision(value) {
   return value;
 }
 export function validateStatus(value, now = Date.now()) {
-  if (value.protocol !== 1 || value.renderer !== 'bmwp-2') throw new Error('incompatible broadcast');
+  if (value.protocol !== 1 || value.renderer !== 'bmwp-3') throw new Error('incompatible broadcast');
   if (!['offline', 'starting', 'live', 'paused'].includes(value.state)) throw new Error('invalid state');
   revision(value.revision);
   if (value.epoch !== null && (typeof value.epoch !== 'string' || !UUID.test(value.epoch))) throw new Error('invalid epoch');
@@ -134,7 +134,7 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
         return boundedBytes(response, 8 * 1024 * 1024);
       }, true);
       if (bytes === null || !current()) return;
-      if (bytes.length < 5 || bytes[0] !== 66 || bytes[1] !== 77 || bytes[2] !== 87 || bytes[3] !== 80 || bytes[4] !== 2) {
+      if (bytes.length < 5 || bytes[0] !== 66 || bytes[1] !== 77 || bytes[2] !== 87 || bytes[3] !== 80 || bytes[4] !== 3) {
         throw new Error('incompatible presentation');
       }
       if (await viewer.present(bytes, current) && current()) {

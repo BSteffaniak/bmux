@@ -45,7 +45,7 @@ impl LinkedOwner {
         linked: LinkedRegistry,
     ) -> Result<Self, HostError> {
         let mut rich = crate::rich::RichAssets::prepare(assets).map_err(|_| HostError::Invalid)?;
-        rich.code = crate::rich::highlight(&deck);
+        rich.code = std::sync::Arc::new(crate::rich::highlight(&deck));
         Ok(Self::with_registry(deck, rich, linked))
     }
     #[cfg(test)]
@@ -382,7 +382,7 @@ impl Owner for LinkedOwner {
         assets: &[bmux_presenter_runtime::Asset],
     ) -> Result<Box<dyn Owner>, HostError> {
         let mut rich = crate::rich::RichAssets::prepare(assets).map_err(|_| HostError::Invalid)?;
-        rich.code = crate::rich::highlight(deck);
+        rich.code = std::sync::Arc::new(crate::rich::highlight(deck));
         let mut candidate = LinkedOwner::prepare_candidate(self, deck.clone(), rich)?;
         // Detached snapshots only: no candidate tasks or live command handles.
         candidate.demo_environment = self.demo_environment.clone();

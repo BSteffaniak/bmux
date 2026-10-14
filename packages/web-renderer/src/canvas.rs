@@ -494,7 +494,7 @@ impl CanvasRenderer {
             return Ok("null".to_owned());
         };
         serde_json::to_string(&serde_json::json!({ "revision": frame.revision().to_string(),
-            "generation": frame.generation(), "unsupported_metadata": frame.unsupported_metadata(), "partial_metadata": frame.partial_metadata(), "surfaces": frame.surfaces(), "hits": frame.hits(), "focus": frame.focus(), "focus_scope": frame.focus_scope(),
+            "generation": frame.generation(), "unsupported_metadata": frame.unsupported_metadata(), "partial_metadata": frame.partial_metadata(), "surfaces": frame.surfaces(), "metadata_availability": frame.metadata_availability(), "hits": frame.hits(), "focus": frame.focus(), "focus_scope": frame.focus_scope(),
             "selection": frame.selection(), "selection_text": frame.selection_text(), "selection_text_available": frame.selection_text_available(), "semantics": frame.semantics() })).map_err(error)
     }
     pub fn reset(&mut self) -> Result<(), JsValue> {

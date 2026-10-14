@@ -1,6 +1,6 @@
 //! Compact presentation protocol, shared by native and WASM consumers.
 //!
-//! `BMWP\x02` freezes field order and enum indices below. Changing these types,
+//! `BMWP\x03` freezes field order and enum indices below. Changing these types,
 //! or the positional TUI metadata projection, requires a new binary version.
 //! Rows retain every cell, including explicit wide continuations. This is an
 //! output projection, not a compositor or an authoritative state installer.
@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{BrowserFrame, DecodeError, Limits};
 
-pub const BINARY_WIRE_VERSION: u8 = 2;
-const MAGIC: &[u8; 5] = b"BMWP\x02";
+pub const BINARY_WIRE_VERSION: u8 = 3;
+const MAGIC: &[u8; 5] = b"BMWP\x03";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Immutable content-addressed image payload; placement keys are independent.

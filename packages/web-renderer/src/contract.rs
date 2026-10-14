@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
 
 /// Full-snapshot wire version. Unknown versions are never guessed.
-pub const WIRE_VERSION: u32 = 2;
+pub const WIRE_VERSION: u32 = 3;
 
 /// Producer metadata that is not supplied by this output projection.
 /// An empty scene alone never establishes availability.
@@ -80,6 +80,15 @@ pub struct SurfaceProvenance {
     pub semantics_available: bool,
 }
 
+/// Clipped compositor declaration of regional metadata availability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataAvailability {
+    pub area: Rect,
+    pub selection: bool,
+    pub semantics: bool,
+}
+
 /// A directional snapshot of shared TUI output, not a second compositor.
 /// Full cells and reconciled images allow repair after any dropped frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,8 +97,9 @@ pub struct BrowserFrame {
     version: u32,
     revision: u64,
     generation: String,
-    // Required in v2: v1 cannot establish producer metadata availability.
+    // Required in v3: v1 cannot establish producer metadata availability.
     unsupported_metadata: Vec<MetadataKind>,
+    metadata_availability: Vec<MetadataAvailability>,
     #[serde(default)]
     surfaces: Vec<SurfaceProvenance>,
     buffer: Buffer,
@@ -142,49 +152,51 @@ impl BrowserFrame {
         revision: u64,
         prepared: &PreparedPresentation,
     ) -> Result<Self, DecodeError> {
-        let selection_available = prepared
-            .metadata_availability()
+        let selection_text: BTreeMap<_, _> = prepared
+            .selection_text()
             .iter()
-            .all(|region| region.selection);
-        let semantics_available = prepared
-            .metadata_availability()
+            .filter(|(id, _)| {
+                prepared
+                    .selection()
+                    .fragments()
+                    .iter()
+                    .any(|fragment| &fragment.content_id == *id)
+            })
+            .map(|(id, text)| (id.clone(), text.clone()))
+            .collect();
+        let selection_text_available = prepared
+            .selection()
+            .fragments()
             .iter()
-            .all(|region| region.semantics);
+            .all(|fragment| selection_text.contains_key(&fragment.content_id));
         let frame = Self {
             version: WIRE_VERSION,
             revision,
             generation: generation.to_owned(),
-            unsupported_metadata: {
-                let mut unsupported = Vec::new();
-                if !selection_available {
-                    unsupported.push(MetadataKind::Selection);
-                }
-                if !semantics_available {
-                    unsupported.push(MetadataKind::Semantics);
-                }
-                unsupported
-            },
+            unsupported_metadata: Vec::new(),
+            metadata_availability: prepared
+                .metadata_availability()
+                .iter()
+                .map(|region| MetadataAvailability {
+                    area: region.area,
+                    selection: region.selection,
+                    semantics: region.semantics,
+                })
+                .collect(),
             surfaces: Vec::new(),
             buffer: prepared.buffer().clone(),
             cursor: prepared.cursor(),
             hits: prepared.hits().clone(),
             focus_scope: prepared.focus_scope().cloned(),
             focus: prepared.focus().clone(),
-            // The wire's unsupported flags are global. Conservatively omit
-            // the whole category here, without modifying composer metadata.
-            selection: if selection_available {
-                prepared.selection().clone()
+            selection: prepared.selection().clone(),
+            selection_text_available,
+            selection_text: if selection_text_available {
+                selection_text
             } else {
-                SelectionScene::new()
+                BTreeMap::new()
             },
-            selection_text_available: selection_available
-                && prepared.selection().fragments().is_empty(),
-            selection_text: BTreeMap::new(),
-            semantics: if semantics_available {
-                prepared.semantics().clone()
-            } else {
-                SemanticScene::new()
-            },
+            semantics: prepared.semantics().clone(),
             image_scene: prepared.image_scene().clone(),
             damage: prepared.damage().clone(),
         };
@@ -231,22 +243,33 @@ impl BrowserFrame {
     pub fn partial_metadata(&self) -> Vec<MetadataKind> {
         let mut partial = Vec::new();
         if !self.unsupported_metadata.contains(&MetadataKind::Selection)
-            && self
+            && (self
                 .surfaces
                 .iter()
                 .any(|surface| !surface.selection_available)
+                || self
+                    .metadata_availability
+                    .iter()
+                    .any(|region| !region.selection))
         {
             partial.push(MetadataKind::Selection);
         }
         if !self.unsupported_metadata.contains(&MetadataKind::Semantics)
-            && self
+            && (self
                 .surfaces
                 .iter()
                 .any(|surface| !surface.semantics_available)
+                || self
+                    .metadata_availability
+                    .iter()
+                    .any(|region| !region.semantics))
         {
             partial.push(MetadataKind::Semantics);
         }
         partial
+    }
+    pub fn metadata_availability(&self) -> &[MetadataAvailability] {
+        &self.metadata_availability
     }
     pub fn surfaces(&self) -> &[SurfaceProvenance] {
         &self.surfaces
@@ -327,6 +350,13 @@ impl BrowserFrame {
         let area = self.buffer.area();
         valid_rect(area)?;
         let count = usize::from(area.width) * usize::from(area.height);
+        if self.metadata_availability.len() > limits.regions {
+            return Err(DecodeError::Limit("metadata availability"));
+        }
+        for region in &self.metadata_availability {
+            valid_rect(region.area)?;
+            within(region.area, area)?;
+        }
         if self.surfaces.len() > limits.regions {
             return Err(DecodeError::Limit("surface provenance"));
         }
@@ -680,14 +710,16 @@ pub fn encode_json(frame: &BrowserFrame) -> Result<String, DecodeError> {
 
 #[cfg(test)]
 mod metadata_availability_tests {
-    use super::{BrowserFrame, MetadataKind};
+    use super::{
+        BrowserFrame, Limits, MetadataAvailability, MetadataKind, decode_json, encode_json,
+    };
     use bmux_tui::{
         damage::Damage, geometry::Rect, paint::LocalRect, presentation::PresentationState,
     };
 
     #[test]
-    fn unavailable_regions_omit_mixed_metadata_only_from_wire_projection() {
-        use bmux_tui::selection::{SelectionScope, plain_text_fragments};
+    fn unavailable_regions_preserve_outer_metadata_and_only_public_source_text() {
+        use bmux_tui::selection::{SelectionContentId, SelectionScope, plain_text_fragments};
         use bmux_tui::semantic::SemanticRegion;
         let state = PresentationState::new(Rect::new(0, 0, 8, 4));
         let prepare = |unavailable| {
@@ -706,37 +738,79 @@ mod metadata_availability_tests {
                 })
                 .unwrap();
             prepared
-                .set_selection_text([("source".into(), "hi".to_owned())].into())
+                .set_selection_text(
+                    [
+                        ("source".into(), "hi".to_owned()),
+                        ("private".into(), "PRIVATE-NOTES-NEVER-PUBLISH".to_owned()),
+                    ]
+                    .into(),
+                )
                 .unwrap();
             prepared
         };
         let complete = prepare(false);
-        let base = BrowserFrame::from_prepared(1, &complete)
-            .unwrap()
-            .with_selection_text(complete.selection_text())
-            .unwrap();
+        let base = BrowserFrame::from_prepared(1, &complete).unwrap();
         let partial = prepare(true);
         let frame = BrowserFrame::from_prepared(2, &partial).unwrap();
+        assert!(frame.unsupported_metadata().is_empty());
         assert_eq!(
-            frame.unsupported_metadata(),
-            &[MetadataKind::Selection, MetadataKind::Semantics]
+            frame.partial_metadata(),
+            vec![MetadataKind::Selection, MetadataKind::Semantics]
         );
-        assert!(frame.selection().scopes().is_empty());
-        assert!(frame.selection().fragments().is_empty());
-        assert!(frame.selection_text().is_empty());
-        assert!(!frame.selection_text_available());
-        assert!(frame.semantics().regions().is_empty());
-        assert!(!partial.selection().fragments().is_empty());
-        assert!(!partial.selection_text().is_empty());
-        assert!(!partial.semantics().regions().is_empty());
-        let full = crate::encode_binary(&frame).unwrap();
-        assert_eq!(crate::decode_binary(&full, None).unwrap(), frame);
+        assert_eq!(frame.selection(), partial.selection());
+        assert_eq!(frame.semantics(), partial.semantics());
+        assert_eq!(frame.selection_text().len(), 1);
+        assert_eq!(
+            frame.selection_text()[&SelectionContentId::new("source")],
+            "hi"
+        );
+        assert!(frame.selection_text_available());
+        assert_eq!(
+            frame.metadata_availability(),
+            &[MetadataAvailability {
+                area: Rect::new(2, 1, 3, 2),
+                selection: false,
+                semantics: false,
+            }]
+        );
+        let json = encode_json(&frame).unwrap();
+        assert!(!json.contains("PRIVATE-NOTES-NEVER-PUBLISH"));
+        assert!(!json.contains("private"));
+        assert_eq!(decode_json(&json, Limits::default()).unwrap(), frame);
+        let encoded = crate::encode_binary(&frame).unwrap();
+        assert_eq!(crate::decode_binary(&encoded, None).unwrap(), frame);
+        assert!(
+            !encoded
+                .windows(b"PRIVATE-NOTES-NEVER-PUBLISH".len())
+                .any(|bytes| bytes == b"PRIVATE-NOTES-NEVER-PUBLISH")
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("metadata_availability");
+        assert!(decode_json(&value.to_string(), Limits::default()).is_err());
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value["metadata_availability"] = serde_json::json!(vec![
+            MetadataAvailability {
+                area: Rect::new(2, 1, 3, 2),
+                selection: false,
+                semantics: false,
+            };
+            Limits::default().regions + 1
+        ]);
+        assert!(decode_json(&value.to_string(), Limits::default()).is_err());
+        for invalid in [
+            serde_json::json!([{ "area": {"x": 8, "y": 0, "width": 1, "height": 1}, "selection": false, "semantics": false }]),
+            serde_json::json!([{ "area": {"x": 2, "y": 1, "width": 3, "height": 2}, "selection": false }]),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            value["metadata_availability"] = invalid;
+            assert!(decode_json(&value.to_string(), Limits::default()).is_err());
+        }
         let delta = crate::encode_delta(&frame, &base).unwrap();
         assert_eq!(crate::decode_binary(&delta, Some(&base)).unwrap(), frame);
-        let restored = BrowserFrame::from_prepared(3, &complete)
-            .unwrap()
-            .with_selection_text(complete.selection_text())
-            .unwrap();
+        let restored = BrowserFrame::from_prepared(3, &complete).unwrap();
         let delta = crate::encode_delta(&restored, &frame).unwrap();
         assert_eq!(
             crate::decode_binary(&delta, Some(&frame)).unwrap(),
@@ -745,7 +819,7 @@ mod metadata_availability_tests {
     }
 
     #[test]
-    fn regional_unavailability_projects_through_existing_full_wire_contract() {
+    fn regional_unavailability_projects_through_full_wire_contract() {
         let mut state = PresentationState::new(Rect::new(0, 0, 8, 4));
         let prepared = state
             .prepare(Damage::Full, |cx| {
@@ -753,10 +827,12 @@ mod metadata_availability_tests {
             })
             .unwrap();
         let frame = BrowserFrame::from_prepared(1, &prepared).unwrap();
+        assert!(frame.unsupported_metadata().is_empty());
         assert_eq!(
-            frame.unsupported_metadata(),
-            &[MetadataKind::Selection, MetadataKind::Semantics]
+            frame.partial_metadata(),
+            vec![MetadataKind::Selection, MetadataKind::Semantics]
         );
+        assert_eq!(frame.metadata_availability().len(), 1);
         let encoded = crate::encode_binary(&frame).unwrap();
         assert_eq!(crate::decode_binary(&encoded, None).unwrap(), frame);
         assert_eq!(
@@ -772,6 +848,8 @@ mod metadata_availability_tests {
             .unwrap();
         let hidden = BrowserFrame::from_prepared(2, &hidden).unwrap();
         assert!(hidden.unsupported_metadata().is_empty());
+        assert!(hidden.metadata_availability().is_empty());
+        assert!(hidden.partial_metadata().is_empty());
         let encoded = crate::encode_binary(&hidden).unwrap();
         assert_eq!(crate::decode_binary(&encoded, None).unwrap(), hidden);
     }

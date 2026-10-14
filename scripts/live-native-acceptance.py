@@ -122,7 +122,7 @@ class Harness:
 
     def frame(self):
         code, body, headers = self.http('presentation?epoch=' + str(self.status()['epoch']))
-        require(code == 200 and body.startswith(b'BMWP\x02'), 'complete BMWP2 audience frame missing')
+        require(code == 200 and body.startswith(b'BMWP\x03'), 'complete BMWP3 audience frame missing')
         return body, headers
 
     def inspect(self, expected, absent):

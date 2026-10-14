@@ -5,6 +5,42 @@ presentation snapshots. The optional `presentation` feature provides native rend
 Native compilation records source provenance only: it never compiles WASM. Web callers
 explicitly opt into first-use asset setup; terminal-only operation never needs setup.
 
+## Semantic document delivery
+
+`DocumentPublication { generation, revision, capability, content: Arc<[u8]> }`
+contains opaque product bytes; the host never parses them or owns navigation.
+`SnapshotPublisher::publish_document(transport_revision, document, resources)`
+atomically replaces content and its complete SHA-256 resource manifest. Transport
+revisions strictly increase. Document revisions are positive and strictly increase
+within a generation; changing capability requires a new generation. Failed admission
+preserves the previous publication. Fixed-frame APIs remain unchanged.
+
+`GET /document?version=1[&after=<transport revision>]` is authenticated by the same
+policy as snapshots. It returns `application/vnd.bmux.document-v1+json` and
+`X-Snapshot-Revision`. Full-only JSON schema:
+
+```json
+{"version":1,"publication_revision":"42","generation":"source-v1","revision":"7","capability":"application.content.v1","content":[123,125],"resources":[{"id":"<lowercase SHA-256>","mime_type":"image/png","length":123}]}
+```
+
+Both revisions are decimal strings, never JavaScript numbers. Content is a nonempty
+byte array; maximum source bytes are one quarter of the smaller of the configured
+feed limit and 16 MiB, bounding JSON byte-array expansion. The entire serialized
+envelope must also fit that smaller limit. Generation/capability are 1–128 ASCII
+alphanumeric characters or `._:-`. Resources retain the fixed transport's 8 MiB
+per resource, 1024 entries, and 32 MiB latest-plus-previous admission bounds.
+`/resource/<id>` remains the exact resource endpoint. A caught-up poll returns 204;
+wrong representation returns 406; closed sources return 503. Repair fetches a full
+document without `after`; there is no delta or independent publication queue.
+
+The generic index still defaults to fixed frames. Products explicitly announce
+`/?delivery=document&adapter=/application-adapter.js` (followed by the existing token
+fragment when applicable). Document bootstrap capability-checks a caller-provided
+same-origin module, locally reflows independent browser viewports, and never acquires
+or mutates a shared viewport lease. The explicit bundle allowlist includes the
+presenter adapter and existing presenter WASM crate as packaging assets only; no
+presentation semantics live in the host.
+
 ## First-use assets
 
 `resolve_assets(override_directory).await` returns a verified cached directory or

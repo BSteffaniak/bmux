@@ -7,8 +7,8 @@ import { validateSnapshot } from '../src/worker.js';
 
 // No inferred path or fabricated semantic fixture. Coordinator supplies real
 // encode_binary[_with_resources] output after the Rust build reservation.
-const path = process.env.BMWP2_FIXTURE;
-test('external Rust BMWP2 full snapshot survives real HTTP relay byte-for-byte', { skip: !path && 'set BMWP2_FIXTURE to Rust-produced binary' }, async () => {
+const path = process.env.BMWP3_FIXTURE;
+test('external Rust BMWP3 full snapshot survives real HTTP relay byte-for-byte', { skip: !path && 'set BMWP3_FIXTURE to Rust-produced binary' }, async () => {
   const bytes = new Uint8Array(await readFile(path));
   validateSnapshot(bytes);
   const key = 'isolated-cross-language-test';
@@ -18,7 +18,7 @@ test('external Rust BMWP2 full snapshot survives real HTTP relay byte-for-byte',
   const url = `${running.url}/api/live/main`;
   const auth = { Authorization: `Bearer ${key}` };
   try {
-    const started = await fetch(`${url}/publisher/start`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify({ protocol: 1, renderer: 'bmwp-2', publisher_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }) });
+    const started = await fetch(`${url}/publisher/start`, { method: 'POST', headers: { ...auth, 'Content-Type': 'application/json' }, body: JSON.stringify({ protocol: 1, renderer: 'bmwp-3', publisher_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }) });
     assert.equal(started.status, 200);
     const { epoch } = await started.json();
     const uploaded = await fetch(`${url}/publisher/frame`, { method: 'PUT', headers: { ...auth, 'X-Bmux-Epoch': epoch, 'X-Bmux-Revision': '1', 'Content-Type': 'application/octet-stream' }, body: bytes });

@@ -70,7 +70,7 @@ impl Relay {
     pub async fn start(&mut self) -> Result<(), &'static str> {
         let url = self.base.join("start").map_err(|_| "invalid_endpoint")?;
         let mut response = self.client.post(url).bearer_auth(&self.key)
-            .json(&serde_json::json!({"protocol":1,"renderer":"bmwp-2","publisher_id":self.publisher}))
+            .json(&serde_json::json!({"protocol":1,"renderer":"bmwp-3","publisher_id":self.publisher}))
             .send().await.map_err(|_| "relay_unreachable")?;
         if response.status() != reqwest::StatusCode::OK {
             return Err("relay_rejected");
@@ -83,7 +83,7 @@ impl Relay {
             bytes.extend_from_slice(&chunk);
         }
         let started: Started = serde_json::from_slice(&bytes).map_err(|_| "relay_protocol")?;
-        if started.protocol != 1 || started.renderer != "bmwp-2" || started.lease_ms != 15_000 {
+        if started.protocol != 1 || started.renderer != "bmwp-3" || started.lease_ms != 15_000 {
             return Err("relay_protocol");
         }
         self.epoch = Some(started.epoch);

@@ -39,7 +39,7 @@ def smoke(url):
             return body
     for path in ('/api/live/main/health', '/api/live/main/status'):
         data = json.loads(get(path, 4096))
-        if data.get('protocol') != 1 or data.get('renderer') != 'bmwp-2':
+        if data.get('protocol') != 1 or data.get('renderer') != 'bmwp-3':
             raise ValueError('Unsupported public protocol')
         if path.endswith('/status') and data.get('state') not in ('offline', 'starting', 'live', 'paused'):
             raise ValueError('Unsupported public state')
@@ -50,7 +50,7 @@ def smoke(url):
     base = next(iter(parser.bases))
     manifest = json.loads(get(base + 'manifest.json', 8192))
     if (manifest.get('schema') != 1 or manifest.get('protocol') != 1 or
-            manifest.get('renderer') != 'bmwp-2' or manifest.get('bundle_sha256') != base.split('/')[2]):
+            manifest.get('renderer') != 'bmwp-3' or manifest.get('bundle_sha256') != base.split('/')[2]):
         raise ValueError('Unsupported asset manifest')
     required = {'live-page.js', 'live-viewer.js', 'canvas-viewer.js',
                 'bmux_web_renderer.js', 'bmux_web_renderer_bg.wasm'}

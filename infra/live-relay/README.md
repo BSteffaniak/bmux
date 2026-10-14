@@ -62,14 +62,14 @@ JS, CSS, WASM, images and fonts, maximum 256 entries/32 MiB aggregate/16 MiB per
 asset. Symlinks and traversal are rejected; no arbitrary filesystem or SPA/API
 fallback. Viewer and API share one origin; CSP limits connections to that origin.
 
-Example real workflow (use a Rust-produced self-contained BMWP2 snapshot):
+Example real workflow (use a Rust-produced self-contained BMWP3 snapshot):
 
 ```sh
 base=http://127.0.0.1:8787/api/live/main
 # $TEST_KEY contains the isolated test bearer, not a production credential.
 curl --fail "$base/publisher/start" -H "Authorization: Bearer $TEST_KEY" \
   -H 'Content-Type: application/json' \
-  --data '{"protocol":1,"renderer":"bmwp-2","publisher_id":"11111111-1111-4111-8111-111111111111"}'
+  --data '{"protocol":1,"renderer":"bmwp-3","publisher_id":"11111111-1111-4111-8111-111111111111"}'
 # Set $EPOCH to the returned UUID, and $FIXTURE to actual encode_binary output.
 curl --fail -X PUT "$base/publisher/frame" -H "Authorization: Bearer $TEST_KEY" \
   -H "X-Bmux-Epoch: $EPOCH" -H 'X-Bmux-Revision: 1' \
@@ -89,10 +89,10 @@ to break local rendering. Those protections are outside the relay's authority.
 cd infra/live-relay
 npm test
 # Coordinator supplies this path after generating a real Rust full snapshot:
-BMWP2_FIXTURE=/absolute/path/to/actual-snapshot.bmwp npm test
+BMWP3_FIXTURE=/absolute/path/to/actual-snapshot.bmwp npm test
 ```
 
-Without `BMWP2_FIXTURE`, only the explicitly external cross-language test skips;
+Without `BMWP3_FIXTURE`, only the explicitly external cross-language test skips;
 all offline state-machine and real HTTP adapter tests run. Tests allocate ephemeral
 loopback ports and temporary isolated state, never a live daemon/runtime. The
 external fixture test admits and uploads actual Rust bytes and compares the complete

@@ -47,7 +47,7 @@ def main():
     version = (site / 'live-assets/current-version').read_text().strip()
     assets = site / 'live-assets' / version
     frame = args.fixture.read_bytes()
-    assert frame.startswith(b'BMWP\x02')
+    assert frame.startswith(b'BMWP\x03')
     module_path = f'/live-assets/{version}/live-page.js'
     generated_pages = list(site.rglob('*.html'))
     assert generated_pages
@@ -169,7 +169,7 @@ def main():
                     return json.load(response) if response.status == 200 else None
 
             def start():
-                return publish('start', {'protocol': 1, 'renderer': 'bmwp-2',
+                return publish('start', {'protocol': 1, 'renderer': 'bmwp-3',
                                         'publisher_id': str(uuid.uuid4())})['epoch']
 
             def visible():

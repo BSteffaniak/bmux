@@ -302,11 +302,14 @@ mod tests {
             crate::decode_json(&json, limits),
             Err(DecodeError::Limit(_))
         ));
-        let unknown = json.replace("\"version\":2", "\"version\":42");
-        assert_eq!(
-            crate::decode_json(&unknown, Limits::default()),
-            Err(DecodeError::Version)
-        );
+        let mut versioned: serde_json::Value = serde_json::from_str(&json).expect("JSON");
+        for version in [crate::WIRE_VERSION + 1, 2] {
+            versioned["version"] = version.into();
+            assert_eq!(
+                crate::decode_json(&versioned.to_string(), Limits::default()),
+                Err(DecodeError::Version)
+            );
+        }
         let mut value: serde_json::Value = serde_json::from_str(&json).expect("JSON");
         value["buffer"]["cells"][0]["width"] = 2.into();
         assert!(crate::decode_json(&value.to_string(), Limits::default()).is_err());

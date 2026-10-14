@@ -21,7 +21,7 @@ spec.loader.exec_module(public)
 def run(assets, frame):
     # Frame comes from the real Rust renderer/example, never a fabricated fixture.
     payload = frame.read_bytes()
-    if not payload.startswith(b'BMWP\x02') or not 0 < len(payload) <= 8 * 1024 * 1024:
+    if not payload.startswith(b'BMWP\x03') or not 0 < len(payload) <= 8 * 1024 * 1024:
         raise ValueError('Supply a real supported bounded native presentation')
     root = Path(__file__).resolve().parent.parent
     with tempfile.TemporaryDirectory(prefix='bmux-live-isolated-') as directory:
@@ -61,7 +61,7 @@ def run(assets, frame):
                 except urllib.error.HTTPError as error:
                     return error.code, b'', error.headers
             status, body, _ = request('publisher/start', 'POST', json.dumps({
-                'protocol': 1, 'renderer': 'bmwp-2', 'publisher_id': str(uuid.uuid4())}).encode(), True)
+                'protocol': 1, 'renderer': 'bmwp-3', 'publisher_id': str(uuid.uuid4())}).encode(), True)
             if status != 200:
                 raise ValueError('Publisher start failed')
             epoch = json.loads(body)['epoch']
@@ -98,7 +98,7 @@ def run(assets, frame):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--assets', type=Path, required=True, help='Generated immutable SHA256 directory containing manifest.json')
-    parser.add_argument('--frame', type=Path, required=True, help='Real Rust-generated self-contained BMWP v2 bytes')
+    parser.add_argument('--frame', type=Path, required=True, help='Real Rust-generated self-contained BMWP v3 bytes')
     args = parser.parse_args()
     try:
         run(args.assets, args.frame)

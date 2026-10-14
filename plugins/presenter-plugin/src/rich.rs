@@ -6,17 +6,19 @@ use bmux_presenter_runtime::Asset;
 use bmux_tui::component::Element;
 use bmux_tui::image::ImagePayload;
 use std::collections::BTreeMap;
+use unicode_segmentation::UnicodeSegmentation;
 include!("highlight.rs");
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RichAssets {
-    pub images: BTreeMap<String, ImagePayload>,
-    pub code: BTreeMap<String, bmux_tui::text::Text>,
+    pub images: std::sync::Arc<BTreeMap<String, ImagePayload>>,
+    pub code: std::sync::Arc<BTreeMap<String, bmux_tui::text::Text>>,
 }
 impl RichAssets {
     pub fn prepare(assets: &[Asset]) -> Result<Self> {
         let mut images = BTreeMap::new();
         let mut decoded_bytes = 0_usize;
+        let mut encoded_bytes = 0_usize;
         ensure!(assets.len() <= 128, "asset count exceeds budget");
         for asset in assets {
             ensure!(asset.bytes.len() <= 8 * 1024 * 1024, "asset exceeds budget");
@@ -81,22 +83,37 @@ impl RichAssets {
                 decoded_bytes <= 64 * 1024 * 1024,
                 "decoded asset bundle exceeds memory budget"
             );
+            let prepared_bytes = match &payload {
+                ImagePayload::Png { bytes, .. } | ImagePayload::Pixels { bytes, .. } => bytes.len(),
+            };
+            ensure!(
+                prepared_bytes <= 8 * 1024 * 1024,
+                "prepared asset exceeds budget"
+            );
+            encoded_bytes = encoded_bytes
+                .checked_add(prepared_bytes)
+                .context("prepared asset size overflow")?;
+            ensure!(
+                encoded_bytes <= 32 * 1024 * 1024,
+                "prepared asset bundle exceeds budget"
+            );
             images.insert(asset.id.clone(), payload);
         }
         Ok(Self {
-            images,
-            code: BTreeMap::new(),
+            images: std::sync::Arc::new(images),
+            code: std::sync::Arc::new(BTreeMap::new()),
         })
     }
 }
 impl RichContent for RichAssets {
     fn build<'a>(&'a self, block: &'a Block) -> Option<Element<'a>> {
-        if let BlockKind::Code { .. } = &block.kind {
+        if let BlockKind::Code { source, .. } = &block.kind {
             return self.code.get(block.id.as_str()).map(|text| {
-                Element::new(
-                    bmux_tui::prelude::TextBlock::new(text.clone())
-                        .id(format!("code/{}", block.id.as_str())),
-                )
+                Element::new(PreparedCode {
+                    id: format!("code/{}", block.id.as_str()),
+                    source,
+                    text: text.clone(),
+                })
             });
         }
         let BlockKind::Image {
@@ -115,8 +132,151 @@ impl RichContent for RichAssets {
     }
 }
 
+/// Highlighting changes style only; authored UTF-8 offsets remain authoritative.
+struct PreparedCode<'a> {
+    id: String,
+    source: &'a str,
+    text: bmux_tui::text::Text,
+}
+impl bmux_tui::component::Component for PreparedCode<'_> {
+    fn layout(
+        &self,
+        constraints: bmux_tui::component::Constraints,
+        cx: &mut bmux_tui::component::LayoutCx,
+    ) -> bmux_tui::component::LayoutNode {
+        bmux_tui::prelude::TextBlock::new(self.text.clone())
+            .id(self.id.clone())
+            .wrap(bmux_tui::text::TextWrap::None)
+            .layout(constraints, cx)
+    }
+    fn paint(
+        &self,
+        layout: &bmux_tui::component::LayoutNode,
+        cx: &mut bmux_tui::paint::PaintCx<'_, '_>,
+    ) {
+        use bmux_tui::geometry::Rect;
+        use bmux_tui::selection::{SelectionFragment, SelectionScope};
+        use bmux_tui::semantic::SemanticRegion;
+        bmux_tui::prelude::TextBlock::new(self.text.clone())
+            .id(self.id.clone())
+            .wrap(bmux_tui::text::TextWrap::None)
+            .paint(layout, cx);
+        let scope = format!("{}/selection", self.id);
+        cx.push_selection_scope(SelectionScope::new(
+            scope.clone(),
+            Rect::new(
+                0,
+                0,
+                u16::try_from(layout.size.width).unwrap_or(u16::MAX),
+                u16::try_from(layout.size.height).unwrap_or(u16::MAX),
+            ),
+        ));
+        let mut offset = 0;
+        for (row, line) in self.source.split_inclusive('\n').enumerate() {
+            let mut column = 0_usize;
+            for (byte, grapheme) in line.trim_end_matches(['\r', '\n']).grapheme_indices(true) {
+                let width = bmux_tui::text_width::display_width(grapheme);
+                if width > 0
+                    && u64::try_from(row).unwrap_or(u64::MAX) < layout.size.height
+                    && u64::try_from(column.saturating_add(width)).unwrap_or(u64::MAX)
+                        <= layout.size.width
+                {
+                    let area = Rect::new(
+                        u16::try_from(column).unwrap_or(u16::MAX),
+                        u16::try_from(row).unwrap_or(u16::MAX),
+                        u16::try_from(width).unwrap_or(u16::MAX),
+                        1,
+                    );
+                    let start = offset + byte;
+                    cx.push_selection_fragment(SelectionFragment::new(
+                        scope.clone(),
+                        self.id.clone(),
+                        area,
+                        u64::try_from(start).unwrap_or(u64::MAX),
+                        start..start + grapheme.len(),
+                    ));
+                    cx.push_semantic(SemanticRegion::new(
+                        format!("{}/source/{start}", self.id),
+                        area,
+                        "code/source",
+                    ));
+                }
+                column = column.saturating_add(width);
+            }
+            offset += line.len();
+        }
+    }
+}
+
+pub(crate) fn code_selection_sources(
+    slide: &bmux_presenter::Slide,
+) -> BTreeMap<bmux_tui::selection::SelectionContentId, String> {
+    fn collect(
+        blocks: &[Block],
+        output: &mut BTreeMap<bmux_tui::selection::SelectionContentId, String>,
+    ) {
+        for block in blocks {
+            match &block.kind {
+                BlockKind::Code { source, .. } => {
+                    output.insert(format!("code/{}", block.id.as_str()).into(), source.clone());
+                }
+                BlockKind::Columns { columns } => {
+                    for column in columns {
+                        collect(&column.blocks, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut output = BTreeMap::new();
+    collect(&slide.blocks, &mut output);
+    output
+}
+
 #[cfg(test)]
 mod tests {
+    use bmux_tui::component::Component;
+
+    #[test]
+    fn prepared_code_provenance_uses_whole_graphemes_and_discards_clipped_cells() {
+        let source = "界e\u{301}Z";
+        let component = PreparedCode {
+            id: "code/test".into(),
+            source,
+            text: bmux_tui::text::Text::from(source),
+        };
+        let layout = component.layout(
+            Constraints::tight(bmux_tui::prelude::Size::new(4, 1)),
+            &mut LayoutCx::default(),
+        );
+        let scene = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 4, 1));
+        let prepared = scene
+            .prepare(bmux_tui::damage::Damage::Full, |cx| {
+                cx.with_child(
+                    0,
+                    0,
+                    bmux_tui::prelude::LocalRect::new(0, 0, 3, 1),
+                    |child| component.paint(&layout, child),
+                );
+            })
+            .unwrap();
+        let selected = prepared
+            .selection()
+            .fragments()
+            .iter()
+            .map(|fragment| &source[fragment.source_range.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(selected, ["界", "e\u{301}"]);
+        assert!(
+            prepared
+                .selection()
+                .fragments()
+                .iter()
+                .all(|fragment| fragment.area.right() <= 3)
+        );
+        assert!(!prepared.semantics().regions().is_empty());
+    }
     use super::*;
     use bmux_tui::component::{Constraints, LayoutCx};
     use bmux_tui::{geometry::Rect, terminal::Terminal};
@@ -181,7 +341,7 @@ mod tests {
     #[test]
     fn image_provider_contributes_real_image_scene() {
         let mut rich = RichAssets::default();
-        rich.images.insert(
+        std::sync::Arc::make_mut(&mut rich.images).insert(
             "asset".into(),
             ImagePayload::Pixels {
                 bytes: vec![255; 4],

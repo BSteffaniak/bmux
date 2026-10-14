@@ -88,7 +88,7 @@ fn real_http_lifecycle_refresh_fencing_and_shutdown() {
                     .to_owned()
             } else if route == "start" {
                 let json = format!(
-                    "{{\"protocol\":1,\"renderer\":\"bmwp-2\",\"epoch\":\"{epoch}\",\"lease_ms\":15000}}"
+                    "{{\"protocol\":1,\"renderer\":\"bmwp-3\",\"epoch\":\"{epoch}\",\"lease_ms\":15000}}"
                 );
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",

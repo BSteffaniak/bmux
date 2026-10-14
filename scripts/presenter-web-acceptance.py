@@ -7,6 +7,7 @@ Run only after coordinator grants the browser/runtime resource lock. Evidence is
 private, retained, and capability-safe in console output. Linux /proc required.
 """
 import argparse
+import base64
 import fcntl
 import importlib.util
 import json
@@ -47,6 +48,59 @@ SECRET = "PRESENTER_WEB_PRIVATE_9327"
 HIDDEN = "PRESENTER_WEB_UNREVEALED_9327"
 FIRST = "PRESENTER_WEB_FIRST_9327"
 LAST = "FINAL_SLIDE_COMPLETE_ZYXWVUT"
+REFLOW = "AUDIENCE_REFLOW_SENTENCE_9327"
+PRIVATE_CONFIG = "AUDIENCE_PRIVATE_CUSTOM_CONFIG_9327"
+
+# Instrument transport only: the product adapter, WASM layout, and Canvas commit
+# remain real. Faults affect one viewer; no test server or alternative renderer.
+DOCUMENT_PROBE = r"""
+(() => {
+ const original = window.fetch.bind(window);
+ window.__audienceProbe = {resources: {}, fault: null, faults: 0, failures: []};
+ const watch = () => {
+   const status = document.getElementById('status');
+   if (!status) return;
+   new MutationObserver(() => {
+     if (status.textContent.includes('retained')) window.__audienceProbe.failures.push(status.textContent);
+   }).observe(status, {childList:true, subtree:true, characterData:true});
+ };
+ addEventListener('DOMContentLoaded', watch, {once:true});
+ window.fetch = async (...args) => {
+   const path = new URL(typeof args[0] === 'string' ? args[0] : args[0].url, location.href).pathname;
+   const p = window.__audienceProbe;
+   if (path.startsWith('/resource/')) {
+     p.resources[path] = (p.resources[path] || 0) + 1;
+     if (p.fault === 'resource' && path.endsWith('0'.repeat(64))) return new Response('', {status:503});
+   }
+   const response = await original(...args);
+   if (path !== '/document' || response.status !== 200 || !p.fault) return response;
+   const value = await response.clone().json();
+   p.faults++;
+   const headers = new Headers(response.headers);
+   if (p.fault === 'invalid') value.content = [123];
+   if (p.fault === 'stale') {
+     value.publication_revision = (BigInt(value.publication_revision) + 100n).toString();
+     value.revision = '1';
+     headers.set('X-Snapshot-Revision', value.publication_revision);
+   }
+   if (p.fault === 'resource') {
+     const content = new TextDecoder().decode(new Uint8Array(value.content));
+     const image = value.resources.find(r => r.mime_type === 'image/png');
+     if (!image) throw Error('acceptance fixture has no PNG resource');
+     value.content = Array.from(new TextEncoder().encode(content.split(image.id).join('0'.repeat(64))));
+     image.id = '0'.repeat(64);
+   }
+   if (!p.baseline) {
+     const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(value.content));
+     p.candidate = {generation:value.generation, revision:value.revision,
+       publication_revision:value.publication_revision,
+       content_sha256:Array.from(new Uint8Array(digest), b=>b.toString(16).padStart(2,'0')).join('')};
+     p.baseline = {inspection:window.__bmuxDocumentInspection(), pixels:window.__audiencePixels()};
+   }
+   return new Response(JSON.stringify(value), {status:200, headers});
+ };
+})();
+"""
 
 
 class Mirror:
@@ -115,7 +169,9 @@ class Acceptance:
             self.env["BMUX_" + name.upper() + "_DIR"] = str(self.root / ("logs" if name == "log" else name))
         self.config = self.root / "config/bmux.toml"
         self.env.update(BMUX_CONFIG=str(self.config), BMUX_NO_BASE_CONFIG="1",
-                        BMUX_RUNTIME_NAME="default", BMUX_TARGET="local", TERM="xterm-256color")
+                        BMUX_RUNTIME_NAME="default", BMUX_TARGET="local", TERM="xterm-256color",
+                        BMUX_PRESENTER_WEB_DELIVERY="frame",
+                        BMUX_MERMAID_WORKER_PATH=str(args.mermaid_worker))
         self.command = [str(args.binary), "--runtime", "default", "--target", "local",
                         "--config", str(self.config)]
         self.processes, self.clients, self.cases = [], [], []
@@ -129,7 +185,9 @@ class Acceptance:
         (self.root / "presenter").write_text(self.credential)
         (self.root / "presenter").chmod(0o600)
         self.identity = {"binary": WEB.digest(args.binary), "browser": WEB.digest(args.browser),
-                         "assets": {name: WEB.digest(args.assets / name) for name in WEB.ASSETS},
+                         "mermaid_worker": WEB.digest(args.mermaid_worker),
+                         "assets": {name: WEB.digest(args.assets / name) for name in
+                                    (*WEB.ASSETS, "presenter-adapter.js", "bmux_presenter.js", "bmux_presenter_bg.wasm")},
                          "plugins": {str(p.relative_to(args.plugins)): WEB.digest(p)
                                      for p in sorted(args.plugins.rglob("*.so"))}}
         require(self.identity["plugins"], "no staged plugin libraries")
@@ -200,7 +258,16 @@ class Acceptance:
             return match[0].decode() if match else None
         return wait_for("presenter browser URL", ready, 30)
 
-    def browser(self, url, width=1000, height=720, rejected=False):
+    def browser(self, url, width=1000, height=720, rejected=False, delivery="frame"):
+        parts = urllib.parse.urlsplit(url)
+        query = dict(urllib.parse.parse_qsl(parts.query))
+        query["delivery"] = delivery
+        if delivery == "document":
+            query["inspect"] = "1"
+            query["adapter"] = "/presenter-adapter.js"
+        else:
+            query.pop("adapter", None)
+        url = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
         self.browser_sequence += 1
         profile = self.root / f"browser-{self.browser_sequence}"
         process = WEB.Process([str(self.args.browser), "--headless", "--disable-gpu", "--no-first-run",
@@ -215,18 +282,45 @@ class Acceptance:
             page = next(p for p in json.load(response) if p["type"] == "page" and p["url"] == "about:blank")
         client = WEB.CDP(page["webSocketDebuggerUrl"])
         self.clients.append(client)
+        events = []
+        receive = client._message
+        def receive_with_evidence():
+            message = receive()
+            if message.get("method") in ("Runtime.consoleAPICalled", "Runtime.exceptionThrown",
+                    "Network.responseReceived", "Network.loadingFailed", "Log.entryAdded"):
+                events.append(message)
+                del events[:-200]
+            return message
+        client._message = receive_with_evidence
+        client.call("Runtime.enable")
+        client.call("Log.enable")
         client.call("Page.enable")
         client.call("Network.enable")
         client.call("Emulation.setDeviceMetricsOverride", {"width": width, "height": height,
                     "deviceScaleFactor": 1, "mobile": False})
-        client.call("Page.navigate", {"url": url})
+        if delivery == "document":
+            client.call("Page.addScriptToEvaluateOnNewDocument", {"source": DOCUMENT_PROBE +
+                        "\nwindow.__audiencePixels = () => " + WEB.PIXELS + ";"})
+        navigation = client.call("Page.navigate", {"url": url})
         if rejected:
             wait_for("invalid capability rejected by browser", lambda: "Access denied" in
                      (client.evaluate("document.getElementById('status')?.textContent") or ""))
         else:
             try:
-                wait_for("WASM Canvas commit", lambda: (client.evaluate(WEB.PIXELS) or {}).get("status", "").startswith("Read-only · revision"))
+                prefix = "Read-only · responsive · revision" if delivery == "document" else "Read-only · revision"
+                wait_for("WASM Canvas commit", lambda: (client.evaluate(WEB.PIXELS) or {}).get("status", "").startswith(prefix))
             except RuntimeError:
+                diagnostic = {"requested_url": url, "navigation": navigation,
+                    "page": client.evaluate("({url:location.href,ready:document.readyState,"
+                        "title:document.title,html:document.documentElement.outerHTML})"),
+                    "events": events, "browser_output": process.bytes().decode(errors="replace")}
+                stem = self.root / f"browser-{self.browser_sequence}-failure"
+                stem.with_suffix(".json").write_text(json.dumps(diagnostic, indent=2))
+                try:
+                    screenshot = client.call("Page.captureScreenshot", {"format": "png"})
+                    stem.with_suffix(".png").write_bytes(base64.b64decode(screenshot["data"]))
+                except RuntimeError:
+                    pass
                 status = client.evaluate("document.getElementById('status')?.textContent") or "missing status"
                 status = re.sub(r"https?://[^\s]+|[a-fA-F0-9]{32,}", "[redacted]", status)
                 raise RuntimeError("WASM Canvas commit failed; profile " + str(self.browser_sequence)
@@ -274,6 +368,7 @@ class Acceptance:
  const response=await fetch('/presentation?version=1',{headers});
  if(!response.ok)throw Error('presentation rejected');
  const b=new Uint8Array(await response.arrayBuffer());
+ if(b.length<5||b[0]!==66||b[1]!==77||b[2]!==87||b[3]!==80||b[4]!==3)throw Error('expected BMWP wire v3');
  const refs=JSON.parse(m.CanvasRenderer.binary_resources(b));
  const bodies=[b];
  for(const r of refs){const p=await fetch('/resource/'+encodeURIComponent(r.id),{headers});
@@ -318,6 +413,343 @@ class Acceptance:
             area = frame["buffer"]["area"]
             return frame if (area["width"], area["height"]) == (metric["cols"], metric["rows"]) else None
         return wait_for("first browser measured geometry committed", matching)
+
+    def document(self, url, marker=FIRST):
+        origin, token = self.endpoint(url)
+        last_response = {}
+        def ready():
+            status, data = WEB.http(origin, "/document?version=1", token)
+            last_response.update(status=status, body=data.decode(errors="replace"))
+            require(status in (200, 503), "audience document rejected")
+            if status == 503:
+                return None
+            envelope = json.loads(data)
+            require(envelope.get("version") == 1 and
+                    envelope.get("capability") == "bmux.presenter.audience.v1",
+                    "audience document capability/version mismatch")
+            content = bytes(envelope["content"]).decode("utf-8")
+            if marker not in content:
+                return None
+            require(all(secret not in content for secret in (SECRET, HIDDEN, PRIVATE_CONFIG)),
+                    "private/unrevealed audience document data leaked")
+            public = json.loads(content)
+            def inspect(value):
+                if isinstance(value, dict):
+                    require("notes" not in value and value.get("config") is None and
+                            not ("kind" in value and value.get("source") is not None),
+                            "private audience notes/config/source exported")
+                    for child in value.values():
+                        inspect(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        inspect(child)
+            inspect(public)
+            ids = set()
+            for resource in envelope["resources"]:
+                require(re.fullmatch(r"[0-9a-f]{64}", resource["id"]) and resource["id"] not in ids,
+                        "document resource identity invalid/duplicate")
+                ids.add(resource["id"])
+                code, body = WEB.http(origin, "/resource/" + resource["id"], token)
+                require(code == 200 and len(body) == resource["length"] and
+                        WEB.hashlib.sha256(body).hexdigest() == resource["id"],
+                        "document resource bytes/length/hash mismatch")
+                require(not any(secret.encode() in body for secret in (SECRET, HIDDEN, PRIVATE_CONFIG)),
+                        "private data leaked through document resource")
+            require(WEB.http(origin, "/resource/" + self.hidden_resource_id, token)[0] == 404,
+                    "unrevealed resource accessible in document mode")
+            return envelope, public
+        try:
+            return wait_for("audience document: " + marker, ready)
+        except RuntimeError:
+            (self.root / "document-failure.private.json").write_text(json.dumps(last_response, indent=2))
+            for index, process in enumerate(self.processes):
+                (self.root / f"document-process-{index}.private.log").write_bytes(process.bytes())
+            raise
+
+    def inspection(self, client):
+        value = client.evaluate("window.__bmuxDocumentInspection?.() ?? null")
+        require(value and value.get("frame"), "committed audience Canvas inspection missing")
+        frame = value["frame"]
+        require(isinstance(frame.get("partial_metadata"), list) and
+                isinstance(frame.get("unsupported_metadata"), list),
+                "audience metadata availability not explicit")
+        require(not any(secret in json.dumps(value) for secret in (SECRET, HIDDEN, PRIVATE_CONFIG)),
+                "private data leaked through committed metadata")
+        return value
+
+    def local_scene(self, client):
+        value = self.inspection(client)
+        # Publication and Canvas revisions may advance without changing this view.
+        # Compare all geometry/source/focus metadata, not transport counters.
+        frame = dict(value["frame"])
+        frame.pop("revision", None)
+        return {"generation": value["generation"], "viewport": value["viewport"], "frame": frame}
+
+    def document_commit(self, client, envelope):
+        def ready():
+            value = client.evaluate("window.__bmuxDocumentInspection?.() ?? null")
+            pixels = client.evaluate(WEB.PIXELS)
+            if (value and value.get("frame") and pixels and pixels["ink"] and
+                    value["generation"] == envelope["generation"] and
+                    int(value["publication_revision"]) >= int(envelope["publication_revision"]) and
+                    int(value["revision"]) >= int(envelope["revision"])):
+                return self.inspection(client), pixels
+            return None
+        try:
+            result = wait_for("real audience document Canvas commit", ready)
+        except RuntimeError:
+            result = None
+            raise
+        finally:
+            diagnostic = {"expected": {key: envelope[key] for key in
+                          ("generation", "revision", "publication_revision")},
+                "inspection": client.evaluate("window.__bmuxDocumentInspection?.() ?? null"),
+                "pixels": client.evaluate(WEB.PIXELS),
+                "dom": client.evaluate("({url:location.href,status:document.getElementById('status')?.textContent,"
+                    "viewport:document.getElementById('viewport')?.getBoundingClientRect().toJSON(),"
+                    "canvases:Array.from(document.querySelectorAll('canvas'),c=>({id:c.id,width:c.width,"
+                    "height:c.height,hidden:c.hidden,rect:c.getBoundingClientRect().toJSON()}))})")}
+            client_id = self.clients.index(client) + 1
+            stem = self.root / f"document-commit-{client_id}-{envelope['publication_revision']}"
+            stem.with_suffix(".private.json").write_text(json.dumps(diagnostic, indent=2))
+            if result is None:
+                screenshot = client.call("Page.captureScreenshot", {"format": "png"})
+                stem.with_suffix(".png").write_bytes(base64.b64decode(screenshot["data"]))
+        return result
+
+    def semantic_audience(self):
+        # Dedicated source: long prose must wrap locally, code must remain native,
+        # and the same image identity appears on both navigable slides.
+        source = self.root / "responsive.md"
+        prose = " ".join([REFLOW + " local audience layout preserves every word."] * 4)
+        tail = " ".join(["AUDIENCE_SCROLL_TAIL_9327 keeps the local view scrollable."] * 60)
+        source.write_text(f"""<!-- bmux:slide-id first -->
+# {FIRST}
+
+<!-- bmux:block-id responsive-prose -->
+{prose}
+
+<!-- bmux:block-id responsive-code -->
+```rust
+let native_code_9327 = 42;
+```
+
+<!-- bmux:block-id responsive-first-image -->
+![red square](red.png)
+
+<!-- bmux:block-id counter -->
+<!-- bmux:component counter {{"private":"{PRIVATE_CONFIG}"}} -->
+
+<!-- bmux:block-id responsive-prose-tail -->
+{tail}
+
+<!-- bmux:notes -->
+{SECRET}
+<!-- bmux:end-notes -->
+<!-- bmux:pause -->
+{HIDDEN}
+![{HIDDEN}](hidden.png)
+
+---
+<!-- bmux:slide-id last -->
+# {LAST}
+
+<!-- bmux:block-id responsive-last-image -->
+![red square](red.png)
+
+<!-- bmux:block-id responsive-last-prose -->
+{prose}
+""")
+        process = self.spawn(["present", "play", source, "--presenter", "--web-assets", self.args.assets,
+                              "--web-port", "0", "--web-auth", "none"], mirror=True,
+                             env=dict(self.env, BMUX_PRESENTER_WEB_DELIVERY="document"))
+        url = self.url(process)
+        envelope, public = self.document(url)
+        require(public.get("surfaces"), "fixed custom raster fixture not exported")
+        # Surface revisions can advance; exact retained cells/images are checked below.
+        narrow = self.browser(url, 440, 1100, delivery="document")
+        wide = self.browser(url, 1100, 1100, delivery="document")
+        ni, np = self.document_commit(narrow, envelope)
+        wi, wp = self.document_commit(wide, envelope)
+        require(ni["viewport"] != wi["viewport"] and ni["frame"] != wi["frame"],
+                "simultaneous audiences did not compose distinct local layouts")
+        require(np["red"] > 0 and wp["red"] > 0, "native image missing in responsive Canvas")
+        for pixels in (np, wp):
+            require(abs((pixels["maxX"] - pixels["minX"]) -
+                        (pixels["maxY"] - pixels["minY"])) <= 2,
+                    "native PNG aspect ratio distorted")
+            require(abs((pixels["minX"] + pixels["maxX"]) / 2 - pixels["width"] / 2) < 20,
+                    "native PNG not centered in locally composed allocation")
+        require(np["minY"] > wp["minY"] and np["minX"] != wp["minX"],
+                "PNG placement did not follow locally wrapped prose/cell transforms")
+        # Selection/semantics are canonical source metadata, not OCR of cell pixels.
+        logical = json.dumps(wi["frame"])
+        require(REFLOW in logical and "native_code_9327" in logical,
+                "native prose/code missing from committed source metadata")
+        def prose_geometry(frame):
+            texts = frame.get("selection_text", {})
+            ids = {key for key, text in texts.items() if REFLOW in text}
+            require(len(ids) == 1, "wrap probe must identify exactly one visible source")
+            fragments = [fragment for fragment in frame["selection"]["fragments"]
+                         if fragment["content_id"] in ids]
+            require(fragments, "native prose source-linked geometry missing")
+            source = texts[next(iter(ids))].encode("utf-8")
+            covered = set()
+            spans = {}
+            for fragment in fragments:
+                bounds = fragment["source_range"]
+                covered.update(range(bounds["start"], bounds["end"]))
+                area = fragment["area"]
+                left, right = spans.get(area["y"], (area["x"], area["x"]))
+                spans[area["y"]] = min(left, area["x"]), max(right, area["x"] + area["width"])
+            require(all(index in covered for index, byte in enumerate(source) if not chr(byte).isspace()),
+                    "wrap probe source clipped or missing visible geometry")
+            width = max(right - left for left, right in spans.values())
+            return len(spans), width
+        nrows, nwidth = prose_geometry(ni["frame"])
+        wrows, wwidth = prose_geometry(wi["frame"])
+        require(nrows > wrows and nwidth < wwidth,
+                "native prose did not rewrap into more narrower visual rows")
+        require("selection" in wi["frame"]["partial_metadata"] and
+                "semantics" in wi["frame"]["partial_metadata"],
+                "embedded raster incorrectly advertises complete logical metadata")
+        counts = [c.evaluate("({...window.__audienceProbe.resources})") for c in (narrow, wide)]
+        require(all(counts) and all(all(n == 1 for n in count.values()) for count in counts),
+                "initial document resources missing or redundantly fetched")
+        wide_before = self.local_scene(wide)
+        narrow.call("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": 200, "y": 200,
+                    "deltaX": 0, "deltaY": 180})
+        wait_for("local audience scroll repaint", lambda:
+                 (narrow.evaluate(WEB.PIXELS) or {}).get("checksum") != np["checksum"])
+        require(self.local_scene(wide) == wide_before and
+                wide.evaluate(WEB.PIXELS)["checksum"] == wp["checksum"],
+                "one audience scroll rearranged another")
+        wide_focus = wide.evaluate("document.activeElement?.id")
+        narrow.evaluate("document.activeElement?.blur()")
+        narrow.call("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Tab", "code": "Tab",
+                    "windowsVirtualKeyCode": 9})
+        narrow.call("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Tab", "code": "Tab",
+                    "windowsVirtualKeyCode": 9})
+        wait_for("local Canvas focus", lambda: narrow.evaluate("document.activeElement?.id") == "bmux")
+        require(wide.evaluate("document.activeElement?.id") == wide_focus and
+                self.local_scene(wide) == wide_before, "audience focus crossed viewers")
+        narrow.call("Emulation.setDeviceMetricsOverride", {"width": 620, "height": 1100,
+                    "deviceScaleFactor": 1, "mobile": False})
+        wait_for("local audience resize", lambda:
+                 (narrow.evaluate("window.__bmuxDocumentInspection?.()") or {}).get("viewport") != ni["viewport"])
+        require(self.local_scene(wide) == wide_before, "one audience resize rearranged another")
+        unchanged, current = self.document(url)
+        require(current["state"] == public["state"] and current["deck"] == public["deck"] and
+                current["assets"] == public["assets"] and
+                [surface["frame"]["buffer"] for surface in current["surfaces"]] ==
+                [surface["frame"]["buffer"] for surface in public["surfaces"]] and
+                [surface["frame"]["image_scene"] for surface in current["surfaces"]] ==
+                [surface["frame"]["image_scene"] for surface in public["surfaces"]],
+                "browser layout mutated shared navigation or fixed producer cells/images")
+        require(process.child.poll() is None, "resize stopped native presenter lifecycle")
+        for client, count in zip((narrow, wide), counts):
+            require(client.evaluate("({...window.__audienceProbe.resources})") == count,
+                    "resource refetched on resize/scroll/focus")
+        # Invalid JSON, stale source revision, and resource failure must not move
+        # either visible pixels or canonical metadata past the last good scene.
+        for fault in ("invalid", "stale", "resource"):
+            before_scene = self.local_scene(narrow)
+            before = self.inspection(narrow)
+            pixels = narrow.evaluate(WEB.PIXELS)
+            narrow.evaluate("window.__audienceProbe.fault = " + json.dumps(fault) +
+                            "; window.__audienceProbe.faults = 0; window.__audienceProbe.failures = [];"
+                            " window.__audienceProbe.baseline = null; window.__audienceProbe.candidate = null")
+            process.send(b"\r\r")
+            latest, _ = self.document(url, LAST)
+            wait_for("injected document preparation failure", lambda:
+                     narrow.evaluate("window.__audienceProbe.faults") > 0 and
+                     narrow.evaluate("window.__audienceProbe.failures.length") > 0)
+            baseline = narrow.evaluate("window.__audienceProbe.baseline")
+            require(baseline and baseline["inspection"], "fault delivery baseline missing")
+            before = baseline["inspection"]
+            pixels = baseline["pixels"]
+            before_frame = dict(before["frame"])
+            before_frame.pop("revision", None)
+            before_scene = {"generation": before["generation"], "viewport": before["viewport"],
+                            "frame": before_frame}
+            after = self.inspection(narrow)
+            after_pixels = narrow.evaluate(WEB.PIXELS)
+            (self.root / f"fault-{fault}.private.json").write_text(json.dumps({
+                "before": before, "after": after, "before_pixels": pixels,
+                "after_pixels": after_pixels, "probe": narrow.evaluate("window.__audienceProbe")}, indent=2))
+            require(self.local_scene(narrow) == before_scene and
+                    after["generation"] == before["generation"] and
+                    after["publication_revision"] == before["publication_revision"] and
+                    after["revision"] == before["revision"] and
+                    after_pixels["checksum"] == pixels["checksum"],
+                    "failed document advanced committed cells/images/metadata")
+            self.document_commit(wide, latest)
+            narrow.evaluate("window.__audienceProbe.fault = null")
+            self.document_commit(narrow, latest)
+            require(narrow.evaluate(WEB.PIXELS)["red"] > 0,
+                    "recovery lost native image")
+            process.send(b"\x1b[D\x1b[D")
+            first, _ = self.document(url)
+            self.document_commit(narrow, first)
+            self.document_commit(wide, first)
+        for client, count in zip((narrow, wide), counts):
+            after = client.evaluate("({...window.__audienceProbe.resources})")
+            require(all(after.get(path) == number for path, number in count.items()),
+                    "cached image resource refetched on navigation/recovery")
+        self.stop(process, url)
+        self.passed("document audience: simultaneous local reflow/scroll/focus; shared navigation; "
+                    "fixed raster/privacy/partial metadata; cache; invalid/stale/resource recovery")
+
+    def semantic_mermaid(self):
+        source = self.root / "responsive-mermaid.md"
+        source.write_text(f"""# {FIRST}
+
+<!-- bmux:block-id prepared-diagram -->
+```mermaid
+flowchart LR
+  A[Native Mermaid] --> B[Prepared PNG]
+```
+
+<!-- bmux:notes -->
+{SECRET}
+<!-- bmux:end-notes -->
+""")
+        process = self.spawn(["present", "play", source, "--web-only", "--web-assets", self.args.assets,
+                              "--web-port", "0", "--web-auth", "none"],
+                             env=dict(self.env, BMUX_PRESENTER_WEB_DELIVERY="document"))
+        url = self.url(process)
+        envelope, public = self.document(url)
+        blocks = [block for slide in public["deck"]["slides"] for block in slide["blocks"]]
+        diagram = next((block for block in blocks if block["id"] == "prepared-diagram"), None)
+        require(diagram and diagram["kind"]["type"] == "image" and
+                diagram["kind"]["destination"] in public["assets"],
+                "loader did not substitute Mermaid with prepared image")
+        require(envelope["resources"] and
+                all(resource["mime_type"] == "image/png" for resource in envelope["resources"]),
+                "Mermaid exported source/SVG rather than prepared PNG")
+        narrow = self.browser(url, 440, 600, delivery="document")
+        wide = self.browser(url, 1100, 600, delivery="document")
+        _, small = self.document_commit(narrow, envelope)
+        _, large = self.document_commit(wide, envelope)
+        require(small["ink"] > 0 and large["ink"] > 0,
+                "prepared Mermaid image not painted in audience Canvas")
+        # Count genuinely colored pixels, excluding white text and dark background:
+        # this diagram's default node/edge palette must survive the real image path.
+        colored = """(()=>{const c=document.getElementById('bmux');
+ const d=c.getContext('2d').getImageData(0,0,c.width,c.height).data;let n=0;
+ for(let i=0;i<d.length;i+=4)if(Math.max(d[i],d[i+1],d[i+2])-Math.min(d[i],d[i+1],d[i+2])>20&&Math.max(d[i],d[i+1],d[i+2])>100)n++;
+ return n;})()"""
+        colored_counts = [client.evaluate(colored) for client in (narrow, wide)]
+        for index, (client, pixels, count) in enumerate(zip((narrow, wide), (small, large), colored_counts)):
+            (self.root / f"mermaid-{index}.private.json").write_text(json.dumps({
+                "inspection": self.inspection(client), "pixels": pixels, "colored_pixels": count,
+                "current_pixels": client.evaluate(WEB.PIXELS)}, indent=2))
+            screenshot = client.call("Page.captureScreenshot", {"format": "png"})
+            (self.root / f"mermaid-{index}.png").write_bytes(base64.b64decode(screenshot["data"]))
+        require(all(count > 100 for count in colored_counts),
+                "Mermaid prepared PNG missing from actual Canvas output")
+        self.stop(process, url)
+        self.passed("document Mermaid: explicit worker; loader PNG substitution; real Canvas in two widths")
 
     def play(self, mirror):
         argv = ["present", "play", self.deck, "--presenter", "--web-assets", self.args.assets,
@@ -403,7 +835,8 @@ class Acceptance:
         # A fragment-only Page.navigate does not reload bootstrap JavaScript.
         rejected.call("Page.navigate", {"url": "about:blank"})
         wait_for("rejected page unload", lambda: rejected.evaluate("location.href") == "about:blank")
-        rejected.call("Page.navigate", {"url": url})
+        frame_url = urllib.parse.urlunsplit(urllib.parse.urlsplit(url)._replace(query="delivery=frame"))
+        rejected.call("Page.navigate", {"url": frame_url})
         wait_for("auth rejection browser recovery", lambda: (rejected.evaluate(WEB.PIXELS) or {}).get("status", "").startswith("Read-only · revision"))
         client = self.browser(url)
         before = self.frame(url)
@@ -587,6 +1020,8 @@ class Acceptance:
         self.run_case(self.play, True)
         self.run_case(self.host)
         self.run_case(self.host, mirror=True)
+        self.run_case(self.semantic_audience)
+        self.run_case(self.semantic_mermaid)
         self.run_case(self.configuration)
         self.run_case(self.network, self.args.lan_address)
         if socket.has_ipv6:
@@ -634,14 +1069,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("binary", "plugins", "assets", "browser"):
         parser.add_argument("--" + name, type=lambda s: Path(s).resolve(strict=True), required=True)
+    parser.add_argument("--mermaid-worker", type=lambda s: Path(s).resolve(strict=True),
+                        help="explicit packaged worker; defaults to bmux-mermaid-worker beside --binary")
     parser.add_argument("--state-parent", type=Path, default=Path("/tmp"))
     parser.add_argument("--lan-address", required=True,
                         help="owned machine's non-loopback IPv4 address; required real LAN bind/browser test")
     args = parser.parse_args()
+    args.mermaid_worker = args.mermaid_worker or args.binary.with_name("bmux-mermaid-worker")
+    require(args.mermaid_worker.is_file() and os.access(args.mermaid_worker, os.X_OK),
+            "packaged Mermaid worker required; supply --mermaid-worker")
     require(args.binary.is_file() and os.access(args.binary, os.X_OK), "explicit bmux binary not executable")
     require(args.browser.is_file() and os.access(args.browser, os.X_OK), "explicit Chromium not executable")
     require(args.plugins.is_dir() and args.assets.is_dir(), "explicit staged directories required")
-    for name in WEB.ASSETS:
+    for name in (*WEB.ASSETS, "presenter-adapter.js", "bmux_presenter.js", "bmux_presenter_bg.wasm"):
         require((args.assets / name).is_file(), "missing coordinator-built WASM asset: " + name)
     import ipaddress
     address = ipaddress.IPv4Address(args.lan_address)

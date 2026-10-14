@@ -19,6 +19,158 @@ mod auth_tests;
 mod network_tests;
 
 #[tokio::test]
+async fn static_asset_queries_preserve_exact_paths_and_bootstrap_authentication() {
+    let (_directory, publisher, host) = host().await;
+    let address = host.address();
+    publisher.publish(1, Arc::from(b"{}".as_slice())).unwrap();
+    for (path, expected_path) in [
+        ("/?delivery=frame", "/"),
+        (
+            "/?delivery=document&adapter=/presenter-adapter.js&inspect=1",
+            "/",
+        ),
+        ("/bootstrap.js?v=3", "/bootstrap.js"),
+        (
+            "/bootstrap.js?adapter=%2Fpresenter-adapter.js",
+            "/bootstrap.js",
+        ),
+    ] {
+        // Static bootstrap stays publicly fetchable; capabilities remain in fragments.
+        let base = exchange(
+            address,
+            &request(address, "GET", expected_path, "wrong", ""),
+        )
+        .await;
+        let response = exchange(address, &request(address, "GET", path, "wrong", "")).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+        assert_eq!(response, base);
+    }
+    for path in [
+        "/../bootstrap.js?v=3",
+        "/%2e%2e/bootstrap.js?v=3",
+        "/%62ootstrap.js?v=3",
+        "//bootstrap.js?v=3",
+        "/missing.js?v=3",
+    ] {
+        let response = exchange(address, &request(address, "GET", path, "wrong", "")).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+    }
+    for path in [
+        "/?token=secret",
+        "/bootstrap.js?Token=secret",
+        "/?%74oken=secret",
+    ] {
+        let response = exchange(address, &request(address, "GET", path, "wrong", "")).await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{path}: {response}");
+        assert!(!response.contains("secret"));
+    }
+    let response = exchange(address, &request(address, "GET", "/snapshot", "wrong", "")).await;
+    assert!(response.starts_with("HTTP/1.1 401"));
+    let response = exchange(
+        address,
+        &request(
+            address,
+            "GET",
+            "/?delivery=frame",
+            "wrong",
+            "Origin: http://evil.example\r\n",
+        ),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 403"));
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn negotiated_document_is_atomic_and_repairs_latest_full() {
+    use crate::{DocumentPublication, Resource};
+    use sha2::Digest;
+    use std::collections::BTreeMap;
+    let (directory, mut config) = fixture();
+    config.limits.max_snapshot_bytes = 4096;
+    config.limits.poll_timeout = Duration::from_millis(25);
+    let (publisher, feed) = snapshot_feed(config.limits.max_snapshot_bytes).unwrap();
+    let host = start(config, feed).await.unwrap();
+    let _directory = directory;
+    let address = host.address();
+    let bearer = token(&host);
+    let resource = Resource {
+        bytes: Arc::from(b"opaque resource".as_slice()),
+        mime_type: "application/octet-stream".into(),
+    };
+    let id: String = sha2::Sha256::digest(&resource.bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let publish = |transport, revision| {
+        publisher.publish_document(
+            transport,
+            DocumentPublication {
+                generation: "source-v1".into(),
+                revision,
+                capability: "test.document.v1".into(),
+                content: Arc::from(b"opaque semantic bytes".as_slice()),
+            },
+            BTreeMap::from([(id.clone(), resource.clone())]),
+        )
+    };
+    publish(1, 7).unwrap();
+    assert!(publish(2, 7).is_err());
+    for transport in 2..=10 {
+        publish(transport, transport + 7).unwrap();
+    }
+    for path in ["/document?version=1", "/document?version=1&after=1"] {
+        let response = exchange(address, &request(address, "GET", path, &bearer, "")).await;
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("Content-Type: application/vnd.bmux.document-v1+json\r\n"));
+        assert!(response.contains("X-Snapshot-Revision: 10\r\n"));
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let value: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(value["publication_revision"], "10");
+        assert_eq!(value["revision"], "17");
+        assert_eq!(value["resources"][0]["id"], id);
+    }
+    let response = exchange(
+        address,
+        &request(address, "GET", "/document?version=1&after=10", &bearer, ""),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 204"));
+    for path in [
+        "/document",
+        "/document?version=2",
+        "/document?version=1&version=1",
+        "/document?version=1&after=-1",
+    ] {
+        let response = exchange(address, &request(address, "GET", path, &bearer, "")).await;
+        assert!(response.starts_with("HTTP/1.1 400"));
+    }
+    let response = exchange(
+        address,
+        &request(address, "GET", "/document?version=1", "wrong", ""),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 401"));
+    let response = exchange(
+        address,
+        &request(address, "GET", &format!("/resource/{id}"), &bearer, ""),
+    )
+    .await;
+    assert!(response.ends_with("opaque resource"));
+    // Legacy JSON is not substituted for semantic content, nor vice versa.
+    let response = exchange(address, &request(address, "GET", "/snapshot", &bearer, "")).await;
+    assert!(response.starts_with("HTTP/1.1 406"));
+    publisher.publish(11, Arc::from(b"{}".as_slice())).unwrap();
+    let response = exchange(
+        address,
+        &request(address, "GET", "/document?version=1", &bearer, ""),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 406"));
+    host.shutdown().await;
+}
+
+#[tokio::test]
 async fn negotiated_binary_resources_and_repair() {
     use crate::{BinaryPresentation, Resource};
     use sha2::Digest;

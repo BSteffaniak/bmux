@@ -36,9 +36,9 @@ class SmokeTests(unittest.TestCase):
         routes = {base + name: body for name, body in files.items()}
         routes.update({
             '/live': f'<script type="module" src="{base}live-page.js"></script>'.encode(),
-            '/api/live/main/health': json.dumps({'protocol': 1, 'renderer': 'bmwp-2'}).encode(),
-            '/api/live/main/status': json.dumps({'protocol': 1, 'renderer': 'bmwp-2', 'state': 'offline'}).encode(),
-            base + 'manifest.json': json.dumps({'schema': 1, 'protocol': 1, 'renderer': 'bmwp-2',
+            '/api/live/main/health': json.dumps({'protocol': 1, 'renderer': 'bmwp-3'}).encode(),
+            '/api/live/main/status': json.dumps({'protocol': 1, 'renderer': 'bmwp-3', 'state': 'offline'}).encode(),
+            base + 'manifest.json': json.dumps({'schema': 1, 'protocol': 1, 'renderer': 'bmwp-3',
                                                 'bundle_sha256': version, 'files': entries}).encode(),
         })
         class Opener:
@@ -70,7 +70,7 @@ class SmokeTests(unittest.TestCase):
 
     def test_protocol_rejected(self):
         routes, opener, _ = self.fixture()
-        routes['/api/live/main/health'] = b'{"protocol":2,"renderer":"bmwp-2"}'
+        routes['/api/live/main/health'] = b'{"protocol":2,"renderer":"bmwp-3"}'
         with patch.object(m.urllib.request, 'build_opener', return_value=opener):
             with self.assertRaises(ValueError):
                 m.smoke('https://test.example')

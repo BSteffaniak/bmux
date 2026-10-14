@@ -15,7 +15,7 @@ bmux_mermaid_render          = { workspace = true }
 bmux_syntax_render           = { workspace = true }
 bmux_tui                     = { workspace = true }
 hyperchad_color              = { workspace = true }
-hyperchad_markdown           = { workspace = true, features = ["syntax-highlighting"] }
+hyperchad_markdown           = { workspace = true }
 hyperchad_transformer        = { workspace = true }
 hyperchad_transformer_models = { workspace = true }
 pulldown-cmark               = { workspace = true }
@@ -26,6 +26,9 @@ url                          = { workspace = true }
 [dev-dependencies]
 insta         = { workspace = true }
 unicode-width = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+hyperchad_markdown = { workspace = true, features = ["syntax-highlighting"] }
 
 [features]
 default          = []

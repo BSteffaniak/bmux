@@ -56,6 +56,21 @@ impl Asset {
                 ContentType::JavaScript,
             ),
             (
+                "/presenter-adapter.js",
+                "presenter-adapter.js",
+                ContentType::JavaScript,
+            ),
+            (
+                "/bmux_presenter.js",
+                "bmux_presenter.js",
+                ContentType::JavaScript,
+            ),
+            (
+                "/bmux_presenter_bg.wasm",
+                "bmux_presenter_bg.wasm",
+                ContentType::Wasm,
+            ),
+            (
                 "/bmux_web_renderer_bg.wasm",
                 "bmux_web_renderer_bg.wasm",
                 ContentType::Wasm,
@@ -189,7 +204,69 @@ mod tests {
     #[test]
     fn defaults_include_only_explicit_bounded_stylesheet() {
         let defaults = Asset::browser_defaults();
-        assert_eq!(defaults.len(), 9);
+        let actual: Vec<_> = defaults
+            .iter()
+            .map(|asset| {
+                (
+                    asset.url.as_str(),
+                    asset.filename.as_str(),
+                    asset.content_type.header(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("/", "index.html", "text/html; charset=utf-8"),
+                ("/index.html", "index.html", "text/html; charset=utf-8"),
+                (
+                    "/bootstrap.js",
+                    "bootstrap.js",
+                    "text/javascript; charset=utf-8"
+                ),
+                (
+                    "/canvas-viewer.js",
+                    "canvas-viewer.js",
+                    "text/javascript; charset=utf-8"
+                ),
+                (
+                    "/live-viewer.js",
+                    "live-viewer.js",
+                    "text/javascript; charset=utf-8"
+                ),
+                (
+                    "/live-page.js",
+                    "live-page.js",
+                    "text/javascript; charset=utf-8"
+                ),
+                ("/style.css", "style.css", "text/css; charset=utf-8"),
+                (
+                    "/bmux_web_renderer.js",
+                    "bmux_web_renderer.js",
+                    "text/javascript; charset=utf-8"
+                ),
+                (
+                    "/presenter-adapter.js",
+                    "presenter-adapter.js",
+                    "text/javascript; charset=utf-8"
+                ),
+                (
+                    "/bmux_presenter.js",
+                    "bmux_presenter.js",
+                    "text/javascript; charset=utf-8"
+                ),
+                (
+                    "/bmux_presenter_bg.wasm",
+                    "bmux_presenter_bg.wasm",
+                    "application/wasm"
+                ),
+                (
+                    "/bmux_web_renderer_bg.wasm",
+                    "bmux_web_renderer_bg.wasm",
+                    "application/wasm"
+                ),
+            ]
+        );
         let css = defaults
             .iter()
             .find(|asset| asset.url == "/style.css")
@@ -208,7 +285,13 @@ mod tests {
         std::fs::write(directory.path().join("unlisted.css"), b"hidden").unwrap();
         let mut config = HostConfig::new(directory.path().canonicalize().unwrap());
         let loaded = load(&config).unwrap();
-        assert_eq!(loaded.len(), 9);
+        assert_eq!(loaded.len(), defaults.len());
+        for asset in &defaults {
+            assert_eq!(
+                loaded[&asset.url].content_type.header(),
+                asset.content_type.header()
+            );
+        }
         assert!(!loaded.contains_key("/unlisted.css"));
         assert_eq!(loaded["/style.css"].bytes.as_ref(), b"x");
         // Keep valid WASM within the per-file budget so only the stylesheet exceeds it.
@@ -216,10 +299,10 @@ mod tests {
         std::fs::write(directory.path().join("style.css"), b"123456789").unwrap();
         assert!(load(&config).is_err());
         std::fs::write(directory.path().join("style.css"), b"x").unwrap();
-        // Eight one-byte mappings (including the index alias) plus eight WASM bytes.
-        config.limits.max_total_asset_bytes = 16;
+        // Ten one-byte mappings (including the index alias), two eight-byte WASMs.
+        config.limits.max_total_asset_bytes = 26;
         assert!(load(&config).is_ok());
-        config.limits.max_total_asset_bytes = 15;
+        config.limits.max_total_asset_bytes = 25;
         assert!(load(&config).is_err());
     }
 

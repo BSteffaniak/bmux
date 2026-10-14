@@ -197,11 +197,16 @@ def http(origin, path, token, method="GET", body=None, controller=None,
 
 
 def unsupported_metadata(frame):
-    require(frame.get("version") == 2, "browser snapshot must use wire v2")
+    require(frame.get("version") == 3, "browser snapshot must use wire v3")
     kinds = frame.get("unsupported_metadata")
     require(isinstance(kinds, list) and len(kinds) <= 2 and
             all(isinstance(kind, str) and kind in ("selection", "semantics") for kind in kinds) and
             len(set(kinds)) == len(kinds), "invalid or missing metadata availability enum list")
+    regions = frame.get("metadata_availability")
+    require(isinstance(regions, list) and all(
+            isinstance(region, dict) and type(region.get("selection")) is bool and
+            type(region.get("semantics")) is bool for region in regions),
+            "wire v3 native metadata availability regions missing")
     surfaces = frame.get("surfaces", [])
     for surface in surfaces:
         require(type(surface.get("selection_available")) is bool and
@@ -228,7 +233,8 @@ def unsupported_metadata(frame):
 def partial_metadata(frame):
     kinds = unsupported_metadata(frame)
     return [kind for kind in ("selection", "semantics") if kind not in kinds and
-            any(not surface[kind + "_available"] for surface in frame["surfaces"])]
+            (any(not surface[kind + "_available"] for surface in frame["surfaces"]) or
+             any(not region[kind] for region in frame["metadata_availability"]))]
 
 
 def rendered_status(status, frame):
@@ -829,7 +835,8 @@ class Harness:
                 return value and value["width"] == 1200 and value["height"] == 1200
             wait_for("large binary viewport", sized_frame)
             status, body = http(self.origin, "/presentation?version=1", self.token)
-            require(status == 200, "large binary source unavailable")
+            require(status == 200 and body.startswith(b"BMWP\x03"),
+                    "large binary source must use BMWP wire v3")
             converter = self.args.binary.parent / "examples" / "wire_frame"
             result = subprocess.run([str(converter), "--dense"], input=body, capture_output=True, timeout=15)
             require(result.returncode == 0, "dense conformance encoding failed")

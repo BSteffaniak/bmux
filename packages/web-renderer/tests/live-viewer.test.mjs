@@ -6,10 +6,10 @@ import { mountLivePage } from '../browser/live-page.js';
 
 const epoch = '11111111-1111-4111-8111-111111111111';
 const secondEpoch = '22222222-2222-4222-8222-222222222222';
-const bytes = Uint8Array.of(66, 77, 87, 80, 2, 0);
+const bytes = Uint8Array.of(66, 77, 87, 80, 3, 0);
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 function statusValue(state = 'live', overrides = {}) {
-  return { protocol: 1, renderer: 'bmwp-2', state, epoch, revision: '1', lease_expires_at: Date.now() + 15000, ...overrides };
+  return { protocol: 1, renderer: 'bmwp-3', state, epoch, revision: '1', lease_expires_at: Date.now() + 15000, ...overrides };
 }
 function frameResponse(overrides = {}) {
   return new Response(bytes, { headers: { 'Content-Type': 'application/octet-stream',
@@ -43,7 +43,7 @@ async function fixture() {
 test('explicit protocol, epoch, lease and lossless u64 compatibility', () => {
   assert.equal(revision('18446744073709551615'), '18446744073709551615');
   for (const value of ['01', '-1', '18446744073709551616', 1, null]) assert.throws(() => revision(value));
-  assert.throws(() => validateStatus(statusValue('live', { renderer: 'bmwp-3' })));
+  assert.throws(() => validateStatus(statusValue('live', { renderer: 'bmwp-2' })));
   assert.throws(() => validateStatus(statusValue('live', { epoch: '../private' })));
   assert.equal(validateStatus(statusValue('live', { lease_expires_at: 1 })).state, 'offline');
 });
@@ -122,6 +122,16 @@ test('offline/network failure and mismatched response cursor clear already visib
   } finally { f.handle.dispose(); }
 });
 
+test('legacy renderer negotiation is rejected before fetching or painting a frame', async () => {
+  const f = await fixture();
+  try {
+    f.setStatus(statusValue('live', { renderer: 'bmwp-2' }));
+    await f.handle.pollStatus();
+    await f.handle.pollFrame();
+    assert.equal(f.visible, false);
+  } finally { f.handle.dispose(); }
+});
+
 test('body bound and incompatible BMWP reject without presenting', async () => {
   const f = await fixture();
   try {
@@ -129,7 +139,7 @@ test('body bound and incompatible BMWP reject without presenting', async () => {
     f.setFrame(async () => frameResponse({ 'Content-Length': '8388609' }));
     await f.handle.pollFrame(); assert.equal(f.visible, false);
     await f.handle.pollStatus();
-    f.setFrame(async () => new Response(Uint8Array.of(66,77,87,80,3), { headers: {
+    f.setFrame(async () => new Response(Uint8Array.of(66,77,87,80,2), { headers: {
       'Content-Type': 'application/octet-stream', 'X-Bmux-Epoch': epoch, 'X-Snapshot-Revision': '1' } }));
     await f.handle.pollFrame(); assert.equal(f.visible, false);
   } finally { f.handle.dispose(); }

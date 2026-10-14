@@ -14,6 +14,33 @@ pub(crate) struct RemoteUpdate {
     pub acknowledgment: Option<String>,
 }
 
+/// One admitted immutable bundle per observer. Navigation and resize do not decode again.
+#[derive(Default)]
+pub(crate) struct PreparationCache {
+    admitted: Option<(String, crate::rich::RichAssets)>,
+}
+impl PreparationCache {
+    fn key(snapshot: &Snapshot) -> Result<String> {
+        let key = serde_json::to_string(&(
+            &snapshot.cursor.run_id,
+            snapshot.cursor.deck_revision,
+            &snapshot.deck,
+            &snapshot.assets,
+        ))?;
+        anyhow::ensure!(
+            key.len() <= 8 * 1024 * 1024,
+            "preparation identity exceeds budget"
+        );
+        Ok(key)
+    }
+    fn get(&self, key: &str) -> Option<crate::rich::RichAssets> {
+        self.admitted
+            .as_ref()
+            .filter(|(identity, _)| identity == key)
+            .map(|(_, rich)| rich.clone())
+    }
+}
+
 pub(crate) enum Connection {
     Local {
         host: std::sync::Arc<std::sync::Mutex<bmux_presenter_runtime::Host>>,
@@ -172,7 +199,11 @@ impl Connection {
             }
         }
     }
-    pub(crate) async fn prepare(&mut self, snapshot: Snapshot) -> Result<RemoteUpdate> {
+    pub(crate) async fn prepare(
+        &mut self,
+        snapshot: Snapshot,
+        cache: &mut PreparationCache,
+    ) -> Result<RemoteUpdate> {
         anyhow::ensure!(
             snapshot
                 .surfaces
@@ -184,6 +215,14 @@ impl Connection {
             snapshot.assets.len() <= 128,
             "remote asset count exceeds budget"
         );
+        let key = PreparationCache::key(&snapshot)?;
+        if let Some(rich) = cache.get(&key) {
+            return Ok(RemoteUpdate {
+                snapshot,
+                rich,
+                acknowledgment: None,
+            });
+        }
         let mut assets = Vec::new();
         let mut total = 0_usize;
         for info in &snapshot.assets {
@@ -263,10 +302,11 @@ impl Connection {
         let deck = snapshot.deck.clone();
         let rich = tokio::task::spawn_blocking(move || {
             let mut rich = crate::rich::RichAssets::prepare(&assets)?;
-            rich.code = crate::rich::highlight(&deck);
+            rich.code = std::sync::Arc::new(crate::rich::highlight(&deck));
             Ok::<_, anyhow::Error>(rich)
         })
         .await??;
+        cache.admitted = Some((key, rich.clone()));
         Ok(RemoteUpdate {
             snapshot,
             rich,
@@ -398,8 +438,9 @@ pub(crate) async fn run_connected(
     browser: Option<crate::web::Browser>,
     external_stop: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
+    let mut cache = PreparationCache::default();
     let initial = connection.snapshot().await?;
-    let prepared = connection.prepare(initial).await?;
+    let prepared = connection.prepare(initial, &mut cache).await?;
     let initial = prepared.snapshot;
     let (actions, mut action_rx) = tokio::sync::mpsc::channel(16);
     let (updates, update_rx) = tokio::sync::mpsc::channel(2);
@@ -414,6 +455,7 @@ pub(crate) async fn run_connected(
         None
     };
     player.rich = prepared.rich;
+    player.observe_producer_run(&initial.cursor.run_id)?;
     player.surfaces = initial.surfaces.clone();
     player.remote = Some(crate::player::RemoteConnection {
         actions,
@@ -441,7 +483,7 @@ pub(crate) async fn run_connected(
             match result {
                 Ok(Some(snapshot)) => {
                     cursor = snapshot.cursor.clone();
-                    match connection.prepare(snapshot).await {
+                    match connection.prepare(snapshot, &mut cache).await {
                         Ok(mut prepared) => {
                             prepared.acknowledgment = acknowledgment.take();
                             if updates.send(Ok(prepared)).await.is_err() {
@@ -474,7 +516,8 @@ pub(crate) async fn run_connected(
                                     candidate.leave().await;
                                     break;
                                 }
-                                if let Ok(prepared) = candidate.prepare(snapshot).await {
+                                if let Ok(prepared) = candidate.prepare(snapshot, &mut cache).await
+                                {
                                     recovered = Some((candidate, next, prepared));
                                     break;
                                 }
@@ -517,4 +560,61 @@ pub(crate) async fn run_connected(
         browser.shutdown().await;
     }
     result
+}
+
+#[cfg(test)]
+mod preparation_cache_tests {
+    use super::*;
+    #[test]
+    fn identity_reuses_navigation_but_separates_run_deck_and_resource() {
+        let deck = bmux_presenter::DeckBuilder::new("cache").build().unwrap();
+        let mut snapshot = Snapshot {
+            cursor: Cursor {
+                run_id: "run".into(),
+                deck_revision: 1,
+                revision: 1,
+            },
+            state: bmux_presenter::PresentationState::new(&deck),
+            deck,
+            notes: None,
+            surfaces: vec![],
+            assets: vec![],
+        };
+        let key = PreparationCache::key(&snapshot).unwrap();
+        let rich = crate::rich::RichAssets::default();
+        let mut cache = PreparationCache {
+            admitted: Some((key.clone(), rich.clone())),
+        };
+        snapshot.cursor.revision = 2;
+        let reused = cache
+            .get(&PreparationCache::key(&snapshot).unwrap())
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&rich.images, &reused.images));
+        snapshot.cursor.run_id = "other".into();
+        assert!(
+            cache
+                .get(&PreparationCache::key(&snapshot).unwrap())
+                .is_none()
+        );
+        snapshot.cursor.run_id = "run".into();
+        snapshot.cursor.deck_revision = 2;
+        assert!(
+            cache
+                .get(&PreparationCache::key(&snapshot).unwrap())
+                .is_none()
+        );
+        snapshot.cursor.deck_revision = 1;
+        snapshot.assets.push(bmux_presenter_runtime::AssetInfo {
+            id: "new".into(),
+            media_type: "image/png".into(),
+            bytes: 1,
+        });
+        assert!(
+            cache
+                .get(&PreparationCache::key(&snapshot).unwrap())
+                .is_none()
+        );
+        cache.admitted = None;
+        assert!(cache.get(&key).is_none());
+    }
 }

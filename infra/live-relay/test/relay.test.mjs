@@ -16,7 +16,7 @@ class MemoryStorage {
 // Explicit positional envelope fixture. Metadata is opaque to admission, not
 // claimed as a Rust semantic fixture; cross-language validation uses Rust output.
 function fixture({ revision = 1, delta = false, resources = false } = {}) {
-  const out = [66, 77, 87, 80, 2];
+  const out = [66, 77, 87, 80, 3];
   const uint = n => { n = BigInt(n); do { let b = Number(n & 127n); n >>= 7n; out.push(b | (n ? 128 : 0)); } while (n); };
   const blob = bytes => { uint(bytes.length); out.push(...bytes); };
   const text = s => blob(new TextEncoder().encode(s));
@@ -37,13 +37,28 @@ function request(action, { epoch, revision, body, auth = true, method, headers =
   const h = { ...(auth && publisherRoute ? { Authorization: `Bearer ${key}` } : {}), ...headers };
   if (epoch) h['X-Bmux-Epoch'] = epoch;
   if (revision) h['X-Bmux-Revision'] = revision;
-  if (action === 'publisher/start' && body === undefined) { body = JSON.stringify({ protocol: 1, renderer: 'bmwp-2', publisher_id: publisher }); h['Content-Type'] = 'application/json'; }
+  if (action === 'publisher/start' && body === undefined) { body = JSON.stringify({ protocol: 1, renderer: 'bmwp-3', publisher_id: publisher }); h['Content-Type'] = 'application/json'; }
   if (action === 'publisher/frame') h['Content-Type'] ??= 'application/octet-stream';
   return new Request(`${host}/api/live/main/${action}${query}`, { method: method ?? (action === 'publisher/frame' ? 'PUT' : publisherRoute ? 'POST' : 'GET'), headers: h, body, ...(body instanceof ReadableStream ? { duplex: 'half' } : {}) });
 }
 async function start(handler) { const r = await handler.fetch(request('publisher/start')); assert.equal(r.status, 200); return (await r.json()).epoch; }
 async function status(handler) { return (await handler.fetch(request('status'))).json(); }
 async function upload(handler, epoch, revision = '1', body = fixture()) { return handler.fetch(request('publisher/frame', { epoch, revision, body })); }
+
+test('legacy renderer negotiation and v2 frames are rejected without publication', async () => {
+  const handler = new ChannelHandler(new MemoryStorage(), env);
+  const legacy = request('publisher/start', {
+    body: JSON.stringify({ protocol: 1, renderer: 'bmwp-2', publisher_id: publisher }),
+    headers: { 'Content-Type': 'application/json' }
+  });
+  assert.equal((await handler.fetch(legacy)).status, 415);
+  assert.equal((await status(handler)).state, 'offline');
+  const epoch = await start(handler);
+  const frame = fixture(); frame[4] = 2;
+  assert.equal((await upload(handler, epoch, '1', frame)).status, 415);
+  assert.equal((await status(handler)).state, 'starting');
+  assert.equal((await status(handler)).revision, '0');
+});
 
 test('full lifecycle, duplicate/conflict revisions, paused retries and output-only routes', async () => {
   const handler = new ChannelHandler(new MemoryStorage(), env);
@@ -106,8 +121,8 @@ test('auth, channel allowlist, unsupported versions, headers and complete envelo
   assert.equal((await handler.fetch(new Request('https://relay.invalid/api/live/deleted/status'))).status, 404);
   assert.equal((await handler.fetch(request('publisher/start', { body: JSON.stringify({ protocol: 2 }), headers: { 'Content-Type': 'application/json' } }))).status, 415);
   const epoch = await start(handler);
-  for (const bad of [fixture().slice(0, -1), Uint8Array.of(66, 77, 87, 80, 2), Uint8Array.from([...fixture(), 0]), fixture({ delta: true })]) assert.equal((await upload(handler, epoch, '1', bad)).status, 400);
-  assert.equal((await upload(handler, epoch, '1', Uint8Array.of(66, 77, 87, 80, 3))).status, 415);
+  for (const bad of [fixture().slice(0, -1), Uint8Array.of(66, 77, 87, 80, 3), Uint8Array.from([...fixture(), 0]), fixture({ delta: true })]) assert.equal((await upload(handler, epoch, '1', bad)).status, 400);
+  assert.equal((await upload(handler, epoch, '1', Uint8Array.of(66, 77, 87, 80, 2))).status, 415);
   for (const rev of ['0', '-1', '01', '18446744073709551616']) assert.equal((await upload(handler, epoch, rev)).status, 400);
   validateSnapshot(fixture({ resources: true }));
   assert.equal((await upload(handler, epoch, '1', fixture(),)).status, 204);
@@ -152,7 +167,7 @@ test('actual streaming overflow, dishonest length and body deadline', async () =
 test('concurrent start ownership and durable write acknowledgment', async () => {
   const storage = new MemoryStorage(); const handler = new ChannelHandler(storage, env);
   const one = request('publisher/start');
-  const two = request('publisher/start', { body: JSON.stringify({ protocol: 1, renderer: 'bmwp-2', publisher_id: '22222222-2222-4222-8222-222222222222' }), headers: { 'Content-Type': 'application/json' } });
+  const two = request('publisher/start', { body: JSON.stringify({ protocol: 1, renderer: 'bmwp-3', publisher_id: '22222222-2222-4222-8222-222222222222' }), headers: { 'Content-Type': 'application/json' } });
   const statuses = (await Promise.all([handler.fetch(one), handler.fetch(two)])).map(r => r.status).sort();
   assert.deepEqual(statuses, [200, 409]);
   const epoch = (await status(handler)).epoch;
@@ -205,7 +220,7 @@ test('admission interleavings do not undo pause or allow stale stop to replace o
   const body = new ReadableStream({ start(c) { control = c; } });
   const delayedStart = handler.fetch(request('publisher/start', { body, headers: { 'Content-Type': 'application/json' } }));
   await handler.fetch(request('publisher/pause', { epoch }));
-  control.enqueue(new TextEncoder().encode(JSON.stringify({ protocol: 1, renderer: 'bmwp-2', publisher_id: publisher }))); control.close();
+  control.enqueue(new TextEncoder().encode(JSON.stringify({ protocol: 1, renderer: 'bmwp-3', publisher_id: publisher }))); control.close();
   assert.equal((await delayedStart).status, 200); assert.equal((await status(handler)).state, 'paused');
   const pausedDelivery = await handler.fetch(request('presentation', { query: `?epoch=${epoch}` }));
   assert.equal(pausedDelivery.status, 503);

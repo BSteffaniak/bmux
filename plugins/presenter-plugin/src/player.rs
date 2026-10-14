@@ -111,33 +111,62 @@ struct CommittedDemo {
     generation: Option<u64>,
 }
 
-pub(crate) struct Player {
-    pub _playbook_approval: Option<crate::playbook::Approval>,
-    pub(crate) live_demos: Option<crate::playbook_live::LiveDemos>,
+/// Caller-owned arrangement; only successful output promotes pending input geometry.
+#[derive(Default)]
+struct PresentationView {
     painted_demo: Option<CommittedDemo>,
     pending_demo: Option<CommittedDemo>,
     viewer: ViewerState,
     painted_viewer: ViewerState,
     pending_viewer: ViewerState,
     focused_block: Option<bmux_presenter::BlockId>,
+    painted_focus: Option<bmux_presenter::BlockId>,
+    pending_focus: Option<bmux_presenter::BlockId>,
+    painted_layout: Option<bmux_tui::component::LayoutNode>,
+    pending_layout: Option<bmux_tui::component::LayoutNode>,
+    mirror_geometry: Vec<MirrorGeometry>,
+    pending_mirror_geometry: Vec<MirrorGeometry>,
+    navigation: Option<Option<bmux_presenter::SlideId>>,
+    displayed: Option<DisplayedContent>,
+    pending_content: Option<DisplayedContent>,
+}
+struct DisplayedContent {
+    deck: Deck,
+    state: PresentationState,
+    rich: crate::rich::RichAssets,
+    surfaces: Vec<bmux_presenter_runtime::mirror::MirrorFrame>,
+}
+type MirrorGeometry = (
+    String,
+    u64,
+    String,
+    bmux_presenter_runtime::mirror::CanvasPlacement,
+);
+impl PresentationView {
+    fn commit(&mut self) {
+        self.displayed = self.pending_content.take();
+        self.painted_demo = self.pending_demo.take();
+        self.painted_layout = self.pending_layout.take();
+        self.painted_focus = self.pending_focus.take();
+        self.painted_viewer
+            .scroll
+            .set(self.pending_viewer.scroll.get());
+        self.viewer.scroll.set(self.pending_viewer.scroll.get());
+        self.mirror_geometry = std::mem::take(&mut self.pending_mirror_geometry);
+    }
+}
+
+pub(crate) struct Player {
+    pub _playbook_approval: Option<crate::playbook::Approval>,
+    pub(crate) live_demos: Option<crate::playbook_live::LiveDemos>,
+    local_view: PresentationView,
+    browser_view: PresentationView,
     linked: bmux_presenter::custom::LinkedRegistry,
     instances: LocalStates,
     pub rich: crate::rich::RichAssets,
     pub surfaces: Vec<bmux_presenter_runtime::mirror::MirrorFrame>,
-    painted_layout: Option<bmux_tui::component::LayoutNode>,
-    pending_layout: Option<bmux_tui::component::LayoutNode>,
-    mirror_geometry: Vec<(
-        String,
-        u64,
-        String,
-        bmux_presenter_runtime::mirror::CanvasPlacement,
-    )>,
-    pending_mirror_geometry: Vec<(
-        String,
-        u64,
-        String,
-        bmux_presenter_runtime::mirror::CanvasPlacement,
-    )>,
+    producer_run: Option<String>,
+    producer_generation: u64,
     reloads: Option<tokio::sync::mpsc::Receiver<Result<(Deck, crate::rich::RichAssets), String>>>,
     pub remote: Option<RemoteConnection>,
     pub deck: Deck,
@@ -171,20 +200,14 @@ impl Player {
         Self {
             _playbook_approval: None,
             live_demos: None,
-            painted_demo: None,
-            pending_demo: None,
-            viewer: ViewerState::new(),
-            painted_viewer: ViewerState::new(),
-            pending_viewer: ViewerState::new(),
-            focused_block: None,
+            local_view: PresentationView::default(),
+            browser_view: PresentationView::default(),
             linked,
             instances,
             rich: crate::rich::RichAssets::default(),
             surfaces: vec![],
-            painted_layout: None,
-            pending_layout: None,
-            mirror_geometry: vec![],
-            pending_mirror_geometry: vec![],
+            producer_run: None,
+            producer_generation: 0,
             reloads: None,
             remote: None,
             deck,
@@ -200,6 +223,18 @@ impl Player {
             audience_size: Size::new(80, 24),
         }
     }
+    /// The transport run identity, not a view revision, replaces producer epochs.
+    pub(crate) fn observe_producer_run(&mut self, run: &str) -> Result<()> {
+        if self.producer_run.as_deref() != Some(run) {
+            self.producer_generation = self
+                .producer_generation
+                .checked_add(1)
+                .context("producer generation exhausted")?;
+            self.producer_run = Some(run.to_owned());
+        }
+        Ok(())
+    }
+
     fn registry(&self) -> CustomRegistry<'static> {
         let mut registry = CustomRegistry::new();
         if self.remote.is_some() {
@@ -238,17 +273,19 @@ impl Player {
             return Ok(false);
         }
         let selected_surface = self.surfaces.iter().find(|surface| {
-            self.focused_block
+            self.local_view
+                .painted_focus
                 .as_ref()
                 .is_some_and(|id| id.as_str() == surface.surface_id)
         });
         let geometry = selected_surface
             .and_then(|surface| {
-                self.mirror_geometry
+                self.local_view
+                    .mirror_geometry
                     .iter()
                     .find(|(id, _, _, _)| *id == surface.surface_id)
             })
-            .or_else(|| self.mirror_geometry.first());
+            .or_else(|| self.local_view.mirror_geometry.first());
         let Some((surface_id, revision, slide_id, placement)) = geometry else {
             return Ok(false);
         };
@@ -364,20 +401,11 @@ impl Player {
         }
         targets
     }
-    fn reconcile_focus(&mut self, registry: &CustomRegistry<'_>) {
-        let targets = self.focus_targets(registry);
-        if self
-            .focused_block
-            .as_ref()
-            .is_none_or(|id| !targets.contains(id))
-        {
-            self.focused_block = targets.first().cloned();
-        }
-    }
     fn cycle_focus(&mut self, reverse: bool) {
         let registry = self.registry();
         let targets = self.focus_targets(&registry);
         let next = self
+            .local_view
             .focused_block
             .as_ref()
             .and_then(|id| targets.iter().position(|target| target == id))
@@ -388,39 +416,48 @@ impl Player {
                     (index + 1) % targets.len()
                 }
             });
-        self.focused_block = targets.get(next).cloned();
-    }
-    fn selected_surface(&self) -> Option<&bmux_presenter_runtime::mirror::MirrorFrame> {
-        let slide = self.state.current_slide(&self.deck)?;
-        self.surfaces.iter().rev().find(|surface| {
-            surface.slide_id == slide.id.as_str()
-                && self
-                    .focused_block
-                    .as_ref()
-                    .is_none_or(|id| id.as_str() == surface.surface_id)
-        })
+        self.local_view.focused_block = targets.get(next).cloned();
     }
     fn route_component(&mut self, event: &Event) -> bmux_tui::event::EventOutcome {
-        let Some(layout) = &self.painted_layout else {
+        let Some(layout) = &self.local_view.painted_layout else {
             return bmux_tui::event::EventOutcome::Ignored;
         };
-        let theme = PresentationTheme::for_deck(&self.deck);
+        let Some(displayed) = &self.local_view.displayed else {
+            return bmux_tui::event::EventOutcome::Ignored;
+        };
+        let theme = PresentationTheme::for_deck(&displayed.deck);
         let registry = self.registry();
-        let committed_scroll = self.painted_viewer.scroll.get();
+        let committed_scroll = self.local_view.painted_viewer.scroll.get();
         let mut component = ViewerComponent::new(
-            &self.deck,
-            &self.state,
-            &self.painted_viewer,
+            &displayed.deck,
+            &displayed.state,
+            &self.local_view.painted_viewer,
             &theme,
             &registry,
         )
-        .rich_content(&self.rich);
-        if let Some(id) = &self.focused_block {
+        .rich_content(&displayed.rich);
+        if let Some(id) = &self.local_view.painted_focus {
             component = component.focused_block(id);
         }
-        let mirror = self.selected_surface().and_then(|surface| {
-            crate::mirror::MirrorComponent::new(surface, 16_384, 512 * 1024).ok()
-        });
+        let mirror = displayed
+            .surfaces
+            .iter()
+            .rev()
+            .find(|surface| {
+                displayed
+                    .state
+                    .slide_id
+                    .as_ref()
+                    .is_some_and(|slide| slide.as_str() == surface.slide_id)
+                    && self
+                        .local_view
+                        .painted_focus
+                        .as_ref()
+                        .is_none_or(|id| id.as_str() == surface.surface_id)
+            })
+            .and_then(|surface| {
+                crate::mirror::MirrorComponent::new(surface, 16_384, 512 * 1024).ok()
+            });
         if let Some(mirror) = &mirror {
             component = component.content(mirror);
         }
@@ -429,18 +466,21 @@ impl Player {
             layout,
             &mut bmux_tui::component::EventCx::new(layout),
         );
-        self.viewer.scroll.set(self.painted_viewer.scroll.get());
-        self.painted_viewer.scroll.set(committed_scroll);
+        self.local_view
+            .viewer
+            .scroll
+            .set(self.local_view.painted_viewer.scroll.get());
+        self.local_view.painted_viewer.scroll.set(committed_scroll);
         outcome
     }
     fn invalidate_committed_input(&mut self) {
-        self.painted_layout = None;
-        self.pending_layout = None;
-        self.painted_demo = None;
-        self.pending_demo = None;
-        self.focused_block = None;
-        self.mirror_geometry.clear();
-        self.pending_mirror_geometry.clear();
+        self.local_view.painted_layout = None;
+        self.local_view.pending_layout = None;
+        self.local_view.painted_demo = None;
+        self.local_view.pending_demo = None;
+        self.local_view.focused_block = None;
+        self.local_view.mirror_geometry.clear();
+        self.local_view.pending_mirror_geometry.clear();
     }
     fn reload(&mut self) -> bool {
         let mut changed = false;
@@ -486,14 +526,11 @@ impl Player {
                         self.instances = states;
                         self.deck = deck;
                         self.rich = rich;
-                        self.painted_layout = None;
-                        self.pending_layout = None;
-                        self.painted_demo = None;
-                        self.pending_demo = None;
-                        self.focused_block = None;
-                        self.mirror_geometry.clear();
-                        self.pending_mirror_geometry.clear();
-                        self.viewer.reset_scroll();
+                        self.local_view.pending_layout = None;
+                        self.local_view.pending_demo = None;
+                        self.local_view.focused_block = None;
+                        self.local_view.pending_mirror_geometry.clear();
+                        self.local_view.viewer.reset_scroll();
                         reduce(&self.deck, &mut self.state, NavigationAction::Reconcile);
                         self.status = None;
                         changed = true;
@@ -521,12 +558,7 @@ impl Program for Player {
         &mut self,
         _report: bmux_tui_runtime::PresentReport,
     ) -> Update<Message> {
-        self.painted_demo = self.pending_demo.take();
-        self.painted_layout = self.pending_layout.take();
-        self.painted_viewer
-            .scroll
-            .set(self.pending_viewer.scroll.get());
-        self.mirror_geometry = std::mem::take(&mut self.pending_mirror_geometry);
+        self.local_view.commit();
         if let Some(browser) = self.browser.clone() {
             let size = self.audience_size;
             let result = match browser.lock() {
@@ -556,9 +588,12 @@ impl Program for Player {
                 if let Some(demos) = &mut self.live_demos {
                     demos.update();
                 }
-                if let Some(remote) = &mut self.remote {
+                if self.remote.is_some() {
                     for _ in 0..16 {
-                        let update = match remote.updates.try_recv() {
+                        // Release the connection borrow before applying owner state.
+                        let received = self.remote.as_mut().map(|remote| remote.updates.try_recv());
+                        let Some(received) = received else { break };
+                        let update = match received {
                             Ok(update) => update,
                             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -580,16 +615,15 @@ impl Program for Player {
                                     continue;
                                 }
                                 let previous_slide = self.state.slide_id.clone();
+                                self.observe_producer_run(&snapshot.cursor.run_id)?;
                                 self.deck = snapshot.deck;
                                 self.state = snapshot.state;
                                 if previous_slide != self.state.slide_id {
-                                    self.viewer.reset_scroll();
-                                    self.focused_block = None;
+                                    self.local_view.viewer.reset_scroll();
+                                    self.local_view.focused_block = None;
                                 }
-                                self.mirror_geometry.clear();
                                 self.rich = update.rich;
                                 self.surfaces = snapshot.surfaces;
-                                self.painted_layout = None;
                                 self.notes = if self.presenter { snapshot.notes } else { None };
                                 self.status = update.acknowledgment;
                             }
@@ -611,7 +645,7 @@ impl Program for Player {
                 {
                     return Ok(Update::exit());
                 }
-                if let Some(id) = self.painted_demo.clone()
+                if let Some(id) = self.local_view.painted_demo.clone()
                     && let Some(demos) = &mut self.live_demos
                 {
                     let input = overlay_key_input(&key);
@@ -624,12 +658,15 @@ impl Program for Player {
                         return Ok(Update::redraw());
                     }
                 }
-                if self.painted_demo.is_some() && matches!(key.key, KeyCode::Tab | KeyCode::Enter) {
+                if self.local_view.painted_demo.is_some()
+                    && matches!(key.key, KeyCode::Tab | KeyCode::Enter)
+                {
                     return Ok(Update::none());
                 }
                 if key.key == KeyCode::Char('o')
                     && self.remote.is_none()
-                    && let (Some(demos), Some(id)) = (&mut self.live_demos, &self.focused_block)
+                    && let (Some(demos), Some(id)) =
+                        (&mut self.live_demos, &self.local_view.focused_block)
                 {
                     self.status = Some(
                         demos
@@ -657,10 +694,7 @@ impl Program for Player {
                 if key.key == KeyCode::Tab {
                     self.cycle_focus(key.modifiers.shift);
                     // Focus changes invalidate input until the replacement frame commits.
-                    self.painted_layout = None;
-                    self.painted_demo = None;
-                    self.pending_demo = None;
-                    self.mirror_geometry.clear();
+                    self.local_view.pending_demo = None;
                     return Ok(Update::redraw());
                 }
                 if self.route_component(&Event::Key(key)) != bmux_tui::event::EventOutcome::Ignored
@@ -697,11 +731,9 @@ impl Program for Player {
                             {
                                 demos.leave(slide.as_str()).map_err(anyhow::Error::msg)?;
                             }
-                            self.viewer.reset_scroll();
-                            self.focused_block = None;
+                            self.local_view.viewer.reset_scroll();
+                            self.local_view.focused_block = None;
                         }
-                        self.painted_layout = None;
-                        self.mirror_geometry.clear();
                     }
                 }
                 Ok(Update::redraw())
@@ -709,7 +741,7 @@ impl Program for Player {
             RuntimeEvent::Terminal(event) => {
                 // A displayed local modal never forwards pointer/paste to its
                 // obscured slide. Closing takes effect after the next commit.
-                if self.painted_demo.is_some() {
+                if self.local_view.painted_demo.is_some() {
                     return Ok(Update::none());
                 }
                 let _ = self.route_mirror(&event)?;
@@ -767,36 +799,59 @@ fn paint(player: &mut Player, cx: &mut PaintCx<'_, '_>) {
 /// are not audience content. Browser publication must start here, never by cropping
 /// the speaker's already-painted terminal frame.
 fn paint_audience(
-    player: &mut Player,
+    content: AudienceContent<'_>,
+    view: &mut PresentationView,
     theme: &PresentationTheme,
     size: Size,
     show_local_focus: bool,
     cx: &mut PaintCx<'_, '_>,
 ) {
-    let registry = player.registry();
-    player.reconcile_focus(&registry);
-    let mirror_surface = player.selected_surface();
+    let navigation = content.state.slide_id.clone();
+    if view.navigation.as_ref() != Some(&navigation) {
+        view.viewer.reset_scroll();
+        view.focused_block = None;
+        view.navigation = Some(navigation);
+    }
+    view.pending_viewer.scroll.set(view.viewer.scroll.get());
+    let registry = content.registry;
+    let targets = content.targets;
+    if view
+        .focused_block
+        .as_ref()
+        .is_none_or(|id| !targets.contains(id))
+    {
+        view.focused_block = targets.first().cloned();
+    }
+    let mirror_surface = content.state.current_slide(content.deck).and_then(|slide| {
+        content.surfaces.iter().rev().find(|surface| {
+            surface.slide_id == slide.id.as_str()
+                && view
+                    .focused_block
+                    .as_ref()
+                    .is_none_or(|id| id.as_str() == surface.surface_id)
+        })
+    });
     let mirror = mirror_surface
         .and_then(|surface| crate::mirror::MirrorComponent::new(surface, 16_384, 512 * 1024).ok());
     let mut component = ViewerComponent::new(
-        &player.deck,
-        &player.state,
-        &player.viewer,
+        content.deck,
+        content.state,
+        &view.pending_viewer,
         theme,
         &registry,
     )
-    .rich_content(&player.rich);
-    if show_local_focus && let Some(id) = &player.focused_block {
+    .rich_content(content.rich);
+    if show_local_focus && let Some(id) = &view.focused_block {
         component = component.focused_block(id);
     }
     if let Some(mirror) = &mirror {
         component = component.content(mirror);
     }
-    let live = player
+    let live = content
         .state
         .slide_id
         .as_ref()
-        .and_then(|slide| player.live_demos.as_ref()?.visible(slide.as_str()));
+        .and_then(|slide| content.live_demos.as_ref()?.visible(slide.as_str()));
     let mut pending_mirror_geometry = vec![];
     let (layout, demo_id) = if let Some((id, demo)) = live {
         let overlay = bmux_tui::composition::Overlay::new(component, demo.view(!show_local_focus))
@@ -835,8 +890,8 @@ fn paint_audience(
                 clipped_mirror_placement(
                     placement,
                     viewport,
-                    player.viewer.scroll.get().horizontal_offset(),
-                    player.viewer.scroll.get().vertical_offset(),
+                    view.pending_viewer.scroll.get().horizontal_offset(),
+                    view.pending_viewer.scroll.get().vertical_offset(),
                 )
             })
         {
@@ -849,10 +904,10 @@ fn paint_audience(
         }
         (layout, None)
     };
-    player.pending_demo = demo_id;
-    player.pending_mirror_geometry = pending_mirror_geometry;
-    player.pending_viewer.scroll.set(player.viewer.scroll.get());
-    player.pending_layout = Some(layout);
+    view.pending_demo = demo_id;
+    view.pending_mirror_geometry = pending_mirror_geometry;
+    view.pending_focus = view.focused_block.clone();
+    view.pending_layout = Some(layout);
 }
 
 fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintCx<'_, '_>) {
@@ -861,7 +916,7 @@ fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintC
     let slide_height = area.height.saturating_sub(notes_height).saturating_sub(1);
     let audience_size = Size::new(area.width, slide_height);
     player.audience_size = audience_size;
-    paint_audience(player, theme, audience_size, true, cx);
+    paint_view(player, theme, audience_size, true, cx);
     let Some(slide) = player.state.current_slide(&player.deck) else {
         return;
     };
@@ -907,30 +962,181 @@ fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintC
 }
 
 pub(crate) fn paint_browser_audience(player: &mut Player, cx: &mut PaintCx<'_, '_>) {
-    // Browser preparation cannot install pending geometry for local keyboard/mouse
-    // admission or alter the local speaker's scrolling/focus state.
-    let pending_demo = player.pending_demo.clone();
-    let pending_layout = player.pending_layout.take();
-    let pending_geometry = std::mem::take(&mut player.pending_mirror_geometry);
-    let pending_scroll = player.pending_viewer.scroll.get();
-    let scroll = player.viewer.scroll.get();
-    let focused = player.focused_block.clone();
     let theme = PresentationTheme::for_deck(&player.deck);
     let area = cx.area();
     cx.fill(area, " ", theme.background);
-    paint_audience(
+    paint_view(
         player,
         &theme,
         Size::new(area.width, area.height),
         false,
         cx,
     );
-    player.pending_demo = pending_demo;
-    player.pending_layout = pending_layout;
-    player.pending_mirror_geometry = pending_geometry;
-    player.pending_viewer.scroll.set(pending_scroll);
-    player.viewer.scroll.set(scroll);
-    player.focused_block = focused;
+}
+
+pub(crate) fn commit_browser_view(player: &mut Player) {
+    player.browser_view.commit();
+}
+
+pub(crate) fn audience_surfaces(
+    player: &mut Player,
+    generation: &str,
+    revision: u64,
+) -> Result<Vec<bmux_presenter::audience::AudienceSurface>> {
+    fn collect(blocks: &[bmux_presenter::Block], reveal: u32, ids: &mut Vec<String>) {
+        for block in blocks.iter().filter(|block| block.reveal_step <= reveal) {
+            match &block.kind {
+                bmux_presenter::BlockKind::Custom { .. } => ids.push(block.id.as_str().to_owned()),
+                bmux_presenter::BlockKind::Columns { columns } => {
+                    for column in columns {
+                        collect(&column.blocks, reveal, ids);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut ids = vec![];
+    if let Some(slide) = player.state.current_slide(&player.deck) {
+        collect(&slide.blocks, player.state.reveal_step, &mut ids);
+    }
+    if player.remote.is_some() {
+        return player
+            .surfaces
+            .iter()
+            .filter(|surface| {
+                player
+                    .state
+                    .slide_id
+                    .as_ref()
+                    .is_some_and(|slide| slide.as_str() == surface.slide_id)
+                    && ids.contains(&surface.surface_id)
+            })
+            .map(|surface| {
+                let retained =
+                    surface.retained_surface(player.producer_generation, 16_384, 512 * 1024)?;
+                let component = bmux_tui::embedded_surface::EmbeddedSurface::new(&retained);
+                let size = Size::new(surface.width, surface.height);
+                let layout = component.layout(Constraints::tight(size), &mut LayoutCx::default());
+                let scene = bmux_tui::presentation::PresentationState::new(Rect::new(
+                    0,
+                    0,
+                    size.width,
+                    size.height,
+                ));
+                let prepared = scene
+                    .prepare(bmux_tui::damage::Damage::Full, |cx| {
+                        component.paint(&layout, cx)
+                    })
+                    .context("missing surface preparation")?;
+                Ok(bmux_presenter::audience::AudienceSurface {
+                    block_id: surface.surface_id.clone(),
+                    frame: bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
+                        generation, revision, &prepared,
+                    )?,
+                })
+            })
+            .collect();
+    }
+    let registry = player.registry();
+    fn find<'a>(
+        blocks: &'a [bmux_presenter::Block],
+        id: &str,
+    ) -> Option<&'a bmux_presenter::Block> {
+        for block in blocks {
+            if block.id.as_str() == id {
+                return Some(block);
+            }
+            if let bmux_presenter::BlockKind::Columns { columns } = &block.kind {
+                for column in columns {
+                    if let Some(block) = find(&column.blocks, id) {
+                        return Some(block);
+                    }
+                }
+            }
+        }
+        None
+    }
+    ids.into_iter()
+        .map(|block_id| {
+            let slide = player
+                .state
+                .current_slide(&player.deck)
+                .context("missing custom slide")?;
+            let block = find(&slide.blocks, &block_id).context("missing custom block")?;
+            let component = if let Some(demo) = player
+                .live_demos
+                .as_ref()
+                .and_then(|demos| demos.entries.get(&block_id))
+            {
+                demo.view(true)
+            } else {
+                registry.build(block).map_err(anyhow::Error::msg)?
+            };
+            let size = Size::new(80, 24);
+            let layout = component.layout(Constraints::tight(size), &mut LayoutCx::default());
+            let scene = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 80, 24));
+            let prepared = scene
+                .prepare_bounded(
+                    bmux_tui::presentation::PresentationLimits {
+                        max_cells: 16_384,
+                        max_entries: 16_384,
+                        max_bytes: 512 * 1024,
+                    },
+                    bmux_tui::damage::Damage::Full,
+                    |cx| component.paint(&layout, cx),
+                )?
+                .context("missing custom preparation")?;
+            Ok(bmux_presenter::audience::AudienceSurface {
+                block_id,
+                frame: bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
+                    generation, revision, &prepared,
+                )?,
+            })
+        })
+        .collect()
+}
+
+struct AudienceContent<'a> {
+    deck: &'a Deck,
+    state: &'a PresentationState,
+    rich: &'a crate::rich::RichAssets,
+    surfaces: &'a [bmux_presenter_runtime::mirror::MirrorFrame],
+    live_demos: Option<&'a crate::playbook_live::LiveDemos>,
+    registry: CustomRegistry<'static>,
+    targets: Vec<bmux_presenter::BlockId>,
+}
+
+fn paint_view(
+    player: &mut Player,
+    theme: &PresentationTheme,
+    size: Size,
+    local: bool,
+    cx: &mut PaintCx<'_, '_>,
+) {
+    let registry = player.registry();
+    let targets = player.focus_targets(&registry);
+    let content = AudienceContent {
+        deck: &player.deck,
+        state: &player.state,
+        rich: &player.rich,
+        surfaces: &player.surfaces,
+        live_demos: player.live_demos.as_ref(),
+        registry,
+        targets,
+    };
+    let view = if local {
+        &mut player.local_view
+    } else {
+        &mut player.browser_view
+    };
+    view.pending_content = Some(DisplayedContent {
+        deck: player.deck.clone(),
+        state: player.state.clone(),
+        rich: player.rich.clone(),
+        surfaces: player.surfaces.clone(),
+    });
+    paint_audience(content, view, theme, size, local, cx);
 }
 
 pub(crate) async fn run(player: Player) -> Result<()> {
@@ -967,7 +1173,8 @@ fn start_reloads(player: &mut Player) -> Option<tokio::task::JoinHandle<()>> {
                     let result = crate::source::loaded(&path)
                         .and_then(|loaded| {
                             crate::rich::RichAssets::prepare(&loaded.assets).map(|mut rich| {
-                                rich.code = crate::rich::highlight(&loaded.deck);
+                                rich.code =
+                                    std::sync::Arc::new(crate::rich::highlight(&loaded.deck));
                                 (loaded.deck, rich)
                             })
                         })
@@ -1037,6 +1244,25 @@ pub(crate) async fn run_headless(
     result
 }
 
+fn install_native_selection_sources(
+    player: &Player,
+    prepared: &mut bmux_tui::presentation::PreparedPresentation,
+) -> Result<(), bmux_tui::presentation::PresentationLimitError> {
+    let mut sources = std::collections::BTreeMap::new();
+    if let Some(slide) = player.state.current_slide(&player.deck) {
+        sources = bmux_presenter::component::markdown_selection_sources(slide);
+        sources.extend(crate::rich::code_selection_sources(slide));
+    }
+    let visible_ids = prepared
+        .selection()
+        .fragments()
+        .iter()
+        .map(|fragment| &fragment.content_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    sources.retain(|id, _| visible_ids.contains(id));
+    prepared.set_selection_text(sources)
+}
+
 async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> {
     let reload_task = start_reloads(&mut player);
     let (cols, rows) = crossterm::terminal::size()?;
@@ -1047,22 +1273,22 @@ async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> 
                 |player: &mut Player,
                  prepared: &mut bmux_tui::presentation::PreparedPresentation| {
                     let scopes = player
+                        .local_view
                         .pending_demo
                         .as_ref()
                         .map(|id| bmux_tui::focus::FocusScopeId::new(format!("playbook-{}", id.id)))
                         .into_iter()
                         .collect::<Vec<_>>();
                     prepared.set_modal_scopes(&scopes);
+                    install_native_selection_sources(player, prepared)
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
                     prepared
                         .validate_limits(bmux_tui::presentation::PresentationLimits {
                             max_cells: 262_144,
                             max_entries: 16_384,
                             max_bytes: 32 * 1024 * 1024,
                         })
-                        .map_err(|error| {
-                            player.invalidate_committed_input();
-                            std::io::Error::other(error.to_string())
-                        })
+                        .map_err(|error| std::io::Error::other(error.to_string()))
                 },
             );
     let stop = player.stop.take();
@@ -1148,7 +1374,7 @@ async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> 
         }
         Err(bmux_tui_runtime::RuntimeError::Presenter { error, mut output }) => {
             output.program.invalidate_committed_input();
-            output.program.focused_block = None;
+            output.program.local_view.focused_block = None;
             let images = output
                 .presenter
                 .cleanup_images()
@@ -1261,6 +1487,155 @@ fn overlay_key_input(key: &bmux_keyboard::KeyStroke) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_sources_follow_clipped_visible_fragments_and_preserve_prepared_code() {
+        let deck = bmux_presenter::DeckBuilder::new("sources")
+            .slide(
+                bmux_presenter::SlideBuilder::new("s")
+                    .markdown("visible", "**VISIBLE_SOURCE**")
+                    .code(
+                        "code",
+                        Some("rust".into()),
+                        "let wide = \"界e\u{301}\";\nsecond line",
+                    )
+                    .markdown("offscreen", "OFFSCREEN_SOURCE")
+                    .pause()
+                    .markdown("hidden", "UNREVEALED_SOURCE")
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, false);
+        player.rich.code = std::sync::Arc::new(crate::rich::highlight(&player.deck));
+        let scene = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 40, 30));
+        let mut prepared = scene
+            .prepare(bmux_tui::damage::Damage::Full, |cx| paint(&mut player, cx))
+            .unwrap();
+        install_native_selection_sources(&player, &mut prepared).unwrap();
+        let markdown =
+            bmux_tui::selection::SelectionContentId::new("presentation/s/visible/markdown");
+        let code = bmux_tui::selection::SelectionContentId::new("code/code");
+        assert_eq!(prepared.selection_text()[&markdown], "**VISIBLE_SOURCE**");
+        assert_eq!(
+            prepared.selection_text()[&code],
+            "let wide = \"界e\u{301}\";\nsecond line"
+        );
+        assert!(
+            !prepared
+                .selection_text()
+                .values()
+                .any(|source| source == "UNREVEALED_SOURCE")
+        );
+        for fragment in prepared.selection().fragments() {
+            let source = &prepared.selection_text()[&fragment.content_id];
+            assert!(source.get(fragment.source_range.clone()).is_some());
+        }
+        let small = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 40, 3));
+        let mut clipped = small
+            .prepare(bmux_tui::damage::Damage::Full, |cx| paint(&mut player, cx))
+            .unwrap();
+        install_native_selection_sources(&player, &mut clipped).unwrap();
+        assert!(
+            !clipped
+                .selection_text()
+                .values()
+                .any(|source| source == "OFFSCREEN_SOURCE")
+        );
+        assert!(clipped.selection_text().len() < prepared.selection_text().len());
+        for id in clipped.selection_text().keys() {
+            assert!(
+                clipped
+                    .selection()
+                    .fragments()
+                    .iter()
+                    .any(|fragment| &fragment.content_id == id)
+            );
+        }
+    }
+    #[test]
+    fn producer_epoch_tracks_host_run_not_view_publication() {
+        let deck = bmux_presenter::DeckBuilder::new("producer")
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, false);
+        player.observe_producer_run("run-a").unwrap();
+        let epoch = player.producer_generation;
+        player.observe_producer_run("run-a").unwrap();
+        assert_eq!(player.producer_generation, epoch);
+        player.observe_producer_run("run-b").unwrap();
+        assert_eq!(player.producer_generation, epoch + 1);
+    }
+    #[test]
+    fn browser_preparation_and_failed_output_leave_local_display_authority_unchanged() {
+        let deck = bmux_presenter::DeckBuilder::new("views")
+            .slide(
+                bmux_presenter::SlideBuilder::new("s")
+                    .text("body", "public")
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, false);
+        let mut terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 40, 12));
+        terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+        player.local_view.commit();
+        let committed = player.local_view.painted_layout.as_ref().unwrap().size;
+        let scroll = player.local_view.painted_viewer.scroll.get();
+        let scene = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 8, 3));
+        let candidate = scene
+            .prepare(bmux_tui::damage::Damage::Full, |cx| {
+                paint_browser_audience(&mut player, cx)
+            })
+            .unwrap();
+        assert_eq!(
+            player.local_view.painted_layout.as_ref().unwrap().size,
+            committed
+        );
+        assert_eq!(player.local_view.painted_viewer.scroll.get(), scroll);
+        assert!(player.browser_view.painted_layout.is_none());
+        assert!(player.browser_view.pending_layout.is_some());
+        drop(candidate); // rejected output: deliberately no view commit
+        assert!(player.browser_view.painted_layout.is_none());
+        assert!(player.local_view.displayed.is_some());
+    }
+
+    #[test]
+    fn uncommitted_navigation_keeps_displayed_content_and_focus() {
+        let deck = bmux_presenter::DeckBuilder::new("views")
+            .slide(
+                bmux_presenter::SlideBuilder::new("a")
+                    .text("one", "first")
+                    .build(),
+            )
+            .slide(
+                bmux_presenter::SlideBuilder::new("b")
+                    .text("two", "second")
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, false);
+        let mut terminal = bmux_tui::terminal::Terminal::new(Vec::new(), Rect::new(0, 0, 40, 12));
+        terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+        player.local_view.commit();
+        reduce(&player.deck, &mut player.state, NavigationAction::Next);
+        let scene = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 40, 12));
+        let _candidate = scene.prepare(bmux_tui::damage::Damage::Full, |cx| paint(&mut player, cx));
+        assert_eq!(
+            player.local_view.displayed.as_ref().unwrap().state.slide_id,
+            Some("a".into())
+        );
+        assert_eq!(
+            player
+                .local_view
+                .pending_content
+                .as_ref()
+                .unwrap()
+                .state
+                .slide_id,
+            Some("b".into())
+        );
+    }
     use super::*;
     use bmux_keyboard::KeyStroke;
     use bmux_presenter::builder::{DeckBuilder, SlideBuilder};
@@ -1278,7 +1653,7 @@ mod tests {
             .unwrap();
         let mut player = Player::local(deck("s", "old"), None, true);
         player.live_demos = Some(running.demos);
-        player.focused_block = Some("demo".into());
+        player.local_view.focused_block = Some("demo".into());
         let (updates, receiver) = tokio::sync::mpsc::channel(4);
         player.reloads = Some(receiver);
         updates
@@ -1288,7 +1663,7 @@ mod tests {
             )))
             .unwrap();
         assert!(player.reload());
-        assert!(player.focused_block.is_none());
+        assert!(player.local_view.focused_block.is_none());
         let entry = &player.live_demos.as_ref().unwrap().entries["demo"];
         assert_eq!(entry.controller.owner_epoch(), epoch);
         assert_eq!(entry.snapshot.attempt.as_ref().unwrap().generation, 41);
@@ -1351,20 +1726,20 @@ mod tests {
             None,
             true,
         );
-        player.focused_block = Some("demo".into());
+        player.local_view.focused_block = Some("demo".into());
         let identity = CommittedDemo {
             id: "demo".into(),
             owner_epoch: uuid::Uuid::new_v4(),
             generation: Some(41),
         };
-        player.painted_demo = Some(identity.clone());
-        player.pending_demo = Some(identity);
+        player.local_view.painted_demo = Some(identity.clone());
+        player.local_view.pending_demo = Some(identity);
         player.invalidate_committed_input();
-        assert!(player.painted_demo.is_none());
-        assert!(player.pending_demo.is_none());
-        assert!(player.focused_block.is_none());
-        assert!(player.painted_layout.is_none());
-        assert!(player.pending_layout.is_none());
+        assert!(player.local_view.painted_demo.is_none());
+        assert!(player.local_view.pending_demo.is_none());
+        assert!(player.local_view.focused_block.is_none());
+        assert!(player.local_view.painted_layout.is_none());
+        assert!(player.local_view.pending_layout.is_none());
     }
 
     #[test]
@@ -1457,6 +1832,7 @@ mod tests {
         let placement = surface.placement(10, 5);
         player.surfaces.push(surface);
         player
+            .local_view
             .mirror_geometry
             .push(("demo".into(), 4, "s".into(), placement));
         let (sender, mut actions) = tokio::sync::mpsc::channel(2);
@@ -1524,6 +1900,7 @@ mod tests {
         let event = Event::Key(KeyStroke::simple(KeyCode::Char('+')));
         assert!(!player.route_mirror(&event).unwrap());
         player
+            .local_view
             .mirror_geometry
             .push(("demo".into(), 4, "s".into(), placement));
         assert!(player.route_mirror(&event).unwrap());
@@ -1556,25 +1933,29 @@ mod tests {
         let mut player = Player::local(deck, None, false);
         let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 30, 10));
         terminal.draw(|cx| paint(&mut player, cx)).unwrap();
-        player.painted_layout = player.pending_layout.take();
-        player
-            .painted_viewer
-            .scroll
-            .set(player.pending_viewer.scroll.get());
+        player.local_view.commit();
         assert!(
             player
                 .route_component(&Event::Key(KeyStroke::simple(KeyCode::PageDown)))
                 .is_handled()
         );
-        assert!(player.viewer.scroll.get().vertical_offset() > 0);
-        assert_eq!(player.painted_viewer.scroll.get().vertical_offset(), 0);
+        assert!(player.local_view.viewer.scroll.get().vertical_offset() > 0);
+        assert_eq!(
+            player
+                .local_view
+                .painted_viewer
+                .scroll
+                .get()
+                .vertical_offset(),
+            0
+        );
         player
             .update(RuntimeEvent::Terminal(Event::Key(KeyStroke::simple(
                 KeyCode::Right,
             ))))
             .unwrap();
         assert_eq!(player.state.slide_id, Some("next".into()));
-        assert_eq!(player.viewer.scroll.get().vertical_offset(), 0);
+        assert_eq!(player.local_view.viewer.scroll.get().vertical_offset(), 0);
     }
     #[test]
     fn local_linked_values_follow_stable_blocks_and_focus() {
@@ -1591,11 +1972,7 @@ mod tests {
         let mut player = Player::local(deck.clone(), None, false);
         let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 40, 18));
         terminal.draw(|cx| paint(&mut player, cx)).unwrap();
-        player.painted_layout = player.pending_layout.take();
-        player
-            .painted_viewer
-            .scroll
-            .set(player.pending_viewer.scroll.get());
+        player.local_view.commit();
         assert!(
             player
                 .route_component(&Event::Key(KeyStroke::simple(KeyCode::Char('+'))))
@@ -1610,7 +1987,7 @@ mod tests {
         assert_eq!(values["two"], serde_json::json!(0));
         assert_eq!(values["switch"], serde_json::json!(false));
         player.cycle_focus(false);
-        assert_eq!(player.focused_block, Some("two".into()));
+        assert_eq!(player.local_view.focused_block, Some("two".into()));
         let replacement = prepare_states(&deck, &player.linked, &player.instances).unwrap();
         assert_eq!(
             replacement
@@ -1675,7 +2052,7 @@ mod tests {
         let mut player = Player::local(deck, None, true);
         player.status = Some("PRIVATECONTROL".into());
         for id in ["visible", "hidden"] {
-            player.rich.images.insert(
+            std::sync::Arc::make_mut(&mut player.rich.images).insert(
                 id.into(),
                 bmux_tui::image::ImagePayload::Pixels {
                     bytes: vec![255, 0, 0, 255],
@@ -1707,7 +2084,7 @@ mod tests {
             bmux_web_renderer::BrowserFrame::from_prepared_in_generation("audience", 1, &prepared)
                 .unwrap();
         let binary = bmux_web_renderer::encode_binary(&frame).unwrap();
-        assert!(binary.starts_with(b"BMWP\x02"));
+        assert!(binary.starts_with(b"BMWP\x03"));
         let decoded = bmux_web_renderer::decode_binary(&binary, None).unwrap();
         let json = bmux_web_renderer::encode_json(&decoded).unwrap();
         let all_metadata = format!("{prepared:?} {json}");
@@ -1752,7 +2129,7 @@ mod tests {
         terminal
             .draw(|cx| {
                 cx.fill(cx.area(), " ", theme.background);
-                paint_audience(&mut player, &theme, Size::new(40, 20), false, cx);
+                paint_view(&mut player, &theme, Size::new(40, 20), false, cx);
             })
             .unwrap();
         let cells = (0..20)

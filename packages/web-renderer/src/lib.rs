@@ -13,8 +13,8 @@ pub use wire::{
 };
 mod renderer;
 pub use contract::{
-    BrowserFrame, DecodeError, Limits, MetadataKind, SurfaceProvenance, WIRE_VERSION, decode_json,
-    encode_json,
+    BrowserFrame, DecodeError, Limits, MetadataAvailability, MetadataKind, SurfaceProvenance,
+    WIRE_VERSION, decode_json, encode_json,
 };
 pub use renderer::{BackendCapabilities, BrowserBackend, PresentError, Renderer, RequiredFeature};
 

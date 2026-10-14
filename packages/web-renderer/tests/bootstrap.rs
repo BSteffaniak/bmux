@@ -21,6 +21,39 @@ fn viewport_requires_an_explicit_leased_controller_and_bounded_latest_queue() {
 }
 
 #[test]
+fn document_bootstrap_executes_transactional_mock_adapter() {
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/document-bootstrap.js");
+    let output = std::process::Command::new("node")
+        .arg(script)
+        .output()
+        .expect("Node is required for browser bootstrap acceptance");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn document_delivery_is_explicit_and_does_not_claim_a_shared_viewport() {
+    let source = include_str!("../browser/bootstrap.js");
+    let document = source
+        .split("async function runDocument(adapterPath)")
+        .nth(1)
+        .unwrap();
+    assert!(!document.contains("'/view'"));
+    assert!(!document.contains("'/viewport'"));
+    assert!(document.contains("document.capability !== adapter.capability"));
+    assert!(document.contains("transaction.commit();"));
+    assert!(document.contains("transaction?.discard();"));
+    assert!(document.contains("epoch !== layoutEpoch"));
+    assert!(source.contains("delivery.get('delivery') === 'document'"));
+    assert!(source.contains("? runDocument(delivery.get('adapter'))\n  : run()"));
+}
+
+#[test]
 fn transport_cursor_is_independent_from_native_presentation_revision() {
     let source = include_str!("../browser/bootstrap.js");
     assert!(source.contains("let pollCursor = null;"));

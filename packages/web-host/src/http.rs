@@ -55,6 +55,7 @@ fn valid_port(value: &str) -> bool {
 enum Route<'a> {
     Asset(&'a str),
     Snapshot(Option<u64>),
+    Document(Option<u64>),
     Presentation {
         after: Option<u64>,
         base: Option<u64>,
@@ -77,6 +78,31 @@ fn route(target: &str) -> Result<Route<'_>, u16> {
         } else {
             Err(400)
         };
+    }
+    if target == "/document" || target.starts_with("/document?") {
+        let query = target.strip_prefix("/document?").ok_or(400_u16)?;
+        let mut version = None;
+        let mut after = None;
+        for part in query.split('&') {
+            let (key, value) = part.split_once('=').ok_or(400_u16)?;
+            let slot = match key {
+                "version" => &mut version,
+                "after" => &mut after,
+                _ => return Err(400),
+            };
+            if slot.is_some()
+                || value.is_empty()
+                || value.len() > 20
+                || !value.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(400);
+            }
+            *slot = Some(value.parse::<u64>().map_err(|_| 400_u16)?);
+        }
+        if version != Some(1) {
+            return Err(400);
+        }
+        return Ok(Route::Document(after));
     }
     if target == "/presentation" || target.starts_with("/presentation?") {
         let mut version = None;
@@ -121,8 +147,20 @@ fn route(target: &str) -> Result<Route<'_>, u16> {
             .map(|value| Route::Snapshot(Some(value)))
             .map_err(|_| 400);
     }
-    if target == "/"
-        || target.strip_prefix('/').is_some_and(|name| {
+    // Queries select browser capabilities, never a filesystem path or credential.
+    // Validate the undecoded path exactly as before; only the allowlisted key is used.
+    if let Some((_, query)) = target.split_once('?')
+        && query.split('&').any(|part| {
+            let key = part.split_once('=').map_or(part, |(key, _)| key);
+            key.eq_ignore_ascii_case("token") || key.contains('%')
+        })
+    {
+        // Preserve the pre-query-support response for URL credential attempts.
+        return Err(404);
+    }
+    let asset_path = target.split_once('?').map_or(target, |(path, _)| path);
+    if asset_path == "/"
+        || asset_path.strip_prefix('/').is_some_and(|name| {
             !name.is_empty()
                 && name != "."
                 && name != ".."
@@ -132,7 +170,7 @@ fn route(target: &str) -> Result<Route<'_>, u16> {
                     .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
         })
     {
-        return Ok(Route::Asset(target));
+        return Ok(Route::Asset(asset_path));
     }
     Err(404)
 }
@@ -490,6 +528,29 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
                 .await;
             } else {
                 error(&mut stream, &state, 404).await;
+            }
+        }
+        Ok(Route::Document(after)) => {
+            match timeout(state.limits.poll_timeout, latest(&mut feed, after)).await {
+                Ok(Ok(snapshot)) => {
+                    if let Some(document) = &snapshot.document {
+                        let _ = timeout(
+                            state.limits.write_timeout,
+                            response(
+                                &mut stream,
+                                200,
+                                "application/vnd.bmux.document-v1+json",
+                                &document.bytes,
+                                Some(snapshot.revision),
+                            ),
+                        )
+                        .await;
+                    } else {
+                        error(&mut stream, &state, 406).await;
+                    }
+                }
+                Ok(Err(status)) => error(&mut stream, &state, status).await,
+                Err(_) => error(&mut stream, &state, 204).await,
             }
         }
         Ok(Route::Presentation { after, base }) => {

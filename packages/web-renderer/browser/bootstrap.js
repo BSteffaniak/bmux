@@ -356,4 +356,233 @@ async function run() {
     try { renderer.reset(); } finally { renderer.free(); }
   }
 }
-run().catch(() => { if (!stopped) status.textContent = 'Browser renderer could not start.'; });
+// Generic full-document delivery. No product model or viewport mutation transport.
+function validateDocument(value, announced) {
+  const identity = value => typeof value === 'string' && /^[A-Za-z0-9._:-]{1,128}$/.test(value);
+  if (!value || value.version !== 1 || value.publication_revision !== announced ||
+      !identity(value.generation) || !identity(value.capability)) throw new Error('invalid document identity');
+  transportRevision(value.publication_revision);
+  transportRevision(value.revision);
+  if (!Array.isArray(value.content) || !value.content.length || value.content.length > MAX_JSON_BYTES / 4 ||
+      !value.content.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255) ||
+      !Array.isArray(value.resources) || value.resources.length > 1024) throw new Error('invalid document bounds');
+  let total = 0;
+  const ids = new Set();
+  for (const resource of value.resources) {
+    if (!resource || typeof resource.id !== 'string' || !/^[a-f0-9]{64}$/.test(resource.id) || ids.has(resource.id) ||
+        typeof resource.mime_type !== 'string' || resource.mime_type.length > 128 ||
+        !/^[\x20-\x7e]+$/.test(resource.mime_type) || !resource.mime_type.includes('/') ||
+        !Number.isSafeInteger(resource.length) || resource.length < 0 || resource.length > 8 * 1024 * 1024) {
+      throw new Error('invalid document resource');
+    }
+    ids.add(resource.id);
+    total += resource.length;
+    if (total > 32 * 1024 * 1024) throw new Error('document resource budget exceeded');
+    Object.freeze(resource);
+  }
+  Object.freeze(value.content);
+  Object.freeze(value.resources);
+  return Object.freeze(value);
+}
+
+function documentAdapterPath(value) {
+  // Assets are explicit same-origin modules, not arbitrary URLs or product dispatch.
+  if (typeof value !== 'string' || !/^\/[A-Za-z0-9_/-]+\.js$/.test(value) ||
+      value.startsWith('//') || value.includes('/../') || value.includes('/./')) {
+    throw new Error('document delivery requires a same-origin adapter module');
+  }
+  return value;
+}
+
+async function runDocument(adapterPath) {
+  if (token !== null && (!token || token.length > 4096 || /[\r\n]/.test(token))) {
+    expire();
+    throw new Error('invalid bootstrap token');
+  }
+  const module = await import(documentAdapterPath(adapterPath));
+  const adapter = await module.createDocumentRenderer({ canvas });
+  if (!adapter || typeof adapter.capability !== 'string' || typeof adapter.prepare !== 'function' ||
+      typeof adapter.reset !== 'function' || typeof adapter.free !== 'function') {
+    throw new Error('invalid document adapter');
+  }
+  let committed = null;
+  let committedViewport = null;
+  const inspection = () => committed ? {
+    generation: committed.generation, revision: committed.revision,
+    publication_revision: committed.publication_revision,
+    viewport: committedViewport,
+    frame: adapter.inspectCommittedFrame?.() ?? null,
+  } : null;
+  if (new URLSearchParams(location.search).get('inspect') === '1') {
+    window.__bmuxDocumentInspection = inspection;
+  }
+  let drawTask = null;
+  let layoutEpoch = 0;
+  let cursor = null;
+  let highWater = null;
+  const cache = new Map();
+  let cacheBytes = 0;
+  let resourceRequests = 0;
+  const lifetime = new AbortController();
+  const stop = () => lifetime.abort();
+  addEventListener('pagehide', stop);
+  function viewport() {
+    const bounds = container.getBoundingClientRect();
+    return Object.freeze({ width: Math.max(1, Math.min(16384, Math.floor(bounds.width))),
+      height: Math.max(1, Math.min(16384, Math.floor(bounds.height))),
+      device_pixel_ratio: Math.max(1, Math.min(4, devicePixelRatio || 1)) });
+  }
+  async function resourceFor(document, id) {
+    const descriptor = document.resources.find(resource => resource.id === id);
+    if (!descriptor) throw new Error('resource absent from document manifest');
+    const retained = cache.get(id);
+    if (retained) {
+      if (retained.mime !== descriptor.mime_type || retained.bytes.length !== descriptor.length) {
+        throw new Error('resource identity changed');
+      }
+      return retained.bytes.slice();
+    }
+    if (resourceRequests >= 8) throw new Error('document resource concurrency budget exceeded');
+    resourceRequests++;
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    lifetime.signal.addEventListener('abort', cancel, { once: true });
+    if (lifetime.signal.aborted) controller.abort();
+    const timer = setTimeout(cancel, 10000);
+    try {
+      const response = await request(`/resource/${id}`, controller);
+      if (response.status !== 200 || response.headers.get('Content-Type') !== descriptor.mime_type) {
+        throw new Error('document resource unavailable');
+      }
+      const bytes = await boundedBytes(response, 8 * 1024 * 1024);
+      if (bytes.length !== descriptor.length) throw new Error('document resource length mismatch');
+      const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+      const hash = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+      if (hash !== id) throw new Error('document resource digest mismatch');
+      while (cacheBytes + bytes.length > 32 * 1024 * 1024 || cache.size >= 1024) {
+        const oldest = cache.keys().next().value;
+        if (oldest === undefined) throw new Error('resource cache exhausted');
+        cacheBytes -= cache.get(oldest).bytes.length;
+        cache.delete(oldest);
+      }
+      cache.set(id, { mime: descriptor.mime_type, bytes });
+      cacheBytes += bytes.length;
+      return bytes.slice();
+    } finally {
+      resourceRequests--;
+      clearTimeout(timer);
+      lifetime.signal.removeEventListener('abort', cancel);
+    }
+  }
+  function committedStatus(revision) {
+    let frame;
+    try { frame = adapter.inspectCommittedFrame?.(); }
+    catch { return `Read-only · responsive · revision ${revision} · Committed metadata inspection unavailable`; }
+    const kinds = values => Array.isArray(values) && values.length <= 16 &&
+      values.every(kind => typeof kind === 'string' && /^[a-z_]{1,32}$/.test(kind)) ? values : [];
+    const unavailable = kinds(frame?.unsupported_metadata);
+    const partial = kinds(frame?.partial_metadata);
+    return `Read-only · responsive · revision ${revision}` +
+      (unavailable.length ? ` · Unavailable metadata: ${unavailable.join(', ')}` : '') +
+      (partial.length ? ` · Partial metadata: ${partial.join(', ')}` : '') +
+      (frame?.selection_text_available === false ? ' · Selection source text unavailable' : '') +
+      (frame == null ? ' · Committed metadata inspection unavailable' : '');
+  }
+  async function draw(document) {
+    if (document.capability !== adapter.capability) throw new Error('unsupported document capability');
+    if (committed && committed.generation === document.generation &&
+        (BigInt(document.revision) < BigInt(committed.revision) ||
+         (document.revision === committed.revision && document.publication_revision !== committed.publication_revision))) {
+      throw new Error('document revision did not advance');
+    }
+    for (let attempts = 0; attempts < 8; attempts++) {
+      const epoch = layoutEpoch;
+      const nextViewport = viewport();
+      let transaction = null;
+      try {
+        transaction = await adapter.prepare(document, nextViewport, {
+          requestResource: id => resourceFor(document, id), signal: lifetime.signal,
+        });
+        if (!transaction || typeof transaction.commit !== 'function' || typeof transaction.discard !== 'function') {
+          throw new Error('invalid document transaction');
+        }
+        if (stopped || lifetime.signal.aborted) return;
+        if (epoch !== layoutEpoch) continue;
+        // Adapter commit must be synchronous and all-or-nothing, including metadata.
+        transaction.commit();
+        transaction = null;
+        committed = document;
+        committedViewport = nextViewport;
+        status.textContent = committedStatus(document.revision);
+        return;
+      } finally { transaction?.discard(); }
+    }
+    throw new Error('local layout changed too frequently');
+  }
+  async function apply(document) {
+    if (drawTask) await drawTask;
+    if (stopped) return;
+    drawTask = draw(document);
+    try { await drawTask; } finally { drawTask = null; }
+  }
+  function reflow() {
+    layoutEpoch++;
+    if (committed && !drawTask && !stopped) {
+      void apply(committed).catch(() => {
+        if (!stopped) status.textContent = 'Local reflow failed; last committed output retained.';
+      });
+    }
+  }
+  const observer = new ResizeObserver(reflow);
+  observer.observe(container);
+  addEventListener('resize', reflow);
+  document.fonts.addEventListener('loadingdone', reflow);
+  try {
+    while (!stopped) {
+      const controller = new AbortController();
+      activeRequest = controller;
+      const timer = setTimeout(() => controller.abort(), 35000);
+      try {
+        const response = await request(`/document?version=1${cursor === null ? '' : `&after=${cursor}`}`, controller);
+        if (stopped) break;
+        if (response.status === 204) continue;
+        if (response.status !== 200 || response.headers.get('Content-Type') !== 'application/vnd.bmux.document-v1+json') {
+          throw new Error('document unavailable');
+        }
+        const announced = response.headers.get('X-Snapshot-Revision');
+        const transport = transportRevision(announced);
+        if (highWater !== null && (transport < highWater || (transport === highWater && cursor !== null))) {
+          throw new Error('obsolete document publication');
+        }
+        const next = validateDocument(JSON.parse(await boundedText(response)), announced);
+        if (stopped) break;
+        await apply(next);
+        if (stopped) break;
+        highWater = transport;
+        cursor = announced;
+      } catch (error) {
+        if (stopped) break;
+        status.textContent = `Document failed; last committed output retained. Repairing full document (${error.message}).`;
+        cursor = null;
+        await pause();
+      } finally { clearTimeout(timer); activeRequest = null; }
+    }
+  } finally {
+    lifetime.abort();
+    observer.disconnect();
+    removeEventListener('resize', reflow);
+    removeEventListener('pagehide', stop);
+    document.fonts.removeEventListener('loadingdone', reflow);
+    if (drawTask) await drawTask.catch(() => {});
+    cache.clear();
+    if (window.__bmuxDocumentInspection === inspection) delete window.__bmuxDocumentInspection;
+    try { adapter.reset(); } finally { adapter.free(); }
+    expire();
+  }
+}
+
+const delivery = new URLSearchParams(location.search);
+const browserTask = delivery.get('delivery') === 'document'
+  ? runDocument(delivery.get('adapter'))
+  : run();
+browserTask.catch(() => { if (!stopped) status.textContent = 'Browser renderer could not start.'; });

@@ -4,6 +4,9 @@ use std::time::Duration;
 
 fn audience_player(prepared: crate::viewer::RemoteUpdate) -> crate::player::Player {
     let mut player = crate::player::Player::local(prepared.snapshot.deck, None, false);
+    player
+        .observe_producer_run(&prepared.snapshot.cursor.run_id)
+        .expect("fresh observer producer epoch is available");
     player.state = prepared.snapshot.state;
     player.surfaces = prepared.snapshot.surfaces;
     player.rich = prepared.rich;
@@ -22,8 +25,9 @@ pub(crate) async fn run(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let result = async {
+        let mut cache = crate::viewer::PreparationCache::default();
         let snapshot = connection.snapshot().await?;
-        let prepared = connection.prepare(snapshot).await?;
+        let prepared = connection.prepare(snapshot, &mut cache).await?;
         let mut cursor = prepared.snapshot.cursor.clone();
         let mut player = audience_player(prepared);
         let mut width = 80;
@@ -52,8 +56,9 @@ pub(crate) async fn run(
                     match connection.poll(cursor.clone()).await {
                         Ok(Some(snapshot)) => {
                             let candidate_cursor = snapshot.cursor.clone();
-                            match connection.prepare(snapshot).await {
+                            match connection.prepare(snapshot, &mut cache).await {
                             Ok(prepared) => {
+                                player.observe_producer_run(&prepared.snapshot.cursor.run_id)?;
                                 cursor = prepared.snapshot.cursor;
                                 player.deck = prepared.snapshot.deck;
                                 player.state = prepared.snapshot.state;
@@ -128,8 +133,9 @@ mod tests {
         };
         let snapshot = connection.snapshot().await.unwrap();
         assert_eq!(snapshot.notes.as_deref(), Some("HOSTPRIVATESECRET"));
+        let mut cache = crate::viewer::PreparationCache::default();
         let cursor = snapshot.cursor.clone();
-        let prepared = connection.prepare(snapshot).await.unwrap();
+        let prepared = connection.prepare(snapshot, &mut cache).await.unwrap();
         let mut player = audience_player(prepared);
         assert!(player.notes.is_none());
         assert!(!player.presenter);

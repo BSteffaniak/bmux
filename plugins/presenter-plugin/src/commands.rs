@@ -37,7 +37,7 @@ pub(crate) async fn run(
                 .then(|| crate::playbook::Approval::prepare(&source, &loaded.deck))
                 .transpose()?;
             let mut rich = crate::rich::RichAssets::prepare(&loaded.assets)?;
-            rich.code = crate::rich::highlight(&loaded.deck);
+            rich.code = std::sync::Arc::new(crate::rich::highlight(&loaded.deck));
             let mut player =
                 crate::player::Player::local(loaded.deck, reload.then_some(source), presenter);
             if let Some(approval) = approval.clone() {

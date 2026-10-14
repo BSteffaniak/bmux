@@ -49,7 +49,7 @@ output is handed off; private notes and controls are not audience content.
 
 ## Delivery guarantees
 
-The controller keeps one latest pending full inline BMWP2 repair, limited to
+The controller keeps one latest pending full inline BMWP3 repair, limited to
 8 MiB. HTTP mutation execution is serialized with pause/stop, and local gate
 changes invalidate pending and in-flight uploads. Transient uploads retry exact
 revision/bytes until acknowledged or superseded. Lost relay epochs reacquire

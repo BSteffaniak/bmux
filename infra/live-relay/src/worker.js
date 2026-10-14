@@ -1,5 +1,5 @@
 // Deployment artifact: native ES module, no build step or runtime dependencies.
-// BMWP2 positional admission mirrors packages/web-renderer/src/wire.rs; Rust
+// BMWP3 positional admission mirrors packages/web-renderer/src/wire.rs; Rust
 // producer/viewer still own full semantic metadata/image/render validation.
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 export const LEASE_MS = 15000;
@@ -133,7 +133,7 @@ class Wire {
   }
 }
 export function validateSnapshot(bytes) {
-  if (bytes.length < 5 || bytes[0] !== 66 || bytes[1] !== 77 || bytes[2] !== 87 || bytes[3] !== 80 || bytes[4] !== 2) reject(415);
+  if (bytes.length < 5 || bytes[0] !== 66 || bytes[1] !== 77 || bytes[2] !== 87 || bytes[3] !== 80 || bytes[4] !== 3) reject(415);
   const w = new Wire(bytes);
   if (!w.text(128)) reject();
   w.uint();
@@ -247,7 +247,7 @@ export class ChannelHandler {
       if (action === 'publisher/start') {
         if (request.headers.get('Content-Type')?.split(';')[0].trim() !== 'application/json') reject(415);
         try { start = JSON.parse(decoder.decode(await readBounded(request, 1024, this.bodyTimeoutMs))); } catch (e) { if (e instanceof Rejection) throw e; reject(); }
-        if (start?.protocol !== 1 || start?.renderer !== 'bmwp-2') reject(415);
+        if (start?.protocol !== 1 || start?.renderer !== 'bmwp-3') reject(415);
         if (typeof start.publisher_id !== 'string' || !UUID.test(start.publisher_id) || Object.keys(start).some(k => !['protocol', 'renderer', 'publisher_id'].includes(k))) reject();
       } else if (action.startsWith('publisher/')) {
         if ((await readBounded(request, 0, this.bodyTimeoutMs)).length) reject();
@@ -257,8 +257,8 @@ export class ChannelHandler {
         if (action.startsWith('publisher/')) await authorize(request, this.env);
         await this.expire();
         const m = this.meta;
-        if (action === 'health') return response(200, { protocol: 1, renderer: 'bmwp-2' });
-        if (action === 'status') return response(200, { protocol: 1, renderer: 'bmwp-2', state: m.state,
+        if (action === 'health') return response(200, { protocol: 1, renderer: 'bmwp-3' });
+        if (action === 'status') return response(200, { protocol: 1, renderer: 'bmwp-3', state: m.state,
           epoch: m.epoch, revision: m.revision, lease_expires_at: m.lease_expires_at });
         if (action === 'presentation') {
           if (url.searchParams.get('epoch') !== m.epoch) reject(409);
@@ -297,7 +297,7 @@ export class ChannelHandler {
           if (m.epoch !== null && m.publisher_id !== start.publisher_id.toLowerCase()) reject(409);
           if (m.epoch === null) await this.commit({ ...blank(), revoked: m.revoked, state: 'starting',
             epoch: crypto.randomUUID(), publisher_id: start.publisher_id.toLowerCase(), lease_expires_at: this.now() + LEASE_MS, fence: m.fence + 1 }, null);
-          return response(200, { protocol: 1, renderer: 'bmwp-2', epoch: this.meta.epoch, lease_ms: LEASE_MS });
+          return response(200, { protocol: 1, renderer: 'bmwp-3', epoch: this.meta.epoch, lease_ms: LEASE_MS });
         }
         if (action === 'publisher/stop' && request.headers.get('X-Bmux-Epoch') === m.revoked) return response(204);
         this.owner(request);

@@ -125,9 +125,11 @@ fn truncation_unknown_version_and_trailing_bytes_fail() {
     for end in 0..bytes.len() {
         assert!(decode_binary(&bytes[..end], None).is_err());
     }
-    let mut corrupt = bytes.clone();
-    corrupt[4] = 99;
-    assert!(decode_binary(&corrupt, None).is_err());
+    for version in [bmux_web_renderer::BINARY_WIRE_VERSION + 1, 2] {
+        let mut corrupt = bytes.clone();
+        corrupt[4] = version;
+        assert!(decode_binary(&corrupt, None).is_err());
+    }
     let mut corrupt = bytes;
     corrupt.push(0);
     assert!(decode_binary(&corrupt, None).is_err());
@@ -178,7 +180,8 @@ fn corrupt(change: impl FnOnce(&mut TestMessage)) {
     let bytes = encode_binary(&frame(4, 2, 1)).unwrap();
     let mut message: TestMessage = bmux_codec::from_positional_bytes(&bytes[5..]).unwrap();
     change(&mut message);
-    let mut bytes = b"BMWP\x02".to_vec();
+    let mut bytes = b"BMWP".to_vec();
+    bytes.push(bmux_web_renderer::BINARY_WIRE_VERSION);
     bytes.extend(bmux_codec::to_positional_vec(&message).unwrap());
     assert!(decode_binary(&bytes, None).is_err());
 }

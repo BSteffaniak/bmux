@@ -32,7 +32,7 @@ key = undefined;
 const assets = await realpath(options.get('--assets'));
 const manifest = JSON.parse(await readFile(resolve(assets, 'manifest.json'), 'utf8'));
 const version = manifest.bundle_sha256;
-if (!/^[0-9a-f]{64}$/.test(version) || manifest.protocol !== 1 || manifest.renderer !== 'bmwp-2') throw new Error('Use a real generated immutable viewer bundle');
+if (!/^[0-9a-f]{64}$/.test(version) || manifest.protocol !== 1 || manifest.renderer !== 'bmwp-3') throw new Error('Use a real generated immutable viewer bundle');
 const assetBase = `/live-assets/${version}/`;
 const types = new Map([['js', 'text/javascript'], ['wasm', 'application/wasm'], ['css', 'text/css'], ['html', 'text/html']]);
 let active = 0;
@@ -79,7 +79,7 @@ viewer.requestTimeout = 5000;
 viewer.headersTimeout = 5000;
 await new Promise(ok => viewer.listen(0, '127.0.0.1', ok));
 const url = `http://127.0.0.1:${viewer.address().port}`;
-await writeFile(options.get('--ready-file'), JSON.stringify({ url, protocol: 1, renderer: 'bmwp-2' }), { mode: 0o600, flag: 'wx' });
+await writeFile(options.get('--ready-file'), JSON.stringify({ url, protocol: 1, renderer: 'bmwp-3' }), { mode: 0o600, flag: 'wx' });
 console.log(`Isolated live viewer: ${url}/live/`);
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
   viewer.close(); viewer.closeAllConnections(); relay.server.close(); relay.server.closeAllConnections();

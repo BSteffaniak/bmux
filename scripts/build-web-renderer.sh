@@ -23,6 +23,10 @@ if [[ "$("$BINDGEN" --version)" != "wasm-bindgen 0.2.126" ]]; then
   exit 1
 fi
 cargo build --locked -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown --release
+cargo build --locked -p bmux_presenter --features wasm --target wasm32-unknown-unknown --release
+"$BINDGEN" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/bmux_presenter.wasm" \
+  --target web --out-dir "$OUTPUT" --out-name bmux_presenter
+cp scripts/presenter-adapter.js "$OUTPUT/"
 "$BINDGEN" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/bmux_web_renderer.wasm" \
   --target web --out-dir "$OUTPUT" --out-name bmux_web_renderer
 cp packages/web-renderer/browser/index.html packages/web-renderer/browser/bootstrap.js \
@@ -47,7 +51,7 @@ for name in sys.argv[3:]:
     data = (root / name).read_bytes()
     files.append({"name": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
 (root / "manifest.json").write_text(json.dumps({"schema": 1, "protocol": 1,
-    "renderer": "bmwp-2", "bundle_sha256": sys.argv[2], "files": files}, indent=2) + "\n")
+    "renderer": "bmwp-3", "bundle_sha256": sys.argv[2], "files": files}, indent=2) + "\n")
 PY
 printf '%s\n' "$VERSION" > "$DOCS_ASSETS/current-version"
 echo "Docs audience bundle: $DOCS_ASSETS/$VERSION"
