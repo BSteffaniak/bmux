@@ -29,13 +29,28 @@ pub(super) async fn fetch_server_status(
     )
     .await;
 
-    let Ok(Ok(mut client)) = connect else {
-        return Ok(None);
-    };
-
-    match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await {
-        Ok(Ok(status)) => Ok(Some(status)),
-        Ok(Err(_)) | Err(_) => Ok(None),
+    match connect {
+        Ok(Ok(mut client)) => {
+            match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await {
+                Ok(Ok(status)) => Ok(Some(status)),
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "server status request failed");
+                    Ok(None)
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "server status request timed out");
+                    Ok(None)
+                }
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "server status connection failed");
+            Ok(None)
+        }
+        Err(error) => {
+            tracing::debug!(%error, "server status connection timed out");
+            Ok(None)
+        }
     }
 }
 

@@ -1757,6 +1757,12 @@ pub(super) fn dispatch_loaded_plugin_event(
     event: &PluginEvent,
 ) -> Result<()> {
     for plugin in loaded_plugins {
+        let started = std::time::Instant::now();
+        tracing::debug!(
+            plugin_id = plugin.declaration.id.as_str(),
+            event_kind = event.kind.as_str(),
+            "plugin event dispatch started"
+        );
         let _ = plugin.dispatch_event(event).with_context(|| {
             format!(
                 "failed dispatching plugin event '{}' to '{}'",
@@ -1764,13 +1770,19 @@ pub(super) fn dispatch_loaded_plugin_event(
                 plugin.declaration.id.as_str()
             )
         })?;
+        tracing::debug!(
+            plugin_id = plugin.declaration.id.as_str(),
+            event_kind = event.kind.as_str(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "plugin event dispatch completed"
+        );
     }
 
     Ok(())
 }
 
 pub(super) async fn plugin_event_bridge_loop(
-    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    loaded_plugins: std::sync::Arc<Vec<bmux_plugin::LoadedPlugin>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     if loaded_plugins.is_empty() {
@@ -1839,16 +1851,28 @@ pub(super) async fn plugin_event_bridge_loop(
                     if is_pane_output_plugin_event(&event) {
                         continue;
                     }
-                    if let Err(error) = dispatch_loaded_plugin_event(
-                        loaded_plugins,
-                        &plugin_event_from_server_event(&event)?,
-                    ) {
+                    let plugins = std::sync::Arc::clone(&loaded_plugins);
+                    let event = plugin_event_from_server_event(&event)?;
+                    // A synchronous plugin callback can wait on services backed by
+                    // server.run(). Never block that sibling future's polling task.
+                    if let Err(error) = dispatch_plugin_callback(move || {
+                        dispatch_loaded_plugin_event(&plugins, &event)
+                    }).await? {
                         warn!(%error, "failed dispatching bridged plugin event");
                     }
                 }
             }
         }
     }
+}
+
+async fn dispatch_plugin_callback<F>(callback: F) -> Result<Result<()>>
+where
+    F: FnOnce() -> Result<()> + Send + 'static,
+{
+    tokio::task::spawn_blocking(callback)
+        .await
+        .context("join plugin event dispatch")
 }
 
 fn is_pane_output_plugin_event(event: &bmux_client::ServerEvent) -> bool {
@@ -2382,6 +2406,27 @@ fn emit_external_plugin_phase_timing(
 }
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_plugin_callback_does_not_stall_sibling_service_progress() {
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let callback = super::dispatch_plugin_callback(move || {
+            request_tx.send(()).expect("request sibling service");
+            response_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .map_err(anyhow::Error::from)?;
+            Ok(())
+        });
+        let service = async move {
+            request_rx.await.expect("callback requested service");
+            response_tx.send(()).expect("reply to plugin callback");
+        };
+        let (dispatch, ()) = tokio::join!(callback, service);
+        dispatch
+            .expect("blocking task joined")
+            .expect("service progressed while callback waited");
+    }
+
     static TEMP_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn temp_dir() -> std::path::PathBuf {

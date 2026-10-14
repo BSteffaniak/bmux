@@ -96,6 +96,29 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires BMUX_CLIPBOARD_ISOLATED_TEST=1 and a disposable native clipboard"]
+    fn isolated_native_roundtrip_without_command_fallback() {
+        assert_eq!(
+            std::env::var("BMUX_CLIPBOARD_ISOLATED_TEST").as_deref(),
+            Ok("1")
+        );
+        for text in ["", "Unicode 界 🦀 e\u{301}\n", "trailing newline\n"] {
+            copy_text(text).unwrap();
+            assert_eq!(read_text().unwrap().as_deref(), Some(text));
+        }
+        let text = "large 界\n".repeat(200_000);
+        copy_text(&text).unwrap();
+        assert_eq!(read_text().unwrap(), Some(text));
+        let image = NativeImage {
+            width: 2,
+            height: 2,
+            bytes: vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 1, 2, 3, 255],
+        };
+        copy_image(&image).unwrap();
+        assert_eq!(read_image().unwrap(), Some(image));
+    }
+
+    #[test]
     fn image_validation_checks_dimensions_and_overflow() {
         for (width, height, bytes) in [(0, 1, vec![]), (1, 1, vec![0; 3]), (usize::MAX, 2, vec![])]
         {

@@ -35,6 +35,13 @@ impl TempDirGuard {
 
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "isolated server evidence retained at {}",
+                self.path.display()
+            );
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }

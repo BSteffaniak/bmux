@@ -1,0 +1,55 @@
+name: Native clipboard interoperability
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "packages/clipboard/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "flake.lock"
+      - ".github/workflows/native-clipboard.yml"
+      - ".github/workflows/rust-version.yml"
+  pull_request:
+    paths:
+      - "packages/clipboard/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "flake.lock"
+      - ".github/workflows/native-clipboard.yml"
+      - ".github/workflows/rust-version.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  rust-version:
+    uses: ./.github/workflows/rust-version.yml
+
+  native-clipboard:
+    needs: rust-version
+    # GitHub-hosted disposable VMs only; never use a developer's desktop or
+    # self-hosted runner with clipboard sharing. These establish baseline native
+    # roundtrips, not Word/TIFF/BigTIFF or independent application acceptance.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      BMUX_CLIPBOARD_ISOLATED_TEST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
+          components: clippy
+      - name: Check native backend
+        run: cargo clippy -p bmux_clipboard --all-targets --features native-clipboard -- -D warnings
+      - name: Test native unit contracts
+        run: cargo test -p bmux_clipboard --features native-clipboard --lib -- --test-threads=1
+      - name: Test native API without command fallbacks
+        run: cargo test -p bmux_clipboard --features native-clipboard --lib native::tests::isolated_native_roundtrip_without_command_fallback -- --ignored --exact --test-threads=1 --nocapture
+      - name: Test isolated text and image roundtrips
+        run: cargo test -p bmux_clipboard --features native-clipboard --test native_interop native_text_and_image_roundtrip -- --ignored --exact --test-threads=1 --nocapture

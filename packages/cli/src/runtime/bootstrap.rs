@@ -411,7 +411,7 @@ async fn run_server_start_inner(
         return Ok(0);
     }
 
-    let loaded_plugins = load_enabled_plugins(&config, &registry)?;
+    let loaded_plugins = std::sync::Arc::new(load_enabled_plugins(&config, &registry)?);
     register_recording_plugin_config(
         &config,
         &paths,
@@ -437,7 +437,7 @@ async fn run_server_start_inner(
     // lifetime; they terminate automatically when the server drops
     // (see `spawn_plugin_bus_forwarder` for the Weak-held shutdown
     // story).
-    for plugin in &loaded_plugins {
+    for plugin in loaded_plugins.iter() {
         for publication in &plugin.declaration.event_publications {
             if !publication.forward_to_streaming_clients {
                 continue;
@@ -552,7 +552,10 @@ async fn run_server_start_inner(
     } else {
         let (plugin_bridge_shutdown_tx, plugin_bridge_shutdown_rx) =
             tokio::sync::watch::channel(false);
-        let plugin_bridge = plugin_event_bridge_loop(&loaded_plugins, plugin_bridge_shutdown_rx);
+        let plugin_bridge = plugin_event_bridge_loop(
+            std::sync::Arc::clone(&loaded_plugins),
+            plugin_bridge_shutdown_rx,
+        );
         tokio::pin!(plugin_bridge);
         tokio::select! {
             result = server.run() => {

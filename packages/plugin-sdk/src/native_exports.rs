@@ -297,6 +297,12 @@ pub trait RustPlugin: Default + Send + 'static {
     /// or command-only.
     type Contract: crate::PluginContract;
 
+    /// Whether this implementation needs mutable event callbacks. Implementations
+    /// using the default no-op handler may opt out to avoid taking a write lock
+    /// while service readers wait for reentrant peer calls. Defaults to true for
+    /// compatibility with existing event handlers.
+    const HANDLES_EVENTS: bool = true;
+
     /// Handle a CLI command declared in the plugin manifest.
     ///
     /// The default returns `Err(PluginCommandError::unknown_command(""))`.
@@ -878,8 +884,29 @@ pub fn handle_event_export<P: RustPlugin>(
     parse_binary_input::<PluginEvent>(input_ptr, input_len, 2, 3).map_or_else(
         |code| code,
         |payload| {
+            if !P::HANDLES_EVENTS {
+                return EXIT_OK;
+            }
+            let started = Instant::now();
+            tracing::debug!(
+                plugin_type = std::any::type_name::<P>(),
+                event_kind = payload.kind.as_str(),
+                "plugin event write lock requested"
+            );
             instance.write().map_or(EXIT_UNAVAILABLE, |mut plugin| {
-                result_to_exit_code(plugin.handle_event(payload))
+                tracing::debug!(
+                    plugin_type = std::any::type_name::<P>(),
+                    event_kind = payload.kind.as_str(),
+                    wait_us = started.elapsed().as_micros(),
+                    "plugin event write lock acquired"
+                );
+                let result = result_to_exit_code(plugin.handle_event(payload));
+                tracing::debug!(
+                    plugin_type = std::any::type_name::<P>(),
+                    elapsed_us = started.elapsed().as_micros(),
+                    "plugin event handler completed"
+                );
+                result
             })
         },
     )
@@ -1022,6 +1049,34 @@ pub fn invoke_streaming_service_export<P: RustPlugin>(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod concurrent_tests {
+    #[derive(Default)]
+    struct NoEventPlugin;
+    impl super::RustPlugin for NoEventPlugin {
+        type Contract = crate::NoPluginContract;
+        const HANDLES_EVENTS: bool = false;
+    }
+
+    #[test]
+    fn no_event_export_does_not_acquire_write_lock() {
+        static INSTANCE: std::sync::OnceLock<std::sync::RwLock<NoEventPlugin>> =
+            std::sync::OnceLock::new();
+        let instance = INSTANCE.get_or_init(|| std::sync::RwLock::new(NoEventPlugin));
+        let _reader = instance.read().expect("hold service reader");
+        let event = crate::PluginEvent {
+            kind: crate::PluginEventKind::from_owned("test/event".into()),
+            payload: serde_json::Value::Null,
+        };
+        let payload = crate::encode_service_message(&event).expect("encode event");
+        assert_eq!(
+            super::handle_event_export(instance, payload.as_ptr(), payload.len()),
+            crate::EXIT_OK
+        );
+        assert_ne!(
+            super::handle_event_export(instance, std::ptr::null(), 0),
+            crate::EXIT_OK
+        );
+    }
+
     use super::{
         ConcurrentRustPlugin, NativeLifecycleContext, NativeServiceContext,
         NativeStreamingServiceContext, ServiceEnvelopeKind, ServiceResponse,

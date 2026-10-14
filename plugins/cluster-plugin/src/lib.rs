@@ -194,6 +194,10 @@ async fn ensure_persistent_consensus_runtime(
 impl RustPlugin for ClusterPlugin {
     type Contract = bmux_cluster_plugin_api::Contract;
 
+    // This plugin uses the default no-op event handler. Taking an event write
+    // lock can prevent reentrant Raft RPC readers while a quorum read is pending.
+    const HANDLES_EVENTS: bool = false;
+
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         let node_identity = load_or_create_node_identity(&context).map_err(|error| {
             PluginCommandError::failed(format!(
