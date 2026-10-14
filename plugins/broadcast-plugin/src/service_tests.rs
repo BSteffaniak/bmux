@@ -54,6 +54,18 @@ mod tests {
         };
         let response = BroadcastPlugin.invoke_service(context.clone());
         assert_eq!(response.error.unwrap().code, "local_authorization_required");
+        let mut profile = context.clone();
+        profile.request.service.interface_id = "broadcast-turnkey-v1".into();
+        profile.request.operation = "start-profile".into();
+        profile.request.payload = bmux_codec::to_typed_vec(&turnkey::client::StartProfileRequest {
+            profile: None,
+            source_id: uuid::Uuid::new_v4().to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            BroadcastPlugin.invoke_service(profile).error.unwrap().code,
+            "local_authorization_required"
+        );
         let mut register = context;
         register.request.service.interface_id = "broadcast-output-v1".into();
         register.request.operation = "register".into();

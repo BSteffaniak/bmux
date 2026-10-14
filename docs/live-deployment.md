@@ -2,6 +2,62 @@
 
 Live hosting is optional. No infrastructure, credential, or remote relay is needed for ordinary local BMUX operation. The HTTP compatibility boundary is [protocol v1](live-broadcast-protocol.md).
 
+## Guided deployment from an installed binary
+
+```sh
+bmux broadcast deploy
+bmux broadcast deploy --profile staging --setup
+bmux broadcast deploy --profile staging --doctor
+bmux broadcast deploy --profile staging --plan
+bmux broadcast deploy --profile staging --review
+bmux broadcast deploy --profile staging --apply OPERATION_ID
+```
+
+The no-argument wizard guides setup, optional read-only account/zone discovery,
+resource import review, planning, and explicit approval of the exact operation
+before apply. Deployment profiles are separate from publishing profiles created
+by `bmux broadcast setup`. Existing accounts, registrar delegation, credentials,
+and billing/SQLite Durable Object entitlement remain external prerequisites.
+
+The installed binary embeds seven exact installer/infrastructure resources and
+extracts them into a private, verified, content-addressed cache. No sidecar,
+repository checkout, xtask changes, or implicit frontend build is required.
+Python 3.12 or newer is selected from bounded absolute PATH entries, or explicitly
+with `--python /absolute/path/to/python3`; its isolated version probe times out
+after five seconds. OpenTofu 1.10.9, AWS CLI, and Node 22 are deployment tools;
+the immutable candidate contains pinned Wrangler and provider locks.
+
+Candidate authority, highest priority first:
+
+1. Explicit `--artifact /absolute/immutable/candidate`; a missing path fails
+   closed. Combining this with release URL/digest flags is rejected.
+2. Explicit or saved approved `--candidate-url https://…` and independently
+   trusted `--candidate-sha256 SHA256`. The wizard acquires and verifies this
+   archive; it does not trust a digest obtained from an unsigned mutable response.
+3. Optional `live-candidate` beside the selected executable, never the working
+   directory or extracted installer cache.
+
+`--doctor` uses the same authority without downloading or applying. Missing
+candidates report the exact selected path and packaged-release setup remediation.
+Candidate production remains the explicit CI/operator action
+`scripts/build-live-artifact.sh`; it is not part of ordinary CLI builds.
+
+Advanced workflows support `--import ADDRESS=ID --approve-import`, separate
+`--bootstrap --accept-cost` plan/review/apply, and explicit
+`--state-role ROLE --approve-policy-attachment`. Review the exact proposed
+imports and cost before approval. Resume is bound to the artifact, plan hash,
+profile, AWS account, and operation ID. Interrupted apply requires read-only
+`--reconcile OPERATION_ID` or explicit `--abandon OPERATION_ID` and a fresh plan;
+it never blindly repeats a mutation. Ambiguous Pages upload acknowledgement is
+separate (`--ack-pages OPERATION_ID`). Profiles and operation ledgers contain no
+reusable credentials; provide credentials through protected prompts/environment.
+
+HTTP protocol v1 negotiates renderer `bmwp-3` and `BMWP\x03` frames, not a new
+HTTP protocol version. See the [coordinated upgrade contract](live-broadcast-protocol.md#coordinated-renderer-upgrade).
+Offline tests and built-executable help/doctor checks do not establish real
+provider import, billing, Durable Object migration, DNS/TLS, or cloud deployment
+acceptance. Those require separately authorized staging operations.
+
 ## Ownership and topology
 
 `infra/live-terraform/main.tf` owns, per environment:

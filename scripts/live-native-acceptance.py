@@ -259,6 +259,7 @@ class Harness:
         wait('local presenter graceful quit', lambda: presenter.child.poll() is not None)
         require(presenter.child.returncode == 0, 'presenter graceful quit failed')
         self.cases.append('source-switch-full-repair-stop-offline-local-quit')
+        self.turnkey_profiles(deck, public, private, hidden)
         self.run('server', 'stop')
         secret = self.key.read_bytes().strip()
         for log in self.logs:
@@ -267,6 +268,69 @@ class Harness:
         require(secret not in presenter.bytes(), 'publisher key leaked into presenter terminal')
         return {'binary': str(self.args.binary), 'sha256': self.args.sha256, 'version': version,
                 'wasm_sha256': digest(self.args.assets / 'bmux_web_renderer_bg.wasm'), 'cases': self.cases}
+
+    def turnkey_profiles(self, deck, public, private, hidden):
+        self.run('broadcast', 'setup', '--profile', 'acceptance', '--endpoint', self.url,
+                 '--channel', 'main', '--credential-file', str(self.key), '--default')
+
+        def launch(*flags):
+            mirror = PRESENTER.Mirror(self.command + ['present', 'play', str(deck), '--presenter', *flags], self.env)
+            self.terminals.append(mirror)
+            wait('turnkey local speaker remains usable',
+                 lambda: public.encode() in mirror.bytes() and private.encode() in mirror.bytes())
+            return mirror
+
+        def quit_presenter(mirror):
+            mirror.send(b'q')
+            wait('turnkey presenter graceful quit', lambda: mirror.child.poll() is not None)
+            require(mirror.child.returncode == 0, 'turnkey presenter quit failed')
+
+        automatic = launch('--broadcast')
+        wait('default profile automatic publishing', self.live)
+        automatic_source = self.control('status')['source_id']
+        require(uuid.UUID(automatic_source).version == 4, 'automatic source is not a UUID v4')
+        self.inspect(public, [private, hidden])
+        require(b'Local browser URL' not in automatic.bytes() and
+                b'Read-only audience browser:' not in automatic.bytes(), 'turnkey activated local web listener')
+        quit_presenter(automatic)
+        wait('owned default publication stops on quit', lambda: self.status()['state'] == 'offline')
+        self.cases.append('bare-broadcast-default-profile-auto-uuid-no-listener-owned-stop')
+
+        named = launch('--broadcast-profile', 'acceptance')
+        wait('explicit named profile publishing', self.live)
+        named_source = self.control('status')['source_id']
+        require(named_source != automatic_source, 'turnkey reused previous source identity')
+        self.inspect(public, [private, hidden])
+        replacement_source = str(uuid.uuid4())
+        replacement = launch('--broadcast', replacement_source)
+        wait('legacy replacement registration only', lambda: b': registered;' in replacement.bytes())
+        require(self.control('status')['source_id'] == named_source, 'legacy UUID unexpectedly started publishing')
+        self.run('broadcast', 'start', '--profile', 'acceptance', '--source', replacement_source)
+        wait('replacement profile publishing', self.live)
+        require(self.control('status')['source_id'] == replacement_source, 'profile source selection failed')
+        quit_presenter(named)
+        # Wait beyond the old caller source lease: its teardown must not stop the
+        # newly owned stream, even though both used the same destination profile.
+        deadline = time.monotonic() + 7
+        while time.monotonic() < deadline:
+            require(self.live() and self.control('status')['source_id'] == replacement_source,
+                    'superseded presenter stopped unrelated publication')
+            time.sleep(.3)
+        self.inspect(public, [private, hidden])
+        self.control('stop')
+        wait('replacement publication stopped', lambda: self.status()['state'] == 'offline')
+        quit_presenter(replacement)
+        self.cases.append('named-profile-legacy-registration-superseded-token-teardown-fenced')
+
+        missing = launch('--broadcast-profile', 'missing-profile')
+        wait('missing profile content-free diagnostic', lambda: b'local playback continues' in missing.bytes())
+        require(self.control('status')['local'] in ('offline', 'stopped'), 'missing profile opened upload gate')
+        require(missing.child.poll() is None, 'missing profile stopped local playback')
+        quit_presenter(missing)
+        self.cases.append('missing-profile-no-default-fallback-local-playback-independent')
+        secret = self.key.read_bytes().strip()
+        require(all(secret not in mirror.bytes() for mirror in (automatic, named, replacement, missing)),
+                'publisher key leaked into turnkey terminal')
 
     def inspect_terminal(self):
         try:

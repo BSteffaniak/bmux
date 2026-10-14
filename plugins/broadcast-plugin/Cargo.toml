@@ -17,7 +17,10 @@ crate-type = ["cdylib", "rlib"]
 bmux_broadcast_plugin_api = { path = "../broadcast-plugin-api" }
 bmux_client = { workspace = true }
 bmux_config = { workspace = true }
+bmux_plugin = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
+bmux_presentation_state = { workspace = true }
+bmux_sessions_plugin_api = { path = "../sessions-plugin-api" }
 bmux_web_renderer = { path = "../../packages/web-renderer" }
 libc = { workspace = true }
 reqwest = { workspace = true }

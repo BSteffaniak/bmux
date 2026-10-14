@@ -125,7 +125,25 @@ passing harness remains separate.
 
 ## Opt-in live audience source
 
-`--broadcast SOURCE_UUID` on `present play` or `present host` registers only
+Bare `--broadcast` on `present play` or `present host` generates a fresh UUID,
+registers the safe label `Presentation`, and publishes the configured default
+profile. `--broadcast-profile NAME` selects exactly that named profile (and implies
+broadcast); it never silently falls back to the default. Both use the existing
+persistent proof-authorized connection, with no local web assets or HTTP listener.
+Missing/invalid profiles and remote failures leave local playback usable and print
+a content-free diagnostic directing the operator to `bmux broadcast doctor`.
+
+```sh
+bmux present play deck.md --broadcast
+bmux present play deck.md --broadcast-profile staging
+```
+
+Publishing is attempted once per caller, not retried on reconnect: reconnect must
+not reclaim a stream superseded by another publisher. Graceful teardown uses only
+the private token returned by `start_profile` with `stop_owned`; stale tokens are
+no-ops, never global stops. An unresponsive remote is fenced by controller leases.
+
+Advanced `--broadcast SOURCE_UUID` on `present play` or `present host` registers only
 that command's audience output. It does not start a relay broadcast or an HTTP
 listener. Choose a stable UUID and select it separately:
 

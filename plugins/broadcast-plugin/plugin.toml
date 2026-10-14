@@ -1,10 +1,13 @@
 execution_class = "native_fast"
 id = "bmux.broadcast"
 name = "bmux Broadcast"
+optional_capabilities = ["bmux.sessions.read"]
 owns_namespaces = ["broadcast"]
 provided_capabilities = [
     "bmux.broadcast.control.v1",
     "bmux.broadcast.output.v1",
+    "bmux.broadcast.turnkey.v1",
+    "bmux.broadcast.presentation.v1",
 ]
 provided_features = ["bmux.broadcast"]
 version = "0.0.1-alpha.0"
@@ -17,6 +20,14 @@ kind         = "command"
 [[services]]
 capability   = "bmux.broadcast.output.v1"
 interface_id = "broadcast-output-v1"
+kind         = "command"
+[[services]]
+capability   = "bmux.broadcast.turnkey.v1"
+interface_id = "broadcast-turnkey-v1"
+kind         = "command"
+[[services]]
+capability   = "bmux.broadcast.presentation.v1"
+interface_id = "broadcast-presentation-v1"
 kind         = "command"
 [[commands]]
 execution     = "caller_process"
@@ -31,3 +42,45 @@ multiple            = true
 name                = "args"
 position            = 0
 trailing_var_arg    = true
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "broadcast-start"
+path          = ["broadcast", "start"]
+summary       = "Broadcast start"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "broadcast-pause"
+path          = ["broadcast", "pause"]
+summary       = "Broadcast pause"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "broadcast-resume"
+path          = ["broadcast", "resume"]
+summary       = "Broadcast resume"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "broadcast-stop"
+path          = ["broadcast", "stop"]
+summary       = "Broadcast stop"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "broadcast-setup"
+path          = ["broadcast", "setup"]
+summary       = "Broadcast setup"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "broadcast-doctor"
+path          = ["broadcast", "doctor"]
+summary       = "Broadcast doctor"

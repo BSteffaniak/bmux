@@ -16,11 +16,18 @@ struct Source {
     expires: Instant,
     last: Option<(u64, String, u64)>,
     terminal_stop: Option<tokio::sync::watch::Sender<bool>>,
+    label: String,
 }
 struct Pending {
     refresh: u64,
     bytes: Vec<u8>,
     relay_revision: Option<u64>,
+}
+struct Owned {
+    owner: Uuid,
+    token: String,
+    source: String,
+    profile: Option<String>,
 }
 struct State {
     sources: BTreeMap<String, Source>,
@@ -30,6 +37,9 @@ struct State {
     remote: &'static str,
     error: Option<&'static str>,
     pending: Option<Pending>,
+    owned: Option<Owned>,
+    viewer_url: Option<String>,
+    starts: BTreeMap<String, (Uuid, Option<String>)>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -41,6 +51,9 @@ impl Default for State {
             remote: "offline",
             error: None,
             pending: None,
+            owned: None,
+            viewer_url: None,
+            starts: BTreeMap::new(),
         }
     }
 }
@@ -130,6 +143,9 @@ impl Controller {
             .operation
             .lock()
             .map_err(|_| "controller_unavailable")?;
+        self.control_locked(control)
+    }
+    fn control_locked(&self, control: Control) -> Result<Status, &'static str> {
         let (reply, response) = std::sync::mpsc::sync_channel(1);
         // Admission and the local gate transition are atomic. A full command queue
         // rejects the action without changing local state.
@@ -191,13 +207,164 @@ impl Controller {
                 }
             }
         }
+        if matches!(
+            &control,
+            Control::Start(_, _) | Control::Source(_) | Control::Stop | Control::Shutdown
+        ) {
+            state.owned = None;
+            if !matches!(&control, Control::Source(_)) {
+                state.viewer_url = None;
+            }
+        }
         state.invalidate();
+        crate::indicator::update(state.local, state.remote);
         self.gate.send_replace(state.refresh);
         permit.send(Request { control, reply });
         drop(state);
         response
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "controller_timeout")
+    }
+    pub fn register_label(
+        &self,
+        owner: Uuid,
+        id: &str,
+        label: &str,
+    ) -> Result<bmux_broadcast_plugin_api::broadcast_turnkey_v1::SourceDescriptor, &'static str>
+    {
+        if label.is_empty()
+            || label.len() > 64
+            || !label.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+        {
+            return Err("invalid_source_label");
+        }
+        self.source(owner, id, true)?;
+        let mut state = self.state.lock().map_err(|_| "controller_unavailable")?;
+        let selected = state.selected.as_deref() == Some(id);
+        let source = state.sources.get_mut(id).ok_or("source_not_registered")?;
+        if source.owner != owner {
+            return Err("source_not_owned");
+        }
+        source.label = label.into();
+        Ok(
+            bmux_broadcast_plugin_api::broadcast_turnkey_v1::SourceDescriptor {
+                source_id: id.into(),
+                label: label.into(),
+                selected,
+            },
+        )
+    }
+    pub fn sources(
+        &self,
+    ) -> Result<Vec<bmux_broadcast_plugin_api::broadcast_turnkey_v1::SourceDescriptor>, &'static str>
+    {
+        let state = self.state.lock().map_err(|_| "controller_unavailable")?;
+        Ok(state
+            .sources
+            .iter()
+            .filter(|(_, source)| source.expires > Instant::now())
+            .map(
+                |(id, source)| bmux_broadcast_plugin_api::broadcast_turnkey_v1::SourceDescriptor {
+                    source_id: id.clone(),
+                    label: source.label.clone(),
+                    selected: state.selected.as_ref() == Some(id),
+                },
+            )
+            .collect())
+    }
+    pub fn turnkey_status(
+        &self,
+    ) -> Result<bmux_broadcast_plugin_api::broadcast_turnkey_v1::BroadcastStatus, &'static str>
+    {
+        let state = self.state.lock().map_err(|_| "controller_unavailable")?;
+        let status = state.status();
+        Ok(
+            bmux_broadcast_plugin_api::broadcast_turnkey_v1::BroadcastStatus {
+                local: status.local,
+                remote: status.remote,
+                source_id: status.source_id,
+                error_code: status.error_code,
+                viewer_url: state.viewer_url.clone(),
+            },
+        )
+    }
+    pub fn start_owned(
+        &self,
+        owner: Uuid,
+        id: &str,
+        profile: Option<String>,
+        relay: Relay,
+        url: String,
+        state_root: &std::path::Path,
+    ) -> Result<bmux_broadcast_plugin_api::broadcast_turnkey_v1::Publication, &'static str> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| "controller_unavailable")?;
+        {
+            let state = self.state.lock().map_err(|_| "controller_unavailable")?;
+            if state
+                .sources
+                .get(id)
+                .is_none_or(|source| source.owner != owner || source.expires <= Instant::now())
+            {
+                return Err("source_not_owned");
+            }
+            if let Some(owned) = &state.owned {
+                if owned.owner == owner
+                    && owned.source == id
+                    && owned.profile == profile
+                    && state.local != "stopped"
+                {
+                    return Ok(owned_publication(&state, &owned.token));
+                }
+                return Err("publication_already_owned");
+            }
+            if state.local != "stopped" {
+                return Err("source_unavailable_or_already_started");
+            }
+            if state.starts.contains_key(id) {
+                return Err("start_identity_superseded");
+            }
+            if state.starts.len() >= 1024 {
+                return Err("start_identity_limit");
+            }
+        }
+        crate::start_identity::claim(state_root, id)?;
+        // Keep the token even on remote uncertainty: retries return the same admitted start.
+        let result = self.control_locked(Control::Start(relay, id.into()));
+        let mut state = self.state.lock().map_err(|_| "controller_unavailable")?;
+        if state.selected.as_deref() != Some(id) || state.local == "stopped" {
+            return Err(result.err().unwrap_or("start_not_admitted"));
+        }
+        let token = Uuid::new_v4().to_string();
+        state.starts.insert(id.into(), (owner, profile.clone()));
+        state.owned = Some(Owned {
+            owner,
+            token: token.clone(),
+            source: id.into(),
+            profile,
+        });
+        state.viewer_url = Some(url);
+        Ok(owned_publication(&state, &token))
+    }
+    pub fn stop_owned(&self, owner: Uuid, token: &str) -> Result<bool, &'static str> {
+        let _operation = self
+            .operation
+            .lock()
+            .map_err(|_| "controller_unavailable")?;
+        {
+            let state = self.state.lock().map_err(|_| "controller_unavailable")?;
+            if state.owned.as_ref().is_none_or(|owned| {
+                owned.owner != owner
+                    || owned.token != token
+                    || state.selected.as_ref() != Some(&owned.source)
+            }) {
+                return Ok(false);
+            }
+        }
+        self.control_locked(Control::Stop)?;
+        Ok(true)
     }
     pub fn source(
         &self,
@@ -250,6 +417,7 @@ impl Controller {
                     expires: now + SOURCE_LEASE,
                     last: None,
                     terminal_stop: None,
+                    label: "Source".into(),
                 },
             );
         }
@@ -414,6 +582,20 @@ impl Controller {
     }
 }
 
+fn owned_publication(
+    state: &State,
+    token: &str,
+) -> bmux_broadcast_plugin_api::broadcast_turnkey_v1::Publication {
+    let status = state.status();
+    bmux_broadcast_plugin_api::broadcast_turnkey_v1::Publication {
+        token: token.into(),
+        local: status.local,
+        remote: status.remote,
+        source_id: status.source_id,
+        error_code: status.error_code,
+        viewer_url: state.viewer_url.clone(),
+    }
+}
 async fn worker(
     state: Arc<Mutex<State>>,
     mut commands: mpsc::Receiver<Request>,
@@ -539,8 +721,16 @@ async fn worker(
                 }
             }
         }
+        if let Ok(state) = state.lock() {
+            crate::indicator::update(state.local, state.remote);
+        }
     }
+    crate::indicator::remove();
 }
+
+#[cfg(test)]
+#[path = "turnkey_tests.rs"]
+mod turnkey_tests;
 
 #[cfg(test)]
 #[path = "recovery_tests.rs"]

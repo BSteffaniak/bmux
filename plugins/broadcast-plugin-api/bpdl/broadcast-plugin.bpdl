@@ -1,6 +1,28 @@
 plugin bmux.broadcast version 1;
 capability BROADCAST_CONTROL = bmux.broadcast.control.v1;
 capability BROADCAST_OUTPUT = bmux.broadcast.output.v1;
+capability BROADCAST_TURNKEY = bmux.broadcast.turnkey.v1;
+capability BROADCAST_PRESENTATION = bmux.broadcast.presentation.v1;
+
+@capability(BROADCAST_PRESENTATION)
+interface broadcast-presentation-v1 {
+    record indicator { state: string, revision: u64 }
+    command status() -> indicator;
+}
+
+@capability(BROADCAST_TURNKEY)
+interface broadcast-turnkey-v1 {
+    // Public-safe labels only: printable ASCII, 1..64 bytes; never paths/titles.
+    record source-descriptor { source_id: string, label: string, selected: bool }
+    record publication { token: string, local: string, remote: string, source_id: string?, error_code: string?, viewer_url: string? }
+    record broadcast-status { local: string, remote: string, source_id: string?, error_code: string?, viewer_url: string? }
+    command register(source_id: string, label: string) -> source-descriptor;
+    command sources() -> list<source-descriptor>;
+    command status() -> broadcast-status;
+    command start-profile(profile: string?, source_id: string) -> publication;
+    // False means superseded/not owned: MUST NOT stop another publication.
+    command stop-owned(token: string) -> bool;
+}
 
 @capability(BROADCAST_CONTROL)
 interface broadcast-control-v1 {

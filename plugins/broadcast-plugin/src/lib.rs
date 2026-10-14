@@ -6,9 +6,20 @@ pub mod authorization;
 mod service_tests;
 
 mod controller;
+mod deploy;
+mod indicator;
+mod mirror;
+mod presentation;
+mod profiles;
+pub use presentation::BroadcastPresentation;
+mod guided;
+mod identity;
 mod relay;
+mod start_identity;
 pub mod terminal;
-use bmux_broadcast_plugin_api::{broadcast_control_v1 as control, broadcast_output_v1 as output};
+use bmux_broadcast_plugin_api::{
+    broadcast_control_v1 as control, broadcast_output_v1 as output, broadcast_turnkey_v1 as turnkey,
+};
 use bmux_plugin_sdk::{
     NativeCommandContext, NativeServiceContext, PluginCommandError, RustPlugin, ServiceResponse,
 };
@@ -66,6 +77,7 @@ impl RustPlugin for BroadcastPlugin {
             .lock()
             .map_err(|_| PluginCommandError::failed("broadcast activation unavailable"))?
             .enabled = true;
+        indicator::update("stopped", "offline");
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
     fn deactivate(
@@ -85,10 +97,24 @@ impl RustPlugin for BroadcastPlugin {
                 controller.shutdown();
             }
         }
+        indicator::update("stopped", "offline");
+        indicator::remove();
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
+            "broadcast-presentation-v1", "status" => |_r: (), _ctx| { Ok::<_, ServiceResponse>(indicator::status()) },
+            "broadcast-turnkey-v1", "register" => |r: turnkey::client::RegisterRequest, ctx| { let owner = authenticated(ctx)?; controller()?.register_label(owner, &r.source_id, &r.label).map_err(error) },
+            "broadcast-turnkey-v1", "sources" => |_r: (), ctx| { authenticated(ctx)?; controller()?.sources().map_err(error) },
+            "broadcast-turnkey-v1", "status" => |_r: (), ctx| { authenticated(ctx)?; controller()?.turnkey_status().map_err(error) },
+            "broadcast-turnkey-v1", "start-profile" => |r: turnkey::client::StartProfileRequest, ctx| {
+                let owner = authenticated(ctx)?;
+                let profile = profiles::selected(std::path::Path::new(&ctx.connection.config_dir), r.profile.as_deref()).map_err(error)?;
+                let relay = relay::Relay::new(&profile.endpoint, &profile.channel, &profile.credential_file).map_err(error)?;
+                let url = guided::viewer_url(&profile.endpoint, &profile.channel).map_err(error)?;
+                controller()?.start_owned(owner, &r.source_id, r.profile, relay, url, std::path::Path::new(&ctx.connection.state_dir)).map_err(error)
+            },
+            "broadcast-turnkey-v1", "stop-owned" => |r: turnkey::client::StopOwnedRequest, ctx| { let owner = authenticated(ctx)?; controller()?.stop_owned(owner, &r.token).map_err(error) },
             "broadcast-control-v1", "prepare-local" => |_r: (), ctx| {
                 if ctx.caller_client_id.is_none() { return Err(error("authentication_required")); }
                 if !CONTROLLER.get_or_init(Mutex::default).lock().map_err(|_| error("controller_unavailable"))?.enabled { return Err(error("controller_stopped")); }
@@ -126,6 +152,28 @@ impl RustPlugin for BroadcastPlugin {
         })
     }
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        if context.invocation_source
+            == bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding
+        {
+            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                PluginCommandError::failed("broadcast prompts require attach runtime")
+            })?;
+            handle.spawn_blocking(move || {
+                if let Err(error) = run_command(context) {
+                    let text = format!("Broadcast action failed: {error}");
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                        runtime.spawn(async move {
+                            let _ = bmux_plugin::prompt::request(
+                                bmux_plugin::prompt::PromptRequest::confirm(text)
+                                    .confirm_labels("OK", "Close"),
+                            )
+                            .await;
+                        });
+                    }
+                }
+            });
+            return Ok(bmux_plugin_sdk::EXIT_OK);
+        }
         std::thread::scope(|scope| {
             scope
                 .spawn(move || run_command(context))
@@ -134,17 +182,23 @@ impl RustPlugin for BroadcastPlugin {
         })
     }
 }
-fn run_command(context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+fn run_command(mut context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+    if let Some(action) = context.command.strip_prefix("broadcast-") {
+        context.arguments.insert(0, action.to_owned());
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| PluginCommandError::failed("broadcast caller unavailable"))?;
     runtime.block_on(async {
-        let paths = bmux_config::ConfigPaths::new(context.connection.config_dir.into(), context.connection.runtime_dir.into(), context.connection.data_dir.into(), context.connection.state_dir.into());
+        if context.arguments.first().is_some_and(|arg| arg == "deploy") { return deploy::run(&context, &context.arguments[1..]).await; }
+        if guided::local(&context).await? { return Ok(bmux_plugin_sdk::EXIT_OK); }
+        let paths = bmux_config::ConfigPaths::new(context.connection.config_dir.clone().into(), context.connection.runtime_dir.clone().into(), context.connection.data_dir.clone().into(), context.connection.state_dir.clone().into());
         let mut client = bmux_client::BmuxClient::connect_with_paths(&paths, "broadcast-control").await.map_err(|_| PluginCommandError::failed("broadcast service unavailable"))?;
         control::client::prepare_local(&mut client).await.map_err(|_| PluginCommandError::failed("broadcast local authorization unavailable"))?;
         let proof = authorization::local_proof(&paths.runtime_dir).map_err(|_| PluginCommandError::failed("broadcast local authorization unavailable"))?;
         control::client::authorize(&mut client, proof).await.map_err(|_| PluginCommandError::failed("broadcast local authorization rejected"))?;
+        if guided::connected(&context, &mut client).await? { return Ok(bmux_plugin_sdk::EXIT_OK); }
         let args = &context.arguments;
         let result = match args.first().map(String::as_str) {
             Some("start") if args.len() == 5 => control::client::start(&mut client, args[1].clone(), args[2].clone(), args[3].clone(), args[4].clone()).await,
@@ -161,7 +215,7 @@ fn run_command(context: NativeCommandContext) -> Result<i32, PluginCommandError>
             _ => return Err(PluginCommandError::failed("usage: broadcast start ENDPOINT CHANNEL CREDENTIAL_FILE SOURCE_UUID | pause | resume | stop | status | source SOURCE_UUID | terminal SOURCE_UUID SESSION_UUID ABSOLUTE_EXECUTABLE SHA256 VERSION COLS ROWS")),
         };
         let status = result.map_err(|_| PluginCommandError::failed("broadcast operation rejected"))?;
-        println!("{}", serde_json::to_string(&status).map_err(|_| PluginCommandError::failed("broadcast status unavailable"))?);
+        if context.invocation_source == bmux_plugin_sdk::NativeCommandInvocationSource::Cli { println!("{}", serde_json::to_string(&status).map_err(|_| PluginCommandError::failed("broadcast status unavailable"))?); }
         Ok(bmux_plugin_sdk::EXIT_OK)
     })
 }

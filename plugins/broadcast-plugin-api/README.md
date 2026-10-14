@@ -32,6 +32,31 @@ the upload gate before remote acknowledgement; `stop_unacknowledged` does not
 claim that a remote frame has already disappeared. Startup is offline, and
 local rendering never depends on relay availability.
 
+## Turnkey and safe presentation contracts
+
+New capability `bmux.broadcast.turnkey.v1` / `broadcast_turnkey_v1` leaves both
+existing v1 interfaces unchanged. Authenticate using the existing local proof
+flow on the same persistent connection before any turnkey request.
+
+- `start_profile(client, profile: Option<String>, source_id: String)` returns
+  `Publication { token, local, remote, source_id, error_code, viewer_url }`.
+  The source UUID must belong to that caller. The private token is teardown
+  authority: never log it or publish it. Identical retries return the same token;
+  conflicting/superseded attempts reject. Retain the connection and token.
+- `stop_owned(client, token)` returns false for stale/foreign ownership and never
+  stops a newer manual start/source selection.
+- `status()` returns `BroadcastStatus` with all status fields above except token.
+- `register(source_id, label)` returns `SourceDescriptor { source_id, label,
+  selected }`; labels must be explicit printable ASCII, 1–64 bytes, never
+  inferred private titles/paths. Renew the source lease via output-v1 polling.
+- `sources()` returns bounded active descriptors.
+
+`bmux.broadcast.presentation.v1` / `broadcast_presentation_v1::client::status`
+is proof-free and returns only `Indicator { state, revision }`. States are
+`live|paused|offline|unavailable`; starting/recovering never falsely claim live.
+Reads never initialize the publisher or perform network IO. Consumers must
+validate states/revisions outside rendering and clear/remove stale UI on loss.
+
 ## Committed producer contract
 
 Use `broadcast_output_v1::client::{register, poll, publish, unregister}` on the

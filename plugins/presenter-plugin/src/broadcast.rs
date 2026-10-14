@@ -1,10 +1,15 @@
 //! Caller-owned output source. No relay credentials or network work in render hooks.
 use std::{sync::Arc, time::Duration};
 
-use bmux_broadcast_plugin_api::{broadcast_control_v1 as control, broadcast_output_v1 as output};
+use bmux_broadcast_plugin_api::{
+    broadcast_control_v1 as control, broadcast_output_v1 as output, broadcast_turnkey_v1 as turnkey,
+};
 use tokio::sync::watch;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
+// The controller may spend three seconds acquiring the remote lease. Local
+// rendering runs independently; allow the reply to deliver its ownership token.
+const START_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 type Frame = Arc<bmux_web_renderer::BrowserFrame>;
@@ -86,6 +91,48 @@ async fn authorize_source<C: bmux_plugin_sdk::TypedDispatchClient>(
     )
 }
 
+async fn start_publication<C: bmux_plugin_sdk::TypedDispatchClient>(
+    client: &mut C,
+    profile: Option<String>,
+    source: String,
+) -> Option<String> {
+    let registered = tokio::time::timeout(
+        CALL_TIMEOUT,
+        turnkey::client::register(client, source.clone(), "Presentation".into()),
+    )
+    .await;
+    if !matches!(registered, Ok(Ok(_))) {
+        eprintln!("Broadcast: profile registration unavailable; local playback continues");
+        return None;
+    }
+    match tokio::time::timeout(
+        START_TIMEOUT,
+        turnkey::client::start_profile(client, profile, source),
+    )
+    .await
+    {
+        Ok(Ok(publication)) => {
+            // Never print the private ownership token, transport error, or credential path.
+            if publication.error_code.is_some() {
+                eprintln!(
+                    "Broadcast: destination unavailable; run bmux broadcast doctor; local playback continues"
+                );
+            } else {
+                eprintln!(
+                    "Broadcast: profile publication requested; local playback remains independent"
+                );
+            }
+            (!publication.token.is_empty()).then_some(publication.token)
+        }
+        _ => {
+            eprintln!(
+                "Broadcast: profile unavailable; run bmux broadcast doctor; local playback continues"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) struct Source {
     frames: watch::Sender<Option<Frame>>,
     stop: watch::Sender<bool>,
@@ -93,10 +140,10 @@ pub(crate) struct Source {
 }
 
 impl Source {
-    pub fn start(source: uuid::Uuid, paths: bmux_config::ConfigPaths) -> Self {
+    pub fn start(options: crate::cli::BroadcastOptions, paths: bmux_config::ConfigPaths) -> Self {
         let (frames, receiver) = watch::channel(None);
         let (stop, stopping) = watch::channel(false);
-        let task = tokio::spawn(run(source.to_string(), paths, receiver, stopping));
+        let task = tokio::spawn(run(options, paths, receiver, stopping));
         Self { frames, stop, task }
     }
 
@@ -120,11 +167,14 @@ fn needs_publication(
 }
 
 async fn run(
-    source: String,
+    options: crate::cli::BroadcastOptions,
     paths: bmux_config::ConfigPaths,
     frames: watch::Receiver<Option<Frame>>,
     mut stop: watch::Receiver<bool>,
 ) {
+    let source = options.source.to_string();
+    // Start at most once: reconnecting must never reclaim a superseding broadcast.
+    let mut start_attempted = false;
     eprintln!("Broadcast source {source}: registering (audience output only)");
     let mut retry = tokio::time::interval(Duration::from_secs(1));
     let mut unavailable = false;
@@ -168,7 +218,14 @@ async fn run(
             continue;
         }
         unavailable = false;
-        eprintln!("Broadcast source {source}: registered; select with --source {source}");
+        eprintln!(
+            "Broadcast source {source}: registered; registration-only unless a profile was requested"
+        );
+        let mut token = None;
+        if options.publish && !start_attempted {
+            start_attempted = true;
+            token = start_publication(&mut client, options.profile.clone(), source.clone()).await;
+        }
         let mut sent = None;
         let mut selected = None;
         let mut rejected = false;
@@ -280,6 +337,14 @@ async fn run(
         }
         // Explicit release is best effort; dropping this same authenticated connection
         // and the controller's six-second source lease cover transport failure/crash.
+        if let Some(token) = token {
+            // A stale ownership token is a no-op, never a global stop.
+            let _ = tokio::time::timeout(
+                CALL_TIMEOUT,
+                turnkey::client::stop_owned(&mut client, token),
+            )
+            .await;
+        }
         let _ = tokio::time::timeout(
             CALL_TIMEOUT,
             output::client::unregister(&mut client, source.clone()),
@@ -297,6 +362,105 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PublicationClient {
+        calls: Vec<String>,
+        profile: Option<String>,
+        fail_start: bool,
+    }
+
+    impl bmux_plugin_sdk::TypedDispatchClient for PublicationClient {
+        async fn invoke_service_raw(
+            &mut self,
+            capability: &str,
+            _kind: bmux_ipc::InvokeServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>> {
+            assert_eq!(capability, "bmux.broadcast.turnkey.v1");
+            assert_eq!(interface, "broadcast-turnkey-v1");
+            self.calls.push(operation.into());
+            match operation {
+                "register" => {
+                    let request: turnkey::client::RegisterRequest =
+                        bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+                    assert_eq!(request.label, "Presentation");
+                    Ok(
+                        bmux_plugin_sdk::encode_service_message(&turnkey::SourceDescriptor {
+                            source_id: request.source_id,
+                            label: request.label,
+                            selected: false,
+                        })
+                        .unwrap(),
+                    )
+                }
+                "start-profile" => {
+                    let request: turnkey::client::StartProfileRequest =
+                        bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+                    assert_eq!(request.profile, self.profile);
+                    Ok(
+                        bmux_plugin_sdk::encode_service_message(&turnkey::Publication {
+                            token: if self.fail_start {
+                                String::new()
+                            } else {
+                                "private-owned-token".into()
+                            },
+                            local: "offline".into(),
+                            remote: "unknown".into(),
+                            source_id: Some(request.source_id),
+                            error_code: self.fail_start.then(|| "profile_not_found".into()),
+                            viewer_url: None,
+                        })
+                        .unwrap(),
+                    )
+                }
+                "stop-owned" => {
+                    let request: turnkey::client::StopOwnedRequest =
+                        bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+                    assert_eq!(request.token, "private-owned-token");
+                    // Stale token: caller must accept false, never fall back to stop.
+                    Ok(bmux_plugin_sdk::encode_service_message(&false).unwrap())
+                }
+                _ => panic!("unexpected publication operation"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_profiles_keep_default_named_errors_and_stale_teardown_explicit() {
+        for profile in [None, Some("stage".to_owned())] {
+            let mut client = PublicationClient {
+                calls: Vec::new(),
+                profile: profile.clone(),
+                fail_start: false,
+            };
+            let token = start_publication(&mut client, profile, uuid::Uuid::new_v4().to_string())
+                .await
+                .unwrap();
+            assert!(
+                !turnkey::client::stop_owned(&mut client, token)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(client.calls, ["register", "start-profile", "stop-owned"]);
+        }
+        let mut client = PublicationClient {
+            calls: Vec::new(),
+            profile: Some("missing".into()),
+            fail_start: true,
+        };
+        assert!(
+            start_publication(
+                &mut client,
+                Some("missing".into()),
+                uuid::Uuid::new_v4().to_string()
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(client.calls, ["register", "start-profile"]);
+    }
 
     struct RecordingClient {
         calls: Vec<String>,

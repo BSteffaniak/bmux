@@ -661,7 +661,14 @@ mod tests {
             publisher: None,
             documents: Some(documents),
             projection: None,
-            broadcast: Some(crate::broadcast::Source::start(uuid::Uuid::new_v4(), paths)),
+            broadcast: Some(crate::broadcast::Source::start(
+                crate::cli::BroadcastOptions {
+                    source: uuid::Uuid::new_v4(),
+                    profile: None,
+                    publish: false,
+                },
+                paths,
+            )),
             control: None,
             scene: bmux_tui::presentation::PresentationState::new(area),
             area,

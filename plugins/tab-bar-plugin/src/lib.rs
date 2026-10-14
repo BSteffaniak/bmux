@@ -4,6 +4,7 @@
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
 mod group_actions;
+mod live_indicator;
 mod menu;
 mod projection;
 mod rename_input;
@@ -235,6 +236,7 @@ struct CompanionState {
     menu_tab_id: Option<Uuid>,
     menu: menu::MenuInput,
     local_presentation: AttachLocalPresentationSnapshot,
+    live_indicator: Option<live_indicator::LiveIndicator>,
     catalog: tabs_list::TabListSnapshot,
     selected_context_id: Option<Uuid>,
     workspace_label: Option<String>,
@@ -286,6 +288,7 @@ impl CompanionState {
             menu_tab_id: None,
             menu: menu::MenuInput::default(),
             local_presentation: AttachLocalPresentationSnapshot::initial(),
+            live_indicator: None,
             catalog: tabs_list::TabListSnapshot {
                 tabs: Vec::new(),
                 revision: 0,
@@ -573,6 +576,18 @@ impl TabBarPresentation {
         settings: Option<&toml::Value>,
         resources: &bmux_plugin::AttachPresentationResources,
     ) -> Result<Self, String> {
+        Self::install_with_facts(
+            settings,
+            resources,
+            bmux_presentation_state::global_presentation_fact_host_service().registry(),
+        )
+    }
+
+    fn install_with_facts(
+        settings: Option<&toml::Value>,
+        resources: &bmux_plugin::AttachPresentationResources,
+        fact_registry: &'static bmux_presentation_state::PresentationFactRegistry,
+    ) -> Result<Self, String> {
         let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
         let request = layout_request(&settings);
         let handle = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
@@ -598,7 +613,9 @@ impl TabBarPresentation {
                 &bmux_workspaces_plugin_api::workspaces_list::STATE_KIND,
             )
             .ok();
+        let mut facts_rx = fact_registry.subscribe_changes();
         let mut companion = CompanionState::new(settings);
+        companion.live_indicator = live_indicator::read(fact_registry);
         let mut workspaces_rx = workspace_subscription.map(|(snapshot, rx)| {
             companion.workspace_choices.clone_from(&snapshot.workspaces);
             rx
@@ -628,6 +645,11 @@ impl TabBarPresentation {
         let task = handle.spawn(async move {
             loop {
                 let update = tokio::select! {
+                    result = facts_rx.changed() => {
+                        if result.is_err() { break; }
+                        facts_rx.borrow_and_update();
+                        PresentationUpdate::Indicator(live_indicator::read(fact_registry))
+                    }
                     result = async {
                         match &mut workspaces_rx {
                             Some(rx) => rx.changed().await.ok().map(|()| rx.borrow_and_update().workspaces.clone()),
@@ -682,6 +704,7 @@ impl Drop for TabBarPresentation {
 }
 
 enum PresentationUpdate {
+    Indicator(Option<live_indicator::LiveIndicator>),
     Workspaces(Vec<workspaces_state::WorkspaceSummary>),
     Tabs(tabs_list::TabListSnapshot),
     Local(Box<AttachLocalPresentationSnapshot>),
@@ -699,6 +722,12 @@ fn apply_presentation_update(
         return Ok(());
     };
     match update {
+        PresentationUpdate::Indicator(indicator) => {
+            if companion.live_indicator == indicator {
+                return Ok(());
+            }
+            companion.live_indicator = indicator;
+        }
         PresentationUpdate::Workspaces(workspaces) => companion.workspace_choices = workspaces,
         PresentationUpdate::Tabs(snapshot) => companion.replace_tabs(snapshot),
         PresentationUpdate::Local(snapshot) => companion.replace_local_presentation(*snapshot),
@@ -749,8 +778,27 @@ pub fn start() -> Result<(), String> {
     publish_selection(initial_selection.context_id)?;
     publish(initial.as_ref().clone())?;
     publish_local_presentation(initial_local_presentation.as_ref().clone())?;
+    let fact_registry = bmux_presentation_state::global_presentation_fact_host_service().registry();
+    let mut facts_rx = fact_registry.subscribe_changes();
+    apply_presentation_update(
+        state(),
+        PresentationUpdate::Indicator(live_indicator::read(fact_registry)),
+    )?;
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|error| format!("tab-bar companion requires an async runtime: {error}"))?;
+    handle.spawn(async move {
+        while ATTACH_GENERATION.load(Ordering::Acquire) == generation
+            && facts_rx.changed().await.is_ok()
+        {
+            facts_rx.borrow_and_update();
+            if let Err(error) = apply_presentation_update(
+                state(),
+                PresentationUpdate::Indicator(live_indicator::read(fact_registry)),
+            ) {
+                tracing::warn!(%error, "tab-bar indicator publication failed");
+            }
+        }
+    });
     handle.spawn(async move {
         while ATTACH_GENERATION.load(Ordering::Acquire) == generation
             && selection_receiver.changed().await.is_ok()
@@ -1142,6 +1190,9 @@ fn adjust_rgb(value: (u8, u8, u8), delta: i16) -> (u8, u8, u8) {
 
 fn projection_interaction(state: &CompanionState) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
+        live_indicator: state
+            .live_indicator
+            .map(live_indicator::LiveIndicator::label),
         measurements: Some(&state.measurements),
         scroll_anchor: state.scroll_anchor,
         editing_tab_id: state.editing_tab_id,
@@ -1507,6 +1558,9 @@ fn projection_interaction_without_marker(
     state: &CompanionState,
 ) -> projection::ProjectionInteraction<'_> {
     projection::ProjectionInteraction {
+        live_indicator: state
+            .live_indicator
+            .map(live_indicator::LiveIndicator::label),
         measurements: Some(&state.measurements),
         scroll_anchor: state.scroll_anchor,
         editing_tab_id: state.editing_tab_id,
@@ -2076,6 +2130,86 @@ bmux_plugin_sdk::export_plugin!(TabBarPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn attach_companion_republishes_indicator_without_local_input() {
+        use bmux_presentation_state::{PresentationFactRegistry, PresentationFactSnapshot};
+
+        // Isolated retained facts exercise the real attach companion subscription,
+        // not a global publisher that could interfere with parallel UI tests.
+        let facts = Box::leak(Box::new(PresentationFactRegistry::new()));
+        let resources = populated_resources(900);
+        let presentation = TabBarPresentation::install_with_facts(None, &resources, facts).unwrap();
+        let baseline = resources.surfaces.owner_snapshot(OWNER).unwrap();
+        let text = |snapshot: &PluginSurfaceSnapshot| {
+            snapshot
+                .surfaces
+                .iter()
+                .flat_map(|surface| &surface.ops)
+                .filter_map(|op| {
+                    if let RenderOp::TextRun { text, .. } = op {
+                        Some(text.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>()
+        };
+        assert!(!text(&baseline).contains("OFFLINE"));
+        let mut previous_revision = baseline.revision;
+        for (revision, label) in [
+            (1, "LIVE"),
+            (2, "PAUSED"),
+            (3, "OFFLINE"),
+            (4, "UNAVAILABLE"),
+        ] {
+            facts
+                .publish_authorized(
+                    "bmux.broadcast",
+                    "bmux.broadcast",
+                    PresentationFactSnapshot {
+                        revision,
+                        facts: vec![PresentationFact {
+                            entity: PresentationEntityRef::new("bmux.broadcast", "indicator"),
+                            key: "status".into(),
+                            role: PresentationFactRole::Neutral,
+                            short_text: label.into(),
+                            detail_text: None,
+                            icon_id: None,
+                            priority: 0,
+                        }],
+                    },
+                )
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let snapshot = resources.surfaces.owner_snapshot(OWNER).unwrap();
+                    if snapshot.revision > previous_revision && text(&snapshot).contains(label) {
+                        previous_revision = snapshot.revision;
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        facts.remove_producer("bmux.broadcast");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = resources.surfaces.owner_snapshot(OWNER).unwrap();
+                if snapshot.revision > previous_revision {
+                    assert_eq!(text(&snapshot), text(&baseline));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(presentation);
+        assert!(resources.surfaces.owner_snapshot(OWNER).is_none());
+    }
+
     #[test]
     fn manifest_declares_workspace_query_and_mutation_capabilities() {
         let manifest: toml::Value = toml::from_str(include_str!("../plugin.toml")).unwrap();

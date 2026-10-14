@@ -50,5 +50,22 @@ git rev-parse HEAD > "$OUTPUT/REVISION"
 # Lock and infrastructure are part of the same immutable candidate as code/assets.
 mkdir "$OUTPUT/infrastructure"
 cp infra/live-terraform/main.tf infra/live-terraform/.terraform.lock.hcl "$OUTPUT/infrastructure/"
+mkdir "$OUTPUT/infrastructure/bootstrap"
+cp infra/live-terraform/bootstrap/main.tf infra/live-terraform/bootstrap/.terraform.lock.hcl "$OUTPUT/infrastructure/bootstrap/"
+# Normalize npm-created executable links to ordinary inventory-covered files.
+python3 - "$OUTPUT/tools" <<'PY'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1]).resolve()
+for path in root.rglob('*'):
+    if path.is_symlink():
+        target = path.resolve(strict=True)
+        if not target.is_relative_to(root) or not target.is_file():
+            raise SystemExit('Unexpected external npm asset symlink')
+        payload = target.read_bytes()
+        path.unlink()
+        path.write_bytes(payload)
+PY
+python3 scripts/test-live-install.py
 (cd "$OUTPUT" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
 echo "Immutable live candidate: $OUTPUT"

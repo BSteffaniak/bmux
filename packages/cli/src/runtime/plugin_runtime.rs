@@ -124,11 +124,12 @@ macro_rules! declare_bundled_plugins {
         fn install_static_bundled_client_adapters(
             enabled: &[String],
             settings: &std::collections::BTreeMap<String, toml::Value>,
+            paths: &ConfigPaths,
         ) {
             $(
                 #[cfg(feature = $feature)]
                 if enabled.iter().any(|plugin_id| plugin_id == $plugin_id) {
-                    install_bundled_client_adapter($plugin_id, settings.get($plugin_id));
+                    install_bundled_client_adapter($plugin_id, settings.get($plugin_id), paths);
                 }
             )*
         }
@@ -143,7 +144,23 @@ macro_rules! declare_bundled_plugins {
     feature = "bundled-plugin-sidebar"
 ))]
 #[allow(unused_variables, clippy::missing_const_for_fn)]
-fn install_bundled_client_adapter(plugin_id: &str, settings: Option<&toml::Value>) {
+fn install_bundled_client_adapter(
+    plugin_id: &str,
+    settings: Option<&toml::Value>,
+    paths: &ConfigPaths,
+) {
+    #[cfg(feature = "bundled-plugin-broadcast")]
+    if plugin_id == "bmux.broadcast" {
+        let paths = paths.clone();
+        bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::from_factory(
+            plugin_id,
+            std::sync::Arc::new(move |_resources| {
+                Ok(Box::new(
+                    bmux_broadcast_plugin::BroadcastPresentation::install(paths.clone())?,
+                ))
+            }),
+        ));
+    }
     #[cfg(feature = "bundled-plugin-cluster")]
     if plugin_id == "bmux.cluster" {
         bmux_cluster_plugin_client::install();
@@ -780,10 +797,15 @@ pub(super) fn effective_enabled_plugins(
 /// Server plugin activation and client attach-provider registration have
 /// different lifetimes. This hook derives client registration from the same
 /// effective enabled-plugin set so disabled plugins cannot claim targets.
-pub(super) fn install_enabled_client_adapters(config: &BmuxConfig, registry: &PluginRegistry) {
+pub(super) fn install_enabled_client_adapters(
+    config: &BmuxConfig,
+    registry: &PluginRegistry,
+    paths: &ConfigPaths,
+) {
     install_static_bundled_client_adapters(
         &effective_enabled_plugins(config, registry),
         &config.plugins.settings,
+        paths,
     );
 }
 

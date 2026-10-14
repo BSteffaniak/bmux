@@ -89,7 +89,7 @@ pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
     let scan_us = scan_started.elapsed().as_micros();
     let state_started = Instant::now();
     let command_state = build_runtime_command_state(config.clone(), paths, Arc::clone(&registry))?;
-    install_enabled_client_adapters(&config, &registry);
+    install_enabled_client_adapters(&config, &registry, &command_state.paths);
     let state_us = state_started.elapsed().as_micros();
     let parse_started = Instant::now();
     let parsed = parse_runtime_cli_with_registry(

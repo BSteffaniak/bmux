@@ -49,6 +49,7 @@ resource "aws_iam_policy" "state" {
   for_each = aws_s3_bucket.state
   name     = "bmux-live-state-${each.key}"
   policy = jsonencode({ Version = "2012-10-17", Statement = [
+    { Effect = "Allow", Action = ["s3:GetBucketLocation", "s3:GetBucketVersioning", "s3:GetBucketPublicAccessBlock", "s3:GetEncryptionConfiguration"], Resource = each.value.arn },
     { Effect = "Allow", Action = ["s3:ListBucket"], Resource = each.value.arn,
     Condition = { StringLike = { "s3:prefix" = ["bmux/live/${each.key}/*"] } } },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:PutObject"],

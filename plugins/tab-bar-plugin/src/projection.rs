@@ -343,6 +343,7 @@ impl Default for ProjectionMeasurements {
 
 #[derive(Default)]
 pub struct ProjectionInteraction<'a> {
+    pub(super) live_indicator: Option<&'a str>,
     pub(super) measurements: Option<&'a ProjectionMeasurements>,
     pub(super) scroll_anchor: Option<Uuid>,
     pub(super) editing_tab_id: Option<Uuid>,
@@ -365,6 +366,28 @@ pub fn project_bar(
 ) -> ProjectedBar {
     let style = RenderStyle::from_settings(settings);
     let mut right = right_segments(settings, local, &style);
+    if let Some(label) = interaction.live_indicator {
+        if !right.is_empty() {
+            right.insert(
+                0,
+                ProjectedSegment {
+                    text: style.module_separator.clone(),
+                    kind: SegmentKind::Base,
+                    tab_id: None,
+                    edit_cursor_offset: None,
+                },
+            );
+        }
+        right.insert(
+            0,
+            ProjectedSegment {
+                text: style.badge(label),
+                kind: SegmentKind::Mode,
+                tab_id: None,
+                edit_cursor_offset: None,
+            },
+        );
+    }
     let mut tail = left_tail(settings, local, &style);
     let width = if local.viewport_cols == 0 {
         usize::from(u16::MAX)
@@ -1156,6 +1179,63 @@ fn segments_width(segments: &[ProjectedSegment]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_live_indicator_preserves_tab_interaction_and_baseline() {
+        let settings = Settings::default();
+        let tabs = vec![tab(1, "one", true), tab(2, "two", false)];
+        let baseline = project_bar(
+            &settings,
+            &tabs,
+            &local(80),
+            None,
+            &ProjectionInteraction::default(),
+        );
+        for label in ["LIVE", "PAUSED", "OFFLINE", "UNAVAILABLE"] {
+            let projected = project_bar(
+                &settings,
+                &tabs,
+                &local(80),
+                None,
+                &ProjectionInteraction {
+                    live_indicator: Some(label),
+                    ..ProjectionInteraction::default()
+                },
+            );
+            assert!(projected.plain_text().contains(label));
+            assert_eq!(projected.tab_ranges().len(), tabs.len());
+        }
+        assert_eq!(
+            project_bar(
+                &settings,
+                &tabs,
+                &local(80),
+                None,
+                &ProjectionInteraction::default()
+            ),
+            baseline
+        );
+        for width in 2..20 {
+            let projected = project_bar(
+                &settings,
+                &tabs,
+                &local(width),
+                None,
+                &ProjectionInteraction {
+                    live_indicator: Some("UNAVAILABLE"),
+                    ..ProjectionInteraction::default()
+                },
+            );
+            for row in 0..projected.height {
+                let occupied: usize = projected
+                    .positioned_rows()
+                    .filter(|(_, _, _, segment_row)| *segment_row == row)
+                    .map(|(_, _, segment_width, _)| usize::from(segment_width))
+                    .sum();
+                assert!(occupied <= usize::from(width));
+            }
+        }
+    }
 
     #[test]
     fn scroll_targets_remain_bound_to_the_projected_order() {

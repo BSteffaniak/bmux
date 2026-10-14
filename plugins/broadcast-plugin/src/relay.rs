@@ -24,33 +24,10 @@ struct Started {
 
 impl Relay {
     pub fn new(endpoint: &str, channel: &str, credential: &Path) -> Result<Self, &'static str> {
-        if channel.is_empty()
-            || channel.len() > 48
-            || !channel.as_bytes()[0].is_ascii_lowercase()
-                && !channel.as_bytes()[0].is_ascii_digit()
-            || !channel
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        {
-            return Err("invalid_channel");
-        }
-        let mut base = reqwest::Url::parse(endpoint).map_err(|_| "invalid_endpoint")?;
-        let loopback = base.host_str().is_some_and(|host| {
-            host == "localhost"
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|ip| ip.is_loopback())
-        });
-        if !(base.scheme() == "https" || base.scheme() == "http" && loopback)
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-            || base.path() != "/"
-        {
-            return Err("invalid_endpoint");
-        }
-        base.set_path(&format!("/api/live/{channel}/publisher/"));
+        let base = validate_endpoint(endpoint, channel)?;
+        Self::from_base(base, credential)
+    }
+    fn from_base(base: reqwest::Url, credential: &Path) -> Result<Self, &'static str> {
         let key = credential_key(credential)?;
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
@@ -130,7 +107,40 @@ impl Relay {
     }
 }
 
-fn credential_key(path: &Path) -> Result<String, &'static str> {
+pub(crate) fn validate_endpoint(
+    endpoint: &str,
+    channel: &str,
+) -> Result<reqwest::Url, &'static str> {
+    if channel.is_empty()
+        || channel.len() > 48
+        || !channel.as_bytes()[0].is_ascii_lowercase() && !channel.as_bytes()[0].is_ascii_digit()
+        || !channel
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err("invalid_channel");
+    }
+    let mut base = reqwest::Url::parse(endpoint).map_err(|_| "invalid_endpoint")?;
+    let loopback = base.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if !(base.scheme() == "https" || base.scheme() == "http" && loopback)
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+        || base.path() != "/"
+    {
+        return Err("invalid_endpoint");
+    }
+    base.set_path(&format!("/api/live/{channel}/publisher/"));
+    Ok(base)
+}
+
+pub(crate) fn credential_key(path: &Path) -> Result<String, &'static str> {
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut options = std::fs::OpenOptions::new();

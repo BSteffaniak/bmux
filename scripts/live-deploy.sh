@@ -41,7 +41,7 @@ run_private tofu init -input=false -lockfile=readonly -backend-config="$WORK/bac
 run_private tofu plan -input=false -lock-timeout=5m -out="$WORK/plan"
 run_private tofu apply -input=false -lock-timeout=5m "$WORK/plan"
 # Pages owns only static assets. No Wrangler Worker upload/deploy or DO migrations.
-run_private "$ARTIFACT/tools/node_modules/.bin/wrangler" pages deploy "$ARTIFACT/site" \
+run_private node "$ARTIFACT/tools/node_modules/wrangler/bin/wrangler.js" pages deploy "$ARTIFACT/site" \
   --project-name="$LIVE_PAGES_PROJECT" --branch=master --commit-hash="$(cat "$ARTIFACT/REVISION")"
 python3 "$ROOT/scripts/smoke-live-broadcast.py" --url "https://$LIVE_HOSTNAME"
 echo 'Environment deployed; public read-only health/status/viewer smoke passed.'

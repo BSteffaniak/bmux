@@ -4,10 +4,18 @@ use bmux_presenter_runtime::protocol::InteractionMode;
 use std::{net::IpAddr, path::PathBuf};
 
 /// CLI values only: shared configuration resolution owns environment/defaults.
+#[derive(Debug, Clone)]
+pub(crate) struct BroadcastOptions {
+    pub source: uuid::Uuid,
+    /// None selects the configured default when publish is true.
+    pub profile: Option<String>,
+    pub publish: bool,
+}
+
 #[derive(Default, Debug)]
 pub(crate) struct WebOptions {
     pub enabled: bool,
-    pub broadcast: Option<uuid::Uuid>,
+    pub broadcast: Option<BroadcastOptions>,
     pub assets: Option<PathBuf>,
     pub only: bool,
     pub port: Option<u16>,
@@ -19,10 +27,43 @@ pub(crate) struct WebOptions {
 
 impl WebOptions {
     fn parse(args: &mut Arguments<'_>) -> Result<Self> {
-        let broadcast = args
-            .value("--broadcast")?
-            .map(|value| value.parse().context("--broadcast must be a source UUID"))
-            .transpose()?;
+        let profile = args.value("--broadcast-profile")?;
+        ensure!(
+            profile.as_ref().is_none_or(|name| !name.trim().is_empty()),
+            "--broadcast-profile requires a nonempty name"
+        );
+        let broadcast = if let Some(index) = args.index("--broadcast")? {
+            args.used[index] = true;
+            let manual = args
+                .values
+                .get(index + 1)
+                .filter(|value| !value.starts_with('-'))
+                .map(|value| {
+                    value
+                        .parse::<uuid::Uuid>()
+                        .context("--broadcast must be a source UUID")
+                })
+                .transpose()?;
+            if manual.is_some() {
+                ensure!(!args.used[index + 1], "--broadcast value already consumed");
+                args.used[index + 1] = true;
+                ensure!(
+                    profile.is_none(),
+                    "--broadcast SOURCE_UUID is registration-only; use --broadcast-profile NAME without a UUID to publish"
+                );
+            }
+            Some(BroadcastOptions {
+                source: manual.unwrap_or_else(uuid::Uuid::new_v4),
+                profile,
+                publish: manual.is_none(),
+            })
+        } else {
+            profile.map(|name| BroadcastOptions {
+                source: uuid::Uuid::new_v4(),
+                profile: Some(name),
+                publish: true,
+            })
+        };
         let enabled = args.flag("--web")?;
         let assets = args.value("--web-assets")?.map(PathBuf::from);
         let only = args.flag("--web-only")?;
@@ -313,7 +354,10 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(web.broadcast.unwrap().to_string(), source);
+        let broadcast = web.broadcast.unwrap();
+        assert_eq!(broadcast.source.to_string(), source);
+        assert!(!broadcast.publish);
+        assert!(broadcast.profile.is_none());
         assert!(!web.enabled && !web.only);
         assert!(parse("play", &["deck.md", "--broadcast", "invalid"]).is_err());
         assert!(parse("join", &["bmux:host", "--broadcast", source]).is_err());
@@ -327,6 +371,49 @@ mod tests {
             assert!(web.broadcast.is_some());
             assert_eq!(web.only, flag == "--web-only");
         }
+    }
+
+    #[test]
+    fn turnkey_broadcast_uses_fresh_sources_and_explicit_profile_selection() {
+        let mut sources = Vec::new();
+        for flags in [
+            vec!["--broadcast"],
+            vec!["--broadcast", "--presenter"],
+            vec!["--broadcast-profile", "stage"],
+            vec!["--broadcast", "--broadcast-profile", "stage"],
+        ] {
+            let mut args = vec!["deck.md"];
+            args.extend(flags);
+            let Command::Play { web, .. } = parse("play", &args).unwrap() else {
+                panic!()
+            };
+            assert!(!web.enabled && !web.only);
+            let broadcast = web.broadcast.unwrap();
+            assert!(broadcast.publish);
+            assert_eq!(broadcast.source.get_version_num(), 4);
+            assert_eq!(
+                broadcast.profile.as_deref(),
+                args.contains(&"stage").then_some("stage")
+            );
+            assert!(!sources.contains(&broadcast.source));
+            sources.push(broadcast.source);
+        }
+        for args in [
+            vec!["deck.md", "--broadcast-profile"],
+            vec!["deck.md", "--broadcast-profile", " "],
+            vec!["deck.md", "--broadcast", "--broadcast"],
+            vec![
+                "deck.md",
+                "--broadcast",
+                "12345678-1234-4234-8234-123456789abc",
+                "--broadcast-profile",
+                "stage",
+            ],
+        ] {
+            assert!(parse("play", &args).is_err());
+        }
+        assert!(parse("join", &["bmux:host", "--broadcast-profile", "stage"]).is_err());
+        assert!(parse("check", &["deck.md", "--broadcast"]).is_err());
     }
 
     #[test]

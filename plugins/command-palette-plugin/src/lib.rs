@@ -488,9 +488,52 @@ bmux_plugin_sdk::export_plugin!(CommandPalettePlugin, include_str!("../plugin.to
 mod tests {
     use super::{
         PaletteEntry, PaletteEntryKind, bindable_action_key_hint, collect_command_arguments,
-        plugin_action_string, plugin_command_key_hint, shell_quote, uses_default_palette_arguments,
+        plugin_action_string, plugin_command_entries, plugin_command_key_hint, shell_quote,
+        uses_default_palette_arguments,
     };
     use bmux_plugin_sdk::{ActiveKeybinding, PluginCommand, PromptOption};
+
+    #[test]
+    fn named_broadcast_commands_are_discovered_only_when_enabled() {
+        let names = ["start", "pause", "resume", "stop", "setup", "doctor"];
+        let plugin = bmux_plugin_sdk::RegisteredPluginInfo {
+            id: "bmux.broadcast".into(),
+            display_name: "Broadcast".into(),
+            version: "1".into(),
+            bundled_static: false,
+            required_capabilities: Vec::new(),
+            provided_capabilities: Vec::new(),
+            commands: names.iter().map(ToString::to_string).collect(),
+            command_schemas: names
+                .iter()
+                .map(|name| PluginCommand::new(*name, format!("Broadcast {name}")))
+                .collect(),
+        };
+        assert!(plugin_command_entries(std::slice::from_ref(&plugin), &[], &[]).is_empty());
+        assert!(plugin_command_entries(&[], std::slice::from_ref(&plugin.id), &[]).is_empty());
+        let entries = plugin_command_entries(
+            std::slice::from_ref(&plugin),
+            std::slice::from_ref(&plugin.id),
+            &[],
+        );
+        assert_eq!(entries.len(), names.len());
+        for (entry, name) in entries.iter().zip(names) {
+            let PaletteEntryKind::PluginCommand {
+                plugin_id,
+                command_name,
+                schema,
+            } = &entry.kind
+            else {
+                panic!("expected normal plugin command path");
+            };
+            assert_eq!(command_name, name);
+            assert!(schema.arguments.is_empty());
+            assert_eq!(
+                plugin_action_string(plugin_id, command_name, &[]),
+                format!("plugin:bmux.broadcast:{name}")
+            );
+        }
+    }
 
     #[test]
     fn pane_padding_configurator_uses_default_palette_arguments() {
