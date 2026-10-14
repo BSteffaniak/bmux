@@ -108,6 +108,7 @@ dependencies = [
 [[package]]
 name = "mermaid-rs-renderer"
 version = "0.3.1"
+source = "git+https://github.com/BSteffaniak/mermaid-rs-renderer?branch=wasm-portability#7c06c9ab2c69da15f356ccfc5c27d1b77f59bec4"
 dependencies = [
  "anyhow",
  "fontdb",

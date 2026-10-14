@@ -6,15 +6,14 @@ version = "0.1.0"
 
 # Intentionally independent: no host runtime dependencies or outer workspace locks.
 [workspace]
-# Third-party library stays outside the guest's first-party lint/test targets.
-exclude = ["vendor/mermaid-rs-renderer"]
 
 [lib]
 crate-type = ["cdylib"]
 
 [workspace.dependencies]
-# Guest-local portability changes; never patch the native workspace renderer.
-mermaid-rs-renderer = { path = "vendor/mermaid-rs-renderer", version = "=0.3.1", default-features = false }
+# Follow the portable fork branch; Cargo.lock retains the exact resolved commit.
+# Native workspace rendering still uses crates.io 0.3.1.
+mermaid-rs-renderer = { git = "https://github.com/BSteffaniak/mermaid-rs-renderer", branch = "wasm-portability", default-features = false }
 
 [dependencies]
 mermaid-rs-renderer = { workspace = true }

@@ -31,6 +31,16 @@ pub unsafe extern "C" fn render(ptr: u32, len: u32) -> u64 {
     let result = std::str::from_utf8(bytes)
         .map_err(|error| error.to_string())
         .and_then(|source| {
+            static FONT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+            FONT.get_or_init(|| {
+                mermaid_rs_renderer::set_text_measurement_font(
+                    include_bytes!("../fonts/JetBrainsMonoNerdFont-Regular.ttf").to_vec(),
+                    0,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(Clone::clone)?;
             mermaid_rs_renderer::render_strict(
                 source,
                 mermaid_rs_renderer::RenderOptions::default(),
