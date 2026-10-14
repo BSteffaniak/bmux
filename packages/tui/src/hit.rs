@@ -260,6 +260,16 @@ impl HitMap {
             .retain(|region| region.area.intersection(area).is_empty());
     }
 
+    /// Exclude background interaction while preserving its visible geometry.
+    /// This mutates only a staged map; commit it with the matching output.
+    pub(crate) fn exclude_outside_scope(&mut self, scope: Option<&HitId>) {
+        for region in &mut self.regions {
+            if region.focus_scope.as_ref() != scope {
+                region.enabled = false;
+            }
+        }
+    }
+
     /// Return enabled focusable targets in deterministic traversal order.
     #[must_use]
     pub fn focus_targets(&self, scope: Option<&HitId>) -> Vec<HitId> {
@@ -394,6 +404,32 @@ mod tests {
         let hit = map.hit_mouse(event).expect("hover region should match");
 
         assert_eq!(hit.id().as_str(), "hover");
+    }
+
+    #[test]
+    fn modal_exclusion_blocks_background_even_without_visible_foreground() {
+        let scope = HitId::new("modal");
+        let mut map = HitMap::new()
+            .with_region(HitRegion::new("background", Rect::new(0, 0, 8, 4)).focusable(true))
+            .with_region(
+                HitRegion::new("hidden", Rect::new(3, 1, 2, 2))
+                    .focus_scope(scope.clone())
+                    .focusable(true)
+                    .visible(false),
+            );
+        map.exclude_outside_scope(Some(&scope));
+        for point in [Point::new(0, 0), Point::new(3, 1), Point::new(7, 3)] {
+            assert!(map.hit_test(point).is_none());
+            assert!(
+                map.hit_mouse(MouseEvent::new(
+                    MouseEventKind::Down(MouseButton::Left),
+                    point
+                ))
+                .is_none()
+            );
+        }
+        assert!(map.focus_targets(Some(&scope)).is_empty());
+        assert!(map.focus_targets(None).is_empty());
     }
 
     #[test]

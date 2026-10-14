@@ -1,0 +1,53 @@
+plugin bmux.playbook version 1;
+
+capability PLAYBOOK_READ = bmux.playbook.read;
+capability PLAYBOOK_EXECUTE = bmux.playbook.execute;
+
+interface playbook-types {
+    record attempt {
+        generation: u64,
+        revision: u64,
+        phase: string,
+        step: u64,
+        paused: bool,
+        cleanup_acknowledged: bool,
+        root: string,
+        runtime_dir: string,
+        config_dir: string,
+        data_dir: string,
+        state_dir: string,
+        session_id: string?,
+        diagnostic: string?,
+    }
+    record preparation {
+        request_id: string,
+        source: string,
+        allowed_root: string,
+        executable: string,
+        attempts_root: string,
+        trusted_executable_input: bool,
+        expected_closure_sha256: string,
+    }
+    variant playbook-error {
+        rejected { message: string },
+    }
+}
+
+@capability(PLAYBOOK_READ)
+interface playbook-state {
+    query lookup-preparation(request_id: string) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    query status(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    query watch(generation: u64, after_revision: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    query settled(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+}
+
+@capability(PLAYBOOK_EXECUTE)
+interface playbook-commands {
+    command prepare(input: playbook-types.preparation) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    command start(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    command pause-script(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    command next-step(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    command resume-script(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    command stop(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+    command restart(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
+}

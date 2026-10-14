@@ -2,6 +2,66 @@
 mod tests {
     use super::*;
     use bmux_presenter::{DeckBuilder, SlideBuilder};
+
+    #[tokio::test]
+    async fn trusted_host_installs_initial_owner_once_and_keeps_stale_fence() {
+        let root =
+            std::env::temp_dir().join(format!("presenter-trusted-host-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("deck.md");
+        std::fs::write(&source, include_str!("../examples/live-demo.md")).unwrap();
+        let playbook = root.join("live-demo.dsl");
+        std::fs::write(&playbook, include_str!("../examples/live-demo.dsl")).unwrap();
+        let loaded = crate::source::loaded(&source).unwrap();
+        let environment = crate::playbook_live::DemoEnvironment {
+            paths: bmux_config::ConfigPaths::new(
+                root.join("config"),
+                root.join("runtime"),
+                root.join("data"),
+                root.join("state"),
+            ),
+            approval: crate::playbook::Approval::prepare(&source, &loaded.deck).unwrap(),
+            executable: std::env::current_exe().unwrap(),
+            attempts_root: root.clone(),
+            runtime: tokio::runtime::Handle::current(),
+        };
+        // Host credentials require at least 32 bytes; this is test-only input.
+        let credential = uuid::Uuid::new_v4().to_string();
+        let mut host = build_trusted(&source, true, credential.clone(), None, environment).unwrap();
+        let participant = host
+            .authenticate(
+                bmux_presenter_runtime::protocol::PROTOCOL_VERSION,
+                Some(&credential),
+                InteractionMode::Shared,
+            )
+            .unwrap();
+        let snapshot = host.snapshot(&participant).unwrap();
+        assert!(
+            snapshot
+                .surfaces
+                .iter()
+                .any(|surface| surface.surface_id == "live-demo")
+        );
+        let mut stale = snapshot.cursor;
+        stale.revision = stale.revision.saturating_sub(1);
+        let action_id = host.next_action_id(&participant).unwrap().unwrap();
+        assert!(matches!(
+            host.submit(
+                &participant,
+                bmux_presenter_runtime::Submission {
+                    expected: stale,
+                    action_id,
+                    action: Action::Navigate(NavigationAction::Next),
+                }
+            ),
+            Err(HostError::Stale)
+        ));
+        host.shutdown_owner().await.unwrap();
+        std::fs::remove_file(playbook).unwrap();
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
     #[test]
     fn generated_projection_keeps_notes_separate_and_cursor_exact() {
         let mut deck = DeckBuilder::new("d")

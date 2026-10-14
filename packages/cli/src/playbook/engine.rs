@@ -2154,6 +2154,19 @@ pub async fn run_playbook(
     target_server: bool,
     options: RunOptions,
 ) -> Result<PlaybookResult> {
+    if let Some(control) = super::managed::ManagedRun::from_env()? {
+        ensure!(
+            !target_server && !options.interactive,
+            "managed runs cannot target a user server or acquire a terminal"
+        );
+        control.publish("starting", 0, None, false, None)?;
+        let result = run_playbook_inner(playbook, false, options).await;
+        if let Err(error) = result.as_ref() {
+            let diagnostic = format!("{error:#}");
+            control.publish_failure(&diagnostic)?;
+        }
+        return result;
+    }
     tokio::select! {
         result = run_playbook_inner(playbook, target_server, options) => result,
         _ = tokio::signal::ctrl_c() => {
@@ -2472,8 +2485,12 @@ async fn run_playbook_inner(
     options: RunOptions,
 ) -> Result<PlaybookResult> {
     let started = Instant::now();
+    let mut managed = super::managed::ManagedRun::from_env()?;
+    if managed.is_some() {
+        super::managed::validate_environment(&playbook)?;
+    }
     let playbook_name = playbook.config.name.clone();
-    let should_record = playbook.config.record;
+    let should_record = playbook.config.record && managed.is_none();
 
     let mut step_results = Vec::new();
     let mut snapshots = Vec::new();
@@ -2598,6 +2615,19 @@ async fn run_playbook_inner(
     }
 
     for (step_position, step) in playbook.steps.iter().enumerate() {
+        if let Some(control) = managed.as_mut() {
+            control.publish("running", step_position, session_id, false, None)?;
+            if let Err(error) = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                control.permission(),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("deadline exceeded while paused")))
+            {
+                error_msg = Some(error.to_string());
+                break;
+            }
+        }
         if let Some(ref mut visual_state) = visual_interactive {
             let prompt_decision = visual_wait_for_step_permission(
                 visual_state,
@@ -2732,7 +2762,8 @@ async fn run_playbook_inner(
                 step.action.name()
             );
         }
-        let result = execute_step(
+        let result = tokio::select! {
+            result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), execute_step(
             step,
             &mut client,
             &mut inspector,
@@ -2750,8 +2781,9 @@ async fn run_playbook_inner(
             real_attach_runtime.as_ref(),
             step_position,
             total_steps,
-        )
-        .await;
+        )) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("playbook deadline exceeded"))),
+            () = super::managed::cancellation(managed.as_ref()) => Err(anyhow::anyhow!("managed playbook stopped")),
+        };
 
         #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = step_start.elapsed().as_millis() as u64;
@@ -2928,6 +2960,26 @@ async fn run_playbook_inner(
         }
     }
 
+    if let Some(control) = managed.as_ref() {
+        control.publish(
+            "script-complete",
+            total_steps,
+            session_id,
+            false,
+            error_msg.as_deref(),
+        )?;
+        if error_msg.is_none() {
+            control.hold().await?;
+        }
+        control.publish(
+            "stopping",
+            total_steps,
+            session_id,
+            false,
+            error_msg.as_deref(),
+        )?;
+    }
+
     if let Some(abort_start_index) = interactive_abort_from_step {
         for skipped_step in playbook.steps.iter().skip(abort_start_index) {
             step_results.push(StepResult {
@@ -2976,10 +3028,18 @@ async fn run_playbook_inner(
         if let Some(sb) = &sandbox {
             // Copy recording dir from sandbox to user recordings dir.
             let src_dir = sb.paths().recordings_dir().join(rid.to_string());
-            let user_recordings = bmux_config::ConfigPaths::default().recordings_dir();
-            let dest_dir = user_recordings.join(rid.to_string());
+            let dest_dir = if managed.is_some() {
+                // Managed recordings remain under the explicitly owned attempt.
+                src_dir.clone()
+            } else {
+                bmux_config::ConfigPaths::default()
+                    .recordings_dir()
+                    .join(rid.to_string())
+            };
 
-            if src_dir.exists() {
+            if managed.is_some() {
+                recording_path = Some(src_dir);
+            } else if src_dir.exists() {
                 if let Err(e) = copy_dir_recursive(&src_dir, &dest_dir) {
                     warn!("failed to copy recording to user dir: {e:#}");
                 } else {
@@ -3011,9 +3071,28 @@ async fn run_playbook_inner(
 
     // Shutdown sandbox if we created one.
     if let Some(sb) = sandbox
-        && let Err(e) = sb.shutdown(!pass).await
+        && let Err(error) = sb.shutdown(!pass || managed.is_some()).await
     {
-        warn!("sandbox shutdown error: {e:#}");
+        if let Some(control) = managed.as_ref() {
+            let diagnostic = format!("sandbox cleanup unacknowledged: {error:#}");
+            control.publish(
+                "cleanup-failed",
+                total_steps,
+                session_id,
+                false,
+                Some(&diagnostic),
+            )?;
+        }
+        return Err(error.context("sandbox cleanup unacknowledged"));
+    }
+    if let Some(control) = managed.as_ref() {
+        control.publish(
+            "settled",
+            total_steps,
+            session_id,
+            true,
+            error_msg.as_deref(),
+        )?;
     }
 
     Ok(PlaybookResult {
@@ -3999,7 +4078,8 @@ pub(super) async fn execute_step(
                     .await?;
                 }
 
-                let wait_deadline = Instant::now() + (*timeout).min(deadline - Instant::now());
+                let wait_deadline = Instant::now()
+                    + (*timeout).min(deadline.saturating_duration_since(Instant::now()));
                 let mut poll_delay = Duration::from_millis(10);
 
                 let result = loop {
@@ -4345,7 +4425,8 @@ pub(super) async fn execute_step(
             }
 
             let resolved_event = runtime_vars.resolve_opt(event);
-            let wait_deadline = Instant::now() + (*timeout).min(deadline - Instant::now());
+            let wait_deadline =
+                Instant::now() + (*timeout).min(deadline.saturating_duration_since(Instant::now()));
             let mut poll_delay = Duration::from_millis(25);
 
             loop {

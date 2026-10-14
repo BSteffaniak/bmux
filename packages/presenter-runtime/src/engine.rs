@@ -107,6 +107,16 @@ pub trait Owner: Send {
     fn reconcile_reload(&mut self, context: OwnerContext<'_>) -> Result<Vec<MirrorFrame>, String> {
         self.scene(context)
     }
+    fn advance(&mut self, _context: OwnerContext<'_>) -> Result<bool, HostError> {
+        Ok(false)
+    }
+    fn navigation(
+        &mut self,
+        _previous_slide: Option<&str>,
+        _context: OwnerContext<'_>,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
     fn scene(&mut self, _context: OwnerContext<'_>) -> Result<Vec<MirrorFrame>, String> {
         Ok(Vec::new())
     }
@@ -121,6 +131,13 @@ pub trait Owner: Send {
         name: &str,
         input: &str,
     ) -> Result<OwnerUpdate, HostError>;
+    /// Explicit lifecycle command boundary, never called by rendering or reads.
+    fn shutdown(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HostError>> + Send + '_>>
+    {
+        Box::pin(async { Ok(()) })
+    }
     fn disconnect(&mut self, _participant: &str) {}
 }
 
@@ -206,6 +223,12 @@ impl Host {
             actions: BTreeMap::new(),
             owner: None,
         })
+    }
+    pub async fn shutdown_owner(&mut self) -> Result<(), HostError> {
+        if let Some(owner) = &mut self.owner {
+            owner.shutdown().await?;
+        }
+        Ok(())
     }
     pub fn limits(&self) -> &Limits {
         &self.config.limits
@@ -630,6 +653,7 @@ impl Host {
             return Err(HostError::NotFound);
         }
         // Consume ordering BEFORE external invocation, including uncertain failures.
+        let previous_slide = state.slide_id.as_ref().map(|id| id.as_str().to_owned());
         if independent {
             let participant = self
                 .participants
@@ -654,6 +678,31 @@ impl Host {
                 } else {
                     reduce(&self.deck, &mut self.state, action);
                     self.surfaces.clear();
+                }
+                let participant = self.participants.get(id).ok_or(HostError::Authentication)?;
+                let state = if independent {
+                    &participant.state
+                } else {
+                    &self.state
+                };
+                let cursor = self.cursor(id)?;
+                if let Some(owner) = self.owner.as_mut() {
+                    owner.navigation(
+                        previous_slide.as_deref(),
+                        OwnerContext {
+                            participant: id,
+                            instance: if independent {
+                                participant
+                                    .grant
+                                    .as_deref()
+                                    .ok_or(HostError::Authentication)?
+                            } else {
+                                "shared"
+                            },
+                            state,
+                            cursor: &cursor,
+                        },
+                    )?;
                 }
                 self.refresh_scene(id, independent)?;
                 "navigation committed".to_owned()
@@ -785,6 +834,53 @@ impl Host {
             }
         }
         Ok(result)
+    }
+    /// Explicit scheduler turn, never invoked by snapshot/poll/paint. Owners may
+    /// consume bounded ready updates and publish complete retained scenes.
+    pub fn advance_owner(&mut self) -> Result<bool, HostError> {
+        let mut changed = false;
+        let mut targets = vec![(None, "shared".to_owned(), self.state.clone(), self.revision)];
+        for (id, participant) in &self.participants {
+            if participant.mode == InteractionMode::Independent
+                && let Some(grant) = &participant.grant
+            {
+                targets.push((
+                    Some(id.clone()),
+                    grant.clone(),
+                    participant.state.clone(),
+                    participant.revision,
+                ));
+            }
+        }
+        for (participant, instance, state, revision) in targets {
+            let cursor = Cursor {
+                run_id: self.run_id.clone(),
+                deck_revision: self.deck_revision,
+                revision,
+            };
+            let Some(owner) = self.owner.as_mut() else {
+                break;
+            };
+            let context = OwnerContext {
+                participant: participant.as_deref().unwrap_or(""),
+                instance: &instance,
+                state: &state,
+                cursor: &cursor,
+            };
+            if owner.advance(context)? {
+                let frames = owner
+                    .scene(OwnerContext {
+                        participant: participant.as_deref().unwrap_or(""),
+                        instance: &instance,
+                        state: &state,
+                        cursor: &cursor,
+                    })
+                    .map_err(|_| HostError::Invalid)?;
+                self.commit_surfaces(&cursor, participant.as_deref(), frames)?;
+                changed = true;
+            }
+        }
+        Ok(changed)
     }
     /// Trusted owner commits a complete scene batch; failed validation changes nothing.
     pub fn commit_surfaces(

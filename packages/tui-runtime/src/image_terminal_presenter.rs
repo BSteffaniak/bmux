@@ -10,6 +10,7 @@ use bmux_tui::focus::FocusTrap;
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::hit::HitMap;
 use bmux_tui::paint::PaintCx;
+use bmux_tui::presentation::PreparedPresentation;
 use bmux_tui::selection::SelectionScene;
 use bmux_tui::terminal::Terminal;
 
@@ -49,11 +50,48 @@ impl From<io::Error> for ImagePresentationError {
     }
 }
 
+/// Default prepared-snapshot configuration preserving existing constructors.
+pub struct NoopPreparedConfiguration;
+
+/// Caller-owned configuration applied before output, never a focus authority.
+pub trait PreparedConfiguration<P> {
+    /// Stage metadata and validate admission before the backend writes anything.
+    ///
+    /// # Errors
+    /// Returns a rejected configuration or admission error.
+    fn configure(&mut self, program: &mut P, prepared: &mut PreparedPresentation)
+    -> io::Result<()>;
+}
+
+impl<P> PreparedConfiguration<P> for NoopPreparedConfiguration {
+    fn configure(
+        &mut self,
+        _program: &mut P,
+        _prepared: &mut PreparedPresentation,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<P, F> PreparedConfiguration<P> for F
+where
+    F: FnMut(&mut P, &mut PreparedPresentation) -> io::Result<()>,
+{
+    fn configure(
+        &mut self,
+        program: &mut P,
+        prepared: &mut PreparedPresentation,
+    ) -> io::Result<()> {
+        self(program, prepared)
+    }
+}
+
 /// Presenter that commits cell and terminal-image output through one flush.
-pub struct ImageTerminalPresenter<W, R, C = NoopPresentationCommit> {
+pub struct ImageTerminalPresenter<W, R, C = NoopPresentationCommit, Q = NoopPreparedConfiguration> {
     terminal: Terminal<W>,
     render: R,
     commit: C,
+    configure: Q,
     compositor: TuiImageCompositor,
     host_capabilities: HostImageCapabilities,
     image_config: ImageConfig,
@@ -94,7 +132,7 @@ impl<W: Write, R> ImageTerminalPresenter<W, R, NoopPresentationCommit> {
     }
 }
 
-impl<W: Write, R, C> ImageTerminalPresenter<W, R, C> {
+impl<W: Write, R, C, Q> ImageTerminalPresenter<W, R, C, Q> {
     /// Refresh pixel geometry without reading terminal input or changing protocols.
     pub fn refresh_cell_metrics(&mut self) {
         let (width, height) = bmux_image::host_caps::query_cell_pixel_size();
@@ -103,7 +141,9 @@ impl<W: Write, R, C> ImageTerminalPresenter<W, R, C> {
             self.host_capabilities.cell_pixel_height = height;
         }
     }
+}
 
+impl<W: Write, R, C> ImageTerminalPresenter<W, R, C> {
     /// Create an image-capable presenter with a successful-commit observer.
     #[must_use]
     pub fn with_commit(
@@ -117,9 +157,29 @@ impl<W: Write, R, C> ImageTerminalPresenter<W, R, C> {
             terminal,
             render,
             commit,
+            configure: NoopPreparedConfiguration,
             compositor: TuiImageCompositor::new(),
             host_capabilities,
             image_config,
+        }
+    }
+}
+
+impl<W: Write, R, C, Q> ImageTerminalPresenter<W, R, C, Q> {
+    /// Install caller-owned prepared metadata configuration before output.
+    /// The callback receives `(&mut P, &mut PreparedPresentation)` and returns
+    /// `io::Result<()>`. Stage scopes first, then call `validate_limits` with
+    /// the application's admission budget; rejection performs no output.
+    #[must_use]
+    pub fn configure_prepared<F>(self, configure: F) -> ImageTerminalPresenter<W, R, C, F> {
+        ImageTerminalPresenter {
+            terminal: self.terminal,
+            render: self.render,
+            commit: self.commit,
+            configure,
+            compositor: self.compositor,
+            host_capabilities: self.host_capabilities,
+            image_config: self.image_config,
         }
     }
 
@@ -206,10 +266,11 @@ impl<W: Write, R, C> ImageTerminalPresenter<W, R, C> {
     }
 }
 
-impl<P, W, R> Presenter<P> for ImageTerminalPresenter<W, R, NoopPresentationCommit>
+impl<P, W, R, Q> Presenter<P> for ImageTerminalPresenter<W, R, NoopPresentationCommit, Q>
 where
     W: Write,
     R: FnMut(&mut P, &mut PaintCx<'_, '_>),
+    Q: PreparedConfiguration<P>,
 {
     type Error = ImagePresentationError;
 
@@ -228,6 +289,7 @@ where
         present_image_frame(
             &mut self.terminal,
             &mut self.render,
+            &mut self.configure,
             &mut self.compositor,
             &self.host_capabilities,
             &self.image_config,
@@ -236,11 +298,12 @@ where
     }
 }
 
-impl<P, W, R, C> Presenter<P> for ImageTerminalPresenter<W, R, C>
+impl<P, W, R, C, Q> Presenter<P> for ImageTerminalPresenter<W, R, C, Q>
 where
     W: Write,
     R: FnMut(&mut P, &mut PaintCx<'_, '_>),
     C: FnMut(&mut P, &HitMap, &FocusTrap),
+    Q: PreparedConfiguration<P>,
 {
     type Error = ImagePresentationError;
 
@@ -259,6 +322,7 @@ where
         let report = present_image_frame(
             &mut self.terminal,
             &mut self.render,
+            &mut self.configure,
             &mut self.compositor,
             &self.host_capabilities,
             &self.image_config,
@@ -269,9 +333,10 @@ where
     }
 }
 
-fn present_image_frame<P, W, R>(
+fn present_image_frame<P, W, R, Q>(
     terminal: &mut Terminal<W>,
     render: &mut R,
+    configure: &mut Q,
     compositor: &mut TuiImageCompositor,
     capabilities: &HostImageCapabilities,
     config: &ImageConfig,
@@ -280,6 +345,7 @@ fn present_image_frame<P, W, R>(
 where
     W: Write,
     R: FnMut(&mut P, &mut PaintCx<'_, '_>),
+    Q: PreparedConfiguration<P>,
 {
     let terminal_area = terminal.area();
     let pane = PaneRect {
@@ -289,9 +355,11 @@ where
         h: terminal_area.height,
     };
     let staged_compositor = std::cell::RefCell::new(compositor.clone());
-    let stats = terminal.draw_damage_with_output_hooks(
+    let program = std::cell::RefCell::new(program);
+    let stats = terminal.draw_damage_with_prepared_output_hooks(
         bmux_tui::damage::Damage::Full,
-        |cx| render(program, cx),
+        |cx| render(&mut program.borrow_mut(), cx),
+        |prepared| configure.configure(&mut program.borrow_mut(), prepared),
         |writer| staged_compositor.borrow_mut().prepare_output(writer),
         |writer, scene, delta| {
             let mut staged_compositor = staged_compositor.borrow_mut();
@@ -318,6 +386,120 @@ where
         changed_cells: stats.changed_cells,
         full_repaint: stats.full_repaint,
     })
+}
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::ImageTerminalPresenter;
+    use crate::presenter::Presenter;
+    use bmux_tui::focus::{FocusScopeId, FocusTrap};
+    use bmux_tui::geometry::Rect;
+    use bmux_tui::hit::{HitMap, HitRegion};
+    use bmux_tui::paint::PaintCx;
+    use bmux_tui::presentation::{PreparedPresentation, PresentationLimits};
+    use bmux_tui::terminal::Terminal;
+    use std::io::{self, Write};
+
+    #[derive(Default)]
+    struct Writer {
+        bytes: Vec<u8>,
+        fail_flush: bool,
+    }
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::other("flush failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[derive(Default)]
+    struct Program {
+        scopes: Vec<FocusScopeId>,
+        commits: usize,
+        reject: bool,
+    }
+    fn render(program: &mut Program, cx: &mut PaintCx<'_, '_>) {
+        cx.push_hit(HitRegion::new("background", Rect::new(0, 0, 4, 2)).focusable(true));
+        for scope in &program.scopes {
+            cx.set_focus_scope(Some(scope.clone()));
+            cx.push_hit(HitRegion::new(scope.clone(), Rect::new(1, 0, 2, 1)).focusable(true));
+        }
+    }
+    fn configure(program: &mut Program, prepared: &mut PreparedPresentation) -> io::Result<()> {
+        if program.reject || !prepared.set_modal_scopes(&program.scopes) {
+            return Err(io::Error::other("configuration rejected"));
+        }
+        prepared
+            .validate_limits(PresentationLimits {
+                max_cells: 8,
+                max_entries: 128,
+                max_bytes: 8192,
+            })
+            .map_err(io::Error::other)
+    }
+    fn commit(program: &mut Program, hits: &HitMap, focus: &FocusTrap) {
+        program.commits += 1;
+        assert_eq!(focus.active_scope(), program.scopes.last());
+        if let Some(scope) = program.scopes.last() {
+            assert_eq!(focus.active(), Some(scope));
+            assert!(hits.focus_targets(None).is_empty());
+        }
+    }
+    #[test]
+    fn configured_scopes_commit_only_after_successful_flush() {
+        let mut presenter = ImageTerminalPresenter::with_commit(
+            Terminal::new(Writer::default(), Rect::new(0, 0, 4, 2)),
+            render,
+            commit,
+            bmux_image::HostImageCapabilities::default(),
+            bmux_image::ImageConfig::default(),
+        )
+        .configure_prepared(configure);
+        let mut program = Program::default();
+        presenter.present(&mut program).unwrap();
+        program.scopes.push(FocusScopeId::new("modal"));
+        presenter.terminal_mut().writer_mut().fail_flush = true;
+        assert!(presenter.present(&mut program).is_err());
+        assert_eq!(program.commits, 1);
+        assert!(presenter.terminal().focus().active_scope().is_none());
+        presenter.terminal_mut().writer_mut().fail_flush = false;
+        presenter.present(&mut program).unwrap();
+        assert_eq!(program.commits, 2);
+        let written = presenter.terminal().writer().bytes.len();
+        program.reject = true;
+        assert!(presenter.present(&mut program).is_err());
+        assert_eq!(presenter.terminal().writer().bytes.len(), written);
+        assert_eq!(program.commits, 2);
+        assert_eq!(
+            presenter.terminal().focus().active_scope(),
+            program.scopes.last()
+        );
+    }
+    #[test]
+    fn prepared_configuration_also_supports_noop_commit_constructor() {
+        let mut presenter = ImageTerminalPresenter::new(
+            Terminal::new(Writer::default(), Rect::new(0, 0, 4, 2)),
+            render,
+            bmux_image::HostImageCapabilities::default(),
+            bmux_image::ImageConfig::default(),
+        )
+        .configure_prepared(configure);
+        let mut program = Program {
+            scopes: vec![FocusScopeId::new("modal")],
+            ..Program::default()
+        };
+        presenter.present(&mut program).unwrap();
+        assert_eq!(
+            presenter.terminal().focus().active_scope(),
+            program.scopes.last()
+        );
+    }
 }
 
 #[cfg(all(test, feature = "image-kitty"))]

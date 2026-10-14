@@ -876,7 +876,7 @@ const fn format_status(status: StepStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::playbook::types::{PlaybookResult, StepResult, StepStatus};
+    use crate::types::{PlaybookResult, StepResult, StepStatus};
 
     fn make_result(pass: bool, steps: Vec<StepResult>) -> PlaybookResult {
         PlaybookResult {

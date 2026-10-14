@@ -1,0 +1,18 @@
+execution_class       = "native_fast"
+id                    = "bmux.playbook"
+name                  = "bmux Playbook"
+owns_namespaces       = []
+provided_capabilities = ["bmux.playbook.read", "bmux.playbook.execute"]
+provided_features     = ["bmux.playbook"]
+required_capabilities = []
+version               = "0.0.1-alpha.0"
+
+[[services]]
+capability   = "bmux.playbook.read"
+interface_id = "playbook-state"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.playbook.execute"
+interface_id = "playbook-commands"
+kind         = "command"

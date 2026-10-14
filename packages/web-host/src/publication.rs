@@ -127,9 +127,21 @@ pub(crate) fn validate(
                 .get(id)
                 .or_else(|| value.previous_resources.get(id))
         });
-        let digest = Sha256::digest(&resource.bytes);
-        let expected: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        if id != &expected || existing.is_some_and(|value| value != resource) {
+        // Retained entries were digest-checked at their original admission. Exact
+        // MIME/content equality preserves that proof; an ID alone never does.
+        // Shared immutable allocations avoid both comparison and rehashing.
+        let unchanged = existing.is_some_and(|value| {
+            value.mime_type == resource.mime_type
+                && (Arc::ptr_eq(&value.bytes, &resource.bytes) || value.bytes == resource.bytes)
+        });
+        let valid_content = if existing.is_some() {
+            unchanged
+        } else {
+            let digest = Sha256::digest(&resource.bytes);
+            let expected: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+            id == &expected
+        };
+        if !valid_content {
             return Err(invalid(
                 "browser resource rejected: digest mismatch or changed retained content",
             ));
@@ -146,4 +158,153 @@ pub(crate) fn validate(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod retained_resource_tests {
+    use super::*;
+    use crate::snapshot_feed;
+
+    fn manifest(bytes: Arc<[u8]>) -> BTreeMap<String, Resource> {
+        let id = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        BTreeMap::from([(
+            id,
+            Resource {
+                bytes,
+                mime_type: "application/octet-stream".into(),
+            },
+        )])
+    }
+
+    fn full() -> BinaryPresentation {
+        BinaryPresentation {
+            snapshot: Arc::from([1_u8]),
+            delta: None,
+        }
+    }
+
+    #[test]
+    fn reuse_requires_exact_content_and_mime_and_preserves_atomicity() {
+        let (publisher, feed) = snapshot_feed(128).unwrap();
+        let resources = manifest(Arc::from([2_u8, 3]));
+        let id = resources.keys().next().unwrap().clone();
+        publisher
+            .publish_representations(1, None, full(), resources.clone())
+            .unwrap();
+        let mut copied = resources.clone();
+        copied.get_mut(&id).unwrap().bytes = Arc::from([2_u8, 3]);
+        assert!(!Arc::ptr_eq(&resources[&id].bytes, &copied[&id].bytes));
+        publisher
+            .publish_representations(2, None, full(), copied)
+            .unwrap();
+        for changed in [
+            Resource {
+                bytes: Arc::from([2_u8, 4]),
+                mime_type: "application/octet-stream".into(),
+            },
+            Resource {
+                bytes: Arc::clone(&resources[&id].bytes),
+                mime_type: "image/png".into(),
+            },
+        ] {
+            assert!(
+                publisher
+                    .publish_representations(
+                        3,
+                        None,
+                        full(),
+                        BTreeMap::from([(id.clone(), changed)]),
+                    )
+                    .is_err()
+            );
+            assert_eq!(feed.receiver.borrow().as_ref().unwrap().revision, 2);
+        }
+        publisher
+            .publish_representations(3, None, full(), resources)
+            .unwrap();
+        assert_eq!(feed.receiver.borrow().as_ref().unwrap().revision, 3);
+    }
+
+    #[test]
+    fn previous_manifest_reuse_and_eviction_keep_digest_validation() {
+        let (publisher, feed) = snapshot_feed(128).unwrap();
+        let resources = manifest(Arc::from([2_u8, 3]));
+        publisher
+            .publish_representations(1, None, full(), resources.clone())
+            .unwrap();
+        publisher
+            .publish_representations(2, None, full(), BTreeMap::new())
+            .unwrap();
+        publisher
+            .publish_representations(3, None, full(), resources.clone())
+            .unwrap();
+        for revision in [4, 5] {
+            publisher
+                .publish_representations(revision, None, full(), BTreeMap::new())
+                .unwrap();
+        }
+        let mut corrupt = resources.clone();
+        corrupt.values_mut().next().unwrap().bytes = Arc::from([9_u8]);
+        assert!(
+            publisher
+                .publish_representations(6, None, full(), corrupt)
+                .is_err()
+        );
+        assert_eq!(feed.receiver.borrow().as_ref().unwrap().revision, 5);
+        publisher
+            .publish_representations(6, None, full(), resources)
+            .unwrap();
+    }
+
+    #[test]
+    fn shared_reuse_does_not_relax_retained_byte_budget() {
+        let (publisher, feed) = snapshot_feed(128).unwrap();
+        let mut resources = BTreeMap::new();
+        for value in 0..3_u8 {
+            resources.extend(manifest(Arc::from(vec![value; MAX_RESOURCE_BYTES])));
+        }
+        publisher
+            .publish_representations(1, None, full(), resources.clone())
+            .unwrap();
+        assert!(
+            publisher
+                .publish_representations(2, None, full(), resources)
+                .is_err()
+        );
+        assert_eq!(feed.receiver.borrow().as_ref().unwrap().revision, 1);
+    }
+
+    /// Admission-only timing harness: no renderer, network, or end-to-end claims.
+    #[test]
+    #[ignore = "manual resource admission measurement; coordinator runs explicitly"]
+    fn resource_admission_measurement() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let (publisher, feed) = snapshot_feed(128).unwrap();
+        let resources = manifest(Arc::from(vec![7_u8; 1024 * 1024]));
+        publisher
+            .publish_representations(1, None, full(), resources.clone())
+            .unwrap();
+        let current = feed.receiver.borrow();
+        let mut copied = resources.clone();
+        copied.values_mut().next().unwrap().bytes = Arc::from(vec![7_u8; 1024 * 1024]);
+        for (label, candidate, retained) in [
+            ("unseen/hash", &resources, None),
+            ("retained/shared", &resources, current.as_deref()),
+            ("retained/copied", &copied, current.as_deref()),
+        ] {
+            let started = Instant::now();
+            for _ in 0..100 {
+                validate(128, 2, None, black_box(candidate), black_box(retained)).unwrap();
+            }
+            eprintln!(
+                "{label}: 100 admissions, 1 MiB payload, {:?}",
+                started.elapsed()
+            );
+        }
+    }
 }

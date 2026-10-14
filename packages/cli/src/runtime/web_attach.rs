@@ -1,55 +1,10 @@
 //! Local read-only browser attachment and explicit terminal mirroring.
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use bmux_web_renderer::{BrowserFrame, SurfaceProvenance};
-
-use super::attach::observer::{AttachSnapshot, attach_observer_channel};
+use super::attach::observer::attach_observer_channel;
+use super::attach::observer::transport::{generation, project_frame};
 use super::{ConnectionContext, ConnectionPolicyScope, connect_with_context};
-
-fn generation(snapshot: &AttachSnapshot) -> String {
-    format!("{}:{}", snapshot.epoch, snapshot.attached_id)
-}
-
-fn project_frame(snapshot: &AttachSnapshot) -> Result<BrowserFrame> {
-    let surfaces = snapshot
-        .surfaces
-        .iter()
-        .map(|surface| SurfaceProvenance {
-            retained_id: surface.retained_id.to_string(),
-            owner_plugin_id: surface.owner_plugin_id.clone(),
-            owner_local_id: surface.owner_local_id.clone(),
-            revision: surface.revision,
-            rect: surface.rect,
-            clip: surface.clip,
-            layer: surface.layer,
-            z: surface.z,
-            content_id: surface.content_id.map(|id| id.to_string()),
-            stream_end: surface.stream_end,
-            selection_available: surface.selection_available,
-            semantics_available: surface.semantics_available,
-        })
-        .collect();
-    let frame = BrowserFrame::from_prepared_in_generation(
-        &generation(snapshot),
-        snapshot.revision,
-        &snapshot.prepared,
-    )?
-    .with_surfaces(surfaces)?
-    .with_selection_text(&snapshot.selection_text)?
-    .with_unsupported_metadata(
-        &snapshot
-            .unsupported_metadata
-            .iter()
-            .map(|kind| match *kind {
-                "selection" => Ok(bmux_web_renderer::MetadataKind::Selection),
-                "semantics" => Ok(bmux_web_renderer::MetadataKind::Semantics),
-                _ => Err(anyhow::anyhow!("unknown native metadata availability")),
-            })
-            .collect::<Result<Vec<_>>>()?,
-    )?;
-    Ok(frame)
-}
+use anyhow::{Context, Result};
 
 fn start_browser_observer(
     feed_publisher: bmux_web_host::SnapshotPublisher,

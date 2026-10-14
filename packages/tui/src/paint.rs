@@ -331,6 +331,32 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         self.frame.focus_scope()
     }
 
+    /// Declare whether a producer supplies logical metadata for a local region.
+    /// This is an availability statement, never metadata reconstructed from cells.
+    pub fn declare_metadata_availability(
+        &mut self,
+        area: LocalRect,
+        selection: bool,
+        semantics: bool,
+    ) {
+        if let Some(area) = self.project_rect(area) {
+            self.frame
+                .declare_metadata_availability(crate::frame::SurfaceMetadataAvailability {
+                    area,
+                    selection,
+                    semantics,
+                });
+        }
+    }
+
+    /// Occlude earlier staged output using this context's translation and clip.
+    /// Source image lifetime remains owned by the retained scene and caller.
+    pub fn occlude(&mut self, area: LocalRect) {
+        if let Some(area) = self.project_rect(area) {
+            self.frame.occlude(area);
+        }
+    }
+
     /// Register local damage after translation and clipping.
     pub fn push_damage(&mut self, area: LocalRect) {
         if let Some(area) = self.project_rect(area) {

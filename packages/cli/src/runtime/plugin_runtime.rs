@@ -247,6 +247,11 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/sessions-plugin/plugin.toml"),
     plugin_type = bmux_sessions_plugin::SessionsPlugin;
 
+    feature = "bundled-plugin-playbook",
+    id = "bmux.playbook",
+    manifest = include_str!("../../../../plugins/playbook-plugin/plugin.toml"),
+    plugin_type = bmux_playbook_plugin::PlaybookPlugin;
+
     feature = "bundled-plugin-presenter",
     id = "bmux.presenter",
     manifest = include_str!("../../../../plugins/presenter-plugin/plugin.toml"),

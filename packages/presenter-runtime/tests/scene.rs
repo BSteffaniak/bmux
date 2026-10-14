@@ -247,6 +247,24 @@ fn owner_seeds_navigation_reload_and_independent_scenes_without_effects() {
     let snapshot = host.snapshot(&id).unwrap();
     snapshot.surfaces[0].placement(1, 1);
     snapshot.surfaces[0].placement(100, 40);
+    // Client ingestion/painting is derived from the retained owner snapshot,
+    // never an owner callback or an alternate product scene authority.
+    let retained = snapshot.surfaces[0].retained_surface(1, 100, 8192).unwrap();
+    let component = bmux_tui::embedded_surface::EmbeddedSurface::new(&retained);
+    use bmux_tui::component::Component;
+    let layout = component.layout(
+        bmux_tui::component::Constraints::tight(bmux_tui::geometry::Size::new(6, 3)),
+        &mut bmux_tui::component::LayoutCx::default(),
+    );
+    let state =
+        bmux_tui::presentation::PresentationState::new(bmux_tui::geometry::Rect::new(0, 0, 6, 3));
+    let prepared = state
+        .prepare(bmux_tui::damage::Damage::Full, |cx| {
+            component.paint(&layout, cx)
+        })
+        .unwrap();
+    assert_eq!(prepared.buffer().cells()[8].symbol, "x");
+    assert_eq!(component.input_point(&layout, 2, 1).unwrap().x, 0);
     host.snapshot(&id).unwrap();
     assert_eq!(scenes.load(Ordering::SeqCst), count);
     host.reload(deck, vec![]).unwrap();

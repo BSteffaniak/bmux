@@ -68,4 +68,35 @@ competing terminal. Navigation uses arrow keys/space, Home/End, and q to exit.
 Only explicit subcommands are supported. `present` is a namespace, not an executable
 leaf; `present deck.md` shorthand is intentionally unsupported because the registry
 rejects a leaf that is also a parent of commands. No core parser special case is
-introduced. Managed host lifetime belongs to BMUX, not the CLI.
+introduced.
+## Live playbook demo
+
+Using a bundled BMUX executable that supports managed playbooks and the private
+retained observer protocol:
+
+```sh
+bmux present play plugins/presenter-plugin/examples/live-demo.md --allow-playbooks --presenter --no-reload
+```
+
+Tab focuses `live-demo`; `o` opens the overlay, `r` manually starts the run,
+`s` requests stop, and `R` restarts only after cleanup acknowledgment. `p`, `n`,
+and `c` pause, single-step, and resume at script boundaries. Escape hides the
+overlay without terminating its run. Leaving the slide requests stop. Add `--web`
+for a read-only browser audience showing the same fixed 80×24 retained output.
+Browser viewport changes clip/center the display; they do not reflow the producer.
+
+Managed creation uses the explicit versioned approval contract:
+
+```sh
+bmux present host plugins/presenter-plugin/examples/live-demo.md --managed --allow-playbooks --presenter-credential PRIVATE_FILE --public-read --no-reload
+bmux present join bmux:HOST_ID --credential PRIVATE_FILE --presenter --mode shared
+```
+
+Only presenter effects authority may run/control the demo. `present check` and
+joining an audience never authorize execution. Playbooks are executable input;
+approve only trusted sources. Approval binds to the canonical deck root and
+original source content; changed/new executable input is rejected. Reload retires
+owned controllers rather than transferring live execution handles into a candidate.
+The local and managed examples have coordinator-run isolated PTY and Chromium
+acceptance covering shared live output, Stop, Restart, and acknowledged cleanup.
+This is not a claim of crash recovery or arbitrary terminal-input support.

@@ -11,7 +11,7 @@ use crate::hit::HitMap;
 use crate::image::ImageContribution;
 use crate::image_scene::{ImageScene, ImageSceneDelta};
 use crate::paint::PaintCx;
-use crate::presentation::PresentationState;
+use crate::presentation::{PreparedPresentation, PresentationState};
 use crate::selection::SelectionScene;
 
 /// Statistics from one terminal draw.
@@ -225,9 +225,30 @@ impl<W: Write> Terminal<W> {
         before: impl FnOnce(&mut W) -> io::Result<bool>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
+        self.draw_damage_with_prepared_output_hooks(damage, render, |_| Ok(()), before, overlay)
+    }
+
+    /// Configure a prepared snapshot before any output in the same transaction.
+    /// Callers stage scopes and validate their admission budget here. Rejection
+    /// writes nothing; output failure preserves all committed scene metadata.
+    ///
+    /// # Errors
+    /// Returns configuration, output, or hook errors without committing staging.
+    pub fn draw_damage_with_prepared_output_hooks(
+        &mut self,
+        damage: Damage,
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
+        configure: impl FnOnce(&mut PreparedPresentation) -> io::Result<()>,
+        before: impl FnOnce(&mut W) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+    ) -> io::Result<DrawStats> {
+        let mut prepared = self.state.prepare(damage, render);
+        if let Some(prepared) = &mut prepared {
+            configure(prepared)?;
+        }
         let writer = &mut self.writer;
         self.state
-            .present(damage, render, |prepared, previous| {
+            .present_prepared(prepared, |prepared, previous| {
                 writer.write_all(b"\x1b[?2026h")?;
                 let output: io::Result<DrawStats> = (|| {
                     let repaint = before(writer)?;

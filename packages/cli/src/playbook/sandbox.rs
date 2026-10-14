@@ -72,7 +72,25 @@ impl SandboxServer {
     ///
     /// Returns an error if the sandbox server fails to start.
     pub(super) async fn start(options: SandboxStartOptions<'_>) -> Result<Self> {
-        let (paths, root_dir) = create_temp_paths();
+        let (paths, root_dir) = if let Some(root) = std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT") {
+            let root = PathBuf::from(root).join("sandbox");
+            anyhow::ensure!(root.is_absolute(), "managed sandbox root must be absolute");
+            std::fs::create_dir(&root)
+                .context("managed sandbox root already exists or cannot be created")?;
+            let runtime = std::env::var_os("BMUX_PLAYBOOK_MANAGED_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .context("managed runtime path missing")?;
+            anyhow::ensure!(
+                runtime.is_absolute(),
+                "managed runtime path must be absolute"
+            );
+            (
+                ConfigPaths::new(root.join("c"), runtime, root.join("d"), root.join("s")),
+                root,
+            )
+        } else {
+            create_temp_paths()
+        };
         write_sandbox_config(
             &paths,
             options.shell,
@@ -83,6 +101,9 @@ impl SandboxServer {
         .context("failed writing sandbox config")?;
 
         let bmux_binary = match options.binary {
+            _ if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some() => {
+                std::env::current_exe().context("failed resolving managed executable")?
+            }
             Some(p) => p.to_path_buf(),
             None => std::env::current_exe().context("failed resolving bmux binary path")?,
         };
@@ -157,6 +178,12 @@ impl SandboxServer {
     pub async fn shutdown(mut self, retain_on_failure: bool) -> Result<()> {
         self.cleaned_up = true;
         let result = self.stop_server().await;
+        if result.is_ok()
+            && let Some(root) = std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT")
+        {
+            std::fs::remove_file(PathBuf::from(root).join("sandbox-child-owned"))
+                .context("failed recording sandbox child cleanup")?;
+        }
         let status = if result.is_ok() {
             "succeeded"
         } else {
@@ -194,8 +221,13 @@ impl SandboxServer {
                     return Ok(());
                 }
                 // Force kill
-                let _ = child.kill();
-                let _ = wait_for_child_exit(child, Duration::from_secs(1)).await;
+                child
+                    .kill()
+                    .context("failed requesting sandbox termination")?;
+                anyhow::ensure!(
+                    wait_for_child_exit(child, Duration::from_secs(1)).await?,
+                    "sandbox termination not acknowledged"
+                );
                 Ok(())
             }
             ServerHandle::Daemon { paths, .. } => {
@@ -204,9 +236,9 @@ impl SandboxServer {
                 }
                 // Try to kill via PID file
                 if let Some(pid) = read_pid_file(paths)? {
-                    let _ = try_kill_pid(pid);
+                    anyhow::ensure!(try_kill_pid(pid)?, "sandbox termination request failed");
                 }
-                Ok(())
+                anyhow::bail!("daemon process termination is unacknowledged; retaining diagnostics")
             }
         }
     }
@@ -234,8 +266,10 @@ impl Drop for SandboxServer {
                 }
             }
         }
-        clear_sandbox_lock(&self.root_dir);
-        let _ = std::fs::remove_dir_all(&self.root_dir);
+        if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_none() {
+            clear_sandbox_lock(&self.root_dir);
+            let _ = std::fs::remove_dir_all(&self.root_dir);
+        }
     }
 }
 
@@ -365,6 +399,22 @@ fn apply_sandbox_env(
     for (key, value) in env {
         cmd.env(key, value);
     }
+    // Explicit deck overrides cannot change the sandbox's runtime authority.
+    if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some() {
+        cmd.env("BMUX_NO_BASE_CONFIG", "1");
+        cmd.env_remove("BMUX_SLOT");
+        cmd.env_remove("BMUX_RUNTIME");
+        cmd.env_remove("BMUX_CONFIG");
+        cmd.env_remove("BMUX_PLAYBOOK_ALLOWED_ROOT");
+    }
+    cmd.env_remove("BMUX_PLAYBOOK_MANAGED_ROOT");
+    cmd.env_remove("BMUX_PLAYBOOK_MANAGED_GENERATION");
+    cmd.env_remove("BMUX_PLAYBOOK_MANAGED_RUNTIME_DIR");
+    cmd.env("BMUX_CONFIG_DIR", &paths.config_dir);
+    cmd.env("BMUX_RUNTIME_DIR", &paths.runtime_dir);
+    cmd.env("BMUX_DATA_DIR", &paths.data_dir);
+    cmd.env("BMUX_STATE_DIR", &paths.state_dir);
+    cmd.env("BMUX_LOG_DIR", root_dir.join("logs"));
 }
 
 // ── Config writing ───────────────────────────────────────────────────────────
@@ -502,6 +552,11 @@ async fn start_sandbox_server(
     match start_foreground(binary, paths, root_dir, timeout, env, env_mode).await {
         Ok(handle) => Ok(handle),
         Err(fg_error) => {
+            if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some() {
+                return Err(fg_error.context(
+                    "managed sandbox requires owned foreground child; daemon fallback disabled",
+                ));
+            }
             warn!("playbook sandbox foreground startup failed, falling back to daemon: {fg_error}");
             start_daemon(binary, paths, root_dir, timeout, env, env_mode)
                 .await
@@ -538,15 +593,32 @@ async fn start_foreground(
 
     let mut cmd = ProcessCommand::new(binary);
     cmd.arg("server").arg("start");
+    if std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").is_some() {
+        cmd.arg("--foreground-internal");
+    }
 
     apply_sandbox_env(&mut cmd, paths, root_dir, env, env_mode);
 
-    let child = cmd
+    let ownership_marker = std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT")
+        .map(|root| PathBuf::from(root).join("sandbox-child-owned"));
+    if let Some(marker) = ownership_marker.as_ref() {
+        std::fs::write(marker, b"sandbox spawn pending; cleanup not acknowledged")?;
+    }
+    let spawned = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
-        .spawn()
-        .with_context(|| format!("failed spawning sandbox server {}", binary.display()))?;
+        .spawn();
+    let child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(marker) = ownership_marker.as_ref() {
+                std::fs::remove_file(marker)?;
+            }
+            return Err(error)
+                .with_context(|| format!("failed spawning sandbox server {}", binary.display()));
+        }
+    };
 
     let mut handle = ServerHandle::Foreground {
         child,
@@ -555,12 +627,23 @@ async fn start_foreground(
         stderr_log: stderr_log.clone(),
     };
 
-    match wait_for_server_ready(paths, timeout, handle.child_mut()).await {
+    let managed = super::managed::ManagedRun::from_env()?;
+    let ready = tokio::select! {
+        ready = wait_for_server_ready(paths, timeout, handle.child_mut()) => ready,
+        () = super::managed::cancellation(managed.as_ref()) => Err(anyhow::anyhow!("managed startup cancelled")),
+    };
+    match ready {
         Ok(()) => Ok(handle),
         Err(error) => {
             let excerpt = read_log_excerpt(&stderr_log);
             if let ServerHandle::Foreground { ref mut child, .. } = handle {
                 let _ = child.kill();
+                child
+                    .wait()
+                    .context("sandbox startup cleanup could not reap child")?;
+                if let Some(marker) = ownership_marker.as_ref() {
+                    std::fs::remove_file(marker)?;
+                }
             }
             Err(error).with_context(|| format!("sandbox startup failed (stderr: {excerpt})"))
         }

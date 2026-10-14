@@ -229,6 +229,15 @@ impl MirrorFrame {
     }
 
     pub fn validate(&self, max_cells: usize, max_bytes: usize) -> Result<(), HostError> {
+        self.validate_wire(max_cells, max_bytes, true)
+    }
+
+    fn validate_wire(
+        &self,
+        max_cells: usize,
+        max_bytes: usize,
+        decode_png: bool,
+    ) -> Result<(), HostError> {
         let count = usize::from(self.width) * usize::from(self.height);
         if count == 0
             || count > max_cells
@@ -249,7 +258,7 @@ impl MirrorFrame {
             return Err(HostError::Invalid);
         }
         validate_cells(self)?;
-        validate_images(self, max_bytes)?;
+        validate_images(self, max_bytes, decode_png)?;
         if serde_json::to_vec(self)
             .map_err(|_| HostError::Invalid)?
             .len()
@@ -262,34 +271,11 @@ impl MirrorFrame {
 
     /// Center a fixed canvas without reflow. Larger canvases clip centrally.
     pub fn placement(&self, viewport_width: u16, viewport_height: u16) -> CanvasPlacement {
-        CanvasPlacement {
-            source_x: self.width.saturating_sub(viewport_width) / 2,
-            source_y: self.height.saturating_sub(viewport_height) / 2,
-            destination_x: viewport_width.saturating_sub(self.width) / 2,
-            destination_y: viewport_height.saturating_sub(self.height) / 2,
-            width: self.width.min(viewport_width),
-            height: self.height.min(viewport_height),
-        }
+        CanvasPlacement::centered(self.width, self.height, viewport_width, viewport_height)
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CanvasPlacement {
-    pub source_x: u16,
-    pub source_y: u16,
-    pub destination_x: u16,
-    pub destination_y: u16,
-    pub width: u16,
-    pub height: u16,
-}
-impl CanvasPlacement {
-    /// Map only visible placement coordinates back to the owner's committed canvas.
-    pub fn input_point(self, x: u16, y: u16) -> Option<(u16, u16)> {
-        let x = x.checked_sub(self.destination_x)?;
-        let y = y.checked_sub(self.destination_y)?;
-        (x < self.width && y < self.height).then(|| (x + self.source_x, y + self.source_y))
-    }
-}
+pub use bmux_tui::embedded_surface::SurfacePlacement as CanvasPlacement;
 
 fn validate_cells(frame: &MirrorFrame) -> Result<(), HostError> {
     use unicode_segmentation::UnicodeSegmentation;
@@ -323,7 +309,11 @@ fn validate_cells(frame: &MirrorFrame) -> Result<(), HostError> {
     }
     Ok(())
 }
-fn validate_images(frame: &MirrorFrame, max_bytes: usize) -> Result<(), HostError> {
+fn validate_images(
+    frame: &MirrorFrame,
+    max_bytes: usize,
+    decode_png: bool,
+) -> Result<(), HostError> {
     let mut keys = std::collections::BTreeSet::new();
     let mut total = 0_usize;
     for image in &frame.images {
@@ -373,7 +363,7 @@ fn validate_images(frame: &MirrorFrame, max_bytes: usize) -> Result<(), HostErro
             WireImagePayload::Pixels { .. } if bytes.len() != decoded => {
                 return Err(HostError::Invalid);
             }
-            WireImagePayload::Png { .. } => {
+            WireImagePayload::Png { .. } if decode_png => {
                 let mut reader = image::ImageReader::with_format(
                     std::io::Cursor::new(bytes),
                     image::ImageFormat::Png,
@@ -436,6 +426,106 @@ fn native_style(cell: &WireCell) -> bmux_tui::style::Style {
 }
 
 impl MirrorFrame {
+    /// Decode the legacy product wire projection once into neutral retained primitives.
+    /// Generation is supplied by the owning transport; no authority is inferred from
+    /// a slide label or installed into the compositor by this adapter.
+    ///
+    /// # Errors
+    /// Returns invalid wire data or resource admission failures unchanged.
+    pub fn retained_surface(
+        &self,
+        generation: u64,
+        max_cells: usize,
+        max_bytes: usize,
+    ) -> Result<bmux_tui::embedded_surface::RetainedSurface, HostError> {
+        use bmux_tui::{
+            buffer::Buffer,
+            embedded_surface::{RetainedSurface, SurfaceError, SurfaceIdentity, SurfaceLimits},
+            geometry::{Point, Rect},
+            image::{ImageContribution, ImageKey, ImageLifecycle, ImagePlacement},
+        };
+        use std::sync::Arc;
+        // Validate the actual wire topology before Buffer's safe setters normalize it.
+        // Native snapshot admission performs bounded PNG decoding exactly once.
+        self.validate_wire(max_cells, max_bytes, false)?;
+        let mut buffer = Buffer::empty(Rect::new(0, 0, self.width, self.height));
+        for (index, cell) in self.cells.iter().enumerate() {
+            if cell.continuation {
+                continue;
+            }
+            let x = u16::try_from(index % usize::from(self.width)).map_err(|_| HostError::Limit)?;
+            let y = u16::try_from(index / usize::from(self.width)).map_err(|_| HostError::Limit)?;
+            buffer.set_cell(Point::new(x, y), &cell.symbol, native_style(cell));
+        }
+        let contributions = self
+            .images
+            .iter()
+            .map(|image| {
+                let payload = match &image.payload {
+                    WireImagePayload::Png {
+                        bytes,
+                        width,
+                        height,
+                    } => ImagePayload::Png {
+                        bytes: bytes.clone(),
+                        width: *width,
+                        height: *height,
+                    },
+                    WireImagePayload::Pixels {
+                        bytes,
+                        width,
+                        height,
+                        rgba,
+                    } => ImagePayload::Pixels {
+                        bytes: bytes.clone(),
+                        width: *width,
+                        height: *height,
+                        format: if *rgba {
+                            ImagePixelFormat::Rgba8
+                        } else {
+                            ImagePixelFormat::Rgb8
+                        },
+                    },
+                };
+                let destination = image.destination;
+                let clip = image.clip;
+                ImageContribution::Present(ImagePlacement {
+                    key: ImageKey::new(image.key.clone()),
+                    payload,
+                    destination: Rect::new(
+                        destination.x,
+                        destination.y,
+                        destination.width,
+                        destination.height,
+                    ),
+                    fit: image.fit,
+                    allocation: image.allocation,
+                    clip: Rect::new(clip.x, clip.y, clip.width, clip.height),
+                    lifecycle: ImageLifecycle::Frame,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut images = ImageScene::default();
+        images.reconcile(&contributions);
+        RetainedSurface::new(
+            SurfaceIdentity {
+                owner: self.surface_id.clone(),
+                generation,
+                revision: self.revision,
+            },
+            Arc::new(buffer),
+            Arc::new(images),
+            SurfaceLimits {
+                max_cells,
+                max_bytes,
+            },
+        )
+        .map_err(|error| match error {
+            SurfaceError::Invalid => HostError::Invalid,
+            SurfaceError::Limit => HostError::Limit,
+        })
+    }
+
     /// Paint a validated mirror using BMUX's scoped painting and image scene APIs.
     /// The caller publishes placement/input geometry only after terminal commit.
     pub fn paint(
@@ -455,80 +545,7 @@ impl MirrorFrame {
         max_cells: usize,
         max_bytes: usize,
     ) -> Result<CanvasPlacement, HostError> {
-        use bmux_tui::{
-            geometry::Rect,
-            image::{ImageContribution, ImageKey, ImageLifecycle, ImagePlacement},
-            paint::LocalRect,
-        };
-        self.validate(max_cells, max_bytes)?;
-        let placement = self.placement(width, height);
-        cx.fill(
-            LocalRect::new(0, 0, width, height),
-            " ",
-            bmux_tui::style::Style::new(),
-        );
-        let dx = i32::from(placement.destination_x) - i32::from(placement.source_x);
-        let dy = i64::from(placement.destination_y) - i64::from(placement.source_y);
-        cx.with_child(
-            dx,
-            dy,
-            LocalRect::new(0, 0, self.width, self.height),
-            |child| {
-                for (index, cell) in self.cells.iter().enumerate() {
-                    if cell.continuation {
-                        continue;
-                    }
-                    let x = u16::try_from(index % usize::from(self.width)).unwrap_or(0);
-                    let y = u16::try_from(index / usize::from(self.width)).unwrap_or(0);
-                    // Atomic clipping of wide glyphs is owned by PaintCx.
-                    child.set_cell(i32::from(x), i64::from(y), &cell.symbol, native_style(cell));
-                }
-                for image in &self.images {
-                    let payload = match &image.payload {
-                        WireImagePayload::Png {
-                            bytes,
-                            width,
-                            height,
-                        } => ImagePayload::Png {
-                            bytes: bytes.clone(),
-                            width: *width,
-                            height: *height,
-                        },
-                        WireImagePayload::Pixels {
-                            bytes,
-                            width,
-                            height,
-                            rgba,
-                        } => ImagePayload::Pixels {
-                            bytes: bytes.clone(),
-                            width: *width,
-                            height: *height,
-                            format: if *rgba {
-                                ImagePixelFormat::Rgba8
-                            } else {
-                                ImagePixelFormat::Rgb8
-                            },
-                        },
-                    };
-                    let destination = image.destination;
-                    let clip = image.clip;
-                    child.push_image(ImageContribution::Present(ImagePlacement {
-                        fit: image.fit,
-                        allocation: image.allocation,
-                        key: ImageKey::new(format!("{}:{}", self.surface_id, image.key)),
-                        payload,
-                        destination: Rect::new(
-                            destination.x,
-                            destination.y,
-                            destination.width,
-                            destination.height,
-                        ),
-                        clip: Rect::new(clip.x, clip.y, clip.width, clip.height),
-                        lifecycle: ImageLifecycle::Frame,
-                    }));
-                }
-            },
-        );
-        Ok(placement)
+        let surface = self.retained_surface(0, max_cells, max_bytes)?;
+        Ok(surface.paint_viewport(cx, width, height))
     }
 }

@@ -124,6 +124,132 @@ impl Owner for Counter {
     }
 }
 #[test]
+fn retained_reads_and_receive_only_control_never_execute_owner_effects() {
+    let mut host = Host::new(deck(), vec![], HostConfig::default()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    host.set_owner(Box::new(Counter(calls.clone()))).unwrap();
+    let (viewer, _, _) = join(
+        &mut host,
+        InteractionMode::ReceiveOnly,
+        Scopes {
+            effects: true,
+            ..Scopes::default()
+        },
+    );
+    let initial = host.snapshot(&viewer).unwrap();
+    for _ in 0..8 {
+        let snapshot = host.snapshot(&viewer).unwrap();
+        assert_eq!(snapshot.cursor, initial.cursor);
+        assert!(matches!(
+            host.poll(&viewer, Some(&initial.cursor)).unwrap(),
+            Poll::Unchanged(cursor) if cursor == initial.cursor
+        ));
+        assert!(matches!(
+            host.poll(&viewer, None).unwrap(),
+            Poll::Snapshot { .. }
+        ));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        host.submit(
+            &viewer,
+            Submission {
+                action_id: 1,
+                expected: initial.cursor.clone(),
+                action: Action::Effect {
+                    name: "run".into(),
+                    input: "manual".into(),
+                },
+            },
+        )
+        .unwrap_err(),
+        HostError::Unauthorized
+    );
+    assert_eq!(host.snapshot(&viewer).unwrap().cursor, initial.cursor);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn effect_scope_is_required_even_for_an_interactive_owner_view() {
+    let mut host = Host::new(deck(), vec![], HostConfig::default()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    host.set_owner(Box::new(Counter(calls.clone()))).unwrap();
+    let (viewer, _, _) = join(
+        &mut host,
+        InteractionMode::Shared,
+        Scopes {
+            demo_input: true,
+            navigate: true,
+            ..Scopes::default()
+        },
+    );
+    let initial = host.snapshot(&viewer).unwrap();
+    assert_eq!(
+        host.submit(
+            &viewer,
+            Submission {
+                action_id: 1,
+                expected: initial.cursor.clone(),
+                action: Action::Effect {
+                    name: "run".into(),
+                    input: "manual".into(),
+                },
+            },
+        )
+        .unwrap_err(),
+        HostError::Unauthorized
+    );
+    assert_eq!(host.snapshot(&viewer).unwrap().cursor, initial.cursor);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+struct ScheduledOwner {
+    advances: Arc<AtomicUsize>,
+    effects: Arc<AtomicUsize>,
+}
+impl Owner for ScheduledOwner {
+    fn advance(&mut self, _: OwnerContext<'_>) -> Result<bool, HostError> {
+        self.advances.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+    fn demo_input(
+        &mut self,
+        _: OwnerContext<'_>,
+        _: &SurfaceInput,
+    ) -> Result<OwnerUpdate, HostError> {
+        Err(HostError::Unauthorized)
+    }
+    fn effect(&mut self, _: OwnerContext<'_>, _: &str, _: &str) -> Result<OwnerUpdate, HostError> {
+        self.effects.fetch_add(1, Ordering::SeqCst);
+        Ok(OwnerUpdate::default())
+    }
+}
+#[test]
+fn scheduled_owner_updates_publish_without_read_side_effects() {
+    let mut host = Host::new(deck(), vec![], HostConfig::default()).unwrap();
+    let advances = Arc::new(AtomicUsize::new(0));
+    let effects = Arc::new(AtomicUsize::new(0));
+    host.set_owner(Box::new(ScheduledOwner {
+        advances: advances.clone(),
+        effects: effects.clone(),
+    }))
+    .unwrap();
+    let (viewer, _, _) = join(&mut host, InteractionMode::ReceiveOnly, Scopes::default());
+    let initial = host.snapshot(&viewer).unwrap();
+    assert_eq!(advances.load(Ordering::SeqCst), 0);
+    assert!(host.advance_owner().unwrap());
+    assert_eq!(advances.load(Ordering::SeqCst), 1);
+    let current = host.snapshot(&viewer).unwrap();
+    assert!(current.cursor.revision > initial.cursor.revision);
+    assert!(matches!(
+        host.poll(&viewer, Some(&current.cursor)).unwrap(),
+        Poll::Unchanged(_)
+    ));
+    assert_eq!(advances.load(Ordering::SeqCst), 1);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn uncertain_effect_is_deduplicated_across_reauthentication_and_eviction() {
     let mut config = HostConfig::default();
     config.limits.retained_actions = 1;

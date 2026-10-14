@@ -1526,6 +1526,168 @@ impl Component for Stack<'_> {
     }
 }
 
+/// Opaque, centered foreground over a background using one resolved layout.
+///
+/// Occluded background cells and metadata are clipped through `PaintCx`, including
+/// image placements. Visibility never starts, suspends, or stops owned resources.
+/// Applications stage modal scope lifecycles on `PreparedPresentation` and route
+/// input against the last successfully presented tree, not a proposed tree.
+pub struct Overlay<'a> {
+    id: LayoutId,
+    background: Element<'a>,
+    foreground: Element<'a>,
+    scope: Option<crate::focus::FocusScopeId>,
+}
+
+impl<'a> Overlay<'a> {
+    /// Compose a background and an opaque foreground, centered in its allocation.
+    #[must_use]
+    pub fn new(background: impl Component + 'a, foreground: impl Component + 'a) -> Self {
+        Self {
+            id: LayoutId::new("overlay"),
+            background: Element::new(background),
+            foreground: Element::new(foreground),
+            scope: None,
+        }
+    }
+
+    /// Set stable caller-owned layout identity.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<LayoutId>) -> Self {
+        self.id = id.into();
+        self
+    }
+
+    /// Exclude background keyboard, paste, and pointer input.
+    ///
+    /// Stage the same outer-to-inner scope chain with
+    /// `PreparedPresentation::set_modal_scopes` before delivering output.
+    #[must_use]
+    pub fn modal(mut self, scope: crate::focus::FocusScopeId) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+}
+
+impl Component for Overlay<'_> {
+    fn revision(&self) -> ComponentRevision {
+        combine_child_revisions(
+            ComponentRevision::new(
+                stable_revision(|state| self.id.as_str().hash(state)),
+                stable_revision(|state| self.scope.hash(state)),
+            ),
+            [self.background.revision(), self.foreground.revision()],
+        )
+    }
+
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        cx.record_measurement();
+        let background = self.background.layout(constraints, cx);
+        let foreground = self.foreground.layout(
+            Constraints::new(0, constraints.max_width(), 0, constraints.max_height()),
+            cx,
+        );
+        let size = constraints.constrain(LogicalSize::new(
+            background.size.width.max(foreground.size.width),
+            background.size.height.max(foreground.size.height),
+        ));
+        let x = size.width.saturating_sub(foreground.size.width) / 2;
+        let y = size.height.saturating_sub(foreground.size.height) / 2;
+        LayoutNode::with_children(
+            self.id.clone(),
+            size,
+            vec![
+                ChildLayout::new(0, 0, background),
+                ChildLayout::new(x, y, foreground),
+            ],
+        )
+    }
+
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let [background, foreground] = layout.children.as_slice() else {
+            return;
+        };
+        paint_child(&self.background, background, cx);
+        cx.occlude(LocalRect::new(
+            i32::try_from(foreground.x).unwrap_or(i32::MAX),
+            i64::try_from(foreground.y).unwrap_or(i64::MAX),
+            u16::try_from(foreground.node.size.width).unwrap_or(u16::MAX),
+            u16::try_from(foreground.node.size.height).unwrap_or(u16::MAX),
+        ));
+        if let Some(scope) = &self.scope {
+            cx.set_focus_scope(Some(scope.clone()));
+            let area = cx.area();
+            cx.set_cursor_logical(
+                u64::try_from(area.x).unwrap_or(0),
+                u64::try_from(area.y).unwrap_or(0),
+                false,
+            );
+        }
+        cx.with_child_size(
+            i32::try_from(foreground.x).unwrap_or(i32::MAX),
+            i64::try_from(foreground.y).unwrap_or(i64::MAX),
+            foreground.node.size,
+            |cx| {
+                cx.fill(cx.area(), " ", Style::new());
+                self.foreground.paint(&foreground.node, cx);
+            },
+        );
+    }
+
+    fn event(
+        &self,
+        event: &crate::event::Event,
+        layout: &LayoutNode,
+        cx: &mut crate::component::EventCx<'_>,
+    ) -> crate::event::EventOutcome {
+        let [background, foreground] = layout.children.as_slice() else {
+            return crate::event::EventOutcome::Ignored;
+        };
+        let inside = if let crate::event::Event::Mouse(mouse) = event {
+            let (x, y) = cx.local_point(mouse.position);
+            x >= 0
+                && y >= 0
+                && u64::try_from(x).is_ok_and(|x| {
+                    x >= foreground.x && x < foreground.x.saturating_add(foreground.node.size.width)
+                })
+                && u64::try_from(y).is_ok_and(|y| {
+                    y >= foreground.y
+                        && y < foreground.y.saturating_add(foreground.node.size.height)
+                })
+        } else {
+            true
+        };
+        if inside {
+            let outcome = cx.with_child(foreground, |cx| {
+                self.foreground.event(event, &foreground.node, cx)
+            });
+            if outcome.is_handled()
+                || matches!(
+                    event,
+                    crate::event::Event::Key(_)
+                        | crate::event::Event::Paste(_)
+                        | crate::event::Event::Mouse(_)
+                )
+            {
+                return outcome;
+            }
+        }
+        if self.scope.is_some()
+            && matches!(
+                event,
+                crate::event::Event::Key(_)
+                    | crate::event::Event::Paste(_)
+                    | crate::event::Event::Mouse(_)
+            )
+        {
+            return crate::event::EventOutcome::Ignored;
+        }
+        cx.with_child(background, |cx| {
+            self.background.event(event, &background.node, cx)
+        })
+    }
+}
+
 fn paint_single_child(child: &Element<'_>, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
     if let Some(resolved) = layout.children.first() {
         paint_child(child, resolved, cx);
@@ -1960,6 +2122,105 @@ mod tests {
     use crate::geometry::{Insets, Point, Rect};
     use crate::paint::PaintCx;
     use crate::style::{Color, Style};
+
+    #[test]
+    fn overlay_clips_wide_cells_images_and_invisible_modal_targets() {
+        use super::Overlay;
+        use crate::damage::Damage;
+        use crate::hit::HitRegion;
+        use crate::image::{
+            ImageContribution, ImageFit, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement,
+        };
+        use crate::presentation::PresentationState;
+        struct Background;
+        impl Component for Background {
+            fn layout(&self, constraints: Constraints, _: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::leaf(
+                    LayoutId::new("background"),
+                    constraints.constrain(LogicalSize::new(8, 4)),
+                )
+            }
+            fn paint(&self, _: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+                cx.write_line(
+                    crate::paint::LocalRect::new(0, 1, 8, 1),
+                    &crate::text::Line::raw("ab界界yz"),
+                );
+                cx.push_hit(HitRegion::new("background", Rect::new(0, 0, 8, 4)).focusable(true));
+                cx.push_image(ImageContribution::Present(ImagePlacement {
+                    key: ImageKey::new("source"),
+                    payload: ImagePayload::Pixels {
+                        bytes: vec![255, 0, 0],
+                        width: 1,
+                        height: 1,
+                        format: crate::image::ImagePixelFormat::Rgb8,
+                    },
+                    destination: Rect::new(0, 0, 8, 4),
+                    clip: Rect::new(0, 0, 8, 4),
+                    fit: ImageFit::Stretch,
+                    allocation: None,
+                    lifecycle: ImageLifecycle::Frame,
+                }));
+            }
+        }
+        struct InvisibleForeground;
+        impl Component for InvisibleForeground {
+            fn layout(&self, constraints: Constraints, _: &mut LayoutCx) -> LayoutNode {
+                LayoutNode::leaf(
+                    LayoutId::new("foreground"),
+                    constraints.constrain(LogicalSize::new(2, 2)),
+                )
+            }
+            fn paint(&self, _: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+                cx.push_hit(
+                    HitRegion::new("invisible", Rect::new(0, 0, 2, 2))
+                        .visible(false)
+                        .focusable(true),
+                );
+            }
+        }
+        let scope = crate::focus::FocusScopeId::new("modal");
+        let overlay = Overlay::new(Background, InvisibleForeground).modal(scope.clone());
+        let layout = overlay.layout(Constraints::new(8, 8, 4, Some(4)), &mut LayoutCx::new());
+        assert_eq!((layout.children[1].x, layout.children[1].y), (3, 1));
+        let mut state = PresentationState::new(Rect::new(0, 0, 8, 4));
+        let mut prepared = state
+            .prepare(Damage::Full, |cx| overlay.paint(&layout, cx))
+            .unwrap();
+        assert!(prepared.set_modal_scopes(&[scope]));
+        let popup = Rect::new(3, 1, 2, 2);
+        assert_eq!(prepared.image_scene().placements().len(), 4);
+        for image in prepared.image_scene().placements() {
+            assert!(image.clip.intersection(popup).is_empty());
+            assert_eq!(image.destination, Rect::new(0, 0, 8, 4));
+            assert_eq!(
+                image.payload,
+                ImagePayload::Pixels {
+                    bytes: vec![255, 0, 0],
+                    width: 1,
+                    height: 1,
+                    format: crate::image::ImagePixelFormat::Rgb8,
+                }
+            );
+        }
+        // Wide graphemes touching an opaque boundary are omitted as complete
+        // spans, never represented by half a glyph on either visible side.
+        let row = prepared.buffer().cells();
+        assert_eq!(row[8 + 2].symbol, " ");
+        assert_eq!(row[8 + 3].symbol, " ");
+        assert_eq!(row[8 + 4].symbol, " ");
+        assert_eq!(row[8 + 5].symbol, " ");
+        state
+            .present_prepared(Some(prepared), |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert!(state.focus().active().is_none());
+        for point in [Point::new(0, 0), Point::new(3, 1), Point::new(7, 3)] {
+            assert!(state.hits().hit_test(point).is_none());
+        }
+        state
+            .present(Damage::Full, |_| {}, |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.image_scene().placements().len(), 0);
+    }
 
     #[test]
     fn rich_text_ingestion_preserves_cross_span_graphemes_for_all_wrap_policies() {

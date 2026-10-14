@@ -1,0 +1,14 @@
+# Executable input: explicitly trust before using prepare.
+# Script completion keeps the isolated BMUX runtime alive until stop.
+@name Managed pane split
+@viewport cols=100 rows=28
+@timeout 30000
+@plugin enable=bmux.sessions
+@plugin enable=bmux.contexts
+@plugin enable=bmux.clients
+@plugin enable=bmux.tabs
+new-session name='managed-split'
+send-keys keys='printf "LEFT PANE\\n"\r'
+split-pane direction=vertical
+send-keys keys='printf "RIGHT PANE\\n"\r'
+sleep ms=300

@@ -1244,6 +1244,8 @@ dependencies = [
  "bmux_performance_state",
  "bmux_permissions_plugin",
  "bmux_permissions_plugin_api",
+ "bmux_playbook",
+ "bmux_playbook_plugin",
  "bmux_plugin",
  "bmux_plugin_cli_plugin",
  "bmux_plugin_sdk",
@@ -2088,6 +2090,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_playbook"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "sha2 0.11.0",
+ "tempfile",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_playbook_plugin"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_playbook",
+ "bmux_playbook_plugin_api",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_playbook_plugin_api"
+version = "0.0.1-alpha.1"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bmux_plugin"
 version = "0.0.1-alpha.1"
 dependencies = [
@@ -2206,6 +2246,8 @@ dependencies = [
  "bmux_image",
  "bmux_keyboard 0.0.1-alpha.1",
  "bmux_mermaid_render",
+ "bmux_playbook",
+ "bmux_playbook_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_presenter",
@@ -2711,6 +2753,7 @@ dependencies = [
  "bmux_text_edit 0.0.1-alpha.1",
  "crossterm",
  "futures-util",
+ "image",
  "libc",
  "serde",
  "unicode-segmentation",

@@ -2,7 +2,9 @@
 //! the authenticated BMUX connection, never accepted as bearer credentials.
 use bmux_plugin_sdk::{NativeServiceContext, ServiceResponse};
 use bmux_presenter::NavigationAction;
-use bmux_presenter_plugin_api::{presenter_host_v1 as manage, presenter_view_v2 as view};
+use bmux_presenter_plugin_api::{
+    presenter_host_v1 as manage, presenter_host_v2 as trusted_manage, presenter_view_v2 as view,
+};
 use bmux_presenter_runtime::{
     Action, Credential, Cursor, Host, HostConfig, HostError, InteractionMode, PROTOCOL_VERSION,
     Poll, Response, Scopes, Submission,
@@ -19,10 +21,41 @@ struct Managed {
     source: PathBuf,
     run_id: String,
     participants: BTreeMap<String, Option<uuid::Uuid>>,
+    _playbook_approval: Option<crate::playbook::Approval>,
 }
 static HOSTS: OnceLock<Mutex<BTreeMap<String, Managed>>> = OnceLock::new();
 fn hosts() -> &'static Mutex<BTreeMap<String, Managed>> {
     HOSTS.get_or_init(Mutex::default)
+}
+fn demo_runtime() -> anyhow::Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let _ = RUNTIME.set(runtime);
+    RUNTIME
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("demo executor unavailable"))
+}
+fn advance_managed(id: String) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(50));
+            let Ok(mut all) = hosts().lock() else {
+                break;
+            };
+            let Some(managed) = all.get_mut(&id) else {
+                break;
+            };
+            if let Err(error) = managed.host.advance_owner() {
+                eprintln!("retained playbook update rejected: {error}");
+            }
+        }
+    });
 }
 fn transport(error: impl ToString) -> ServiceResponse {
     ServiceResponse::error("presentation_failed", error.to_string())
@@ -40,6 +73,16 @@ pub(crate) fn build(
         &loaded.assets,
         crate::demo::linked_registry(),
     )?;
+    build_with_owner(loaded, public, presenter, audience, owner)
+}
+
+fn build_with_owner(
+    loaded: bmux_presenter_runtime::loader::LoadedDeck,
+    public: bool,
+    presenter: String,
+    audience: Option<String>,
+    owner: crate::owner::LinkedOwner,
+) -> anyhow::Result<Host> {
     let mut host = Host::new(
         loaded.deck,
         loaded.assets,
@@ -75,6 +118,22 @@ pub(crate) fn build(
     Ok(host)
 }
 
+pub(crate) fn build_trusted(
+    source: &std::path::Path,
+    public: bool,
+    presenter: String,
+    audience: Option<String>,
+    environment: crate::playbook_live::DemoEnvironment,
+) -> anyhow::Result<Host> {
+    let loaded = crate::source::loaded(source)?;
+    let mut owner = crate::owner::LinkedOwner::new(
+        loaded.deck.clone(),
+        &loaded.assets,
+        crate::demo::linked_registry(),
+    )?;
+    owner.configure_demos(environment)?;
+    build_with_owner(loaded, public, presenter, audience, owner)
+}
 pub(crate) fn reload(
     host: &mut Host,
     loaded: bmux_presenter_runtime::loader::LoadedDeck,
@@ -135,6 +194,34 @@ fn access<T>(
 
 pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
+        "presenter-host-v2", "start" => |r: trusted_manage::client::StartRequest, ctx| {
+            let result = (|| -> anyhow::Result<manage::HostInfo> {
+                let source = std::fs::canonicalize(&r.source)?;
+                let loaded = crate::source::loaded(&source)?;
+                let approval = r.allow_playbooks.then(|| crate::playbook::Approval::prepare(&source, &loaded.deck)).transpose()?;
+                let secret = r.presenter_credential;
+                let mut host = if let Some(approval) = approval.clone() {
+                    let paths = bmux_config::ConfigPaths::new(ctx.connection.config_dir.clone().into(), ctx.connection.runtime_dir.clone().into(), ctx.connection.data_dir.clone().into(), ctx.connection.state_dir.clone().into());
+                    let attempts_root = paths.state_dir.join("presenter-playbooks");
+                    std::fs::create_dir_all(&attempts_root)?;
+                    let environment = crate::playbook_live::DemoEnvironment { paths, approval, executable: std::env::current_exe()?, attempts_root, runtime: demo_runtime()?.handle().clone() };
+                    build_trusted(&source, r.public_read, secret.clone(), r.audience_credential, environment)?
+                } else { build(&source, r.public_read, secret.clone(), r.audience_credential)? };
+                let participant = host.authenticate(PROTOCOL_VERSION, Some(&secret), InteractionMode::ReceiveOnly)?;
+                let run_id = host.cursor(&participant)?.run_id;
+                host.disconnect(&participant);
+                let id = uuid::Uuid::new_v4().to_string();
+                let info = manage::HostInfo { id: id.clone(), run_id: run_id.clone(), source: source.to_string_lossy().into_owned() };
+                let mut all = hosts().lock().map_err(|_| anyhow::anyhow!("host registry poisoned"))?;
+                anyhow::ensure!(all.len() < 16, "managed host limit exceeded");
+                all.insert(id.clone(), Managed { host, source: source.clone(), run_id, participants: BTreeMap::new(), _playbook_approval: approval });
+                drop(all);
+                advance_managed(id.clone());
+                if r.live_reload { watch_source(id, source); }
+                Ok(info)
+            })().map_err(|error| error.to_string());
+            Ok::<_, ServiceResponse>(result)
+        },
         "presenter-host-v1", "start" => |r: manage::client::StartRequest, _ctx| {
             let result = (|| -> anyhow::Result<manage::HostInfo> {
                 let source = std::fs::canonicalize(&r.source)?;
@@ -147,7 +234,7 @@ pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
                 let mut all = hosts().lock().map_err(|_| anyhow::anyhow!("host registry poisoned"))?;
                 anyhow::ensure!(all.len() < 16, "managed host limit exceeded");
                 let info = manage::HostInfo { id: id.clone(), run_id: run_id.clone(), source: source.to_string_lossy().into_owned() };
-                all.insert(id.clone(), Managed { host, source: source.clone(), run_id, participants: BTreeMap::new() });
+                all.insert(id.clone(), Managed { host, source: source.clone(), run_id, participants: BTreeMap::new(), _playbook_approval: None });
                 if r.live_reload { watch_source(id, source); }
                 Ok(info)
             })().map_err(|e| e.to_string());
@@ -168,7 +255,23 @@ pub(crate) fn invoke(context: NativeServiceContext) -> ServiceResponse {
             Ok::<_, ServiceResponse>(result)
         },
         "presenter-host-v1", "stop" => |r: manage::client::StopRequest, _ctx| {
-            let result = hosts().lock().map_err(|e| e.to_string()).and_then(|mut all| all.remove(&r.host_id).map(|_| ()).ok_or_else(|| "host not found".into()));
+            let result = (|| -> Result<(), String> {
+                let runtime = demo_runtime().map_err(|error| error.to_string())?;
+                let mut managed = hosts().lock().map_err(|error| error.to_string())?
+                    .remove(&r.host_id).ok_or("host not found")?;
+                // Release the registry lock before any await. This lifecycle
+                // command owns the removed host until cleanup is acknowledged;
+                // synchronous Owner callbacks still never block on network IO.
+                let (managed, settled) = std::thread::spawn(move || {
+                    let settled = runtime.block_on(managed.host.shutdown_owner());
+                    (managed, settled)
+                }).join().map_err(|_| "host cleanup task panicked; settlement unknown".to_owned())?;
+                if let Err(error) = settled {
+                    hosts().lock().map_err(|error| error.to_string())?.insert(r.host_id, managed);
+                    return Err(format!("host retained: cleanup not acknowledged: {error}"));
+                }
+                Ok(())
+            })();
             Ok::<_, ServiceResponse>(result)
         },
         "presenter-view-v2", "authenticate" => |r: view::client::AuthenticateRequest, ctx| {

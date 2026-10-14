@@ -20,6 +20,8 @@ bmux_config = { workspace = true }
 bmux_image = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_mermaid_render = { path = "../../packages/mermaid-render" }
+bmux_playbook = { path = "../../packages/playbook" }
+bmux_playbook_plugin_api = { path = "../playbook-plugin-api" }
 bmux_plugin_sdk = { workspace = true }
 bmux_presenter = { path = "../../packages/presenter" }
 bmux_presenter_plugin_api = { path = "../presenter-plugin-api" }
@@ -34,19 +36,28 @@ bmux_tui_runtime = { workspace = true, features = [
 bmux_web_host = { path = "../../packages/web-host", features = [
     "presentation",
 ] }
+bmux_web_renderer = { path = "../../packages/web-renderer" }
 crossterm = { workspace = true }
 image = { workspace = true }
 resvg = { workspace = true }
 rustls = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time", "sync", "signal", "net"] }
+tokio = { workspace = true, features = [
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "sync",
+    "signal",
+    "net",
+    "process",
+    "io-util",
+] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-bmux_cli_schema   = { workspace = true }
-bmux_plugin       = { workspace = true }
-bmux_web_renderer = { path = "../../packages/web-renderer" }
-clap              = { workspace = true }
+bmux_cli_schema = { workspace = true }
+bmux_plugin     = { workspace = true }
+clap            = { workspace = true }
 
 [features]
 default          = []

@@ -187,3 +187,49 @@ impl BrowserPublisher {
             .context("browser atomic publication rejected (generation/full/resources)")
     }
 }
+
+#[cfg(test)]
+mod retained_delivery_tests {
+    use super::*;
+    use crate::viewport::Viewport;
+    use crate::{ViewportMode, snapshot_feed};
+    use bmux_tui::{damage::Damage, geometry::Rect, presentation::PresentationState};
+
+    #[test]
+    fn slow_reader_gets_latest_complete_frame_without_advancing_on_stale_source() {
+        let (writer, feed) = snapshot_feed(crate::Limits::default().max_snapshot_bytes).unwrap();
+        let (viewport, _requests) = Viewport::new(ViewportMode::Observer);
+        let control = ViewControl::new(Arc::new(viewport));
+        let mut publisher = BrowserPublisher::new(writer, control);
+        let state = PresentationState::new(Rect::new(0, 0, 8, 2));
+        let prepared = state.prepare(Damage::Full, |_| {}).unwrap();
+        for revision in 1..=32 {
+            assert_eq!(
+                publisher
+                    .publish_prepared("owner", revision, &prepared)
+                    .unwrap(),
+                revision,
+            );
+        }
+        // No receiver reads occurred during the burst. The feed is latest-value,
+        // not an output log, and the full bytes remain available for gap repair.
+        let latest = feed.receiver.borrow();
+        let latest = latest.as_ref().unwrap();
+        assert_eq!(latest.revision, 32);
+        let decoded = bmux_web_renderer::wire::decode_binary_with_resources(
+            &latest.binary.as_ref().unwrap().snapshot,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(decoded.generation(), "owner");
+        assert_eq!(decoded.revision(), 32);
+        assert_eq!(
+            decoded.buffer(),
+            publisher.previous.as_ref().unwrap().buffer()
+        );
+        assert!(publisher.publish_prepared("owner", 31, &prepared).is_err());
+        assert_eq!(publisher.revision, 32);
+        assert_eq!(feed.receiver.borrow().as_ref().unwrap().revision, 32);
+    }
+}

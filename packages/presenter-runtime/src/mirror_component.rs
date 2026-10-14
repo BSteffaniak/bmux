@@ -1,87 +1,59 @@
-//! Borrowed validated mirror in the canonical BMUX Component lifecycle.
+//! Legacy product adapter over the neutral retained raster component.
 use crate::{
     HostError,
     mirror::{CanvasPlacement, MirrorFrame},
 };
 use bmux_tui::{
-    component::{
-        Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode,
-        LogicalSize,
-    },
+    component::{Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutNode},
+    embedded_surface::{EmbeddedSurface, RetainedSurface},
     event::{Event, EventOutcome},
-    paint::{LocalRect, PaintCx},
+    paint::PaintCx,
 };
 
+/// Decode once at ingestion, then borrow the native component during painting.
+/// The lifetime retains source compatibility with the former borrowed adapter.
 pub struct MirrorComponent<'a> {
-    frame: &'a MirrorFrame,
-    max_cells: usize,
-    max_bytes: usize,
+    surface: RetainedSurface,
+    source: std::marker::PhantomData<&'a MirrorFrame>,
 }
+
 impl<'a> MirrorComponent<'a> {
     pub fn new(
         frame: &'a MirrorFrame,
         max_cells: usize,
         max_bytes: usize,
     ) -> Result<Self, HostError> {
-        frame.validate(max_cells, max_bytes)?;
         Ok(Self {
-            frame,
-            max_cells,
-            max_bytes,
+            surface: frame.retained_surface(0, max_cells, max_bytes)?,
+            source: std::marker::PhantomData,
         })
     }
-    /// Use the exact layout that was painted and successfully committed, never new
-    /// viewport dimensions from an uncommitted resize. Coordinates are local to it.
+
+    /// Pass only the layout successfully committed by the presentation owner.
     pub fn placement(&self, committed: &LayoutNode) -> Option<CanvasPlacement> {
-        if committed.id != self.id() {
-            return None;
-        }
-        Some(self.frame.placement(
-            u16::try_from(committed.size.width).ok()?,
-            u16::try_from(committed.size.height).ok()?,
-        ))
+        EmbeddedSurface::new(&self.surface).placement(committed)
     }
+
     pub fn input_point(&self, committed: &LayoutNode, x: u16, y: u16) -> Option<(u16, u16)> {
-        self.placement(committed)?.input_point(x, y)
-    }
-    fn id(&self) -> LayoutId {
-        LayoutId::new(format!("presentation/mirror/{}", self.frame.surface_id))
+        let point = EmbeddedSurface::new(&self.surface).input_point(committed, x, y)?;
+        Some((point.x, point.y))
     }
 }
+
 impl Component for MirrorComponent<'_> {
-    fn layout(&self, constraints: Constraints, _cx: &mut LayoutCx) -> LayoutNode {
-        LayoutNode::leaf(
-            self.id(),
-            constraints.constrain(LogicalSize::new(
-                u64::from(self.frame.width),
-                u64::from(self.frame.height),
-            )),
-        )
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        EmbeddedSurface::new(&self.surface).layout(constraints, cx)
     }
+
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        let Some(_placement) = self.placement(layout) else {
-            return;
-        };
-        let Ok(width) = u16::try_from(layout.size.width) else {
-            return;
-        };
-        let Ok(height) = u16::try_from(layout.size.height) else {
-            return;
-        };
-        cx.with_child(0, 0, LocalRect::new(0, 0, width, height), |child| {
-            let _validated =
-                self.frame
-                    .paint_viewport(child, width, height, self.max_cells, self.max_bytes);
-        });
+        EmbeddedSurface::new(&self.surface).paint(layout, cx);
     }
-    fn event(&self, _event: &Event, _layout: &LayoutNode, _cx: &mut EventCx<'_>) -> EventOutcome {
-        // Application transports inert input with cursor/surface preconditions.
-        EventOutcome::Ignored
+
+    fn event(&self, event: &Event, layout: &LayoutNode, cx: &mut EventCx<'_>) -> EventOutcome {
+        EmbeddedSurface::new(&self.surface).event(event, layout, cx)
     }
+
     fn revision(&self) -> ComponentRevision {
-        ComponentRevision::new(
-            (u64::from(self.frame.width) << 16) | u64::from(self.frame.height),
-            self.frame.revision,
-        )
+        EmbeddedSurface::new(&self.surface).revision()
     }
 }

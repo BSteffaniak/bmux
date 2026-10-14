@@ -1,4 +1,4 @@
-//! Two linked example registrations. Viewers only consume owner mirrors.
+//! Linked example controls and an inert playbook-demo allowlist. Viewers consume mirrors.
 use bmux_presenter::Block;
 use bmux_presenter::custom::{LinkedComponentFactory, LinkedRegistry, LinkedState};
 use bmux_tui::prelude::{
@@ -113,6 +113,9 @@ pub fn linked_registry() -> LinkedRegistry {
         .expect("unique example registration");
     registry
         .register("toggle", ToggleFactory)
+        .expect("unique example registration");
+    registry
+        .register("playbook-demo", crate::playbook_live::DemoFactory)
         .expect("unique example registration");
     registry
 }

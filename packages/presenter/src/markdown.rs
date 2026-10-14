@@ -533,6 +533,47 @@ mod tests {
         ));
     }
     #[test]
+    fn playbook_demo_authoring_is_inert_custom_data_with_a_stable_identity() {
+        let source = concat!(
+            "<!-- bmux:block-id live-demo -->\n",
+            "<!-- bmux:component playbook-demo ",
+            "{\"playbook\":\"demo.playbook.toml\",\"title\":\"Live demo\",\"on_leave\":\"stop\"} -->\n"
+        );
+        // No registry, runner, file, or trust input is available to the parser.
+        let deck = parse_markdown("deck.md", source).unwrap();
+        let block = &deck.slides[0].blocks[0];
+        assert_eq!(block.id.as_str(), "live-demo");
+        let BlockKind::Custom { name, config } = &block.kind else {
+            panic!("custom component")
+        };
+        assert_eq!(name, "playbook-demo");
+        assert_eq!(
+            config,
+            &serde_json::json!({
+                "playbook": "demo.playbook.toml",
+                "title": "Live demo",
+                "on_leave": "stop"
+            })
+        );
+        let registry = crate::custom::LinkedRegistry::default();
+        assert!(registry.factory(name).is_none());
+        assert!(registry.compatibility_key(block).is_none());
+        let mut restored: Deck =
+            serde_json::from_str(&serde_json::to_string(&deck).unwrap()).unwrap();
+        let restored_block = restored.slides[0].blocks.remove(0);
+        assert_eq!(restored_block.id, block.id);
+        let BlockKind::Custom {
+            name: restored_name,
+            config: restored_config,
+        } = restored_block.kind
+        else {
+            panic!("restored custom component")
+        };
+        assert_eq!(restored_name, *name);
+        assert_eq!(restored_config, *config);
+    }
+
+    #[test]
     fn columns_preserve_source_order_and_weights() {
         let deck = parse_markdown("x", "<!-- bmux:columns 1,2 -->\n\nLeft\n\n<!-- bmux:column -->\n\nRight\n\n<!-- bmux:end-columns -->").unwrap();
         let BlockKind::Columns { columns } = &deck.slides[0].blocks[0].kind else {

@@ -1094,8 +1094,7 @@ mod tests {
     /// playbook is valid) and return the parsed action at the given step index.
     fn parse_action_dsl(dsl_line: &str, step_index: usize) -> Action {
         let input = format!("new-session\n{dsl_line}\n");
-        let (playbook, _) =
-            crate::playbook::parse_dsl::parse_dsl(&input).expect("DSL should parse");
+        let (playbook, _) = crate::parse_dsl::parse_dsl(&input).expect("DSL should parse");
         playbook.steps[step_index].action.clone()
     }
 
@@ -1111,7 +1110,7 @@ mod tests {
         let action = Action::NewSession { name: None };
         // new-session is the first step, so parse at index 0
         let dsl = action.to_dsl();
-        let (playbook, _) = crate::playbook::parse_dsl::parse_dsl(&format!("{dsl}\n")).unwrap();
+        let (playbook, _) = crate::parse_dsl::parse_dsl(&format!("{dsl}\n")).unwrap();
         assert!(matches!(
             playbook.steps[0].action,
             Action::NewSession { name: None }
@@ -1124,7 +1123,7 @@ mod tests {
             name: Some("my-session".to_string()),
         };
         let dsl = action.to_dsl();
-        let (playbook, _) = crate::playbook::parse_dsl::parse_dsl(&format!("{dsl}\n")).unwrap();
+        let (playbook, _) = crate::parse_dsl::parse_dsl(&format!("{dsl}\n")).unwrap();
         match &playbook.steps[0].action {
             Action::NewSession { name } => assert_eq!(name.as_deref(), Some("my-session")),
             other => panic!("expected NewSession, got {other:?}"),

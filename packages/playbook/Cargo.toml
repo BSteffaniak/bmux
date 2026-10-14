@@ -1,0 +1,26 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shared playbook domain models, parsers, source snapshots and result comparison"
+edition     = { workspace = true }
+keywords    = ["bmux", "playbook", "parser", "automation"]
+license     = { workspace = true }
+name        = "bmux_playbook"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+anyhow  = { workspace = true, features = ["std"] }
+libc    = { workspace = true }
+serde   = { workspace = true, features = ["derive", "std"] }
+sha2    = { workspace = true }
+toml    = { workspace = true }
+tracing = { workspace = true }
+uuid    = { workspace = true, features = ["serde", "std"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+fail-on-warnings = []

@@ -10,6 +10,43 @@ pub type FocusId = HitId;
 /// Stable identifier for a focus scope such as a page or modal.
 pub type FocusScopeId = HitId;
 
+/// Saved return target for a committed modal scope, not application lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModalFocus {
+    pub(crate) scope: FocusScopeId,
+    pub(crate) return_target: Option<FocusId>,
+}
+
+/// Derive a scope transition without changing the committed focus state.
+pub(crate) fn modal_transition(
+    committed: &[ModalFocus],
+    focus: &FocusTrap,
+    hits: &HitMap,
+    scopes: &[FocusScopeId],
+) -> (Vec<ModalFocus>, FocusTrap) {
+    let common = committed
+        .iter()
+        .zip(scopes)
+        .take_while(|(old, next)| &old.scope == *next)
+        .count();
+    let mut next = committed[..common].to_vec();
+    let mut target = focus.active().cloned();
+    for removed in committed[common..].iter().rev() {
+        target.clone_from(&removed.return_target);
+    }
+    for scope in &scopes[common..] {
+        next.push(ModalFocus {
+            scope: scope.clone(),
+            return_target: target,
+        });
+        target = FocusTrap::from_hits(hits, Some(scope), None)
+            .active()
+            .cloned();
+    }
+    let trap = FocusTrap::from_hits(hits, scopes.last(), target.as_ref());
+    (next, trap)
+}
+
 /// Result of focus key handling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FocusKeyOutcome {
@@ -163,11 +200,33 @@ impl FocusTrap {
 
 #[cfg(test)]
 mod tests {
-    use super::{FocusId, FocusKeyOutcome, FocusTrap};
+    use super::{FocusId, FocusKeyOutcome, FocusScopeId, FocusTrap};
     use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 
     use crate::geometry::Rect;
     use crate::hit::{HitMap, HitRegion};
+
+    #[test]
+    fn modal_transition_restores_stable_identity_after_reordering() {
+        let hits = HitMap::new()
+            .with_region(HitRegion::new("first", Rect::new(0, 0, 1, 1)).focusable(true))
+            .with_region(HitRegion::new("return", Rect::new(1, 0, 1, 1)).focusable(true));
+        let mut focus = FocusTrap::from_hits(&hits, None, None);
+        assert!(focus.set_active(&FocusId::new("return")));
+        let scope = FocusScopeId::new("modal");
+        let modal_hits = HitMap::new().with_region(
+            HitRegion::new("control", Rect::new(0, 0, 1, 1))
+                .focusable(true)
+                .focus_scope(scope.clone()),
+        );
+        let (saved, modal) = super::modal_transition(&[], &focus, &modal_hits, &[scope]);
+        let reordered = HitMap::new()
+            .with_region(HitRegion::new("return", Rect::new(0, 0, 1, 1)).focusable(true))
+            .with_region(HitRegion::new("first", Rect::new(1, 0, 1, 1)).focusable(true));
+        let (saved, restored) = super::modal_transition(&saved, &modal, &reordered, &[]);
+        assert!(saved.is_empty());
+        assert_eq!(restored.active(), Some(&FocusId::new("return")));
+    }
 
     #[test]
     fn focus_trap_cycles_next_and_previous() {

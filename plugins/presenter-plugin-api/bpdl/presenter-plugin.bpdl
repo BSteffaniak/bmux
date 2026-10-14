@@ -2,6 +2,7 @@
 plugin bmux.presenter version 1;
 capability PRESENTER_VIEW = bmux.presenter.view.v2;
 capability PRESENTER_MANAGE = bmux.presenter.manage.v1;
+capability PRESENTER_MANAGE_TRUSTED = bmux.presenter.manage.v2;
 
 @capability(PRESENTER_VIEW)
 interface presenter-view-v2 {
@@ -47,4 +48,10 @@ interface presenter-host-v1 {
     command list() -> list<host-info>;
     command reload(host_id: string) -> result<unit, string>;
     command stop(host_id: string) -> result<unit, string>;
+}
+
+// Explicit approval is a new versioned contract. V1 creation stays untrusted.
+@capability(PRESENTER_MANAGE_TRUSTED)
+interface presenter-host-v2 {
+    command start(source: string, public_read: bool, presenter_credential: string, audience_credential: string?, live_reload: bool, allow_playbooks: bool) -> result<presenter-host-v1.host-info, string>;
 }

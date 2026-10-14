@@ -1,7 +1,7 @@
 //! Native caller command orchestration; generated services own BMUX integration.
 use anyhow::{Context, Result};
 use bmux_plugin_sdk::NativeCommandContext;
-use bmux_presenter_plugin_api::presenter_host_v1 as manage;
+use bmux_presenter_plugin_api::{presenter_host_v1 as manage, presenter_host_v2 as trusted_manage};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -29,13 +29,33 @@ pub(crate) async fn run(
             source,
             presenter,
             reload,
+            allow_playbooks,
             web,
         } => {
             let loaded = crate::source::loaded(&source)?;
+            let approval = allow_playbooks
+                .then(|| crate::playbook::Approval::prepare(&source, &loaded.deck))
+                .transpose()?;
             let mut rich = crate::rich::RichAssets::prepare(&loaded.assets)?;
             rich.code = crate::rich::highlight(&loaded.deck);
             let mut player =
                 crate::player::Player::local(loaded.deck, reload.then_some(source), presenter);
+            if let Some(approval) = approval.clone() {
+                let attempts_root = paths(context).state_dir.join("presenter-playbooks");
+                std::fs::create_dir_all(&attempts_root)?;
+                let environment = crate::playbook_live::DemoEnvironment {
+                    paths: paths(context),
+                    approval,
+                    executable: std::env::current_exe()?,
+                    attempts_root,
+                    runtime: tokio::runtime::Handle::current(),
+                };
+                player.live_demos = Some(
+                    crate::playbook_live::LiveDemos::prepare(&player.deck, &environment)
+                        .map_err(anyhow::Error::msg)?,
+                );
+            }
+            player._playbook_approval = approval;
             player.rich = rich;
             match crate::web::Browser::start(web, &paths(context)).await? {
                 Some(browser) if browser.only => crate::player::run_headless(player, browser).await,
@@ -71,15 +91,28 @@ pub(crate) async fn run(
                 let source = std::fs::canonicalize(&options.source)?
                     .to_string_lossy()
                     .into_owned();
-                let info = manage::client::start(
-                    &mut client,
-                    source,
-                    options.public_read,
-                    presenter.clone(),
-                    audience.clone(),
-                    options.reload,
-                )
-                .await?
+                let info = if options.allow_playbooks {
+                    trusted_manage::client::start(
+                        &mut client,
+                        source,
+                        options.public_read,
+                        presenter.clone(),
+                        audience.clone(),
+                        options.reload,
+                        true,
+                    )
+                    .await?
+                } else {
+                    manage::client::start(
+                        &mut client,
+                        source,
+                        options.public_read,
+                        presenter.clone(),
+                        audience.clone(),
+                        options.reload,
+                    )
+                    .await?
+                }
                 .map_err(anyhow::Error::msg)?;
                 println!("bmux:{} (run {})", info.id, info.run_id);
                 if let Some(browser) = browser {
@@ -116,13 +149,48 @@ pub(crate) async fn run(
                     Ok(())
                 }
             } else {
-                let host = crate::services::build(
-                    &options.source,
-                    options.public_read,
-                    presenter.clone(),
-                    audience,
-                )?;
+                let host = if options.allow_playbooks {
+                    let loaded = crate::source::loaded(&options.source)?;
+                    let approval =
+                        crate::playbook::Approval::prepare(&options.source, &loaded.deck)?;
+                    let attempts_root = paths(context).state_dir.join("presenter-playbooks");
+                    std::fs::create_dir_all(&attempts_root)?;
+                    let environment = crate::playbook_live::DemoEnvironment {
+                        paths: paths(context),
+                        approval,
+                        executable: std::env::current_exe()?,
+                        attempts_root,
+                        runtime: tokio::runtime::Handle::current(),
+                    };
+                    crate::services::build_trusted(
+                        &options.source,
+                        options.public_read,
+                        presenter.clone(),
+                        audience,
+                        environment,
+                    )?
+                } else {
+                    crate::services::build(
+                        &options.source,
+                        options.public_read,
+                        presenter.clone(),
+                        audience,
+                    )?
+                };
                 let host = Arc::new(Mutex::new(host));
+                let update_host = Arc::downgrade(&host);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(Duration::from_millis(50));
+                    loop {
+                        tick.tick().await;
+                        let Some(host) = update_host.upgrade() else {
+                            break;
+                        };
+                        if let Ok(mut host) = host.lock() {
+                            let _ = host.advance_owner();
+                        }
+                    }
+                });
                 let tls = crate::tls::server(
                     options
                         .cert

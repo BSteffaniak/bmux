@@ -13,7 +13,7 @@ version     = { workspace = true }
 [dependencies]
 bmux_mermaid_render = { path = "../mermaid-render" }
 bmux_presenter = { path = "../presenter" }
-bmux_tui = { path = "../tui" }
+bmux_tui = { path = "../tui", features = ["serde"] }
 image = { workspace = true }
 pulldown-cmark = { workspace = true }
 rustls = { workspace = true }

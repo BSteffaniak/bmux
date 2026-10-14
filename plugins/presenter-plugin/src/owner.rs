@@ -32,6 +32,8 @@ pub struct LinkedOwner {
     instances: BTreeMap<String, InstanceState>,
     layouts: BTreeMap<(String, String), Geometry>,
     revisions: BTreeMap<String, u64>,
+    demo_environment: Option<crate::playbook_live::DemoEnvironment>,
+    demos: BTreeMap<String, crate::playbook_live::LiveDemos>,
 }
 impl LinkedOwner {
     /// Prepare a trusted linked owner with an application-supplied registry.
@@ -58,6 +60,8 @@ impl LinkedOwner {
             instances: BTreeMap::new(),
             layouts: BTreeMap::new(),
             revisions: BTreeMap::new(),
+            demo_environment: None,
+            demos: BTreeMap::new(),
         }
     }
     /// Detached candidate: failed preparation cannot alter the live owner or its mutexes.
@@ -84,6 +88,16 @@ impl LinkedOwner {
         }
         candidate.revisions.clone_from(&self.revisions);
         Ok(candidate)
+    }
+    pub(crate) fn configure_demos(
+        &mut self,
+        environment: crate::playbook_live::DemoEnvironment,
+    ) -> Result<(), HostError> {
+        let demos = crate::playbook_live::LiveDemos::prepare(&self.deck, &environment)
+            .map_err(|_| HostError::Invalid)?;
+        self.demos.insert("shared".into(), demos);
+        self.demo_environment = Some(environment);
+        Ok(())
     }
     pub(crate) fn scenes(
         &mut self,
@@ -129,11 +143,28 @@ impl LinkedOwner {
         let mut buffer =
             bmux_tui::buffer::Buffer::empty(bmux_tui::geometry::Rect::new(0, 0, 80, 24));
         let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
-        let layout = component.layout(
-            Constraints::tight(Size::new(80, 24)),
-            &mut LayoutCx::default(),
-        );
-        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        let overlay = self
+            .demos
+            .get(context.instance)
+            .and_then(|demos| demos.visible(slide.id.as_str()));
+        let layout = if let Some((id, demo)) = overlay {
+            let overlay = bmux_tui::composition::Overlay::new(component, demo.view(true))
+                .id(format!("playbook-overlay-{id}"))
+                .modal(bmux_tui::focus::FocusScopeId::new(format!("playbook-{id}")));
+            let layout = overlay.layout(
+                Constraints::tight(Size::new(80, 24)),
+                &mut LayoutCx::default(),
+            );
+            overlay.paint(&layout, &mut PaintCx::new(&mut frame));
+            layout
+        } else {
+            let layout = component.layout(
+                Constraints::tight(Size::new(80, 24)),
+                &mut LayoutCx::default(),
+            );
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            layout
+        };
         let mut images = bmux_tui::image_scene::ImageScene::default();
         images.reconcile(frame.images());
         let revision = self
@@ -267,18 +298,63 @@ fn render_registry(
     Ok(registry)
 }
 impl Owner for LinkedOwner {
+    fn shutdown(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HostError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            for demos in self.demos.values_mut() {
+                demos
+                    .shutdown()
+                    .await
+                    .map_err(|_| HostError::EffectUncertain)?;
+            }
+            Ok(())
+        })
+    }
+    fn advance(&mut self, context: OwnerContext<'_>) -> Result<bool, HostError> {
+        if !self.demos.contains_key(context.instance)
+            && let Some(environment) = &self.demo_environment
+        {
+            let demos = crate::playbook_live::LiveDemos::prepare(&self.deck, environment)
+                .map_err(|_| HostError::Invalid)?;
+            self.demos.insert(context.instance.into(), demos);
+        }
+        Ok(self
+            .demos
+            .get_mut(context.instance)
+            .is_some_and(crate::playbook_live::LiveDemos::update))
+    }
+    fn navigation(
+        &mut self,
+        previous_slide: Option<&str>,
+        context: OwnerContext<'_>,
+    ) -> Result<(), HostError> {
+        if previous_slide != context.state.slide_id.as_ref().map(|id| id.as_str())
+            && let (Some(slide), Some(demos)) =
+                (previous_slide, self.demos.get_mut(context.instance))
+        {
+            demos.leave(slide).map_err(|_| HostError::Invalid)?;
+        }
+        Ok(())
+    }
     fn prepare_reload(
         &self,
         deck: &Deck,
         assets: &[bmux_presenter_runtime::Asset],
     ) -> Result<Box<dyn Owner>, HostError> {
+        if self.demos.values().any(|demos| !demos.settled()) {
+            // Candidate preparation remains effect-free. The owner must explicitly
+            // stop and settle before reload can retire live resources.
+            return Err(HostError::Invalid);
+        }
         let mut rich = crate::rich::RichAssets::prepare(assets).map_err(|_| HostError::Invalid)?;
         rich.code = crate::rich::highlight(deck);
-        Ok(Box::new(LinkedOwner::prepare_candidate(
-            self,
-            deck.clone(),
-            rich,
-        )?))
+        let mut candidate = LinkedOwner::prepare_candidate(self, deck.clone(), rich)?;
+        // No live handles/tasks in candidates. Approval is immutable; successful
+        // publication drops the old owner, whose controllers request settled stop.
+        candidate.demo_environment = self.demo_environment.clone();
+        Ok(Box::new(candidate))
     }
     fn reconcile_reload(&mut self, context: OwnerContext<'_>) -> Result<Vec<MirrorFrame>, String> {
         self.scene(context)
@@ -310,6 +386,21 @@ impl Owner for LinkedOwner {
             .into_iter()
             .find(|block| block.id.as_str() == input.surface_id)
             .ok_or(HostError::Stale)?;
+        if let BlockKind::Custom { name, .. } = &block.kind
+            && name == "playbook-demo"
+        {
+            let demos = self
+                .demos
+                .get_mut(context.instance)
+                .ok_or(HostError::Unauthorized)?;
+            let outcome = demos
+                .input(input.surface_id.as_str(), &input.input, false)
+                .map_err(|_| HostError::Unauthorized)?;
+            return Ok(OwnerUpdate {
+                outcome,
+                surfaces: self.scenes(context)?,
+            });
+        }
         let states = self
             .instances
             .get(context.instance)
@@ -359,11 +450,31 @@ impl Owner for LinkedOwner {
     }
     fn effect(
         &mut self,
-        _context: OwnerContext<'_>,
-        _name: &str,
-        _input: &str,
+        context: OwnerContext<'_>,
+        name: &str,
+        input: &str,
     ) -> Result<OwnerUpdate, HostError> {
-        Err(HostError::Unauthorized)
+        let id = name
+            .strip_prefix("playbook-demo:")
+            .ok_or(HostError::Unauthorized)?;
+        let slide = context
+            .state
+            .current_slide(&self.deck)
+            .ok_or(HostError::Stale)?;
+        if !custom_blocks(&slide.blocks, context.state.reveal_step).iter().any(|block| block.id.as_str() == id && matches!(&block.kind, BlockKind::Custom { name, .. } if name == "playbook-demo")) {
+            return Err(HostError::Stale);
+        }
+        let demos = self
+            .demos
+            .get_mut(context.instance)
+            .ok_or(HostError::Unauthorized)?;
+        let outcome = demos
+            .input(id, input, true)
+            .map_err(|_| HostError::Invalid)?;
+        Ok(OwnerUpdate {
+            outcome,
+            surfaces: self.scenes(context)?,
+        })
     }
 }
 

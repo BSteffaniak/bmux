@@ -1,10 +1,15 @@
-execution_class       = "native_fast"
-id                    = "bmux.presenter"
-name                  = "bmux Presenter"
-owns_namespaces       = ["present"]
-provided_capabilities = ["bmux.presenter.view.v2", "bmux.presenter.manage.v1"]
-provided_features     = ["bmux.presenter"]
-version               = "0.0.1-alpha.0"
+execution_class = "native_fast"
+id = "bmux.presenter"
+name = "bmux Presenter"
+owns_namespaces = ["present"]
+provided_capabilities = [
+    "bmux.presenter.view.v2",
+    "bmux.presenter.manage.v1",
+    "bmux.presenter.manage.v2",
+]
+provided_features = ["bmux.presenter"]
+required_capabilities = ["bmux.playbook.read", "bmux.playbook.execute"]
+version = "0.0.1-alpha.0"
 
 [native_abi]
 minimum = "1.1"
@@ -25,9 +30,13 @@ kind         = "command"
 capability   = "bmux.presenter.manage.v1"
 interface_id = "presenter-host-v1"
 kind         = "command"
+[[services]]
+capability   = "bmux.presenter.manage.v2"
+interface_id = "presenter-host-v2"
+kind         = "command"
 
 [[commands]]
-description   = "present play DECK [--presenter] [--no-reload] [--web] [--web-assets DIR] [--web-only] [--web-port PORT] [--web-auth none|token] [--web-host IP] [--web-public-host IP] [--web-allowed-hosts HOST,...]. Web mirrors locally; web-only needs no terminal. Assets are prepared lazily unless overridden. Web-only holds a read-only audience view until Ctrl-C; browsers cannot navigate. Local arrow/space navigation; q exits. Presenter notes never enter audience frames."
+description   = "present play DECK [--presenter] [--allow-playbooks] [--no-reload] [--web] [--web-assets DIR] [--web-only] [--web-port PORT] [--web-auth none|token] [--web-host IP] [--web-public-host IP] [--web-allowed-hosts HOST,...]. Web mirrors locally; web-only needs no terminal. Assets are prepared lazily unless overridden. Web-only holds a read-only audience view until Ctrl-C; browsers cannot navigate. Local arrow/space navigation; q exits. Presenter notes never enter audience frames."
 execution     = "caller_process"
 expose_in_cli = true
 name          = "present-play"
@@ -42,7 +51,7 @@ position            = 0
 trailing_var_arg    = true
 
 [[commands]]
-description   = "present host DECK --presenter-credential FILE (--audience-credential FILE | --public-read) [--managed | --cert FILE --key FILE [--listen ADDRESS]] [--no-reload] [--web] [--web-assets DIR] [--web-only] [--web-port PORT] [--web-auth none|token] [--web-host IP] [--web-public-host IP] [--web-allowed-hosts HOST,...]. Assets are prepared lazily unless overridden. Managed hosts run in BMUX; standalone hosts use TLS. Browser audience output has independent authentication and no navigation. Mirror retains local speaker controls; web-only uses presenter-authorized transport controls. Credentials are read from private files, not argv."
+description   = "present host DECK --presenter-credential FILE (--audience-credential FILE | --public-read) [--managed | --cert FILE --key FILE [--listen ADDRESS]] [--allow-playbooks] [--no-reload] [--web] [--web-assets DIR] [--web-only] [--web-port PORT] [--web-auth none|token] [--web-host IP] [--web-public-host IP] [--web-allowed-hosts HOST,...]. Assets are prepared lazily unless overridden. Managed hosts run in BMUX; standalone hosts use TLS. Browser audience output has independent authentication and no navigation. Mirror retains local speaker controls; web-only uses presenter-authorized transport controls. Credentials are read from private files, not argv."
 execution     = "caller_process"
 expose_in_cli = true
 name          = "present-host"

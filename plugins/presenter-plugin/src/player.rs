@@ -104,7 +104,18 @@ fn prepare_states(
     Ok(states)
 }
 
+#[derive(Clone)]
+struct CommittedDemo {
+    id: String,
+    owner_epoch: uuid::Uuid,
+    generation: Option<u64>,
+}
+
 pub(crate) struct Player {
+    pub _playbook_approval: Option<crate::playbook::Approval>,
+    pub(crate) live_demos: Option<crate::playbook_live::LiveDemos>,
+    painted_demo: Option<CommittedDemo>,
+    pending_demo: Option<CommittedDemo>,
     viewer: ViewerState,
     painted_viewer: ViewerState,
     pending_viewer: ViewerState,
@@ -138,6 +149,7 @@ pub(crate) struct Player {
     pub status: Option<String>,
     pub browser: Option<std::sync::Arc<std::sync::Mutex<crate::web::Browser>>>,
     pub stop: Option<tokio::sync::watch::Receiver<bool>>,
+    browser_publication_error: Option<String>,
     audience_size: Size,
 }
 
@@ -157,6 +169,10 @@ impl Player {
             ),
         };
         Self {
+            _playbook_approval: None,
+            live_demos: None,
+            painted_demo: None,
+            pending_demo: None,
             viewer: ViewerState::new(),
             painted_viewer: ViewerState::new(),
             pending_viewer: ViewerState::new(),
@@ -180,6 +196,7 @@ impl Player {
             status,
             browser: None,
             stop: None,
+            browser_publication_error: None,
             audience_size: Size::new(80, 24),
         }
     }
@@ -220,7 +237,19 @@ impl Player {
         if remote.receive_only {
             return Ok(false);
         }
-        let Some((surface_id, revision, slide_id, placement)) = self.mirror_geometry.first() else {
+        let selected_surface = self.surfaces.iter().find(|surface| {
+            self.focused_block
+                .as_ref()
+                .is_some_and(|id| id.as_str() == surface.surface_id)
+        });
+        let geometry = selected_surface
+            .and_then(|surface| {
+                self.mirror_geometry
+                    .iter()
+                    .find(|(id, _, _, _)| *id == surface.surface_id)
+            })
+            .or_else(|| self.mirror_geometry.first());
+        let Some((surface_id, revision, slide_id, placement)) = geometry else {
             return Ok(false);
         };
         if self
@@ -239,15 +268,11 @@ impl Player {
             return Ok(false);
         }
         let (x, y, input) = match event {
-            Event::Key(key)
-                if matches!(key.key, KeyCode::Char(_))
-                    && !key.modifiers.ctrl
-                    && !key.modifiers.alt =>
-            {
-                let KeyCode::Char(character) = key.key else {
-                    unreachable!()
+            Event::Key(key) => {
+                let Some(input) = overlay_key_input(key) else {
+                    return Ok(false);
                 };
-                (0, 0, character.to_string())
+                (0, 0, input)
             }
             Event::Mouse(mouse)
                 if mouse.kind
@@ -262,6 +287,23 @@ impl Player {
             }
             _ => return Ok(false),
         };
+        let playbook = self.deck.slides.iter().flat_map(|slide| slide.blocks.iter()).any(|block| block.id.as_str() == surface_id && matches!(&block.kind, bmux_presenter::BlockKind::Custom { name, .. } if name == "playbook-demo"));
+        if playbook {
+            if !matches!(
+                input.as_str(),
+                "o" | "r" | "s" | "R" | "p" | "n" | "c" | "escape" | "click"
+            ) {
+                return Ok(false);
+            }
+            remote
+                .actions
+                .try_send(bmux_presenter_runtime::Action::Effect {
+                    name: format!("playbook-demo:{surface_id}"),
+                    input: input.clone(),
+                })
+                .context("playbook effect admission full or disconnected")?;
+            return Ok(true);
+        }
         remote
             .actions
             .try_send(bmux_presenter_runtime::Action::DemoInput(
@@ -400,6 +442,14 @@ impl Player {
                 };
                 match update {
                     Ok((deck, rich)) => {
+                        if self
+                            .live_demos
+                            .as_ref()
+                            .is_some_and(|demos| !demos.settled())
+                        {
+                            self.status = Some("Reload deferred: stop and settle playbooks before replacing the deck".into());
+                            continue;
+                        }
                         let states = match prepare_states(&deck, &self.linked, &self.instances) {
                             Ok(states) => states,
                             Err(error) => {
@@ -409,6 +459,9 @@ impl Player {
                                 continue;
                             }
                         };
+                        // Atomic deck reload never implicitly approves new executable
+                        // input. Retire old runs before installing replacement views.
+                        self.live_demos = None;
                         self.instances = states;
                         self.deck = deck;
                         self.rich = rich;
@@ -442,6 +495,7 @@ impl Program for Player {
         &mut self,
         _report: bmux_tui_runtime::PresentReport,
     ) -> Update<Message> {
+        self.painted_demo = self.pending_demo.take();
         self.painted_layout = self.pending_layout.take();
         self.painted_viewer
             .scroll
@@ -449,8 +503,20 @@ impl Program for Player {
         self.mirror_geometry = std::mem::take(&mut self.pending_mirror_geometry);
         if let Some(browser) = self.browser.clone() {
             let size = self.audience_size;
-            if let Ok(mut browser) = browser.lock() {
-                let _ = browser.publish(self, size.width, size.height);
+            let result = match browser.lock() {
+                Ok(mut browser) => browser.publish(self, size.width, size.height),
+                Err(_) => Err(anyhow::anyhow!("browser publication lock poisoned")),
+            };
+            match result {
+                Ok(()) => self.browser_publication_error = None,
+                Err(error) => {
+                    let diagnostic = bounded_publication_error(&error);
+                    if self.browser_publication_error.as_ref() != Some(&diagnostic) {
+                        eprintln!("{diagnostic}");
+                    }
+                    self.status = Some(diagnostic.clone());
+                    self.browser_publication_error = Some(diagnostic);
+                }
             }
         }
         Update::none()
@@ -461,6 +527,9 @@ impl Program for Player {
             RuntimeEvent::Message(Message::InputError(error)) => Err(error.into()),
             RuntimeEvent::Timer(_) => {
                 self.reload();
+                if let Some(demos) = &mut self.live_demos {
+                    demos.update();
+                }
                 if let Some(remote) = &mut self.remote {
                     for _ in 0..16 {
                         let update = match remote.updates.try_recv() {
@@ -509,6 +578,43 @@ impl Program for Player {
                 Ok(Update::redraw())
             }
             RuntimeEvent::Terminal(Event::Key(key)) => {
+                // Exit is a caller lifecycle action, not an overlay control. It
+                // must remain available when the runner has failed cleanup.
+                if key.key == KeyCode::Char('q')
+                    || (key.modifiers.ctrl && key.key == KeyCode::Char('c'))
+                {
+                    return Ok(Update::exit());
+                }
+                if let Some(id) = self.painted_demo.clone()
+                    && let Some(demos) = &mut self.live_demos
+                {
+                    let input = overlay_key_input(&key);
+                    if let Some(input) = input {
+                        self.status = Some(
+                            demos
+                                .input_committed(&id.id, id.owner_epoch, id.generation, &input)
+                                .unwrap_or_else(|error| error),
+                        );
+                        return Ok(Update::redraw());
+                    }
+                }
+                if self.painted_demo.is_some() && matches!(key.key, KeyCode::Tab | KeyCode::Enter) {
+                    return Ok(Update::none());
+                }
+                if key.key == KeyCode::Char('o')
+                    && self.remote.is_none()
+                    && let (Some(demos), Some(id)) = (&mut self.live_demos, &self.focused_block)
+                {
+                    self.status = Some(
+                        demos
+                            .input(id.as_str(), "open", false)
+                            .unwrap_or_else(|error| error),
+                    );
+                    return Ok(Update::redraw());
+                }
+                if self.remote.is_some() && self.route_mirror(&Event::Key(key))? {
+                    return Ok(Update::redraw());
+                }
                 if key.key == KeyCode::Char('q')
                     || key.key == KeyCode::Escape
                     || (key.modifiers.ctrl && key.key == KeyCode::Char('c'))
@@ -558,6 +664,11 @@ impl Program for Player {
                         let previous_slide = self.state.slide_id.clone();
                         reduce(&self.deck, &mut self.state, action);
                         if previous_slide != self.state.slide_id {
+                            if let (Some(demos), Some(slide)) =
+                                (&mut self.live_demos, &previous_slide)
+                            {
+                                demos.leave(slide.as_str()).map_err(anyhow::Error::msg)?;
+                            }
                             self.viewer.reset_scroll();
                             self.focused_block = None;
                         }
@@ -568,6 +679,11 @@ impl Program for Player {
                 Ok(Update::redraw())
             }
             RuntimeEvent::Terminal(event) => {
+                // A displayed local modal never forwards pointer/paste to its
+                // obscured slide. Closing takes effect after the next commit.
+                if self.painted_demo.is_some() {
+                    return Ok(Update::none());
+                }
                 let _ = self.route_mirror(&event)?;
                 let _ = self.route_component(&event);
                 Ok(Update::redraw())
@@ -648,32 +764,64 @@ fn paint_audience(
     if let Some(mirror) = &mirror {
         component = component.content(mirror);
     }
-    let layout = component.layout(Constraints::tight(size), &mut LayoutCx::default());
-    cx.with_child(
-        0,
-        0,
-        LocalRect::new(0, 0, size.width, size.height),
-        |child| component.paint(&layout, child),
-    );
+    let live = player
+        .state
+        .slide_id
+        .as_ref()
+        .and_then(|slide| player.live_demos.as_ref()?.visible(slide.as_str()));
     let mut pending_mirror_geometry = vec![];
-    if let (Some(surface), Some(mirror)) = (mirror_surface, &mirror)
-        && let Some((viewport, content)) = component.content_geometry(&layout)
-        && let Some(placement) = mirror.placement(content).and_then(|placement| {
-            clipped_mirror_placement(
+    let (layout, demo_id) = if let Some((id, demo)) = live {
+        let overlay = bmux_tui::composition::Overlay::new(component, demo.view(!show_local_focus))
+            .id(format!("playbook-overlay-{id}"))
+            .modal(bmux_tui::focus::FocusScopeId::new(format!("playbook-{id}")));
+        let layout = overlay.layout(Constraints::tight(size), &mut LayoutCx::default());
+        cx.with_child(
+            0,
+            0,
+            LocalRect::new(0, 0, size.width, size.height),
+            |child| overlay.paint(&layout, child),
+        );
+        (
+            layout,
+            Some(CommittedDemo {
+                id: id.to_owned(),
+                owner_epoch: demo.snapshot.owner_epoch,
+                generation: demo
+                    .snapshot
+                    .attempt
+                    .as_ref()
+                    .map(|attempt| attempt.generation),
+            }),
+        )
+    } else {
+        let layout = component.layout(Constraints::tight(size), &mut LayoutCx::default());
+        cx.with_child(
+            0,
+            0,
+            LocalRect::new(0, 0, size.width, size.height),
+            |child| component.paint(&layout, child),
+        );
+        if let (Some(surface), Some(mirror)) = (mirror_surface, &mirror)
+            && let Some((viewport, content)) = component.content_geometry(&layout)
+            && let Some(placement) = mirror.placement(content).and_then(|placement| {
+                clipped_mirror_placement(
+                    placement,
+                    viewport,
+                    player.viewer.scroll.get().horizontal_offset(),
+                    player.viewer.scroll.get().vertical_offset(),
+                )
+            })
+        {
+            pending_mirror_geometry.push((
+                surface.surface_id.clone(),
+                surface.revision,
+                surface.slide_id.clone(),
                 placement,
-                viewport,
-                player.viewer.scroll.get().horizontal_offset(),
-                player.viewer.scroll.get().vertical_offset(),
-            )
-        })
-    {
-        pending_mirror_geometry.push((
-            surface.surface_id.clone(),
-            surface.revision,
-            surface.slide_id.clone(),
-            placement,
-        ));
-    }
+            ));
+        }
+        (layout, None)
+    };
+    player.pending_demo = demo_id;
     player.pending_mirror_geometry = pending_mirror_geometry;
     player.pending_viewer.scroll.set(player.viewer.scroll.get());
     player.pending_layout = Some(layout);
@@ -733,6 +881,7 @@ fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintC
 pub(crate) fn paint_browser_audience(player: &mut Player, cx: &mut PaintCx<'_, '_>) {
     // Browser preparation cannot install pending geometry for local keyboard/mouse
     // admission or alter the local speaker's scrolling/focus state.
+    let pending_demo = player.pending_demo.clone();
     let pending_layout = player.pending_layout.take();
     let pending_geometry = std::mem::take(&mut player.pending_mirror_geometry);
     let pending_scroll = player.pending_viewer.scroll.get();
@@ -748,6 +897,7 @@ pub(crate) fn paint_browser_audience(player: &mut Player, cx: &mut PaintCx<'_, '
         false,
         cx,
     );
+    player.pending_demo = pending_demo;
     player.pending_layout = pending_layout;
     player.pending_mirror_geometry = pending_geometry;
     player.pending_viewer.scroll.set(pending_scroll);
@@ -761,7 +911,7 @@ pub(crate) async fn run(player: Player) -> Result<()> {
         "presentation playback requires stdin/stdout TTY"
     );
     let mut guard = TerminalGuard::enter()?;
-    let result = run_owned(player).await;
+    let result = run_owned(player, &mut guard).await;
     let restored = guard.restore();
     match (result, restored) {
         (_, Err(error)) => Err(error.context("presentation terminal restoration failed")),
@@ -839,7 +989,11 @@ pub(crate) async fn run_headless(
                     } else { false }
                 } else { break Ok(()); }
             }
-            _ = tick.tick() => { player.reload() }
+            _ = tick.tick() => {
+                let reload = player.reload();
+                let live = player.live_demos.as_mut().is_some_and(crate::playbook_live::LiveDemos::update);
+                reload || live
+            }
         };
         if changed && let Err(error) = browser.publish(&mut player, width, height) {
             eprintln!("Audience update rejected; committed scene retained: {error}");
@@ -849,16 +1003,37 @@ pub(crate) async fn run_headless(
         task.abort();
         let _ = task.await;
     }
+    let cleanup = shutdown_local_demos(&mut player).await;
     browser.shutdown().await;
+    cleanup?;
     result
 }
 
-async fn run_owned(mut player: Player) -> Result<()> {
+async fn run_owned(mut player: Player, guard: &mut TerminalGuard) -> Result<()> {
     let reload_task = start_reloads(&mut player);
     let (cols, rows) = crossterm::terminal::size()?;
     let terminal = Terminal::new(stdout(), Rect::new(0, 0, cols, rows));
     let presenter =
-        ImageTerminalPresenter::detect(terminal, paint, bmux_image::ImageConfig::default());
+        ImageTerminalPresenter::detect(terminal, paint, bmux_image::ImageConfig::default())
+            .configure_prepared(
+                |player: &mut Player,
+                 prepared: &mut bmux_tui::presentation::PreparedPresentation| {
+                    let scopes = player
+                        .pending_demo
+                        .as_ref()
+                        .map(|id| bmux_tui::focus::FocusScopeId::new(format!("playbook-{}", id.id)))
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    prepared.set_modal_scopes(&scopes);
+                    prepared
+                        .validate_limits(bmux_tui::presentation::PresentationLimits {
+                            max_cells: 262_144,
+                            max_entries: 16_384,
+                            max_bytes: 32 * 1024 * 1024,
+                        })
+                        .map_err(|error| std::io::Error::other(error.to_string()))
+                },
+            );
     let stop = player.stop.take();
     let (runtime, handle) = Runtime::new(player, presenter, RuntimeConfig::default());
     let mut input = TerminalInput::start::<Player>(handle.clone(), Message::InputError);
@@ -917,24 +1092,55 @@ async fn run_owned(mut player: Player) -> Result<()> {
         let _ = task.await;
     }
     match result {
-        Ok(mut output) => output
-            .presenter
-            .cleanup_images()
-            .map_err(anyhow::Error::from),
-        Err(bmux_tui_runtime::RuntimeError::Program { error, mut output }) => {
-            output
+        Ok(mut output) => {
+            let images = output
                 .presenter
                 .cleanup_images()
-                .context("image cleanup after program error")?;
+                .map_err(anyhow::Error::from);
+            let restored = guard.restore();
+            let cleanup = shutdown_local_demos(&mut output.program).await;
+            restored?;
+            images?;
+            cleanup
+        }
+        Err(bmux_tui_runtime::RuntimeError::Program { error, mut output }) => {
+            let images = output
+                .presenter
+                .cleanup_images()
+                .context("image cleanup after program error");
+            let restored = guard.restore();
+            let cleanup = shutdown_local_demos(&mut output.program).await;
+            restored?;
+            images?;
+            cleanup?;
             Err(error)
         }
         Err(bmux_tui_runtime::RuntimeError::Presenter { error, mut output }) => {
-            output
+            let images = output
                 .presenter
                 .cleanup_images()
-                .context("image cleanup after presentation error")?;
+                .context("image cleanup after presentation error");
+            let restored = guard.restore();
+            let cleanup = shutdown_local_demos(&mut output.program).await;
+            restored?;
+            images?;
+            cleanup?;
             Err(anyhow::anyhow!(error))
         }
+    }
+}
+
+async fn shutdown_local_demos(player: &mut Player) -> Result<()> {
+    let Some(demos) = &mut player.live_demos else {
+        return Ok(());
+    };
+    // One deadline for all demos, not twenty seconds per failed controller.
+    // The service remains authoritative for unresolved resources after UI exit.
+    match tokio::time::timeout(Duration::from_secs(2), demos.shutdown()).await {
+        Ok(result) => result.map_err(anyhow::Error::msg),
+        Err(_) => Err(anyhow::anyhow!(
+            "Presenter closed; playbook cleanup is NOT acknowledged. Owned runner must reconcile; do not restart until settled."
+        )),
     }
 }
 
@@ -995,11 +1201,155 @@ impl Drop for TerminalGuard {
     }
 }
 
+fn bounded_publication_error(error: &anyhow::Error) -> String {
+    let detail = format!("{error:#}")
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(1024)
+        .collect::<String>();
+    format!("Audience publication rejected; committed scene retained: {detail}")
+}
+
+/// Restore the semantic character from the canonical lowercase-plus-Shift key.
+fn overlay_key_input(key: &bmux_keyboard::KeyStroke) -> Option<String> {
+    match key.key {
+        KeyCode::Escape => Some("escape".to_owned()),
+        KeyCode::Char(character) if !key.modifiers.ctrl && !key.modifiers.alt => {
+            let character = if key.modifiers.shift && character.is_ascii_alphabetic() {
+                character.to_ascii_uppercase()
+            } else {
+                character
+            };
+            Some(character.to_string())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bmux_keyboard::KeyStroke;
     use bmux_presenter::builder::{DeckBuilder, SlideBuilder};
+
+    #[test]
+    fn publication_diagnostic_is_bounded_and_preserves_error_chain() {
+        let error = anyhow::anyhow!("invalid metadata\u{1b}\n{}", "x".repeat(2048))
+            .context("browser frame validation");
+        let diagnostic = bounded_publication_error(&error);
+        assert!(diagnostic.contains("browser frame validation: invalid metadata"));
+        assert!(!diagnostic.chars().any(char::is_control));
+        assert!(diagnostic.chars().count() <= 1088);
+    }
+
+    #[test]
+    fn redacted_playbook_deck_prepares_inert_viewer_without_private_config() {
+        let deck = DeckBuilder::new("public demo")
+            .slide(
+                SlideBuilder::new("slide")
+                    .custom(
+                        "live-demo",
+                        "playbook-demo",
+                        serde_json::json!({"playbook":"PRIVATE-SOURCE.dsl", "title":"PRIVATE-TITLE"}),
+                    )
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let public = deck.public();
+        let encoded = serde_json::to_string(&public).unwrap();
+        assert!(!encoded.contains("PRIVATE-SOURCE"));
+        assert!(!encoded.contains("PRIVATE-TITLE"));
+        let player = Player::local(public.clone(), None, false);
+        assert!(player.status.is_none());
+        assert!(player.live_demos.is_none());
+        let registry = player.registry();
+        let placeholder = registry.build(&public.slides[0].blocks[0]).unwrap();
+        let _layout = placeholder.layout(
+            Constraints::tight(Size::new(80, 24)),
+            &mut LayoutCx::default(),
+        );
+        let bmux_presenter::BlockKind::Custom { config, .. } = &public.slides[0].blocks[0].kind
+        else {
+            panic!("custom block expected");
+        };
+        assert!(crate::playbook::DemoConfig::parse(config).is_err());
+    }
+
+    #[test]
+    fn overlay_shift_r_selects_restart_while_lowercase_r_selects_run() {
+        let run =
+            KeyStroke::with_modifiers(KeyCode::Char('r'), bmux_keyboard::Modifiers::default());
+        let restart = KeyStroke::with_modifiers(
+            KeyCode::Char('r'),
+            bmux_keyboard::Modifiers {
+                shift: true,
+                ..bmux_keyboard::Modifiers::default()
+            },
+        );
+        assert_eq!(overlay_key_input(&run).as_deref(), Some("r"));
+        assert_eq!(overlay_key_input(&restart).as_deref(), Some("R"));
+    }
+
+    #[test]
+    fn remote_playbook_routes_shift_r_as_restart() {
+        use bmux_presenter_runtime::mirror::{MirrorFrame, WireCell};
+        let deck = DeckBuilder::new("d")
+            .slide(
+                SlideBuilder::new("s")
+                    .custom("demo", "playbook-demo", serde_json::Value::Null)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, false);
+        let surface = MirrorFrame {
+            surface_id: "demo".into(),
+            slide_id: "s".into(),
+            revision: 4,
+            width: 1,
+            height: 1,
+            cells: vec![WireCell {
+                symbol: "x".into(),
+                width: 1,
+                continuation: false,
+                fg: None,
+                bg: None,
+                modifiers: 0,
+            }],
+            images: vec![],
+        };
+        let placement = surface.placement(10, 5);
+        player.surfaces.push(surface);
+        player
+            .mirror_geometry
+            .push(("demo".into(), 4, "s".into(), placement));
+        let (sender, mut actions) = tokio::sync::mpsc::channel(2);
+        let (_, receiver) = tokio::sync::mpsc::channel(1);
+        player.remote = Some(RemoteConnection {
+            actions: sender,
+            updates: receiver,
+            receive_only: false,
+        });
+        for (shift, expected) in [(false, "r"), (true, "R")] {
+            let key = KeyStroke::with_modifiers(
+                KeyCode::Char('r'),
+                bmux_keyboard::Modifiers {
+                    shift,
+                    ..bmux_keyboard::Modifiers::default()
+                },
+            );
+            assert!(player.route_mirror(&Event::Key(key)).unwrap());
+            let bmux_presenter_runtime::Action::Effect { name, input } =
+                actions.try_recv().unwrap()
+            else {
+                panic!("playbook effect expected");
+            };
+            assert_eq!(name, "playbook-demo:demo");
+            assert_eq!(input, expected);
+        }
+    }
+
     #[test]
     fn mirror_input_requires_committed_geometry_and_matching_revision() {
         use bmux_presenter_runtime::mirror::{MirrorFrame, WireCell};

@@ -1231,6 +1231,8 @@ pub(crate) mod tests {
             .initialize_single(ids[0], endpoints[0])
             .await
             .unwrap();
+        // Initialization admits election; membership writes require a ready leader.
+        assert_eq!(wait_for_leader(&[&nodes[0]]).await, ids[0]);
         nodes[0]
             .change_voters(BTreeMap::from([
                 (ids[0], BasicNode::new(endpoints[0])),

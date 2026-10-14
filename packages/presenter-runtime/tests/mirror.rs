@@ -164,3 +164,58 @@ fn all_modifiers_round_trip_through_bmux_paint() {
     .unwrap();
     assert_eq!(captured.cells[0].modifiers, 255);
 }
+
+#[test]
+fn legacy_wire_adapter_preserves_json_and_native_unicode_styles() {
+    use bmux_tui::{
+        component::{Component, Constraints, LayoutCx},
+        embedded_surface::EmbeddedSurface,
+        geometry::Size,
+    };
+    let mut value = frame();
+    value.cells[0].symbol = "界".into();
+    value.cells[0].width = 2;
+    value.cells[0].modifiers = 255;
+    value.cells[1].symbol.clear();
+    value.cells[1].width = 0;
+    value.cells[1].continuation = true;
+    value.cells[1].modifiers = 255;
+    let wire = serde_json::to_value(&value).unwrap();
+    let restored: MirrorFrame = serde_json::from_value(wire.clone()).unwrap();
+    let retained = restored.retained_surface(17, 100, 8192).unwrap();
+    assert_eq!(serde_json::to_value(&restored).unwrap(), wire);
+    assert_eq!(retained.identity().owner, "surface");
+    assert_eq!(retained.identity().generation, 17);
+    assert_eq!(retained.buffer().cells()[0].symbol, "界");
+    assert!(retained.buffer().cells()[1].is_wide_continuation());
+    let component = EmbeddedSurface::new(&retained);
+    let committed = component.layout(
+        Constraints::tight(Size::new(6, 5)),
+        &mut LayoutCx::default(),
+    );
+    let point = component.input_point(&committed, 2, 2).unwrap();
+    assert_eq!((point.x, point.y), (0, 0));
+    // The serialized legacy schema remains product-specific; the reusable
+    // retained identity does not acquire the slide label.
+    assert_eq!(wire["slide_id"], "slide");
+    assert!(wire.get("generation").is_none());
+}
+
+#[test]
+fn mirror_component_rejects_geometry_from_another_revision() {
+    use bmux_presenter_runtime::MirrorComponent;
+    use bmux_tui::{
+        component::{Component, Constraints, LayoutCx},
+        geometry::Size,
+    };
+    let first = frame();
+    let mut next = frame();
+    next.revision += 1;
+    let original = MirrorComponent::new(&first, 100, 8192).unwrap();
+    let committed = original.layout(
+        Constraints::tight(Size::new(6, 5)),
+        &mut LayoutCx::default(),
+    );
+    let replacement = MirrorComponent::new(&next, 100, 8192).unwrap();
+    assert!(replacement.input_point(&committed, 2, 2).is_none());
+}

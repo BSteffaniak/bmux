@@ -12,9 +12,10 @@ mod tests {
     #[test]
     fn separates_viewer_and_management_authority() {
         let declarations = super::Contract::service_declarations().unwrap();
-        assert_eq!(declarations.len(), 2);
+        assert_eq!(declarations.len(), 3);
         let debug = format!("{declarations:?}");
         assert!(debug.contains("bmux.presenter.view.v2"));
         assert!(debug.contains("bmux.presenter.manage.v1"));
+        assert!(debug.contains("bmux.presenter.manage.v2"));
     }
 }

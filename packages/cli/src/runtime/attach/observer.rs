@@ -8,6 +8,9 @@ use bmux_tui::presentation::PreparedPresentation;
 use tokio::sync::watch;
 use uuid::Uuid;
 
+#[path = "observer_transport.rs"]
+pub mod transport;
+
 /// Provenance of a surface in the exact committed retained graph.
 #[derive(Debug, Clone)]
 pub struct AttachSurfaceProvenance {

@@ -6,11 +6,11 @@
 
 use crate::buffer::Buffer;
 use crate::damage::Damage;
-use crate::focus::{FocusScopeId, FocusTrap};
-use crate::frame::{Cursor, Frame};
+use crate::focus::{FocusScopeId, FocusTrap, ModalFocus, modal_transition};
+use crate::frame::{Cursor, Frame, SurfaceMetadataAvailability};
 use crate::geometry::Rect;
 use crate::hit::HitMap;
-use crate::image::{ImageContribution, ImagePayload};
+use crate::image::{ImageContribution, ImageKey, ImagePayload};
 use crate::image_scene::{ImageScene, ImageSceneDelta};
 use crate::paint::PaintCx;
 use crate::selection::SelectionScene;
@@ -27,16 +27,58 @@ pub struct PreparedPresentation {
     hits: HitMap,
     focus_scope: Option<FocusScopeId>,
     focus: FocusTrap,
+    modal_origin: FocusTrap,
+    modal_focus: Vec<ModalFocus>,
     images: Vec<ImageContribution>,
     image_scene: ImageScene,
     image_delta: ImageSceneDelta,
     selection: SelectionScene,
     selection_text: std::collections::BTreeMap<crate::selection::SelectionContentId, String>,
     semantics: SemanticScene,
+    metadata_availability: Vec<SurfaceMetadataAvailability>,
     damage: Damage,
 }
 
 impl PreparedPresentation {
+    /// Stage caller-owned modal scopes in outer-to-inner order.
+    ///
+    /// Returns false for repeated identities or non-full damage. Modal lifecycle
+    /// changes require a full snapshot to replace background interaction metadata.
+    /// Restoration is resolved against this snapshot's enabled focus targets;
+    /// neither the scope chain nor focus advances until output succeeds.
+    pub fn set_modal_scopes(&mut self, scopes: &[FocusScopeId]) -> bool {
+        if !matches!(self.damage, Damage::Full)
+            || scopes.len() > 64
+            || scopes.iter().any(|scope| scope.as_str().len() > 1024)
+            || scopes
+                .iter()
+                .enumerate()
+                .any(|(index, scope)| scopes[..index].contains(scope))
+        {
+            return false;
+        }
+        let (modal_focus, focus) =
+            modal_transition(&self.modal_focus, &self.modal_origin, &self.hits, scopes);
+        self.modal_focus = modal_focus;
+        self.focus = focus;
+        self.focus_scope = scopes.last().cloned();
+        if self.focus_scope.is_some() {
+            // Preserve visible background metadata, but make all hit APIs obey
+            // the modal exclusion, including callers using unscoped hit_mouse.
+            self.hits.exclude_outside_scope(self.focus_scope.as_ref());
+        }
+        self.cursor = self.cursor.filter(|cursor| {
+            self.focus_scope.is_none()
+                || self.hits.regions().iter().any(|hit| {
+                    hit.enabled
+                        && hit.visible
+                        && hit.focus_scope == self.focus_scope
+                        && hit.area.contains(cursor.position)
+                })
+        });
+        true
+    }
+
     /// Caller-owned immutable logical text referenced by selection fragments.
     #[must_use]
     pub const fn selection_text(
@@ -103,7 +145,8 @@ impl PreparedPresentation {
     pub const fn focus(&self) -> &FocusTrap {
         &self.focus
     }
-    /// Image contributions, including retained regional contributions.
+    /// Explicit latest image contributions, not the retained visible projection.
+    /// Backends render `image_scene()` and `image_delta()`, not this producer log.
     #[must_use]
     pub fn images(&self) -> &[ImageContribution] {
         &self.images
@@ -118,6 +161,13 @@ impl PreparedPresentation {
     pub const fn image_delta(&self) -> &ImageSceneDelta {
         &self.image_delta
     }
+    /// Original caller-owned identity of a derived visibility fragment.
+    /// Payload bytes and allocation are unchanged by fragment projection.
+    #[must_use]
+    pub fn image_source(&self, key: &ImageKey) -> Option<&ImageKey> {
+        self.image_scene.source_key(key)
+    }
+
     /// Final logical selection geometry.
     #[must_use]
     pub const fn selection(&self) -> &SelectionScene {
@@ -128,13 +178,32 @@ impl PreparedPresentation {
     pub const fn semantics(&self) -> &SemanticScene {
         &self.semantics
     }
+    /// Clipped regional producer metadata availability declarations.
+    #[must_use]
+    pub fn metadata_availability(&self) -> &[SurfaceMetadataAvailability] {
+        &self.metadata_availability
+    }
+
     /// Effective damage, expanded to include complete wide-cell spans.
     #[must_use]
     pub const fn damage(&self) -> &Damage {
         &self.damage
     }
 
-    fn validate_limits(&self, limits: PresentationLimits) -> Result<(), PresentationLimitError> {
+    /// Recheck the complete snapshot after caller-owned metadata staging.
+    ///
+    /// # Errors
+    /// Returns the exceeded entry or byte budget. Call after staging modal
+    /// scopes and selection text when using a caller-selected admission budget.
+    pub fn validate_limits(
+        &self,
+        limits: PresentationLimits,
+    ) -> Result<(), PresentationLimitError> {
+        if usize::from(self.buffer.area().width) * usize::from(self.buffer.area().height)
+            > limits.max_cells
+        {
+            return Err(PresentationLimitError::Cells);
+        }
         let mut entries = 0_usize;
         let mut bytes = 0_usize;
         let mut add = |count: usize, size: usize| -> Result<(), PresentationLimitError> {
@@ -163,6 +232,12 @@ impl PreparedPresentation {
         }
         if let Some(scope) = &self.focus_scope {
             add(0, scope.as_str().len())?;
+        }
+        for modal in &self.modal_focus {
+            add(1, modal.scope.as_str().len())?;
+            if let Some(target) = &modal.return_target {
+                add(0, target.as_str().len())?;
+            }
         }
         for target in self.focus.targets() {
             add(1, target.as_str().len())?;
@@ -200,14 +275,28 @@ impl PreparedPresentation {
         for placement in self
             .image_scene
             .placements()
+            .chain(self.image_scene.source_placements())
             .chain(self.image_delta.upserted.iter())
         {
             add(1, placement.key.as_str().len())?;
+            if let Some(source) = self.image_scene.source_key(&placement.key) {
+                add(
+                    1,
+                    source
+                        .as_str()
+                        .len()
+                        .saturating_add(placement.key.as_str().len()),
+                )?;
+            }
             add(0, payload_bytes(&placement.payload))?;
+        }
+        for target in self.modal_origin.targets() {
+            add(1, target.as_str().len())?;
         }
         for key in &self.image_delta.removed {
             add(1, key.as_str().len())?;
         }
+        add(self.metadata_availability.len(), 0)?;
         add(self.damage.retained_regions().len(), 0)?;
         Ok(())
     }
@@ -280,6 +369,7 @@ pub struct PresentationState {
     hits: HitMap,
     focus: FocusTrap,
     focus_scope: Option<FocusScopeId>,
+    modal_focus: Vec<ModalFocus>,
     images: Vec<ImageContribution>,
     image_scene: ImageScene,
     image_delta: ImageSceneDelta,
@@ -287,6 +377,7 @@ pub struct PresentationState {
     selection: SelectionScene,
     selection_text: std::collections::BTreeMap<crate::selection::SelectionContentId, String>,
     semantics: SemanticScene,
+    metadata_availability: Vec<SurfaceMetadataAvailability>,
 }
 
 impl PresentationState {
@@ -299,6 +390,7 @@ impl PresentationState {
             hits: HitMap::new(),
             focus: FocusTrap::new(),
             focus_scope: None,
+            modal_focus: Vec::new(),
             images: Vec::new(),
             image_scene: ImageScene::default(),
             image_delta: ImageSceneDelta::default(),
@@ -306,6 +398,7 @@ impl PresentationState {
             selection: SelectionScene::new(),
             selection_text: std::collections::BTreeMap::new(),
             semantics: SemanticScene::new(),
+            metadata_availability: Vec::new(),
         }
     }
     /// Viewport being prepared.
@@ -333,6 +426,31 @@ impl PresentationState {
     pub const fn focus(&self) -> &FocusTrap {
         &self.focus
     }
+    /// Committed caller-owned modal identities, in outer-to-inner order.
+    #[must_use]
+    pub fn modal_scopes(&self) -> impl ExactSizeIterator<Item = &FocusScopeId> {
+        self.modal_focus.iter().map(|modal| &modal.scope)
+    }
+
+    /// Route pointer input only within the committed active scope.
+    ///
+    /// An empty modal still excludes the background: no hit is not permission
+    /// to fall through to another target. Applications must dispatch keyboard
+    /// and paste to `focus().active()` only, using the committed component tree.
+    #[must_use]
+    pub fn hit_mouse(&self, event: crate::event::MouseEvent) -> Option<crate::hit::Hit<'_>> {
+        self.hits
+            .hit_mouse_in_scope(event, self.focus_scope.as_ref())
+    }
+
+    /// Navigate focus only within the committed active scope.
+    pub fn handle_focus_key(
+        &mut self,
+        key: bmux_keyboard::KeyStroke,
+    ) -> crate::focus::FocusKeyOutcome {
+        self.focus.handle_key(key)
+    }
+
     /// Set focus within the last committed scene.
     pub fn set_focused(&mut self, id: &crate::focus::FocusId) -> bool {
         self.focus.set_active(id)
@@ -342,6 +460,12 @@ impl PresentationState {
     pub const fn selection(&self) -> &SelectionScene {
         &self.selection
     }
+    /// Last committed regional producer metadata declarations.
+    #[must_use]
+    pub fn metadata_availability(&self) -> &[SurfaceMetadataAvailability] {
+        &self.metadata_availability
+    }
+
     /// Last committed semantic geometry.
     #[must_use]
     pub const fn semantics(&self) -> &SemanticScene {
@@ -357,6 +481,12 @@ impl PresentationState {
     pub const fn image_delta(&self) -> &ImageSceneDelta {
         &self.image_delta
     }
+    /// Original caller-owned identity of a committed visibility fragment.
+    #[must_use]
+    pub fn image_source(&self, key: &ImageKey) -> Option<&ImageKey> {
+        self.image_scene.source_key(key)
+    }
+
     /// Last committed image contributions.
     #[must_use]
     pub fn images(&self) -> &[ImageContribution] {
@@ -377,6 +507,8 @@ impl PresentationState {
     /// Prepare an owned snapshot without committing it.
     ///
     /// No damage skips rendering after an initial successful presentation.
+    /// Render callbacks must paint the complete tree when using occlusion or
+    /// modal scopes: these replace full interaction geometry, not a local patch.
     /// Regional rendering preserves committed content outside replaced regions.
     /// The caller must bound viewport size and render contributions; preparation
     /// retains one previous grid and stages one new grid, never a frame queue.
@@ -414,13 +546,85 @@ impl PresentationState {
         Ok(prepared)
     }
 
+    fn reconcile_metadata_availability(
+        &self,
+        frame: &Frame<'_>,
+        damage: &Damage,
+    ) -> Vec<SurfaceMetadataAvailability> {
+        let mut declarations = if let Damage::Regions(regions) = damage {
+            let mut retained = self.metadata_availability.clone();
+            for region in regions {
+                retained = retained
+                    .into_iter()
+                    .flat_map(|declaration| {
+                        crate::image_scene::subtract_rect(declaration.area, *region)
+                            .into_iter()
+                            .map(move |area| SurfaceMetadataAvailability {
+                                area,
+                                ..declaration
+                            })
+                    })
+                    .collect();
+            }
+            retained
+        } else {
+            Vec::new()
+        };
+        declarations.extend_from_slice(frame.metadata_availability());
+        declarations
+    }
+
+    /// Replace staged hit geometry only in the requested damage regions.
+    fn reconcile_staged_hits(&self, staged: &HitMap, damage: &Damage) -> HitMap {
+        let Damage::Regions(regions) = damage else {
+            return staged.clone();
+        };
+        let mut hits = self.hits.clone();
+        for region in regions {
+            hits.retain_outside(*region);
+        }
+        for hit in staged.regions() {
+            if regions
+                .iter()
+                .any(|region| !hit.area.intersection(*region).is_empty())
+            {
+                hits.push(hit.clone());
+            }
+        }
+        hits
+    }
+
+    /// Repair unchanged cells and expand regional damage to complete wide spans.
+    fn restore_retained_cells(
+        &self,
+        buffer: &mut Buffer,
+        damage: Damage,
+        regions: &[Rect],
+    ) -> Damage {
+        let retained_regions =
+            if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
+                buffer.expand_regions_to_cell_spans(previous, regions)
+            } else {
+                regions.to_vec()
+            };
+        if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
+            buffer.restore_outside(previous, &retained_regions);
+        }
+        buffer.debug_assert_valid_wide_spans();
+        if matches!(damage, Damage::Regions(_)) {
+            Damage::Regions(retained_regions)
+        } else {
+            damage
+        }
+    }
+
     fn prepare_from(
         &self,
         damage: Damage,
         repair: bool,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
     ) -> Option<PreparedPresentation> {
-        let damage = if self.previous.is_none() {
+        let mut damage = if self.previous.is_none() {
             Damage::Full
         } else {
             damage
@@ -428,7 +632,7 @@ impl PresentationState {
         if damage.is_none() {
             return None;
         }
-        let requested_regions = damage.retained_regions();
+        let mut requested_regions = damage.retained_regions().to_vec();
         let mut buffer = if repair {
             self.previous
                 .clone()
@@ -436,32 +640,24 @@ impl PresentationState {
         } else {
             Buffer::empty(self.area)
         };
-        let (cursor, hits, focus_scope, images, selection, semantics) = {
+        let metadata_availability;
+        let (cursor, hits, focus_scope, images, selection, semantics, occlusions) = {
             let mut frame = Frame::new(&mut buffer);
             render(&mut PaintCx::new(&mut frame));
-            let mut hits = if matches!(damage, Damage::Regions(_)) {
-                let mut retained = self.hits.clone();
-                for region in requested_regions {
-                    retained.retain_outside(*region);
-                }
-                retained
-            } else {
-                HitMap::new()
-            };
-            for hit in frame.hits().regions() {
-                if !matches!(damage, Damage::Regions(_))
-                    || requested_regions
-                        .iter()
-                        .any(|region| !hit.area.intersection(*region).is_empty())
-                {
-                    hits.push(hit.clone());
-                }
+            // Occlusion replaces scene geometry globally. A producer invoking
+            // it must paint the complete tree, not a regional-only patch.
+            if !frame.occlusions().is_empty() || !self.modal_focus.is_empty() {
+                damage = Damage::Full;
+                requested_regions.clear();
             }
+            metadata_availability = self.reconcile_metadata_availability(&frame, &damage);
+            let hits = self.reconcile_staged_hits(frame.hits(), &damage);
             let mut images = if matches!(damage, Damage::Regions(_)) {
-                self.image_scene.contributions_outside(requested_regions)
+                self.image_scene.contributions_outside(&requested_regions)
             } else {
                 Vec::new()
             };
+            let retained_image_count = images.len();
             images.extend_from_slice(frame.images());
             let cursor = frame.cursor().or_else(|| {
                 matches!(damage, Damage::Regions(_))
@@ -475,48 +671,51 @@ impl PresentationState {
             });
             let selection = if matches!(damage, Damage::Regions(_)) {
                 self.selection
-                    .merge_regions(frame.selection(), requested_regions)
+                    .merge_regions(frame.selection(), &requested_regions)
             } else {
                 frame.selection().clone()
             };
             let semantics = if matches!(damage, Damage::Regions(_)) {
                 self.semantics
-                    .merge_regions(frame.semantics(), requested_regions)
+                    .merge_regions(frame.semantics(), &requested_regions)
             } else {
                 frame.semantics().clone()
             };
-            (cursor, hits, focus_scope, images, selection, semantics)
+            let occlusions: Vec<_> = frame
+                .occlusions()
+                .iter()
+                .map(|(boundary, area)| (boundary.saturating_add(retained_image_count), *area))
+                .collect();
+            (
+                cursor,
+                hits,
+                focus_scope,
+                images,
+                selection,
+                semantics,
+                occlusions,
+            )
         };
-        let retained_regions =
-            if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
-                buffer.expand_regions_to_cell_spans(previous, requested_regions)
-            } else {
-                requested_regions.to_vec()
-            };
-        if let (Some(previous), Damage::Regions(_)) = (&self.previous, &damage) {
-            buffer.restore_outside(previous, &retained_regions);
-        }
-        buffer.debug_assert_valid_wide_spans();
+        let damage = self.restore_retained_cells(&mut buffer, damage, &requested_regions);
         let mut image_scene = self.image_scene.clone();
-        let image_delta = image_scene.reconcile(&images);
+        let image_delta = image_scene.reconcile_occluded(&images, &occlusions);
+
         let focus = FocusTrap::from_hits(&hits, focus_scope.as_ref(), self.focus.active());
-        let damage = if matches!(damage, Damage::Regions(_)) {
-            Damage::Regions(retained_regions)
-        } else {
-            damage
-        };
         Some(PreparedPresentation {
             buffer,
             cursor,
             hits,
             focus_scope,
             focus,
+            modal_focus: self.modal_focus.clone(),
+            modal_origin: self.focus.clone(),
             images,
             image_scene,
             image_delta,
             selection,
             selection_text: std::collections::BTreeMap::new(),
             semantics,
+            metadata_availability,
             damage,
         })
     }
@@ -610,6 +809,7 @@ impl PresentationState {
         self.hits = prepared.hits;
         self.focus = prepared.focus;
         self.focus_scope = prepared.focus_scope;
+        self.modal_focus = prepared.modal_focus;
         self.images = prepared.images;
         self.image_scene = prepared.image_scene;
         self.image_delta = prepared.image_delta;
@@ -617,6 +817,7 @@ impl PresentationState {
         self.selection = prepared.selection;
         self.selection_text = prepared.selection_text;
         self.semantics = prepared.semantics;
+        self.metadata_availability = prepared.metadata_availability;
         Ok(Some(result))
     }
 }
@@ -633,6 +834,251 @@ mod tests {
         cx.fill(LocalRect::new(0, 0, 2, 1), symbol, Style::new());
         cx.push_hit(HitRegion::new(id, Rect::new(0, 0, 2, 1)).focusable(true));
         cx.set_cursor(Point::new(1, 0), true);
+    }
+
+    #[test]
+    fn metadata_availability_is_clipped_occluded_and_transactional() {
+        let mut state = PresentationState::new(Rect::new(0, 0, 8, 4));
+        let render = |cx: &mut PaintCx<'_, '_>| {
+            cx.with_child(2, 1, LocalRect::new(0, 0, 3, 2), |cx| {
+                cx.declare_metadata_availability(LocalRect::new(-1, -1, 8, 8), false, false);
+            });
+        };
+        let prepared = state.prepare(Damage::Full, render).unwrap();
+        assert_eq!(
+            prepared.metadata_availability(),
+            &[SurfaceMetadataAvailability {
+                area: Rect::new(2, 1, 3, 2),
+                selection: false,
+                semantics: false,
+            }]
+        );
+        assert_eq!(
+            state.present_prepared(Some(prepared), |_, _| Err::<(), _>("failed")),
+            Err("failed")
+        );
+        assert!(state.metadata_availability().is_empty());
+        state
+            .present(Damage::Full, render, |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.metadata_availability().len(), 1);
+        let hidden = state
+            .prepare(Damage::Full, |cx| {
+                render(cx);
+                cx.occlude(LocalRect::new(2, 1, 3, 2));
+            })
+            .unwrap();
+        assert!(hidden.metadata_availability().is_empty());
+        assert_eq!(
+            state.present_prepared(Some(hidden), |_, _| Err::<(), _>("failed hide")),
+            Err("failed hide")
+        );
+        assert_eq!(state.metadata_availability().len(), 1);
+        state
+            .present(
+                Damage::Full,
+                |cx| {
+                    render(cx);
+                    cx.occlude(LocalRect::new(2, 1, 3, 2));
+                },
+                |_, _| Ok::<_, ()>(()),
+            )
+            .unwrap();
+        assert!(state.metadata_availability().is_empty());
+    }
+
+    #[test]
+    fn occlusion_uses_scoped_projection_and_failed_output_preserves_images() {
+        use crate::image::{ImageFit, ImageKey, ImageLifecycle, ImagePixelFormat, ImagePlacement};
+        let source = ImagePlacement {
+            key: ImageKey::new("persistent"),
+            payload: ImagePayload::Pixels {
+                bytes: vec![1, 2, 3],
+                width: 1,
+                height: 1,
+                format: ImagePixelFormat::Rgb8,
+            },
+            destination: Rect::new(0, 0, 8, 4),
+            clip: Rect::new(0, 0, 8, 4),
+            lifecycle: ImageLifecycle::Persistent,
+            fit: ImageFit::Stretch,
+            allocation: None,
+        };
+        let mut state = PresentationState::new(Rect::new(0, 0, 8, 4));
+        state
+            .present(
+                Damage::Full,
+                |cx| {
+                    cx.push_image(ImageContribution::Present(source.clone()));
+                    cx.push_hit(
+                        HitRegion::new("background", Rect::new(0, 0, 8, 4)).focusable(true),
+                    );
+                },
+                |_, _| Ok::<_, ()>(()),
+            )
+            .unwrap();
+        let render = |cx: &mut PaintCx<'_, '_>| {
+            cx.push_hit(HitRegion::new("background", Rect::new(0, 0, 8, 4)).focusable(true));
+            cx.with_child(2, 1, LocalRect::new(0, 0, 3, 2), |cx| {
+                // Oversized local occlusion must use the child clip and origin.
+                cx.occlude(LocalRect::new(-1, -1, 8, 8));
+            });
+        };
+        let prepared = state.prepare(Damage::Full, render).unwrap();
+        let expected = Rect::new(2, 1, 3, 2);
+        assert_eq!(prepared.image_scene().placements().len(), 4);
+        for image in prepared.image_scene().placements() {
+            assert!(image.clip.intersection(expected).is_empty());
+            assert_eq!(prepared.image_source(&image.key), Some(&source.key));
+        }
+        assert!(prepared.hits().hit_test(Point::new(2, 1)).is_none());
+        assert!(prepared.hits().hit_test(Point::new(1, 1)).is_some());
+        assert_eq!(
+            state.present_prepared(Some(prepared), |_, _| Err::<(), _>("rejected")),
+            Err("rejected")
+        );
+        assert_eq!(state.image_scene().get(&source.key), Some(&source));
+        assert!(state.hits().hit_test(Point::new(2, 1)).is_some());
+        let limits = PresentationLimits {
+            max_cells: 32,
+            max_entries: 2,
+            max_bytes: 4096,
+        };
+        assert!(matches!(
+            state.prepare_bounded(limits, Damage::Full, render),
+            Err(PresentationLimitError::Entries)
+        ));
+        let staged = state.prepare(Damage::Full, render).unwrap();
+        state
+            .present_prepared(Some(staged), |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(
+            state.image_scene().source_placements().next(),
+            Some(&source)
+        );
+        state
+            .present(Damage::Full, |_| {}, |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.image_scene().get(&source.key), Some(&source));
+    }
+
+    #[test]
+    fn modal_commit_failure_nested_restore_and_invalidated_return_target() {
+        use crate::event::{MouseButton, MouseEvent, MouseEventKind};
+        use bmux_keyboard::{KeyCode, KeyStroke};
+        let mut state = PresentationState::new(Rect::new(0, 0, 8, 3));
+        let render = |cx: &mut PaintCx<'_, '_>, scopes: &[FocusScopeId], valid: bool| {
+            cx.set_focus_scope(None);
+            cx.push_hit(HitRegion::new("fallback", Rect::new(0, 0, 1, 1)).focusable(true));
+            if valid {
+                cx.push_hit(HitRegion::new("return", Rect::new(1, 0, 1, 1)).focusable(true));
+            }
+            for scope in scopes {
+                cx.set_focus_scope(Some(scope.clone()));
+                cx.push_hit(HitRegion::new(scope.clone(), Rect::new(3, 1, 2, 1)).focusable(true));
+            }
+            cx.push_selection_scope(crate::selection::SelectionScope::new(
+                "selection",
+                Rect::new(0, 0, 8, 3),
+            ));
+            cx.set_cursor(Point::new(3, 1), true);
+        };
+        state
+            .present(
+                Damage::Full,
+                |cx| render(cx, &[], true),
+                |_, _| Ok::<_, ()>(()),
+            )
+            .unwrap();
+        assert!(state.set_focused(&FocusScopeId::new("return")));
+        let outer = FocusScopeId::new("outer");
+        let inner = FocusScopeId::new("inner");
+        let outer_scope = std::slice::from_ref(&outer);
+        let mut opening = state
+            .prepare(Damage::Full, |cx| render(cx, outer_scope, true))
+            .unwrap();
+        assert!(opening.set_modal_scopes(outer_scope));
+        let old_cursor = state.cursor();
+        let old_selection = state.selection().clone();
+        assert_eq!(
+            state.present_prepared(Some(opening), |_, _| Err::<(), _>("failed")),
+            Err("failed")
+        );
+        assert_eq!(state.focus().active(), Some(&FocusScopeId::new("return")));
+        assert_eq!(state.modal_scopes().len(), 0);
+        assert_eq!(state.cursor(), old_cursor);
+        assert_eq!(state.selection(), &old_selection);
+        let mut opening = state
+            .prepare(Damage::Full, |cx| render(cx, outer_scope, true))
+            .unwrap();
+        assert!(opening.set_modal_scopes(outer_scope));
+        state
+            .present_prepared(Some(opening), |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        let outside = MouseEvent::new(MouseEventKind::Down(MouseButton::Left), Point::new(0, 0));
+        assert!(state.hit_mouse(outside).is_none());
+        assert!(state.hits().hit_mouse(outside).is_none());
+        let mut nested = state
+            .prepare(Damage::Full, |cx| {
+                render(cx, &[outer.clone(), inner.clone()], true);
+            })
+            .unwrap();
+        assert!(nested.set_modal_scopes(&[outer.clone(), inner.clone()]));
+        state
+            .present_prepared(Some(nested), |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.focus().active(), Some(&inner));
+        state.handle_focus_key(KeyStroke::simple(KeyCode::Tab));
+        assert_eq!(state.focus().active(), Some(&inner));
+        let mut closing = state
+            .prepare(Damage::Full, |cx| render(cx, outer_scope, true))
+            .unwrap();
+        assert!(closing.set_modal_scopes(outer_scope));
+        assert_eq!(
+            state.present_prepared(Some(closing), |_, _| Err::<(), _>("failed close")),
+            Err("failed close")
+        );
+        assert_eq!(state.focus().active(), Some(&inner));
+        assert_eq!(state.modal_scopes().len(), 2);
+        let mut closing = state
+            .prepare(Damage::Full, |cx| render(cx, outer_scope, true))
+            .unwrap();
+        assert!(closing.set_modal_scopes(outer_scope));
+        state
+            .present_prepared(Some(closing), |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.focus().active(), Some(&outer));
+        let mut dismissed = state
+            .prepare(Damage::Full, |cx| render(cx, &[], false))
+            .unwrap();
+        assert!(dismissed.set_modal_scopes(&[]));
+        state
+            .present_prepared(Some(dismissed), |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(state.focus().active(), Some(&FocusScopeId::new("fallback")));
+        assert_eq!(state.modal_scopes().len(), 0);
+    }
+
+    #[test]
+    fn empty_modal_scope_excludes_background_and_navigation() {
+        use bmux_keyboard::{KeyCode, KeyStroke};
+        let mut state = PresentationState::new(Rect::new(0, 0, 2, 1));
+        let mut prepared = state
+            .prepare(Damage::Full, |cx| {
+                paint(cx, "background", "B");
+            })
+            .unwrap();
+        assert!(prepared.set_modal_scopes(&[FocusScopeId::new("empty")]));
+        state
+            .present_prepared(Some(prepared), |_, _| Ok::<_, ()>(()))
+            .unwrap();
+        assert!(state.focus().active().is_none());
+        assert_eq!(
+            state.handle_focus_key(KeyStroke::simple(KeyCode::Tab)),
+            crate::focus::FocusKeyOutcome::Ignored
+        );
+        assert!(state.hits().hit_test(Point::new(0, 0)).is_none());
+        assert!(state.cursor().is_none());
     }
 
     #[test]

@@ -69,6 +69,7 @@ pub(crate) enum Command {
         source: PathBuf,
         presenter: bool,
         reload: bool,
+        allow_playbooks: bool,
         web: WebOptions,
     },
     Check {
@@ -88,6 +89,7 @@ pub(crate) struct HostOptions {
     pub audience_credential: Option<PathBuf>,
     pub public_read: bool,
     pub reload: bool,
+    pub allow_playbooks: bool,
     pub web: WebOptions,
 }
 
@@ -116,12 +118,14 @@ impl Command {
             "play" => {
                 let presenter = args.flag("--presenter")?;
                 let reload = !args.flag("--no-reload")?;
+                let allow_playbooks = args.flag("--allow-playbooks")?;
                 let web = WebOptions::parse(&mut args)?;
                 args.finish()?;
                 Ok(Self::Play {
                     source: target.into(),
                     presenter,
                     reload,
+                    allow_playbooks,
                     web,
                 })
             }
@@ -147,6 +151,7 @@ impl Command {
                 let audience_credential = args.value("--audience-credential")?.map(PathBuf::from);
                 let public_read = args.flag("--public-read")?;
                 let reload = !args.flag("--no-reload")?;
+                let allow_playbooks = args.flag("--allow-playbooks")?;
                 let web = WebOptions::parse(&mut args)?;
                 ensure!(
                     public_read || audience_credential.is_some(),
@@ -171,6 +176,7 @@ impl Command {
                     audience_credential,
                     public_read,
                     reload,
+                    allow_playbooks,
                     web,
                 }))
             }
@@ -308,6 +314,47 @@ mod tests {
                 }
             ));
         }
+    }
+    #[test]
+    fn executable_input_approval_is_creation_only_and_explicit() {
+        assert!(matches!(
+            parse("play", &["deck.md"]).unwrap(),
+            Command::Play {
+                allow_playbooks: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse("play", &["deck.md", "--allow-playbooks"]).unwrap(),
+            Command::Play {
+                allow_playbooks: true,
+                ..
+            }
+        ));
+        let Command::Host(options) = parse(
+            "host",
+            &[
+                "deck.md",
+                "--managed",
+                "--presenter-credential",
+                "p",
+                "--public-read",
+                "--allow-playbooks",
+            ],
+        )
+        .unwrap() else {
+            panic!("host")
+        };
+        assert!(options.allow_playbooks);
+        assert!(parse("check", &["deck.md", "--allow-playbooks"]).is_err());
+        assert!(parse("join", &["bmux:host", "--allow-playbooks"]).is_err());
+        assert!(
+            parse(
+                "play",
+                &["deck.md", "--allow-playbooks", "--allow-playbooks"]
+            )
+            .is_err()
+        );
     }
     #[test]
     fn hosting_is_private_unless_explicitly_public() {

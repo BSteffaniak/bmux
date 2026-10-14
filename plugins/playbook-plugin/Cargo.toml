@@ -1,0 +1,27 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Managed headless playbook execution plugin"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "playbook", "automation"]
+license     = { workspace = true }
+name        = "bmux_playbook_plugin"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmux_playbook            = { workspace = true }
+bmux_playbook_plugin_api = { workspace = true }
+bmux_plugin_sdk          = { workspace = true }
+serde                    = { workspace = true, features = ["derive", "std"] }
+serde_json               = { workspace = true }
+tempfile                 = { workspace = true }
+uuid                     = { workspace = true, features = ["v4", "std", "serde"] }
+
+[features]
+fail-on-warnings = []
+static-bundled   = []

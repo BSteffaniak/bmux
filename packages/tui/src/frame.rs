@@ -13,6 +13,17 @@ use crate::semantic::{SemanticRegion, SemanticScene};
 use crate::style::Style;
 use crate::text::Line;
 
+/// Regional producer declaration; absence means ordinary complete metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceMetadataAvailability {
+    /// Visible terminal geometry, projected by `PaintCx`.
+    pub area: Rect,
+    /// Whether logical selection metadata is supplied for this region.
+    pub selection: bool,
+    /// Whether semantic metadata is supplied for this region.
+    pub semantics: bool,
+}
+
 /// Cursor requested by a rendered frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -58,9 +69,11 @@ pub struct Frame<'buffer> {
     hits: HitMap,
     focus_scope: Option<FocusScopeId>,
     images: Vec<ImageContribution>,
+    occlusions: Vec<(usize, Rect)>,
     selection: SelectionScene,
     semantics: SemanticScene,
     damage: Vec<Rect>,
+    metadata_availability: Vec<SurfaceMetadataAvailability>,
 }
 
 impl<'buffer> Frame<'buffer> {
@@ -72,9 +85,11 @@ impl<'buffer> Frame<'buffer> {
             hits: HitMap::new(),
             focus_scope: None,
             images: Vec::new(),
+            occlusions: Vec::new(),
             selection: SelectionScene::new(),
             semantics: SemanticScene::new(),
             damage: Vec::new(),
+            metadata_availability: Vec::new(),
         }
     }
 
@@ -114,6 +129,27 @@ impl<'buffer> Frame<'buffer> {
         &self.images
     }
 
+    /// Regional producer metadata declarations in paint order.
+    #[must_use]
+    pub fn metadata_availability(&self) -> &[SurfaceMetadataAvailability] {
+        &self.metadata_availability
+    }
+
+    pub(crate) fn declare_metadata_availability(
+        &mut self,
+        declaration: SurfaceMetadataAvailability,
+    ) {
+        if !declaration.area.is_empty() {
+            self.metadata_availability.push(declaration);
+        }
+    }
+
+    /// Staged opaque rectangles with their image paint-order boundary.
+    #[must_use]
+    pub fn occlusions(&self) -> &[(usize, Rect)] {
+        &self.occlusions
+    }
+
     /// Return selection metadata registered for this frame.
     #[must_use]
     pub const fn selection(&self) -> &SelectionScene {
@@ -135,6 +171,65 @@ impl<'buffer> Frame<'buffer> {
     // Every mutator below is reachable only through `crate::paint::PaintCx`,
     // which translates and clips each contribution before staging it here.
 
+    /// Subtract an already projected opaque rectangle from earlier metadata.
+    /// Image occlusion is resolved by the retained image scene, not by deleting
+    /// source contributions. Cells are cleared with complete wide-cell repair.
+    pub(crate) fn occlude(&mut self, area: Rect) {
+        let area = area.intersection(self.area());
+        if area.is_empty() {
+            return;
+        }
+        self.occlusions.push((self.images.len(), area));
+        self.metadata_availability = self
+            .metadata_availability
+            .iter()
+            .flat_map(|declaration| {
+                crate::image_scene::subtract_rect(declaration.area, area)
+                    .into_iter()
+                    .map(|visible| SurfaceMetadataAvailability {
+                        area: visible,
+                        ..*declaration
+                    })
+            })
+            .collect();
+        self.buffer.fill(area, " ", Style::new());
+        self.cursor = self.cursor.filter(|cursor| !area.contains(cursor.position));
+        let mut hits = HitMap::new();
+        for hit in self.hits.regions() {
+            for visible in crate::image_scene::subtract_rect(hit.area, area) {
+                let mut fragment = hit.clone();
+                fragment.area = visible;
+                hits.push(fragment);
+            }
+        }
+        self.hits = hits;
+        let mut selection = SelectionScene::new();
+        for scope in self.selection.scopes() {
+            let mut scope = scope.clone();
+            if !scope.initiation_area.intersection(area).is_empty() {
+                // A scope has one rectangular initiation area. Conservatively
+                // disable initiation rather than invent a competing shape model.
+                scope.initiation_area = Rect::new(0, 0, 0, 0);
+            }
+            selection.push_scope(scope);
+        }
+        for fragment in self.selection.fragments() {
+            if fragment.area.intersection(area).is_empty() {
+                selection.push_fragment(fragment.clone());
+            }
+        }
+        self.selection = selection;
+        let mut semantics = SemanticScene::new();
+        for region in self.semantics.regions() {
+            for visible in crate::image_scene::subtract_rect(region.area, area) {
+                let mut fragment = region.clone();
+                fragment.area = visible;
+                semantics.push(fragment);
+            }
+        }
+        self.semantics = semantics;
+    }
+
     pub(crate) const fn buffer_mut(&mut self) -> &mut Buffer {
         self.buffer
     }
@@ -154,6 +249,22 @@ impl<'buffer> Frame<'buffer> {
     }
 
     pub(crate) fn set_focus_scope(&mut self, scope: Option<FocusScopeId>) {
+        if scope.is_some() && scope != self.focus_scope {
+            // Selection also obeys scope exclusion. Previously painted scopes
+            // remain logical metadata but cannot initiate or autoscroll behind
+            // the foreground. Newly painted foreground scopes remain eligible.
+            let mut selection = SelectionScene::new();
+            for prior in self.selection.scopes() {
+                let mut prior = prior.clone();
+                prior.capture = crate::selection::SelectionCapture::Disabled;
+                prior.auto_scroll = crate::selection::SelectionAutoScrollPolicy::disabled();
+                selection.push_scope(prior);
+            }
+            for fragment in self.selection.fragments() {
+                selection.push_fragment(fragment.clone());
+            }
+            self.selection = selection;
+        }
         self.focus_scope = scope;
     }
 
@@ -199,6 +310,38 @@ mod tests {
     use crate::buffer::Buffer;
     use crate::geometry::{Point, Rect};
     use crate::image::{ImageContribution, ImageKey};
+
+    #[test]
+    fn occlusion_and_scope_exclusion_share_staged_metadata() {
+        use crate::hit::HitRegion;
+        use crate::selection::{SelectionCapture, SelectionScope};
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 4));
+        let mut frame = Frame::new(&mut buffer);
+        frame.push_hit(HitRegion::new("background", Rect::new(0, 0, 8, 4)).focusable(true));
+        frame.push_selection_scope(SelectionScope::new(
+            "background-selection",
+            Rect::new(0, 0, 8, 4),
+        ));
+        frame.set_cursor(Cursor::visible(Point::new(3, 1)));
+        frame.occlude(Rect::new(3, 1, 2, 2));
+        assert!(frame.cursor().is_none());
+        assert!(frame.hits().hit_test(Point::new(3, 1)).is_none());
+        assert!(frame.hits().hit_test(Point::new(0, 0)).is_some());
+        frame.set_focus_scope(Some("modal".into()));
+        frame.push_selection_scope(SelectionScope::new(
+            "foreground-selection",
+            Rect::new(3, 1, 2, 2),
+        ));
+        assert_eq!(
+            frame.selection().scopes()[0].capture,
+            SelectionCapture::Disabled
+        );
+        assert_eq!(
+            frame.selection().scopes()[1].capture,
+            SelectionCapture::Capture
+        );
+        assert_eq!(frame.occlusions(), &[(0, Rect::new(3, 1, 2, 2))]);
+    }
 
     #[test]
     fn frame_tracks_cursor_request() {

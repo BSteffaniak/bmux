@@ -344,6 +344,13 @@ pub enum Command {
     Attach {
         /// Session name or UUID
         target: Option<String>,
+        /// Private output-only committed-frame channel for an owning local process
+        #[arg(long, hide = true, requires = "target", conflicts_with_all = ["follow", "global", "web", "web_only", "web_assets"])]
+        observer_socket: Option<std::path::PathBuf>,
+        #[arg(long, hide = true, requires = "observer_socket", default_value_t = 80)]
+        observer_cols: u16,
+        #[arg(long, hide = true, requires = "observer_socket", default_value_t = 24)]
+        observer_rows: u16,
         /// Mirror this terminal view read-only in a browser (assets are prepared lazily)
         #[arg(long)]
         web: bool,

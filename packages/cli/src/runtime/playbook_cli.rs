@@ -23,11 +23,24 @@ pub(super) async fn run_playbook_run(
     cli_vars: &[String],
     verbose: bool,
 ) -> Result<u8> {
-    let mut playbook = if source == "-" {
-        crate::playbook::parse_stdin().context("failed parsing playbook from stdin")?
+    if let Some(probe) = std::env::var_os("BMUX_PLAYBOOK_PROTOCOL_PROBE") {
+        let probe = std::path::PathBuf::from(probe);
+        anyhow::ensure!(probe.is_absolute(), "worker probe path must be absolute");
+        std::fs::write(probe, b"bmux-playbook-worker-v1")?;
+        return Ok(0);
+    }
+    let parsed = if source == "-" {
+        crate::playbook::parse_stdin().context("failed parsing playbook from stdin")
     } else {
         crate::playbook::parse_file(std::path::Path::new(source))
-            .with_context(|| format!("failed parsing playbook from {source}"))?
+            .with_context(|| format!("failed parsing playbook from {source}"))
+    };
+    let mut playbook = match parsed {
+        Ok(playbook) => playbook,
+        Err(error) => {
+            crate::playbook::report_managed_prelaunch_failure(&error)?;
+            return Err(error);
+        }
     };
 
     // CLI flags override playbook config.

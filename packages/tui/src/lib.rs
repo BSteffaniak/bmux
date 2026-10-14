@@ -17,6 +17,7 @@ pub mod composition;
 #[cfg(feature = "crossterm")]
 pub mod crossterm;
 pub mod damage;
+pub mod embedded_surface;
 pub mod event;
 pub mod focus;
 pub mod frame;

@@ -468,6 +468,9 @@ pub(super) async fn dispatch_built_in_command(
                 target,
                 follow,
                 global,
+                observer_socket,
+                observer_cols,
+                observer_rows,
                 web,
                 web_assets,
                 web_only,
@@ -478,6 +481,32 @@ pub(super) async fn dispatch_built_in_command(
                 web_allowed_hosts,
             },
         ) => {
+            if let Some(socket) = observer_socket {
+                let session_id = target
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("observer requires a session UUID"))?
+                    .parse::<uuid::Uuid>()?;
+                let client = super::connect_with_context(
+                    super::ConnectionPolicyScope::Normal,
+                    "bmux-retained-observer",
+                    connection_context,
+                )
+                .await?;
+                #[cfg(unix)]
+                return super::attach::observer::transport::run_private_worker(
+                    client,
+                    session_id,
+                    socket,
+                    *observer_cols,
+                    *observer_rows,
+                )
+                .await;
+                #[cfg(not(unix))]
+                {
+                    let _ = (client, session_id, socket, observer_cols, observer_rows);
+                    anyhow::bail!("private attachment observation requires Unix sockets");
+                }
+            }
             if *web || *web_only || web_assets.is_some() {
                 return Box::pin(super::web_attach::run(
                     target.as_deref(),
