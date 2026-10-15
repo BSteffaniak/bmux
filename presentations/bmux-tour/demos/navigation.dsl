@@ -1,4 +1,4 @@
-@name Work keeps running while views change
+@name Return to the same running shell
 @viewport cols=100 rows=30
 @shell sh
 @input-profile tmux_compat
@@ -12,9 +12,9 @@
 @plugin enable=bmux.tab_bar
 new-session name='api'
 send-attach key='ctrl+b'
-# Remember actual shell identity, not a printed pretend status.
+# Save shell identity and a private job-list fixture before changing views.
 send-attach key='escape'
-paste-attach text='tour_origin=$$; pwd'
+paste-attach text='tour_origin=$$; seq 1 42 > "$BMUX_RUNTIME_DIR/navigation-jobs"; pwd'
 send-attach key='enter'
 sleep ms=500
 send-attach key='ctrl+b'
@@ -31,11 +31,14 @@ sleep ms=1800
 send-attach key='ctrl+h'
 sleep ms=700
 send-attach key='escape'
-paste-attach text='test "$tour_origin" = "$$" && expr 20 + 22'
+# Only the original shell can satisfy this identity check and count its fixture.
+paste-attach text='test "$tour_origin" = "$$" && wc -l < "$BMUX_RUNTIME_DIR/navigation-jobs"'
 send-attach key='enter'
 sleep ms=500
 send-attach key='ctrl+b'
-wait-for pattern='42'
+wait-for pattern='(?m)^42\s*$'
+assert-screen matches='(?m)^42\s*$'
+snapshot id='original-shell-restored'
 sleep ms=1800
 send-attach key='ctrl+s'
 sleep ms=1600
@@ -49,7 +52,7 @@ paste-attach text='uname -sr'
 send-attach key='enter'
 sleep ms=500
 send-attach key='ctrl+b'
-wait-for pattern='Linux'
+wait-for pattern='(?m)^Linux '
 sleep ms=1800
 send-attach key='alt+l'
 sleep ms=700

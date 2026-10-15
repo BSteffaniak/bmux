@@ -82,26 +82,6 @@ Deeper path: Composition still converges on one retained authority. A browser or
 <!-- bmux:end-notes -->
 
 ---
-<!-- bmux:slide-id distributed-details -->
-<!-- bmux:block-id distributed-title -->
-# Optional: recovery is also an ownership problem
-
-<!-- bmux:block-id distributed-flow -->
-Durable intent → deterministic consensus application → reconciliation of effects.
-
-<!-- bmux:block-id distributed-contracts -->
-- Validate revision, generation, and retry identity against authority.
-- Fence obsolete execution owners.
-- Do not infer worker death from a lost gateway connection.
-- Keep reusable private credentials out of replicated public metadata.
-
-<!-- bmux:notes -->
-Quick path: Skip unless the audience asks about distributed operation. This slide explains design contracts from INVARIANTS.md, not a live cluster demonstration or production-readiness claim.
-Deeper path: Use plugins/cluster-plugin/src and its tests as a follow-up reading location, not an assertion that this authoring pass inspected or executed every cluster path. A retry identity has a defined deduplication window; it is not eternal exactly-once execution. Reconciliation does not imply rollback of arbitrary external effects. Execution replacement must be explicit and fenced; foreground process survival after host restart is not promised.
-Rehearsal gate: any additional distributed demonstration needs separate ownership, failure injection, evidence, and privacy review. None is embedded in this tour.
-<!-- bmux:end-notes -->
-
----
 <!-- bmux:slide-id evidence -->
 <!-- bmux:block-id evidence-followup-title -->
 # Three levels of confidence
@@ -115,6 +95,6 @@ Rehearsal gate: any additional distributed demonstration needs separate ownershi
 Do not promote an unrun demo, a passing screenshot, or a fixture label into a stronger claim.
 
 <!-- bmux:notes -->
-Quick path: Return to the sources checklist. Six actual managed scripts passed; that evidence is separate from final audience/privacy rehearsal and browser/Canvas acceptance.
+Quick path: Return to the sources checklist. Historical six-demo acceptance is not current approval of edited scripts. Validate the settled artifact, then separately rehearse audience/privacy and browser/Canvas delivery.
 Deeper path: Unit/protocol/pixel assertions, PTY integration, injected failures, and actual terminal/browser rehearsal answer different questions. Benchmark work counts answer another. Retained final output is not an execution-output journal and is not proof all intermediate frames were observed. Redact private artifacts and capability-bearing URLs before sharing.
 <!-- bmux:end-notes -->

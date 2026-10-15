@@ -11,13 +11,14 @@
 @plugin enable=bmux.tab_bar
 new-session name='rendering'
 send-attach key='ctrl+b'
-# Genuine utility output exercises terminal scrolling, not hand-painted ANSI rows.
+# Number real package manifests; cap at 100 so the final row is a stable landmark.
 send-attach key='escape'
-paste-attach text='seq 1 100'
+paste-attach text='find packages plugins -name Cargo.toml | sort | head -n 100 | nl -ba'
 send-attach key='enter'
 sleep ms=500
 send-attach key='ctrl+b'
-wait-for pattern='100'
+wait-for pattern='(?m)^\s*100\s+.*Cargo.toml'
+assert-screen matches='(?m)^\s*100\s+.*Cargo.toml'
 sleep ms=1800
 send-attach key='['
 sleep ms=1200
@@ -27,6 +28,9 @@ send-attach key='page_down'
 sleep ms=1800
 send-attach key='escape'
 sleep ms=700
+# Leaving scrollback restores the live terminal at its last manifest.
+assert-screen matches='(?m)^\s*100\s+.*Cargo.toml'
+snapshot id='catalog-scrollback-restored'
 send-attach key='escape'
 paste-attach text='date -u'
 send-attach key='enter'

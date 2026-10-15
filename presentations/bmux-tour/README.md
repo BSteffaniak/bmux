@@ -5,21 +5,22 @@ A feature-led narrative: **feature + embedded run on the same slide**, followed 
 ## Files
 
 - [deck.md](deck.md): opening; splits/layout; tabs/sessions/workspaces; cross-workspace finder; theme composition/control; rendering/flush; playbooks as evidence; presentation/browser reuse; close.
-- [appendix.md](appendix.md): optional technical discussion, including distributed contracts.
+- [appendix.md](appendix.md): optional technical discussion of the demonstrated local features.
 - [sources.md](sources.md): excerpt provenance, evidence limits, and final rehearsal checklist.
+- [editorial-review.md](editorial-review.md): JEV review method, human decisions, implementation confidence, and acceptance limits.
 - `demos/`: the six original embedded playbooks plus the opt-in [Jev Flappy Bird finale](demos/jev-flappy.md). Parsing the deck does not execute them.
 - `assets/`: optional diagrams; the narrative does not depend on them.
 
 Preserve stable `bmux:slide-id` and `bmux:block-id` identities when editing. Component identity participates in controller/reload behavior; do not reuse an ID for a different execution casually.
 
-## Architecture diagrams
+## Mechanisms behind the demonstrations
 
-Five dedicated Mermaid slides explain specific boundaries rather than inventorying crates:
+Two former overview diagrams now show actual plugin implementation and shell-state checks. Three Mermaid slides retain focused explanatory models:
 
 | Slide ID | Question answered | Read the arrows as |
 | --- | --- | --- |
-| `command-route` | Where does product behavior belong? | Logical call/output boundaries; not an exhaustive call stack |
-| `ownership-map` | What changes when I navigate? | Organization, selection, and execution relationships; not exclusive ownership |
+| `command-route` | Where does product behavior belong? | Actual plugin target resolution and bounded split ratio, followed by typed delegation |
+| `ownership-map` | Did navigation return to the same shell? | Actual saved-PID and fixture commands from the navigation playbook |
 | `preview-lifecycle` | Why is preview not a saved choice? | Successful token-owned preview/confirm/cancel paths; not all error transitions |
 | `frame-transaction` | When is a rendering baseline safe to reuse? | Delivery success versus invalidation/full repaint; not atomic rollback |
 | `demo-authority` | Who can send input to an embedded demo? | One worker-owned attach and a read-only output projection; not a second controller |
@@ -37,7 +38,7 @@ The demos use generated isolated configuration with the built-in `tmux_compat` i
 | `demo-finder` / `demos/finder.dsl` | Real fuzzy `api` query from a generated second workspace, Enter selects the API tab |
 | `demo-themes` / `demos/themes.dsl` | Select Theme previews every bundled preset plus default for two seconds each; Enter confirms Cyberpunk after the cycle; shell continues |
 | `demo-rendering` / `demos/rendering.dsl` | Actual `seq` output, Page Up/Page Down scrollback, return to live shell; **not fault injection** |
-| `demo-evidence` / `demos/evidence.dsl` | Actual arithmetic results, two-pane layout/screen assertions and `verified-demo` snapshot |
+| `demo-evidence` / `demos/evidence.dsl` | Fixture count plus independent second-pane count/sum, complete-line output/layout assertions and `verified-demo` snapshot |
 
 The acceptance harness observes intermediate feature output and commits it to browser Canvas, retaining screenshots as well as managed results. **This does not establish venue legibility, final audience geometry, or final note privacy.** Demo acceptance is not a claim that all project validation is complete.
 
@@ -92,4 +93,4 @@ All six demos run by default; `--demos finder themes` selects a subset. The harn
 3. Do **not** screen-share the presenter viewport. Verify notes and private source paths are absent from public audience output.
 4. Enable an optional browser audience only after separate native/WASM, authentication, delivery-mode, and Canvas acceptance. Document and fixed-frame delivery are distinct contracts; a query string cannot convert one host mode into the other. The browser is read-only; embedded rasters do not promise logical selection/copy.
 5. Keep capability URLs, credentials, observer/runtime paths, and retained evidence private or redacted. See [responsive delivery](../../docs/responsive-presentations.md) and [web hosting](../../packages/web-host/README.md).
-6. Close before the appendix unless questions call for deeper discussion. Distributed operation is an optional contract discussion, not a demonstrated cluster deployment.
+6. Close before the appendix unless questions call for deeper discussion. The appendix elaborates demonstrated local features; it is not a roadmap or a showcase for unfinished subsystems.
