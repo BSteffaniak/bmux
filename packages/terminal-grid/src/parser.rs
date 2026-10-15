@@ -643,20 +643,20 @@ impl Perform for GridPerformer<'_> {
             'M' => self.grid.delete_lines(one_based(values.first())),
             'P' => self.grid.delete_chars(one_based(values.first())),
             'S' => {
-                let (_, bottom) = self
+                let (top, bottom) = self
                     .grid
                     .scroll_region()
                     .unwrap_or_else(|| (0, self.grid.height().saturating_sub(1)));
                 self.grid
-                    .scroll_region_up(0, bottom, one_based(values.first()));
+                    .scroll_region_up(top, bottom, one_based(values.first()));
             }
             'T' => {
-                let (_, bottom) = self
+                let (top, bottom) = self
                     .grid
                     .scroll_region()
                     .unwrap_or_else(|| (0, self.grid.height().saturating_sub(1)));
                 self.grid
-                    .scroll_region_down(0, bottom, one_based(values.first()));
+                    .scroll_region_down(top, bottom, one_based(values.first()));
             }
             'X' => self.grid.erase_chars(one_based(values.first())),
             '@' => self.grid.insert_blank_chars(one_based(values.first())),
@@ -2632,6 +2632,27 @@ mod tests {
 
         stream.process(b"\x1b[?25h");
         assert!(stream.grid().cursor().visible);
+    }
+
+    #[test]
+    fn explicit_scroll_commands_preserve_rows_outside_margins() {
+        for (command, expected) in [
+            (b'S', ["HUD", "three", "four", "", "", "FOOT"]),
+            (b'T', ["HUD", "", "", "one", "two", "FOOT"]),
+        ] {
+            let mut stream = TerminalGridStream::new(12, 6, GridLimits::default()).unwrap();
+            stream.process(b"HUD\r\none\r\ntwo\r\nthree\r\nfour\r\nFOOT");
+            stream.process(b"\x1b[2;5r\x1b[4;7H");
+            let cursor = stream.grid().cursor();
+            // Split like real PTY chunks; scroll only rows 2..5, not the HUD.
+            for byte in [0x1b, b'[', b'2', command] {
+                stream.process(&[byte]);
+            }
+            for (row, text) in stream.grid().viewport_rows().iter().zip(expected) {
+                assert_eq!(row_text(row), text);
+            }
+            assert_eq!(stream.grid().cursor(), cursor);
+        }
     }
 
     #[test]
