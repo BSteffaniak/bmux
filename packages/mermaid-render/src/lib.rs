@@ -9,13 +9,18 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Condvar, Mutex, OnceLock};
+
+#[cfg(not(target_arch = "wasm32"))]
 mod wasm;
+#[cfg(not(target_arch = "wasm32"))]
 pub use wasm::WasmMermaidRenderer;
 
 /// Maximum successful Mermaid renders retained in memory.
@@ -23,10 +28,13 @@ pub const MAX_CACHE_ENTRIES: usize = 64;
 /// Maximum encoded Mermaid output bytes retained in memory.
 pub const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
+#[cfg(not(target_arch = "wasm32"))]
 static RENDER_PERMITS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
 
+#[cfg(not(target_arch = "wasm32"))]
 struct RenderPermit;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for RenderPermit {
     fn drop(&mut self) {
         if let Some((permits, available)) = RENDER_PERMITS.get()
@@ -358,6 +366,7 @@ impl std::error::Error for MermaidRenderError {}
 ///
 /// # Errors
 /// Returns typed initialization, validation, resource-limit or guest errors.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn render_mermaid(
     request: &MermaidRenderRequest,
     cancellation: &MermaidCancellationToken,
@@ -369,6 +378,22 @@ pub fn render_mermaid(
         .as_ref()
         .map_err(Clone::clone)?
         .render(request, cancellation)
+}
+
+/// Browser consumers receive owner-rendered SVG; nested Wasmtime is unsupported.
+///
+/// # Errors
+/// Returns validation errors or an explicit renderer-unavailable error.
+#[cfg(target_arch = "wasm32")]
+pub fn render_mermaid(
+    request: &MermaidRenderRequest,
+    cancellation: &MermaidCancellationToken,
+) -> Result<MermaidRendered, MermaidRenderError> {
+    validate_request(request, cancellation)?;
+    Err(MermaidRenderError::RendererUnavailable {
+        message: "Mermaid rendering runs on the owner host; browser consumers use prepared SVG"
+            .into(),
+    })
 }
 
 fn validate_request(
@@ -407,6 +432,7 @@ fn validate_request(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn svg_dimensions(svg: &str) -> Option<(f64, f64)> {
     let tag_end = svg.find('>')?;
     let opening = &svg[..tag_end];
@@ -415,6 +441,7 @@ fn svg_dimensions(svg: &str) -> Option<(f64, f64)> {
     Some((width, height))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn svg_attribute_number(opening_tag: &str, name: &str) -> Option<f64> {
     let marker = format!("{name}=\"");
     let start = opening_tag.find(&marker)?.saturating_add(marker.len());
@@ -433,7 +460,7 @@ fn stable_source_hash(source: &str) -> u64 {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     fn cached_render(key: &str, bytes: usize) -> MermaidRendered {

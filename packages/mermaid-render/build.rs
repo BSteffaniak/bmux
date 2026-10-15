@@ -12,6 +12,11 @@ const TARGET: &str = "wasm32-unknown-unknown";
 const ARTIFACT: &str = "bmux_mermaid_guest.wasm";
 
 fn main() {
+    // Browser consumers share request/cache models, not a nested Wasmtime host.
+    // Rendering remains owner-side; browser targets consume the resulting SVG.
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+        return;
+    }
     if let Err(error) = build() {
         panic!("could not build embedded Mermaid guest: {error}");
     }

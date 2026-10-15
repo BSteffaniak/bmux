@@ -16,6 +16,14 @@ helper executable is required on deployed machines.
 same embedded portable WASM. Both execute the same guest and enforce the same
 contract. Fuel budgets are explicitly opt-in.
 
+## Browser boundary
+
+Browser (`wasm32`) consumers share request/cache models but do not link Wasmtime
+or compile a nested guest. Rendering occurs on the owner host; browser viewers
+consume prepared SVG. Calling `render_mermaid` in a browser build returns an
+explicit renderer-unavailable error after validation. The web asset build guards
+against pulling the native Wasmtime runtime into the browser dependency graph.
+
 ## API and bounds
 
 - `render_mermaid` is the synchronous convenience entry backed by a shared WASM

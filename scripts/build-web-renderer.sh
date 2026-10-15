@@ -22,6 +22,13 @@ if [[ "$("$BINDGEN" --version)" != "wasm-bindgen 0.2.126" ]]; then
   echo "wasm-bindgen must match the workspace's 0.2.126 crate version" >&2
   exit 1
 fi
+# Browser consumers must not link the native Wasmtime host runtime. Build-time
+# dependencies are deliberately excluded: they execute on the build host.
+BROWSER_DEPS="$(cargo tree --locked -p bmux_presenter --target wasm32-unknown-unknown --edges normal --prefix none)"
+if grep -Eq '^wasmtime v' <<< "$BROWSER_DEPS"; then
+    echo "error: browser presenter depends on the native Wasmtime runtime" >&2
+    exit 1
+fi
 cargo build --locked -p bmux_web_renderer --features wasm --target wasm32-unknown-unknown --release
 cargo build --locked -p bmux_presenter --features wasm --target wasm32-unknown-unknown --release
 "$BINDGEN" "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/bmux_presenter.wasm" \
