@@ -54,7 +54,7 @@ async function audience(width) {
   };
   const globals = {
     URLSearchParams, TextDecoder, Uint8Array, BigInt, AbortController, Response,
-    crypto: webcrypto, devicePixelRatio: 2,
+    crypto: webcrypto, performance, console, devicePixelRatio: 2,
       location: { hash: '#token=secret', pathname: '/', search: '?inspect=1' },
     window: {},
     history: { replaceState() {} },

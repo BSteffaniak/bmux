@@ -161,6 +161,16 @@ impl Browser {
         width: u16,
         height: u16,
     ) -> Result<()> {
+        if let Some(host) = &self.host {
+            let diagnostics = host.diagnostics();
+            if !diagnostics.running {
+                let reason = diagnostics
+                    .events
+                    .last()
+                    .map_or("unknown", |event| event.code);
+                anyhow::bail!("browser HTTP host unavailable: {reason}; last output retained");
+            }
+        }
         if width == 0 || height == 0 || usize::from(width) * usize::from(height) > 262_144 {
             if let Some(control) = &self.control {
                 control.set_presentation_status(Some("browser presentation rejected"));

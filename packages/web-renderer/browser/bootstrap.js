@@ -50,12 +50,37 @@ function authorized(response) {
   }
   return response;
 }
+let diagnosticSequence = 0;
+const diagnosticEvents = [];
+function diagnostic(code, details = {}) {
+  // Only fixed fields and route classes: never URLs, tokens, bodies or error text.
+  const event = { sequence: ++diagnosticSequence, elapsed_ms: Math.round(performance.now()), code, ...details };
+  if (diagnosticEvents.length === 64) diagnosticEvents.shift();
+  diagnosticEvents.push(event);
+  if (diagnosticEvents.length === 1 || code === 'recovered') console.info('bmux browser', event);
+}
+window.__bmuxDiagnostics = () => ({ version: 1, events: diagnosticEvents.map(event => ({ ...event })) });
+function routeClass(path) {
+  const route = path.split('?')[0];
+  return route.startsWith('/resource/') ? 'resource' :
+    ['/document', '/presentation', '/snapshot', '/view', '/viewport', '/info', '/diagnostics'].includes(route) ? route.slice(1) : 'other';
+}
 function request(path, controller, options = {}) {
+  const route = routeClass(path);
   return fetch(path, {
     ...options,
     headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options.headers },
     cache: 'no-store', credentials: 'omit', redirect: 'error', signal: controller.signal,
-  }).then(authorized);
+  }).then(response => {
+    if (response.status >= 400) diagnostic('http_rejected', { route, status: response.status });
+    return authorized(response);
+  }, error => {
+    const code = controller.signal.aborted ? 'request_aborted' : 'network_unavailable';
+    diagnostic(code, { route });
+    const classified = new Error(`${route}: ${code === 'request_aborted' ? 'request cancelled or deadline exceeded' : 'HTTP host unreachable or connection rejected (no HTTP response)'}`);
+    classified.bmuxCode = code;
+    throw classified;
+  });
 }
 async function boundedBytes(response, limit = MAX_JSON_BYTES) {
   const length = response.headers.get('Content-Length');
@@ -420,6 +445,8 @@ async function runDocument(adapterPath) {
   let layoutEpoch = 0;
   let cursor = null;
   let highWater = null;
+  let consecutiveFailures = 0;
+  let lastSuccess = null;
   const cache = new Map();
   let cacheBytes = 0;
   let resourceRequests = 0;
@@ -558,11 +585,19 @@ async function runDocument(adapterPath) {
         if (stopped) break;
         await apply(next);
         if (stopped) break;
+        if (consecutiveFailures) diagnostic('recovered', { failures: consecutiveFailures });
+        consecutiveFailures = 0;
+        lastSuccess = performance.now();
         highWater = transport;
         cursor = announced;
       } catch (error) {
         if (stopped) break;
-        status.textContent = `Document failed; last committed output retained. Repairing full document (${error.message}).`;
+        consecutiveFailures++;
+        diagnostic('document_repair', { failures: consecutiveFailures,
+          reason: error.bmuxCode || 'document_or_render_rejected',
+          retained: committed !== null });
+        const age = lastSuccess === null ? 'none yet' : `${Math.floor((performance.now() - lastSuccess) / 1000)}s ago`;
+        status.textContent = `Document unavailable; last committed output retained. Full-document retry ${consecutiveFailures}; last success ${age}. ${error.message}. Diagnostics: window.__bmuxDiagnostics()`;
         cursor = null;
         await pause();
       } finally { clearTimeout(timer); activeRequest = null; }

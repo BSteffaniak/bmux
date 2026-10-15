@@ -10,6 +10,7 @@ use crate::assets::LoadedAsset;
 use crate::{Limits, Snapshot, SnapshotFeed};
 
 pub(crate) struct State {
+    pub(crate) diagnostics: Arc<crate::diagnostics::Diagnostics>,
     pub assets: BTreeMap<String, LoadedAsset>,
     pub limits: Limits,
     pub auth_mode: crate::AuthMode,
@@ -53,6 +54,7 @@ fn valid_port(value: &str) -> bool {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Route<'a> {
+    Diagnostics,
     Asset(&'a str),
     Snapshot(Option<u64>),
     Document(Option<u64>),
@@ -72,6 +74,9 @@ enum Route<'a> {
 }
 
 fn route(target: &str) -> Result<Route<'_>, u16> {
+    if target == "/diagnostics" {
+        return Ok(Route::Diagnostics);
+    }
     if let Some(id) = target.strip_prefix("/resource/") {
         return if crate::publication::valid_id(id) {
             Ok(Route::Resource(id))
@@ -428,6 +433,15 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
         return;
     }
     match route {
+        Ok(Route::Diagnostics) => {
+            if let Ok(body) = serde_json::to_vec(&state.diagnostics.snapshot()) {
+                let _ = timeout(
+                    state.limits.write_timeout,
+                    response(&mut stream, 200, "application/json", &body, None),
+                )
+                .await;
+            }
+        }
         Ok(Route::View {
             controller,
             release,
@@ -489,15 +503,13 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
         }
         Ok(Route::Asset(path)) => {
             if let Some(asset) = state.assets.get(path) {
-                let _ = timeout(
-                    state.limits.write_timeout,
-                    response(
-                        &mut stream,
-                        200,
-                        asset.content_type.header(),
-                        &asset.bytes,
-                        None,
-                    ),
+                observed_response(
+                    &mut stream,
+                    &state,
+                    200,
+                    asset.content_type.header(),
+                    &asset.bytes,
+                    None,
                 )
                 .await;
             } else {
@@ -521,9 +533,13 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
                 })
                 .cloned();
             if let Some(resource) = resource {
-                let _ = timeout(
-                    state.limits.write_timeout,
-                    response(&mut stream, 200, &resource.mime_type, &resource.bytes, None),
+                observed_response(
+                    &mut stream,
+                    &state,
+                    200,
+                    &resource.mime_type,
+                    &resource.bytes,
+                    None,
                 )
                 .await;
             } else {
@@ -534,15 +550,13 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
             match timeout(state.limits.poll_timeout, latest(&mut feed, after)).await {
                 Ok(Ok(snapshot)) => {
                     if let Some(document) = &snapshot.document {
-                        let _ = timeout(
-                            state.limits.write_timeout,
-                            response(
-                                &mut stream,
-                                200,
-                                "application/vnd.bmux.document-v1+json",
-                                &document.bytes,
-                                Some(snapshot.revision),
-                            ),
+                        observed_response(
+                            &mut stream,
+                            &state,
+                            200,
+                            "application/vnd.bmux.document-v1+json",
+                            &document.bytes,
+                            Some(snapshot.revision),
                         )
                         .await;
                     } else {
@@ -567,15 +581,13 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
                             .as_ref()
                             .filter(|(revision, _)| Some(*revision) == base)
                             .map_or(&binary.snapshot, |(_, bytes)| bytes);
-                        let _ = timeout(
-                            state.limits.write_timeout,
-                            response(
-                                &mut stream,
-                                200,
-                                "application/vnd.bmux.presentation-v1",
-                                bytes,
-                                Some(snapshot.revision),
-                            ),
+                        observed_response(
+                            &mut stream,
+                            &state,
+                            200,
+                            "application/vnd.bmux.presentation-v1",
+                            bytes,
+                            Some(snapshot.revision),
                         )
                         .await;
                     } else {
@@ -623,10 +635,44 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
     }
 }
 
-async fn error(stream: &mut TcpStream, state: &State, status: u16) {
-    let _ = timeout(
+async fn observed_response(
+    stream: &mut TcpStream,
+    state: &State,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    revision: Option<u64>,
+) {
+    match timeout(
         state.limits.write_timeout,
-        response(stream, status, "text/plain; charset=utf-8", &[], None),
+        response(stream, status, content_type, body, revision),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => state.diagnostics.event(
+            "response_write_failed",
+            error
+                .raw_os_error()
+                .and_then(|code| u64::try_from(code).ok()),
+        ),
+        Err(_) => state.diagnostics.event("response_write_timeout", revision),
+    }
+}
+
+async fn error(stream: &mut TcpStream, state: &State, status: u16) {
+    if status >= 400 {
+        state
+            .diagnostics
+            .event("request_rejected", Some(u64::from(status)));
+    }
+    observed_response(
+        stream,
+        state,
+        status,
+        "text/plain; charset=utf-8",
+        &[],
+        None,
     )
     .await;
 }
@@ -642,6 +688,7 @@ mod tests {
             auth_mode: crate::AuthMode::Token,
             token: "a".repeat(64),
             allowed_hosts: vec!["127.0.0.1:1234".into()],
+            diagnostics: Arc::new(crate::diagnostics::Diagnostics::new()),
             viewport: Arc::new(crate::viewport::Viewport::new(crate::ViewportMode::Observer).0),
         }
     }

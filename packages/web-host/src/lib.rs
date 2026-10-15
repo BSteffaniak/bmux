@@ -3,6 +3,9 @@
 #![cfg(unix)]
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 
+mod diagnostics;
+pub use diagnostics::{HostDiagnostics, HostEvent};
+
 #[cfg(test)]
 mod acceptance;
 mod assets;
@@ -270,6 +273,7 @@ impl SnapshotPublisher {
 
 /// Owns all serving tasks. No Debug implementation: the capability is intentionally secret.
 pub struct HostHandle {
+    diagnostics: Arc<diagnostics::Diagnostics>,
     address: SocketAddr,
     public_address: SocketAddr,
     token: Option<String>,
@@ -280,6 +284,23 @@ pub struct HostHandle {
 }
 
 impl HostHandle {
+    /// Bounded serving evidence; excludes addresses, credentials and document contents.
+    #[must_use]
+    pub fn diagnostics(&self) -> HostDiagnostics {
+        let snapshot = self.diagnostics.snapshot();
+        if snapshot.running
+            && self
+                .task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            self.diagnostics
+                .stopped("host_task_ended_unexpectedly", None);
+            return self.diagnostics.snapshot();
+        }
+        snapshot
+    }
+
     /// Restricted cloneable output-generation control; no bearer or lifecycle authority.
     #[must_use]
     pub fn view_control(&self) -> ViewControl {
@@ -405,7 +426,9 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
     let public_address = SocketAddr::new(display_host, address.port());
     let (viewport, viewport_requests) = viewport::Viewport::new(config.viewport_mode);
     let viewport = Arc::new(viewport);
+    let diagnostics = Arc::new(diagnostics::Diagnostics::new());
     let state = Arc::new(http::State {
+        diagnostics: Arc::clone(&diagnostics),
         viewport: Arc::clone(&viewport),
         assets,
         limits: config.limits,
@@ -420,12 +443,20 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
         loop {
             tokio::select! {
                 biased;
-                _ = stopped.changed() => break,
-                result = feed.receiver.changed() => { if result.is_err() { break; } },
-                Some(_) = connections.join_next(), if !connections.is_empty() => {},
+                _ = stopped.changed() => { state.diagnostics.stopped("shutdown_requested", None); break; },
+                result = feed.receiver.changed() => {
+                    if result.is_err() { state.diagnostics.stopped("producer_closed", None); break; }
+                    if let Some(snapshot) = feed.receiver.borrow_and_update().as_ref() { state.diagnostics.published(snapshot.revision); }
+                },
+                Some(result) = connections.join_next(), if !connections.is_empty() => { if result.is_err() { state.diagnostics.event("connection_task_failed", None); } },
                 accepted = listener.accept() => {
-                    let Ok((stream, _peer)) = accepted else { break; };
+                    let (stream, _peer) = match accepted {
+                        Ok(connection) => connection,
+                        Err(error) => { state.diagnostics.stopped("listener_accept_failed", error.raw_os_error().and_then(|code| u64::try_from(code).ok())); break; }
+                    };
+                    state.diagnostics.accepted();
                     if connections.len() >= state.limits.max_connections {
+                        state.diagnostics.event("capacity_rejected", Some(connections.len() as u64));
                         drop(stream);
                         continue;
                     }
@@ -440,6 +471,7 @@ pub async fn start(config: HostConfig, feed: SnapshotFeed) -> io::Result<HostHan
         while connections.join_next().await.is_some() {}
     });
     Ok(HostHandle {
+        diagnostics,
         viewport_requests: Some(viewport_requests),
         viewport,
         address,

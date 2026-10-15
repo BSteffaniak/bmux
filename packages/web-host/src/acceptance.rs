@@ -362,6 +362,78 @@ async fn host() -> (TempDir, SnapshotPublisher, HostHandle) {
     (directory, publisher, host)
 }
 
+#[tokio::test]
+async fn diagnostics_follow_auth_policy_and_survive_producer_loss_locally() {
+    let (_directory, publisher, host) = host().await;
+    let address = host.address();
+    let rejected = exchange(
+        address,
+        &request(address, "GET", "/diagnostics", "wrong", ""),
+    )
+    .await;
+    assert!(rejected.starts_with("HTTP/1.1 401"));
+    let accepted = exchange(
+        address,
+        &request(address, "GET", "/diagnostics", &token(&host), ""),
+    )
+    .await;
+    assert!(accepted.starts_with("HTTP/1.1 200"));
+    let body = accepted.split_once("\r\n\r\n").unwrap().1;
+    let evidence: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(evidence["running"], true);
+    assert_eq!(evidence["request_rejections"], 1);
+    assert!(!body.contains(&token(&host)));
+    drop(publisher);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while host.diagnostics().running {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        host.diagnostics().events.last().unwrap().code,
+        "producer_closed"
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn diagnostics_record_capacity_without_request_contents() {
+    let (_directory, mut config) = fixture();
+    config.limits.max_connections = 1;
+    let (_publisher, feed) = snapshot_feed(config.limits.max_snapshot_bytes).unwrap();
+    let host = start(config, feed).await.unwrap();
+    let held = tokio::net::TcpStream::connect(host.address())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while host.diagnostics().accepted_connections < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let excess = tokio::net::TcpStream::connect(host.address())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while host.diagnostics().capacity_rejections < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        host.diagnostics().events.last().unwrap().code,
+        "capacity_rejected"
+    );
+    assert!(host.diagnostics().running);
+    drop(excess);
+    drop(held);
+    host.shutdown().await;
+}
+
 fn token(host: &HostHandle) -> String {
     host.bootstrap_url()
         .split_once("#token=")
