@@ -59,11 +59,14 @@ unicode-segmentation = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+# Paused-time capture tests must also compile outside workspace feature unification.
 bmux_cli_schema = { workspace = true }
 bmux_ipc        = { workspace = true }
 bmux_plugin     = { workspace = true }
 clap            = { workspace = true }
 tempfile        = { workspace = true }
+tokio           = { workspace = true, features = ["test-util"] }
+ttf-parser      = { workspace = true }
 
 [features]
 default          = []

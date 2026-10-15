@@ -1,3 +1,8 @@
+/// Font shared by Mermaid measurement and SVG painting. Deliberately regular:
+/// the guest measures advances without style-dependent font selection.
+pub const DIAGRAM_FONT_FAMILY: &str = "BMUX Diagram";
+pub const DIAGRAM_FONT: &[u8] = include_bytes!("../assets/diagram/BmuxDiagram-Regular.ttf");
+
 use ab_glyph::{FontArc, FontVec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

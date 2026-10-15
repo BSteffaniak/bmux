@@ -1947,6 +1947,7 @@ name = "bmux_mermaid_render"
 version = "0.0.1-alpha.1"
 dependencies = [
  "cranelift-codegen",
+ "roxmltree 0.21.1",
  "sha2 0.11.0",
  "tempfile",
  "tokio",
@@ -2374,6 +2375,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "ttf-parser",
  "unicode-segmentation",
  "uuid",
 ]

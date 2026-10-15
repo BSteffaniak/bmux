@@ -363,7 +363,7 @@ fn error(e: HostError) -> view::Error {
         HostError::Limit => view::Error::Limit,
         HostError::Stale => view::Error::Stale,
         HostError::NotFound => view::Error::NotFound,
-        HostError::Invalid => view::Error::Invalid,
+        HostError::Invalid | HostError::Diagram { .. } => view::Error::Invalid,
         HostError::ActionConflict => view::Error::ActionConflict,
         HostError::OutcomeEvicted => view::Error::OutcomeEvicted,
         HostError::ActionSequence => view::Error::ActionSequence,

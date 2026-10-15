@@ -13,7 +13,7 @@ use wasmtime::{Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder,
 
 use crate::{
     MermaidCancellationToken, MermaidRenderError, MermaidRenderRequest, MermaidRendered,
-    MermaidRenderedOutput, RENDER_PERMITS, RenderPermit, svg_dimensions, validate_request,
+    MermaidRenderedOutput, RENDER_PERMITS, RenderPermit, validate_request,
 };
 
 #[path = "../wasm_config.rs"]
@@ -511,21 +511,110 @@ fn decode_response(
     if !text.trim_start().starts_with("<svg") {
         return Err(invalid_abi("successful guest response is not SVG"));
     }
-    if let Some((width, height)) = svg_dimensions(text)
-        && (!width.is_finite()
-            || !height.is_finite()
-            || width < 0.0
-            || height < 0.0
-            || width > f64::from(request.width)
-            || height > f64::from(request.height))
+    let (svg, scaled) = fit_svg(text, request)?;
+    if svg.len() > request.limits.max_output_bytes {
+        return Err(MermaidRenderError::OutputTooLarge {
+            actual: svg.len(),
+            maximum: request.limits.max_output_bytes,
+        });
+    }
+    Ok(MermaidRendered {
+        output: MermaidRenderedOutput::Svg(svg.into_bytes()),
+        cache_key: request.cache_key(),
+        diagnostics: if scaled {
+            vec![crate::MermaidDiagnostic {
+            severity: crate::MermaidDiagnosticSeverity::Info,
+            message: "Diagram scaled to fit viewport; split it into smaller diagrams if labels are too small".into(),
+        }]
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+/// Change only the root viewport, preserving the coordinate system and all
+/// geometry. Malformed, non-finite and absurd intrinsic sizes fail explicitly.
+fn fit_svg(
+    text: &str,
+    request: &MermaidRenderRequest,
+) -> Result<(String, bool), MermaidRenderError> {
+    let document = roxmltree::Document::parse(text).map_err(|_| invalid_abi("malformed SVG"))?;
+    let root = document.root_element();
+    if root.tag_name().name() != "svg" {
+        return Err(invalid_abi("missing SVG root"));
+    }
+    // Synthetic/custom ABI guests may omit sizes; the bundled guest never does.
+    let parse_dimension = |name| -> Result<Option<f64>, MermaidRenderError> {
+        root.attribute(name)
+            .map(|value| {
+                value
+                    .trim_end_matches("px")
+                    .trim_end_matches("pt")
+                    .parse::<f64>()
+                    .map_err(|_| invalid_abi("invalid SVG dimensions"))
+            })
+            .transpose()
+    };
+    let (Some(width), Some(height)) = (parse_dimension("width")?, parse_dimension("height")?)
+    else {
+        return Ok((text.to_owned(), false));
+    };
+    if !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || width > 1_000_000.0
+        || height > 1_000_000.0
     {
         return Err(MermaidRenderError::OutputDimensionsExceeded);
     }
-    Ok(MermaidRendered {
-        output: MermaidRenderedOutput::Svg(text.as_bytes().to_vec()),
-        cache_key: request.cache_key(),
-        diagnostics: Vec::new(),
-    })
+    let scale = (f64::from(request.width) / width)
+        .min(f64::from(request.height) / height)
+        .min(1.0);
+    if scale >= 1.0 {
+        return Ok((text.to_owned(), false));
+    }
+    let view_box = if let Some(value) = root.attribute("viewBox") {
+        let values = value
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|s| !s.is_empty())
+            .map(str::parse::<f64>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| invalid_abi("invalid SVG viewBox"))?;
+        if values.len() != 4
+            || values.iter().any(|v| !v.is_finite())
+            || values[2] <= 0.0
+            || values[3] <= 0.0
+        {
+            return Err(invalid_abi("invalid SVG viewBox"));
+        }
+        format!("{} {} {} {}", values[0], values[1], values[2], values[3])
+    } else {
+        format!("0 0 {width} {height}")
+    };
+    let viewport = format!(
+        " width=\"{}\" height=\"{}\" viewBox=\"{}\" preserveAspectRatio=\"xMidYMid meet\"",
+        width * scale,
+        height * scale,
+        view_box
+    );
+    let mut replacements = root
+        .attributes()
+        .filter(|a| {
+            matches!(
+                a.name(),
+                "width" | "height" | "viewBox" | "preserveAspectRatio"
+            )
+        })
+        .map(|a| a.range())
+        .collect::<Vec<_>>();
+    replacements.sort_by_key(|range| range.start);
+    let mut result = text.to_owned();
+    for range in replacements.into_iter().rev() {
+        result.replace_range(range, "");
+    }
+    result.insert_str(root.range().start + 4, &viewport);
+    Ok((result, true))
 }
 
 fn bounded_message(message: &str) -> String {

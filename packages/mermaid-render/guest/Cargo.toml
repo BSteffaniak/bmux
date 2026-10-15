@@ -12,7 +12,6 @@ crate-type = ["cdylib"]
 
 [workspace.dependencies]
 # Follow the portable fork branch; Cargo.lock retains the exact resolved commit.
-# Native workspace rendering still uses crates.io 0.3.1.
 mermaid-rs-renderer = { git = "https://github.com/BSteffaniak/mermaid-rs-renderer", branch = "wasm-portability", default-features = false }
 
 [dependencies]

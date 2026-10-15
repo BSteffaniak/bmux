@@ -96,7 +96,9 @@ impl SourceLoader {
                             loader.limits.asset_bytes.min(4 * 1024 * 1024);
                         let rendered = renderer
                             .render(&request, &MermaidCancellationToken::default())
-                            .map_err(|_| HostError::Invalid)?;
+                            .map_err(|error| HostError::Diagram {
+                                message: error.to_string(),
+                            })?;
                         let MermaidRenderedOutput::Svg(bytes) = rendered.output;
                         let id = uuid::Uuid::new_v4().to_string();
                         push_asset(

@@ -1,8 +1,33 @@
 {
   "version": 1,
-  "typical": ["flowchart", "sequence", "class", "state", "er", "pie", "unicode", "nesting"],
-  "diagnostic_native": ["flowchart", "sequence", "class", "state", "er", "pie"],
-  "stress": ["dense", "deep", "near-limit", "over-limit", "malformed", "directive"],
+  "typical": [
+    "flowchart",
+    "sequence",
+    "class",
+    "state",
+    "er",
+    "pie",
+    "unicode",
+    "nesting",
+    "long-labels",
+    "symbols"
+  ],
+  "diagnostic_native": [
+    "flowchart",
+    "sequence",
+    "class",
+    "state",
+    "er",
+    "pie"
+  ],
+  "stress": [
+    "dense",
+    "deep",
+    "near-limit",
+    "over-limit",
+    "malformed",
+    "directive"
+  ],
   "generators": {
     "dense": "flowchart LR: 32 nodes, edge i->j when i<j and (i+j)%3==0",
     "deep": "flowchart TD: 24 nested subgraphs containing A-->B",

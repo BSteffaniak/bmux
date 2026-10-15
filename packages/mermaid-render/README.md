@@ -39,9 +39,11 @@ against pulling the native Wasmtime runtime into the browser dependency graph.
   blocking the executor. Permits remain held until actual execution stops.
 - Directives are rejected. Errors never trigger a native/process fallback.
 
-The guest uses fixed bundled font metrics. Presenter rasterization selects bundled
-fonts and installed system fallback; glyph coverage and complex-script layout are
-not universal. Minor native layout differences are not compatibility failures.
+The guest and presenter use identical BMUX Diagram regular font bytes, including
+monochrome emoji/symbol coverage. System fallback extends unsupported scripts;
+glyph coverage and complex-script layout are not universal. Oversized intrinsic
+SVGs scale into the requested viewport with their viewBox preserved and a typed
+info diagnostic; timeout/source/output/memory budgets remain enforced. Minor native layout differences are not compatibility failures.
 See `guest/README.md` for fork and font provenance.
 
 ## Verification and measurements

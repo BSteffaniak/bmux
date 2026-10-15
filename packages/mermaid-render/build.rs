@@ -27,6 +27,7 @@ fn build() -> Result<(), Box<dyn std::error::Error>> {
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("missing manifest dir")?);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing OUT_DIR")?);
     let guest = manifest_dir.join("guest");
+    watch_tree(&manifest_dir.join("../fonts/assets/diagram"))?;
     watch_tree(&guest)?;
     watch_tree(&manifest_dir.join("wasm_config.rs"))?;
     let destination_target = env::var("TARGET")?;

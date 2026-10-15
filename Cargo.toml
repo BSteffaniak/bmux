@@ -379,6 +379,7 @@ reqwest = { version = "0.13.3", default-features = false, features = [
     "rustls-no-provider",
 ] }
 resvg = { version = "0.47.0", default-features = true }
+roxmltree = "0.21.1"
 rustls = { version = "0.23.40", default-features = false, features = [
     "std",
     "ring",

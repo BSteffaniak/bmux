@@ -1,0 +1,4 @@
+flowchart LR
+    A[Read customer configuration and validate required fields] --> B{Was the configuration accepted?}
+    B -->|yes: continue with validated settings| C[Connect to the production service]
+    B -->|no: show a useful error| D[Keep the original source for correction]

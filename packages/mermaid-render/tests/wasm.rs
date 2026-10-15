@@ -78,10 +78,7 @@ fn synthetic_guest_abi_bounds_and_settlement() {
         renderer.render(&small, &MermaidCancellationToken::default()),
         Err(MermaidRenderError::OutputTooLarge { .. })
     ));
-    assert_eq!(
-        render(&guest("", b"\0<svg width=\"900\" height=\"8\"></svg>")),
-        Err(MermaidRenderError::OutputDimensionsExceeded)
-    );
+    assert!(render(&guest("", b"\0<svg width=\"900\" height=\"8\"></svg>")).is_ok());
 
     for body in [
         "unreachable",
@@ -138,6 +135,28 @@ fn cancellation_and_settlement(renderer: &WasmMermaidRenderer) {
     // Concurrent cancellation isolation uses actual epoch readiness in the
     // runtime's async unit test, rather than assuming a sleeping host has started.
     assert!(render(renderer).is_ok());
+}
+
+#[test]
+fn oversized_svg_fits_viewport_without_changing_geometry() {
+    let renderer = guest("", b"\0<svg width=\"1600\" height=\"1200\" viewBox=\"10 20 1600 1200\"><rect x=\"40\" y=\"50\" width=\"200\" height=\"100\"/></svg>");
+    let result = render(&renderer).unwrap();
+    let MermaidRenderedOutput::Svg(bytes) = result.output;
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains("width=\"800\" height=\"600\""));
+    assert!(text.contains("viewBox=\"10 20 1600 1200\""));
+    assert!(text.contains("<rect x=\"40\" y=\"50\" width=\"200\" height=\"100\"/>"));
+    assert_eq!(result.diagnostics.len(), 1);
+    for svg in [
+        "<svg width=\"NaN\" height=\"8\"/>",
+        "<svg width=\"inf\" height=\"8\"/>",
+        "<svg width=\"2000000\" height=\"8\"/>",
+        "<svg width=\"900\" height=\"8\" viewBox=\"0 0 NaN 8\"/>",
+    ] {
+        let mut response = vec![0];
+        response.extend_from_slice(svg.as_bytes());
+        assert!(render(&guest("", &response)).is_err());
+    }
 }
 
 #[test]

@@ -34,18 +34,17 @@ pub unsafe extern "C" fn render(ptr: u32, len: u32) -> u64 {
             static FONT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
             FONT.get_or_init(|| {
                 mermaid_rs_renderer::set_text_measurement_font(
-                    include_bytes!("../fonts/JetBrainsMonoNerdFont-Regular.ttf").to_vec(),
+                    include_bytes!("../../../fonts/assets/diagram/BmuxDiagram-Regular.ttf")
+                        .to_vec(),
                     0,
                 )
                 .map_err(|error| error.to_string())
             })
             .as_ref()
             .map_err(Clone::clone)?;
-            mermaid_rs_renderer::render_strict(
-                source,
-                mermaid_rs_renderer::RenderOptions::default(),
-            )
-            .map_err(|error| error.to_string())
+            let mut options = mermaid_rs_renderer::RenderOptions::default();
+            options.theme.font_family = "BMUX Diagram".into();
+            mermaid_rs_renderer::render_strict(source, options).map_err(|error| error.to_string())
         });
     let (status, text) = match result {
         Ok(svg) => (0, svg),

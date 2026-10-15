@@ -17,20 +17,32 @@ fn diagram_svg_options() -> resvg::usvg::Options<'static> {
         std::sync::OnceLock::new();
     let fonts = FONTS.get_or_init(|| {
         let mut db = resvg::usvg::fontdb::Database::new();
-        bmux_fonts::register_preset_fonts(&mut db, bmux_fonts::FontPreset::GhosttyNerd);
+        db.load_font_data(bmux_fonts::DIAGRAM_FONT.to_vec());
         db.load_system_fonts();
-        db.set_sans_serif_family("JetBrainsMono Nerd Font");
-        db.set_serif_family("JetBrainsMono Nerd Font");
-        db.set_monospace_family("JetBrainsMono Nerd Font");
+        db.set_sans_serif_family(bmux_fonts::DIAGRAM_FONT_FAMILY);
+        db.set_serif_family(bmux_fonts::DIAGRAM_FONT_FAMILY);
+        db.set_monospace_family(bmux_fonts::DIAGRAM_FONT_FAMILY);
         std::sync::Arc::new(db)
     });
     let mut options = resvg::usvg::Options {
         fontdb: fonts.clone(),
-        font_family: "JetBrainsMono Nerd Font".into(),
+        font_family: bmux_fonts::DIAGRAM_FONT_FAMILY.into(),
         ..Default::default()
     };
     let select = resvg::usvg::FontResolver::default_font_selector();
     options.font_resolver.select_font = Box::new(move |font, db| {
+        if font
+            .families()
+            .iter()
+            .any(|family| family.to_string() == bmux_fonts::DIAGRAM_FONT_FAMILY)
+        {
+            return db.query(&resvg::usvg::fontdb::Query {
+                families: &[resvg::usvg::fontdb::Family::Name(
+                    bmux_fonts::DIAGRAM_FONT_FAMILY,
+                )],
+                ..Default::default()
+            });
+        }
         select(font, db).or_else(|| {
             db.query(&resvg::usvg::fontdb::Query {
                 families: &[resvg::usvg::fontdb::Family::SansSerif],
@@ -317,8 +329,8 @@ mod tests {
         let mut options = diagram_svg_options();
         let db = options.fontdb_mut();
         *db = resvg::usvg::fontdb::Database::new();
-        bmux_fonts::register_preset_fonts(db, bmux_fonts::FontPreset::GhosttyNerd);
-        db.set_sans_serif_family("JetBrainsMono Nerd Font");
+        db.load_font_data(bmux_fonts::DIAGRAM_FONT.to_vec());
+        db.set_sans_serif_family(bmux_fonts::DIAGRAM_FONT_FAMILY);
         let empty = br#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="80"/>"#;
         let labelled = br#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="80"><text x="10" y="40" font-family="Unavailable Font" font-size="24">Hello world</text></svg>"#;
         let render = |svg: &[u8]| {
@@ -332,6 +344,56 @@ mod tests {
             pixels
         };
         assert_ne!(render(empty).data(), render(labelled).data());
+    }
+
+    #[test]
+    fn diagram_font_covers_portable_symbols_without_host_fonts() {
+        let mut options = diagram_svg_options();
+        let db = options.fontdb_mut();
+        *db = resvg::usvg::fontdb::Database::new();
+        db.load_font_data(bmux_fonts::DIAGRAM_FONT.to_vec());
+        let face = db.faces().next().unwrap().id;
+        // Verify a real outline, not just pixels from a missing-glyph box.
+        assert!(
+            db.with_face_data(face, |data, index| {
+                let font = ttf_parser::Face::parse(data, index).unwrap();
+                "Hello café Ελληνικά ✅🚀⚠❌✓"
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .all(|c| font.glyph_index(c).is_some())
+            })
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn technical_corpus_has_matching_font_and_visible_labels_without_system_fonts() {
+        let renderer = bmux_mermaid_render::WasmMermaidRenderer::new().unwrap();
+        let mut options = diagram_svg_options();
+        let db = options.fontdb_mut();
+        *db = resvg::usvg::fontdb::Database::new();
+        db.load_font_data(bmux_fonts::DIAGRAM_FONT.to_vec());
+        db.set_sans_serif_family(bmux_fonts::DIAGRAM_FONT_FAMILY);
+        for source in [
+            include_str!("../../../packages/mermaid-render/bench-corpus/long-labels.mmd"),
+            include_str!("../../../packages/mermaid-render/bench-corpus/symbols.mmd"),
+            "flowchart TD\nA[\"First line<br/>Second line\"] --> B[Done]",
+            "classDiagram\nclass Service {\n+String configuration\n+connect()\n}",
+        ] {
+            let request = bmux_mermaid_render::MermaidRenderRequest::svg(source, 800, 600);
+            let result = renderer
+                .render(
+                    &request,
+                    &bmux_mermaid_render::MermaidCancellationToken::default(),
+                )
+                .unwrap();
+            let bmux_mermaid_render::MermaidRenderedOutput::Svg(bytes) = result.output;
+            assert!(String::from_utf8_lossy(&bytes).contains(bmux_fonts::DIAGRAM_FONT_FAMILY));
+            let tree = resvg::usvg::Tree::from_data(&bytes, &options).unwrap();
+            assert!(tree.size().width() <= 800.0 && tree.size().height() <= 600.0);
+            let svg = tree.to_string(&resvg::usvg::WriteOptions::default());
+            assert!(!svg.contains("<text"), "labels must resolve to outlines");
+        }
     }
 
     #[test]

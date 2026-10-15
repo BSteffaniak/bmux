@@ -11,7 +11,8 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-sha2 = { workspace = true }
+roxmltree = { workspace = true }
+sha2      = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio    = { workspace = true, features = ["rt", "sync", "time"] }
 wasmtime = { workspace = true }

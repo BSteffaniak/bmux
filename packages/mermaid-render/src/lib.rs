@@ -47,7 +47,7 @@ impl Drop for RenderPermit {
 }
 
 /// Version of the stable BMUX Mermaid render contract and cache-key semantics.
-pub const RENDER_CONTRACT_VERSION: u16 = 1;
+pub const RENDER_CONTRACT_VERSION: u16 = 2;
 
 /// Mermaid source owned by a render request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,8 +337,8 @@ impl std::fmt::Display for MermaidRenderError {
             Self::OutputDimensionsExceeded => {
                 formatter.write_str("Mermaid output dimensions exceed configured bounds")
             }
-            Self::DirectiveNotAllowed => formatter.write_str("Mermaid directives are not allowed"),
-            Self::TimedOut => formatter.write_str("Mermaid rendering timed out"),
+            Self::DirectiveNotAllowed => formatter.write_str("Mermaid configuration directives (%%{...}%%) are unsupported; remove the directive and use plain diagram syntax"),
+            Self::TimedOut => formatter.write_str("Mermaid layout timed out; simplify the diagram or split it into smaller diagrams"),
             Self::BackendPanicked => formatter.write_str("Mermaid backend panicked"),
             Self::Cancelled => formatter.write_str("Mermaid rendering was cancelled"),
             Self::InvalidDiagram { message } => {
@@ -432,26 +432,6 @@ fn validate_request(
     Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn svg_dimensions(svg: &str) -> Option<(f64, f64)> {
-    let tag_end = svg.find('>')?;
-    let opening = &svg[..tag_end];
-    let width = svg_attribute_number(opening, "width")?;
-    let height = svg_attribute_number(opening, "height")?;
-    Some((width, height))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn svg_attribute_number(opening_tag: &str, name: &str) -> Option<f64> {
-    let marker = format!("{name}=\"");
-    let start = opening_tag.find(&marker)?.saturating_add(marker.len());
-    let end = opening_tag[start..].find('"')?.saturating_add(start);
-    let raw = opening_tag[start..end]
-        .trim_end_matches("px")
-        .trim_end_matches("pt");
-    raw.parse().ok()
-}
-
 fn stable_source_hash(source: &str) -> u64 {
     const OFFSET: u64 = 14_695_981_039_346_656_037;
     const PRIME: u64 = 1_099_511_628_211;
@@ -506,10 +486,8 @@ mod tests {
         );
 
         let too_small = MermaidRenderRequest::svg("flowchart LR\nA --> B", 1, 1);
-        assert_eq!(
-            render_mermaid(&too_small, &MermaidCancellationToken::default()),
-            Err(MermaidRenderError::OutputDimensionsExceeded)
-        );
+        let scaled = render_mermaid(&too_small, &MermaidCancellationToken::default()).unwrap();
+        assert_eq!(scaled.diagnostics.len(), 1);
     }
 
     #[test]

@@ -414,7 +414,7 @@ fn mermaid_contribution_renders_svg_or_keeps_source_with_diagnostic() {
             source,
             rendering: MermaidContributionRendering::Failed(message),
             ..
-        } if source.contains("%%{init") && message.contains("directives are not allowed")
+        } if source.contains("%%{init") && message.contains("remove the directive")
     )));
     let visible = rejected
         .lines

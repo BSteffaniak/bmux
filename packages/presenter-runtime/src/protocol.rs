@@ -148,6 +148,8 @@ pub enum HostError {
     Stale,
     #[error("resource not found")]
     NotFound,
+    #[error("Mermaid preparation failed: {message}")]
+    Diagram { message: String },
     #[error("invalid content")]
     Invalid,
     #[error("action identity reused with different payload")]

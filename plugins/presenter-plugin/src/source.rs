@@ -78,6 +78,26 @@ mod tests {
     }
 
     #[test]
+    fn mermaid_failures_preserve_actionable_diagnostics_and_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deck.md");
+        let source = "# Diagram\n\n```mermaid\n%%{init: {}}%%\nflowchart LR\nA --> B\n```\n";
+        std::fs::write(&path, source).unwrap();
+        let error = match loaded(&path) {
+            Ok(_) => panic!("directive must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("remove the directive"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        std::fs::write(&path, "# Diagram\n\n```mermaid\nflowchart LR\nA -->\n```\n").unwrap();
+        let error = match loaded(&path) {
+            Ok(_) => panic!("invalid syntax must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("invalid Mermaid diagram"));
+    }
+
+    #[test]
     fn rejects_missing_sources_without_terminal_io() {
         assert!(load(Path::new("/nonexistent/bmux-presentation-deck.md")).is_err());
     }

@@ -24,10 +24,11 @@ never execute Rust or Mermaid. Local reload retains the last valid deck on error
 Mermaid runs through the embedded, bounded WASM renderer; no worker executable
 or worker-path environment variable is required. The build automatically compiles
 and embeds the guest, so release toolchains must include `wasm32-unknown-unknown`.
-SVG rasterization uses bundled JetBrains fonts as the default/unknown-family
-fallback and installed system fonts for additional script coverage. Unsupported
-glyphs still depend on available fallback fonts; the bundled font is not a
-universal Unicode font.
+SVG rasterization uses the same bundled BMUX Diagram font as guest measurement,
+including monochrome symbols/emoji, with installed system fonts for additional
+script coverage. The bundled font is not a universal Unicode font. Mermaid
+syntax/directive/timeout failures preserve local diagnostic text; source files
+are never rewritten. Oversized diagrams scale into the bounded viewport.
 Images and
 diagrams are decoded/prepared outside update/paint; remote assets are opaque and
 fetched in bounded chunks. Private audience credentials grant navigation/demo

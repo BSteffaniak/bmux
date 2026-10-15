@@ -29,3 +29,11 @@ Licenses and attribution are provided in:
 - packages/fonts/licenses/NERD_FONTS_LICENSE
 - packages/fonts/licenses/NERD_FONTS_LICENSE_AUDIT.md
 - packages/fonts/licenses/JETBRAINS_MONO_OFL.txt
+
+## BMUX Diagram derivative
+
+The always-available diagram font combines subsets of the regular JetBrains
+input above and Noto Emoji (SIL OFL 1.1). It is renamed BMUX Diagram. See
+`assets/diagram/README.md` for source commit, SHA-256 hashes and regeneration.
+Noto copyright/license: `licenses/NOTO_EMOJI_OFL.txt`. Both input licenses apply
+to the derivative.
