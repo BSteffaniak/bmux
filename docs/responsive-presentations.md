@@ -2,7 +2,9 @@
 
 ## Explicit delivery contracts
 
-Presenter audiences select semantic delivery with the announced presenter URL:
+Presenter audiences open the announced presenter URL at `/`; the host supplies
+semantic document delivery and `/presenter-adapter.js` as browser defaults.
+No query parameters are needed. Explicit overrides remain supported:
 
 ```text
 ?delivery=document&adapter=/presenter-adapter.js

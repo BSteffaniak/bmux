@@ -33,9 +33,16 @@ per resource, 1024 entries, and 32 MiB latest-plus-previous admission bounds.
 wrong representation returns 406; closed sources return 503. Repair fetches a full
 document without `after`; there is no delta or independent publication queue.
 
-The generic index still defaults to fixed frames. Products explicitly announce
-`/?delivery=document&adapter=/application-adapter.js` (followed by the existing token
-fragment when applicable). Document bootstrap capability-checks a caller-provided
+The generic index defaults to fixed frames. Applications may set
+`HostConfig::browser_delivery` to `BrowserDelivery::Document { adapter }` so `/`
+opens their document viewer directly. The host validates the adapter against its
+JavaScript asset allowlist and embeds these defaults in the bootstrap at startup,
+without redirects or extra configuration requests. Presenter hosts select their
+own adapter this way; the host does not interpret application semantics.
+Explicit `delivery` and `adapter` query parameters override host defaults, so
+`/?delivery=document&adapter=/application-adapter.js` remains supported (followed
+by the existing token fragment when applicable). Unknown delivery modes are
+rejected. Document bootstrap capability-checks a caller-provided
 same-origin module, locally reflows independent browser viewports, and never acquires
 or mutates a shared viewport lease. The explicit bundle allowlist includes the
 presenter adapter and existing presenter WASM crate as packaging assets only; no

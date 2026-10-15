@@ -37,6 +37,18 @@ fn document_bootstrap_executes_transactional_mock_adapter() {
 }
 
 #[test]
+fn browser_delivery_defaults_execute_with_query_overrides() {
+    let status = std::process::Command::new("node")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/delivery-defaults.js"
+        ))
+        .status()
+        .expect("node is required for browser bootstrap tests");
+    assert!(status.success());
+}
+
+#[test]
 fn document_delivery_is_explicit_and_does_not_claim_a_shared_viewport() {
     let source = include_str!("../browser/bootstrap.js");
     let document = source
@@ -49,8 +61,10 @@ fn document_delivery_is_explicit_and_does_not_claim_a_shared_viewport() {
     assert!(document.contains("transaction.commit();"));
     assert!(document.contains("transaction?.discard();"));
     assert!(document.contains("epoch !== layoutEpoch"));
-    assert!(source.contains("delivery.get('delivery') === 'document'"));
-    assert!(source.contains("? runDocument(delivery.get('adapter'))\n  : run()"));
+    assert!(source.contains("delivery.get('delivery') ?? defaults.delivery"));
+    assert!(source.contains("representation === 'document'"));
+    assert!(source.contains("runDocument(delivery.get('adapter') ?? defaults.adapter)"));
+    assert!(source.contains("representation === 'frame' ? run() : Promise.reject"));
 }
 
 #[test]

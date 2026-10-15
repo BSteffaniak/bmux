@@ -150,6 +150,7 @@ impl Browser {
             bmux_config::WebAuth::None => bmux_web_host::AuthMode::None,
             bmux_config::WebAuth::Token => bmux_web_host::AuthMode::Token,
         };
+        config.browser_delivery = browser_delivery(fixed);
         config.viewport_mode = if only {
             bmux_web_host::ViewportMode::Resizable
         } else {
@@ -173,18 +174,12 @@ impl Browser {
                     "IPv6"
                 }
             );
-            eprintln!(
-                "Local browser URL: {}",
-                audience_url(&host.bootstrap_url(), fixed)
-            );
+            eprintln!("Local browser URL: {}", host.bootstrap_url());
             eprintln!(
                 "LAN access: replace the URL host with this computer's IP or DNS name (keep the port and any token fragment)."
             );
         } else {
-            eprintln!(
-                "Read-only audience browser: {}",
-                audience_url(&host.bootstrap_url(), fixed)
-            );
+            eprintln!("Read-only audience browser: {}", host.bootstrap_url());
         }
         Ok(Some(Self {
             only,
@@ -359,19 +354,14 @@ impl Browser {
     }
 }
 
-fn audience_url(url: &str, fixed: bool) -> String {
-    let (base, fragment) = url
-        .split_once('#')
-        .map_or((url, None), |(base, fragment)| (base, Some(fragment)));
-    let delivery = if fixed {
-        "?delivery=frame"
+fn browser_delivery(fixed: bool) -> bmux_web_host::BrowserDelivery {
+    if fixed {
+        bmux_web_host::BrowserDelivery::Frame
     } else {
-        "?delivery=document&adapter=/presenter-adapter.js"
-    };
-    format!(
-        "{base}{delivery}{}",
-        fragment.map_or(String::new(), |fragment| format!("#{fragment}"))
-    )
+        bmux_web_host::BrowserDelivery::Document {
+            adapter: "/presenter-adapter.js".into(),
+        }
+    }
 }
 struct AudienceProjection {
     source: bmux_presenter::Deck,
@@ -878,14 +868,14 @@ mod tests {
         assert!(resources.is_empty());
     }
     #[test]
-    fn semantic_url_preserves_auth_fragment_and_selects_adapter() {
-        assert_eq!(
-            audience_url("http://localhost:80/#token=secret", false),
-            "http://localhost:80/?delivery=document&adapter=/presenter-adapter.js#token=secret"
-        );
-        assert_eq!(
-            audience_url("http://localhost:80/", true),
-            "http://localhost:80/?delivery=frame"
+    fn browser_defaults_match_published_representation() {
+        assert!(matches!(
+            browser_delivery(true),
+            bmux_web_host::BrowserDelivery::Frame
+        ));
+        assert!(
+            matches!(browser_delivery(false), bmux_web_host::BrowserDelivery::Document { adapter }
+            if adapter == "/presenter-adapter.js")
         );
     }
 

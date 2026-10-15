@@ -102,6 +102,17 @@ pub enum AuthMode {
     Token,
 }
 
+/// Default browser representation, selected by the application hosting the feed.
+/// Query parameters may override these defaults, but cannot change the feed itself.
+#[derive(Clone, Debug, Default)]
+pub enum BrowserDelivery {
+    #[default]
+    Frame,
+    Document {
+        adapter: String,
+    },
+}
+
 /// Assets are explicit build output, never discovered recursively or built by this crate.
 #[derive(Clone, Debug)]
 pub struct HostConfig {
@@ -118,6 +129,7 @@ pub struct HostConfig {
     pub assets: Vec<Asset>,
     pub limits: Limits,
     pub viewport_mode: ViewportMode,
+    pub browser_delivery: BrowserDelivery,
 }
 
 impl HostConfig {
@@ -133,6 +145,7 @@ impl HostConfig {
             assets: Asset::browser_defaults(),
             limits: Limits::default(),
             viewport_mode: ViewportMode::Observer,
+            browser_delivery: BrowserDelivery::default(),
         }
     }
 }

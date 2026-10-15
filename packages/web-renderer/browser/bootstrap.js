@@ -735,7 +735,9 @@ async function runDocument(adapterPath) {
 }
 
 const delivery = new URLSearchParams(location.search);
-const browserTask = delivery.get('delivery') === 'document'
-  ? runDocument(delivery.get('adapter'))
-  : run();
+const defaults = typeof bmuxViewerDefaults === 'undefined' ? { delivery: 'frame' } : bmuxViewerDefaults;
+const representation = delivery.get('delivery') ?? defaults.delivery;
+const browserTask = representation === 'document'
+  ? runDocument(delivery.get('adapter') ?? defaults.adapter)
+  : representation === 'frame' ? run() : Promise.reject(new Error('Unsupported delivery representation'));
 browserTask.catch(() => { if (!stopped) status.textContent = 'Browser renderer could not start.'; });

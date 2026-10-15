@@ -149,6 +149,19 @@ pub(crate) fn load(config: &HostConfig) -> io::Result<BTreeMap<String, LoadedAss
     if config.assets.is_empty() || config.assets.len() > 16 {
         return Err(invalid());
     }
+    if let crate::BrowserDelivery::Document { adapter } = &config.browser_delivery
+        && (!safe_url(adapter)
+            || !adapter.ends_with(".js")
+            || !config.assets.iter().any(|asset| {
+                asset.url == *adapter && matches!(asset.content_type, ContentType::JavaScript)
+            })
+            || !config.assets.iter().any(|asset| {
+                asset.url == "/bootstrap.js"
+                    && matches!(asset.content_type, ContentType::JavaScript)
+            }))
+    {
+        return Err(invalid());
+    }
     let directory = open_directory(&config.asset_directory)?;
     let mut assets = BTreeMap::new();
     let mut total = 0_usize;
@@ -180,6 +193,18 @@ pub(crate) fn load(config: &HostConfig) -> io::Result<BTreeMap<String, LoadedAss
         }
         if matches!(asset.content_type, ContentType::Wasm) && !bytes.starts_with(b"\0asm\x01\0\0\0")
         {
+            return Err(invalid());
+        }
+        if matches!(asset.content_type, ContentType::JavaScript)
+            && asset.url == "/bootstrap.js"
+            && let crate::BrowserDelivery::Document { adapter } = &config.browser_delivery
+        {
+            let defaults = serde_json::json!({"delivery": "document", "adapter": adapter});
+            let mut configured = format!("const bmuxViewerDefaults = {defaults};\n").into_bytes();
+            configured.extend_from_slice(&bytes);
+            bytes = configured;
+        }
+        if bytes.len() > config.limits.max_asset_bytes {
             return Err(invalid());
         }
         total = total.checked_add(bytes.len()).ok_or_else(invalid)?;
@@ -303,6 +328,52 @@ mod tests {
         config.limits.max_total_asset_bytes = 26;
         assert!(load(&config).is_ok());
         config.limits.max_total_asset_bytes = 25;
+        assert!(load(&config).is_err());
+    }
+
+    #[test]
+    fn document_defaults_are_validated_and_embedded_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = HostConfig::new(directory.path().to_path_buf());
+        for asset in &config.assets {
+            let bytes: &[u8] = if matches!(asset.content_type, ContentType::Wasm) {
+                b"\0asm\x01\0\0\0"
+            } else {
+                b"// asset\n"
+            };
+            std::fs::write(directory.path().join(&asset.filename), bytes).unwrap();
+        }
+        let original = load(&config).unwrap();
+        assert_eq!(&*original["/bootstrap.js"].bytes, b"// asset\n");
+        config.browser_delivery = crate::BrowserDelivery::Document {
+            adapter: "/presenter-adapter.js".into(),
+        };
+        let configured = load(&config).unwrap();
+        let bootstrap = std::str::from_utf8(&configured["/bootstrap.js"].bytes).unwrap();
+        assert!(bootstrap.starts_with("const bmuxViewerDefaults = "));
+        assert!(bootstrap.contains("\"delivery\":\"document\""));
+        assert!(bootstrap.contains("\"adapter\":\"/presenter-adapter.js\""));
+        assert!(bootstrap.ends_with("// asset\n"));
+        assert_eq!(configured["/"].bytes, original["/"].bytes);
+        for adapter in [
+            "https://other/adapter.js",
+            "/missing.js",
+            "/style.css",
+            "/../x.js",
+            "/presenter-adapter.js?x=1",
+        ] {
+            config.browser_delivery = crate::BrowserDelivery::Document {
+                adapter: adapter.into(),
+            };
+            assert!(load(&config).is_err(), "{adapter}");
+        }
+        config.browser_delivery = crate::BrowserDelivery::Document {
+            adapter: "/presenter-adapter.js".into(),
+        };
+        config.limits.max_asset_bytes = 32;
+        assert!(load(&config).is_err());
+        config.limits.max_asset_bytes = 1024;
+        config.limits.max_total_asset_bytes = 128;
         assert!(load(&config).is_err());
     }
 

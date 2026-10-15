@@ -21,6 +21,48 @@ mod delivery_tests;
 mod network_tests;
 
 #[tokio::test]
+async fn document_host_serves_defaults_at_root_without_redirect_or_auth_bypass() {
+    let (directory, mut config) = fixture();
+    std::fs::write(
+        directory.path().join("adapter.js"),
+        b"// application adapter",
+    )
+    .unwrap();
+    config.assets.push(Asset {
+        url: "/adapter.js".into(),
+        filename: "adapter.js".into(),
+        content_type: ContentType::JavaScript,
+    });
+    config.browser_delivery = crate::BrowserDelivery::Document {
+        adapter: "/adapter.js".into(),
+    };
+    let (_publisher, feed) = snapshot_feed(config.limits.max_snapshot_bytes).unwrap();
+    let host = start(config, feed).await.unwrap();
+    let address = host.address();
+    let root = exchange(address, &request(address, "GET", "/", "", "")).await;
+    status(&root, 200);
+    assert!(!root.contains("Location:"));
+    let bootstrap = exchange(address, &request(address, "GET", "/bootstrap.js", "", "")).await;
+    status(&bootstrap, 200);
+    assert!(bootstrap.contains("const bmuxViewerDefaults = "));
+    assert!(bootstrap.contains("\"adapter\":\"/adapter.js\""));
+    assert!(bootstrap.contains("Cache-Control: no-store"));
+    let denied = exchange(
+        address,
+        &request(address, "GET", "/document?version=1", "", ""),
+    )
+    .await;
+    status(&denied, 401);
+    let authorized = exchange(
+        address,
+        &request(address, "GET", "/document?version=1", &token(&host), ""),
+    )
+    .await;
+    assert!(!authorized.starts_with("HTTP/1.1 401"));
+    host.shutdown().await;
+}
+
+#[tokio::test]
 async fn static_asset_queries_preserve_exact_paths_and_bootstrap_authentication() {
     let (_directory, publisher, host) = host().await;
     let address = host.address();
