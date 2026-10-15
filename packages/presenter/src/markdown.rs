@@ -72,8 +72,9 @@ fn units(source: &str, base: usize) -> Vec<Unit<'_>> {
     if let Some(unit) = current {
         units.push(unit);
     }
-    // CommonMark groups adjacent standalone HTML comments into one HTML block.
-    // Split only all-comment bmux blocks; never interpret directives in code or nested content.
+    // CommonMark groups adjacent comments, including authoring metadata and
+    // BMUX directives. Split complete comment-only HTML blocks, never code or
+    // nested Markdown. Source ranges remain offsets into the original input.
     let mut separated = Vec::new();
     for unit in units {
         let raw = &source[unit.range.start - base..unit.range.end - base];
@@ -83,26 +84,36 @@ fn units(source: &str, base: usize) -> Vec<Unit<'_>> {
                 Event::Html(_) | Event::Start(Tag::HtmlBlock) | Event::End(TagEnd::HtmlBlock)
             )
         });
-        let directive_lines = raw.split_inclusive('\n').all(|line| {
-            let line = line.trim();
-            line.is_empty() || (line.starts_with("<!-- bmux:") && line.ends_with("-->"))
-        });
-        if standalone_html && directive_lines {
-            let mut offset = unit.range.start;
-            for line in raw.split_inclusive('\n') {
-                if !line.trim().is_empty() {
-                    separated.push(Unit {
-                        range: offset..offset + line.len(),
-                        events: Vec::new(),
-                    });
-                }
-                offset += line.len();
+        if let Some(comments) = standalone_html.then(|| comment_ranges(raw)).flatten() {
+            for range in comments {
+                separated.push(Unit {
+                    range: unit.range.start + range.start..unit.range.start + range.end,
+                    events: Vec::new(),
+                });
             }
         } else {
             separated.push(unit);
         }
     }
     separated
+}
+
+/// Recognize complete comment-only blocks without interpreting comment bodies.
+fn comment_ranges(raw: &str) -> Option<Vec<Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while offset < raw.len() {
+        let rest = &raw[offset..];
+        offset += rest.len() - rest.trim_start().len();
+        if offset == raw.len() {
+            break;
+        }
+        let body = raw[offset..].strip_prefix("<!--")?;
+        let end = offset + 4 + body.find("-->")? + 3;
+        ranges.push(offset..end);
+        offset = end;
+    }
+    Some(ranges)
 }
 
 fn kind_key(kind: &BlockKind) -> String {
@@ -205,6 +216,11 @@ pub fn parse_markdown(source_name: &str, source: &str) -> Result<Deck, MarkdownE
                     Some(location(source_name, source, start..unit.range.start));
                 draft.notes_start = None;
             }
+            continue;
+        }
+        if unit.events.is_empty() && directive.is_none() {
+            // Complete ordinary HTML comments are authoring metadata, not slides.
+            // Keep pending block IDs and reveal state untouched.
             continue;
         }
         if let Some(directive) = directive {
@@ -521,6 +537,74 @@ mod tests {
         assert!(deck.slides[0].notes.text.contains("secret"));
         assert!(!serde_json::to_string(&deck).unwrap().contains("secret"));
     }
+    #[test]
+    fn authoring_comments_do_not_hide_adjacent_directives_or_create_blocks() {
+        let input = concat!(
+            "---\ntitle: Tour\n---\n",
+            "<!-- markdownlint-disable MD025 -->\n",
+            "<!-- Slide decks intentionally have one top-level heading per slide. -->\n",
+            "<!-- bmux:slide-id opening -->\n",
+            "<!-- bmux:block-id title -->\n",
+            "<!-- ordinary\nmultiline comment -->\n",
+            "# Hello\n\n",
+            "<!-- ignored --><!-- bmux:pause -->\n",
+            "<!-- bmux:block-id later --><!-- ignored again -->\n",
+            "Visible later\n",
+        );
+        let deck = parse_markdown("tour.md", input).unwrap();
+        assert_eq!(deck.slides.len(), 1);
+        let slide = &deck.slides[0];
+        assert_eq!(slide.id.as_str(), "opening");
+        assert_eq!(slide.blocks.len(), 2);
+        assert_eq!(slide.blocks[0].id.as_str(), "title");
+        assert_eq!(slide.blocks[1].id.as_str(), "later");
+        assert_eq!(slide.blocks[1].reveal_step, 1);
+        let source = slide.blocks[0].source.as_ref().unwrap();
+        assert_eq!(source.line, 10);
+        assert_eq!(&input[source.start..source.end], "# Hello\n");
+        let public = serde_json::to_string(&deck).unwrap();
+        assert!(!public.contains("markdownlint"));
+        assert!(!public.contains("multiline comment"));
+        assert!(!public.contains("ignored"));
+    }
+
+    #[test]
+    fn comments_preserve_code_literals_and_do_not_activate_nested_directives() {
+        let input = concat!(
+            "<!-- hidden\n<!-- bmux:pause -->\n\n",
+            "```html\n<!-- literal -->\n<!-- bmux:pause -->\n```\n\n",
+            "    <!-- indented literal -->\n\n",
+            "`<!-- inline code -->`\n\n",
+            "> <!-- bmux:pause -->\n",
+        );
+        let deck = parse_markdown("x", input).unwrap();
+        let slide = &deck.slides[0];
+        assert_eq!(slide.max_reveal_step(), 0);
+        assert!(
+            matches!(&slide.blocks[0].kind, BlockKind::Code { source, .. }
+            if source.contains("<!-- literal -->") && source.contains("<!-- bmux:pause -->"))
+        );
+        assert!(
+            matches!(&slide.blocks[1].kind, BlockKind::Code { source, .. }
+            if source.contains("<!-- indented literal -->"))
+        );
+        assert!(
+            matches!(&slide.blocks[2].kind, BlockKind::Text { content, .. }
+            if content.contains("`<!-- inline code -->`"))
+        );
+    }
+
+    #[test]
+    fn ordinary_comments_leave_notes_and_errors_intact() {
+        let input = "<!-- ignored -->\n<!-- bmux:notes -->\nprivate\n<!-- ordinary -->\n<!-- bmux:end-notes -->\n# Hello\n";
+        let deck = parse_markdown("x", input).unwrap();
+        assert!(deck.slides[0].notes.text.contains("private"));
+        assert_eq!(deck.slides[0].blocks.len(), 1);
+        assert!(!serde_json::to_string(&deck).unwrap().contains("private"));
+        assert!(parse_markdown("x", "<!-- ignored --><!-- bmux:run curl -->").is_err());
+        assert!(parse_markdown("x", "<!-- bmux:block-id unused --><!-- ignored -->").is_err());
+    }
+
     #[test]
     fn fences_and_nested_rules_do_not_split_slides_or_execute_directives() {
         let deck =
