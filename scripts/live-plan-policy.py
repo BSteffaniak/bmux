@@ -26,7 +26,25 @@ def validate(plan, configure=False, migration=False):
         version_replacement = address == 'cloudflare_worker_version.live' and actions in (
             ['delete', 'create'], ['create', 'delete'])
         deployment_replacement = address == 'cloudflare_workers_deployment.live' and actions == ['create', 'delete']
-        release_replacement = version_replacement or deployment_replacement
+        # Provider 5.17.0 WorkerVersion.Delete is state-only. A targeted
+        # create-before-destroy apply can leave the old instance deposed until
+        # the next full plan. Require its current replacement in that same plan.
+        deposed_version_cleanup = (
+            address == 'cloudflare_worker_version.live' and actions == ['delete']
+            and isinstance(resource.get('deposed'), str) and bool(resource['deposed'])
+            and change.get('after') is None and not change.get('importing')
+            and (change.get('before') or {}).get('id')
+            and all((change.get('before') or {}).get(key) for key in ('account_id', 'worker_id'))
+            and any(
+                current.get('address') == address and not current.get('deposed')
+                and current.get('change', {}).get('actions') == ['no-op']
+                and isinstance(current.get('change', {}).get('after'), dict)
+                and current['change']['after'].get('id')
+                and current['change']['after']['id'] != (change.get('before') or {}).get('id')
+                and all(current['change']['after'].get(key) == (change.get('before') or {}).get(key)
+                        for key in ('account_id', 'worker_id'))
+                for current in plan['resource_changes']))
+        release_replacement = version_replacement or deployment_replacement or deposed_version_cleanup
         if 'delete' in actions and not release_replacement:
             raise ValueError('Destructive infrastructure changes require a separate reviewed migration')
         if migration:

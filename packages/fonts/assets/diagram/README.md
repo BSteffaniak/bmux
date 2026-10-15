@@ -6,6 +6,7 @@ v3.4.0 input already in this repository) and Noto Emoji from google/fonts commit
 `ofl/notoemoji/NotoEmoji[wght].ttf`.
 
 Input SHA-256:
+
 - JetBrains: `0ec29a68b539ece7078fc714cebff0c0accb2f4948f8f7963d9f5e86633b12d9`
 - Noto Emoji: `de6c18832938afc99caf132b39d6a30a19bac7f2e812e28db2535b4608d27551`
 

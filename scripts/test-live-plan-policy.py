@@ -59,6 +59,28 @@ class PlanPolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 m.validate(plan('cloudflare_worker_version.live', actions, importing={'id': 'existing'}))
 
+    def test_deposed_version_cleanup_requires_current_replacement(self):
+        old = {'id': 'old', 'account_id': 'account', 'worker_id': 'worker'}
+        current = {'id': 'current', 'account_id': 'account', 'worker_id': 'worker'}
+        cleanup = plan('cloudflare_worker_version.live', ['delete'], before=old, after=None)
+        cleanup['resource_changes'][0]['deposed'] = 'deadbeef'
+        replacement = plan('cloudflare_worker_version.live', ['no-op'], after=current)
+        combined = {'resource_changes': cleanup['resource_changes'] + replacement['resource_changes']}
+        self.assertTrue(m.validate(combined))
+        self.assertTrue(m.validate(combined, configure=True))
+        with self.assertRaises(ValueError):
+            m.validate(cleanup, configure=True)
+        for key, value in (('id', 'old'), ('account_id', 'foreign'), ('worker_id', 'foreign')):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                current[key], saved = value, current[key]
+                try:
+                    m.validate(combined, configure=True)
+                finally:
+                    current[key] = saved
+        cleanup['resource_changes'][0].pop('deposed')
+        with self.assertRaises(ValueError):
+            m.validate(combined, configure=True)
+
     def test_invalid_actions_rejected(self):
         for actions in ([], ['unknown'], None):
             with self.assertRaises(ValueError):
