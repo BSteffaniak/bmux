@@ -77,6 +77,17 @@ class PlanPolicyTests(unittest.TestCase):
                     m.validate(combined, configure=True)
                 finally:
                     current[key] = saved
+        # A candidate may replace the current version while retiring a previous
+        # deposed one. The future ID is unknown; ownership and prior current ID
+        # must still prove this is not deleting the only managed version.
+        replacement['resource_changes'][0]['change'] = {
+            'actions': ['create', 'delete'], 'before': dict(current),
+            'after': {key: value for key, value in current.items() if key != 'id'}}
+        self.assertTrue(m.validate(combined, configure=True))
+        replacement['resource_changes'][0]['change']['actions'] = ['delete', 'create']
+        with self.assertRaises(ValueError):
+            m.validate(combined, configure=True)
+        replacement['resource_changes'][0]['change'] = {'actions': ['no-op'], 'after': current}
         cleanup['resource_changes'][0].pop('deposed')
         with self.assertRaises(ValueError):
             m.validate(combined, configure=True)

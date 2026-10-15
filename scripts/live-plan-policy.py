@@ -37,10 +37,11 @@ def validate(plan, configure=False, migration=False):
             and all((change.get('before') or {}).get(key) for key in ('account_id', 'worker_id'))
             and any(
                 current.get('address') == address and not current.get('deposed')
-                and current.get('change', {}).get('actions') == ['no-op']
+                and current.get('change', {}).get('actions') in (['no-op'], ['create', 'delete'])
                 and isinstance(current.get('change', {}).get('after'), dict)
-                and current['change']['after'].get('id')
-                and current['change']['after']['id'] != (change.get('before') or {}).get('id')
+                and (current['change'].get('before') or current['change']['after']).get('id')
+                and (current['change'].get('before') or current['change']['after'])['id']
+                    != (change.get('before') or {}).get('id')
                 and all(current['change']['after'].get(key) == (change.get('before') or {}).get(key)
                         for key in ('account_id', 'worker_id'))
                 for current in plan['resource_changes']))
