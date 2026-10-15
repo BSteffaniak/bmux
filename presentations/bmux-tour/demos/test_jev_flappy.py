@@ -123,8 +123,35 @@ class RenderingTests(unittest.TestCase):
                 self.assertTrue(field.x <= x < field.x + field.width)
         bird_left, top, bird_right, bottom = field.bird_bounds(game)
         for y in range(top, bottom):
+            expected = "█o>" if y == int(game.y / game.height * field.height) else "███"
             self.assertEqual("".join(screen.cells[x, y + field.y]
-                                     for x in range(field.x + bird_left, field.x + bird_right)), "█o>")
+                                     for x in range(field.x + bird_left, field.x + bird_right)), expected)
+        # Moving, colliding, holding the crash, and restarting must each produce
+        # a single face and exactly the same raster as a fresh screen. This also
+        # checks that the previous bird position is erased, not retained.
+        def render():
+            with patch.object(demo.curses, "color_pair", return_value=0):
+                demo.draw(screen, controller)
+            fresh = Screen()
+            with patch.object(demo.curses, "color_pair", return_value=0):
+                demo.draw(fresh, controller)
+            self.assertEqual(screen.cells, fresh.cells)
+            faces = [(x, y) for (x, y), ch in screen.cells.items()
+                     if ch == ">" and field.y <= y < field.y + field.height]
+            self.assertEqual(len(faces), 1)
+            self.assertEqual(faces[0][1], field.y + int(game.y / game.height * field.height))
+        for center in (15, 16, 18, 20):
+            game.y = center
+            render()
+        game.pipes[0] = demo.Pipe(game.bird_x, 15)
+        game.y = 15 + game.gap_height / 2
+        game.velocity = 0
+        game.tick()
+        self.assertTrue(game.dead)
+        render()
+        render()
+        controller.command("restart")
+        render()
         # Bird entirely above the viewport is not pinned to the top row.
         game.y = -10
         with patch.object(demo.curses, "color_pair", return_value=0):

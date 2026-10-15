@@ -685,10 +685,15 @@ def draw(screen, controller):
             if abs(world_y - pipe.gap_y) >= game.gap_height / 2 and right > left:
                 text(y + field.y, left + field.x, "█" * (right - left), green)
     left, top, right, bottom = field.bird_bounds(game)
+    # A multi-row body is one sprite, not one complete bird per row. Keep its
+    # only face anchored to the world center, including when bounds are clipped.
+    face_row = math.floor(game.y / game.height * field.height)
     for y in range(top, bottom):
         width = right - left
         if width > 0:
-            bird = ("█" * max(0, width - 2) + "o>")[-width:]
+            bird = "█" * width
+            if y == face_row:
+                bird = ("█" * max(0, width - 2) + "o>")[-width:]
             text(y + field.y, left + field.x, bird, yellow)
     text(field.y + field.height, field.x, "=" * field.width, green)
 
