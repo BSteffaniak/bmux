@@ -58,15 +58,17 @@ resource "cloudflare_r2_bucket_lifecycle" "state" {
       }
     },
     {
-      id      = "abort-incomplete-state-uploads"
+      # Preserve Cloudflare's pristine baseline rather than shorten its window.
+      id      = "Default Multipart Abort Rule"
       enabled = true
+      # Provider requires prefix; empty is the API's omitted all-objects prefix.
       conditions = {
         prefix = ""
       }
       abort_multipart_uploads_transition = {
         condition = {
           type    = "Age"
-          max_age = 86400
+          max_age = 604800
         }
       }
     }

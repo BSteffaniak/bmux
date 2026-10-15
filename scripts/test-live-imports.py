@@ -235,6 +235,44 @@ class Tests(unittest.TestCase):
         with self.assertRaises(MODULE.ImportErrorSafe):
             MODULE.Cloudflare('SECRET_TOKEN', opener).listing('test')
 
+    def test_dns_mail_records_do_not_compete_with_pages_but_addresses_do(self):
+        api = FakeAPI()
+        endpoint = f'zones/{ZONE}/dns_records?name=bmux.dev'
+        cname = api.data[endpoint][0]
+        api.data[endpoint] = [cname, {'name': 'bmux.dev', 'type': 'MX'},
+                              {'name': 'bmux.dev', 'type': 'TXT'}]
+        found = MODULE.discover(api, MODULE.configuration(ENV), set())
+        self.assertEqual(found['cloudflare_dns_record.live'], ZONE + '/' + DNS)
+        for record_type in ('A', 'AAAA', 'CNAME'):
+            with self.subTest(record_type=record_type), self.assertRaises(MODULE.ImportErrorSafe):
+                api.data[endpoint] = [cname, {'name': 'bmux.dev', 'type': record_type}]
+                MODULE.discover(api, MODULE.configuration(ENV), set())
+
+    def test_only_exact_preserved_default_lifecycle_is_adoptable(self):
+        baseline = {'id': 'Default Multipart Abort Rule', 'enabled': True, 'conditions': {},
+                    'abortMultipartUploadsTransition': {'condition': {'type': 'Age', 'maxAge': 604800}}}
+        endpoint = f'accounts/{ACCOUNT}/r2/buckets/bmux-opentofu-state/lifecycle'
+        api = FakeAPI()
+        api.data[endpoint] = [baseline]
+        self.assertIn('cloudflare_r2_bucket.state', MODULE.discover(api, MODULE.configuration(ENV), set()))
+        import copy
+        variants = []
+        for field, value in [('id', 'custom'), ('enabled', False), ('conditions', {'prefix': 'private/'})]:
+            changed = copy.deepcopy(baseline)
+            changed[field] = value
+            variants.append([changed])
+        changed = copy.deepcopy(baseline)
+        changed['abortMultipartUploadsTransition']['condition']['maxAge'] = 86400
+        variants.extend(([changed], [baseline, {'id': 'custom'}], [dict(baseline, deleteObjectsTransition={})]))
+        for rules in variants:
+            with self.subTest(rules=rules), self.assertRaises(MODULE.ImportErrorSafe):
+                api.data[endpoint] = rules
+                MODULE.discover(api, MODULE.configuration(ENV), set())
+        # Prevent code/config divergence from silently shortening the preserved rule.
+        config = (Path(__file__).resolve().parent.parent / 'infra/live-terraform/state.tf').read_text()
+        self.assertIn('id      = "Default Multipart Abort Rule"', config)
+        self.assertIn('max_age = 604800', config)
+
     def test_r2_bucket_and_unmanaged_policy_guards(self):
         config = MODULE.configuration(ENV)
         endpoint = f'accounts/{ACCOUNT}/r2/buckets'

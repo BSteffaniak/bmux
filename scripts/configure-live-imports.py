@@ -222,7 +222,15 @@ def discover(api, config, managed):
     for suffix, address in (('lock', 'cloudflare_r2_bucket_lock.state'),
                             ('lifecycle', 'cloudflare_r2_bucket_lifecycle.state')):
         rules = api.listing(f'accounts/{account}/r2/buckets/{config["bucket"]}/{suffix}')
-        if rules and address not in managed:
+        # A pristine Cloudflare multipart-abort baseline is preserved verbatim
+        # in state.tf. This is not permission to replace custom lifecycle policy;
+        # every other unmanaged rule set still requires ownership reconciliation.
+        default_abort = [{
+            'id': 'Default Multipart Abort Rule', 'enabled': True, 'conditions': {},
+            'abortMultipartUploadsTransition': {'condition': {'type': 'Age', 'maxAge': 604800}},
+        }]
+        preserved_baseline = suffix == 'lifecycle' and rules == default_abort
+        if rules and address not in managed and not preserved_baseline:
             raise ImportErrorSafe('Existing unmanaged R2 policy requires explicit ownership reconciliation')
     if project is not None:
         found[ADDRESSES[0]] = account + '/' + config['pages']
@@ -238,7 +246,12 @@ def discover(api, config, managed):
     if domain_matches:
         found[ADDRESSES[1]] = account + '/' + config['pages'] + '/' + config['hostname']
     query = urllib.parse.urlencode({'name': config['hostname']})
-    dns = unique(api.listing(f'zones/{zone}/dns_records?{query}'), 'name', config['hostname'])
+    # Mail and verification records legitimately share the hostname. Only
+    # address/alias records compete with the Pages routing record; never import
+    # or rewrite the unrelated MX/TXT policy.
+    dns_records = api.listing(f'zones/{zone}/dns_records?{query}')
+    dns = unique([item for item in dns_records if item.get('type') in ('A', 'AAAA', 'CNAME')],
+                 'name', config['hostname'])
     if dns is not None:
         if dns.get('type') != 'CNAME' or dns.get('content') != config['pages'] + '.pages.dev':
             raise ImportErrorSafe('Hostname DNS points elsewhere; reconcile manually')

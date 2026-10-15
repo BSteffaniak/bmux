@@ -262,6 +262,12 @@ For existing Pages/domain/DNS/route resources, the first discovery reports a
 validated public `imports` map and fingerprint, then stops without adoption.
 Confirm those exact resources are no longer managed by another state/automation;
 rerun with the exact JSON map in `reviewed_imports` and `approve_import=true`.
+The pristine R2 `Default Multipart Abort Rule` (enabled, all prefixes, seven-day
+incomplete-upload abort, no other actions) is preserved by the lifecycle resource.
+Discovery permits only that exact unmanaged baseline; any custom or additional
+policy still requires ownership reconciliation. No policy is modified by discovery.
+MX/TXT records sharing the website hostname are not adoption targets; competing
+A/AAAA/CNAME records still stop discovery.
 The approval attests ownership transfer. Unexpected Worker/version/Durable Object
 ownership or ambiguous matches require reconciliation; names alone never prove
 ownership. Do not delete/recreate the existing website to make deployment pass.
