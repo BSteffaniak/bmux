@@ -67,8 +67,10 @@ class Acceptance(HELPERS.Acceptance):
         self.original = (ROOT / "plugins/presenter-plugin/examples/live-demo.md").read_text()
         self.deck.write_text(self.original)
         self.source = self.root / "live-demo.dsl"
-        self.approved = ('@name Owned regression\n@viewport cols=80 rows=24\n@timeout 180000\n'
-                         f'new-session\nsend-keys keys="printf \'{MARKER}\\\\n\'; sleep 120\\r"\n'
+        # The fixed 80x24 surface is centrally clipped by the smaller notes
+        # viewport. Put evidence in its shared visible center, not cropped row 0.
+        self.approved = ('@name Owned regression\n@viewport cols=80 rows=24\n@shell sh\n@timeout 180000\n'
+                         f'new-session\nsend-keys keys="printf \'\\\\033[12;1H{MARKER}\\\\n\'; sleep 120\\r"\n'
                          f'wait-for pattern="{MARKER}"\n'
                          'wait-for pattern="NEVER_COMPLETE_OWNED_REGRESSION" timeout=120000\n')
         self.source.write_text(self.approved)
@@ -273,7 +275,11 @@ class Acceptance(HELPERS.Acceptance):
         player.send(b"r")
         first = wait_for("first actual attempt", lambda: self.started(1), 25)
         frame = self.frame(url, MARKER)
-        require(frame.get("unsupported_metadata"), "embedded metadata availability missing")
+        unavailable = frame.get("unsupported_metadata", [])
+        regions = frame.get("metadata_availability", [])
+        require(all(kind in unavailable or any(not region.get(kind, True) for region in regions)
+                    for kind in ("selection", "semantics")),
+                "embedded metadata availability missing")
         self.commit(browser, frame)
         wait_for("same live shell in controlling PTY", lambda: MARKER.encode() in player.bytes(), 15)
         before, first_runtime = self.attempt_record(first)
@@ -417,6 +423,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("binary", "plugins", "assets", "browser"):
         parser.add_argument("--" + name, type=lambda value: Path(value).resolve(strict=True), required=True)
+    parser.add_argument("--mermaid-worker", type=lambda value: Path(value).resolve(strict=True), required=True)
     parser.add_argument("--state-parent", type=lambda value: Path(value).resolve(strict=True), default=Path("/tmp"))
     args = parser.parse_args()
     require(Path("/proc/self/stat").is_file(), "Linux /proc required")

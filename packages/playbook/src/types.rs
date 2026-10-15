@@ -222,6 +222,10 @@ pub enum Action {
     ResizeViewport { cols: u16, rows: u16 },
     /// Send key chord(s) through the attach keybinding runtime.
     SendAttach { key: String },
+    /// Dispatch a runtime action in the same owned attach as keyboard input.
+    AttachCommand { action: String },
+    /// Wait for text in the committed full attach, including real prompts.
+    WaitRendered { contains: String, timeout: Duration },
     /// Send a semantic paste event through the real attach runtime.
     PasteAttach { text: String },
     /// Send the prefix key combo + a key character.
@@ -668,6 +672,8 @@ impl Action {
             Self::AssertCursor { .. } => "assert-cursor",
             Self::ResizeViewport { .. } => "resize-viewport",
             Self::SendAttach { .. } => "send-attach",
+            Self::AttachCommand { .. } => "attach-command",
+            Self::WaitRendered { .. } => "wait-rendered",
             Self::PasteAttach { .. } => "paste-attach",
             Self::PrefixKey { .. } => "prefix-key",
             Self::WaitForEvent { .. } => "wait-for-event",
@@ -797,6 +803,16 @@ impl Action {
             }
             Self::SendAttach { key } => {
                 format!("send-attach key='{}'", escape_single_quote(key))
+            }
+            Self::AttachCommand { action } => {
+                format!("attach-command action='{}'", escape_single_quote(action))
+            }
+            Self::WaitRendered { contains, timeout } => {
+                format!(
+                    "wait-rendered contains='{}' timeout={}",
+                    escape_single_quote(contains),
+                    timeout.as_millis()
+                )
             }
             Self::PasteAttach { text } => {
                 format!("paste-attach text='{}'", escape_single_quote(text))
@@ -1103,6 +1119,21 @@ mod tests {
         let dsl = action.to_dsl();
         let parsed = parse_action_dsl(&dsl, 1); // index 1 because new-session is index 0
         (dsl, parsed)
+    }
+
+    #[test]
+    fn owned_attach_actions_round_trip() {
+        let (_, command) = round_trip(&Action::AttachCommand {
+            action: "plugin:bmux.tabs:new-tab --name 'editor'".into(),
+        });
+        assert!(matches!(command, Action::AttachCommand { action } if action.contains("editor")));
+        let (_, wait) = round_trip(&Action::WaitRendered {
+            contains: "Find Tab".into(),
+            timeout: Duration::from_millis(1234),
+        });
+        assert!(
+            matches!(wait, Action::WaitRendered { contains, timeout } if contains == "Find Tab" && timeout == Duration::from_millis(1234))
+        );
     }
 
     #[test]

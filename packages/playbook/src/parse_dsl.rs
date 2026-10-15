@@ -340,6 +340,18 @@ pub fn parse_action_line(line: &str) -> Result<Action> {
             let key = require_arg(&args, "key", "send-attach")?;
             Ok(Action::SendAttach { key })
         }
+        "attach-command" => Ok(Action::AttachCommand {
+            action: require_arg(&args, "action", "attach-command")?,
+        }),
+        "wait-rendered" => Ok(Action::WaitRendered {
+            contains: require_arg(&args, "contains", "wait-rendered")?,
+            timeout: Duration::from_millis(
+                args.get("timeout")
+                    .map(|value| value.parse())
+                    .transpose()?
+                    .unwrap_or(5000),
+            ),
+        }),
         "paste-attach" => {
             let text = require_arg(&args, "text", "paste-attach")?;
             Ok(Action::PasteAttach { text })

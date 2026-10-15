@@ -2,8 +2,7 @@
 use super::RunOptions;
 use crate::pane_runtime_client::BmuxPaneRuntimeClientExt;
 use crate::runtime::attach::runtime::{
-    AttachTerminal, AttachTerminalEventFuture, HeadlessAttachTerminal,
-    HeadlessAttachTerminalHandle, run_session_attach_with_terminal_config,
+    AttachTerminal, AttachTerminalEventFuture, HeadlessAttachTerminal, HeadlessAttachTerminalHandle,
 };
 use anyhow::{Context, Result, ensure};
 use bmux_attach_token_state::AttachGrant;
@@ -21,10 +20,7 @@ use bmux_playbook::host::{
 use bmux_playbook::transport::{ClientFuture, PaneGridSnapshotResult, PaneTransport};
 use bmux_session_models::SessionSelector;
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{
-    Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
-    KeyModifiers,
-};
+use crossterm::event::Event as CrosstermEvent;
 use crossterm::style::Print;
 use crossterm::terminal::{
     self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -419,12 +415,15 @@ impl VisualTerminal for VisualTerminalGuard {
 // same target. Session changes alone cannot acknowledge an input action.
 struct AcknowledgedAttachEvent {
     event: CrosstermEvent,
+    action: Option<String>,
     completed: tokio::sync::oneshot::Sender<Uuid>,
 }
 
 struct PlaybookAttachTerminal {
     inner: HeadlessAttachTerminal,
     events: tokio::sync::mpsc::Receiver<AcknowledgedAttachEvent>,
+    action: Option<String>,
+    retained: bool,
     pending: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Uuid>>>,
 }
 
@@ -439,6 +438,12 @@ impl Write for PlaybookAttachTerminal {
 }
 
 impl AttachTerminal for PlaybookAttachTerminal {
+    fn presentation_only(&self) -> bool {
+        self.retained
+    }
+    fn take_owned_action(&mut self) -> Option<String> {
+        self.action.take()
+    }
     fn geometry(&self) -> crate::runtime::attach::input::TerminalGeometry {
         self.inner.geometry()
     }
@@ -452,6 +457,7 @@ impl AttachTerminal for PlaybookAttachTerminal {
             tokio::select! {
                 event = self.events.recv() => {
                     let Some(event) = event else { return Ok(None); };
+                    self.action = event.action;
                     *self.pending.lock().map_err(|_| anyhow::anyhow!("attach acknowledgment lock poisoned"))? = Some(event.completed);
                     Ok(Some(event.event))
                 }
@@ -492,6 +498,9 @@ pub(super) struct RealAttachPlaybookRuntime {
     terminal: HeadlessAttachTerminalHandle,
     events: tokio::sync::mpsc::Sender<AcknowledgedAttachEvent>,
     input_resolved: std::sync::atomic::AtomicBool,
+    prefix: String,
+    required_frame_after: std::sync::atomic::AtomicU64,
+    observer: Option<crate::runtime::attach::observer::AttachObserver>,
     task: tokio::task::JoinHandle<Result<crate::runtime::attach::runtime::AttachRunOutcome>>,
 }
 
@@ -506,12 +515,33 @@ impl RealAttachPlaybookRuntime {
     }
 
     async fn send_event(&self, event: CrosstermEvent, deadline: Instant) -> Result<Uuid> {
+        self.send_input(event, None, deadline).await
+    }
+
+    async fn send_input(
+        &self,
+        event: CrosstermEvent,
+        action: Option<String>,
+        deadline: Instant,
+    ) -> Result<Uuid> {
         self.ensure_input_resolved()?;
+        if let Some(snapshot) = self
+            .observer
+            .as_ref()
+            .and_then(crate::runtime::attach::observer::AttachObserver::latest)
+        {
+            self.required_frame_after
+                .store(snapshot.revision, std::sync::atomic::Ordering::Release);
+        }
         self.input_resolved
             .store(false, std::sync::atomic::Ordering::Release);
         let (completed, completion) = tokio::sync::oneshot::channel();
         self.events
-            .try_send(AcknowledgedAttachEvent { event, completed })
+            .try_send(AcknowledgedAttachEvent {
+                event,
+                action,
+                completed,
+            })
             .map_err(|_| anyhow::anyhow!("real attachment exited before accepting input"))?;
         let committed =
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), completion)
@@ -560,27 +590,23 @@ impl RealAttachPlaybookRuntime {
     }
 
     async fn detach(self) {
-        let _ = self.terminal.send_event(CrosstermEvent::Key(KeyEvent {
-            code: CrosstermKeyCode::Char('b'),
-            modifiers: KeyModifiers::CONTROL,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::empty(),
-        }));
-        let _ = self.terminal.send_event(CrosstermEvent::Key(KeyEvent {
-            code: CrosstermKeyCode::Char('d'),
-            modifiers: KeyModifiers::empty(),
-            kind: KeyEventKind::Press,
-            state: KeyEventState::empty(),
-        }));
-        let captured_bytes = self.terminal.output_bytes().len();
-        if tokio::time::timeout(Duration::from_secs(2), self.task)
+        let Self {
+            terminal,
+            events,
+            mut task,
+            ..
+        } = self;
+        // Close admission even with a modal prompt open: a synthesized detach
+        // chord could otherwise become prompt text. This ends only our view.
+        drop(events);
+        let captured_bytes = terminal.output_bytes().len();
+        if tokio::time::timeout(Duration::from_secs(2), &mut task)
             .await
             .is_err()
         {
-            warn!(
-                captured_bytes,
-                "timed out waiting for real-attach playbook runtime to detach"
-            );
+            task.abort();
+            let _ = task.await;
+            warn!("owned attach detach deadline exceeded; task cancelled");
         } else {
             debug!(captured_bytes, "real-attach playbook runtime detached");
         }
@@ -594,6 +620,10 @@ async fn start_cli_attach_runtime(
     paths: Option<ConfigPaths>,
     viewport: (u16, u16),
 ) -> Result<RealAttachPlaybookRuntime> {
+    let prefix = attach_config.as_ref().map_or_else(
+        || BmuxConfig::load().unwrap_or_default().keybindings.prefix,
+        |config| config.keybindings.prefix.clone(),
+    );
     let kernel_client_factory = paths.map(|paths| {
         let factory: crate::runtime::KernelClientFactory = std::sync::Arc::new(move || {
             let paths = paths.clone();
@@ -607,36 +637,96 @@ async fn start_cli_attach_runtime(
     });
     let (inner, handle) = HeadlessAttachTerminal::new(viewport.0, viewport.1);
     let (events, event_rx) = tokio::sync::mpsc::channel(1);
+    let managed = bmux_playbook::managed::ManagedRun::from_env()?.is_some();
+    let (publisher, observer) = crate::runtime::attach::observer::attach_observer_channel();
+    let retained_observer = managed.then_some(observer);
+    let mut export = retained_observer.clone();
+    let export_identity = if managed {
+        Some((
+            PathBuf::from(
+                std::env::var_os("BMUX_PLAYBOOK_MANAGED_ROOT").context("managed root missing")?,
+            ),
+            std::env::var("BMUX_PLAYBOOK_MANAGED_GENERATION")?.parse::<u64>()?,
+        ))
+    } else {
+        None
+    };
     let mut terminal = PlaybookAttachTerminal {
         inner,
         events: event_rx,
+        action: None,
+        retained: managed,
         pending: std::sync::Mutex::new(None),
     };
     let target = session_id.to_string();
     let task = tokio::spawn(async move {
-        Box::pin(run_session_attach_with_terminal_config(
-            attach_client,
-            Some(target.as_str()),
-            None,
-            false,
-            kernel_client_factory,
-            &mut terminal,
-            attach_config,
-        ))
-        .await
+        let attach =
+            crate::runtime::attach::runtime::run_session_attach_with_terminal_config_observer(
+                attach_client,
+                Some(target.as_str()),
+                None,
+                false,
+                kernel_client_factory,
+                &mut terminal,
+                attach_config,
+                managed.then_some(publisher),
+            );
+        let output = async move {
+            if let (Some(observer), Some((root, generation))) = (export.as_mut(), export_identity) {
+                loop {
+                    let snapshot = observer
+                        .changed()
+                        .await
+                        .context("managed attach output ended")?;
+                    let frame =
+                        crate::runtime::attach::observer::transport::project_frame(&snapshot)?;
+                    let packet = bmux_playbook::managed_display::DisplayPacket {
+                        generation,
+                        epoch: snapshot.epoch,
+                        session: snapshot.attached_id,
+                        frame: bmux_web_renderer::encode_binary(&frame)?,
+                    };
+                    let root = root.clone();
+                    tokio::task::spawn_blocking(move || packet.publish(&root)).await??;
+                }
+            }
+            std::future::pending::<Result<()>>().await
+        };
+        tokio::select! {
+            result = Box::pin(attach) => result,
+            result = output => {
+                result?;
+                anyhow::bail!("managed attach export ended")
+            }
+        }
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(RealAttachPlaybookRuntime {
         terminal: handle,
         events,
         input_resolved: std::sync::atomic::AtomicBool::new(true),
+        prefix,
+        required_frame_after: std::sync::atomic::AtomicU64::new(0),
+        observer: retained_observer,
         task,
     })
 }
 
 impl RealAttach for RealAttachPlaybookRuntime {
+    fn prefix_chord(&self) -> &str {
+        &self.prefix
+    }
     fn send_event(&self, event: CrosstermEvent, deadline: Instant) -> HostFuture<'_, Uuid> {
         Box::pin(Self::send_event(self, event, deadline))
+    }
+    fn send_action(&self, action: String, deadline: Instant) -> HostFuture<'_, Uuid> {
+        Box::pin(async move {
+            // Validate before admission; arbitrary malformed commands must not
+            // be acknowledged as successful no-ops by the UI dispatcher.
+            crate::input::parse_runtime_action_name(&action)?;
+            self.send_input(CrosstermEvent::FocusGained, Some(action), deadline)
+                .await
+        })
     }
     fn ensure_input_resolved(&self) -> Result<()> {
         Self::ensure_input_resolved(self)
@@ -651,6 +741,24 @@ impl RealAttach for RealAttachPlaybookRuntime {
         self.terminal.attached_session_id()
     }
     fn rendered_text(&self, rows: u16) -> Result<String> {
+        if let Some(observer) = &self.observer {
+            let snapshot = observer
+                .latest()
+                .context("owned attach has no committed frame")?;
+            ensure!(
+                snapshot.revision
+                    > self
+                        .required_frame_after
+                        .load(std::sync::atomic::Ordering::Acquire),
+                "owned attach has no post-input committed frame"
+            );
+            let buffer = snapshot.prepared.buffer();
+            return Ok((buffer.area().y..buffer.area().bottom())
+                .take(usize::from(rows))
+                .filter_map(|row| buffer.row_symbols(row))
+                .collect::<Vec<_>>()
+                .join("\n"));
+        }
         let grid = self.terminal.output_grid()?;
         Ok(bmux_playbook::screen::terminal_grid_to_text(
             grid.grid(),
@@ -799,6 +907,36 @@ mod tests {
         )
         .await
     }
+    #[tokio::test]
+    async fn owned_action_uses_the_same_acknowledgment_fence() {
+        let (mut terminal, runtime) = acknowledged_test_runtime();
+        let target = Uuid::new_v4();
+        let action = "plugin:bmux.finder:show";
+        assert_eq!(runtime.prefix_chord(), "ctrl+b");
+        let send = runtime.send_action(action.into(), Instant::now() + Duration::from_secs(5));
+        tokio::pin!(send);
+        assert!(matches!(
+            futures_util::poll!(&mut send),
+            std::task::Poll::Pending
+        ));
+        terminal.next_event().await.unwrap().unwrap();
+        assert_eq!(terminal.take_owned_action().as_deref(), Some(action));
+        assert!(terminal.take_owned_action().is_none());
+        assert!(runtime.ensure_input_resolved().is_err());
+        terminal.set_attached_session_id(target);
+        assert_eq!(send.await.unwrap(), target);
+        assert!(runtime.ensure_input_resolved().is_ok());
+        runtime.task.abort();
+    }
+
+    #[tokio::test]
+    async fn closing_owned_admission_ends_view_even_with_other_terminal_senders() {
+        let (mut terminal, runtime) = acknowledged_test_runtime();
+        drop(runtime.events);
+        assert!(terminal.next_event().await.unwrap().is_none());
+        runtime.task.abort();
+    }
+
     fn acknowledged_test_runtime() -> (PlaybookAttachTerminal, RealAttachPlaybookRuntime) {
         let (inner, handle) = HeadlessAttachTerminal::new(10, 3);
         let (events, event_rx) = tokio::sync::mpsc::channel(1);
@@ -806,12 +944,17 @@ mod tests {
             PlaybookAttachTerminal {
                 inner,
                 events: event_rx,
+                action: None,
+                retained: false,
                 pending: std::sync::Mutex::new(None),
             },
             RealAttachPlaybookRuntime {
                 terminal: handle,
                 events,
                 input_resolved: std::sync::atomic::AtomicBool::new(true),
+                prefix: "ctrl+b".into(),
+                required_frame_after: std::sync::atomic::AtomicU64::new(0),
+                observer: None,
                 task: tokio::spawn(std::future::pending()),
             },
         )

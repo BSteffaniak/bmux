@@ -39,6 +39,10 @@ pub trait VisualTerminal: std::fmt::Debug + Send {
 /// enqueued. An unresolved delivery must fence subsequent input.
 pub trait RealAttach: Send + Sync {
     fn send_event(&self, event: Event, deadline: Instant) -> HostFuture<'_, Uuid>;
+    /// Dispatch an action in the explicitly owned attach (never audience input).
+    fn send_action(&self, action: String, deadline: Instant) -> HostFuture<'_, Uuid>;
+    /// Effective key prefix of this acquired attach, not a runner default.
+    fn prefix_chord(&self) -> &str;
     fn ensure_input_resolved(&self) -> Result<()>;
     fn wait_until_ready(&self) -> HostFuture<'_, ()>;
     fn resize(&self, cols: u16, rows: u16) -> Result<()>;

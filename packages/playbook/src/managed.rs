@@ -250,6 +250,18 @@ mod tests {
     use crate::pacing;
     use std::sync::atomic::AtomicU64;
 
+    #[test]
+    fn managed_attach_keeps_deck_driver_and_config_restrictions() {
+        let (valid, _) = crate::parse_dsl::parse_dsl("new-session\n").unwrap();
+        assert!(validate_environment(&valid).is_ok());
+        let (driver, _) =
+            crate::parse_dsl::parse_dsl("@driver real-attach\nnew-session\n").unwrap();
+        assert!(validate_environment(&driver).is_err());
+        let (config, _) =
+            crate::parse_dsl::parse_dsl("@sandbox-config /tmp/bmux.toml\nnew-session\n").unwrap();
+        assert!(validate_environment(&config).is_err());
+    }
+
     fn fixture() -> (tempfile::TempDir, ManagedRun) {
         let root = tempfile::tempdir().unwrap();
         let run = ManagedRun {

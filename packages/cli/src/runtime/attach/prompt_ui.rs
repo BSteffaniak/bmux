@@ -1232,19 +1232,21 @@ impl AttachPromptState {
         );
         let theme = component_theme(appearance).modal_theme();
         let compact = layout.surface.rect.w < 24 || layout.surface.rect.h < 8;
-        let modal = ModalFrame::new(
+        let mut modal = ModalFrame::new(
             ModalSizing::fixed(
                 Size::new(layout.surface.rect.w, layout.surface.rect.h),
                 Insets::new(0, 0, 0, 0),
             ),
             theme,
         )
-        .title(Line::raw(active.envelope.request.title.clone()))
         .padding(if compact {
             Insets::new(0, 0, 0, 0)
         } else {
             Insets::new(0, 1, 0, 1)
         });
+        if !extension_chrome {
+            modal = modal.title(Line::raw(active.envelope.request.title.clone()));
+        }
         let mut buffer = surface_buffer(area);
         let mut frame = Frame::new(&mut buffer);
         let (rendered_palette, cursor_state) = {
@@ -1253,7 +1255,19 @@ impl AttachPromptState {
                 ModalFrameComponent::new("prompt.overlay", modal.clone(), TextBlock::new(""))
                     .chrome(!extension_chrome);
             paint_component(&modal_component, area, &mut cx);
-            let content = modal.content_area(area);
+            let mut content = modal.content_area(area);
+            if extension_chrome && content.height > 0 {
+                // Extensions paint border cells after prompt content. Keep the
+                // title inside their border, and reserve its row in the same
+                // geometry used by every prompt control and hit map.
+                cx.write_line_with_fallback_style(
+                    LocalRect::terminal(Rect::new(content.x, content.y, content.width, 1)),
+                    &Line::raw(active.envelope.request.title.clone()),
+                    theme.title,
+                );
+                content.y = content.y.saturating_add(1);
+                content.height = content.height.saturating_sub(1);
+            }
             let rendered_palette = render_command_palette(active, content, &mut cx, theme);
             let rendered_single_select =
                 !rendered_palette && render_single_select(active, content, &mut cx, theme);
@@ -2846,7 +2860,9 @@ fn prompt_estimated_width(request: &PromptRequest) -> usize {
 }
 
 fn prompt_estimated_lines(request: &PromptRequest) -> usize {
-    let mut lines = 0usize;
+    // Reserve an interior title row even when fallback chrome can place it on
+    // the border: extension-owned borders must not occlude the prompt title.
+    let mut lines = 1usize;
     if let Some(message) = &request.message {
         lines = lines.saturating_add(message.lines().count().max(1));
     }
@@ -2857,7 +2873,8 @@ fn prompt_estimated_lines(request: &PromptRequest) -> usize {
         PromptField::SingleSelect { options, .. } | PromptField::MultiToggle { options, .. } => {
             options.len().max(1)
         }
-        PromptField::SearchSelect { options, .. } => options.len().saturating_add(1).max(2),
+        // Query input and its separating blank row precede the result list.
+        PromptField::SearchSelect { options, .. } => options.len().saturating_add(2).max(3),
         PromptField::Form { sections, .. } => sections
             .iter()
             .map(|section| 1usize.saturating_add(section.fields.len()))
@@ -3427,7 +3444,8 @@ mod tests {
             },
         )
         .expect("short layout");
-        assert_eq!((layout.surface.rect.w, layout.surface.rect.h), (90, 7));
+        // Interior title and the search/list separator each need their own row.
+        assert_eq!((layout.surface.rect.w, layout.surface.rect.h), (90, 8));
     }
 
     #[test]
@@ -4135,6 +4153,55 @@ mod tests {
             render.surface.rect.y,
             (60_u16.saturating_sub(render.surface.rect.h)) / 3
         );
+    }
+
+    #[test]
+    fn extension_owned_finder_title_and_results_remain_inside_80_by_24_modal() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::search_select(
+                "Find Tab",
+                vec![
+                    PromptOption::new("logs", "operations/logs"),
+                    PromptOption::new("build", "default/build"),
+                    PromptOption::new("api", "default/api"),
+                ],
+            )
+            .message("Search tabs across all workspaces"),
+            AttachInternalPromptAction::QuitSession,
+        );
+        for _ in 0..2 {
+            let render = state
+                .attach_prompt_overlay_render(
+                    TerminalGeometry { cols: 80, rows: 24 },
+                    &RuntimeAppearance::default(),
+                    true,
+                )
+                .expect("finder render");
+            let rect = render.surface.rect;
+            for expected in [
+                "Find Tab",
+                "Search tabs across all workspaces",
+                "default/api",
+            ] {
+                assert!(
+                    render.ops.iter().any(|op| {
+                        matches!(op, bmux_plugin::RenderOp::TextRun { x, y, text, .. }
+                            if text.contains(expected)
+                                && *x > rect.x && *x < rect.x + rect.w - 1
+                                && *y > rect.y && *y < rect.y + rect.h - 1)
+                    }),
+                    "{expected} must survive extension border repaint"
+                );
+            }
+            let active = state.active.as_ref().expect("finder active");
+            assert!(active.list_viewport.y > rect.y + 1);
+            assert!(active.hits.regions().iter().any(|hit| {
+                hit.id.as_str() == "command-list.item.2"
+                    && hit.area.y > rect.y
+                    && hit.area.bottom() < rect.y + rect.h
+            }));
+        }
     }
 
     #[test]

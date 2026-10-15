@@ -1,28 +1,34 @@
-//! Parent-owned bounded reader for the confirmed private retained-attach wire.
+//! Parent-owned bounded readers for retained attach output.
+//! Managed output is a same-view repair, not a second attach or input endpoint.
 //! No pane reconstruction, stdout capture, terminal input, or ANSI decoding.
 use bmux_tui::embedded_surface::{RetainedSurface, SurfaceIdentity, SurfaceLimits};
 use std::sync::Arc;
+#[cfg(test)]
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     sync::watch,
 };
 
+#[cfg(test)]
 #[derive(Debug)]
 pub enum CaptureError {
     Closed,
     Truncated(&'static str),
     Failure(String),
 }
+#[cfg(test)]
 impl From<String> for CaptureError {
     fn from(message: String) -> Self {
         Self::Failure(message)
     }
 }
+#[cfg(test)]
 impl From<&str> for CaptureError {
     fn from(message: &str) -> Self {
         Self::Failure(message.into())
     }
 }
+#[cfg(test)]
 impl std::fmt::Display for CaptureError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -33,6 +39,7 @@ impl std::fmt::Display for CaptureError {
     }
 }
 
+#[cfg(test)]
 async fn read_part<R: AsyncRead + Unpin>(
     reader: &mut R,
     bytes: &mut [u8],
@@ -160,8 +167,133 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 const MAGIC: &[u8; 5] = b"BMAO\x01";
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+pub struct ManagedCaptureCursor {
+    epoch: Option<uuid::Uuid>,
+    generation: Option<u64>,
+    revision: u64,
+}
+
+impl ManagedCaptureCursor {
+    pub fn admit(
+        &mut self,
+        packet: bmux_playbook::managed_display::DisplayPacket,
+        owner: &str,
+    ) -> Result<Option<CaptureSnapshot>, String> {
+        if self.epoch.is_some_and(|epoch| epoch != packet.epoch)
+            || self
+                .generation
+                .is_some_and(|generation| generation != packet.generation)
+        {
+            return Err("managed attach lifetime changed without owner admission".into());
+        }
+        let frame = bmux_web_renderer::decode_binary(&packet.frame, None)
+            .map_err(|error| format!("{error:?}"))?;
+        if frame.generation() != format!("{}:{}", packet.epoch, packet.session) {
+            return Err("managed attach frame identity mismatch".into());
+        }
+        if frame.revision() < self.revision || frame.revision() == 0 {
+            return Err("stale managed attach revision".into());
+        }
+        if frame.revision() == self.revision {
+            return Ok(None);
+        }
+        let surface = RetainedSurface::new(
+            SurfaceIdentity {
+                owner: owner.into(),
+                generation: packet.generation,
+                revision: frame.revision(),
+            },
+            Arc::new(frame.buffer().clone()),
+            Arc::new(frame.image_scene().clone()),
+            SurfaceLimits {
+                max_cells: 262_144,
+                max_bytes: MAX_FRAME_BYTES,
+            },
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        self.epoch = Some(packet.epoch);
+        self.generation = Some(packet.generation);
+        self.revision = frame.revision();
+        Ok(Some(CaptureSnapshot {
+            attempt_generation: packet.generation,
+            epoch: packet.epoch,
+            session: packet.session,
+            frame: Arc::new(frame),
+            surface: Arc::new(surface),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::*;
+
+    fn packet(
+        epoch: uuid::Uuid,
+        session: uuid::Uuid,
+        revision: u64,
+    ) -> bmux_playbook::managed_display::DisplayPacket {
+        let prepared = bmux_tui::presentation::PresentationState::new(
+            bmux_tui::geometry::Rect::new(0, 0, 2, 1),
+        )
+        .prepare(bmux_tui::damage::Damage::Full, |_| {})
+        .unwrap();
+        let frame = bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
+            &format!("{epoch}:{session}"),
+            revision,
+            &prepared,
+        )
+        .unwrap();
+        bmux_playbook::managed_display::DisplayPacket {
+            generation: 7,
+            epoch,
+            session,
+            frame: bmux_web_renderer::encode_binary(&frame).unwrap(),
+        }
+    }
+
+    #[test]
+    fn same_attach_retarget_keeps_epoch_and_rejects_stale_or_foreign_repairs() {
+        let epoch = uuid::Uuid::new_v4();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let mut cursor = ManagedCaptureCursor::default();
+        let retained = cursor
+            .admit(packet(epoch, first, 1), "owner")
+            .unwrap()
+            .unwrap();
+        assert!(
+            cursor
+                .admit(packet(epoch, first, 1), "owner")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cursor
+                .admit(packet(uuid::Uuid::new_v4(), second, 2), "owner")
+                .is_err()
+        );
+        assert_eq!(retained.session, first);
+        let next = cursor
+            .admit(packet(epoch, second, 2), "owner")
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.session, second);
+        assert!(cursor.admit(packet(epoch, first, 1), "owner").is_err());
+        let mut foreign = packet(epoch, second, 3);
+        foreign.generation = 8;
+        assert!(cursor.admit(foreign, "owner").is_err());
+        let mut mismatch = packet(epoch, second, 3);
+        mismatch.session = first;
+        assert!(cursor.admit(mismatch, "owner").is_err());
+        assert_eq!(cursor.revision, 2);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CaptureSnapshot {
@@ -175,6 +307,7 @@ pub struct CaptureSnapshot {
 /// Reads only an explicitly admitted owned connection. A complete valid header
 /// establishes this observer's epoch; subsequent frames cannot change it.
 /// EOF/rejection leaves the receiver's last complete accepted snapshot intact.
+#[cfg(test)]
 pub async fn read_capture<R: AsyncRead + Unpin>(
     mut reader: R,
     owner: String,

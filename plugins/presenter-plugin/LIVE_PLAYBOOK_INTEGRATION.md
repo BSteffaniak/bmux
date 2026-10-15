@@ -23,6 +23,86 @@ The shipped `examples/live-demo.md` and `examples/live-demo.dsl` exercise this
 path. See README for local and managed commands. Runtime acceptance and compiler
 validation remain coordinator-owned; source wiring alone is not proof of parity.
 
+## Real attach prompts and navigation
+
+Managed playbooks keep the default sandbox driver. `@driver real-attach` and
+`@sandbox-config` remain rejected. The trusted runner internally acquires a
+terminal-free real attach with acknowledged input; decks cannot choose another
+runtime or provide an audience input endpoint.
+
+Use runtime actions to run caller-process commands in that same attach:
+
+```text
+new-session name=demo
+attach-command action='plugin:bmux.tabs:new-tab --name editor'
+attach-command action='plugin:bmux.tabs:new-tab --name logs'
+attach-command action='plugin:bmux.tabs:prev-tab'
+attach-command action='plugin:bmux.tabs:next-tab'
+attach-command action='plugin:bmux.finder:show'
+wait-rendered contains='Find Tab' timeout=5000
+assert-rendered contains='Find Tab'
+paste-attach text='editor'
+send-attach key=enter
+sleep ms=300
+attach-command action='plugin:bmux.theme:pick-theme'
+wait-rendered contains='Select Theme' timeout=5000
+send-attach key=down
+sleep ms=300
+send-attach key=enter
+```
+
+`attach-command action=...` accepts the normal runtime action syntax, including
+quoted plugin arguments. It shares the keyboard admission/acknowledgment fence;
+an unresolved delivery stops subsequent actions, including direct pane input.
+Command acknowledgment is not asynchronous prompt readiness: always wait for the
+actual prompt before typing. `wait-rendered` waits for a committed post-input
+frame containing the requested text. `assert-rendered` reads that same retained
+buffer, not a pane grid or simulated UI. Counter-based `@render-trace` is rejected
+for managed runs rather than asserted against a different render path.
+
+`send-keys` still targets a pane. Use `paste-attach` and `send-attach` for prompt
+text/navigation. `prefix-key key=c` sends the owned attach's effective configured
+prefix followed by `c` through its actual keyboard runtime (not a direct tab
+service call). For fixed presentation geometry use `@viewport cols=80 rows=24`;
+80 by 24 is also the default. Finder searches real tabs across workspaces, not arbitrary
+standalone sessions. Theme picker lists the catalog available in the generated
+isolated configuration; host-local custom theme files are not implicitly copied.
+Ensure the relevant bundled plugins are present. A sleep is presentation pacing,
+not proof of prompt completion or tab selection; assert target content where
+possible.
+
+Equivalent TOML controls use `text` for the runtime action and `timeout_ms`:
+
+```toml
+[[step]]
+action = "attach-command"
+text = "plugin:bmux.finder:show"
+
+[[step]]
+action = "wait-rendered"
+contains = "Find Tab"
+timeout_ms = 5000
+```
+
+The presenter reads atomic bounded BMSD1 repairs in the service-owned attempt
+root from the runner's **same** attach. Each repair binds attempt generation,
+attach epoch, target UUID and the unchanged retained BrowserFrame encoding. A
+retarget retains the attach epoch and advances its presentation revision. Old,
+foreign, partial or failed repairs never replace the last accepted scene. No
+second observer process is launched. BMAO1 remains fixed-target and output-only;
+its reader, magic, framing and rejection behavior are unchanged. Old executables
+without managed-display export do not receive a second-view fallback.
+
+Existing services remain useful for typed callers: `bmux.theme.write`, command
+interface `theme-control-v1`, offers `current`, revision-checked `select`,
+`refresh`, and token-scoped preview operations. These mutate theme state but do
+not open the picker. `bmux.tabs.write` / `tabs-commands` offers `new-tab` and
+`switch-tab`; `bmux.sessions.write` / `sessions-commands` offers `new-session`
+and `select-session`. Raw playbook `invoke-service` is not a JSON-to-BPDL bridge:
+it sends UTF-8 payload bytes, whereas these contracts use typed-stable encoding.
+Use the owned attach commands above for visible interaction, not JSON payloads
+or fabricated prompt surfaces.
+
 ## Trust
 
 The approval belongs to the execution owner, never to deck JSON or audience

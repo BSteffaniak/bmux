@@ -322,11 +322,22 @@ fn terminal_command_operations(
                 });
                 x = x.saturating_add(render_text_width_u16(text));
             }
-            TerminalCommand::EraseCells { x, y, width, style } => {
+            TerminalCommand::EraseCells {
+                x: erase_x,
+                y: erase_y,
+                width,
+                style: erase_style,
+            } => {
                 operations.push(crate::projection::PaintOperation::Fill {
-                    rect: bmux_tui::geometry::Rect::new(*x, *y, *width, 1),
-                    style: crate::projection::style(*style),
+                    rect: bmux_tui::geometry::Rect::new(*erase_x, *erase_y, *width, 1),
+                    style: crate::projection::style(*erase_style),
                 });
+                // Native delivery sets style, moves, and prints spaces. The
+                // optimizer can elide the next move/style based on these effects;
+                // neutral capture must carry exactly the same state forward.
+                x = erase_x.saturating_add(*width);
+                y = *erase_y;
+                style = *erase_style;
             }
         }
     }
@@ -7459,6 +7470,74 @@ mod tests {
             crate::projection::capture_neutral(|| super::capture_terminal_commands(&commands));
         assert_eq!(operations.len(), 300);
         assert!(operations.iter().all(|op| matches!(op, crate::projection::PaintOperation::Text { text, .. } if text.len() == 600)));
+    }
+
+    #[test]
+    fn optimized_erase_preserves_neutral_cursor_and_style() {
+        let style = RenderStyle {
+            bold: true,
+            ..RenderStyle::default()
+        };
+        let commands = optimize_terminal_commands(&[
+            TerminalCommand::EraseCells {
+                x: 4,
+                y: 7,
+                width: 3,
+                style,
+            },
+            TerminalCommand::ApplyStyle(style),
+            TerminalCommand::MoveTo { x: 7, y: 7 },
+            TerminalCommand::Print("label".into()),
+        ]);
+        assert_eq!(commands.len(), 2, "move and style should be elided");
+        let operations = super::terminal_command_operations(&commands);
+        assert!(matches!(
+            &operations[1],
+            crate::projection::PaintOperation::Text { x: 7, y: 7, text, style: captured }
+                if text == "label" && *captured == crate::projection::style(style)
+        ));
+    }
+
+    #[test]
+    fn offset_component_buffer_matches_neutral_retained_projection() {
+        use bmux_tui::{
+            buffer::Buffer,
+            frame::Frame,
+            geometry::Rect,
+            paint::PaintCx,
+            style::{Modifier, Style},
+            text::Line,
+        };
+
+        let area = Rect::new(2, 4, 76, 16);
+        let mut source = Buffer::empty(area);
+        for (row, label) in ["Select Theme", "Use configured theme", "cyberpunk"]
+            .into_iter()
+            .enumerate()
+        {
+            source.write_line_with_fallback_style(
+                Rect::new(5, 5 + u16::try_from(row).unwrap(), 70, 1),
+                &Line::raw(label),
+                Style::new().add_modifier(Modifier::BOLD),
+            );
+        }
+        let ops = bmux_plugin::component_render::buffer_render_ops(&source);
+        let (result, operations) = crate::projection::capture_neutral(|| {
+            queue_render_ops(
+                &mut Vec::new(),
+                ExtensionRect::new(area.x, area.y, area.width, area.height),
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+        });
+        assert!(result.unwrap());
+        let mut projected = Buffer::empty(area);
+        let mut frame = Frame::new(&mut projected);
+        crate::projection::paint(&mut PaintCx::new(&mut frame), &operations);
+        for y in area.y..area.bottom() {
+            assert_eq!(projected.row_symbols(y), source.row_symbols(y), "row {y}");
+        }
+        assert!(projected.row_symbols(7).unwrap().contains("cyberpunk"));
     }
 
     #[test]

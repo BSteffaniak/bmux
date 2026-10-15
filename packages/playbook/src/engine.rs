@@ -574,6 +574,20 @@ pub struct AttachInputState {
     scrollback_offset: usize,
 }
 
+impl AttachInputState {
+    fn select_target(&mut self, session_id: Uuid, context_id: Option<Uuid>) {
+        self.attached_id = session_id;
+        self.attached_context_id = context_id;
+        if let Some(context_id) = context_id
+            && !self.window_context_ids.contains(&context_id)
+        {
+            self.window_context_ids.push(context_id);
+        }
+        self.scrollback_active = false;
+        self.scrollback_offset = 0;
+    }
+}
+
 #[derive(Default)]
 struct PlaybookRenderTraceState {
     enabled: bool,
@@ -1412,6 +1426,12 @@ fn validate_render_assertion(
 }
 
 impl AttachInputRuntime {
+    fn select_attachment(&mut self, attach_info: &bmux_client::AttachOpenInfo) {
+        self.state
+            .select_target(attach_info.session_id, attach_info.context_id);
+        self.processor.set_scroll_mode(false);
+    }
+
     pub fn new(attach_info: bmux_client::AttachOpenInfo, host: Arc<dyn HostAdapter>) -> Self {
         let mut config = BmuxConfig::default();
         "normal".clone_into(&mut config.keybindings.initial_mode);
@@ -2186,6 +2206,14 @@ async fn run_playbook_inner(
     let mut managed = super::managed::ManagedRun::from_env()?;
     if managed.is_some() {
         super::managed::validate_environment(&playbook)?;
+        ensure!(
+            !playbook.config.render_trace,
+            "managed render counters are unavailable; use wait-rendered/assert-rendered on the owned attach"
+        );
+        ensure!(
+            !target_server,
+            "managed execution cannot target a live server"
+        );
     }
     let playbook_name = playbook.config.name.clone();
     let should_record = playbook.config.record && managed.is_none();
@@ -2511,7 +2539,8 @@ async fn run_playbook_inner(
                     step.action.name(),
                     elapsed_ms
                 );
-                if matches!(playbook.config.driver, PlaybookDriver::RealAttach)
+                if (managed.is_some()
+                    || matches!(playbook.config.driver, PlaybookDriver::RealAttach))
                     && real_attach_runtime.is_none()
                     && matches!(step.action, Action::NewSession { .. })
                     && let Some(sid) = session_id
@@ -2530,6 +2559,9 @@ async fn run_playbook_inner(
                     .await
                     {
                         Ok(runtime) => real_attach_runtime = Some(runtime),
+                        Err(error) if managed.is_some() => {
+                            return Err(error.context("failed starting owned managed attach"));
+                        }
                         Err(error) => warn!(%error, "failed starting real-attach playbook runtime"),
                     }
                 }
@@ -3542,6 +3574,11 @@ async fn execute_step_paced(
     playback_speed: crate::PlaybackSpeed,
     pacing_credit: &std::sync::atomic::AtomicU64,
 ) -> Result<Option<String>> {
+    if let Some(runtime) = real_attach_runtime {
+        // An uncertain delivery fences every later action, including direct
+        // pane input and new-session, not just the next attach keystroke.
+        runtime.ensure_input_resolved()?;
+    }
     if let Some(runtime) = real_attach_runtime
         && let Some(observed) = runtime.0.attached_session_id()
         && Some(observed) != *session_id
@@ -3560,7 +3597,43 @@ async fn execute_step_paced(
     let result = match &step.action {
         Action::NewSession { name } => {
             let resolved_name = name.as_ref().map(|n| runtime_vars.resolve_opt(n));
-            let sid = typed_new_session_playbook(client, resolved_name.clone()).await?;
+            if let Some(runtime) = real_attach_runtime {
+                let mut action = "plugin:bmux.sessions:new-session".to_owned();
+                if let Some(name) = &resolved_name {
+                    action.push_str(" --name ");
+                    action.push_str(&serde_json::to_string(name)?);
+                }
+                let target = runtime.0.send_action(action, deadline).await?;
+                reconcile_real_attach_target(target, client, session_id, runtime_vars).await?;
+                runtime_vars.session_name = resolved_name;
+                return Ok(Some(format!("session_id={target}")));
+            }
+            let (sid, initial_context) = if managed.is_some() {
+                // Session allocation deliberately does not create a tab. The
+                // managed attach must start from a real context so subsequent
+                // tabs can navigate back to this original shell.
+                let context = bmux_contexts_plugin_api::contexts_commands::client::create_context(
+                    client,
+                    resolved_name.clone(),
+                    BTreeMap::from([("workspace".to_owned(), "default".to_owned())]),
+                )
+                .await
+                .context("managed initial context creation failed")?
+                .map_err(|error| {
+                    anyhow::anyhow!("managed initial context creation failed: {error:?}")
+                })?;
+                (
+                    context
+                        .session_id
+                        .context("created context has no session")?,
+                    Some(context.id),
+                )
+            } else {
+                (
+                    typed_new_session_playbook(client, resolved_name.clone()).await?,
+                    None,
+                )
+            };
             debug!("created session {sid}");
 
             // Update runtime vars
@@ -3570,10 +3643,14 @@ async fn execute_step_paced(
             runtime_vars.focused_pane = 1;
 
             // Attach to the session
-            let grant = client
-                .attach_grant(SessionSelector::ById(sid))
-                .await
-                .map_err(|e| anyhow::anyhow!("attach grant failed: {e}"))?;
+            let grant = if let Some(context_id) = initial_context {
+                client
+                    .attach_context_grant(bmux_context_state::ContextSelector::ById(context_id))
+                    .await
+            } else {
+                client.attach_grant(SessionSelector::ById(sid)).await
+            }
+            .map_err(|e| anyhow::anyhow!("attach grant failed: {e}"))?;
             let attach_info = client
                 .open_attach_stream_info(&grant)
                 .await
@@ -3585,7 +3662,15 @@ async fn execute_step_paced(
 
             *session_id = Some(sid);
             *attached = true;
-            *attach_runtime = Some(AttachInputRuntime::new(attach_info, client.host().clone()));
+            // A new session changes the input target, not the lifetime of the
+            // runner's navigation history. Replacing this runtime discarded all
+            // previously created contexts, leaving next/previous tab with only
+            // the newest context to navigate.
+            if let Some(runtime) = attach_runtime.as_mut() {
+                runtime.select_attachment(&attach_info);
+            } else {
+                *attach_runtime = Some(AttachInputRuntime::new(attach_info, client.host().clone()));
+            }
             let current_context_id = current_context_playbook(client)
                 .await
                 .ok()
@@ -4118,9 +4203,44 @@ async fn execute_step_paced(
             Ok(None)
         }
 
+        Action::AttachCommand { action } => {
+            let runtime = real_attach_runtime.context("attach-command requires an owned attach")?;
+            runtime.wait_until_ready().await?;
+            let target = runtime
+                .0
+                .send_action(runtime_vars.resolve_opt(action), deadline)
+                .await?;
+            reconcile_real_attach_target(target, client, session_id, runtime_vars).await?;
+            Ok(Some(format!("session_id={target}")))
+        }
+        Action::WaitRendered { contains, timeout } => {
+            let runtime = real_attach_runtime.context("wait-rendered requires an owned attach")?;
+            let expected = runtime_vars.resolve_opt(contains);
+            let until = deadline.min(Instant::now() + *timeout);
+            loop {
+                runtime.ensure_input_resolved()?;
+                if runtime
+                    .0
+                    .rendered_text(*viewport_rows)
+                    .is_ok_and(|text| text.contains(&expected))
+                {
+                    if let Some(target) = runtime.0.attached_session_id() {
+                        reconcile_real_attach_target(target, client, session_id, runtime_vars)
+                            .await?;
+                    }
+                    break;
+                }
+                ensure!(
+                    Instant::now() < until,
+                    "wait-rendered timed out waiting for {expected:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Ok(None)
+        }
         Action::PasteAttach { text } => {
             let real_attach =
-                real_attach_runtime.context("paste-attach requires @driver real-attach")?;
+                real_attach_runtime.context("paste-attach requires an owned attach")?;
             real_attach
                 .send_paste(text, deadline)
                 .await
@@ -4168,7 +4288,8 @@ async fn execute_step_paced(
         }
 
         Action::PrefixKey { key } => {
-            let key = format!("ctrl+a {key}");
+            let prefix = real_attach_runtime.map_or("ctrl+a", |runtime| runtime.0.prefix_chord());
+            let key = format!("{prefix} {key}");
             if let Some(real_attach) = real_attach_runtime {
                 execute_real_attach_chord(
                     &key,
@@ -5015,6 +5136,43 @@ fn session_plugin_bus_event_matches(kind: &str, payload: &[u8], name: &str) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selecting_attachment_preserves_navigation_order_and_resets_scrollback() {
+        let first_context = Uuid::new_v4();
+        let second_context = Uuid::new_v4();
+        let first_session = Uuid::new_v4();
+        let second_session = Uuid::new_v4();
+        let mut state = AttachInputState {
+            attached_id: first_session,
+            attached_context_id: Some(first_context),
+            window_context_ids: vec![first_context],
+            scrollback_active: true,
+            scrollback_offset: 42,
+        };
+
+        state.select_target(second_session, Some(second_context));
+        assert_eq!(state.attached_id, second_session);
+        assert_eq!(state.attached_context_id, Some(second_context));
+        assert_eq!(
+            state.window_context_ids,
+            vec![first_context, second_context]
+        );
+        assert!(!state.scrollback_active);
+        assert_eq!(state.scrollback_offset, 0);
+
+        state.select_target(first_session, Some(first_context));
+        assert_eq!(
+            state.window_context_ids,
+            vec![first_context, second_context]
+        );
+        state.select_target(second_session, None);
+        assert_eq!(state.attached_context_id, None);
+        assert_eq!(
+            state.window_context_ids,
+            vec![first_context, second_context]
+        );
+    }
     fn pane_capture(index: u32, screen_text: &str) -> PaneCapture {
         PaneCapture {
             index,

@@ -196,6 +196,13 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
             let key = step.key.context("send-attach requires 'key'")?;
             Ok(Action::SendAttach { key })
         }
+        "attach-command" => Ok(Action::AttachCommand {
+            action: step.text.context("attach-command requires 'text'")?,
+        }),
+        "wait-rendered" => Ok(Action::WaitRendered {
+            contains: step.contains.context("wait-rendered requires 'contains'")?,
+            timeout: Duration::from_millis(step.timeout_ms.unwrap_or(5000)),
+        }),
         "paste-attach" => {
             let text = step.text.context("paste-attach requires 'text'")?;
             Ok(Action::PasteAttach { text })
@@ -468,6 +475,28 @@ struct RawStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_owned_attach_controls() {
+        let (playbook, _) = parse_toml(
+            r#"
+[[step]]
+action = "attach-command"
+text = "plugin:bmux.finder:show"
+[[step]]
+action = "wait-rendered"
+contains = "Find Tab"
+timeout_ms = 1234
+"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&playbook.steps[0].action, Action::AttachCommand { action } if action == "plugin:bmux.finder:show")
+        );
+        assert!(
+            matches!(&playbook.steps[1].action, Action::WaitRendered { timeout, .. } if *timeout == Duration::from_millis(1234))
+        );
+    }
 
     #[test]
     fn parse_minimal_toml() {

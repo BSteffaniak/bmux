@@ -117,6 +117,12 @@ pub trait AttachTerminal: Write {
 
     fn next_event(&mut self) -> AttachTerminalEventFuture<'_>;
 
+    /// Optional trusted in-process action accompanying the just-consumed event.
+    /// Ordinary terminals and read-only observers cannot supply one.
+    fn take_owned_action(&mut self) -> Option<String> {
+        None
+    }
+
     fn restore_after_attach_ui(&mut self) -> Result<()>;
 
     fn set_attached_session_id(&self, _session_id: Uuid) {}
@@ -3495,7 +3501,7 @@ pub async fn run_session_attach_with_terminal_config<T: AttachTerminal + ?Sized>
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Preserve legacy wrappers while threading an explicitly scoped observer through attach lifetime.
-async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?Sized>(
+pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?Sized>(
     mut client: BmuxClient,
     target: Option<&str>,
     follow: Option<&str>,
@@ -4010,7 +4016,16 @@ async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?S
                     display_capture.record_resize(*cols, *rows);
                 }
 
-                match handle_attach_loop_event(
+                let control = if let Some(action) = terminal.take_owned_action() {
+                    handle_attach_action_dispatch(
+                        &mut client,
+                        bmux_plugin_sdk::ActionDispatchRequest::new(action),
+                        &mut view_state,
+                        kernel_client_factory.as_ref(),
+                        true,
+                    ).await?
+                } else {
+                    handle_attach_loop_event(
                     AttachLoopEvent::Terminal(terminal_event),
                     &mut client,
                     &mut attach_input_processor,
@@ -4023,7 +4038,8 @@ async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal + ?S
                     kernel_client_factory.as_ref(),
                 )
                 .await?
-                {
+                };
+                match control {
                     AttachLoopControl::Continue => {}
                     AttachLoopControl::Break(reason) => {
                         exit_reason = reason;
@@ -11220,6 +11236,7 @@ pub async fn handle_attach_loop_event(
                 dispatch_request,
                 view_state,
                 kernel_client_factory,
+                false,
             )
             .await
         }
@@ -12446,6 +12463,7 @@ async fn handle_attach_action_dispatch(
     dispatch_request: bmux_plugin_sdk::ActionDispatchRequest,
     view_state: &mut AttachViewState,
     kernel_client_factory: Option<&KernelClientFactory>,
+    strict: bool,
 ) -> Result<AttachLoopControl> {
     let now = SystemAttachClock.now();
     let action_str = &dispatch_request.action;
@@ -12453,6 +12471,9 @@ async fn handle_attach_action_dispatch(
     let action = match parse_action(action_str) {
         Ok(action) => action,
         Err(error) => {
+            if strict {
+                return Err(error);
+            }
             warn!(action = %action_str, %error, "invalid dispatched attach action");
             view_state.set_transient_status(
                 format!("invalid dispatched action: {error}"),
@@ -12492,6 +12513,9 @@ async fn handle_attach_action_dispatch(
             )
             .await
             {
+                if strict {
+                    return Err(map_attach_client_error(error));
+                }
                 view_state.set_transient_status(
                     format!(
                         "dispatched plugin action failed: {}",

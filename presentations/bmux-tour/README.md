@@ -1,34 +1,80 @@
 # BMUX engineering tour
 
-A 15-minute technical walkthrough for engineers, with no assumed contributor background. Eight main slides, with deeper material in a separate appendix.
+A feature-led narrative: **feature + embedded run on the same slide**, followed by exact implementation excerpts and the relevant ownership/failure boundary. Choose quick or deeper paths chapter by chapter; there is no fixed slide-count or duration requirement.
 
 ## Files
 
-- [Main deck](deck.md): audience content, timed presenter notes, and transitions.
-- [Appendix](appendix.md): six optional technical slides for questions.
-- [Sources](sources.md): code/docs supporting the technical claims.
-- `assets/`: editable SVG diagrams and bundled PNGs used by the deck.
+- [deck.md](deck.md): opening; splits/layout; tabs/sessions/workspaces; cross-workspace finder; theme composition/control; rendering/flush; playbooks as evidence; presentation/browser reuse; close.
+- [appendix.md](appendix.md): optional technical discussion, including distributed contracts.
+- [sources.md](sources.md): excerpt provenance, evidence limits, and final rehearsal checklist.
+- `demos/`: the six embedded playbooks. Parsing the deck does not execute them.
+- `assets/`: optional diagrams; the narrative does not depend on them.
 
-## Present
+Preserve stable `bmux:slide-id` and `bmux:block-id` identities when editing. Component identity participates in controller/reload behavior; do not reuse an ID for a different execution casually.
 
-From the repository root, with a current BMUX build and the presenter plugin installed:
+## What the demos establish
+
+All six actual embedded demos passed managed execution acceptance, with private evidence retained at `/tmp/pw-oa5bi7zp`. They use generated isolated configuration and managed single-authority attach support, not a user's running session.
+
+| Block ID / source | Demonstrated behavior |
+| --- | --- |
+| `demo-panes` / `demos/panes.dsl` | Three panes, focus changes, layout/screen assertions |
+| `demo-navigation` / `demos/navigation.dsl` | Original shell state survives tab switching; workspace switching returns to existing work |
+| `demo-finder` / `demos/finder.dsl` | Real fuzzy `api` query across default/operations, Enter selects the API tab |
+| `demo-themes` / `demos/themes.dsl` | Select Theme opens, Down previews rendered cyberpunk, Enter confirms; shell continues |
+| `demo-rendering` / `demos/rendering.dsl` | Numbered text, in-place update, scrolling; **not fault injection** |
+| `demo-evidence` / `demos/evidence.dsl` | Real layout/screen assertions and `verified-demo` snapshot |
+
+The acceptance harness observes HTTP frames and managed results. **It does not establish browser/Canvas rendering, audience geometry, or final note privacy.** A fixture label such as “12 passed” is not a repository test result. Demo acceptance is not a claim that all project validation is complete.
+
+## Present with an approved executable
+
+Review scripts/includes as executable input before approval. Isolated runtime/config/data paths are **not a security sandbox** for shell actions. Managed execution rejects `real-attach`, custom `@sandbox-config`, and `BMUX_`/`XDG_` environment runtime-selector overrides. Managed attach support does not relax these restrictions.
+
+From the repository root, replace the placeholder with an explicitly approved immutable native artifact:
 
 ```sh
-bmux present play presentations/bmux-tour/deck.md
+/path/to/approved/bmux present play presentations/bmux-tour/deck.md --allow-playbooks --no-reload
 ```
 
-For rehearsal with speaker notes:
+Add `--presenter` for private local speaker notes. Select matching presenter/playbook plugins and managed-worker/observer protocols. Record executable identity/hash; protocol compatibility alone does not authenticate content. Approval covers the actual frozen script/include bytes; changed executable input requires fresh approval. `--no-reload` keeps presentation inputs stable.
+
+See [live component controls](../../docs/live-components.md):
+
+| Control | Meaning |
+| --- | --- |
+| Tab, then `o` | Focus demo and open overlay; does not start execution |
+| `r` | Explicitly prepare/start |
+| `p` / `n` / `c` | Pause / one whole action including waits / resume at boundaries |
+| `s` | Request stop |
+| `R` | Restart a new generation after cleanup acknowledgment |
+| Escape | Hide overlay only; execution may continue |
+| Leave slide | Request stop; retained final output remains inspectable |
+| `q` / Ctrl-C | Exit local presenter and request owned cleanup |
+
+Use arrows/Space for normal slide navigation outside the overlay. A step is not seek/replay. A stop request is not cleanup acknowledgment; inspect unresolved diagnostics. The audience observer is output-only. Scripted attach commands/input exercise the owned managed runtime, not arbitrary audience keyboard/paste access.
+
+## Repeat acceptance with explicit artifacts
+
+[The tour harness](../../scripts/presenter-tour-acceptance.py) requires existing artifacts; it does not build them or attach to an existing user runtime:
 
 ```sh
-bmux present play presentations/bmux-tour/deck.md --presenter
+python3 scripts/presenter-tour-acceptance.py \
+  --binary /absolute/path/to/approved/bmux \
+  --plugins /absolute/path/to/matching/plugins \
+  --assets /absolute/path/to/matching/web-assets \
+  --browser /absolute/path/to/browser \
+  --mermaid-worker /absolute/path/to/matching/bmux-mermaid-worker \
+  --state-parent /tmp
 ```
 
-Use arrows/Space to advance, Left to return, and q to quit. Do not screen-share the presenter viewport: it contains private notes. Verify a separate audience display arrangement before presenting with notes.
+All six demos run by default; `--demos finder themes` selects a subset. The current harness requires `--browser` as an explicit artifact input but checks HTTP snapshots, not a browser/Canvas scene. Keep its printed evidence directory private: PTY output and runner artifacts may contain sensitive details. Compare the actual artifacts and source bytes when repeating a run; the recorded pass is not approval for arbitrary replacements.
 
-PNG diagrams require a supported terminal image protocol. Check legibility at the actual audience dimensions before the talk. Keep the assets beside the deck when copying it.
+## Final audience and privacy rehearsal
 
-The deck runs locally without a Mermaid worker, network fetches, credentials, or custom Rust registrations.
-
-## Prepare
-
-Rehearse using the notes embedded in the slides. Add your real motivation sentence and approve the closing next-step wording. Target 14 minutes, leaving a minute for delays or questions.
+1. Approve the executable and current scripts; rehearse manual controls, stop/cleanup, and restart on the intended setup.
+2. Check actual audience dimensions, legibility, focus/navigation, and pacing. If a run fails, disclose it and use the following implementation slide.
+3. Do **not** screen-share the presenter viewport. Verify notes and private source paths are absent from public audience output.
+4. Enable an optional browser audience only after separate native/WASM, authentication, delivery-mode, and Canvas acceptance. Document and fixed-frame delivery are distinct contracts; a query string cannot convert one host mode into the other. The browser is read-only; embedded rasters do not promise logical selection/copy.
+5. Keep capability URLs, credentials, observer/runtime paths, and retained evidence private or redacted. See [responsive delivery](../../docs/responsive-presentations.md) and [web hosting](../../packages/web-host/README.md).
+6. Close before the appendix unless questions call for deeper discussion. Distributed operation is an optional contract discussion, not a demonstrated cluster deployment.

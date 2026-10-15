@@ -1,40 +1,61 @@
-# Claim and source checklist
+# Sources and presentation evidence
 
-Baseline: checkout `6d7c790b915f`, authored 2026-10-13. Links are repository-relative; recheck implementation and demonstrations before using a different build. A design invariant establishes the intended contract, not proof that every operational scenario has been tested.
+Source baseline: checkout `f2ddda1bbccf` plus current working-tree implementation, inspected 2026-10-14. Line ranges below were refreshed against current source bytes; they are not permanent anchors. Recompare excerpts when changing artifacts or source.
 
-| Slide / claim | Evidence | Presentation limit |
+A **contract** states what must hold; an **implementation excerpt** shows a particular path; **executed evidence** establishes only the scenario actually checked. All six actual embedded demos passed managed execution acceptance, with private evidence at `/tmp/pw-oa5bi7zp`. The harness checks HTTP frames and managed results, **not browser/Canvas acceptance**. Final audience/privacy rehearsal remains required. This evidence does not claim completion of the full project validation suite.
+
+## Exact implementation excerpts
+
+All ten fenced excerpts in the main deck match contiguous literal source text, including indentation. The finder uses two separate excerpts, not one continuous block. BPDL snippets are labeled `text`; architecture arrows are explanatory prose, not quoted code.
+
+| Stable slide / block | Exact source and refreshed lines | Symbol / scope | Supported claim |
+| --- | --- | --- | --- |
+| `splits-contract` / `excerpt-split` | [tabs-plugin.bpdl](../../plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl), 231–236 | `tabs-commands.split-pane` | Typed target/direction/ratio and result, not a keymap |
+| `ownership-contract` / `excerpt-catalog` | Same schema, 97–101 | `tabs-catalog-v1` | Ordered discovery; contract prohibits rewriting arrangement storage on read |
+| `finder-implementation` / `excerpt-finder-scope` | [finder lib.rs](../../plugins/finder-plugin/src/lib.rs), 370–373 | `build_entries` | All/current workspace scope |
+| `finder-implementation` / `excerpt-finder-text` | Same file, 379–383 | `build_entries` | Workspace-qualified search text when configured, not fuzzy scoring internals |
+| `themes-composition` / `excerpt-theme-component` | [minimal.toml](../../plugins/theme-plugin/assets/themes/minimal.toml), 21–27 | `plugins."bmux.decoration".unfocused` | Real bundled extension data |
+| `themes-control` / `excerpt-theme-control` | [theme-plugin.bpdl](../../plugins/theme-plugin/bpdl/theme-plugin.bpdl), 22–28 | `theme-control-v1` | Revisioned selection and token-owned preview |
+| `flush-boundary` / `excerpt-write-frame` | [terminal.rs](../../packages/attach_pipeline/src/terminal.rs), 211–214 | `write_frame` | Write and flush must both succeed |
+| `rendering-repair` / `excerpt-render-repair` | [attach runtime.rs](../../packages/cli/src/runtime/attach/runtime.rs), 9508–9516 | `render_attach_frame_inner`, write-error branch | Clear row baselines and request full repair |
+| `playbooks-boundary` / `excerpt-managed-admission` | [runner.rs](../../plugins/playbook-plugin/src/runner.rs), 196–205 | `Owner::prepare` | Sandbox driver and generated configuration only |
+| `presentation-privacy` / `excerpt-private-notes` | [model.rs](../../packages/presenter/src/model.rs), 75–77 | `Slide::notes` | Notes omitted during serialization |
+
+## Demonstrated scenarios and limits
+
+Acceptance uses [scripts/presenter-tour-acceptance.py](../../scripts/presenter-tour-acceptance.py) with explicit prebuilt artifacts; see [usage](README.md#repeat-acceptance-with-explicit-artifacts). It starts the actual scripts as embedded components in isolated presenters, manually opens/starts them through presenter input, checks managed completion without diagnostics, observes retained HTTP audience snapshots, and checks clean presenter exit. Managed single-authority attach support supplies the actual attach commands/input used by navigation, finder, and themes without admitting real-attach or custom sandbox configuration.
+
+| Component / source | Passed behavior | Limit |
 | --- | --- | --- |
-| 1: Rust multiplexer + independent reusable UI | [README](../../README.md), [TUI guide](../../docs/tui-framework.md) | Early alpha; no invented original motivation or adoption statistics. |
-| 2: session versus client view; personal versus shared arrangements | [Concepts](../../docs/concepts.md), [invariants](../../INVARIANTS.md), [CLI workflows](../../docs/cli-workflows.md) | Demo must show selection/focus independence, not falsely claim shared layout edits are private. Client disconnect is not machine restart. |
-| 3: interpreted terminal state and attachment rendering | [Recording architecture](../../docs/recording-process.md), [attach runtime](../../packages/cli/src/runtime/attach/runtime.rs) | Diagram is conceptual; not every input invokes a domain service. |
-| 4: typed plugin contracts and generic host boundary | [Plugin guide](../../docs/plugins.md), [architecture rules](../../AGENTS.md), [tabs schema](../../plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl) | Snippet is real `tabs-placement-v1`; capability policy and orchestration belong in plugin implementation. Do not claim all legacy migrations are finished. |
-| 5: successful flush precedes presentation commit | [Recording contract](../../docs/recording-process.md), [attach runtime](../../packages/cli/src/runtime/attach/runtime.rs) | Failed presentation does not advance interaction authority; host output can still require repair. |
-| 5: Kitty upload reuse versus destructive erase; raster cleanup | [Image performance](../../docs/image-performance.md), [images](../../docs/images.md), [attach regression tests](../../packages/cli/src/runtime/attach/runtime.rs) | Locate assertions `Kitty frame erased uploads` and `partial frame erased image`. No cross-terminal universal compatibility or speedup number is claimed. |
-| 6: presentation reuses neutral TUI foundations | [Presenter library](../../packages/presenter/README.md), [presenter plugin](../../plugins/presenter-plugin/README.md), [TUI guide](../../docs/tui-framework.md) | Markdown is one adapter; Rust builders use the shared model. The CLI does not compile arbitrary Rust source. |
-| 6: recording and optional browser rendering | [Recording](../../docs/recording-process.md), [browser rendering](../../docs/browser-rendering.md) | Text output is not a visual replay. Browser entry point has local/read-only and viewport-control constraints. |
-| 7: local independence; federation fencing and recovery | [Invariants](../../INVARIANTS.md), [cluster implementation](../../plugins/cluster-plugin/src), [reconciler integration tests](../../plugins/cluster-plugin/src/worker_reconciler/integration_tests.rs) | Explain contracts and code, not unverified deployment maturity. Unreachability does not prove death; retries have a defined deduplication interval. |
-| 8: limitations and engineering lessons | [README](../../README.md), [testing](../../TESTING.md), [image performance](../../docs/image-performance.md) | Closing roadmap is proposed presenter wording, not an externally promised release plan. |
+| `demo-panes` / [panes.dsl](demos/panes.dsl) | Three panes, focus, layout/screen assertions | Printed test-count labels are fixture text, not repository test outcomes |
+| `demo-navigation` / [navigation.dsl](demos/navigation.dsl) | Original API shell state survives tab switching; operations/deploy and return to existing tests work | Not a second-attachment or independent-client-focus test; disconnect is not machine restart |
+| `demo-finder` / [finder.dsl](demos/finder.dsl) | Actual Find Tab prompt, fuzzy `api` query from operations, Enter selects default's API tab | Not exhaustive matching/order coverage; settings can change scope and matching mode |
+| `demo-themes` / [themes.dsl](demos/themes.dsl) | Actual Select Theme, Down previews rendered cyberpunk, Enter confirms, shell continues | Not preview cancellation, revision conflicts, or every layer composition |
+| `demo-rendering` / [rendering.dsl](demos/rendering.dsl) | Text population, in-place update, scrolling, screen assertions | **Not fault injection**, image protocol acceptance, or universal host compatibility |
+| `demo-evidence` / [evidence.dsl](demos/evidence.dsl) | Real shell execution, layout/screen assertions, `verified-demo` snapshot | PASS label alone is not evidence; snapshot does not establish unasserted behavior |
 
-## Feature map for questions
+The retained evidence path is private and ephemeral, not a distributable public artifact. Review/redact PTY output, status, capability URLs, and runtime paths before sharing. Do not copy secrets or reusable credentials into ordinary diagnostics or presentation assets.
 
-| Area | Where to explore |
-| --- | --- |
-| Sessions, tabs, workspaces, independent views | docs/concepts.md, docs/cli-workflows.md |
-| Themes and configuration profiles | docs/config-profiles.md, docs/tui-framework.md |
-| Plugins and revisioned presentation surfaces | docs/plugins.md, docs/tab-presentations.md |
-| Images and host compatibility | docs/images.md, docs/image-performance.md |
-| Recording and agent interaction | docs/recording-process.md, docs/playbooks.md |
-| Browser view | docs/browser-rendering.md |
-| Remote operations | docs/operations.md, docs/cli-workflows.md |
-| Federation and execution fencing | INVARIANTS.md, plugins/cluster-plugin/src |
+## Architectural sources and boundaries
 
-This is the breadth index, not a promise to cover every subsystem in 15 minutes.
+- [Concepts](../../docs/concepts.md) and [invariants](../../INVARIANTS.md): execution lifetime versus organization versus attachment-local selection. Personal-reference removal is not resource destruction; deliberate shared edits remain shared. Optional tab bars/decorations do not own authoritative resource creation, destruction, or ordering.
+- [Architecture rules](../../AGENTS.md), `tabs-placement-v1`, and `tabs-catalog-v1`: domain-neutral core, typed plugin contracts, plugin-owned orchestration. Stable API crates must not acquire runtime managers or lifecycle behavior.
+- Finder `load_windows`, `show_finder`, and `build_entries`: generated catalog client, configured OrderedV1 matching, scope/search projection, and selection are distinct steps.
+- [Theme README](../../plugins/theme-plugin/README.md), bundled theme, and [ThemePlugin::reapply_live_theme](../../plugins/theme-plugin/src/lib.rs): left-to-right composition, deep-merged extension maps, separate appearance/component layers, plugin-owned extension interpretation. Schema revision preconditions are stronger claims than a successful preview demo alone.
+- `write_frame` and `render_attach_frame_inner`: stage output, deliver, then promote presentation state; partial output invalidates incremental assumptions. Interaction metadata follows committed output. Kitty placement lifetime differs from raster cleanup. See [images](../../docs/images.md) and [image performance](../../docs/image-performance.md).
+- [Live components](../../docs/live-components.md), `Owner::prepare`, and [playbook API](../../packages/playbook/README.md): inert parsing, explicit executable approval, source closure freezing, generation-fenced lifecycle, owned cleanup. Isolated paths are not a security sandbox. Managed configuration rejects real-attach, custom sandbox-config, and runtime-selector env overrides.
+- [TUI guide](../../docs/tui-framework.md), [responsive delivery](../../docs/responsive-presentations.md), and [AudienceDocument::decode / rejects_private_projection_fields](../../packages/presenter/src/audience.rs): neutral primitives, directional dependencies, bounded public document/resource handling, omitted notes, rejected private projections. Document/frame delivery differ; raster cells do not imply logical selection/copy. HTTP snapshot acceptance is not Canvas rendering acceptance.
+- Interactive work and retention remain bounded. Slow-consumer repair must not be described as a complete execution journal. Output repair belongs to its execution/generation and must not apply stale output to a replacement.
+- Optional distributed appendix: [invariants](../../INVARIANTS.md) are the contract authority; [cluster implementation](../../plugins/cluster-plugin/src) is follow-up reading, not a demonstrated deployment. No unlimited deduplication, inferred worker death, arbitrary-effect rollback, or host-restart process-survival promise.
 
-## Approval / evidence gates
+## Final operator checklist
 
-- [x] Source-grounded terminology and plugin ownership.
-- [x] Explicit distinction between design contracts and operational claims.
-- [x] No fabricated benchmark numbers, process restart survival, or demo captures.
-- [ ] Presenter approves motivation and next-step wording.
-- [ ] Exact demo build and input bindings rehearsed.
-- [ ] Audience rendering and speaker-note privacy verified on real setup.
+- [ ] Approve the immutable executable and matching plugins/worker/observer protocols; record identity/hash. A protocol probe does not authenticate content.
+- [ ] Review current script/include bytes and explicitly enable `--allow-playbooks`. Changed executable input requires fresh approval; parsing alone never starts a run.
+- [ ] Rehearse manual `r`, `p/n/c`, `s`, stop-on-leave, cleanup acknowledgment, and generation restart on the final setup. A stop request is not completion; Escape only hides the overlay.
+- [ ] Confirm actual audience legibility, geometry, focus/navigation, and timing. Choose quick/deeper chapter paths and personal opening wording.
+- [ ] Exclude the presenter viewport from screen sharing; verify notes and private source paths are absent from audience output.
+- [ ] Perform separate browser/Canvas acceptance before showing a browser audience, with matching native/WASM assets, explicit delivery mode, authentication, and read-only behavior.
+- [ ] Keep capability URLs, credentials, observer/runtime paths, and retained evidence private/redacted.
+
+If a final rehearsal fails, disclose the failed scenario and use its implementation slide rather than manufacturing success. The six-demo pass, exact source comparisons, and final audience rehearsal answer different questions.

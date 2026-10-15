@@ -13,6 +13,7 @@ mod escape;
 pub mod host;
 #[cfg(feature = "runtime")]
 pub mod managed;
+pub mod managed_display;
 pub mod parse_dsl;
 pub mod parse_toml;
 pub mod parser;
