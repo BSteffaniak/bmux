@@ -35,7 +35,9 @@ body {
   min-height: 0;
   max-height: min(4lh, 25%);
   overflow: hidden;
-  overflow-wrap: anywhere;
+  /* Connection diagnostics must not resize the retained presentation. */
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 #viewport {

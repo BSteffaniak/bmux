@@ -563,7 +563,6 @@ async function runDocument(adapterPath) {
         transaction = null;
         committed = document;
         committedViewport = nextViewport;
-        status.textContent = committedStatus(document.revision);
         return;
       } finally { transaction?.discard(); }
     }
@@ -585,8 +584,11 @@ async function runDocument(adapterPath) {
     animation = requestAnimationFrame(() => {
       animation = null;
       if (!layoutPending || !committed || drawTask || stopped) return;
-      void apply(committed).catch(() => {
-        if (!stopped) status.textContent = 'Local reflow failed; last committed output retained.';
+      void apply(committed).then(() => {
+        // Local layout is not evidence that the document transport recovered.
+        if (!stopped && consecutiveFailures === 0) status.textContent = committedStatus(committed.revision);
+      }).catch(() => {
+        if (!stopped && consecutiveFailures === 0) status.textContent = 'Local reflow failed; last committed output retained.';
       });
     });
   }
@@ -633,6 +635,7 @@ async function runDocument(adapterPath) {
         if (stopped) break;
         if (consecutiveFailures) diagnostic('recovered', { failures: consecutiveFailures });
         consecutiveFailures = 0;
+        status.textContent = committedStatus(committed.revision);
         lastSuccess = performance.now();
         highWater = transport;
         cursor = announced;
