@@ -906,10 +906,42 @@ fn paint(player: &mut Player, cx: &mut PaintCx<'_, '_>) {
     });
 }
 
-/// Paint only the audience tree into the supplied viewport. This deliberately
-/// does not call `paint_content`: speaker notes, focus decoration and local status
-/// are not audience content. Browser publication must start here, never by cropping
-/// the speaker's already-painted terminal frame.
+// Keep slide layout independent of the operator overlay's full-terminal bounds.
+// Returning the original subtree preserves viewer geometry and event routing.
+struct AudienceViewport<C> {
+    component: C,
+    size: Size,
+}
+
+impl<C: Component> Component for AudienceViewport<C> {
+    fn layout(
+        &self,
+        _constraints: Constraints,
+        cx: &mut LayoutCx,
+    ) -> bmux_tui::component::LayoutNode {
+        self.component.layout(Constraints::tight(self.size), cx)
+    }
+
+    fn paint(&self, layout: &bmux_tui::component::LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        self.component.paint(layout, cx);
+    }
+
+    fn revision(&self) -> bmux_tui::component::ComponentRevision {
+        self.component.revision()
+    }
+
+    fn event(
+        &self,
+        event: &Event,
+        layout: &bmux_tui::component::LayoutNode,
+        cx: &mut bmux_tui::component::EventCx<'_>,
+    ) -> bmux_tui::event::EventOutcome {
+        self.component.event(event, layout, cx)
+    }
+}
+
+/// Paint the audience tree, with local operator overlays only when requested.
+/// Browser publication uses this path without private notes or local controls.
 fn paint_audience(
     content: AudienceContent<'_>,
     view: &mut PresentationView,
@@ -982,16 +1014,23 @@ fn paint_audience(
         .slide_id
         .as_ref()
         .and_then(|slide| content.live_demos.as_ref()?.visible(slide.as_str()));
+    let overlay_size = if show_local_focus {
+        let area = cx.area();
+        Size::new(area.width, area.height.saturating_sub(1))
+    } else {
+        size
+    };
     let mut pending_mirror_geometry = vec![];
     let (layout, demo_id) = if let Some(operator) = &operator {
         let id = operator.scene.identity["id"].as_str().unwrap_or_default();
-        let overlay = bmux_tui::composition::Overlay::new(component, operator)
-            .modal(bmux_tui::focus::FocusScopeId::new(format!("playbook-{id}")));
-        let layout = overlay.layout(Constraints::tight(size), &mut LayoutCx::default());
+        let overlay =
+            bmux_tui::composition::Overlay::new(AudienceViewport { component, size }, operator)
+                .modal(bmux_tui::focus::FocusScopeId::new(format!("playbook-{id}")));
+        let layout = overlay.layout(Constraints::tight(overlay_size), &mut LayoutCx::default());
         cx.with_child(
             0,
             0,
-            LocalRect::new(0, 0, size.width, size.height),
+            LocalRect::new(0, 0, overlay_size.width, overlay_size.height),
             |child| overlay.paint(&layout, child),
         );
         if let (Some(surface), Some(foreground)) = (mirror_surface, layout.children.get(1))
@@ -1024,18 +1063,18 @@ fn paint_audience(
     } else if let Some((id, demo)) = live {
         let overlay = bmux_tui::composition::Overlay::new(
             bmux_tui::composition::StyleScope::new(
-                component,
+                AudienceViewport { component, size },
                 bmux_tui::style::Style::new().add_modifier(bmux_tui::style::Modifier::DIM),
             ),
             demo.view(!show_local_focus),
         )
         .id(format!("playbook-overlay-{id}"))
         .modal(bmux_tui::focus::FocusScopeId::new(format!("playbook-{id}")));
-        let layout = overlay.layout(Constraints::tight(size), &mut LayoutCx::default());
+        let layout = overlay.layout(Constraints::tight(overlay_size), &mut LayoutCx::default());
         cx.with_child(
             0,
             0,
-            LocalRect::new(0, 0, size.width, size.height),
+            LocalRect::new(0, 0, overlay_size.width, overlay_size.height),
             |child| overlay.paint(&layout, child),
         );
         (
@@ -1095,8 +1134,8 @@ fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintC
     let slide_height = area.height.saturating_sub(notes_height).saturating_sub(1);
     let audience_size = Size::new(area.width, slide_height);
     player.audience_size = audience_size;
-    paint_view(player, theme, audience_size, true, cx);
     let Some(slide) = player.state.current_slide(&player.deck) else {
+        paint_view(player, theme, audience_size, true, cx);
         return;
     };
     if player.presenter {
@@ -1138,6 +1177,8 @@ fn paint_content(player: &mut Player, theme: &PresentationTheme, cx: &mut PaintC
         LocalRect::new(0, i64::from(area.height.saturating_sub(1)), area.width, 1),
         &bmux_tui::text::Line::raw(footer),
     );
+    // Paint operator overlays above private notes, without resizing the slide.
+    paint_view(player, theme, audience_size, true, cx);
 }
 
 pub(crate) fn paint_browser_audience(player: &mut Player, cx: &mut PaintCx<'_, '_>) {
@@ -2016,6 +2057,71 @@ mod tests {
         assert!(player.local_view.focused_block.is_none());
         assert!(player.local_view.painted_layout.is_none());
         assert!(player.local_view.pending_layout.is_none());
+    }
+
+    #[tokio::test]
+    async fn presenter_playbook_overlay_can_cover_notes_without_resizing_audience() {
+        let fixture = crate::playbook_live::reload_tests::Fixture::new();
+        let deck = crate::playbook_live::reload_tests::deck("s", "demo");
+        let mut player = Player::local(deck.clone(), None, true);
+        let mut environment = fixture.environment.clone();
+        environment.attempts_root = fixture.root.join("unstarted-attempts");
+        let mut demos =
+            crate::playbook_live::LiveDemos::prepare_local(&deck, &environment, vec![]).unwrap();
+        demos.input("demo", "open", true).unwrap();
+        player.live_demos = Some(demos);
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 120, 45));
+        terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+        assert_eq!(player.audience_size, Size::new(120, 29));
+        let layout = player.local_view.pending_layout.as_ref().unwrap();
+        assert_eq!(layout.size.height, 44);
+        assert_eq!(layout.children[0].node.size.height, 29);
+        let modal = &layout.children[1];
+        assert!(
+            modal.y + modal.node.size.height > 29,
+            "modal was constrained above notes"
+        );
+        assert!(modal.y + modal.node.size.height <= 44);
+        let mut browser = Terminal::new(Vec::new(), Rect::new(0, 0, 120, 45));
+        browser
+            .draw(|cx| paint_browser_audience(&mut player, cx))
+            .unwrap();
+        assert_eq!(
+            player
+                .browser_view
+                .pending_layout
+                .as_ref()
+                .unwrap()
+                .size
+                .height,
+            45
+        );
+        assert_eq!(player.audience_size, Size::new(120, 29));
+        player
+            .live_demos
+            .as_mut()
+            .unwrap()
+            .input("demo", "close", true)
+            .unwrap();
+        terminal.draw(|cx| paint(&mut player, cx)).unwrap();
+        assert_eq!(
+            player
+                .local_view
+                .pending_layout
+                .as_ref()
+                .unwrap()
+                .size
+                .height,
+            29
+        );
+        player
+            .live_demos
+            .as_mut()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        assert!(!environment.attempts_root.exists());
     }
 
     #[test]
