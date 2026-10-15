@@ -68,12 +68,25 @@ class Cloudflare:
         self.clock = clock
         self.deadline = clock() + 30
 
-    def page(self, endpoint, page):
+    def page(self, endpoint, page, cursor=None):
         remaining = self.deadline - self.clock()
         if remaining <= 0:
             raise ImportErrorSafe('Provider discovery deadline exceeded')
+        path = endpoint.split('?')[0]
+        buckets = path.endswith('/r2/buckets')
+        bucket_detail = bool(re.fullmatch(r'accounts/[a-f0-9]{32}/r2/buckets/[a-z0-9-]+', path))
+        unpaged = bucket_detail or path.endswith(('/workers/scripts', '/workers/routes', '/lock', '/lifecycle'))
+        # Pages rejects per_page=100. Use its supported size, also as a
+        # conservative numbered-page size for DNS and Workers inventories.
+        size = 10
+        params = {} if unpaged else {'per_page': size}
+        if buckets:
+            if cursor is not None:
+                params['cursor'] = cursor
+        elif not unpaged:
+            params['page'] = page
         separator = '&' if '?' in endpoint else '?'
-        url = BASE + endpoint + separator + urllib.parse.urlencode({'page': page, 'per_page': 100})
+        url = BASE + endpoint + (separator + urllib.parse.urlencode(params) if params else '')
         request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + self.token}, method='GET')
         try:
             with self.opener.open(request, timeout=min(5, remaining)) as response:
@@ -92,27 +105,61 @@ class Cloudflare:
                 answer = json.loads(data)
         except ImportErrorSafe:
             raise
+        except urllib.error.HTTPError as error:
+            # Only local endpoint category and numeric status: never echo the
+            # URL, bearer token, provider body, or untrusted exception text.
+            category = ('R2 inventory' if buckets else 'complete collection' if unpaged else 'numbered inventory')
+            raise ImportErrorSafe(f'{category} request rejected (HTTP {error.code})') from None
         except (OSError, ValueError, RecursionError, http.client.HTTPException, urllib.error.URLError):
             raise ImportErrorSafe('Provider discovery failed') from None
         if not isinstance(answer, dict) or answer.get('success') is not True:
             raise ImportErrorSafe('Provider discovery rejected')
         items = answer.get('result')
-        if '/r2/buckets' in url and isinstance(items, dict):
+        if bucket_detail:
+            if not isinstance(items, dict):
+                raise ImportErrorSafe('Invalid R2 bucket detail')
+            items = [items]
+        elif '/r2/buckets' in url and isinstance(items, dict):
             if items.get('cursor'):
                 raise ImportErrorSafe('R2 inventory truncated; reconcile manually')
             items = items.get('rules') if url.split('?')[0].endswith(('/lock', '/lifecycle')) else items.get('buckets')
         if not isinstance(items, list) or len(items) > 100 or any(not isinstance(item, dict) for item in items):
             raise ImportErrorSafe('Unsupported provider list response')
         info = answer.get('result_info')
+        if unpaged:
+            if info is not None:
+                raise ImportErrorSafe('Unexpected pagination on complete provider collection')
+            return items, 1
+        if buckets:
+            # R2 omits result_info entirely on its terminal short page.
+            if info is None:
+                if len(items) >= size:
+                    raise ImportErrorSafe('R2 pagination completeness unavailable')
+                return items, None
+            if not isinstance(info, dict) or info.get('per_page') != size:
+                raise ImportErrorSafe('Invalid R2 cursor metadata')
+            next_cursor = info.get('cursor')
+            if next_cursor is not None and (not isinstance(next_cursor, str) or len(next_cursor) > 4096):
+                raise ImportErrorSafe('Invalid R2 cursor')
+            if len(items) > size:
+                raise ImportErrorSafe('Oversized R2 page')
+            if items and not next_cursor:
+                raise ImportErrorSafe('R2 pagination completeness unavailable')
+            return items, next_cursor or None
         if info is None:
-            # Routes/domains may omit metadata. A full page cannot prove completeness.
-            if len(items) == 100:
+            if len(items) >= size:
                 raise ImportErrorSafe('Provider pagination completeness unavailable')
             return items, 1
         if not isinstance(info, dict):
             raise ImportErrorSafe('Invalid pagination metadata')
         pages = info.get('total_pages')
         current = info.get('page')
+        if pages is None:
+            count = info.get('total_count')
+            per_page = info.get('per_page')
+            if type(count) is not int or count < 0 or type(per_page) is not int or per_page != size:
+                raise ImportErrorSafe('Unsupported provider pagination counts')
+            pages = max(1, (count + size - 1) // size)
         if pages == 0 and type(pages) is int and current == page == 1 and not items:
             return items, 1
         if type(pages) is not int or type(current) is not int or current != page or not 1 <= pages <= MAX_PAGES or page > pages:
@@ -121,6 +168,19 @@ class Cloudflare:
 
     def listing(self, endpoint):
         result, total = self.page(endpoint, 1)
+        if endpoint.split('?')[0].endswith('/r2/buckets'):
+            seen = set()
+            for page in range(2, MAX_PAGES + 1):
+                if total is None:
+                    return result
+                if total in seen:
+                    raise ImportErrorSafe('Repeated R2 pagination cursor')
+                seen.add(total)
+                items, total = self.page(endpoint, page, cursor=total)
+                result.extend(items)
+            if total is not None:
+                raise ImportErrorSafe('R2 pagination exceeds bound')
+            return result
         for page in range(2, total + 1):
             items, observed = self.page(endpoint, page)
             if observed != total:
@@ -148,6 +208,12 @@ def discover(api, config, managed):
     bucket = unique(api.listing(f'accounts/{account}/r2/buckets'), 'name', config['bucket'])
     if bucket is None:
         raise ImportErrorSafe('Selected R2 backend bucket missing; finish explicit bootstrap first')
+    # List responses omit storage_class; fetch the selected bucket's detail
+    # rather than treating omitted fields as defaults.
+    details = api.listing(f'accounts/{account}/r2/buckets/{config["bucket"]}')
+    if len(details) != 1 or details[0].get('name') != bucket['name'] or details[0].get('creation_date') != bucket.get('creation_date'):
+        raise ImportErrorSafe('Selected R2 backend bucket identity changed')
+    bucket = details[0]
     if bucket.get('storage_class') != 'Standard' or not isinstance(bucket.get('creation_date'), str):
         raise ImportErrorSafe('Unsupported R2 backend bucket identity')
     found[STATE_ADDRESSES[0]] = account + '/' + config['bucket'] + '/default'

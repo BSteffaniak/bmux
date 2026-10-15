@@ -37,6 +37,8 @@ class FakeAPI:
         }
 
     def listing(self, endpoint):
+        if endpoint == f'accounts/{ACCOUNT}/r2/buckets/bmux-opentofu-state':
+            return self.data[f'accounts/{ACCOUNT}/r2/buckets']
         return self.data[endpoint]
 
 
@@ -156,6 +158,72 @@ class Tests(unittest.TestCase):
                 MODULE.Cloudflare('SECRET_TOKEN', Opener([answer])).listing('test')
             self.assertNotIn('SECRET_TOKEN', str(error.exception))
 
+    def test_endpoint_specific_pagination_contracts(self):
+        endpoint = f'accounts/{ACCOUNT}/r2/buckets'
+        answers = [
+            {'success': True, 'result': {'buckets': [{'name': str(i)} for i in range(10)]},
+             'result_info': {'per_page': 10, 'cursor': 'next+/='}},
+            {'success': True, 'result': {'buckets': [{'name': 'last'}]}},
+        ]
+        opener = Opener(answers)
+        self.assertEqual(len(MODULE.Cloudflare('SECRET_TOKEN', opener).listing(endpoint)), 11)
+        self.assertIn('cursor=next%2B%2F%3D', opener.requests[1][0].full_url)
+        self.assertNotIn('page=', opener.requests[0][0].full_url.replace('per_page=', 'size='))
+        for suffix in ('workers/scripts', 'workers/routes', 'r2/buckets/b/lock', 'r2/buckets/b/lifecycle'):
+            result = {'rules': [{}] * 15} if suffix.endswith(('/lock', '/lifecycle')) else [{}] * 15
+            opener = Opener([{'success': True, 'result': result}])
+            self.assertEqual(len(MODULE.Cloudflare('SECRET_TOKEN', opener).listing('accounts/a/' + suffix)), 15)
+            self.assertNotIn('?', opener.requests[0][0].full_url)
+        opener = Opener([{'success': True, 'result': [],
+                          'result_info': {'page': 1, 'per_page': 10, 'total_count': 0}}])
+        MODULE.Cloudflare('SECRET_TOKEN', opener).listing('accounts/a/pages/projects')
+        self.assertIn('per_page=10', opener.requests[0][0].full_url)
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.Cloudflare('SECRET_TOKEN', Opener([{'success': True, 'result': [{}] * 10}])).listing('test')
+        repeat = {'success': True, 'result': {'buckets': [{}] * 10},
+                  'result_info': {'per_page': 10, 'cursor': 'same'}}
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.Cloudflare('SECRET_TOKEN', Opener([repeat, repeat])).listing(endpoint)
+        from urllib.error import HTTPError
+        opener = Opener([HTTPError('SECRET_TOKEN', 400, 'SECRET_TOKEN', {}, None)])
+        with self.assertRaises(MODULE.ImportErrorSafe) as error:
+            MODULE.Cloudflare('SECRET_TOKEN', opener).listing('accounts/a/pages/projects')
+        self.assertIn('HTTP 400', str(error.exception))
+        self.assertNotIn('SECRET_TOKEN', str(error.exception))
+
+    def test_workers_count_pagination_and_r2_terminal_shapes(self):
+        opener = Opener([
+            {'success': True, 'result': [{'id': i} for i in range(10)],
+             'result_info': {'page': 1, 'per_page': 10, 'count': 10, 'total_count': 11}},
+            {'success': True, 'result': [{'id': 10}],
+             'result_info': {'page': 2, 'per_page': 10, 'count': 1, 'total_count': 11}},
+        ])
+        self.assertEqual(len(MODULE.Cloudflare('SECRET_TOKEN', opener).listing('accounts/a/workers/workers')), 11)
+        self.assertIn('page=2', opener.requests[1][0].full_url)
+        endpoint = f'accounts/{ACCOUNT}/r2/buckets'
+        for info in ({'cursor': 'x', 'per_page': 11}, {'cursor': 42, 'per_page': 10}):
+            with self.subTest(info=info), self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.Cloudflare('SECRET_TOKEN', Opener([{'success': True, 'result': {'buckets': []},
+                                                          'result_info': info}])).listing(endpoint)
+        full = {'success': True, 'result': {'buckets': [{}] * 10}}
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.Cloudflare('SECRET_TOKEN', Opener([full])).listing(endpoint)
+        detail = {'name': 'bmux-opentofu-state', 'creation_date': '2026-01-01', 'storage_class': 'Standard'}
+        opener = Opener([{'success': True, 'result': detail}])
+        self.assertEqual(MODULE.Cloudflare('SECRET_TOKEN', opener).listing(endpoint + '/bmux-opentofu-state'), [detail])
+        self.assertNotIn('?', opener.requests[0][0].full_url)
+
+    def test_bucket_detail_must_match_inventory_generation(self):
+        api = FakeAPI()
+        original_listing = api.listing
+        def listing(endpoint):
+            if endpoint == f'accounts/{ACCOUNT}/r2/buckets/bmux-opentofu-state':
+                return [{'name': 'bmux-opentofu-state', 'storage_class': 'Standard', 'creation_date': 'changed'}]
+            return original_listing(endpoint)
+        api.listing = listing
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.discover(api, MODULE.configuration(ENV), set())
+
     def test_redirect_and_deadline_fail_closed(self):
         with self.assertRaises(MODULE.ImportErrorSafe):
             MODULE.NoRedirect().redirect_request(None, None, 302, 'SECRET_TOKEN', {}, 'https://evil.invalid')
@@ -184,8 +252,7 @@ class Tests(unittest.TestCase):
             self.assertIn('cloudflare_r2_bucket.state', MODULE.discover(api, config, {address}))
 
     def test_r2_inventory_and_rules_response_shapes(self):
-        for suffix, result in (('', {'buckets': [{'name': 'bmux-opentofu-state'}]}),
-                               ('/bmux-opentofu-state/lock', {'rules': []}),
+        for suffix, result in (('/bmux-opentofu-state/lock', {'rules': []}),
                                ('/bmux-opentofu-state/lifecycle', {'rules': []})):
             api = MODULE.Cloudflare('SECRET_TOKEN', Opener([{'success': True, 'result': result}]))
             self.assertIsInstance(api.listing(f'accounts/{ACCOUNT}/r2/buckets{suffix}'), list)
