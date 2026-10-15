@@ -363,6 +363,42 @@ async fn host() -> (TempDir, SnapshotPublisher, HostHandle) {
 }
 
 #[tokio::test]
+async fn idle_preconnections_close_without_http_rejection_but_partial_requests_time_out() {
+    let (_directory, mut config) = fixture();
+    config.limits.header_timeout = Duration::from_millis(100);
+    let (_publisher, feed) = snapshot_feed(config.limits.max_snapshot_bytes).unwrap();
+    let host = start(config, feed).await.unwrap();
+    let mut idle = TcpStream::connect(host.address()).await.unwrap();
+    let mut bytes = Vec::new();
+    timeout(DEADLINE, idle.read_to_end(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        bytes.is_empty(),
+        "idle socket received an unsolicited response"
+    );
+    assert_eq!(host.diagnostics().request_rejections, 0);
+    assert!(
+        host.diagnostics()
+            .events
+            .iter()
+            .any(|event| event.code == "idle_connection_timeout")
+    );
+
+    let mut partial = connect(host.address(), "GET / HTTP/1.1\r\n").await;
+    status(&read_response(&mut partial).await, 408);
+    assert_eq!(host.diagnostics().request_rejections, 1);
+    assert!(
+        host.diagnostics()
+            .events
+            .iter()
+            .any(|event| event.code == "request_rejected" && event.detail == Some(408))
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test]
 async fn diagnostics_follow_auth_policy_and_survive_producer_loss_locally() {
     let (_directory, publisher, host) = host().await;
     let address = host.address();

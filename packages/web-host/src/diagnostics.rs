@@ -1,10 +1,6 @@
 //! Bounded, credential-free serving evidence. Never accepts URLs, headers or bodies.
 use serde::Serialize;
-use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::Mutex,
-    time::Instant,
-};
+use std::{collections::VecDeque, sync::Mutex, time::Instant};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct HostDiagnostics {
@@ -29,7 +25,6 @@ struct Evidence {
     rejected: u64,
     sequence: u64,
     published_revision: Option<u64>,
-    counts: BTreeMap<&'static str, u64>,
     events: VecDeque<HostEvent>,
 }
 pub(crate) struct Diagnostics {
@@ -47,7 +42,6 @@ impl Diagnostics {
                 rejected: 0,
                 sequence: 0,
                 published_revision: None,
-                counts: BTreeMap::new(),
                 events: VecDeque::new(),
             }),
         }
@@ -64,9 +58,6 @@ impl Diagnostics {
             .evidence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = evidence.counts.entry(code).or_insert(0);
-        *count = count.saturating_add(1);
-        let count = *count;
         match code {
             "capacity_rejected" => {
                 evidence.capacity = evidence.capacity.saturating_add(1);
@@ -87,10 +78,8 @@ impl Diagnostics {
             evidence.events.pop_front();
         }
         evidence.events.push_back(event);
-        // First and power-of-two repetitions retain evidence without flooding stderr.
-        if count.is_power_of_two() {
-            eprintln!("bmux_web_host event={code} detail={detail:?} count={count}");
-        }
+        // Diagnostics are queried through the host API or /diagnostics. Never
+        // write to process stderr: it may share the presentation's terminal.
     }
     pub(crate) fn stopped(&self, code: &'static str, detail: Option<u64>) {
         self.evidence
@@ -123,6 +112,36 @@ impl Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn events_do_not_write_to_the_presenting_process_terminal() {
+        const CHILD: &str = "BMUX_WEB_HOST_DIAGNOSTICS_CAPTURE_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let diagnostics = Diagnostics::new();
+            diagnostics.event("request_rejected", Some(408));
+            diagnostics.event("response_write_failed", Some(32));
+            diagnostics.stopped("listener_failed", None);
+            assert_eq!(diagnostics.snapshot().events.len(), 3);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "diagnostics::tests::events_do_not_write_to_the_presenting_process_terminal",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert!(
+            output.stderr.is_empty(),
+            "diagnostics leaked to stderr: {:?}",
+            output.stderr
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("event="));
+    }
+
     #[test]
     fn history_is_bounded_but_counters_are_retained() {
         let diagnostics = Diagnostics::new();

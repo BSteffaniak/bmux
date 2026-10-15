@@ -328,7 +328,11 @@ fn parse<'a>(bytes: &'a [u8], state: &State) -> Result<Route<'a>, u16> {
     Ok(route)
 }
 
-async fn read_request(stream: &mut TcpStream, state: &State) -> Result<Vec<u8>, u16> {
+async fn read_request(
+    stream: &mut TcpStream,
+    state: &State,
+    request_started: &mut bool,
+) -> Result<Vec<u8>, u16> {
     let mut bytes = Vec::with_capacity(state.limits.max_header_bytes.min(1024));
     let mut chunk = [0_u8; 1024];
     loop {
@@ -344,6 +348,7 @@ async fn read_request(stream: &mut TcpStream, state: &State) -> Result<Vec<u8>, 
         if count == 0 {
             return Err(400);
         }
+        *request_started = true;
         bytes.extend_from_slice(&chunk[..count]);
         if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
             return Ok(bytes);
@@ -406,11 +411,26 @@ async fn response(
 }
 
 pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: SnapshotFeed) {
+    let mut request_started = false;
     let request = timeout(
         state.limits.header_timeout,
-        read_request(&mut stream, &state),
+        read_request(&mut stream, &state, &mut request_started),
     )
     .await;
+    // Browsers may preconnect without sending HTTP bytes. Expire those sockets
+    // within the same budget, but do not invent a rejected HTTP request or write
+    // an unsolicited 408 response. Partial headers still receive a real 408.
+    if !request_started {
+        state.diagnostics.event(
+            if request.is_err() {
+                "idle_connection_timeout"
+            } else {
+                "idle_connection_closed"
+            },
+            None,
+        );
+        return;
+    }
     let header_end = request
         .as_ref()
         .ok()
