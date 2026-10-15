@@ -327,8 +327,22 @@ class Store:
             raise StateError('Admission output must be a new private absolute file')
         value = completion(receipt, self.config)
         verify_bucket(self.config, value['bucket_identity'])
-        if self.inventory():
-            raise StateError('First deployment requires completely empty confirmed new bucket')
+        inventory = self.inventory()
+        if inventory == {self.admission_key()}:
+            # Resume only the same pre-apply admission, never infer a new lineage
+            # from missing state. No remote write or lock is replayed here; begin
+            # still fences the single apply using the exact authoritative ETag.
+            remote = self.directory / uuid.uuid4().hex
+            response = self.call('get-object', '--key', self.admission_key(), str(remote))
+            marker = dict(schema=1, receipt=value, phase='admitted')
+            etag = response.get('ETag')
+            if not etag or remote.read_bytes() != json.dumps(marker, sort_keys=True).encode():
+                raise StateError('Bootstrap receipt differs or apply already started; explicit recovery required')
+            save_private(output, dict(schema=1, marker=marker, etag=etag))
+            self.initial_check(output)
+            return {'admitted_operation': value['operation']}
+        if inventory:
+            raise StateError('First deployment requires empty bucket or exact pre-apply admission')
         lock = json.dumps(dict(ID=value['operation'], Operation='OperationTypeApply',
                                Info='One-shot first deployment admission', Who='bmux-bootstrap',
                                Version='1.10.9', Path=self.key)).encode()
@@ -343,8 +357,9 @@ class Store:
         etag = self.put(self.admission_key(), body, '--if-none-match', '*').get('ETag')
         if not etag:
             raise StateError('Admission marker outcome ambiguous; retain lock')
-        # Remote permanent consumption precedes local acknowledgement. A lost
-        # local receipt requires explicit recovery, never a new empty lineage.
+        # Persist the acknowledgement after the remote marker. A fresh runner may
+        # recover this acknowledgement only while the exact marker is admitted
+        # and remains the sole object; an applying fence is never replayed.
         save_private(output, dict(schema=1, marker=marker, etag=etag))
         self.call('delete-object', '--key', self.key + '.tflock', '--if-match', lock_etag)
         return {'admitted_operation': value['operation']}

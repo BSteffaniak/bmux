@@ -156,9 +156,13 @@ class ArchiveTests(unittest.TestCase):
             self.assertNotIn(self.store.key, self.store.objects)  # no synthetic state
             self.assertIn(self.store.admission_key(), self.store.objects)
             self.store.initial_check(admission)
-            with self.assertRaises(m.StateError):
-                self.store.admit(receipt, self.store.directory / 'another.json')
+            resumed = self.store.directory / 'another.json'
+            self.store.admit(receipt, resumed)
             self.store.initial_check(admission, begin=True)
+            with self.assertRaises(m.StateError):
+                self.store.initial_check(resumed, begin=True)
+            with self.assertRaises(m.StateError):
+                self.store.admit(receipt, self.store.directory / 'after-begin.json')
             with self.assertRaises(m.StateError):
                 self.store.initial_check(admission, begin=True)
             with self.assertRaises(m.StateError):
@@ -167,6 +171,41 @@ class ArchiveTests(unittest.TestCase):
         marker_puts = [args for op, args in self.store.calls if op == 'put-object' and args[1] == self.store.admission_key()]
         self.assertIn('--if-none-match', marker_puts[0])
         self.assertIn('--if-match', marker_puts[1])
+
+    def test_resume_admission_is_read_only_and_requires_exact_marker_only_inventory(self):
+        receipt = self.receipt()
+        self.store.objects.clear()
+        admission = self.store.directory / 'first.json'
+        with patch.dict(os.environ, CLOUDFLARE_ACCOUNT_ID='a' * 32), patch.object(m, 'verify_bucket'):
+            self.store.admit(receipt, admission)
+            original = dict(self.store.objects)
+            self.store.calls.clear()
+            resumed = self.store.directory / 'resumed.json'
+            self.store.admit(receipt, resumed)
+            self.assertEqual(m.read_private(admission), m.read_private(resumed))
+            self.assertEqual(self.store.objects, original)
+            self.assertTrue(all(op in ('get-object', 'list-objects-v2') for op, _ in self.store.calls))
+            # A validated but different operation cannot reuse the admission.
+            value = json.loads(receipt.read_text())
+            value['operation'] = 'e' * 32
+            value.pop('binding')
+            value['binding'] = hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            other = self.store.directory / 'other-receipt.json'
+            m.save_private(other, value)
+            with self.assertRaises(m.StateError):
+                self.store.admit(other, self.store.directory / 'wrong.json')
+            for key in (self.store.key, self.store.key + '.tflock', self.store.prefix + 'archive', 'unrelated'):
+                with self.subTest(key=key):
+                    self.store.objects = dict(original, **{key: BODY})
+                    with self.assertRaises(m.StateError):
+                        self.store.admit(receipt, self.store.directory / 'blocked.json')
+            self.store.objects = dict(original)
+            with patch.object(m, 'verify_bucket', side_effect=m.StateError('Generation changed')):
+                with self.assertRaises(m.StateError):
+                    self.store.admit(receipt, self.store.directory / 'replaced.json')
+            self.store.objects[self.store.admission_key()] = b'corrupt'
+            with self.assertRaises(m.StateError):
+                self.store.admit(receipt, self.store.directory / 'corrupt.json')
 
     def test_admission_rejects_existing_adopted_wrong_generation(self):
         receipt = self.receipt()

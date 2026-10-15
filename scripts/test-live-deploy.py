@@ -107,11 +107,23 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('pages upload', effects)
 
+    def test_existing_state_list_errors_are_not_treated_as_first_use(self):
+        self.env['TEST_FAIL'] = 'state'
+        result, effects = self.run_deploy('configure')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('tofu state', effects)
+        self.assertNotIn('imports checked', effects)
+        self.assertNotIn('tofu plan', effects)
+        self.assertNotIn('pages upload', effects)
+
     def test_explicit_first_configure_fences_before_apply(self):
         receipt = self.root / 'completion.json'
         receipt.write_text('{}')
+        self.env['TEST_FAIL'] = 'state'  # Real tofu state list fails for absent initial state.
         result, effects = self.run_deploy('configure', ('--bootstrap-completion', str(receipt)))
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('tofu state', effects)
+        self.assertEqual(effects.count('state check'), 2)
         self.assertLess(effects.index('state admit'), effects.index('tofu init'))
         self.assertLess(effects.index('state begin'), effects.index('tofu apply'))
         self.assertLess(effects.index('tofu apply'), effects.rindex('state archive'))

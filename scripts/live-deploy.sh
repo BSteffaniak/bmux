@@ -60,8 +60,15 @@ fi
 python3 "$ROOT/scripts/archive-live-state.py" check "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
 run_private tofu init -input=false -lockfile=readonly -backend-config="$WORK/backend.json"
 if [[ "$MODE" == configure ]]; then
-  run_private tofu state list
-  python3 -c 'import json,sys; json.dump(sys.stdin.read().splitlines(),sys.stdout)' < "$WORK/deploy.log" > "$WORK/managed.json"
+  if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
+    # Only the verified admission path may have no state. Recheck the remote
+    # marker-only inventory after init; do not swallow arbitrary state-list errors.
+    python3 "$ROOT/scripts/archive-live-state.py" check "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
+    printf '[]' > "$WORK/managed.json"
+  else
+    run_private tofu state list
+    python3 -c 'import json,sys; json.dump(sys.stdin.read().splitlines(),sys.stdout)' < "$WORK/deploy.log" > "$WORK/managed.json"
+  fi
   # Exact imports require an independently reviewed resource map; no blind adoption.
   REVIEWED_IMPORTS="${LIVE_REVIEWED_IMPORTS:-}"
   [[ -n "$REVIEWED_IMPORTS" ]] || REVIEWED_IMPORTS='{}'

@@ -246,8 +246,14 @@ The checksum covers the exact file bytes, including any trailing newline; do not
 reformat the JSON. The workflow writes a private local receipt and passes
 `--bootstrap-completion` to configure. Admission verifies the exact backend and
 remote bucket creation identity and emptiness, then consumes a conditional remote
-marker before effects. An interrupted or ambiguous admission/apply requires
-explicit recovery; replaying the receipt must not create another state lineage.
+marker before effects. A fresh runner may resume the exact same receipt only while
+that marker is still `admitted`, the bucket generation matches, and the marker is
+the only object (no state, lock, history, or unrelated objects). This path rechecks
+admission after backend initialization and uses an empty managed-resource list
+without calling `tofu state list`, which fails when initial state does not exist.
+It never ignores ordinary state-list errors. An `applying` marker, changed receipt,
+or ambiguous mutation still requires explicit recovery; a retry cannot create
+another state lineage or repeat a first apply.
 Subsequent configure/release runs leave both inputs empty and require existing
 canonical encrypted state. OpenTofu state and saved plans use enforced client-side AES-GCM
 encryption, matching WWMTF; native S3-protocol lockfiles remain enabled.
