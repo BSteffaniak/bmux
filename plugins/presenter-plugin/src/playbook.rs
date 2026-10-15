@@ -12,6 +12,7 @@ const MAX_PLAYBOOKS: usize = 16;
 pub struct DemoConfig {
     pub playbook: PathBuf,
     pub title: String,
+    pub stop_on_leave: bool,
 }
 impl DemoConfig {
     pub fn parse(value: &serde_json::Value) -> Result<Self> {
@@ -45,7 +46,11 @@ impl DemoConfig {
         if let Some(policy) = object.get("on_leave") {
             ensure!(policy.as_str() == Some("stop"), "on_leave must be stop");
         }
-        Ok(Self { playbook, title })
+        Ok(Self {
+            playbook,
+            title,
+            stop_on_leave: object.contains_key("on_leave"),
+        })
     }
 }
 

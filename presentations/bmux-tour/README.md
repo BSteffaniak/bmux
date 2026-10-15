@@ -7,7 +7,7 @@ A feature-led narrative: **feature + embedded run on the same slide**, followed 
 - [deck.md](deck.md): opening; splits/layout; tabs/sessions/workspaces; cross-workspace finder; theme composition/control; rendering/flush; playbooks as evidence; presentation/browser reuse; close.
 - [appendix.md](appendix.md): optional technical discussion, including distributed contracts.
 - [sources.md](sources.md): excerpt provenance, evidence limits, and final rehearsal checklist.
-- `demos/`: the six embedded playbooks. Parsing the deck does not execute them.
+- `demos/`: the six original embedded playbooks plus the opt-in [Jev Flappy Bird finale](demos/jev-flappy.md). Parsing the deck does not execute them.
 - `assets/`: optional diagrams; the narrative does not depend on them.
 
 Preserve stable `bmux:slide-id` and `bmux:block-id` identities when editing. Component identity participates in controller/reload behavior; do not reuse an ID for a different execution casually.

@@ -26,6 +26,8 @@ struct Run {
     control: Control,
     last_snapshot: Vec<u8>,
     action_labels: Vec<&'static str>,
+    // Explicit host opt-in, retained only in memory; never serialized with evidence.
+    application_environment: BTreeMap<String, std::ffi::OsString>,
     stop_requested: Option<Instant>,
 }
 
@@ -232,6 +234,7 @@ impl Owner {
         .map_err(message)?;
         fs::write(runtime.join("playbook-owner.json"), &manifest).map_err(message)?;
         fs::write(root.join("runtime.json"), &manifest).map_err(message)?;
+        let application_environment = application_environment(std::env::vars_os())?;
         // Ownership now transfers to Run; failed/unacknowledged attempts retain
         // the path rather than letting a temporary guard delete a live socket.
         let _runtime = temporary.keep();
@@ -239,6 +242,7 @@ impl Owner {
         let playback_speed = spec.playback_speed.clone();
         let run = Run {
             spec,
+            application_environment,
             original_request,
             probe_deadline: None,
             snapshot,
@@ -381,6 +385,53 @@ impl Owner {
     }
 }
 
+fn application_environment(
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Result<BTreeMap<String, std::ffi::OsString>> {
+    const PREFIX: &str = "BMUX_PLAYBOOK_APP_ENV_";
+    let mut selected = BTreeMap::new();
+    let mut bytes = 0;
+    for (key, value) in environment {
+        let Some(name) = key.to_str().and_then(|key| key.strip_prefix(PREFIX)) else {
+            continue;
+        };
+        // This is application data, never a runtime/configuration selector or
+        // dynamic-loader/interpreter injection channel. Values stay private.
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || !name.as_bytes()[0].is_ascii_uppercase()
+            || ["BMUX_", "XDG_", "LD_", "DYLD_", "PYTHON", "RUST", "CARGO"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            || [
+                "PATH",
+                "HOME",
+                "USER",
+                "SHELL",
+                "ENV",
+                "BASH_ENV",
+                "TERM",
+                "TERMINFO",
+                "TERMINFO_DIRS",
+                "TMPDIR",
+                "LANG",
+                "LC_ALL",
+            ]
+            .contains(&name)
+        {
+            return Err("invalid application environment name".into());
+        }
+        bytes += value.len();
+        if selected.len() >= 32 || bytes > 64 * 1024 {
+            return Err("application environment exceeds limit".into());
+        }
+        selected.insert(name.to_owned(), value);
+    }
+    Ok(selected)
+}
+
 impl Run {
     fn cleanup_runtime(&self) -> Result<()> {
         let runtime = Path::new(&self.snapshot.runtime_dir);
@@ -433,7 +484,9 @@ impl Run {
     }
 
     fn command(&self) -> ProcessCommand {
-        self.command_with_source(Path::new(&self.spec.source))
+        let mut command = self.command_with_source(Path::new(&self.spec.source));
+        command.envs(&self.application_environment);
+        command
     }
 
     fn command_with_source(&self, source: &Path) -> ProcessCommand {
@@ -669,6 +722,71 @@ fn message(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_environment_is_explicit_bounded_and_not_a_runtime_selector() {
+        let selected = application_environment([
+            ("JEV_API_KEY".into(), "not-forwarded".into()),
+            ("BMUX_PLAYBOOK_APP_ENV_JEV_API_KEY".into(), "private".into()),
+        ])
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected["JEV_API_KEY"], "private");
+        for name in [
+            "",
+            "BMUX_CONFIG",
+            "XDG_STATE_HOME",
+            "HOME",
+            "PATH",
+            "LD_PRELOAD",
+            "PYTHONPATH",
+            "lowercase",
+            "9INVALID",
+        ] {
+            assert!(
+                application_environment([(
+                    format!("BMUX_PLAYBOOK_APP_ENV_{name}").into(),
+                    "value".into()
+                )])
+                .is_err()
+            );
+        }
+        assert!(
+            application_environment([(
+                "BMUX_PLAYBOOK_APP_ENV_BIG".into(),
+                "x".repeat(65537).into()
+            )])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn application_inputs_reach_only_the_runner_and_never_serialized_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("deck.playbook"), "new-session\n").unwrap();
+        let mut owner = Owner::default();
+        let attempt = owner.prepare(specification(root.path())).unwrap();
+        let run = owner.runs.get_mut(&attempt.generation).unwrap();
+        run.application_environment
+            .insert("APP_TOKEN".into(), "private-test-value".into());
+        let command = run.command();
+        assert!(command.get_envs().any(|(key, value)| key == "APP_TOKEN"
+            && value == Some(std::ffi::OsStr::new("private-test-value"))));
+        let probe = run.command_with_source(Path::new("missing-probe"));
+        assert!(!probe.get_envs().any(|(key, _)| key == "APP_TOKEN"));
+        for bytes in [
+            serde_json::to_vec(&run.spec).unwrap(),
+            serde_json::to_vec(&run.snapshot).unwrap(),
+            run.original_request.clone(),
+        ] {
+            assert!(
+                !String::from_utf8(bytes)
+                    .unwrap()
+                    .contains("private-test-value")
+            );
+        }
+        run.cleanup_runtime().unwrap();
+    }
 
     fn specification(root: &Path) -> Preparation {
         Preparation {

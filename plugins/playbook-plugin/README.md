@@ -5,6 +5,20 @@
 The typed `playbook-state` and `playbook-commands` interfaces are generated from
 `playbook-plugin-api/bpdl/playbook-plugin.bpdl`. No presenter registration is needed.
 
+## Explicit application environment
+
+Managed workers still clear the host environment. The owner may explicitly opt
+in application inputs using `BMUX_PLAYBOOK_APP_ENV_<NAME>=<value>` in its own
+launch environment. Preparation captures a bounded set in memory; only the real
+runner receives `<NAME>=<value>` (not the compatibility probe). Values are not
+part of preparation JSON, frozen script sources, or status/evidence snapshots.
+Runtime/configuration selectors remain protected. Invalid names or more than
+32 entries / 64 KiB of values reject preparation with a value-free error.
+This is not a secret store or an application sandbox: approved applications and
+their inherited child processes can read these inputs. Do not share an owner
+between untrusted applications. A fresh owner is required to change its launch
+environment; no late environment lookup or secret-file substitution is implied.
+
 ## Execution boundary
 
 The plugin invokes an explicitly selected native BMUX executable's existing

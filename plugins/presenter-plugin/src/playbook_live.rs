@@ -281,6 +281,11 @@ impl LiveDemos {
             .values_mut()
             .filter(|entry| entry.slide == slide)
         {
+            // An explicit executable-input policy requests the authoritative
+            // stop operation. Mere hiding/removal without that policy does not.
+            if entry.config.stop_on_leave {
+                entry.controller.cancel_navigation();
+            }
             entry.open = false;
         }
         Ok(())

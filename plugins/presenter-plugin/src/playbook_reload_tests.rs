@@ -205,6 +205,22 @@ async fn hide_and_navigation_retain_attempt_and_pause_truth() {
 }
 
 #[tokio::test]
+async fn explicit_leave_stop_policy_requests_authoritative_cancellation() {
+    let fixture = Fixture::new();
+    let mut running = fixture.running();
+    running
+        .demos
+        .entries
+        .get_mut("demo")
+        .unwrap()
+        .config
+        .stop_on_leave = true;
+    running.demos.leave("s").unwrap();
+    assert!(!running.demos.entries["demo"].open);
+    assert!(*running.cancelled.borrow() > 0);
+}
+
+#[tokio::test]
 async fn discarded_candidate_and_removed_reference_retain_execution_owner() {
     let fixture = Fixture::new();
     let mut running = fixture.running();

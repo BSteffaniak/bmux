@@ -553,7 +553,25 @@ Transition: “The useful result is not the list of features; it is a set of bou
 BMUX is early alpha. Ask about the feature, the contract, or the failure boundary.
 
 <!-- bmux:notes -->
-Quick path: Recap the path from useful split panes to ownership, discovery, appearance, delivery, and evidence. End here; the appendix is optional, not an automatic distributed-systems detour.
+Quick path: Recap the path from useful split panes to ownership, discovery, appearance, delivery, and evidence. The next slide is an explicitly started live finale; the appendix remains optional.
 Deeper path: Revisit a source slide or inspect an accepted run's retained output. Avoid invented performance figures, maturity claims, adoption, or roadmap commitments. Let the audience choose the layer.
-The six managed demos passed; final audience/privacy rehearsal and browser/Canvas acceptance remain distinct. Architecture intent, inspected implementation, and executed evidence are three different levels of confidence.
+The six original managed demos passed; final audience/privacy rehearsal and browser/Canvas acceptance remain distinct. Architecture intent, inspected implementation, and executed evidence are three different levels of confidence.
+<!-- bmux:end-notes -->
+
+---
+<!-- bmux:slide-id jev-finale -->
+<!-- bmux:block-id jev-title -->
+# One more thing: can Jev fly?
+
+<!-- bmux:block-id jev-contract -->
+Jev chooses **flap or wait**. BMUX hosts the real terminal application.
+Agent-paced physics waits for each decision; crashes start another attempt.
+
+<!-- bmux:block-id demo-jev-flappy -->
+<!-- bmux:component playbook-demo {"playbook":"demos/jev-flappy.dsl","title":"Jev plays Flappy Bird","on_leave":"stop"} -->
+
+<!-- bmux:notes -->
+Explicitly start the approved demo. This is live judgement API usage, not a recording or a hidden scripted pilot. It runs until Stop or leaving this slide, including across game-over retries. Request timeouts do not impose a demo lifetime.
+Configure and approve the standalone application separately using demos/jev-flappy.md. The playbook freezes its script, not external application bytes. Never put keys into scripts or displayed commands. Pause/resume/restart of gameplay use private application controls; presenter script Pause is not application pause. Presenter Stop/Restart and leaving the slide own managed sandbox cleanup.
+Keep this running during Q&A if desired. Requests incur ongoing provider usage. Network errors freeze physics and use bounded retry backoff; do not promise an unbeatable pilot or imply that offline tests prove live provider performance.
 <!-- bmux:end-notes -->
