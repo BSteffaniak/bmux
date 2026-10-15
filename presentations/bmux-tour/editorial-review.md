@@ -59,3 +59,19 @@ Demonstration refinements use real shell/attach paths:
 - Workspace clippy, nextest (5,798 passed, 16 skipped), and dependency analysis passed. See final execution report for exact commands.
 
 Venue readability, actual audience setup, manual pause/step/stop/restart rehearsal and final privacy review remain operator gates. Browser commits do not establish all of those. No presenter screenshot should be screen-shared; authored public code and terminal output are not automatically secret-redacted.
+
+## Second pass: teach the system, not just audit the slides
+
+The first editorial pass did not meet the stronger requirement that a presenter unfamiliar with BMUX could deliver a coherent explanation. This second pass is a structural teaching rewrite, not another score-based polish:
+
+- 23-slide main route with a plain definition, everyday problem, and pane/tab/workspace mental model before live navigation.
+- Playbooks defined before explaining their checks; architecture introduced through an already-familiar split operation.
+- Seven interface/concurrency/lifecycle slides moved to optional appendix depth, not deleted. Every original live demo remains in the main route, with Flappy Bird last.
+- Every main slide has ready-to-speak SAY prose, a visual cue and a transition. All seven demos have specific actions, expected observations and truthful failure branches. Source narration does not pretend a failed/skipped demonstration passed.
+- A continuous speaker script, setup/control guide and concrete Q&A answers make it unnecessary to invent technical explanations on stage.
+
+A fresh-context agent read sequentially without using repository research to fill missing teaching. Its eight follow-up findings led to conditional failure narration, an explicit core definition, first-demo trust/observation explanation, earlier term definitions, corrected model/game identity and bounded finale-operation guidance. It found no remaining blocking factual/comprehension issue in the corrected files; that is editorial acceptance for rehearsal, not human-user validation.
+
+JEV was asked answerable comprehension questions (what BMUX requires, what the PID test establishes, playbook checks, plugin policy, local delivery boundary), plus slide prerequisite/speakability questions. Whole-deck answers were consistent with the intended facts. It marked the old notes as requiring presenter improvisation, the revised notes as ready; initial revision flags on scrollback/game explanation were corrected and rechecked. Final per-slide prerequisite/speakability answers were all self-contained/ready. Opening and vocabulary slides were still labeled abstract in the engagement question; they are brief teaching scaffolds, not a basis for an inflated aggregate score. Model labels remain fallible and are not guarantees.
+
+Every main slide received two-width real Canvas content acceptance; the new mental model and architecture responsibility slides were visually inspected. Markdown lint, main/appendix parser validation, declaration preservation, note-card completeness, unchanged source examples and whitespace checks cover this docs-only rewrite. Runtime suites were not rerun because no code or executable playbook changed; preceding pass results remain historical and separately scoped. Rehearse aloud and test the actual presenter/audience setup before delivery.

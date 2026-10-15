@@ -1,14 +1,14 @@
 # Sources and presentation evidence
 
-Source baseline: checkout `36db28ac2244` plus this presentation working tree, inspected 2026-10-15. Line ranges are not permanent anchors; recompare excerpts when source changes. Runtime/application code was not changed by this editorial pass.
+Source baseline: checkout `5434a844c46a` plus the teaching rewrite, inspected 2026-10-15. Runtime implementation references were checked in the preceding pass; this pass changes Markdown only. Line ranges are not permanent anchors; recompare excerpts when source changes. Runtime/application code was not changed by this editorial pass.
 
 A **contract** states what must hold; an **implementation excerpt** shows a particular path; **executed evidence** establishes only the checked scenario. All six non-network demos passed fresh managed execution, retained audience snapshots, and intermediate browser/Canvas commits on 2026-10-15. The unchanged Flappy Bird finale separately passed a short live TypeSafe/JEV managed run, with non-placeholder model confidence/latency telemetry, Canvas commit, and presenter exit. This is not a promise of autonomous game skill, complete lifecycle coverage, venue legibility, or physical terminal paint acknowledgment.
 
 Test artifact: Linux x86_64 debug `bmux`, SHA-256 `58895c1b1c38709c2ec779a28ce974eb6a91b368135b8e5cfa35366826025293`, with the existing matching plugin directory and web assets. Private evidence is retained outside the repository. Approval applies to the actual reviewed scripts/artifacts, not arbitrary replacements. Final audience/privacy rehearsal remains required.
 
-## Exact implementation excerpts
+## Exact implementation excerpts — main deck and optional appendix
 
-All 15 implementation/DSL excerpts match contiguous literal source text, including indentation. The finder and navigation examples each use separate excerpts. The inline component declaration preserves the actual `demo-evidence` configuration, reformatted over multiple lines for legibility; the closing launch command is an authored usage example, not a production-code quotation. BPDL is labeled `text`.
+All 15 implementation/DSL excerpts remain preserved across the main deck and appendix and match contiguous literal source text, including indentation. The finder and navigation examples each use separate excerpts. The inline component declaration preserves the actual `demo-evidence` configuration, reformatted over multiple lines for legibility; the closing launch command is an authored usage example, not a production-code quotation. BPDL is labeled `text`.
 
 | Stable block | Exact source and refreshed lines |
 | --- | --- |
@@ -55,7 +55,7 @@ These are explanatory models, not generated dependency graphs. The adjacent impl
 | `frame-transaction` | `packages/attach_pipeline/src/terminal.rs`; attach `render_attach_frame_inner` | Successful local transport permits presentation-state commit; failed output invalidates incremental assumptions. Physical paint and browser Canvas are separate boundaries. |
 | `demo-authority` | Presenter playbook controller, managed display and observer paths | One input owner, read-only output audience, bounded repair. Stop request, cleanup and restart remain distinct lifecycle facts. |
 
-The three remaining diagrams retain their earlier source grounding. Fresh selected-slide Canvas checks cover changed code/content at two browser widths; they do not establish venue readability or every native image protocol. Fixed-frame browser width does not itself resize producer terminal geometry. Final rehearsal must deliberately match producer geometry and audience delivery mode.
+The three diagrams retain their earlier source grounding and now live in optional appendix depth. Fresh Canvas checks cover every one of the 23 main slides at two browser widths; they do not establish venue readability or every native image protocol. Fixed-frame browser width does not itself resize producer terminal geometry. Final rehearsal must deliberately match producer geometry and audience delivery mode.
 
 ## Architectural sources and boundaries
 
@@ -79,3 +79,11 @@ The three remaining diagrams retain their earlier source grounding. Fresh select
 - [ ] Keep capability URLs, credentials, observer/runtime paths, and retained evidence private/redacted.
 
 If a final rehearsal fails, disclose the failed scenario and use its implementation slide rather than manufacturing success. The demo passes, exact source comparisons, JEV editorial judgments, and final audience rehearsal answer different questions. See [editorial review](editorial-review.md) for decisions and review limits.
+
+## Teaching rewrite acceptance
+
+The main route now defines BMUX and pane/tab/workspace before using those terms, introduces playbooks before their checks, and explains architecture through the split already demonstrated. Seven interface-heavy slides moved to optional depth; all seven actual live component declarations and configurations are unchanged. All 23 main slides have ready-to-speak SAY, POINT OUT and NEXT notes; all seven demo cards include DO, EXPECTED and IF IT FAILS. [Speaker script](speaker-script.md) and [presenter guide](presenter-guide.md) are companion presenter-only material, not public deck assets.
+
+An independent fresh-context agent reviewed the deck first without code lookup, identified eight concrete teaching/presenter traps, and accepted the corrected route for rehearsal. This is not a newly recruited human audience study. JEV structured comprehension checks supplied a second opinion; no model verdict guarantees a smooth presentation.
+
+All 23 main slides rendered and committed to browser Canvas at 1280×720 and 800×600 using fresh producer geometries of 120×30 and 90×26. Actual venue/terminal/notes layout still requires rehearsal. Component placements were not started in these content checks. The preceding live demo acceptance remains a separate result for the unchanged scripts, not a rerun claimed by these screenshots.

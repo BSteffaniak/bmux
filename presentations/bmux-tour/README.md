@@ -1,10 +1,12 @@
-# BMUX engineering tour
+# BMUX: a guided terminal tour
 
-A feature-led narrative: **feature + embedded run on the same slide**, followed by exact implementation excerpts and the relevant ownership/failure boundary. Choose quick or deeper paths chapter by chapter; there is no fixed slide-count or duration requirement.
+A zero-background story: **see and find real work → repeat it with playbooks → explain the mechanisms → let Jev fly**. The 23-slide main route introduces terms before using them, includes ready-to-speak private narration, and preserves all seven demos. Seven interface-heavy slides moved to optional appendix depth rather than interrupting the first-time explanation.
 
 ## Files
 
-- [deck.md](deck.md): opening; splits/layout; tabs/sessions/workspaces; cross-workspace finder; theme composition/control; rendering/flush; playbooks as evidence; presentation/browser reuse; close.
+- [presenter-guide.md](presenter-guide.md): start here—setup, controls, fallback lines, slide route, and honest Q&A answers.
+- [speaker-script.md](speaker-script.md): continuous ready-to-say narration and demo cue cards, in deck order.
+- [deck.md](deck.md): beginner introduction, work/navigation, themes, playbooks, concrete architecture, output delivery, presentation composition, and Flappy Bird finale.
 - [appendix.md](appendix.md): optional technical discussion of the demonstrated local features.
 - [sources.md](sources.md): excerpt provenance, evidence limits, and final rehearsal checklist.
 - [editorial-review.md](editorial-review.md): JEV review method, human decisions, implementation confidence, and acceptance limits.
@@ -15,7 +17,7 @@ Preserve stable `bmux:slide-id` and `bmux:block-id` identities when editing. Com
 
 ## Mechanisms behind the demonstrations
 
-Two former overview diagrams now show actual plugin implementation and shell-state checks. Three Mermaid slides retain focused explanatory models:
+The main route uses actual implementation and shell-state checks. The three Mermaid models are now optional appendix material, not prerequisites for the main talk:
 
 | Slide ID | Question answered | Read the arrows as |
 | --- | --- | --- |

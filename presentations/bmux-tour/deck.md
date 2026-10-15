@@ -8,119 +8,151 @@ theme: dark
 <!-- Slide decks intentionally have one top-level heading per slide. -->
 <!-- bmux:slide-id opening -->
 <!-- bmux:block-id opening-title -->
-# BMUX
+# BMUX: keep your terminal work together
 
 <!-- bmux:block-id opening-thesis -->
-Split real commands into panes. Return to the same running shell. Find work across workspaces—and inspect how BMUX makes those actions reliable.
+A terminal multiplexer: run several terminal programs, arrange their views, and move between them.
 
 <!-- bmux:block-id opening-route -->
-See the workspace → inspect the contracts → follow a frame → make the demonstration check itself.
+**Use it → automate it → understand why it works → let Jev fly.**
+
+No BMUX background needed. Start with a shell, not an architecture diagram.
 
 <!-- bmux:block-id opening-scope -->
-**Early alpha · implemented-feature tour, not a production-readiness or terminal-compatibility guarantee.**
+Early alpha. This tour shows implemented local features, not a production-readiness promise.
 
 <!-- bmux:notes -->
-Quick path: “A multiplexer is the starting point. The interesting engineering is who owns the work, who owns the view, and what counts as having shown a frame.” Introduce yourself and add your actual motivation; none is invented here.
-Deeper path: Explain that BMUX is early alpha. This is an implementation tour, not a compatibility or production-readiness guarantee. Each demo is an explicitly started managed execution, not a video or a command silently launched by parsing Markdown.
-Rehearsal: select the approved native executable and matching plugins/worker protocol, then verify audience geometry and privacy. Historical six-demo acceptance is not approval of these edited sources; rerun the settled artifact and rehearse audience delivery. There is no fixed slide-count or time budget; choose depth by chapter.
-Transition: “Start with a small, useful workspace.”
-<!-- bmux:end-notes -->
+SAY
+“BMUX is a terminal multiplexer. If that phrase is new, think of keeping several terminal programs together and choosing how to see them. We are going to start with ordinary commands, make the setup repeatable, and then follow a few of those actions into the implementation. You do not need to know BMUX’s internal names. I will introduce them as we need them. The live demos use scripts to drive real terminal input; we will read those scripts after seeing what they do. This is early-alpha software, so this is a tour of specific things that work—not a claim that every terminal, workflow, or failure mode is solved.”
 
+POINT OUT
+The four-part route is the promise. Do not begin with crates, ownership terminology, or a list of subsystems.
+
+NEXT
+“First, here is the situation this is meant to help with.”
+<!-- bmux:end-notes -->
+---
+<!-- bmux:slide-id why-bmux -->
+<!-- bmux:block-id why-bmux-title -->
+# The hard part is finding your work again
+
+<!-- bmux:block-id why-bmux-body -->
+Imagine three things running: a build, a shell for changes, and logs.
+
+- **See them together** without juggling terminal windows.
+- **Find them later** without remembering which tab you used.
+- **Repeat the setup** without remembering every keystroke.
+
+We will do those things first. Then open the hood.
+
+<!-- bmux:notes -->
+SAY
+“Imagine you are changing a program. You have a build running, a shell where you edit or inspect files, and logs you want to keep an eye on. The commands are simple. The frustrating part is keeping track of them as you move around. That gives us three questions: can I see related work together, find it again later, and repeat the setup without relying on memory? The demos use harmless file, system, and clock commands rather than pretending to run your actual production service. They demonstrate those mechanics.”
+
+POINT OUT
+Invite a moment of recognition: ‘Which tab did I leave that in?’ It is a concrete problem, not a promise that BMUX uniquely invented multiplexer workflows.
+
+NEXT
+“We need only three names to watch the first few demos.”
+<!-- bmux:end-notes -->
+---
+<!-- bmux:slide-id mental-model -->
+<!-- bmux:block-id mental-model-title -->
+# Three names you need before the first demo
+
+<!-- bmux:block-id mental-model-body -->
+| Name | Think of it as | In this tour |
+| --- | --- | --- |
+| **Pane** | A terminal surface for a shell or program | Commands visible side by side |
+| **Tab** | A selectable view of running work | Return to the original shell |
+| **Workspace** | A named group of tabs | Find a tab across groups |
+
+**Switching what you see is not the same as restarting what runs.**
+
+Simplified user model—not an execution-lifetime or ownership diagram.
+
+<!-- bmux:notes -->
+SAY
+“A pane is a terminal surface where a shell or program’s input and output appear. A tab is a selectable view of running work. A workspace is a named group of tabs. So I can have several panes visible, select another tab, or switch to another group. Those are changes in what I see; they do not, by themselves, mean starting the work again. Under the hood there are more precise lifetime objects. We do not need them yet. This table is a user’s navigation map, not a diagram of which process owns which state.”
+
+POINT OUT
+Read each row with the concrete example. Do not use pane, tab, workspace and session interchangeably.
+
+NEXT
+“Let’s turn one terminal into a useful little workspace.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id splits-layout -->
 <!-- bmux:block-id splits-title -->
-# One workspace, several useful surfaces
+# Three commands, one useful view
 
 <!-- bmux:block-id chapter-work -->
-Chapter 1 · Work and navigation
+1 · Work you can see and find
 
 <!-- bmux:block-id splits-feature -->
-Keep several real commands visible together. Split the space; move focus without moving the work.
+Watch one terminal become three panes: a file list, system information, and current UTC time.
+
+**Notice:** focus moves between panes; each pane keeps its own output.
 
 <!-- bmux:block-id demo-panes -->
 <!-- bmux:component playbook-demo {"playbook":"demos/panes.dsl","title":"Splits and focus","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Quick path: Focus the component with Tab, open with o, then manually start with r. Narrate the directory listing, kernel version, UTC clock, and the change in focus. These are actual command results, not simulated application/test status.
-Deeper path: Pause with p; n executes a whole action including its waits; c resumes. Distinguish pane geometry, selected input target, and the program running underneath. This script demonstrates splits and focus, not resize or zoom.
-Rehearsal: confirm command output is legible at the venue size. The managed run enables its required plugins and checks pane/focus assertions. The audience observer is output-only; script attach actions use the managed single-authority attach path, not arbitrary audience shell access. Leaving requests stop; verify cleanup acknowledgment before restart.
-Transition: “The UI action has a typed contract.”
+SAY
+“I explicitly start a reviewed script in its managed demo environment. You are watching output, not controlling my shell. These are trusted commands, not a security sandbox. We start with one shell. The script lists directory names, splits the view, and prints system information and the current UTC time in the new panes. Watch the layout, then watch focus move. The commands are deliberately simple so we can see the interface working rather than puzzle over the application. Each pane retains its own terminal output. The useful idea is that related work can stay in sight while input goes to the pane I choose.”
+
+POINT OUT
+Point at the three panes and the active pane. Let the action finish before explaining internals.
+
+DO
+Focus the demo with Tab, press o to open its overlay, then r to start. Do not send the scripted attach keys yourself.
+
+EXPECTED
+The fixture listing, Linux information and UTC clock appear in three panes; focus moves between them.
+
+IF IT FAILS
+Say: “This run did not complete, so I will not call it a successful split demo. The playbook and implementation remain inspectable.” Press s; wait for cleanup status. Do not restart on top of unresolved work. Continue with navigation.
+
+NEXT
+“Seeing several things is useful. Keeping them when we navigate is the next part.”
 <!-- bmux:end-notes -->
-
----
-<!-- bmux:slide-id splits-contract -->
-<!-- bmux:block-id splits-contract-title -->
-# A split is an operation, not a key binding
-
-<!-- bmux:block-id excerpt-split -->
-```text
-    command split-pane(
-        session: selector?,
-        target: selector?,
-        direction: pane-direction,
-        ratio-pct: u32?,
-    ) -> result<pane-ack, pane-mutation-error>;
-```
-
-<!-- bmux:block-id split-provenance -->
-`plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl` · `tabs-commands.split-pane`
-
-<!-- bmux:block-id split-architecture -->
-Input specifies a target, direction, and optional ratio. Success returns `pane-ack`; failure returns a typed `pane-mutation-error`. The shortcut does not define this contract.
-
-<!-- bmux:notes -->
-Quick path: Point out target, direction, and typed failure. A keyboard shortcut is one entry point, not the definition of splitting.
-Deeper path: This is exact BPDL, not Rust or pseudocode. The same interface also exposes resize-pane and zoom-pane; this excerpt does not prove a particular keymap. API crates own contracts; runtime orchestration belongs in plugin implementations. Foundational plugins may invoke kernel requests; core must not grow tabs convenience APIs.
-This schema names the operation; the next slide shows the plugin policy that implements it. Rendering later consumes retained presentation state rather than calling plugins to reconstruct a frame.
-Transition: “What policy sits between that command and the actual split?”
-<!-- bmux:end-notes -->
-
----
-<!-- bmux:slide-id command-route -->
-<!-- bmux:block-id command-route-title -->
-# The shortcut is not the architecture
-
-<!-- bmux:block-id command-route-diagram -->
-```rust
-    let session_id = resolve_session_id(caller, session)?;
-    let target = resolve_target_pane_id(caller, session_id, target)?;
-    let ratio = ratio_pct.unwrap_or(50).clamp(10, 90) as u8;
-```
-
-<!-- bmux:block-id command-route-provenance -->
-`plugins/tabs-plugin/src/lib.rs` · `split_pane_with_policy`
-
-<!-- bmux:block-id command-route-takeaway -->
-The tabs plugin resolves the target and bounds the split ratio. It then calls the generated `pane-runtime-commands` client—not a second handwritten transport.
-
-<!-- bmux:notes -->
-Question: What does a shortcut actually ask the system to do? The preceding BPDL declares the public operation. Here is concrete plugin-side policy: resolve the selected session and pane, default to 50%, clamp to 10–90%, then delegate execution. The adjacent runtime-default branch calls api_pane_runtime_commands::client::split_pane with session_id, target, direction, and ratio. Directory-aware policy takes a separate typed split_shell path; these three lines are not the whole implementation.
-Sources: plugins/tabs-plugin/src/lib.rs split_pane and split_pane_with_policy; plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl tabs-commands. Generated clients preserve declared service boundaries. Domain policy belongs to plugins; the host provides neutral dispatch and execution mechanisms. The keymap is an entry point, not the owner of split policy.
-Transition: “Now separate the work we just started from the view used to find it.”
-<!-- bmux:end-notes -->
-
 ---
 <!-- bmux:slide-id ownership -->
 <!-- bmux:block-id ownership-title -->
-# Running work ≠ its place in your view
+# Change the view, keep the work
 
 <!-- bmux:block-id ownership-feature -->
-Sessions keep execution alive; an attachment selects what you see and where input goes. Tabs expose attachable work, and workspaces organize it.
+We will leave a shell, visit another tab and workspace, then return.
+
+**Notice:** the original shell still knows its saved process ID and fixture.
+That is stronger than opening a new shell that looks the same.
 
 <!-- bmux:block-id demo-navigation -->
 <!-- bmux:component playbook-demo {"playbook":"demos/navigation.dsl","title":"Tabs and workspace navigation","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Quick path: Manually run navigation. The original shell stores its PID; after a tab switch, a successful identity check permits counting its 42-record fixture. Create a generated workspace, run uname there, then return to the existing clock tab with Alt-L.
-Deeper path: Personal arrangements are distinct from deliberately shared arrangements. Changing an attachment's selection does not imply that a shared layout mutation is private. Removing a personal reference is not destroying the running resource. Disconnect survival is not machine-restart survival.
-Rehearsal: keep the state marker visible long enough to explain it. This script exercises real tab/workspace commands and preserved shell state, not a second attachment or independent client-focus demonstration.
-Transition: “Discovery must not quietly rewrite the organization it reads.”
-<!-- bmux:end-notes -->
+SAY
+“This time I want to know whether we actually return to the same shell. Before leaving, the shell saves its process ID and creates a small disposable file containing 42 numbered lines. We call that a fixture. The script visits another tab and another workspace, then returns. The returning command checks the saved ID before counting the fixture. That is better evidence than showing the same prompt twice: a fresh shell could look identical. This run checks a specific navigation scenario; it is not a promise about surviving a machine restart or independently controlling several clients.”
 
+POINT OUT
+Watch the original shell, the other tab’s time output, the temporary workspace, and the return. The count is meaningful because it is conditional on the PID check.
+
+DO
+Tab → o → r. Let the script navigate; do not advance away while explaining the return.
+
+EXPECTED
+The clock and workspace visit occur; the original shell returns and its conditional fixture count is 42.
+
+IF IT FAILS
+Say: “We did not establish the return check in this run. Here is the exact check we intended.” Stop the run and use the following two-command slide. Do not claim state survival from a similar-looking prompt.
+
+NEXT
+“Here are the two commands that make that claim checkable.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id ownership-map -->
 <!-- bmux:block-id ownership-map-title -->
-# Switching the view does not restart the work
+# How do we know it is the same shell?
 
 <!-- bmux:block-id ownership-map-diagram -->
 ```sh
@@ -138,63 +170,60 @@ test "$tour_origin" = "$$" && wc -l < "$BMUX_RUNTIME_DIR/navigation-jobs"
 `presentations/bmux-tour/demos/navigation.dsl` · exact shell commands sent by the playbook
 
 <!-- bmux:block-id ownership-map-takeaway -->
-**The returning shell prints 42 only if its saved PID still matches.** Navigation changes selection, not that shell's lifetime.
+`$$` is the shell’s process ID. Save it before leaving; compare it after returning.
+
+**42 is the fixture’s line count—not a simulated success message.**
 
 <!-- bmux:notes -->
-Question: Did we return to the same work, or just create a similar-looking shell? The first command saves the shell PID and writes a private job-list fixture; the returning command checks the saved PID before counting its records. The playbook waits for the result; this is not a hard-coded success banner. These are two source excerpts separated by actual tab navigation, not a contiguous shell script.
-Sources: presentations/bmux-tour/demos/navigation.dsl; docs/concepts.md and INVARIANTS.md for the wider ownership contract. This is one attachment navigating tabs/workspaces, not a demonstration of independent clients or restart recovery. Personal references and deliberately shared arrangements have different semantics. A replaceable tab bar does not own the underlying resources; removing a personal reference is not destroying running work.
-Transition: “Keeping work alive is only useful if we can still discover it.”
+SAY
+“This is the little test behind the navigation demo. In a shell, dollar-dollar means the shell’s process ID. The first line saves it in tour_origin, writes 42 records to a private runtime fixture, and prints the current directory. After navigation, the second line compares the saved value with the current shell’s ID. Only if they match does it print the fixture’s line count. If the run passed, the result establishes return to this original shell. If it failed or we skipped it, this is the intended check—not a result we established today. Even success would not establish every lifetime guarantee.”
+
+POINT OUT
+Read the first assignment and the test, not every path character. Explain that && means ‘run the next command only if the test succeeds.’
+
+NEXT
+“But what if I remember the work, not where I put it?”
 <!-- bmux:end-notes -->
-
----
-<!-- bmux:slide-id ownership-contract -->
-<!-- bmux:block-id ownership-contract-title -->
-# Discovery and placement have different jobs
-
-<!-- bmux:block-id excerpt-catalog -->
-```text
-interface tabs-catalog-v1 {
-    // Complete discovery in workspace order, then each workspace's tab arrangement.
-    // Reading this catalog never initializes or rewrites arrangement storage.
-    query list-tabs() -> result<list<tabs-state.tab-entry>, string>;
-}
-```
-
-<!-- bmux:block-id catalog-provenance -->
-`plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl` · `tabs-catalog-v1`
-
-<!-- bmux:block-id ownership-boundary -->
-Ask which tabs exist without changing their arrangement. The finder uses this catalog; moving a tab is a separate operation.
-
-<!-- bmux:notes -->
-Quick path: Read the “never initializes or rewrites” line. A finder can ask what exists without acquiring ownership of its arrangement.
-Deeper path: The neighboring tabs-placement-v1 contract says placement appends to the destination before changing the workspace attribute, retains source references, and is retry-idempotent. Those are ownership semantics, not just labels in a tab bar. Consult INVARIANTS.md for authority, discoverability, and input-safety contracts; do not describe the schema as proof of all recovery cases.
-Keep the boundary honest: neutral host mechanisms are not a second source of domain policy. Missing optional domains must not turn baseline server primitives into domain-specific core behavior.
-Transition: “That separation makes a workspace-wide finder possible.”
-<!-- bmux:end-notes -->
-
 ---
 <!-- bmux:slide-id finder -->
 <!-- bmux:block-id finder-title -->
-# Find the tab, not the workspace first
+# Remember “api”, not where you put it
 
 <!-- bmux:block-id finder-feature -->
-Search tab names and workspace context together; switch to the work you meant.
+Start in another workspace. Open **Find Tab**, type `api`, and select it.
+
+**Notice:** we return to the tab with the earlier Linux output.
+Search helps you recover context; it does not create replacement work.
 
 <!-- bmux:block-id demo-finder -->
 <!-- bmux:component playbook-demo {"playbook":"demos/finder.dsl","title":"Cross-workspace tab discovery","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Quick path: Start manually. From operations/logs, the script opens the real fuzzy finder, types api, and presses Enter to return to API / ready in default. Show the query and resulting selection.
-Deeper path: Finder supports fuzzy, prefix, and substring matching, scope settings, and configurable ordering. Do not equate every match mode with fuzzy scoring or promise an unrehearsed shortcut.
-Rehearsal: verify the picker and query are readable at audience size. The managed path uses single-authority attach support for actual prompt interaction under generated configuration. It does not use real-attach or custom sandbox configuration; those remain rejected.
-Transition: “The catalog and the search projection stay separate.”
-<!-- bmux:end-notes -->
+SAY
+“I have a tab named api, but I am now in another workspace. Instead of choosing the right workspace first and scanning its tabs, I open Find Tab and type api. Selecting the result takes us back to the earlier terminal output. On a successful run, that is a Linux version line, not a real API server. The point is recovering the existing tab, not restarting an application or moving it to the current group. The query and the destination should both be visible.”
 
+POINT OUT
+Point out Find Tab, the typed query, and the Linux output after Enter. Do not call a highlighted result a successful activation until the destination appears.
+
+DO
+Tab → o → r. Wait for the picker, api query and destination.
+
+EXPECTED
+Find Tab opens, api is typed, Enter selects the existing API-named tab and its Linux output reappears.
+
+IF IT FAILS
+Say: “The lookup did not reach the checked destination; the next slide separates candidates and search text.” Stop and continue; do not say the word api on screen proves activation.
+
+NEXT
+“Two small pieces of code explain why search can include useful context.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id finder-implementation -->
 <!-- bmux:block-id finder-implementation-title -->
-# Scope and search text are explicit
+# A search result needs context, not just a name
+
+<!-- bmux:block-id finder-reading-key -->
+**Read this as:** choose which tabs to search, then decide what text counts as searchable.
 
 <!-- bmux:block-id excerpt-finder-scope -->
 ```rust
@@ -220,37 +249,58 @@ Transition: “The catalog and the search projection stay separate.”
 With all-workspace scope, `operations/api` can be a candidate while you are elsewhere. Including the workspace name makes `operations` searchable too. These excerpts choose candidates and search text—not the fuzzy scoring algorithm.
 
 <!-- bmux:notes -->
-Quick path: The scope filter decides which tabs are candidates. The second excerpt decides whether workspace names participate in search, not just display.
-Deeper path: load_windows calls the generated tabs_catalog_v1 client; show_finder requests OrderedV1 matching and supplies the configured fuzzy/prefix/substring mode. These excerpts are not the fuzzy scoring algorithm. Selection is handled separately after the prompt response; discovery alone does not mutate arrangement storage.
-Rehearsal: the script checks the rendered picker/query and asserts the selected API pane. This establishes the demonstrated api path across default/operations, not exhaustive search ordering or every matching mode.
-Transition: “Appearance needs the same separation between a convenient UI and a real state contract.”
-<!-- bmux:end-notes -->
+SAY
+“The first excerpt chooses the candidates. If scope is all workspaces, every workspace is eligible; otherwise it keeps tabs from the active workspace. The second excerpt chooses the text that search sees. When workspace names are included, it combines the workspace and tab name. That matters when two tabs have the same name. There are separate steps for matching and for activating a selected result. These lines are not the entire fuzzy-search algorithm. The reusable design idea is to separate finding candidates, matching text, and acting on the chosen identity.”
 
+POINT OUT
+Read the two conditions in ordinary language. ‘Scope’ means where to look; ‘search source’ means the text to match.
+
+NEXT
+“Navigation helps you recover your place. Appearance helps you recognize the place you are in.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id themes -->
 <!-- bmux:block-id themes-title -->
-# Compose appearance; control it coherently
+# Try a different look without committing to it
 
 <!-- bmux:block-id chapter-appearance -->
-Chapter 2 · Appearance and delivery
+2 · A workspace that feels like yours
 
 <!-- bmux:block-id themes-feature -->
-Keep your base palette while layering plugin-owned component settings. The live picker previews bundled presets before confirming Cyberpunk; highlighting a choice does not save it.
+The real theme picker previews bundled presets, then confirms Cyberpunk.
+
+**Notice:** highlighting changes the appearance; Enter chooses what to keep.
+The shell is still there underneath the picker.
 
 <!-- bmux:block-id demo-themes -->
 <!-- bmux:component playbook-demo {"playbook":"demos/themes.dsl","title":"Theme composition and control","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Quick path: Start manually. The script opens Select Theme and previews every bundled preset plus default in alphabetical order, holding each for two seconds. After the cycle, Home and Down return to Cyberpunk, then Enter confirms it. The original shell remains running.
-Deeper path: Theme files merge left to right. Separate appearance_themes and component_themes let component packs avoid replacing base chrome. The theme plugin merges extension data; the owning plugin validates/interprets it.
-Rehearsal: make the preview transition legible before confirmation. The script uses actual managed attach input under generated configuration. It demonstrates preview and confirmation, not cancellation, conflicting revisions, or every composition combination. Real-attach and custom sandbox-config remain rejected.
-Transition: “First the data being composed, then the control protocol.”
-<!-- bmux:end-notes -->
+SAY
+“Here is the theme picker. It previews the bundled presets in order and pauses briefly on each, so we can see the real application change. It then returns to Cyberpunk and confirms that choice. The distinction to watch is preview versus commitment: moving the highlight is trying a look; pressing Enter chooses it. The original shell continues underneath. We are not proving every theme-related error case here. We are demonstrating a coherent, visible workflow that lets you try before deciding.”
 
+POINT OUT
+Let the color and decoration changes breathe. Name one visible change instead of speaking continuously over the cycle.
+
+DO
+Tab → o → r. Let every preset preview for its scripted pause. No need to narrate each name.
+
+EXPECTED
+A full preset cycle, Cyberpunk confirmation, and continued shell output.
+
+IF IT FAILS
+Say: “The preview run did not finish. The source shows what the theme configures, but I am not calling this a completed confirmation.” Stop and continue to the bundled configuration.
+
+NEXT
+“A theme can also describe a plugin’s part of the interface. Here is an actual example.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id themes-composition -->
 <!-- bmux:block-id themes-composition-title -->
-# A theme carries plugin extension data
+# A theme can style a plugin’s part of the screen
+
+<!-- bmux:block-id theme-reading-key -->
+This bundled TOML configures an **unfocused decoration**: a pane that is not active.
 
 <!-- bmux:block-id excerpt-theme-component -->
 ```toml
@@ -267,120 +317,209 @@ style         = "rounded"
 `plugins/theme-plugin/assets/themes/minimal.toml` · `plugins."bmux.decoration".unfocused`
 
 <!-- bmux:block-id themes-composition-boundary -->
-Theme selection/composition → plugin-owned extension settings → owning renderer. Not decoration policy in core.
+**Example:** `fg` sets this unfocused decoration’s foreground color.
+`style = "rounded"` selects its rounded style. The decoration plugin interprets these settings.
 
 <!-- bmux:notes -->
-Quick path: This is a real bundled theme table, not an invented configuration example. It makes the ownership boundary visible: decoration settings live under the decoration plugin identity.
-Deeper path: The theme README documents deep merging extension tables and component maps by ID. ThemePlugin::reapply_live_theme passes the resolved theme to try_apply_theme_extensions and publishes runtime appearance; it avoids reapplying while a preview is active. Composition does not authorize arbitrary plugin behavior or replace the retained compositor.
-The empty strings and list are exact source values. Do not infer all component capabilities from this small static table.
-Transition: “A picker is one client of revisioned state.”
+SAY
+“This is TOML from a bundled theme. TOML is a configuration format; we do not need to learn its syntax to read the idea. The heading identifies the decoration plugin and an unfocused state—a pane that is not currently active. The values beneath it describe that appearance. The important architectural point is that product plugins can interpret their own extension data. The shared theme machinery does not need to hard-code every decoration option. This excerpt shows configuration structure; the picker demo is the corresponding visible workflow. If that run failed, the configuration excerpt is not a substitute for a successful preview or confirmation.”
+
+POINT OUT
+Point at `[plugins."bmux.decoration".unfocused]`, then `fg = "#606060"`: foreground color for this unfocused decoration. `style = "rounded"` selects its rounded style. Read those two values; skip the empty options unless asked.
+
+NEXT
+“So far you have watched several demonstrations. They have all been driven by the same mechanism.”
 <!-- bmux:end-notes -->
-
 ---
-<!-- bmux:slide-id preview-lifecycle -->
-<!-- bmux:block-id preview-lifecycle-title -->
-# Preview is temporary authority, not a saved choice
+<!-- bmux:slide-id playbooks-intro -->
+<!-- bmux:block-id playbooks-intro-title -->
+# What if the demo could check itself?
 
-<!-- bmux:block-id preview-lifecycle-diagram -->
-```mermaid
-flowchart LR
-  C[Committed] -->|revision| T[Preview token]
-  T --> V[Temporary look]
-  V -->|confirm| N[Save choice]
-  V -->|cancel| O[Restore choice]
-  classDef stable fill:#164e63,stroke:#22d3ee,color:#ffffff
-  classDef temporary fill:#78350f,stroke:#fbbf24,color:#ffffff
-  class C,N,O stable
-  class T,V temporary
-```
+<!-- bmux:block-id playbooks-intro-body -->
+A **playbook** is a readable script for terminal actions **and checks**.
 
-<!-- bmux:block-id preview-lifecycle-takeaway -->
-**Revision checks protect entry; the token owns the preview.** This is the control-service contract; the live picker uses a separate interactive prompt path.
+**Set up real work → act on the real UI → wait for output → check it.**
+
+The demos so far were playbooks. Now we will read one.
+
+Not a video. Not a slide that prints “success” without doing the work.
 
 <!-- bmux:notes -->
-Question: Why not save on every Down key? A preview must be reversible and owned. Cyan is committed state; amber is temporary authority/appearance. Moving among candidates changes live appearance without treating each highlight as a saved selection. That repeated preview step is compressed into Temporary look; Save choice and Restore choice are outcomes, not additional state owners. Confirm and cancel are distinct operations.
-Source: plugins/theme-plugin/bpdl/theme-plugin.bpdl, theme-control-v1. This is a successful-path lifecycle, not a complete error state machine. Begin can reject a stale expected revision; token operations can fail and are not unconditional transitions. Renew-preview and cleanup/expiry handling are intentionally omitted. The demo shows previews and confirmation, not all races or cancellation cases.
+SAY
+“Those demonstrations were playbooks. A playbook is a readable script that can create work, send real input, wait for output, and check the result. It is not a recording or a collection of prewritten success messages. The difference between an action and a check is important: sending Enter tells us what we attempted; checking output tells us something about what happened. We will make a tiny fixture, inspect it from another pane, and ask the playbook to reject the wrong result. That turns a demonstration into something we can inspect and repeat.”
+
+POINT OUT
+Walk through the four verbs. Explain fixture as ‘small disposable input created for this demonstration.’
+
+NEXT
+“Here is the fixture demonstration; look for the result, not merely the command.”
 <!-- bmux:end-notes -->
-
 ---
-<!-- bmux:slide-id themes-control -->
-<!-- bmux:block-id themes-control-title -->
-# Stale controls must not silently win
+<!-- bmux:slide-id playbooks-evidence -->
+<!-- bmux:block-id evidence-title -->
+# Make the result prove something
 
-<!-- bmux:block-id excerpt-theme-control -->
+<!-- bmux:block-id chapter-evidence -->
+3 · Repeat the work; inspect the result
+
+<!-- bmux:block-id evidence-feature -->
+Create 42 numbered records. Read them from a second pane.
+Check **42 records, sum 903, two panes**—then retain a snapshot.
+
+**Notice:** the checks read real output, not just the command you typed.
+
+<!-- bmux:block-id demo-evidence -->
+<!-- bmux:component playbook-demo {"playbook":"demos/evidence.dsl","title":"Actions, checks, and evidence","on_leave":"stop"} -->
+
+<!-- bmux:notes -->
+SAY
+“The first pane creates records numbered one through 42 and counts them. A second pane reads that same fixture independently and prints the count and sum. The expected result is 42 records and a sum of 903. The script waits for a complete result line, checks that there are two panes, checks the displayed output, and only then captures a named snapshot. Checking the whole output line matters: the command itself may be echoed in a terminal, and seeing the command is not the same as seeing its result.”
+
+POINT OUT
+Point to 42 in the first pane, 42 903 in the second, then the successful checked run. A snapshot is evidence to inspect, not a proof of everything about the application.
+
+DO
+Tab → o → r. Watch the second pane and let the assertions finish before announcing success.
+
+EXPECTED
+First count 42; second result 42 903; two-pane layout; retained verified-demo snapshot after successful checks.
+
+IF IT FAILS
+Say: “The check has not passed; that is exactly why the demonstration has assertions. Here is the test we expected to pass.” Stop and read the next source slide. Never treat a snapshot label alone as a successful result.
+
+NEXT
+“Now you can read the important part of the playbook yourself.”
+<!-- bmux:end-notes -->
+---
+<!-- bmux:slide-id playbook-source -->
+<!-- bmux:block-id playbook-source-title -->
+# Read the checks like a tiny test
+
+<!-- bmux:block-id excerpt-playbook-check -->
 ```text
-    command current() -> snapshot;
-    command select(expected-revision: u64, selection: selection) -> result<snapshot, string>;
-    command refresh(expected-revision: u64) -> result<snapshot, string>;
-    command begin-preview(expected-revision: u64) -> result<u64, string>;
-    command preview(token: u64, selection: selection) -> result<unit, string>;
-    command cancel-preview(token: u64) -> result<unit, string>;
-    command confirm-preview(token: u64, selection: selection) -> result<snapshot, string>;
+wait-for pattern='(?m)^42 903\s*$'
+assert-layout pane_count=2
+assert-screen matches='(?m)^42 903\s*$'
+# Keep a named snapshot only after both the structural and output checks pass.
+snapshot id='verified-demo'
 ```
 
-<!-- bmux:block-id theme-control-provenance -->
-`plugins/theme-plugin/bpdl/theme-plugin.bpdl` · `theme-control-v1` · excerpt
+<!-- bmux:block-id playbook-source-provenance -->
+`demos/evidence.dsl` · output/layout checks → named snapshot
 
-<!-- bmux:block-id theme-control-scope -->
-Service operations, not the picker's literal call stack. Interactive prompt handlers acquire and renew preview ownership separately; both reach the theme owner's state.
+<!-- bmux:block-id playbook-source-contract -->
+`wait-for`: wait for the complete result line.
+`assert-layout`: require two panes. `assert-screen`: check what is displayed.
+`snapshot`: retain the result **after** the checks pass.
 
 <!-- bmux:notes -->
-Quick path: Read revision before mutation; carry the expected revision back. Preview uses an owned token rather than pretending every temporary frame is committed selection.
-Deeper path: The schema's snapshot pairs revision with selection. The contract also exposes renew-preview, external forms, and component settings; the excerpt intentionally omits those. Runtime state and lifecycle belong in the implementation, not the stable API contract. See ThemePlugin::begin_preview, confirm_preview, and select_without_preview for implementation follow-up.
-Rehearsal gate: an accepted appearance demo is not evidence of conflict handling unless it actually exercises conflicting revisions. No claim that source inspection replaces that test.
-Transition: “Revisions also matter at the output boundary: prepared is not yet presented.”
-<!-- bmux:end-notes -->
+SAY
+“Read these lines as a tiny test. Wait-for gives the result time to appear. The pattern is anchored at the beginning and end of a line, so it asks for the result 42 903 rather than any random occurrence of those numbers. In this pattern, (?m) makes those anchors work across multiline text, and backslash-s-star permits trailing whitespace. Assert-layout requires two panes. Assert-screen checks what is displayed. Snapshot retains a named result only after the checks pass. These are literal lines from the executable demo, not slide pseudocode. You do not need to memorize the regular expression to understand the workflow: do the work, observe it, verify it, keep the evidence.”
 
+POINT OUT
+Read the command names and their purpose. If asked about (?m), it allows line-start/end matching in multiline text; \s* permits trailing whitespace.
+
+NEXT
+“We have seen the behavior. Now let’s trace one familiar action into the architecture.”
+<!-- bmux:end-notes -->
+---
+<!-- bmux:slide-id architecture-overview -->
+<!-- bmux:block-id architecture-overview-title -->
+# Who decides what a split means?
+
+<!-- bmux:block-id architecture-overview-body -->
+| Layer | Its job in our split example |
+| --- | --- |
+| **Input** | Ask to split: keyboard or scripted action |
+| **Product plugin** | Decide the target and split policy |
+| **Typed service** | Carry an agreed request/result between plugins |
+| **Neutral host/runtime** | Provide generic execution and transport |
+
+**Plugins own product behavior—not just colors.**
+
+One operation, followed across boundaries; not a full call-stack diagram.
+
+<!-- bmux:notes -->
+SAY
+“Use the split we already watched as our example. Input asks for an operation: a person can press a shortcut, and a playbook can send the corresponding action. The product plugin decides what that operation means—such as the target and split ratio. We call those decisions policy. A typed service is the declared request-and-result agreement between plugins. The neutral host/runtime is what we mean here by core: generic execution and transport, not a second implementation of tab or workspace policy. Baseline single-terminal operation remains available when the optional domain plugins are absent. Plugins are not just optional paint on top: they own important behavior. This table groups responsibilities; it is not claiming that these are exactly four processes or a complete call stack.”
+
+POINT OUT
+Follow one split downward. Define policy as ‘the decision about what should happen,’ not a security-policy claim.
+
+NEXT
+“These three source lines show plugin policy without making us read the whole codebase.”
+<!-- bmux:end-notes -->
+---
+<!-- bmux:slide-id command-route -->
+<!-- bmux:block-id command-route-title -->
+# The plugin makes three concrete decisions
+
+<!-- bmux:block-id command-route-diagram -->
+```rust
+    let session_id = resolve_session_id(caller, session)?;
+    let target = resolve_target_pane_id(caller, session_id, target)?;
+    let ratio = ratio_pct.unwrap_or(50).clamp(10, 90) as u8;
+```
+
+<!-- bmux:block-id command-route-provenance -->
+`plugins/tabs-plugin/src/lib.rs` · `split_pane_with_policy`
+
+<!-- bmux:block-id command-route-takeaway -->
+**Which session? Which pane? How much space?**
+
+`unwrap_or(50)` chooses half when no ratio is given.
+`clamp(10, 90)` bounds the percentage. The tabs plugin then delegates through a typed service.
+
+<!-- bmux:notes -->
+SAY
+“Here is concrete policy in the tabs plugin. First it resolves the session: which running work is the request about? Then it resolves the target pane. Finally it chooses a ratio: if none was supplied, use 50 percent, and clamp the value between 10 and 90. The question mark in Rust propagates an error rather than continuing with an invalid target. The plugin then delegates through a generated service client. You do not have to know Rust to see the useful separation: entry points ask for a split, while one product implementation makes these decisions.”
+
+POINT OUT
+Read the three questions on the slide, then 50 and the bounds. This excerpt does not show every directory-aware split path.
+
+NEXT
+“Making the right state change is only half of an interactive terminal. We also have to show it reliably.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id rendering -->
 <!-- bmux:block-id rendering-title -->
-# Local presentation state follows successful delivery
+# Output has to stay understandable as it moves
 
 <!-- bmux:block-id rendering-feature -->
-Layout, text, cursor, and interaction must describe the same committed scene—not a mixture of old output and new intent.
+A real command prints a numbered catalog. Scroll up, scroll back, then run the clock.
+
+**Notice:** scrollback—earlier terminal output—is inspectable. Returning to the live end lets the shell show new output.
+This is normal output/scrollback—not an injected delivery failure.
 
 <!-- bmux:block-id demo-rendering -->
 <!-- bmux:component playbook-demo {"playbook":"demos/rendering.dsl","title":"Rendering and retained output","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Quick path: Start manually. Follow seq 1 100, entry into scrollback, Page Up/Page Down, and return to the live shell. This exercises genuine output and scrolling, not image protocols or synthetic ANSI row updates.
-Deeper path: The retained compositor is the common authority for damage, clipping, focus, hit testing, and pointer routing. Different transports do not get independent scene ownership. A correct-looking screenshot alone does not prove flush-failure or stale-input handling.
-Rehearsal: verify text and scrolling at actual audience dimensions. This script does not inject write/flush failures. The following code explains the failure boundary; successful text rendering is not fault-injection evidence.
-Transition: “The smallest important implementation detail is only four lines.”
+SAY
+“This demo exercises ordinary output and scrollback. Scrollback is the earlier output a terminal keeps so we can look back without rerunning a command. Here a command prints a numbered list of package manifests—the files named Cargo.toml that identify Rust packages. The script moves into older output, returns to the live end, and prints the current time. Watch whether you can still understand where you are and whether the live shell remains usable. This is deliberately not a fault-injection demo. It does not cut the output stream halfway through a frame. We will look at an actual implementation path next to discuss what happens when delivery fails.”
+
+POINT OUT
+The meaningful milestones are catalog output, scroll movement, return to the last catalog line, then new time output. Do not claim to have demonstrated an error branch.
+
+DO
+Tab → o → r. Watch the catalog before scroll movement and the time output after the return.
+
+EXPECTED
+Numbered output, scrollback interaction, return to the last catalog row and new UTC output.
+
+IF IT FAILS
+Say: “This normal output run did not finish. It is not evidence of the delivery-error branch either way.” Stop, then explain the following inspected source rather than inventing a fault-injection result.
+
+NEXT
+“Why care about output delivery? An incremental renderer depends on what it believes it already sent.”
 <!-- bmux:end-notes -->
-
----
-<!-- bmux:slide-id frame-transaction -->
-<!-- bmux:block-id frame-transaction-title -->
-# Only successful output advances the local baseline
-
-<!-- bmux:block-id frame-transaction-diagram -->
-```mermaid
-flowchart LR
-  S[Stage] --> W[Write + flush]
-  W -->|success| C[Promote]
-  C --> N[Incremental]
-  W -->|error| I[Invalidate]
-  I --> F[Full repaint]
-  F --> S
-  classDef committed fill:#164e63,stroke:#22d3ee,color:#ffffff
-  classDef repair fill:#7f1d1d,stroke:#fca5a5,color:#ffffff
-  class C,N committed
-  class I,F repair
-```
-
-<!-- bmux:block-id frame-transaction-takeaway -->
-**A failed flush leaves host output uncertain.** Do not promote pending cursor/graphics state or trust the old row baseline.
-
-<!-- bmux:notes -->
-Question: Why can a screenshot look right while the renderer is wrong? Incremental work depends on a known delivered baseline, not just a successfully constructed buffer. Cyan is promotion; red is repair. A partial write is not reversible: invalidation and full repaint repair assumptions, not an atomic rollback of terminal pixels.
-Sources: packages/attach_pipeline/src/terminal.rs write_frame; packages/cli/src/runtime/attach/runtime.rs render_attach_frame_inner write_result branch and following cache promotion. Successfully written/flushed frames enter display capture. This diagram is terminal delivery, not a claim that a browser has already painted a received frame. The demo does not inject output failures.
-<!-- bmux:end-notes -->
-
 ---
 <!-- bmux:slide-id flush-boundary -->
 <!-- bmux:block-id flush-title -->
-# Write + flush permits local commit
+# Do not remember a frame you failed to send
+
+<!-- bmux:block-id flush-reading-key -->
+BMUX sends bytes to the terminal. Only success permits its local display state to advance.
 
 <!-- bmux:block-id excerpt-write-frame -->
 ```rust
@@ -397,15 +536,22 @@ pub fn write_frame<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> io::Resul
 Successful write + flush permits local presentation state to advance. It is **not** acknowledgment that a terminal physically painted the frame or a browser committed Canvas.
 
 <!-- bmux:notes -->
-Quick path: write_all can fail after partial output; flush can fail too. Neither permits a local presentation commit. Success is a transport result, not physical-paint acknowledgment. The function documentation requires committing cursor, damage, and render baselines only after success.
-Deeper path: The attach caller stages pending cursor/graphics state, handles failure, and only then promotes those caches. Interaction metadata must remain tied to committed output. The four lines are a delivery primitive, not the entire transaction or proof that every host terminal displays identically.
-Transition: “The caller takes failed output seriously.”
-<!-- bmux:end-notes -->
+SAY
+“Imagine drawing only the parts of a screen that changed. That is efficient only if your remembered previous screen is trustworthy. These lines write the bytes, then flush the output. Each operation can fail. Only success permits BMUX’s local display state to advance. Flush here means success at the local output boundary; it is not a message from the physical monitor saying every pixel has been painted. Keeping that distinction prevents the program from treating attempted output as a trustworthy baseline.”
 
+POINT OUT
+Read write, then flush, then success. Define baseline as ‘the previous picture used to calculate the next update.’
+
+NEXT
+“If delivery fails, the old picture may be wrong. Here is the recovery decision.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id rendering-repair -->
 <!-- bmux:block-id rendering-repair-title -->
-# Partial output invalidates incremental assumptions
+# If delivery fails, stop trusting the old picture
+
+<!-- bmux:block-id repair-reading-key -->
+An incremental update assumes the previous picture arrived. On error, discard that assumption and request a full repaint.
 
 <!-- bmux:block-id excerpt-render-repair -->
 ```rust
@@ -427,125 +573,22 @@ Transition: “The caller takes failed output seriously.”
 The rendering demo exercises normal output and scrollback; it does **not** inject write/flush failures. This excerpt shows the failure-handling implementation.
 
 <!-- bmux:notes -->
-Quick path: Incremental rendering assumes a known previous frame. After partial output, that assumption is false; clear the row baseline and request a full frame.
-Deeper path: Nearby code invalidates pending Kitty host state on output failure and promotes pending cursor/graphics caches only after success. Successfully delivered frames alone enter display capture. Kitty placements and raster footprints have different lifecycles; see appendix rather than claiming one cleanup rule fits every protocol.
-This is exact implementation, not a benchmark result. Fault injection and real terminal rehearsal answer different questions from the normal-output demo.
-Transition: “That gives us a better question than ‘did it look fine once?’: what evidence did the run produce?”
+SAY
+“An output failure may leave the terminal with only part of the intended update. BMUX cannot roll back bytes that have already escaped. Instead, this branch stops trusting incremental assumptions: it clears cached row information and requests a full repaint. The general lesson is useful beyond terminals: your internal memory of an external effect should advance only at the boundary you can actually establish. The normal scrollback demo did not execute this fault path; this slide explains the source we inspected.”
+
+POINT OUT
+Point to the actual clear/reset operations and the repaint request. Explain the trade-off: a full repair costs more than a tiny update but avoids building on an unknown screen.
+
+NEXT
+“That same distinction between content, execution, and observation appears in the deck you are watching.”
 <!-- bmux:end-notes -->
-
----
-<!-- bmux:slide-id playbooks-evidence -->
-<!-- bmux:block-id evidence-title -->
-# The demonstration can carry its own checks
-
-<!-- bmux:block-id chapter-evidence -->
-Chapter 3 · Inspectable execution and presentation
-
-<!-- bmux:block-id evidence-feature -->
-Scripted actions create a private data fixture, inspect it from two panes, and retain a named snapshot only after output and layout checks pass.
-
-<!-- bmux:block-id demo-evidence -->
-<!-- bmux:component playbook-demo {"playbook":"demos/evidence.dsl","title":"Actions, checks, and evidence","on_leave":"stop"} -->
-
-<!-- bmux:notes -->
-Quick path: Start manually. The first pane creates 42 records in a private runtime file and counts them. The second independently reads the file with awk, producing count 42 and sum 903. The script checks anchored output lines, pane counts, and then retains snapshot verified-demo. There is no printed PASS banner.
-Deeper path: A playbook is executable input, not a passive slide asset. Parser-only consumers do not enable native execution. CLI and managed workers share the playbook executor; a host adapter supplies platform primitives rather than implementing a separate action language. Evidence only supports the assertions actually made.
-Rehearsal: review the frozen source/include closure and redact retained artifacts before sharing. The six scripts exercise real commands through the owned attach; their fixture results are not repository test/benchmark outcomes. A retained snapshot supports the actual assertions, not arbitrary claims about unseen behavior.
-Transition: “Embedding execution requires restrictions, not just a pretty component.”
-<!-- bmux:end-notes -->
-
----
-<!-- bmux:slide-id playbook-source -->
-<!-- bmux:block-id playbook-source-title -->
-# Check a real fixture; retain the evidence
-
-<!-- bmux:block-id excerpt-playbook-check -->
-```text
-wait-for pattern='(?m)^42 903\s*$'
-assert-layout pane_count=2
-assert-screen matches='(?m)^42 903\s*$'
-# Keep a named snapshot only after both the structural and output checks pass.
-snapshot id='verified-demo'
-```
-
-<!-- bmux:block-id playbook-source-provenance -->
-`demos/evidence.dsl` · output/layout checks → named snapshot
-
-<!-- bmux:block-id playbook-source-contract -->
-A preceding `awk` command reads the fixture and prints **record count + sum**. Require the complete output line, check two panes, then retain the snapshot.
-
-<!-- bmux:notes -->
-Quick path: Read the checks in order. The first pane has already written seq 1 42 to a private file under BMUX_RUNTIME_DIR. Before this excerpt, the second pane reads that file with awk and prints record count and sum. These lines wait for the exact result, check layout and output, then retain a named snapshot. Source: presentations/bmux-tour/demos/evidence.dsl. The preceding paste-attach and send-attach actions use the actual managed attach; Ctrl+B returns to command mode. A short sleep gives the command a turn; wait-for is the bounded output condition, not proof from elapsed time.
-Deeper path: This is contiguous source with configuration, fixture creation, second-pane setup, and command submission omitted. Anchoring the output line avoids matching the typed command. The pane count separately checks structural state. Neither assertion proves all intermediate frames or arbitrary dataset correctness. This is a reusable debugging pattern: create an owned fixture, act through the UI, inspect independently, retain after checks.
-Transition: “Those checks drive one real execution. How do we show it without creating another controller?”
-<!-- bmux:end-notes -->
-
----
-<!-- bmux:slide-id demo-authority -->
-<!-- bmux:block-id demo-authority-title -->
-# One input authority; many read-only views
-
-<!-- bmux:block-id demo-authority-diagram -->
-```mermaid
-flowchart LR
-  A[Script] -->|start| W[Worker]
-  W -->|input| T[Attach]
-  T -->|frame| R[Repair]
-  R -->|validate| P[Presenter]
-  P -->|view| B[Audience]
-  classDef control fill:#164e63,stroke:#22d3ee,color:#ffffff
-  classDef readonly fill:#312e81,stroke:#a5b4fc,color:#ffffff
-  class A,W,T control
-  class R,P,B readonly
-```
-
-<!-- bmux:block-id demo-authority-takeaway -->
-**The audience sees the execution owner's view.** It does not get a second attach, shell input, or authority to start work.
-
-<!-- bmux:notes -->
-Question: Is the embedded demo a real UI, a recording, or another controller? The worker drives the actual owned attach. The presenter reads a bounded latest complete repair, validates lifetime identity/revision, and paints retained output; it does not reconstruct the scene from pane text. Cyan is execution/input authority; violet is the read-only projection. Arrows show the data path, not extra processes: browser output is optional.
-Sources: plugins/presenter-plugin/src/playbook.rs admission; packages/playbook/src/managed_display.rs DisplayPacket; plugins/presenter-plugin/src/playbook_capture.rs ManagedCaptureCursor; playbook_observer.rs. Generation/epoch/revision fencing are simplified here. A missing repair is not completion. Stop requests, cleanup acknowledgment, and restart are separate lifecycle facts; output retention is bounded, not a complete output history.
-<!-- bmux:end-notes -->
-
----
-<!-- bmux:slide-id playbooks-boundary -->
-<!-- bmux:block-id playbooks-boundary-title -->
-# Run only explicitly approved demos
-
-<!-- bmux:block-id excerpt-managed-admission -->
-```rust
-        if !matches!(
-            deck.config.driver,
-            bmux_playbook::types::PlaybookDriver::Sandbox
-        ) || deck.config.sandbox_config_file.is_some()
-        {
-            return Err(
-                "managed execution requires sandbox driver and generated isolated configuration"
-                    .into(),
-            );
-        }
-```
-
-<!-- bmux:block-id managed-provenance -->
-`plugins/playbook-plugin/src/runner.rs` · `Owner::prepare`
-
-<!-- bmux:block-id managed-safety -->
-Opt in with `--allow-playbooks`, then manually start. This guard rejects real-attach and custom configuration; the owner supplies isolated paths and cleanup. Approved shell actions are trusted code—not security-sandboxed.
-
-<!-- bmux:notes -->
-Quick path: This rejects real-attach and custom sandbox-config. It is why an ordinary fixture cannot automatically become an embedded demo.
-Deeper path: Owner::prepare also rejects BMUX_/XDG_ runtime-selector environment overrides. Sources/includes are frozen and closure-checked; changed executable bytes require fresh approval. Generation-fenced lifecycle control and retained output are distinct from arbitrary terminal input. A stop request is not cleanup acknowledgment; Escape only hides the overlay.
-Rehearsal: select an approved immutable native executable; protocol compatibility does not establish executable content identity. Do not describe isolation as protection from untrusted shell commands. Finder/themes use the supported managed attach authority without weakening admission.
-Transition: “The same separation—content versus execution—also makes the presentation reusable.”
-<!-- bmux:end-notes -->
-
 ---
 <!-- bmux:slide-id presentation-reuse -->
 <!-- bmux:block-id reuse-title -->
-# Embed a live surface in Markdown
+# This presentation uses the same idea
 
 <!-- bmux:block-id reuse-stack -->
-The evidence demo is declared in this deck—not a custom slide renderer:
+Ordinary Markdown declares the live playbook you just watched:
 
 <!-- bmux:block-id reuse-source -->
 ```text
@@ -560,22 +603,26 @@ The evidence demo is declared in this deck—not a custom slide renderer:
 `presentations/bmux-tour/deck.md` · `demo-evidence` declaration
 
 <!-- bmux:block-id reuse-boundary -->
-Local controls own start/stop. Public audience delivery gets content and live output—not execution authority or speaker notes. The next slide shows the private-field boundary.
+**Content says what to show. Local controls decide when to run it.**
+The audience gets the content and terminal output—not control of the shell.
 
 <!-- bmux:block-id reuse-modes -->
-Responsive document delivery composes public content locally. Fixed-frame delivery retains producer geometry. They are distinct contracts.
+This is why a playbook can sit beside prose and code instead of becoming a separate demo application.
 
 <!-- bmux:notes -->
-Quick path: Use the current slide as the example: ordinary text and an embedded live surface share a presentation model. A browser audience is a read-only audience, not a remote shell or controller. Follow the next slide's actual #[serde(skip)] field to see how notes stay private, rather than treating this as a promise about every delivery path.
-Deeper path: bmux_tui is neutral geometry/painting/input; components build on primitives; runtime handles lifecycle/scheduling without depending on components. Product behavior stays in apps/plugins. Semantic document delivery and fixed-frame delivery must be selected deliberately, with matching assets; changing a URL cannot manufacture the other host representation.
-Rehearsal gate: HTTP frame acceptance is not browser/Canvas acceptance. Only show a browser after validating this exact native/WASM combination, delivery mode, authentication, and privacy. Preserve the announced origin and capability fragment privately; never publish capability URLs, observer paths, or private evidence. No browser keyboard-control or logical selection/copy claim for embedded rasters.
-Transition: “Privacy is visible in the portable model, not just a presenter convention.”
-<!-- bmux:end-notes -->
+SAY
+“This is the declaration of the evidence demo inside the Markdown deck. If that demo did not complete, this declaration still explains how it is embedded; it is not proof of a successful run. The playbook field names its script; the title is what the presenter sees; stop-on-leave requests a stop when we leave its slide. Ordinary prose and a real live terminal component share the presentation model. Reading a Markdown file does not silently run its commands. The presenter must explicitly approve executable input and start the demo. The audience can observe the content and output without becoming another keyboard controller.”
 
+POINT OUT
+Read only playbook, title and on_leave. The multiline example is the same configuration as the actual component, reformatted for readability.
+
+NEXT
+“Observation also needs a clear privacy boundary.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id presentation-privacy -->
 <!-- bmux:block-id privacy-title -->
-# Public content is not presenter state
+# Private notes should not become audience data
 
 <!-- bmux:block-id excerpt-private-notes -->
 ```rust
@@ -588,28 +635,35 @@ Transition: “Privacy is visible in the portable model, not just a presenter co
 `packages/presenter/src/model.rs` · `Slide::notes`
 
 <!-- bmux:block-id privacy-contract -->
-Portable content excludes executable factories. Public audience decoding also rejects injected private projection fields.
+`serde(skip)` means “do not serialize this field.”
+Public projection also removes private structure.
+
+**Not automatic secret removal:** visible code, terminal output, and screen-sharing are still your responsibility.
 
 <!-- bmux:notes -->
-Quick path: The speaker notes are omitted during serialization. That is stronger than merely hiding a notes panel in CSS.
-Deeper path: AudienceDocument::decode bounds the document and rejects private fields. The rejects_private_projection_fields test rejects a private source projection and an injected notes field. Public projection, bounded resources, and committed surface revisions work together; this excerpt alone is not a whole-system privacy proof.
-Rehearsal gate: verify the real audience output contains no notes or private paths and that screen sharing captures the audience rather than the presenter viewport. Browser capability URLs and retained evidence remain private even when the document model is public.
-Transition: “The useful result is not the list of features; it is a set of boundaries we can explain and test.”
-<!-- bmux:end-notes -->
+SAY
+“Speaker notes are for the presenter, not the audience document. Serialization means turning the program’s model into data to store or send. This Rust attribute leaves the notes out of that data, so hiding notes is not just a CSS convention. The audience’s exported content removes private structure as well. But this is not magical secret detection: if I type a credential into visible terminal output, put it in public code, or share my entire presenter screen, these fields cannot undo that. The practical rule is to share the audience view and review what the demonstrations print.”
 
+POINT OUT
+Translate serialization as ‘turning the program’s model into data that can be sent or stored.’ Do not claim the whole system is proven secret-free by one field.
+
+NEXT
+“Let’s put the pieces back together before the fun ending.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id close -->
 <!-- bmux:block-id close-title -->
-# Useful workspaces need trustworthy boundaries
+# One story: work, views, and repeatable actions
 
 <!-- bmux:block-id close-takeaways -->
-1. Return to the same shell after changing tabs and workspaces.
-2. Trace a split from BPDL to plugin-owned target and ratio policy.
-3. On failed terminal delivery, clear row baselines and repaint.
-4. Check fixture output and pane layout before retaining a snapshot.
+1. **Use it:** arrange commands, navigate, search, and customize.
+2. **Repeat it:** playbooks act on real terminals and check results.
+3. **Understand it:** plugins own policy; display state follows successful delivery.
+
+BMUX runs locally without an AI service. Jev is our optional, playful finale.
 
 <!-- bmux:block-id close-invitation -->
-From a repository checkout, using your approved executable:
+To explore this deck yourself, review the scripts and use an approved executable:
 
 <!-- bmux:block-id close-command -->
 ```sh
@@ -621,15 +675,19 @@ From a repository checkout, using your approved executable:
 BMUX is early alpha. Review the scripts before approval; start each demo manually.
 
 <!-- bmux:notes -->
-Quick path: Recap the path from useful split panes to ownership, discovery, appearance, delivery, and evidence. The next two slides prepare and explicitly start the live finale; the appendix remains optional.
-Deeper path: Revisit a source slide or inspect an accepted run's retained output. Avoid invented performance figures, maturity claims, adoption, or roadmap commitments. Let the audience choose the layer.
-The six original scripts' historical pass is not current acceptance of these edited sources. Revalidate the settled artifact; audience/privacy rehearsal and browser/Canvas acceptance are separate gates. Architecture intent, inspected implementation, and executed evidence are three different levels of confidence.
-<!-- bmux:end-notes -->
+SAY
+“The story is simple. First, BMUX gives us views of real terminal work: split it, navigate back to it, find it, and change its appearance. Second, playbooks make those actions repeatable and check the results instead of just pretending the demonstration succeeded. Third, the implementation separates product policy from generic mechanisms and distinguishes intended output from successful delivery. BMUX works locally without an AI service. Jev is not a prerequisite. The game is a terminal application; Jev is its optional external model pilot. If you want to explore, review the scripts and use your approved executable with this deck.”
 
+POINT OUT
+Use the three bold verbs as the recap. Do not end by reading the command character by character.
+
+NEXT
+“One last example: give the same terminal machinery a game and a fallible model pilot.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id jev-source -->
 <!-- bmux:block-id jev-source-title -->
-# Give the finale code—not your credentials
+# The finale is a terminal program—not a slide trick
 
 <!-- bmux:block-id excerpt-jev-inputs -->
 ```text
@@ -642,31 +700,53 @@ The six original scripts' historical pass is not current acceptance of these edi
 `presentations/bmux-tour/demos/jev-flappy.dsl` · declared inputs
 
 <!-- bmux:block-id jev-source-boundary -->
-The game file is a reviewed executable resource. Credentials come from the launch environment, never the deck. Script completion leaves the game running until presenter Stop or slide leave.
+`@resource`: include the game source in reviewed executable input.
+`@env-from`: allow only these named inputs from the launch environment.
+`@env-mode clean`: begin with a clean inherited environment.
+
+No API key is written in the deck. Stop or leave the slide to end the owned game.
 
 <!-- bmux:notes -->
-Quick path: These three contiguous directives separate public executable bytes from private values. @resource makes the application part of the reviewed source closure; @env-from imports only the named host values, and @env-mode clean avoids inheriting the rest of the environment. Do not display the values or credentials. This is an input declaration, not a claim that arbitrary Python is safe to execute.
-Deeper path: Later the script launches exec python3 "$FLAPPY_APP" --control-directory "$BMUX_RUNTIME_DIR" and waits for the game title. Script completion is intentional: the managed owner retains the sandbox until Stop/on_leave. The declared 45000 ms action timeout is not a game lifetime. See demos/jev-flappy.md for live setup and provider cost/privacy gates. Unlike the local workspace chapters, this optional finale needs a remote provider; BMUX itself does not.
-Transition: “The work is real, the control is bounded, and the pilot might still hit a pipe. Let’s see.”
-<!-- bmux:end-notes -->
+SAY
+“The game is an ordinary Python terminal program. This playbook declares its source file as a reviewed resource and names the environment inputs it may inherit: the temporary JEV credential and model selection. Clean environment mode means we do not simply pass the entire launch environment through. The API key is not written in the deck. This is an execution-input boundary, not a claim that shell programs are security-sandboxed. Finishing the playbook’s setup can leave the interactive game running; Stop or leaving the slide requests the owned game to end.”
 
+POINT OUT
+Read resource as ‘which code,’ env-from as ‘which named inputs,’ and clean as ‘do not inherit everything.’ Never open or print the credential to explain it.
+
+NEXT
+“Now the only question is whether our pilot can fly.”
+<!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id jev-finale -->
 <!-- bmux:block-id jev-title -->
 # One more thing: can Jev fly?
 
 <!-- bmux:block-id chapter-finale -->
-Finale · A real application, a fallible pilot
+4 · A real terminal application, a fallible pilot
 
 <!-- bmux:block-id jev-contract -->
-Jev chooses **flap or wait**. BMUX hosts the real terminal application.
-Agent-paced physics waits for each decision; crashes start another attempt.
+An AI model called **Jev** chooses **flap or wait**. BMUX hosts the real terminal game.
+Physics waits for each model decision; crashes start another attempt.
 
 <!-- bmux:block-id demo-jev-flappy -->
 <!-- bmux:component playbook-demo {"playbook":"demos/jev-flappy.dsl","title":"Jev plays Flappy Bird","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Explicitly start the approved demo. This is live judgement API usage, not a recording or a hidden scripted pilot. It runs until Stop or leaving this slide, including across game-over retries. Request timeouts do not impose a demo lifetime.
-Configure the key before launching the presenter; see demos/jev-flappy.md. The game is a declared playbook resource, so approval and source freezing cover its bytes. Runtime control paths are generated automatically; no app-path or socket environment setup is needed. Never put keys into scripts or displayed commands. Pause/resume/restart of gameplay use private application controls; presenter script Pause is not application pause. Presenter Stop/Restart and leaving the slide own managed sandbox cleanup.
-Keep this running during Q&A if desired. Requests incur ongoing provider usage. Network errors freeze physics and use bounded retry backoff; do not promise an unbeatable pilot or imply that offline tests prove live provider performance.
+SAY
+“The terminal application shows the world; Jev, an AI model reached through the TypeSafe API, chooses flap or wait. A flap gives the bird an upward kick; waiting lets its existing motion and gravity continue. It needs to pass through gaps between pipes. Physics advances in decision-sized chunks and waits for the next model answer, so network delay is not the same as the bird continuing to fall unnoticed. The model is the pilot, not a secret corrective script. It can make poor decisions, crash, and try again. A crash is part of the game, not a reason to claim the terminal host failed. Requests can continue and incur provider charges until we stop, so I will finish the attempt before Q&A. This finale is here because it is fun—and because the same playbook and live-surface machinery can host something more playful than a file listing.”
+
+POINT OUT
+Give the game room to be entertaining. Point out a decision and score if present. Confidence is reported by the model, not a validated probability that the move is correct.
+
+DO
+Before the talk, verify the launch environment has the temporary credential without printing it. Here: Tab → o → r. Wait for real game/model telemetry; allow a short attempt. Use s to stop before ending the presentation.
+
+EXPECTED
+The game board and real numeric model confidence/latency appear; the bird moves on model decisions. Crashes can start another attempt.
+
+IF IT FAILS
+If the credential is missing or startup fails, say: “The optional pilot did not start. I will stop and continue without displaying configuration.” If API/quota/network fails, say: “The external pilot is unavailable. BMUX is local; this optional integration needs a reachable service. I will stop rather than disguise the failure.” If the bird crashes while decisions continue, say: “Our pilot needs another lesson.” Stop requests are not cleanup acknowledgments; inspect status before exit.
+
+NEXT
+“Thanks—happy to return to any workflow or code example.”
 <!-- bmux:end-notes -->
