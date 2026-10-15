@@ -85,7 +85,7 @@ export async function createDocumentRenderer({mount}) {
     finally { --inFlight; }
   }
 
-  async function prepareInner(envelope, viewport, {requestResource, signal} = {}, scrollRows = 0) {
+  async function prepareInner(envelope, viewport, {requestResource, resourceDigest, signal} = {}, scrollRows = 0) {
     if (freed) throw new Error('Presenter renderer freed');
     pendingTransaction?.discard();
     const token = ++serial;
@@ -120,7 +120,9 @@ export async function createDocumentRenderer({mount}) {
           live(token, signal);
           resource = result instanceof Uint8Array ? result : new Uint8Array(result);
           if (resource.byteLength !== descriptor.length) throw new Error('Audience resource length mismatch');
-          const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', resource));
+          // The neutral host verifier supports HTTPS and HTTP LAN origins alike.
+          if (typeof resourceDigest !== 'function') throw new Error('Resource digest callback unavailable');
+          const digest = await resourceDigest(resource);
           live(token, signal);
           if (Array.from(digest, value => value.toString(16).padStart(2, '0')).join('') !== id)
             throw new Error('Audience resource SHA mismatch');
@@ -260,7 +262,7 @@ export async function createDocumentRenderer({mount}) {
             // absorb viewport remainders. The host centers the unused space.
             canvas.style.width = `${cols * 9}px`; canvas.style.height = `${rows * 18}px`;
             engine.commit();
-            committed = {envelope, viewport, requestResource, metadata:preparedMetadata};
+            committed = {envelope, viewport, requestResource, resourceDigest, metadata:preparedMetadata};
           } catch (error) {
             try {
               if (changed) {
@@ -304,7 +306,7 @@ export async function createDocumentRenderer({mount}) {
     const previous = committed;
     try {
       const transaction = await prepare(previous.envelope, previous.viewport,
-        {requestResource:previous.requestResource, signal:localAbort.signal}, rows);
+        {requestResource:previous.requestResource, resourceDigest:previous.resourceDigest, signal:localAbort.signal}, rows);
       transaction.commit();
     } catch (error) {
       if (error.name !== 'AbortError') console.error('Audience local scroll rejected', error);

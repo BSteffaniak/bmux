@@ -614,7 +614,7 @@ async function runDocument(adapterPath) {
       let transaction = null;
       try {
         transaction = await adapter.prepare(document, nextViewport, {
-          requestResource: id => resourceFor(document, id), signal: lifetime.signal,
+          requestResource: id => resourceFor(document, id), resourceDigest, signal: lifetime.signal,
         });
         if (!transaction || typeof transaction.commit !== 'function' || typeof transaction.discard !== 'function') {
           throw new Error('invalid document transaction');

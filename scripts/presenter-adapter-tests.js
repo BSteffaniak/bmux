@@ -58,6 +58,7 @@ async function fixture() {
     constructor() { this.pending = null; this.committed = null; this.scroll = []; engines.push(this); }
     discard() { this.pending = null; }
     scroll_by(rows) { this.scroll.push(rows); }
+    add_resource(id, bytes) { this.resource = {id, bytes}; }
     prepare(content, cols, rows, generation, revision) {
       this.pending = {cols, rows, generation, revision:String(revision)};
       paints.push(this.pending);
@@ -258,6 +259,45 @@ async function main() {
   assert.throws(() => rejected.commit(), /engine failed/);
   assert.equal(p.snapshot(), retained);
   p.adapter.free();
-  console.log('presenter adapter contracts: PASS');
+  // No crypto global: exercise the actual HTTP-compatible host verifier through
+  // the production image adapter, not just a resource-fetch-only test adapter.
+  const bootstrap = fs.readFileSync('packages/web-renderer/browser/bootstrap.js', 'utf8');
+  const digestContext = vm.createContext({stopped:false, setTimeout});
+  vm.runInContext(bootstrap.slice(bootstrap.indexOf('async function resourceDigest'),
+    bootstrap.indexOf('function documentAdapterPath')), digestContext);
+  const resourceDigest = bytes => {
+    digestContext.bytes = bytes;
+    return vm.runInContext('resourceDigest(bytes)', digestContext);
+  };
+  const image = new Uint8Array([1, 2, 3]);
+  const id = require('node:crypto').createHash('sha256').update(image).digest('hex');
+  const images = await fixture();
+  const envelope = images.envelope(1);
+  envelope.content = new TextEncoder().encode(JSON.stringify({assets:{image:id}}));
+  envelope.resources = [{id, mime_type:'image/png', length:3}];
+  const options = {requestResource:async () => image, resourceDigest};
+  const imageTransaction = await images.adapter.prepare(envelope, images.viewport(800, 600), options);
+  imageTransaction.commit();
+  const imageSnapshot = images.snapshot();
+  assert.equal(images.engines[0].resource.id, id);
+  const corruptEnvelope = {...envelope, revision:'2'};
+  const otherId = require('node:crypto').createHash('sha256').update(new Uint8Array([4, 5, 6])).digest('hex');
+  corruptEnvelope.content = new TextEncoder().encode(JSON.stringify({assets:{image:otherId}}));
+  corruptEnvelope.resources = [{id:otherId, mime_type:'image/png', length:3}];
+  await assert.rejects(images.adapter.prepare(corruptEnvelope, images.viewport(800, 600), {
+    ...options, requestResource:async () => image,
+  }), /Audience resource SHA mismatch/);
+  assert.equal(images.snapshot(), imageSnapshot, 'failed integrity check replaced committed output');
+  // A new renderer has no verified cache; wrong bytes must not change its frame.
+  const corrupt = await fixture();
+  const retainedCorrupt = corrupt.snapshot();
+  await assert.rejects(corrupt.adapter.prepare(envelope, corrupt.viewport(800, 600), {
+    ...options, requestResource:async () => new Uint8Array([3, 2, 1]),
+  }), /Audience resource SHA mismatch/);
+  assert.equal(corrupt.snapshot(), retainedCorrupt);
+  assert.equal(images.snapshot(), imageSnapshot);
+  corrupt.adapter.free();
+  images.adapter.free();
+  console.log('presenter adapter contracts and HTTP image verification: PASS');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
