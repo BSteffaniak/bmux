@@ -375,10 +375,10 @@ Fast scan: not just demos. Focus, resize, search, history, reflow, recovery, cop
 ---
 <!-- bmux:slide-id architecture-overview -->
 <!-- bmux:block-id architecture-overview-title -->
-# How BMUX turns running programs into your workspace
+# How BMUX fits together
 
 <!-- bmux:block-id architecture-overview-body -->
-```mermaid
+```mermaid rows=24
 flowchart TB
   subgraph UI[Attached UI]
     direction LR
@@ -409,12 +409,8 @@ flowchart TB
   class I,C,D presentation
 ```
 
-<!-- bmux:block-id architecture-overview-takeaway -->
-**Programs keep running; plugins organize the work; the attached UI composes what you see.**
-Execution produces output; terminal state interprets it. The compositor combines it with plugin surfaces.
-
 <!-- bmux:notes -->
-Follow a split request forward, then program output back. Ordinary keystrokes go to the program. Attachment loss does not end execution.
+Follow a split request forward, then output back. Keystrokes target the program. Plugins organize; one compositor combines surfaces. Attachment loss does not end execution.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id command-route -->

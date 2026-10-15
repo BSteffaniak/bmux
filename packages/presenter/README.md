@@ -100,7 +100,13 @@ Column weights must be positive and every declared column needs its separator;
 nested directive columns are rejected (Rust models may compose nested columns).
 Unknown/malformed namespaced directives and unclosed groups are source-located
 errors. Non-namespaced HTML remains inert Markdown content. Code, GFM tables,
-standalone images, and Mermaid fences become portable typed blocks. Mixed image
+standalone images, and Mermaid fences become portable typed blocks. Mermaid
+fences accept `rows=N` (for example, `mermaid rows=24`) to reserve terminal
+rows for that diagram; the default is 12. Use `rows=0` for automatic
+aspect-based allocation (bounded to 24 rows and the available height).
+Malformed or duplicate `rows` values are source-located errors. Other fence
+metadata remains ignored. This controls allocation, not aspect ratio.
+Mixed image
 paragraphs remain Markdown and use the shared renderer's readable fallback.
 
 ## Linked components and rich assets

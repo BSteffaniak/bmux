@@ -368,7 +368,8 @@ pub fn parse_markdown(source_name: &str, source: &str) -> Result<Deck, MarkdownE
             finish_slide(&mut deck, &mut draft, &mut slide_counts);
             continue;
         }
-        let kind = block_kind(&unit.events, raw);
+        let kind =
+            block_kind(&unit.events, raw).map_err(|message| error(message, unit.range.clone()))?;
         let id = draft.next_id(&kind);
         draft.push(Block {
             id,
@@ -403,7 +404,7 @@ fn finish_slide(deck: &mut Deck, draft: &mut SlideDraft, counts: &mut BTreeMap<S
     deck.slides.push(finished.slide);
 }
 
-fn block_kind(events: &[Event<'_>], raw: &str) -> BlockKind {
+fn block_kind(events: &[Event<'_>], raw: &str) -> Result<BlockKind, String> {
     if let Some(Event::Start(Tag::CodeBlock(kind))) = events.first() {
         let language = match kind {
             CodeBlockKind::Fenced(info) => info.split_whitespace().next().map(str::to_owned),
@@ -420,9 +421,24 @@ fn block_kind(events: &[Event<'_>], raw: &str) -> BlockKind {
             })
             .collect();
         if language.as_deref() == Some("mermaid") {
-            return BlockKind::Mermaid { source, rows: 12 };
+            let mut rows = 12;
+            if let CodeBlockKind::Fenced(info) = kind {
+                let mut specified = false;
+                for option in info.split_whitespace().skip(1) {
+                    if let Some(value) = option.strip_prefix("rows=") {
+                        if specified {
+                            return Err("duplicate Mermaid rows option".into());
+                        }
+                        rows = value.parse::<u16>().map_err(|_| {
+                            "Mermaid rows must be an integer from 0 to 65535".to_owned()
+                        })?;
+                        specified = true;
+                    }
+                }
+            }
+            return Ok(BlockKind::Mermaid { source, rows });
         }
-        return BlockKind::Code { language, source };
+        return Ok(BlockKind::Code { language, source });
     }
     if matches!(events.first(), Some(Event::Start(Tag::Table(_)))) {
         let mut headers = Vec::new();
@@ -445,7 +461,7 @@ fn block_kind(events: &[Event<'_>], raw: &str) -> BlockKind {
                 _ => {}
             }
         }
-        return BlockKind::Table { headers, rows };
+        return Ok(BlockKind::Table { headers, rows });
     }
     // A paragraph containing only an image is promoted to a rich image block.
     if events.len() >= 4
@@ -463,16 +479,16 @@ fn block_kind(events: &[Event<'_>], raw: &str) -> BlockKind {
                 _ => None,
             })
             .collect();
-        return BlockKind::Image {
+        return Ok(BlockKind::Image {
             destination: dest_url.to_string(),
             alt,
             rows: 12,
-        };
+        });
     }
-    BlockKind::Text {
+    Ok(BlockKind::Text {
         content: raw.to_owned(),
         format: TextFormat::Markdown,
-    }
+    })
 }
 
 fn front_matter(source: &str) -> Result<(Metadata, Option<DeckId>, usize), String> {
@@ -669,6 +685,47 @@ mod tests {
             matches!(&columns[0].blocks[0].kind, BlockKind::Text { content, .. } if content.contains("Left"))
         );
     }
+    #[test]
+    fn mermaid_rows_are_per_block_and_preserve_source() {
+        let deck = parse_markdown(
+            "sizes.md",
+            "```mermaid rows=24\nflowchart LR\nA --> B\n```\n\n```mermaid rows=0\nA --> C\n```\n\n```mermaid\nA --> D\n```",
+        )
+        .unwrap();
+        let blocks = &deck.slides[0].blocks;
+        for (block, expected) in blocks.iter().zip([24, 0, 12]) {
+            let BlockKind::Mermaid { source, rows } = &block.kind else {
+                panic!("expected Mermaid block");
+            };
+            assert_eq!(*rows, expected);
+            assert!(!source.contains("rows="));
+            assert!(source.contains("-->"));
+        }
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn malformed_mermaid_rows_have_source_locations() {
+        for options in [
+            "rows=",
+            "rows=no",
+            "rows=-1",
+            "rows=65536",
+            "rows=8 rows=16",
+        ] {
+            let input = format!("# Diagram\n\n```mermaid {options}\nA --> B\n```\n");
+            let error = parse_markdown("sizes.md", &input).unwrap_err();
+            assert!(error.message.contains("rows"));
+            assert_eq!(error.source.source, "sizes.md");
+            assert_eq!(error.source.line, 3);
+        }
+        let deck = parse_markdown("code.md", "```rust rows=invalid\nlet n = 1;\n```").unwrap();
+        assert!(matches!(
+            deck.slides[0].blocks[0].kind,
+            BlockKind::Code { .. }
+        ));
+    }
+
     #[test]
     fn stable_ids_survive_unrelated_insertions() {
         let before = parse_markdown("x", "# A\n\nalpha\n\n---\n\n# B\n").unwrap();

@@ -70,9 +70,9 @@ Read input, wait, assertion, snapshot in order. No fixed sleep as proof.
 
 Fast scan: not just demos. Focus, resize, search, history, reflow, recovery, copy.
 
-## How BMUX turns running programs into your workspace
+## How BMUX fits together
 
-Follow a split request forward, then program output back. Ordinary keystrokes go to the program. Attachment loss does not end execution.
+Follow a split request forward, then output back. Keystrokes target the program. Plugins organize; one compositor combines surfaces. Attachment loss does not end execution.
 
 ## The plugin makes three concrete decisions
 
