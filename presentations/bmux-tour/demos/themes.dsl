@@ -23,12 +23,46 @@ send-attach key='ctrl+b'
 sleep ms=1800
 send-attach key='ctrl+alt+t'
 wait-rendered contains='Select Theme'
-sleep ms=1800
+# Catalog order is alphabetical: every bundled preset plus default.
+# Keep the real picker open so each live preview has a visible name.
+sleep ms=2000
+# cyberpunk
 send-attach key='down'
-sleep ms=1800
 wait-rendered contains='cyberpunk'
+sleep ms=2000
+# default
+send-attach key='down'
+sleep ms=2000
+# hacker
+send-attach key='down'
+sleep ms=2000
+# minimal
+send-attach key='down'
+sleep ms=2000
+# mode-aware
+send-attach key='down'
+sleep ms=2000
+# performance
+send-attach key='down'
+sleep ms=2000
+# pong
+send-attach key='down'
+sleep ms=2000
+# pulse-border
+send-attach key='down'
+sleep ms=2000
+# rainbow-snake
+send-attach key='down'
+sleep ms=2000
+# tetris
+send-attach key='down'
+sleep ms=2000
+# Finish on cyberpunk after showing the entire catalog.
+send-attach key='home'
+send-attach key='down'
+sleep ms=2000
 send-attach key='enter'
-sleep ms=1800
+sleep ms=2000
 send-attach key='escape'
 paste-attach text='date -u'
 send-attach key='enter'

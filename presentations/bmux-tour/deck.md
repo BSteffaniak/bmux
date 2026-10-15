@@ -174,7 +174,7 @@ Keep a base visual identity while layering mode cues and plugin-owned components
 <!-- bmux:component playbook-demo {"playbook":"demos/themes.dsl","title":"Theme composition and control","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Quick path: Start manually. The script opens Select Theme, presses Down to preview cyberpunk, waits for it to render, then presses Enter to confirm. The original shell remains running.
+Quick path: Start manually. The script opens Select Theme and previews every bundled preset plus default in alphabetical order, holding each for two seconds. After the cycle, Home and Down return to Cyberpunk, then Enter confirms it. The original shell remains running.
 Deeper path: Theme files merge left to right. Separate appearance_themes and component_themes let component packs avoid replacing base chrome. The theme plugin merges extension data; the owning plugin validates/interprets it.
 Rehearsal: make the preview transition legible before confirmation. The passed script uses actual managed attach input under generated configuration. It demonstrates preview and confirmation, not cancellation, conflicting revisions, or every composition combination. Real-attach and custom sandbox-config remain rejected.
 Transition: “First the data being composed, then the control protocol.”

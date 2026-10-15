@@ -30,7 +30,7 @@ Acceptance uses [scripts/presenter-tour-acceptance.py](../../scripts/presenter-t
 | `demo-panes` / [panes.dsl](demos/panes.dsl) | Three panes through split shortcuts, focus navigation, real listing/kernel/clock output and layout assertion | Commands depend on Linux utilities, not repository test outcomes |
 | `demo-navigation` / [navigation.dsl](demos/navigation.dsl) | Original shell PID survives tab switching; generated workspace and return to existing work | Not a second-attachment or independent-client-focus test; disconnect is not machine restart |
 | `demo-finder` / [finder.dsl](demos/finder.dsl) | Actual Find Tab prompt, fuzzy `api` query from a generated second workspace, Enter selects default's API tab | Not exhaustive matching/order coverage; settings can change scope and matching mode |
-| `demo-themes` / [themes.dsl](demos/themes.dsl) | Actual Select Theme, Down previews rendered cyberpunk, Enter confirms, shell continues | Not preview cancellation, revision conflicts, or every layer composition |
+| `demo-themes` / [themes.dsl](demos/themes.dsl) | Actual Select Theme, Down cycles all bundled presets plus default with two-second previews, Enter confirms Cyberpunk after the cycle, shell continues | Not preview cancellation, revision conflicts, or every layer composition |
 | `demo-rendering` / [rendering.dsl](demos/rendering.dsl) | Real `seq` output, scrollback Page Up/Page Down, return to live shell | **Not fault injection**, image protocol acceptance, or universal host compatibility |
 | `demo-evidence` / [evidence.dsl](demos/evidence.dsl) | Computed arithmetic results, two-pane layout/screen assertions, `verified-demo` snapshot | Snapshot does not establish unasserted behavior |
 

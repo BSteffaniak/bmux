@@ -21,7 +21,7 @@ The demos use generated isolated configuration with the built-in `tmux_compat` i
 | `demo-panes` / `demos/panes.dsl` | Three panes, focus changes, layout/screen assertions |
 | `demo-navigation` / `demos/navigation.dsl` | Original shell state survives tab switching; workspace switching returns to existing work |
 | `demo-finder` / `demos/finder.dsl` | Real fuzzy `api` query from a generated second workspace, Enter selects the API tab |
-| `demo-themes` / `demos/themes.dsl` | Select Theme opens, Down previews rendered cyberpunk, Enter confirms; shell continues |
+| `demo-themes` / `demos/themes.dsl` | Select Theme previews every bundled preset plus default for two seconds each; Enter confirms Cyberpunk after the cycle; shell continues |
 | `demo-rendering` / `demos/rendering.dsl` | Actual `seq` output, Page Up/Page Down scrollback, return to live shell; **not fault injection** |
 | `demo-evidence` / `demos/evidence.dsl` | Actual arithmetic results, two-pane layout/screen assertions and `verified-demo` snapshot |
 
