@@ -4,7 +4,18 @@ use std::{sync::Arc, time::Duration};
 use bmux_broadcast_plugin_api::{
     broadcast_control_v1 as control, broadcast_output_v1 as output, broadcast_turnkey_v1 as turnkey,
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::watch;
+
+// Hash semantic output, not producer bookkeeping. Keep execution generation and
+// every interaction field; damage is only an incremental painting hint.
+fn content_key(frame: &bmux_web_renderer::BrowserFrame) -> Option<[u8; 32]> {
+    let mut value = serde_json::to_value(frame).ok()?;
+    let object = value.as_object_mut()?;
+    object.remove("revision");
+    object.remove("damage");
+    Some(Sha256::digest(serde_json::to_vec(&value).ok()?).into())
+}
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(1);
 // The controller may spend three seconds acquiring the remote lease. Local
@@ -227,6 +238,7 @@ async fn run(
             token = start_publication(&mut client, options.profile.clone(), source.clone()).await;
         }
         let mut sent = None;
+        let mut sent_content = None;
         let mut selected = None;
         let mut rejected = false;
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -262,6 +274,14 @@ async fn run(
             };
             let revision = frame.revision();
             if !needs_publication(state.selected, state.refresh, revision, sent) {
+                continue;
+            }
+            let key = content_key(&frame);
+            if sent.is_some_and(|(refresh, _)| refresh == state.refresh)
+                && key.is_some()
+                && key == sent_content
+            {
+                sent = Some((state.refresh, revision));
                 continue;
             }
             let mut encoded =
@@ -329,6 +349,7 @@ async fn run(
             match published {
                 Ok(Ok(true)) => {
                     sent = Some((current.refresh, revision));
+                    sent_content = key;
                     rejected = false;
                 }
                 Ok(Ok(false)) => {}

@@ -18,6 +18,82 @@ fn frame(generation: &str, revision: u64) -> Vec<u8> {
 }
 
 #[test]
+fn semantic_duplicates_ignore_frame_revision_but_preserve_refresh_and_generation() {
+    let controller = Controller::new().unwrap();
+    let owner = Uuid::new_v4();
+    let id = Uuid::new_v4().to_string();
+    controller.source(owner, &id, true).unwrap();
+    {
+        let mut state = controller.state.lock().unwrap();
+        state.selected = Some(id.clone());
+        state.local = "running";
+    }
+    let refresh = controller.source(owner, &id, false).unwrap().refresh;
+    assert!(
+        controller
+            .publish(owner, &id, refresh, frame("scene", 1))
+            .unwrap()
+    );
+    assert!(
+        controller
+            .publish(owner, &id, refresh, frame("scene", 2))
+            .unwrap()
+    );
+    {
+        let state = controller.state.lock().unwrap();
+        assert_eq!(state.suppressed, 1);
+        assert_eq!(state.coalesced, 0);
+        let retained =
+            bmux_web_renderer::decode_binary(&state.pending.as_ref().unwrap().bytes, None).unwrap();
+        assert_eq!(retained.revision(), 1);
+    }
+    {
+        let mut state = controller.state.lock().unwrap();
+        state.invalidate();
+    }
+    let refreshed = controller.source(owner, &id, false).unwrap().refresh;
+    assert!(
+        controller
+            .publish(owner, &id, refreshed, frame("scene", 2))
+            .unwrap()
+    );
+    assert!(
+        !controller
+            .publish(owner, &id, refreshed, frame("replacement", 1))
+            .unwrap()
+    );
+    let replaced = controller.source(owner, &id, false).unwrap().refresh;
+    assert!(replaced > refreshed);
+    assert!(
+        controller
+            .publish(owner, &id, replaced, frame("replacement", 1))
+            .unwrap()
+    );
+    assert_eq!(controller.delivery_counters().unwrap().suppressed, 1);
+    controller.shutdown();
+    assert_eq!(controller.delivery_counters().unwrap().suppressed, 1);
+}
+
+#[test]
+fn content_key_preserves_interaction_and_generation_but_ignores_frame_revision() {
+    let bytes = frame("scene", 1);
+    let frame = bmux_web_renderer::decode_binary(&bytes, None).unwrap();
+    let key = content_key(&frame).unwrap();
+    let mut json = serde_json::to_value(&frame).unwrap();
+    json["revision"] = serde_json::json!(2);
+    let newer: bmux_web_renderer::BrowserFrame = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(key, content_key(&newer).unwrap());
+    json["generation"] = serde_json::json!("replacement");
+    let replacement: bmux_web_renderer::BrowserFrame = serde_json::from_value(json).unwrap();
+    assert_ne!(key, content_key(&replacement).unwrap());
+    let mut json = serde_json::to_value(&frame).unwrap();
+    json["selection_text_available"] =
+        serde_json::json!(!json["selection_text_available"].as_bool().unwrap());
+    let changed: bmux_web_renderer::BrowserFrame = serde_json::from_value(json).unwrap();
+    assert_ne!(key, content_key(&changed).unwrap());
+}
+
+#[test]
 fn real_http_lifecycle_refresh_fencing_and_shutdown() {
     use std::os::unix::fs::PermissionsExt;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -121,7 +197,7 @@ fn real_http_lifecycle_refresh_fencing_and_shutdown() {
     controller.source(owner, &id, true).unwrap();
     assert_eq!(
         controller
-            .control(Control::Start(relay, id.clone()))
+            .control(Control::Start(Box::new(relay), id.clone()))
             .unwrap()
             .local,
         "running"

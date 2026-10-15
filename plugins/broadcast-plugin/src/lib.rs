@@ -11,7 +11,14 @@ mod indicator;
 mod mirror;
 mod presentation;
 mod profiles;
+pub use controller::DeliveryCounters;
 pub use presentation::BroadcastPresentation;
+
+/// In-process diagnostics only: no terminal writes and no controller startup.
+pub fn delivery_counters() -> Option<DeliveryCounters> {
+    let registry = CONTROLLER.get()?.lock().ok()?;
+    registry.controller.as_ref()?.delivery_counters().ok()
+}
 mod guided;
 mod identity;
 mod relay;
@@ -129,7 +136,7 @@ impl RustPlugin for BroadcastPlugin {
             "broadcast-control-v1", "start" => |r: control::client::StartRequest, ctx| {
                 authenticated(ctx)?;
                 let relay = relay::Relay::new(&r.endpoint, &r.channel, std::path::Path::new(&r.credential_file)).map_err(error)?;
-                controller()?.control(controller::Control::Start(relay, r.source_id)).map_err(error)
+                controller()?.control(controller::Control::Start(Box::new(relay), r.source_id)).map_err(error)
             },
             "broadcast-control-v1", "pause" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control(controller::Control::Pause).map_err(error) },
             "broadcast-control-v1", "resume" => |_r: (), ctx| { authenticated(ctx)?; controller()?.control(controller::Control::Resume).map_err(error) },

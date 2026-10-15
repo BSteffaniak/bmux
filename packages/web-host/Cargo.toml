@@ -18,6 +18,7 @@ required-features = ["presentation"]
 anyhow = { workspace = true, optional = true }
 bmux_tui = { workspace = true, optional = true }
 bmux_web_renderer = { workspace = true, optional = true }
+flate2 = { workspace = true }
 getrandom = "0.3.4"
 libc = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }

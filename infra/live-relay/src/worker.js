@@ -2,6 +2,7 @@
 // BMWP3 positional admission mirrors packages/web-renderer/src/wire.rs; Rust
 // producer/viewer still own full semantic metadata/image/render validation.
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+const bundleEnabled = env => env.DELTA_BUNDLES === 'fanout';
 export const LEASE_MS = 15000;
 export const BUDGETS = Object.freeze({ requests: 16, uploads: 1, viewers: 4, bodyTimeoutMs: 10000 });
 const U64 = (1n << 64n) - 1n;
@@ -47,7 +48,11 @@ function route(request, env, local = false) {
   if (request.method !== method) reject(405);
   if (url.search && action !== 'presentation') reject();
   if (action === 'presentation') {
-    for (const key of url.searchParams.keys()) if (!['epoch', 'after'].includes(key) || url.searchParams.getAll(key).length !== 1) reject();
+    const allowed = request.headers.get('X-Bmux-Capabilities') === 'bmwp-delta-v1'
+      ? ['epoch', 'after', 'generation', 'base'] : ['epoch', 'after'];
+    for (const key of url.searchParams.keys()) if (!allowed.includes(key) || url.searchParams.getAll(key).length !== 1) reject();
+    if (url.searchParams.has('base')) cursor(url.searchParams.get('base'));
+    if (url.searchParams.has('generation') && encoder.encode(url.searchParams.get('generation')).length > 128) reject();
   }
   return { url, action };
 }
@@ -132,12 +137,14 @@ class Wire {
     return { id, mime, width, height, format };
   }
 }
-export function validateSnapshot(bytes) {
+export function validateSnapshot(bytes) { return validatePresentation(bytes, false); }
+function validatePresentation(bytes, allowDelta) {
   if (bytes.length < 5 || bytes[0] !== 66 || bytes[1] !== 77 || bytes[2] !== 87 || bytes[3] !== 80 || bytes[4] !== 3) reject(415);
   const w = new Wire(bytes);
-  if (!w.text(128)) reject();
-  w.uint();
-  if (w.bool()) reject(); // Deltas require a base, so can never be public snapshots.
+  const generation = w.text(128); if (!generation || /[\u0000-\u001f\u007f]/.test(generation)) reject();
+  const revision = w.uint().toString();
+  const base = w.option(() => ({ generation: w.text(128), revision: w.uint().toString() }));
+  if (base && (!allowDelta || base.generation !== generation || BigInt(base.revision) >= BigInt(revision))) reject();
   const [x, y, width, height] = w.rect();
   const cells = width * height;
   if (cells > 262144 || x + width > 65535 || y + height > 65535) reject();
@@ -162,11 +169,14 @@ export function validateSnapshot(bytes) {
     }, width);
     if (columns !== width) reject();
   }, height);
-  if (rows.size !== height) reject();
-  if (!w.bool() || w.blob().length === 0) reject(); // Full snapshot includes opaque Rust metadata.
+  if (!base && rows.size !== height) reject();
+  const metadata = w.bool();
+  if (!base && !metadata) reject();
+  if (metadata && w.blob().length === 0) reject();
   const required = new Map();
-  if (!w.bool()) reject(); // Full snapshots include complete placement list, even empty.
-  w.seq(() => {
+  const images = w.bool();
+  if (!base && !images) reject();
+  if (images) w.seq(() => {
     w.text(256); const r = w.requirement(); required.set(r.id, r);
     w.rect(); w.small(1);
     w.option(() => { w.small(); w.small(); w.small(65535); w.small(65535); });
@@ -180,11 +190,28 @@ export function validateSnapshot(bytes) {
   }, 256);
   for (const [id, r] of required) {
     const supplied = resources.get(id);
-    if (!supplied || JSON.stringify(supplied) !== JSON.stringify(r)) reject();
+    if ((!supplied && !base) || (supplied && JSON.stringify(supplied) !== JSON.stringify(r))) reject();
   }
   if (w.at !== bytes.length) reject();
+  return { generation, revision, base, area: [x, y, width, height] };
 }
 
+async function compressed(bytes) {
+  if (typeof CompressionStream !== 'function' || bytes.length < 1024) return null;
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+  const reader = stream.getReader();
+  const output = new Uint8Array(bytes.length);
+  let size = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return size < bytes.length ? output.slice(0, size) : null;
+      if (size + value.length >= bytes.length) { void reader.cancel().catch(() => {}); return null; }
+      output.set(value, size); size += value.length;
+    }
+  } catch { return null; }
+  finally { reader.releaseLock(); }
+}
 function blank() {
   return { version: 1, state: 'offline', epoch: null, publisher_id: null, revision: '0',
     lease_expires_at: null, revoked: null, frame_hash: null, fence: 0 };
@@ -202,6 +229,9 @@ function validMetadata(m) {
 export class ChannelHandler {
   constructor(storage, env, { now = Date.now, local = false, bodyTimeoutMs = BUDGETS.bodyTimeoutMs } = {}) {
     this.storage = storage; this.env = env; this.now = now; this.local = local; this.bodyTimeoutMs = bodyTimeoutMs;
+    this.delta = null; this.identity = null; this.compressedFull = null;
+    this.counters = { wire_bytes: 0, full: 0, delta: 0, repair: 0,
+      upload_wire_bytes: 0, upload_full_bytes: 0, bundle_overhead_bytes: 0 };
     this.frame = null; this.active = 0; this.uploads = 0; this.viewers = 0; this.deliveries = new Set(); this.tail = Promise.resolve();
     this.ready = this.load();
   }
@@ -218,6 +248,7 @@ export class ChannelHandler {
     const priorEpoch = this.meta?.epoch;
     await this.storage.put('metadata', meta);
     this.meta = meta; this.frame = frame;
+    if (frame === null || meta.epoch !== priorEpoch) { this.delta = null; this.identity = null; this.compressedFull = null; }
     if (meta.epoch === null || meta.state !== 'live' || meta.epoch !== priorEpoch) {
       for (const invalidate of [...this.deliveries]) invalidate();
     }
@@ -259,15 +290,39 @@ export class ChannelHandler {
         const m = this.meta;
         if (action === 'health') return response(200, { protocol: 1, renderer: 'bmwp-3' });
         if (action === 'status') return response(200, { protocol: 1, renderer: 'bmwp-3', state: m.state,
-          epoch: m.epoch, revision: m.revision, lease_expires_at: m.lease_expires_at });
+          epoch: m.epoch, revision: m.revision, lease_expires_at: m.lease_expires_at },
+          request.headers.get('X-Bmux-Capabilities') === 'bmwp-delta-v1'
+            ? { 'X-Bmux-Delivery-Counters': JSON.stringify(this.counters) } : {});
         if (action === 'presentation') {
           if (url.searchParams.get('epoch') !== m.epoch) reject(409);
           const after = url.searchParams.has('after') ? cursor(url.searchParams.get('after')) : null;
           if (m.state !== 'live' || !this.frame) reject(503);
-          if (after !== null && after === BigInt(m.revision)) return response(204);
+          const negotiated = request.headers.get('X-Bmux-Capabilities') === 'bmwp-delta-v1';
+          const exactCurrent = this.identity && url.searchParams.get('generation') === this.identity.generation
+            && url.searchParams.get('base') === this.identity.revision;
+          if (after !== null && after === BigInt(m.revision) && (!negotiated || exactCurrent)) return response(204);
           if (this.viewers >= BUDGETS.viewers) reject(429);
+          const useDelta = negotiated && this.delta && after?.toString() === this.delta.baseRelay
+            && url.searchParams.get('generation') === this.delta.base.generation
+            && url.searchParams.get('base') === this.delta.base.revision;
+          let selected = useDelta ? this.delta.bytes : this.frame;
+          const packed = useDelta ? this.delta.compressed : this.compressedFull;
+          const headers = { 'Content-Type': 'application/octet-stream', 'X-Bmux-Epoch': m.epoch, 'X-Snapshot-Revision': m.revision };
+          if (request.headers.get('X-Bmux-Compression') === 'gzip-v1' && packed) {
+            headers['X-Bmux-Compression'] = 'gzip-v1';
+            selected = packed;
+          }
+          if (negotiated && this.identity) {
+            Object.assign(headers, { 'X-Bmux-Capabilities': 'bmwp-delta-v1',
+              'X-Bmux-Frame': useDelta ? 'delta' : 'full', 'X-Bmux-Generation': encodeURIComponent(this.identity.generation),
+              'X-Bmux-Frame-Revision': this.identity.revision });
+            if (useDelta) Object.assign(headers, { 'X-Bmux-Base-Revision': this.delta.baseRelay,
+              'X-Bmux-Base-Frame-Revision': this.delta.base.revision });
+          }
+          this.counters[useDelta ? 'delta' : 'full'] = Math.min(Number.MAX_SAFE_INTEGER, this.counters[useDelta ? 'delta' : 'full'] + 1);
+          if (negotiated && !useDelta) this.counters.repair = Math.min(Number.MAX_SAFE_INTEGER, this.counters.repair + 1);
           this.viewers++;
-          let bytes = this.frame, offset = 0, released = false, timer, invalidate;
+          let bytes = selected, offset = 0, released = false, timer, invalidate;
           const deliveryEpoch = m.epoch;
           const handler = this;
           const release = () => {
@@ -287,17 +342,19 @@ export class ChannelHandler {
               }
               if (offset === bytes.length) { controller.close(); release(); return; }
               const end = Math.min(offset + 65536, bytes.length);
+              handler.counters.wire_bytes = Math.min(Number.MAX_SAFE_INTEGER, handler.counters.wire_bytes + end - offset);
               controller.enqueue(bytes.slice(offset, end)); offset = end;
             },
             cancel: release,
           }, { highWaterMark: 0 });
-          return response(200, stream, { 'Content-Type': 'application/octet-stream', 'X-Bmux-Epoch': m.epoch, 'X-Snapshot-Revision': m.revision });
+          return response(200, stream, headers);
         }
         if (action === 'publisher/start') {
           if (m.epoch !== null && m.publisher_id !== start.publisher_id.toLowerCase()) reject(409);
           if (m.epoch === null) await this.commit({ ...blank(), revoked: m.revoked, state: 'starting',
             epoch: crypto.randomUUID(), publisher_id: start.publisher_id.toLowerCase(), lease_expires_at: this.now() + LEASE_MS, fence: m.fence + 1 }, null);
-          return response(200, { protocol: 1, renderer: 'bmwp-3', epoch: this.meta.epoch, lease_ms: LEASE_MS });
+          return response(200, { protocol: 1, renderer: 'bmwp-3', epoch: this.meta.epoch, lease_ms: LEASE_MS },
+            bundleEnabled(this.env) && request.headers.get('X-Bmux-Capabilities') === 'bmwp-delta-v1' ? { 'X-Bmux-Capabilities': 'bmwp-delta-v1' } : {});
         }
         if (action === 'publisher/stop' && request.headers.get('X-Bmux-Epoch') === m.revoked) return response(204);
         this.owner(request);
@@ -323,11 +380,39 @@ export class ChannelHandler {
         const epoch = this.owner(request);
         if (this.meta.state === 'paused') reject(409);
         if (BigInt(revision) < BigInt(this.meta.revision)) reject(409);
-        return { epoch, fence: this.meta.fence };
+        return { epoch, fence: this.meta.fence, identity: this.identity, revision: this.meta.revision };
       });
-      const bytes = await readBounded(request, MAX_FRAME_BYTES, this.bodyTimeoutMs);
-      try { validateSnapshot(bytes); } catch (e) { if (e instanceof Rejection) throw e; reject(); }
+      const bundled = request.headers.get('X-Bmux-Capabilities') === 'bmwp-delta-v1';
+      if (bundled && !bundleEnabled(this.env)) reject(415);
+      const body = await readBounded(request, bundled ? 2 * MAX_FRAME_BYTES + 4 : MAX_FRAME_BYTES, this.bodyTimeoutMs);
+      this.counters.upload_wire_bytes = Math.min(Number.MAX_SAFE_INTEGER, this.counters.upload_wire_bytes + body.length);
+      let bytes = body, delta = null, identity;
+      try {
+        if (bundled) {
+          if (body.length < 4) reject();
+          const size = new DataView(body.buffer, body.byteOffset, 4).getUint32(0, true);
+          if (!size || size > MAX_FRAME_BYTES || body.length <= 4 + size || body.length - 4 - size >= size) reject();
+          bytes = body.slice(4, 4 + size);
+          const patch = body.slice(4 + size);
+          identity = validateSnapshot(bytes);
+          const next = validatePresentation(patch, true);
+          const baseRelay = cursor(request.headers.get('X-Bmux-Base-Revision'), true).toString();
+          if (!next.base || next.generation !== identity.generation || next.revision !== identity.revision
+              || JSON.stringify(next.area) !== JSON.stringify(identity.area)) reject(409);
+          const retry = revision === admitted.revision && admitted.identity
+            && identity.generation === admitted.identity.generation && identity.revision === admitted.identity.revision;
+          if (!retry && (!admitted.identity || baseRelay !== admitted.revision
+              || next.base.generation !== admitted.identity.generation || next.base.revision !== admitted.identity.revision
+              || JSON.stringify(next.area) !== JSON.stringify(admitted.identity.area))) reject(409);
+          delta = retry ? null : { bytes: patch, base: next.base, baseRelay };
+        } else identity = validateSnapshot(bytes);
+      } catch (e) { if (e instanceof Rejection) throw e; reject(); }
+      this.counters.upload_full_bytes = Math.min(Number.MAX_SAFE_INTEGER, this.counters.upload_full_bytes + bytes.length);
+      this.counters.bundle_overhead_bytes = Math.min(Number.MAX_SAFE_INTEGER, this.counters.bundle_overhead_bytes + body.length - bytes.length);
       const hash = hex(await digest(bytes));
+      const wantCompression = request.headers.get('X-Bmux-Compression') === 'gzip-v1';
+      const packedFull = wantCompression ? await compressed(bytes) : null;
+      if (delta) delta.compressed = wantCompression ? await compressed(delta.bytes) : null;
       return await this.serialized(async () => {
         route(request, this.env, this.local);
         await authorize(request, this.env);
@@ -336,6 +421,7 @@ export class ChannelHandler {
         if (m.epoch !== admitted.epoch || m.fence !== admitted.fence || m.state === 'paused') reject(409);
         if (BigInt(revision) < BigInt(m.revision) || (revision === m.revision && hash !== m.frame_hash)) reject(409);
         await this.commit({ ...m, state: 'live', revision, frame_hash: hash, lease_expires_at: this.now() + LEASE_MS }, bytes);
+        this.delta = delta; this.identity = identity; this.compressedFull = packedFull;
         return response(204);
       });
     } finally { this.uploads--; }

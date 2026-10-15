@@ -54,6 +54,10 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
   let state = null;
   let ticket = 0;
   let cursor = null;
+  let frameIdentity = null;
+  const deltaCapable = viewer.capabilities?.includes('bmwp-delta-v1') === true;
+  const counters = { wire_bytes: 0, full: 0, delta: 0, repair: 0 };
+  const count = (key, amount = 1) => { counters[key] = Math.min(Number.MAX_SAFE_INTEGER, counters[key] + amount); };
   let statusBusy = false;
   let frameBusy = false;
   let statusTimer;
@@ -65,6 +69,7 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
     ticket++;
     state = null;
     cursor = null;
+    frameIdentity = null;
     frameController?.abort();
     clearTimeout(leaseTimer);
     viewer.clear();
@@ -77,6 +82,8 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
     const timeout = setTimeout(() => controller.abort(), 5000);
     try {
       const response = await fetchImpl(new URL(path, base).href, {
+        ...(isFrame && deltaCapable ? { headers: { 'X-Bmux-Capabilities': 'bmwp-delta-v1',
+          ...(typeof DecompressionStream === 'function' ? { 'X-Bmux-Compression': 'gzip-v1' } : {}) } } : {}),
         signal: controller.signal, credentials: 'omit', redirect: 'error', cache: 'no-store',
       });
       return await consume(response);
@@ -101,7 +108,10 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
         throw new Error('regressing cursor');
       }
       if (!state || next.epoch !== state.epoch || next.revision !== state.revision || next.state !== state.state) {
-        hide(next.state === 'live' ? 'Loading live output…' : `Broadcast ${next.state}`);
+        if (deltaCapable && state?.state === 'live' && next.state === 'live' && next.epoch === state.epoch) {
+          ticket++;
+          frameController?.abort();
+        } else hide(next.state === 'live' ? 'Loading live output…' : `Broadcast ${next.state}`);
       }
       state = next;
       clearTimeout(leaseTimer);
@@ -122,7 +132,10 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
       && state.lease_expires_at > now();
     frameBusy = true;
     try {
-      const path = `presentation?epoch=${encodeURIComponent(admitted.epoch)}${cursor === null ? '' : `&after=${cursor}`}`;
+      const path = `presentation?epoch=${encodeURIComponent(admitted.epoch)}${cursor === null ? '' : `&after=${cursor}`}`
+        + (deltaCapable && frameIdentity ? `&generation=${encodeURIComponent(frameIdentity.generation)}&base=${frameIdentity.revision}` : '');
+      let deliveredIdentity = null;
+      let isDelta = false;
       const bytes = await request(path, async response => {
         if (response.status === 204) { await response.body?.cancel(); return null; }
         if (response.status !== 200 || response.headers.get('Content-Type')?.split(';')[0] !== 'application/octet-stream'
@@ -131,18 +144,52 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
           await response.body?.cancel();
           throw new Error('presentation not admitted');
         }
-        return boundedBytes(response, 8 * 1024 * 1024);
+        const negotiated = response.headers.get('X-Bmux-Capabilities');
+        if (negotiated && negotiated !== 'bmwp-delta-v1') throw new Error('unsupported capability');
+        if (negotiated === 'bmwp-delta-v1') {
+          if (!deltaCapable) throw new Error('unnegotiated delta');
+          const kind = response.headers.get('X-Bmux-Frame');
+          const encodedGeneration = response.headers.get('X-Bmux-Generation');
+          const generation = encodedGeneration === null ? null : decodeURIComponent(encodedGeneration);
+          if (!['full', 'delta'].includes(kind) || !generation || generation.length > 128
+              || /[\u0000-\u001f\u007f]/.test(generation)) throw new Error('invalid frame identity');
+          deliveredIdentity = { generation, revision: revision(response.headers.get('X-Bmux-Frame-Revision')) };
+          isDelta = kind === 'delta';
+          if (isDelta && (!frameIdentity || frameIdentity.generation !== generation
+              || response.headers.get('X-Bmux-Base-Revision') !== cursor
+              || response.headers.get('X-Bmux-Base-Frame-Revision') !== frameIdentity.revision
+              || BigInt(deliveredIdentity.revision) <= BigInt(frameIdentity.revision))) throw new Error('missing delta base');
+        } else if (response.headers.get('X-Bmux-Frame') === 'delta') throw new Error('unnegotiated delta');
+        const wire = await boundedBytes(response, 8 * 1024 * 1024);
+        count('wire_bytes', wire.length);
+        const compression = response.headers.get('X-Bmux-Compression');
+        if (!compression) return wire;
+        if (compression !== 'gzip-v1' || !deltaCapable || typeof DecompressionStream !== 'function') throw new Error('unnegotiated compression');
+        const decoded = new Blob([wire]).stream().pipeThrough(new DecompressionStream('gzip'));
+        return boundedBytes(new Response(decoded), 8 * 1024 * 1024);
       }, true);
       if (bytes === null || !current()) return;
       if (bytes.length < 5 || bytes[0] !== 66 || bytes[1] !== 77 || bytes[2] !== 87 || bytes[3] !== 80 || bytes[4] !== 3) {
         throw new Error('incompatible presentation');
       }
-      if (await viewer.present(bytes, current) && current()) {
+      const presented = await viewer.present(bytes, current);
+      if (!current()) {
+        // A stateful decoder may have rejected this unadmitted update and
+        // dropped its base. Never advertise the older cursor after that race.
+        cursor = null; frameIdentity = null; viewer.clear();
+        return;
+      }
+      if (presented) {
         cursor = admitted.revision;
+        frameIdentity = deliveredIdentity;
+        count(isDelta ? 'delta' : 'full');
         status.textContent = 'Live · read-only';
+      } else if (current()) {
+        count('repair');
+        cursor = null; frameIdentity = null; viewer.clear();
       }
     } catch {
-      if (current()) hide('Broadcast unavailable or incompatible');
+      if (current()) { count('repair'); hide('Broadcast unavailable or incompatible'); }
     } finally { frameBusy = false; }
   }
   async function frameLoop() {
@@ -151,6 +198,7 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
   }
   const handle = {
     pollStatus, pollFrame,
+    get counters() { return { ...counters }; },
     dispose() {
       disposed = true;
       hide('Broadcast offline');

@@ -2,6 +2,39 @@
 
 BMUX live broadcasting reuses self-contained `BMWP\x03` full presentations. This is an output-only transport, not terminal input, navigation, or viewport control. Local operation never depends on the relay.
 
+## Change-driven delivery and optional compression
+
+Presenter timer wakeups check for state changes; they are not an instruction to
+publish a frame. Audience publications deduplicate against the last admitted
+content, ignoring generated revisions and damage hints but preserving generation,
+lifecycle, provenance, and interaction metadata. Local notes/focus do not invalidate
+audience content. Retained full state remains available for reconnect and repair.
+
+The local web host explicitly negotiates `Accept-Encoding: gzip` for JSON,
+document, full-frame and delta responses. Compression is cached once per
+publication, only when smaller, with a 1 KiB threshold, 8 MiB aggregate input-work
+budget and 2 MiB additional retained compressed-byte budget. PNG resources remain
+identity encoded. `/diagnostics` exposes identity/transport byte and representation
+counters without writing into the terminal presentation.
+
+Internet broadcasts default to self-contained full frames, suppressing unchanged
+content and coalescing pending work. Optional relay deployment setting
+`DELTA_BUNDLES=fanout` enables explicitly negotiated `bmwp-delta-v1` delivery.
+The publisher sends a full repair snapshot plus a smaller delta in one bounded
+bundle; **this increases publisher uplink bytes**, and is appropriate only when
+viewer fan-out savings justify the cost. There is no delta-only relay materializer.
+Legacy publishers/viewers remain full-frame compatible.
+
+Negotiated viewers supply exact generation/base revision and relay cursor/epoch;
+only a matching base receives a delta. Reconnect, missing base, epoch/source
+transition or presentation failure falls back to the retained full snapshot.
+A stateful hidden Canvas decoder retains the base; visible output is copied only
+after successful admission. `X-Bmux-Compression: gzip-v1` separately negotiates
+smaller relay payloads with independent 8 MiB encoded/decoded limits. Relay
+counters expose full/delta/repair counts, upload/full-equivalent/bundle overhead
+bytes and viewer wire bytes. Heartbeats and status polling remain necessary
+control traffic, not content changes.
+
 ## Coordinated renderer upgrade
 
 Renderer negotiation is now `bmwp-3` (`BMWP\x03`); the HTTP protocol remains v1. Publishers, relay admission, and the immutable viewer bundle must be deployed together. Stop active publishing before upgrading the relay, rebuild and deploy the matching viewer assets, then restart publishers. Existing `bmwp-2` negotiation and v2 frames are rejected, not reinterpreted. This is not a rolling or dual-version upgrade. Authentication, epoch fencing, revision ordering, and leases remain unchanged.

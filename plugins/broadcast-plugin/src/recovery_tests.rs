@@ -81,7 +81,7 @@ fn expired_epoch_reacquires_only_running_and_requires_fresh_repair() {
     controller.source(owner, &id, true).unwrap();
     controller
         .control(Control::Start(
-            Relay::new(&format!("http://{address}"), "main", &key).unwrap(),
+            Box::new(Relay::new(&format!("http://{address}"), "main", &key).unwrap()),
             id.clone(),
         ))
         .unwrap();

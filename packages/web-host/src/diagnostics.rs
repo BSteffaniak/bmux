@@ -9,8 +9,22 @@ pub struct HostDiagnostics {
     pub capacity_rejections: u64,
     pub request_rejections: u64,
     pub latest_publication_revision: Option<u64>,
+    pub delivery: DeliveryCounters,
     pub events: Vec<HostEvent>,
 }
+/// Successful publication responses only; byte counters exclude HTTP headers.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DeliveryCounters {
+    pub identity_responses: u64,
+    pub gzip_responses: u64,
+    pub identity_bytes: u64,
+    pub transport_bytes: u64,
+    pub full_responses: u64,
+    pub delta_responses: u64,
+    pub document_responses: u64,
+    pub json_responses: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct HostEvent {
     pub sequence: u64,
@@ -25,6 +39,7 @@ struct Evidence {
     rejected: u64,
     sequence: u64,
     published_revision: Option<u64>,
+    delivery: DeliveryCounters,
     events: VecDeque<HostEvent>,
 }
 pub(crate) struct Diagnostics {
@@ -42,6 +57,7 @@ impl Diagnostics {
                 rejected: 0,
                 sequence: 0,
                 published_revision: None,
+                delivery: DeliveryCounters::default(),
                 events: VecDeque::new(),
             }),
         }
@@ -94,6 +110,36 @@ impl Diagnostics {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .published_revision = Some(revision);
     }
+    pub(crate) fn delivered(
+        &self,
+        selected: &crate::delivery::Selected<'_>,
+        representation: &'static str,
+    ) {
+        let mut evidence = self
+            .evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let counters = &mut evidence.delivery;
+        let count = if selected.gzip {
+            &mut counters.gzip_responses
+        } else {
+            &mut counters.identity_responses
+        };
+        *count = count.saturating_add(1);
+        counters.identity_bytes = counters
+            .identity_bytes
+            .saturating_add(u64::try_from(selected.identity_len).unwrap_or(u64::MAX));
+        counters.transport_bytes = counters
+            .transport_bytes
+            .saturating_add(u64::try_from(selected.bytes.len()).unwrap_or(u64::MAX));
+        let count = match representation {
+            "full" => &mut counters.full_responses,
+            "delta" => &mut counters.delta_responses,
+            "document" => &mut counters.document_responses,
+            _ => &mut counters.json_responses,
+        };
+        *count = count.saturating_add(1);
+    }
     pub(crate) fn snapshot(&self) -> HostDiagnostics {
         let evidence = self
             .evidence
@@ -105,6 +151,7 @@ impl Diagnostics {
             capacity_rejections: evidence.capacity,
             request_rejections: evidence.rejected,
             latest_publication_revision: evidence.published_revision,
+            delivery: evidence.delivery.clone(),
             events: evidence.events.iter().cloned().collect(),
         }
     }
@@ -117,6 +164,16 @@ mod tests {
         const CHILD: &str = "BMUX_WEB_HOST_DIAGNOSTICS_CAPTURE_TEST";
         if std::env::var_os(CHILD).is_some() {
             let diagnostics = Diagnostics::new();
+            diagnostics.delivered(
+                &crate::delivery::Selected {
+                    bytes: &[1, 2],
+                    gzip: true,
+                    identity_len: 4096,
+                },
+                "full",
+            );
+            assert_eq!(diagnostics.snapshot().delivery.transport_bytes, 2);
+            assert_eq!(diagnostics.snapshot().delivery.identity_bytes, 4096);
             diagnostics.event("request_rejected", Some(408));
             diagnostics.event("response_write_failed", Some(32));
             diagnostics.stopped("listener_failed", None);

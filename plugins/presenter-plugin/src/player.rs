@@ -188,6 +188,18 @@ pub(crate) struct Player {
 }
 
 impl Player {
+    pub(crate) fn audience_epoch(&self) -> (u64, Vec<(&str, uuid::Uuid)>) {
+        let demos = self.live_demos.as_ref().map_or_else(Vec::new, |demos| {
+            demos
+                .entries
+                .iter()
+                .filter(|(_, demo)| demo.open)
+                .map(|(id, demo)| (id.as_str(), demo.snapshot.owner_epoch))
+                .collect()
+        });
+        (self.producer_generation, demos)
+    }
+
     pub fn local(deck: Deck, source: Option<PathBuf>, presenter: bool) -> Self {
         let state = PresentationState::new(&deck);
         let last_source = source
@@ -545,7 +557,34 @@ impl Player {
         self.local_view.mirror_geometry.clear();
         self.local_view.pending_mirror_geometry.clear();
     }
+    fn publish_browser(&mut self) {
+        if let Some(browser) = self.browser.clone() {
+            let size = self.audience_size;
+            let result = match browser.lock() {
+                Ok(mut browser) => browser.publish(self, size.width, size.height),
+                Err(_) => Err(anyhow::anyhow!("browser publication lock poisoned")),
+            };
+            match result {
+                Ok(()) => {
+                    if self.status == self.browser_publication_error {
+                        self.status = None;
+                    }
+                    self.browser_publication_error = None;
+                }
+                Err(error) => {
+                    let diagnostic = bounded_publication_error(&error);
+                    if self.browser_publication_error.as_ref() != Some(&diagnostic) {
+                        eprintln!("{diagnostic}");
+                    }
+                    self.status = Some(diagnostic.clone());
+                    self.browser_publication_error = Some(diagnostic);
+                }
+            }
+        }
+    }
+
     fn reload(&mut self) -> bool {
+        let previous_status = self.status.clone();
         let mut changed = false;
         if let Some(updates) = &mut self.reloads {
             for _ in 0..16 {
@@ -554,6 +593,13 @@ impl Player {
                 };
                 match update {
                     Ok((deck, rich)) => {
+                        if self.deck == deck
+                            && self.rich.images == rich.images
+                            && self.rich.code == rich.code
+                        {
+                            self.status = None;
+                            continue;
+                        }
                         let mut demos = match self
                             .live_demos
                             .as_ref()
@@ -606,7 +652,7 @@ impl Player {
                 }
             }
         }
-        changed
+        changed || self.status != previous_status
     }
 }
 
@@ -630,24 +676,7 @@ impl Program for Player {
                 eprintln!("Presenter frame evidence failed: {error}");
             }
         }
-        if let Some(browser) = self.browser.clone() {
-            let size = self.audience_size;
-            let result = match browser.lock() {
-                Ok(mut browser) => browser.publish(self, size.width, size.height),
-                Err(_) => Err(anyhow::anyhow!("browser publication lock poisoned")),
-            };
-            match result {
-                Ok(()) => self.browser_publication_error = None,
-                Err(error) => {
-                    let diagnostic = bounded_publication_error(&error);
-                    if self.browser_publication_error.as_ref() != Some(&diagnostic) {
-                        eprintln!("{diagnostic}");
-                    }
-                    self.status = Some(diagnostic.clone());
-                    self.browser_publication_error = Some(diagnostic);
-                }
-            }
-        }
+        self.publish_browser();
         Update::none()
     }
     fn update(&mut self, event: RuntimeEvent<Message>) -> Result<Update<Message>> {
@@ -655,9 +684,10 @@ impl Program for Player {
             RuntimeEvent::Message(Message::Interrupted) => Ok(Update::exit()),
             RuntimeEvent::Message(Message::InputError(error)) => Err(error.into()),
             RuntimeEvent::Timer(_) => {
-                self.reload();
+                let previous_status = self.status.clone();
+                let mut changed = self.reload();
                 if let Some(demos) = &mut self.live_demos {
-                    demos.update();
+                    changed |= demos.update();
                 }
                 if self.remote.is_some() {
                     for _ in 0..16 {
@@ -683,6 +713,16 @@ impl Program for Player {
                                     self.status = Some("Update rejected; retaining last valid deck: invalid mirror scene".into());
                                     continue;
                                 }
+                                let notes = if self.presenter { snapshot.notes } else { None };
+                                changed |= self.producer_run.as_deref()
+                                    != Some(&snapshot.cursor.run_id)
+                                    || self.deck != snapshot.deck
+                                    || self.state != snapshot.state
+                                    || self.rich.images != update.rich.images
+                                    || self.rich.code != update.rich.code
+                                    || serde_json::to_vec(&self.surfaces)?
+                                        != serde_json::to_vec(&snapshot.surfaces)?
+                                    || self.notes != notes;
                                 let previous_slide = self.state.slide_id.clone();
                                 self.observe_producer_run(&snapshot.cursor.run_id)?;
                                 self.deck = snapshot.deck;
@@ -693,7 +733,7 @@ impl Program for Player {
                                 }
                                 self.rich = update.rich;
                                 self.surfaces = snapshot.surfaces;
-                                self.notes = if self.presenter { snapshot.notes } else { None };
+                                self.notes = notes;
                                 self.status = update.acknowledgment;
                             }
                             Err(error) => {
@@ -704,7 +744,16 @@ impl Program for Player {
                         }
                     }
                 }
-                Ok(Update::redraw())
+                // Retry rejected browser admission without forcing an idle local
+                // repaint. Successful retained publications suppress themselves.
+                if !changed && self.browser_publication_error.is_some() {
+                    self.publish_browser();
+                }
+                Ok(if changed || self.status != previous_status {
+                    Update::redraw()
+                } else {
+                    Update::none()
+                })
             }
             RuntimeEvent::Terminal(Event::Key(key)) => {
                 // Exit is a caller lifecycle action, not an overlay control. It
@@ -1469,9 +1518,13 @@ pub(crate) async fn run_headless(
     let mut width = 80;
     let mut height = 24;
     let mut tick = tokio::time::interval(Duration::from_millis(300));
-    if let Err(error) = browser.publish(&mut player, width, height) {
-        eprintln!("Audience update rejected; committed scene retained: {error}");
-    }
+    let mut publication_pending = match browser.publish(&mut player, width, height) {
+        Ok(()) => false,
+        Err(error) => {
+            eprintln!("Audience update rejected; committed scene retained: {error}");
+            true
+        }
+    };
     let result = loop {
         let changed = tokio::select! {
             signal = tokio::signal::ctrl_c() => { break signal.map_err(anyhow::Error::from); }
@@ -1491,8 +1544,16 @@ pub(crate) async fn run_headless(
                 reload || live
             }
         };
-        if changed && let Err(error) = browser.publish(&mut player, width, height) {
-            eprintln!("Audience update rejected; committed scene retained: {error}");
+        if changed || publication_pending {
+            publication_pending = match browser.publish(&mut player, width, height) {
+                Ok(()) => false,
+                Err(error) => {
+                    if !publication_pending {
+                        eprintln!("Audience update rejected; committed scene retained: {error}");
+                    }
+                    true
+                }
+            };
         }
     };
     if let Some(task) = reload_task {
@@ -1758,6 +1819,121 @@ fn overlay_key_input(key: &bmux_keyboard::KeyStroke) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn idle_timer_and_identical_reload_do_not_invalidate() {
+        let deck = bmux_presenter::DeckBuilder::new("deck")
+            .slide(
+                bmux_presenter::SlideBuilder::new("slide")
+                    .text("body", "PUBLIC")
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck.clone(), None, true);
+        let tick = || RuntimeEvent::Timer(bmux_tui_runtime::TimerId::new("presentation.reload"));
+        assert!(matches!(
+            player.update(tick()).unwrap().invalidation,
+            bmux_tui_runtime::Invalidation::None
+        ));
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        player.reloads = Some(receiver);
+        assert!(sender.try_send(Ok((deck, player.rich.clone()))).is_ok());
+        assert!(matches!(
+            player.update(tick()).unwrap().invalidation,
+            bmux_tui_runtime::Invalidation::None
+        ));
+        assert!(sender.try_send(Err("bad reload".into())).is_ok());
+        assert!(!matches!(
+            player.update(tick()).unwrap().invalidation,
+            bmux_tui_runtime::Invalidation::None
+        ));
+        assert!(sender.try_send(Err("bad reload".into())).is_ok());
+        assert!(matches!(
+            player.update(tick()).unwrap().invalidation,
+            bmux_tui_runtime::Invalidation::None
+        ));
+    }
+
+    #[test]
+    fn remote_timer_ignores_cursor_only_updates_but_keeps_notes_and_epochs() {
+        let deck = bmux_presenter::DeckBuilder::new("deck")
+            .slide(
+                bmux_presenter::SlideBuilder::new("slide")
+                    .text("body", "PUBLIC")
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck.clone(), None, true);
+        let (actions, _actions) = tokio::sync::mpsc::channel(4);
+        let (updates, receiver) = tokio::sync::mpsc::channel(4);
+        player.remote = Some(RemoteConnection {
+            actions,
+            updates: receiver,
+            receive_only: true,
+        });
+        let mut snapshot = bmux_presenter_runtime::Snapshot {
+            cursor: bmux_presenter_runtime::Cursor {
+                run_id: "run".into(),
+                deck_revision: 1,
+                revision: 1,
+            },
+            deck,
+            state: player.state.clone(),
+            notes: None,
+            surfaces: vec![],
+            assets: vec![],
+        };
+        player.observe_producer_run("run").unwrap();
+        let tick = || RuntimeEvent::Timer(bmux_tui_runtime::TimerId::new("presentation.reload"));
+        for revision in 2..4 {
+            snapshot.cursor.revision = revision;
+            assert!(
+                updates
+                    .try_send(Ok(crate::viewer::RemoteUpdate {
+                        snapshot: snapshot.clone(),
+                        rich: player.rich.clone(),
+                        acknowledgment: None,
+                    }))
+                    .is_ok()
+            );
+            assert!(matches!(
+                player.update(tick()).unwrap().invalidation,
+                bmux_tui_runtime::Invalidation::None
+            ));
+        }
+        snapshot.notes = Some("PRIVATE".into());
+        assert!(
+            updates
+                .try_send(Ok(crate::viewer::RemoteUpdate {
+                    snapshot: snapshot.clone(),
+                    rich: player.rich.clone(),
+                    acknowledgment: None,
+                }))
+                .is_ok()
+        );
+        assert!(!matches!(
+            player.update(tick()).unwrap().invalidation,
+            bmux_tui_runtime::Invalidation::None
+        ));
+        assert_eq!(player.notes.as_deref(), Some("PRIVATE"));
+        snapshot.cursor.run_id = "replacement".into();
+        assert!(
+            updates
+                .try_send(Ok(crate::viewer::RemoteUpdate {
+                    snapshot,
+                    rich: player.rich.clone(),
+                    acknowledgment: None,
+                }))
+                .is_ok()
+        );
+        assert!(!matches!(
+            player.update(tick()).unwrap().invalidation,
+            bmux_tui_runtime::Invalidation::None
+        ));
+        assert_eq!(player.audience_epoch().0, 2);
+    }
+
     #[tokio::test]
     async fn audience_demo_tracks_open_close_without_execution() {
         let fixture = crate::playbook_live::reload_tests::Fixture::new();
@@ -2014,14 +2190,24 @@ mod tests {
                 crate::rich::RichAssets::default(),
             )))
             .unwrap();
-        assert!(!player.reload());
-        assert_eq!(player.deck.slides[0].id.as_str(), "moved");
-        assert_eq!(
-            player.live_demos.as_ref().unwrap().entries["demo"]
-                .controller
-                .owner_epoch(),
-            epoch
+        let admitted_deck = player.deck.clone();
+        // Rejection changes the visible diagnostic, not the admitted deck or runner.
+        assert!(player.reload());
+        assert!(player.status.is_some());
+        assert!(
+            !player.reload(),
+            "an idle poll must not repeat the status redraw"
         );
+        assert_eq!(player.deck, admitted_deck);
+        assert_eq!(player.deck.slides[0].id.as_str(), "moved");
+        let entry = &player.live_demos.as_ref().unwrap().entries["demo"];
+        assert_eq!(entry.controller.owner_epoch(), epoch);
+        assert_eq!(entry.snapshot.attempt.as_ref().unwrap().generation, 41);
+        assert!(std::sync::Arc::ptr_eq(
+            entry.snapshot.surface.as_ref().unwrap(),
+            &surface
+        ));
+        assert_eq!(entry.slide, "moved");
         assert!(!*running.stopped.borrow());
         assert_eq!(*running.cancelled.borrow(), 0);
         updates
@@ -2635,6 +2821,36 @@ mod tests {
                 .contains("PRIVATESECRET")
         );
     }
+    #[test]
+    fn audience_frame_is_independent_of_local_focus_and_notes() {
+        let deck = DeckBuilder::new("deck")
+            .slide(SlideBuilder::new("slide").text("body", "PUBLIC").build())
+            .build()
+            .unwrap();
+        let mut player = Player::local(deck, None, true);
+        let scene = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 80, 24));
+        let prepared = scene
+            .prepare(bmux_tui::damage::Damage::Full, |cx| {
+                paint_browser_audience(&mut player, cx)
+            })
+            .unwrap();
+        let before =
+            bmux_web_renderer::BrowserFrame::from_prepared_in_generation("test", 1, &prepared)
+                .unwrap();
+        player.local_view.focused_block = Some(bmux_presenter::BlockId::new("body"));
+        player.notes = Some("PRIVATE".into());
+        player.status = Some("PRIVATE".into());
+        let prepared = scene
+            .prepare(bmux_tui::damage::Damage::Full, |cx| {
+                paint_browser_audience(&mut player, cx)
+            })
+            .unwrap();
+        let after =
+            bmux_web_renderer::BrowserFrame::from_prepared_in_generation("test", 1, &prepared)
+                .unwrap();
+        assert_eq!(before, after);
+    }
+
     #[test]
     fn keys_use_pure_reducer_and_quit_requests_runtime_exit() {
         let deck = DeckBuilder::new("d")

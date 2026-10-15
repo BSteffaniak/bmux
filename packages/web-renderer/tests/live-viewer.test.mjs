@@ -15,7 +15,7 @@ function frameResponse(overrides = {}) {
   return new Response(bytes, { headers: { 'Content-Type': 'application/octet-stream',
     'X-Bmux-Epoch': epoch, 'X-Snapshot-Revision': '1', ...overrides } });
 }
-async function fixture() {
+async function fixture(capabilities = []) {
   let value = statusValue();
   let frame = () => Promise.resolve(frameResponse());
   let presentation = async (_bytes, current) => current();
@@ -27,6 +27,7 @@ async function fixture() {
     container: { ownerDocument: { baseURI: 'https://bmux.test/live' } }, status,
     apiBase: '/api/live/main', assetBase: '/live-assets/', autoStart: false,
     canvasFactory: async () => ({
+      capabilities,
       clear() { visible = false; clears++; }, dispose() { visible = false; },
       async present(data, current) { const result = await presentation(data, current); if (result && current()) visible = true; return result; },
     }),
@@ -189,10 +190,133 @@ test('SPA route changes, delayed mount and pagehide dispose viewers without leak
   assert.equal(observerConnected, false);
 });
 
+test('negotiated viewer preserves exact committed base across status revisions and repairs rejected delta', async () => {
+  const f = await fixture(['bmwp-delta-v1']);
+  const identity = { 'X-Bmux-Capabilities': 'bmwp-delta-v1', 'X-Bmux-Frame': 'full',
+    'X-Bmux-Generation': 'scene', 'X-Bmux-Frame-Revision': '10' };
+  try {
+    f.setFrame(async () => frameResponse(identity));
+    await f.handle.pollStatus(); await f.handle.pollFrame();
+    assert.equal(f.visible, true); const clears = f.clears;
+    f.setStatus(statusValue('live', { revision: '2' }));
+    await f.handle.pollStatus(); assert.equal(f.clears, clears);
+    f.setFrame(async () => frameResponse({ ...identity, 'X-Snapshot-Revision': '2', 'X-Bmux-Frame': 'delta',
+      'X-Bmux-Frame-Revision': '11', 'X-Bmux-Base-Revision': '1', 'X-Bmux-Base-Frame-Revision': '10' }));
+    await f.handle.pollFrame();
+    assert.match(f.requests.at(-1).url, /after=1&generation=scene&base=10$/);
+    assert.equal(f.requests.at(-1).options.headers['X-Bmux-Capabilities'], 'bmwp-delta-v1');
+    assert.equal(f.handle.counters.delta, 1);
+    f.setStatus(statusValue('live', { revision: '3' })); await f.handle.pollStatus();
+    f.setFrame(async () => frameResponse({ ...identity, 'X-Snapshot-Revision': '3', 'X-Bmux-Frame': 'delta',
+      'X-Bmux-Frame-Revision': '12', 'X-Bmux-Base-Revision': '2', 'X-Bmux-Base-Frame-Revision': '9' }));
+    await f.handle.pollFrame(); assert.equal(f.visible, false); assert.equal(f.handle.counters.repair, 1);
+    await f.handle.pollStatus();
+    f.setFrame(async () => frameResponse({ ...identity, 'X-Snapshot-Revision': '3', 'X-Bmux-Frame-Revision': '12' }));
+    await f.handle.pollFrame(); assert.doesNotMatch(f.requests.at(-1).url, /after=|base=/);
+    assert.equal(f.visible, true); assert.equal(f.handle.counters.full, 2);
+  } finally { f.handle.dispose(); }
+});
+
+test('failed negotiated presentation retries full, while epoch transition drops retained base', async () => {
+  const f = await fixture(['bmwp-delta-v1']);
+  const identity = { 'X-Bmux-Capabilities': 'bmwp-delta-v1', 'X-Bmux-Frame': 'full',
+    'X-Bmux-Generation': 'scene', 'X-Bmux-Frame-Revision': '1' };
+  try {
+    f.setFrame(async () => frameResponse(identity));
+    await f.handle.pollStatus(); await f.handle.pollFrame();
+    f.setStatus(statusValue('live', { revision: '2' })); await f.handle.pollStatus();
+    f.setFrame(async () => frameResponse({ ...identity, 'X-Snapshot-Revision': '2', 'X-Bmux-Frame': 'delta',
+      'X-Bmux-Frame-Revision': '2', 'X-Bmux-Base-Revision': '1', 'X-Bmux-Base-Frame-Revision': '1' }));
+    f.setPresentation(async () => false);
+    await f.handle.pollFrame(); assert.equal(f.visible, false); assert.equal(f.handle.counters.delta, 0);
+    f.setPresentation(async (_bytes, current) => current());
+    f.setFrame(async () => frameResponse({ ...identity, 'X-Snapshot-Revision': '2', 'X-Bmux-Frame-Revision': '2' }));
+    await f.handle.pollFrame(); assert.doesNotMatch(f.requests.at(-1).url, /after=|base=/);
+    f.setStatus(statusValue('live', { epoch: secondEpoch, revision: '1' })); await f.handle.pollStatus();
+    assert.equal(f.visible, false);
+    f.setFrame(async () => frameResponse({ ...identity, 'X-Bmux-Epoch': secondEpoch }));
+    await f.handle.pollFrame(); assert.doesNotMatch(f.requests.at(-1).url, /after=|base=/);
+  } finally { f.handle.dispose(); }
+});
+
+test('status advancing during stateful decode discards cursor and requests full repair', async () => {
+  const f = await fixture(['bmwp-delta-v1']); const entered = deferred(); const release = deferred();
+  const identity = { 'X-Bmux-Capabilities': 'bmwp-delta-v1', 'X-Bmux-Frame': 'full',
+    'X-Bmux-Generation': 'scene', 'X-Bmux-Frame-Revision': '1' };
+  try {
+    f.setFrame(async () => frameResponse(identity)); await f.handle.pollStatus(); await f.handle.pollFrame();
+    f.setStatus(statusValue('live', { revision: '2' })); await f.handle.pollStatus();
+    f.setFrame(async () => frameResponse({ ...identity, 'X-Snapshot-Revision': '2', 'X-Bmux-Frame-Revision': '2' }));
+    f.setPresentation(async (_bytes, current) => { entered.resolve(); await release.promise; return current(); });
+    const pending = f.handle.pollFrame(); await entered.promise;
+    f.setStatus(statusValue('live', { revision: '3' })); await f.handle.pollStatus();
+    release.resolve(); await pending;
+    f.setPresentation(async (_bytes, current) => current());
+    f.setFrame(async () => frameResponse({ ...identity, 'X-Snapshot-Revision': '3', 'X-Bmux-Frame-Revision': '3' }));
+    await f.handle.pollFrame(); assert.doesNotMatch(f.requests.at(-1).url, /after=|base=/);
+    assert.equal(f.visible, true);
+  } finally { release.resolve(); f.handle.dispose(); }
+});
+
+test('negotiated gzip enforces decoded size independently of small wire size', async () => {
+  const { gzipSync } = await import('node:zlib');
+  const f = await fixture(['bmwp-delta-v1']);
+  const headers = { 'Content-Type': 'application/octet-stream', 'X-Bmux-Epoch': epoch, 'X-Snapshot-Revision': '1',
+    'X-Bmux-Compression': 'gzip-v1', 'X-Bmux-Capabilities': 'bmwp-delta-v1', 'X-Bmux-Frame': 'full',
+    'X-Bmux-Generation': 'scene', 'X-Bmux-Frame-Revision': '1' };
+  try {
+    await f.handle.pollStatus();
+    f.setFrame(async () => new Response(gzipSync(new Uint8Array(8 * 1024 * 1024 + 1)), { headers }));
+    await f.handle.pollFrame(); assert.equal(f.visible, false); assert.equal(f.handle.counters.repair, 1);
+    await f.handle.pollStatus();
+    f.setFrame(async () => new Response(gzipSync(bytes), { headers }));
+    await f.handle.pollFrame(); assert.equal(f.visible, true);
+    assert.ok(f.handle.counters.wire_bytes > bytes.length);
+  } finally { f.handle.dispose(); }
+});
+
+test('Canvas adapter retains decoder for deltas, exposes only admitted copies, and clears base', async () => {
+  const children = new Set(); const decoded = []; let frees = 0; let copies = 0;
+  const doc = { baseURI: 'https://bmux.test/live', createElement() {
+    return { hidden: false, width: 10, height: 20, style: {}, setAttribute() {},
+      getContext(kind) { assert.equal(kind, '2d'); return { drawImage() { copies++; } }; },
+      remove() { children.delete(this); } };
+  } };
+  const module = { default: async () => {}, CanvasRenderer: class {
+    constructor(id) { assert.match(id, /^bmux-audience-staging-/); this.base = false; decoded.push(this); }
+    set_metrics() {} inspect_binary() { return '{"supported":true}'; }
+    async present_binary(data) {
+      if (data[5] === 1 && !this.base) throw new Error('missing base');
+      this.base = true;
+    }
+    free() { frees++; }
+  } };
+  const viewer = await mountCanvasViewer({ container: { ownerDocument: doc, append(canvas) { children.add(canvas); } },
+    assetBase: '/live-assets/', loadModule: async () => module });
+  const full = Uint8Array.of(66, 77, 87, 80, 3, 0);
+  const delta = Uint8Array.of(66, 77, 87, 80, 3, 1);
+  assert.deepEqual(viewer.capabilities, ['bmwp-delta-v1']);
+  assert.equal(await viewer.present(full, () => true), true);
+  assert.equal(await viewer.present(delta, () => true), true);
+  assert.equal(decoded.length, 1); assert.equal(frees, 0); assert.equal(copies, 2);
+  assert.equal(children.size, 2); assert.equal([...children].filter(canvas => !canvas.hidden).length, 1);
+  viewer.clear(); assert.equal(children.size, 0); assert.equal(frees, 1);
+  await assert.rejects(viewer.present(delta, () => true), /missing base/);
+  assert.equal(children.size, 0); assert.equal(frees, 2);
+  assert.equal(await viewer.present(full, () => true), true);
+  assert.equal(await viewer.present(delta, () => false), false);
+  assert.equal(decoded.length, 3); assert.equal(frees, 3);
+  // The previous visible copy stays committed; failed decoder state is gone.
+  assert.equal([...children].filter(canvas => !canvas.hidden).length, 1);
+  assert.equal(await viewer.present(full, () => true), true);
+  assert.equal(decoded.length, 4);
+  viewer.dispose(); assert.equal(children.size, 0); assert.equal(frees, 4);
+});
+
 test('real Canvas adapter detaches pending WASM target and never reveals it after privacy clear', async () => {
   const children = new Set(); const entered = deferred(); const release = deferred();
   const doc = { baseURI: 'https://bmux.test/live', createElement() {
-    return { hidden: false, style: {}, setAttribute() {}, remove() { children.delete(this); } };
+    return { hidden: false, style: {}, setAttribute() {}, getContext() { return { drawImage() {} }; }, remove() { children.delete(this); } };
   } };
   let frees = 0;
   const module = { default: async () => {}, CanvasRenderer: class {
@@ -209,6 +333,7 @@ test('real Canvas adapter detaches pending WASM target and never reveals it afte
   release.resolve(); assert.equal(await pending, false);
   assert.equal(children.size, 0); assert.equal(frees, 1);
   assert.equal(await viewer.present(bytes, () => true), true);
-  assert.equal([...children][0].hidden, false);
+  assert.equal(children.size, 2);
+  assert.equal([...children].filter(canvas => !canvas.hidden).length, 1);
   viewer.dispose(); assert.equal(children.size, 0);
 });

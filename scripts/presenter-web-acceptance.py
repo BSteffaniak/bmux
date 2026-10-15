@@ -1201,6 +1201,43 @@ flowchart LR
         finally:
             self.close_browsers()
 
+    def delivery_idle(self, delivery):
+        process = self.spawn(["present", "play", self.deck, "--presenter",
+                              "--web-assets", self.args.assets, "--web-port", "0",
+                              "--web-auth", "none"], mirror=True,
+                             env=dict(self.env, BMUX_PRESENTER_WEB_DELIVERY=delivery))
+        url = self.url(process)
+        client = self.browser(url, delivery=delivery)
+        origin, token = self.endpoint(url)
+        def diagnostics():
+            return json.loads(WEB.http(origin, "/diagnostics", token)[1])
+        wait_for("initial publication", lambda: diagnostics()["latest_publication_revision"] is not None)
+        time.sleep(1)
+        before = diagnostics()
+        revision = before["latest_publication_revision"]
+        inspection = self.inspection(client) if delivery == "document" else None
+        time.sleep(60)
+        after = diagnostics()
+        require(after["latest_publication_revision"] == revision,
+                f"idle {delivery} advanced content revisions: {revision} -> {after['latest_publication_revision']}")
+        if inspection is not None:
+            require(self.inspection(client)["revision"] == inspection["revision"],
+                    "idle document triggered a new Canvas commit")
+        # A new browser must receive retained state without a presenter action.
+        observer = self.browser(url, delivery=delivery)
+        if delivery == "document":
+            wait_for("retained document repair", lambda: self.inspection(observer)["revision"] == inspection["revision"])
+        else:
+            self.commit(observer, self.frame(url))
+        require(diagnostics()["latest_publication_revision"] == revision,
+                "new observer forced an unchanged publication")
+        evidence = {"delivery": delivery, "seconds": 60, "before": before, "after": after}
+        (self.root / f"delivery-idle-{delivery}.json").write_text(json.dumps(evidence, indent=2))
+        process.send(b"\r")
+        wait_for("visible change published", lambda: diagnostics()["latest_publication_revision"] > revision)
+        self.stop(process, url)
+        self.passed(f"{delivery}: 60s idle no content revisions, retained observer repair, visible change")
+
     def run(self):
         server = self.spawn(["server", "start", "--foreground-internal", "--no-pane-shell-integration"])
         def ready():
@@ -1210,6 +1247,10 @@ flowchart LR
             return result.returncode == 0 and json.loads(result.stdout).get("running")
         wait_for("isolated owned server", ready, 30)
         self.cli("present", "check", self.deck)
+        if self.args.delivery_efficiency_only:
+            self.run_case(self.delivery_idle, "document")
+            self.run_case(self.delivery_idle, "frame")
+            return
         self.run_case(self.viewport_fit, "document")
         self.run_case(self.viewport_fit, "frame")
         if self.args.viewport_fit_only:
@@ -1267,6 +1308,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("binary", "plugins", "assets", "browser"):
         parser.add_argument("--" + name, type=lambda s: Path(s).resolve(strict=True), required=True)
+    parser.add_argument("--delivery-efficiency-only", action="store_true",
+                        help="verify 60-second idle publication suppression and retained observer repair")
     parser.add_argument("--viewport-fit-only", action="store_true",
                         help="run only C1 document/fixed-mirror real-browser geometry cases")
     parser.add_argument("--state-parent", type=Path, default=Path("/tmp"))

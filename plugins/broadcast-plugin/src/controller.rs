@@ -15,6 +15,7 @@ struct Source {
     owner: Uuid,
     expires: Instant,
     last: Option<(u64, String, u64)>,
+    content: Option<[u8; 32]>,
     terminal_stop: Option<tokio::sync::watch::Sender<bool>>,
     label: String,
 }
@@ -37,6 +38,8 @@ struct State {
     remote: &'static str,
     error: Option<&'static str>,
     pending: Option<Pending>,
+    suppressed: u64,
+    coalesced: u64,
     owned: Option<Owned>,
     viewer_url: Option<String>,
     starts: BTreeMap<String, (Uuid, Option<String>)>,
@@ -51,6 +54,8 @@ impl Default for State {
             remote: "offline",
             error: None,
             pending: None,
+            suppressed: 0,
+            coalesced: 0,
             owned: None,
             viewer_url: None,
             starts: BTreeMap::new(),
@@ -86,7 +91,7 @@ impl State {
     }
 }
 pub enum Control {
-    Start(Relay, String),
+    Start(Box<Relay>, String),
     Pause,
     Resume,
     Stop,
@@ -332,7 +337,7 @@ impl Controller {
         }
         crate::start_identity::claim(state_root, id)?;
         // Keep the token even on remote uncertainty: retries return the same admitted start.
-        let result = self.control_locked(Control::Start(relay, id.into()));
+        let result = self.control_locked(Control::Start(Box::new(relay), id.into()));
         let mut state = self.state.lock().map_err(|_| "controller_unavailable")?;
         if state.selected.as_deref() != Some(id) || state.local == "stopped" {
             return Err(result.err().unwrap_or("start_not_admitted"));
@@ -416,6 +421,7 @@ impl Controller {
                     owner,
                     expires: now + SOURCE_LEASE,
                     last: None,
+                    content: None,
                     terminal_stop: None,
                     label: "Source".into(),
                 },
@@ -545,6 +551,7 @@ impl Controller {
         if frame.revision() == 0 {
             return Err("invalid_frame");
         }
+        let key = content_key(&frame)?;
         let mut state = self.state.lock().map_err(|_| "controller_unavailable")?;
         if !state.source_state(id).selected || state.refresh != refresh {
             return Ok(false);
@@ -572,7 +579,20 @@ impl Controller {
         {
             return Err("stale_frame");
         }
+        let duplicate = source
+            .last
+            .as_ref()
+            .is_some_and(|(old_refresh, _, _)| *old_refresh == refresh)
+            && source.content == Some(key);
         source.last = Some((refresh, frame.generation().into(), frame.revision()));
+        source.content = Some(key);
+        if duplicate {
+            state.suppressed = state.suppressed.saturating_add(1);
+            return Ok(true);
+        }
+        if state.pending.is_some() {
+            state.coalesced = state.coalesced.saturating_add(1);
+        }
         state.pending = Some(Pending {
             refresh,
             bytes,
@@ -580,6 +600,31 @@ impl Controller {
         });
         Ok(true)
     }
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct DeliveryCounters {
+    pub suppressed: u64,
+    pub coalesced: u64,
+}
+
+impl Controller {
+    pub fn delivery_counters(&self) -> Result<DeliveryCounters, &'static str> {
+        let state = self.state.lock().map_err(|_| "controller_unavailable")?;
+        Ok(DeliveryCounters {
+            suppressed: state.suppressed,
+            coalesced: state.coalesced,
+        })
+    }
+}
+
+fn content_key(frame: &bmux_web_renderer::BrowserFrame) -> Result<[u8; 32], &'static str> {
+    use sha2::{Digest, Sha256};
+    let mut value = serde_json::to_value(frame).map_err(|_| "invalid_frame")?;
+    let object = value.as_object_mut().ok_or("invalid_frame")?;
+    object.remove("revision");
+    object.remove("damage");
+    Ok(Sha256::digest(serde_json::to_vec(&value).map_err(|_| "invalid_frame")?).into())
 }
 
 fn owned_publication(
@@ -601,7 +646,7 @@ async fn worker(
     mut commands: mpsc::Receiver<Request>,
     mut gate: tokio::sync::watch::Receiver<u64>,
 ) {
-    let mut relay: Option<Relay> = None;
+    let mut relay: Option<Box<Relay>> = None;
     let mut revision = 0_u64;
     let mut heartbeat = Instant::now();
     let mut source_paused = false;

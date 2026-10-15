@@ -382,6 +382,17 @@ async fn response(
     body: &[u8],
     revision: Option<u64>,
 ) -> io::Result<()> {
+    encoded_response(stream, status, content_type, body, revision, None).await
+}
+
+async fn encoded_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    revision: Option<u64>,
+    gzip: Option<bool>,
+) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         204 => "No Content",
@@ -401,8 +412,13 @@ async fn response(
     let revision_header = revision.map_or_else(String::new, |revision| {
         format!("X-Snapshot-Revision: {revision}\r\n")
     });
+    let encoding_header = match gzip {
+        Some(true) => "Vary: Accept-Encoding\r\nContent-Encoding: gzip\r\n",
+        Some(false) => "Vary: Accept-Encoding\r\n",
+        None => "",
+    };
     let headers = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\n{revision_header}Connection: close\r\nCache-Control: no-store\r\nPragma: no-cache\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; style-src 'self'; img-src 'self' blob: data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\n{encoding_header}{revision_header}Connection: close\r\nCache-Control: no-store\r\nPragma: no-cache\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; style-src 'self'; img-src 'self' blob: data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n\r\n",
         body.len()
     );
     stream.write_all(headers.as_bytes()).await?;
@@ -442,6 +458,13 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
         Ok(Err(status)) => Err(*status),
         Err(_) => Err(408),
     };
+    let accept_encoding = crate::delivery::AcceptEncoding::from_headers(
+        request
+            .as_ref()
+            .ok()
+            .and_then(|result| result.as_ref().ok())
+            .map_or(&[][..], |bytes| &bytes[..header_end]),
+    );
     let body_prefix = request
         .as_ref()
         .ok()
@@ -553,6 +576,11 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
                 })
                 .cloned();
             if let Some(resource) = resource {
+                // Resources (especially PNG) are always identity, never recompressed.
+                if accept_encoding.select(&resource.bytes, None).is_none() {
+                    error(&mut stream, &state, 406).await;
+                    return;
+                }
                 observed_response(
                     &mut stream,
                     &state,
@@ -570,13 +598,14 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
             match timeout(state.limits.poll_timeout, latest(&mut feed, after)).await {
                 Ok(Ok(snapshot)) => {
                     if let Some(document) = &snapshot.document {
-                        observed_response(
+                        publication_response(
                             &mut stream,
                             &state,
-                            200,
                             "application/vnd.bmux.document-v1+json",
-                            &document.bytes,
-                            Some(snapshot.revision),
+                            accept_encoding
+                                .select(&document.bytes, snapshot.delivery.document.as_ref()),
+                            snapshot.revision,
+                            "document",
                         )
                         .await;
                     } else {
@@ -596,18 +625,21 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
             {
                 Ok(Ok(snapshot)) => {
                     if let Some(binary) = &snapshot.binary {
-                        let bytes = binary
+                        let delta = binary
                             .delta
                             .as_ref()
-                            .filter(|(revision, _)| Some(*revision) == base)
-                            .map_or(&binary.snapshot, |(_, bytes)| bytes);
-                        observed_response(
+                            .filter(|(revision, _)| Some(*revision) == base);
+                        let (bytes, gzip, representation) = delta.map_or(
+                            (&binary.snapshot, snapshot.delivery.full.as_ref(), "full"),
+                            |(_, bytes)| (bytes, snapshot.delivery.delta.as_ref(), "delta"),
+                        );
+                        publication_response(
                             &mut stream,
                             &state,
-                            200,
                             "application/vnd.bmux.presentation-v1",
-                            bytes,
-                            Some(snapshot.revision),
+                            accept_encoding.select(bytes, gzip),
+                            snapshot.revision,
+                            representation,
                         )
                         .await;
                     } else {
@@ -635,15 +667,13 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
                         error(&mut stream, &state, 406).await;
                         return;
                     }
-                    let _ = timeout(
-                        state.limits.write_timeout,
-                        response(
-                            &mut stream,
-                            200,
-                            "application/json",
-                            &snapshot.bytes,
-                            Some(snapshot.revision),
-                        ),
+                    publication_response(
+                        &mut stream,
+                        &state,
+                        "application/json",
+                        accept_encoding.select(&snapshot.bytes, snapshot.delivery.json.as_ref()),
+                        snapshot.revision,
+                        "json",
                     )
                     .await;
                 }
@@ -652,6 +682,44 @@ pub(crate) async fn serve(mut stream: TcpStream, state: Arc<State>, mut feed: Sn
             }
         }
         Err(status) => error(&mut stream, &state, status).await,
+    }
+}
+
+async fn publication_response(
+    stream: &mut TcpStream,
+    state: &State,
+    content_type: &str,
+    selected: Option<crate::delivery::Selected<'_>>,
+    revision: u64,
+    representation: &'static str,
+) {
+    let Some(selected) = selected else {
+        error(stream, state, 406).await;
+        return;
+    };
+    match timeout(
+        state.limits.write_timeout,
+        encoded_response(
+            stream,
+            200,
+            content_type,
+            selected.bytes,
+            Some(revision),
+            Some(selected.gzip),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => state.diagnostics.delivered(&selected, representation),
+        Ok(Err(error)) => state.diagnostics.event(
+            "response_write_failed",
+            error
+                .raw_os_error()
+                .and_then(|code| u64::try_from(code).ok()),
+        ),
+        Err(_) => state
+            .diagnostics
+            .event("response_write_timeout", Some(revision)),
     }
 }
 
@@ -846,6 +914,42 @@ mod tests {
             ),
             Err(400)
         );
+    }
+
+    #[tokio::test]
+    async fn cached_compression_does_not_wake_an_unchanged_poll() {
+        let (publisher, mut feed) = crate::snapshot_feed(8192).unwrap();
+        publisher.publish(1, vec![b'x'; 4096].into()).unwrap();
+        let cached = feed
+            .receiver
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .delivery
+            .json
+            .clone()
+            .unwrap();
+        assert!(
+            timeout(
+                std::time::Duration::from_millis(10),
+                latest(&mut feed, Some(1))
+            )
+            .await
+            .is_err()
+        );
+        assert!(Arc::ptr_eq(
+            &cached,
+            feed.receiver
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .delivery
+                .json
+                .as_ref()
+                .unwrap()
+        ));
+        publisher.publish(2, vec![b'y'; 4096].into()).unwrap();
+        assert_eq!(latest(&mut feed, Some(1)).await.unwrap().revision, 2);
     }
 
     #[tokio::test]

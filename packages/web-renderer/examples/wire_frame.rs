@@ -6,7 +6,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::io::stdin()
         .take(16 * 1024 * 1024 + 1)
         .read_to_end(&mut input)?;
-    if std::env::args().nth(1).as_deref() == Some("--dense") {
+    let mode = std::env::args().nth(1);
+    if mode.as_deref() == Some("--delta") {
+        let path = std::env::args()
+            .nth(2)
+            .ok_or("--delta requires a base snapshot path")?;
+        let base = std::fs::File::open(path)?;
+        let mut bytes = Vec::new();
+        base.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        let base = bmux_web_renderer::decode_binary(&bytes, None)?;
+        let target = bmux_web_renderer::decode_binary(&input, None)?;
+        std::io::stdout().write_all(&bmux_web_renderer::encode_delta(&target, &base)?)?;
+    } else if mode.as_deref() == Some("--dense") {
         let frame = bmux_web_renderer::decode_binary(&input, None)?;
         let mut value = serde_json::to_value(frame)?;
         value["generation"] = "dense-large-conformance".into();

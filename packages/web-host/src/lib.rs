@@ -3,8 +3,9 @@
 #![cfg(unix)]
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 
+mod delivery;
 mod diagnostics;
-pub use diagnostics::{HostDiagnostics, HostEvent};
+pub use diagnostics::{DeliveryCounters, HostDiagnostics, HostEvent};
 
 #[cfg(test)]
 mod acceptance;
@@ -141,6 +142,7 @@ impl HostConfig {
 pub struct Snapshot {
     pub revision: u64,
     pub bytes: Arc<[u8]>,
+    pub(crate) delivery: delivery::Cache,
     pub(crate) json_available: bool,
     pub(crate) document: Option<document::EncodedDocument>,
     pub(crate) binary: Option<BinaryPresentation>,
@@ -257,8 +259,10 @@ impl SnapshotPublisher {
                     value.resources.clone()
                 })
         };
+        let delivery = delivery::Cache::new(&bytes, binary.as_ref(), document.as_ref());
         sender
             .send(Some(Arc::new(Snapshot {
+                delivery,
                 revision,
                 bytes,
                 json_available,
