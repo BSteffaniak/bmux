@@ -28,6 +28,7 @@ Private setup and pacing notes. Use [the cue sheet](speaker-script.md), not a sp
 | Themes | Preview and cancel; then show composition |
 | Visual adapter | Cells → presence mask → plugin payload → Lua collision lookup |
 | Playbooks | Input → wait → assertion → snapshot; scan the fixture catalog |
+| System overview | Follow commands to server-owned execution; follow output back through the retained compositor |
 | Split implementation | Plugin chooses policy; typed request; host dispatches |
 | Output and scrollback | Live updates vs immutable frozen history |
 | TUI libraries | Three layers; caller-owned state; measured/scoped composition |

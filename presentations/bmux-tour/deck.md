@@ -375,22 +375,46 @@ Fast scan: not just demos. Focus, resize, search, history, reflow, recovery, cop
 ---
 <!-- bmux:slide-id architecture-overview -->
 <!-- bmux:block-id architecture-overview-title -->
-# Who decides what a split means?
+# How BMUX turns running programs into your workspace
 
 <!-- bmux:block-id architecture-overview-body -->
-| Layer | Its job in our split example |
-| --- | --- |
-| **Input** | Ask to split: keyboard or scripted action |
-| **Product plugin** | Decide the target and split policy |
-| **Typed service** | Carry an agreed request/result between plugins |
-| **Host primitives** | Load the plugin, dispatch its request, and return its result |
+```mermaid
+flowchart TB
+  subgraph UI[Attached UI]
+    direction LR
+    I[Input and commands]
+    V["Plugin presentation<br/>Themes, decorations, tab bar"]
+    C[Retained compositor]
+    D[Terminal display]
+  end
+  subgraph S[Server]
+    direction LR
+    P["Plugin services<br/>Tabs, workspaces, and more"]
+    E["Execution<br/>PTYs and running programs"]
+    T["Terminal state<br/>Parsed output and history"]
+  end
+  I -->|typed requests| P
+  P --> E
+  I -->|program keystrokes| E
+  E --> T
+  T -->|terminal updates| C
+  P -->|domain state| V
+  V -->|retained snapshots| C
+  C --> D
+  classDef execution fill:#164e63,stroke:#22d3ee,color:#ffffff
+  classDef plugin fill:#4c1d95,stroke:#c4b5fd,color:#ffffff
+  classDef presentation fill:#1e293b,stroke:#94a3b8,color:#ffffff
+  class E,T execution
+  class P,V plugin
+  class I,C,D presentation
+```
 
-**Plugins own product behavior—not just colors.**
-
-The split plugin decides **what to do**. The host provides the machinery to **run it**.
+<!-- bmux:block-id architecture-overview-takeaway -->
+**Programs keep running; plugins organize the work; the attached UI composes what you see.**
+Execution produces output; terminal state interprets it. The compositor combines it with plugin surfaces.
 
 <!-- bmux:notes -->
-Follow the split we just used. Product policy stays in plugins.
+Follow a split request forward, then program output back. Ordinary keystrokes go to the program. Attachment loss does not end execution.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id command-route -->

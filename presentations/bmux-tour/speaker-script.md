@@ -70,9 +70,9 @@ Read input, wait, assertion, snapshot in order. No fixed sleep as proof.
 
 Fast scan: not just demos. Focus, resize, search, history, reflow, recovery, copy.
 
-## Who decides what a split means?
+## How BMUX turns running programs into your workspace
 
-Follow the split we just used. Product policy stays in plugins.
+Follow a split request forward, then program output back. Ordinary keystrokes go to the program. Attachment loss does not end execution.
 
 ## The plugin makes three concrete decisions
 
