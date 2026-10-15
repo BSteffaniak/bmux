@@ -335,6 +335,34 @@ class Acceptance(OWNED.Acceptance):
         self.stable("Pause changed partial shell input", lambda: self.typed_prefix(0) == paused_prefix
                     and self.lines() == [] and self.attempt()["step"] == progress["step"], seconds=0.6)
         self.audience_capture(self.payloads[0][:32])
+        # Idle Pause is not a transport timeout. Only a deliberately terminated
+        # owned observer should expose view recovery, never restart execution.
+        self.stable("idle Pause disconnected terminal observer", lambda:
+                    self.control("reattach", "Reconnect view") is None, seconds=6)
+        def owned_observers():
+            result = []
+            for record in self.bmux_processes():
+                try:
+                    arguments = Path(f'/proc/{record["pid"]}/cmdline').read_bytes().split(b'\0')
+                    if b'--observer-socket' in arguments:
+                        result.append(record)
+                except OSError:
+                    continue
+            return result
+        observer = wait_for("exactly one owned terminal observer", lambda:
+                            (records := owned_observers()) and len(records) == 1 and records[0], 15)
+        require(OWNED.alive(observer), "observer identity changed before fault injection")
+        OWNED.os.kill(observer["pid"], OWNED.signal.SIGKILL)
+        wait_for("unexpected observer loss is recoverable", lambda:
+                 self.control("reattach", "Reconnect view"), 15)
+        self.stable("observer loss changed paused execution", lambda:
+                    self.typed_prefix(0) == paused_prefix and self.paused()
+                    and self.lines() == [] and self.attempt()["step"] == progress["step"], seconds=0.6)
+        self.click("reattach", "Reconnect view")
+        wait_for("replacement owned observer", lambda: any(
+                 record["pid"] != observer["pid"] for record in owned_observers()), 15)
+        self.stable("view reattachment replayed execution", lambda:
+                    self.typed_prefix(0) == paused_prefix and self.paused() and self.lines() == [], seconds=0.6)
         self.speed("normal")
         self.click("play-toggle", "Play")
         wait_for("normal speed resumes without duplicate bytes", lambda: self.lines() == self.payloads[:1], 30)

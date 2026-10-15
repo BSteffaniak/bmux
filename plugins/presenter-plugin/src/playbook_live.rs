@@ -365,6 +365,7 @@ impl LiveDemos {
             "speed:instant" => Control::Speed(crate::playbook_controller::PlaybackSpeed::Instant),
             "run" | "r" => Control::Run,
             "stop" | "s" => Control::Stop,
+            "reattach" => Control::Reattach,
             "restart" | "R" => Control::Restart,
             "pause" | "p" => Control::Pause,
             "step" | "n" => Control::Step,

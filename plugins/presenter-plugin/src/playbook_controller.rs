@@ -36,6 +36,7 @@ pub enum Control {
     Resume,
     Stop,
     Restart,
+    Reattach,
     Speed(PlaybackSpeed),
 }
 
@@ -165,6 +166,8 @@ impl Controller {
                 capture_rx,
                 observer: None,
                 observer_failed: None,
+                observer_error: None,
+                observer_cleanup_error: None,
                 client: None,
                 attempt: None,
                 playback_speed: PlaybackSpeed::Normal,
@@ -284,10 +287,14 @@ impl Drop for Controller {
     }
 }
 
+fn expected_observer_end(observed: u64, current: Option<u64>, cleaned: bool, closed: bool) -> bool {
+    current != Some(observed) || (cleaned && closed)
+}
+
 struct ObserverTask {
     generation: u64,
     stop: watch::Sender<bool>,
-    task: tokio::task::JoinHandle<Result<(), String>>,
+    task: tokio::task::JoinHandle<Result<(), crate::playbook_observer::ObserverFailure>>,
 }
 
 struct Worker {
@@ -307,6 +314,8 @@ struct Worker {
     capture_tx: watch::Sender<Option<Arc<crate::playbook_capture::CaptureSnapshot>>>,
     capture_rx: watch::Receiver<Option<Arc<crate::playbook_capture::CaptureSnapshot>>>,
     observer_failed: Option<u64>,
+    observer_error: Option<(u64, String)>,
+    observer_cleanup_error: Option<String>,
     observer: Option<ObserverTask>,
     client: Option<bmux_client::BmuxClient>,
     attempt: Option<Attempt>,
@@ -412,6 +421,10 @@ impl Worker {
         self.pending.store(0, std::sync::atomic::Ordering::SeqCst);
     }
     async fn close_observer(&mut self) -> bool {
+        if let Some(error) = &self.observer_cleanup_error {
+            self.publish_result(Err(error.clone()));
+            return false;
+        }
         if let Some(ObserverTask {
             generation,
             stop,
@@ -419,21 +432,28 @@ impl Worker {
         }) = self.observer.take()
         {
             stop.send_replace(true);
-            if tokio::time::timeout(Duration::from_secs(8), &mut task)
-                .await
-                .is_err()
-            {
-                // The observer task owns the child. Never abort its reaping path
-                // because the presenter's enclosing UI deadline elapsed.
-                self.observer = Some(ObserverTask {
-                    generation,
-                    stop,
-                    task,
-                });
-                self.publish_result(Err(
-                    "observer cleanup pending; owned service retained".into()
-                ));
-                return false;
+            match tokio::time::timeout(Duration::from_secs(8), &mut task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(result) => {
+                    let error =
+                        format!("observer cleanup failed: {result:?}; owned service retained");
+                    self.observer_cleanup_error = Some(error.clone());
+                    self.publish_result(Err(error));
+                    return false;
+                }
+                Err(_) => {
+                    // The observer task owns the child. Never abort its reaping path
+                    // because the presenter's enclosing UI deadline elapsed.
+                    self.observer = Some(ObserverTask {
+                        generation,
+                        stop,
+                        task,
+                    });
+                    self.publish_result(Err(
+                        "observer cleanup pending; owned service retained".into()
+                    ));
+                    return false;
+                }
             }
         }
         true
@@ -460,11 +480,33 @@ impl Worker {
             .as_ref()
             .is_some_and(|observer| observer.task.is_finished())
         {
-            if let Some(ObserverTask { task, .. }) = self.observer.take()
-                && let Ok(Err(error)) = task.await
+            if let Some(ObserverTask {
+                generation: observed,
+                task,
+                ..
+            }) = self.observer.take()
             {
-                eprintln!("presenter retained observer failed: {error}");
-                self.publish_result(Err(error));
+                let result = task
+                    .await
+                    .unwrap_or_else(|error| Err(format!("observer task failed: {error}").into()));
+                if let Err(error) = result
+                    && !expected_observer_end(
+                        observed,
+                        generation,
+                        self.attempt
+                            .as_ref()
+                            .is_some_and(|attempt| attempt.cleanup_acknowledged),
+                        error.closed,
+                    )
+                {
+                    let diagnostic =
+                        format!("Terminal view disconnected; last frame retained: {error}");
+                    eprintln!(
+                        "presenter retained observer failed (generation {observed}): {error}"
+                    );
+                    self.observer_error = Some((observed, diagnostic.clone()));
+                    self.publish_result(Err(diagnostic));
+                }
             }
             self.observer_failed = generation;
         }
@@ -498,7 +540,7 @@ impl Worker {
         self.snapshots.send_modify(|snapshot| {
             snapshot.revision = snapshot.revision.saturating_add(1);
             snapshot.cancellation_revision = self.cancelled_through;
-            snapshot.unresolved = self.uncertain;
+            snapshot.unresolved = self.uncertain || self.observer_cleanup_error.is_some();
             if snapshot.surface.as_ref().is_some_and(|surface| {
                 self.attempt
                     .as_ref()
@@ -510,7 +552,15 @@ impl Worker {
             match result {
                 Ok(ref acknowledgment) => {
                     snapshot.acknowledgment = Some(acknowledgment.clone());
-                    snapshot.error = None;
+                    snapshot.error = self
+                        .observer_error
+                        .as_ref()
+                        .filter(|(generation, _)| {
+                            self.attempt.as_ref().is_some_and(|attempt| {
+                                attempt.generation == *generation && !attempt.cleanup_acknowledged
+                            })
+                        })
+                        .map(|(_, error)| error.clone());
                 }
                 Err(ref error) => {
                     snapshot.acknowledgment = None;
@@ -531,6 +581,16 @@ impl Worker {
         Ok(())
     }
     async fn execute(&mut self, control: Control) -> Result<String, String> {
+        // Detach and reap the view before Stop can close its transport. This is
+        // observer cancellation, not evidence that execution cleanup succeeded.
+        if matches!(control, Control::Stop | Control::Restart) {
+            if !self.close_observer().await {
+                return Err("observer cleanup pending; command not dispatched".into());
+            }
+            // Never reopen a view while this generation is being stopped, even
+            // if admission is uncertain or cleanup takes several status polls.
+            self.observer_failed = self.attempt.as_ref().map(|attempt| attempt.generation);
+        }
         match tokio::time::timeout(Duration::from_secs(10), self.execute_inner(control)).await {
             Ok(result) => result,
             Err(_) => {
@@ -541,6 +601,27 @@ impl Worker {
         }
     }
     async fn execute_inner(&mut self, control: Control) -> Result<String, String> {
+        if control == Control::Reattach {
+            let expected = self.attempt.as_ref().map(|attempt| attempt.generation);
+            self.refresh().await?;
+            if self.uncertain || self.attempt.as_ref().map(|attempt| attempt.generation) != expected
+            {
+                return Err(
+                    "observation generation changed or unresolved; reattachment rejected".into(),
+                );
+            }
+            let attempt = self.attempt.as_ref().ok_or("no attempt to observe")?;
+            if attempt.cleanup_acknowledged || attempt.session_id.is_none() {
+                return Err("attempt has no live observation target".into());
+            }
+            if !self.close_observer().await {
+                return Err("observer cleanup pending; reattachment not dispatched".into());
+            }
+            self.observer_failed = None;
+            self.observer_error = None;
+            self.reconcile_observer().await;
+            return Ok("terminal observer reattachment requested; execution unchanged".into());
+        }
         if self.uncertain && control != Control::Stop {
             return Err(
                 "previous command outcome uncertain; reconcile before further control".into(),
@@ -649,6 +730,7 @@ impl Worker {
         }
         let client = self.client.as_mut().ok_or("service connection missing")?;
         let response = match control {
+            Control::Reattach => unreachable!("reattachment is view-only"),
             Control::Run => commands::client::start(client, generation).await,
             Control::Pause => commands::client::pause_script(client, generation).await,
             Control::Step => commands::client::next_step(client, generation).await,
@@ -741,9 +823,17 @@ impl Worker {
             self.attempt = Some(next);
             self.snapshots.send_modify(|snapshot| {
                 snapshot.revision = snapshot.revision.saturating_add(1);
-                snapshot.unresolved = self.uncertain;
+                snapshot.unresolved = self.uncertain || self.observer_cleanup_error.is_some();
                 snapshot.attempt.clone_from(&self.attempt);
-                snapshot.error = None;
+                snapshot.error = self
+                    .observer_error
+                    .as_ref()
+                    .filter(|(generation, _)| {
+                        self.attempt.as_ref().is_some_and(|attempt| {
+                            attempt.generation == *generation && !attempt.cleanup_acknowledged
+                        })
+                    })
+                    .map(|(_, error)| error.clone());
             });
         }
         Ok(())
@@ -753,6 +843,15 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observer_end_requires_current_cleanup_and_frame_boundary() {
+        assert!(expected_observer_end(2, Some(3), false, false));
+        assert!(expected_observer_end(2, Some(2), true, true));
+        assert!(!expected_observer_end(2, Some(2), false, true));
+        assert!(!expected_observer_end(2, Some(2), true, false));
+        assert!(!expected_observer_end(2, Some(2), false, false));
+    }
 
     #[test]
     fn cancellation_bypasses_full_queue_and_blocks_settlement() {

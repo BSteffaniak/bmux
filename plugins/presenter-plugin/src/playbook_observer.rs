@@ -1,5 +1,37 @@
 //! Owned observer subprocess. The only visual transport is the retained wire.
-use crate::playbook_capture::{CaptureSnapshot, read_capture};
+use crate::playbook_capture::{CaptureError, CaptureSnapshot, read_capture};
+
+#[derive(Debug)]
+pub struct ObserverFailure {
+    pub closed: bool,
+    pub message: String,
+}
+impl From<String> for ObserverFailure {
+    fn from(message: String) -> Self {
+        Self {
+            closed: false,
+            message,
+        }
+    }
+}
+impl From<&str> for ObserverFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+impl From<CaptureError> for ObserverFailure {
+    fn from(error: CaptureError) -> Self {
+        Self {
+            closed: matches!(error, CaptureError::Closed),
+            message: error.to_string(),
+        }
+    }
+}
+impl std::fmt::Display for ObserverFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
 use bmux_playbook_plugin_api::playbook_types::Attempt;
 use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
 use tokio::sync::watch;
@@ -11,7 +43,7 @@ pub async fn observe(
     attempt: &Attempt,
     sender: watch::Sender<Option<Arc<CaptureSnapshot>>>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<(), String> {
+) -> Result<(), ObserverFailure> {
     use std::os::unix::fs::PermissionsExt;
     let session = attempt
         .session_id
@@ -48,44 +80,72 @@ pub async fn observe(
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     // D's start probe has already negotiated this selected executable's worker
     // version; F's header independently rejects unsupported observer versions.
     let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut stderr = child.stderr.take().ok_or("observer stderr unavailable")?;
+    let mut diagnostics = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut retained = Vec::new();
+        let mut buffer = [0; 1024];
+        while let Ok(count) = stderr.read(&mut buffer).await {
+            if count == 0 {
+                break;
+            }
+            let remaining = 2048usize.saturating_sub(retained.len());
+            retained.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
+        String::from_utf8_lossy(&retained)
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>()
+    });
     let shutdown_check = shutdown.clone();
-    let result = async {
-        if *shutdown.borrow() {
+    let result = tokio::select! {
+        _ = shutdown.changed() => Ok(()),
+        result = async {
+
+        if *shutdown_check.borrow() {
             return Ok(());
         }
         let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
             .await
             .map_err(|_| "observer handshake timeout".to_owned())?
             .map_err(|error| error.to_string())?;
-        tokio::select! {
-            result = read_capture(stream, owner, attempt.generation, session, sender) => result,
-            _ = shutdown.changed() => Ok(()),
-        }
-    }
-    .await;
+        read_capture(stream, owner, attempt.generation, session, sender).await.map_err(ObserverFailure::from)
+        } => result,
+    };
     // Closing the stream requests orderly detach. Escalation kills only this
     // explicitly owned output observer, never the run's sandbox/server process.
-    if tokio::time::timeout(Duration::from_secs(2), child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+    let status = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            child
+                .start_kill()
+                .map_err(|error| format!("observer kill failed: {error}"))?;
+            child.wait().await
+        }
     }
+    .map_err(|error| format!("observer reap failed: {error}"))?;
+    let diagnostic = match tokio::time::timeout(Duration::from_secs(1), &mut diagnostics).await {
+        Ok(Ok(text)) => text,
+        _ => {
+            diagnostics.abort();
+            let _ = diagnostics.await;
+            String::new()
+        }
+    };
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_dir(&directory);
-    if result.is_err() && attempt.cleanup_acknowledged {
-        return Ok(());
-    }
     if *shutdown_check.borrow() {
         Ok(())
     } else {
-        result
+        result.map_err(|mut error: ObserverFailure| {
+            error.message = format!("{}; observer exit {status}; {diagnostic}", error.message);
+            error
+        })
     }
 }
 #[cfg(not(unix))]
@@ -95,6 +155,6 @@ pub async fn observe(
     _attempt: &Attempt,
     _sender: watch::Sender<Option<Arc<CaptureSnapshot>>>,
     _shutdown: watch::Receiver<bool>,
-) -> Result<(), String> {
+) -> Result<(), ObserverFailure> {
     Err("private retained observer transport requires Unix".into())
 }

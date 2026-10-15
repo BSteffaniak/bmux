@@ -17,7 +17,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-pub(crate) const INPUTS: [&str; 13] = [
+pub(crate) const INPUTS: [&str; 14] = [
     "play-toggle",
     "step",
     "stop",
@@ -31,6 +31,7 @@ pub(crate) const INPUTS: [&str; 13] = [
     "pan:right",
     "pan:up",
     "pan:down",
+    "reattach",
 ];
 
 pub(crate) fn target_input(id: &str) -> Option<&'static str> {
@@ -68,7 +69,7 @@ pub struct PlaybookDemo<'a> {
     snapshot: &'a LifecycleSnapshot,
     audience: bool,
     surface: Option<&'a RetainedSurface>,
-    buttons: [Cell<ButtonState>; 13],
+    buttons: [Cell<ButtonState>; 14],
     viewport: (u16, u16),
     preview_size: bmux_tui::geometry::Size,
 }
@@ -199,6 +200,14 @@ impl<'a> PlaybookDemo<'a> {
             }),
         );
         if !self.audience {
+            if self
+                .snapshot
+                .error
+                .as_ref()
+                .is_some_and(|error| error.starts_with("Terminal view disconnected"))
+            {
+                column = column.child(self.button(13, "Reconnect view"));
+            }
             if width >= 66 {
                 column = column
                     .child(
