@@ -572,6 +572,6 @@ Agent-paced physics waits for each decision; crashes start another attempt.
 
 <!-- bmux:notes -->
 Explicitly start the approved demo. This is live judgement API usage, not a recording or a hidden scripted pilot. It runs until Stop or leaving this slide, including across game-over retries. Request timeouts do not impose a demo lifetime.
-Configure and approve the standalone application separately using demos/jev-flappy.md. The playbook freezes its script, not external application bytes. Never put keys into scripts or displayed commands. Pause/resume/restart of gameplay use private application controls; presenter script Pause is not application pause. Presenter Stop/Restart and leaving the slide own managed sandbox cleanup.
+Configure the key before launching the presenter; see demos/jev-flappy.md. The game is a declared playbook resource, so approval and source freezing cover its bytes. Runtime control paths are generated automatically; no app-path or socket environment setup is needed. Never put keys into scripts or displayed commands. Pause/resume/restart of gameplay use private application controls; presenter script Pause is not application pause. Presenter Stop/Restart and leaving the slide own managed sandbox cleanup.
 Keep this running during Q&A if desired. Requests incur ongoing provider usage. Network errors freeze physics and use bounded retry backoff; do not promise an unbeatable pilot or imply that offline tests prove live provider performance.
 <!-- bmux:end-notes -->

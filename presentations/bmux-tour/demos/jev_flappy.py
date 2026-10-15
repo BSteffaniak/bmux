@@ -490,16 +490,37 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--control", choices=COMMANDS)
+    parser.add_argument("--control-directory", type=Path, help="Owned private runtime directory for the socket")
+    parser.add_argument("--control-file", type=Path, default=Path.home() / ".jev-flappy-control.json",
+                        help="Private application locator; generated automatically")
     args = parser.parse_args()
-    path = os.environ.get("JEV_FLAPPY_SOCKET")
+    directory = None
     try:
         if args.control:
-            if not path:
-                raise DemoError("Set JEV_FLAPPY_SOCKET for application controls")
+            info = args.control_file.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+                raise DemoError("Control locator must be an owned private file")
+            path = json.loads(args.control_file.read_text())["socket"]
             print(json.dumps(send_control(path, args.control)))
             return 0
         config = Config.environment()
-        controls = Controls(path) if path else None
+        import tempfile
+        if args.control_directory:
+            path = str(args.control_directory / "flappy.sock")
+        else:
+            directory = tempfile.TemporaryDirectory(prefix="jf-game-", dir="/tmp")
+            path = str(Path(directory.name) / "s")
+        controls = Controls(path)
+        try:
+            # Exclusive creation prevents replacing another application's locator.
+            descriptor = os.open(args.control_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w") as stream:
+                json.dump({"socket": path}, stream)
+        except BaseException:
+            controls.close()
+            if directory:
+                directory.cleanup()
+            raise
         controller = Controller(config, args.seed)
         previous = {}
         try:
@@ -512,6 +533,9 @@ def main():
             controller.cancel()
             if controls:
                 controls.close()
+            args.control_file.unlink(missing_ok=True)
+            if directory:
+                directory.cleanup()
             for number, handler in previous.items():
                 signal.signal(number, handler)
         return 0

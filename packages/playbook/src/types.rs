@@ -36,6 +36,11 @@ pub struct PlaybookConfig {
     /// In `Clean` mode the sandbox starts empty and only has these plus
     /// deterministic defaults.
     pub env: BTreeMap<String, String>,
+    /// Explicit host environment names; values are never part of the parsed model.
+    pub env_from: std::collections::BTreeSet<String>,
+    /// Application inputs, relative to the declaring script before file resolution.
+    /// Keys become environment names pointing to approved, staged files.
+    pub resources: BTreeMap<String, std::path::PathBuf>,
     /// Controls how the sandbox inherits the parent process environment.
     /// `None` means the playbook did not explicitly specify a mode.
     pub env_mode: Option<SandboxEnvMode>,
@@ -78,6 +83,69 @@ pub enum SandboxEnvMode {
 }
 
 impl PlaybookConfig {
+    /// Validate explicit application inputs without reading or exposing values.
+    /// # Errors
+    /// Rejects runtime selectors, excessive declarations, and ambiguous bindings.
+    pub fn validate_application_inputs(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.env_from.len() + self.resources.len() <= 32,
+            "too many application inputs"
+        );
+        for name in self.env_from.iter().chain(self.resources.keys()) {
+            validate_application_env_name(name)?;
+            anyhow::ensure!(
+                !self.env.contains_key(name),
+                "application input conflicts with literal environment"
+            );
+        }
+        for name in self.resources.keys() {
+            anyhow::ensure!(
+                !self.env_from.contains(name),
+                "resource conflicts with imported environment"
+            );
+        }
+        Ok(())
+    }
+
+    /// Resolve application inputs only at execution, never into parsed/report data.
+    /// # Errors
+    /// Rejects invalid declarations, oversized or non-UTF-8 environment values.
+    pub fn application_environment(
+        &self,
+        mut lookup: impl FnMut(&str) -> Option<std::ffi::OsString>,
+    ) -> anyhow::Result<BTreeMap<String, String>> {
+        self.validate_application_inputs()?;
+        let mut environment = self.env.clone();
+        let mut bytes = 0;
+        for name in &self.env_from {
+            if let Some(value) = lookup(name) {
+                bytes += value.len();
+                anyhow::ensure!(bytes <= 64 * 1024, "application environment exceeds limit");
+                let value = value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("application environment must be UTF-8"))?;
+                anyhow::ensure!(
+                    !value.contains('\0'),
+                    "invalid application environment value"
+                );
+                environment.insert(name.clone(), value);
+            }
+        }
+        for (name, path) in &self.resources {
+            anyhow::ensure!(
+                path.is_absolute(),
+                "resource requires file-based resolution"
+            );
+            environment.insert(
+                name.clone(),
+                path.to_str()
+                    .ok_or_else(|| anyhow::anyhow!("resource path must be UTF-8"))?
+                    .to_owned(),
+            );
+        }
+        Ok(environment)
+    }
+
     /// Resolve the effective sandbox environment mode.
     ///
     /// Priority: playbook config (if explicitly set) → `BMUX_PLAYBOOK_ENV_MODE`
@@ -89,6 +157,41 @@ impl PlaybookConfig {
             std::env::var("BMUX_PLAYBOOK_ENV_MODE").ok().as_deref(),
         )
     }
+}
+
+/// Validate a name usable for an explicit application input, not host configuration.
+/// # Errors
+/// Rejects runtime/configuration and interpreter injection names.
+pub fn validate_application_env_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name.len() <= 128
+            && name.as_bytes()[0].is_ascii_uppercase()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            && ![
+                "BMUX_", "XDG_", "LD_", "DYLD_", "PYTHON", "RUST", "CARGO", "LC_"
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+            && ![
+                "PATH",
+                "HOME",
+                "USER",
+                "SHELL",
+                "ENV",
+                "BASH_ENV",
+                "TERM",
+                "TERMINFO",
+                "TERMINFO_DIRS",
+                "TMPDIR",
+                "LANG"
+            ]
+            .contains(&name),
+        "invalid application environment name"
+    );
+    Ok(())
 }
 
 fn effective_env_mode_from(
@@ -117,6 +220,8 @@ impl Default for PlaybookConfig {
             plugins: PluginConfig::default(),
             vars: BTreeMap::new(),
             env: BTreeMap::new(),
+            env_from: std::collections::BTreeSet::new(),
+            resources: BTreeMap::new(),
             env_mode: None,
             binary: None,
             sandbox_config_file: None,

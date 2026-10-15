@@ -81,7 +81,7 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         Some(other) => bail!("env_mode must be 'inherit' or 'clean', got '{other}'"),
     };
 
-    Ok(PlaybookConfig {
+    let config = PlaybookConfig {
         name: raw.name,
         description: raw.description,
         viewport,
@@ -92,6 +92,13 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         plugins,
         vars: raw.vars.unwrap_or_default(),
         env: raw.env.unwrap_or_default(),
+        env_from: raw.env_from.unwrap_or_default().into_iter().collect(),
+        resources: raw
+            .resources
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, path)| (name, path.into()))
+            .collect(),
         env_mode,
         binary: None,
         sandbox_config_file: raw.sandbox_config_file.map(Into::into),
@@ -99,7 +106,9 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         verbose: false,
         render_trace: raw.render_trace.unwrap_or(false),
         driver: super::types::PlaybookDriver::Sandbox,
-    })
+    };
+    config.validate_application_inputs()?;
+    Ok(config)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -392,6 +401,8 @@ struct RawPlaybookConfig {
     plugins: Option<RawPluginConfig>,
     vars: Option<BTreeMap<String, String>>,
     env: Option<BTreeMap<String, String>>,
+    env_from: Option<Vec<String>>,
+    resources: Option<BTreeMap<String, String>>,
     env_mode: Option<String>,
     sandbox_config_file: Option<String>,
     include: Option<Vec<String>>,

@@ -2240,13 +2240,16 @@ async fn run_playbook_inner(
             host.clone(),
         );
     } else {
+        let application_environment = playbook
+            .config
+            .application_environment(|name| std::env::var_os(name))?;
         let sb = SandboxServer::start(
             SandboxStartOptions {
                 shell: playbook.config.shell.as_deref(),
                 input_profile: playbook.config.input_profile,
                 plugin_config: &playbook.config.plugins,
                 startup_timeout: SERVER_STARTUP_TIMEOUT,
-                env: &playbook.config.env,
+                env: &application_environment,
                 env_mode: playbook.config.effective_env_mode(),
                 binary: playbook.config.binary.as_deref(),
                 sandbox_config_file: playbook.config.sandbox_config_file.as_deref(),

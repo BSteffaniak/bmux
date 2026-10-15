@@ -25,6 +25,37 @@ the server. Use `--target-server` to run against a live server instead.
 
 ______________________________________________________________________
 
+## Declared application inputs
+
+Use `@resource APP=relative/file.py` to bind an environment name to a file
+resolved relative to the declaring playbook (including included playbooks).
+Managed approval hashes and freezes resource bytes with the script/include
+closure. Resource paths cannot be absolute, contain traversal, or cross the
+allowed root; managed freezing rejects symlinks and shares the closure's file
+and byte budgets. Resources are not parsed as DSL. Repeated resource references
+share frozen bytes; a resource cannot double as an included script.
+
+Use `@env-from APP_API_KEY OPTIONAL_SETTING` to import selected host environment
+names only at execution. Missing names remain unset. Names, not values, are
+stored in parsed configuration and approval inputs. Managed preparation captures
+the declared values from its owner's launch environment in memory and forwards
+them only to the real runner; the protocol probe gets no application inputs.
+A clean sandbox still receives declared imports. Literal `@env` values and
+resource names cannot conflict with imports. Runtime/configuration and
+interpreter-selector names are rejected; at most 32 names and 64 KiB of imported
+values are allowed. Never put credential values into scripts or `@env` entries.
+Approved applications can read their imports; this is not a secret-store API.
+
+Equivalent TOML declarations under `[playbook]`:
+
+```toml
+[playbook]
+env_from = ["APP_API_KEY"]
+
+[playbook.resources]
+APP = "application.py"
+```
+
 ## CLI Commands
 
 ### `bmux playbook run`

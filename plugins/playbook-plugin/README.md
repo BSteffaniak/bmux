@@ -7,17 +7,21 @@ The typed `playbook-state` and `playbook-commands` interfaces are generated from
 
 ## Explicit application environment
 
-Managed workers still clear the host environment. The owner may explicitly opt
-in application inputs using `BMUX_PLAYBOOK_APP_ENV_<NAME>=<value>` in its own
-launch environment. Preparation captures a bounded set in memory; only the real
-runner receives `<NAME>=<value>` (not the compatibility probe). Values are not
-part of preparation JSON, frozen script sources, or status/evidence snapshots.
-Runtime/configuration selectors remain protected. Invalid names or more than
-32 entries / 64 KiB of values reject preparation with a value-free error.
-This is not a secret store or an application sandbox: approved applications and
-their inherited child processes can read these inputs. Do not share an owner
-between untrusted applications. A fresh owner is required to change its launch
-environment; no late environment lookup or secret-file substitution is implied.
+Managed workers still clear the host environment. Approved playbooks declare
+application input names with `@env-from NAME ...` (TOML: `env_from = [...]`).
+Preparation captures only those named values in memory; only the actual runner
+receives them, not the compatibility probe. Missing names remain unset so the
+application can report its own configuration requirements. Values never enter
+preparation JSON, frozen script sources, or status/evidence snapshots.
+`@resource NAME=relative-path` (TOML: `[playbook.resources]`) declares application
+files as part of the approved/frozen byte closure. The runner resolves NAME to
+the staged absolute file path when launching the sandbox. Imported names cannot
+select runtime/configuration or interpreter settings, or collide with literal
+environment/resource bindings. Inputs are bounded to 32 names and 64 KiB of
+imported values. The sandbox can use `@env-mode clean` without losing explicit
+inputs. This is not a secret store or an application sandbox: approved processes
+can read their inputs. A fresh owner is needed to change its launch environment.
+The former `BMUX_PLAYBOOK_APP_ENV_` convention is not used.
 
 ## Execution boundary
 

@@ -84,11 +84,9 @@ def main():
     config.write_text('[plugins]\nenabled = ["bmux.presenter", "bmux.playbook", "bmux.sessions", "bmux.contexts", "bmux.clients", "bmux.tabs"]\nsearch_paths = '
                       + json.dumps([str(args.plugins)]) + '\n')
     env["BMUX_CONFIG"] = str(config)
-    control_path = str(root / "game.sock")
-    for key, value in {"JEV_FLAPPY_APP": str(Path(__file__).with_name("jev_flappy.py").resolve()),
-                       "JEV_API_KEY": "smoke-only-key", "JEV_BASE_URL": f"http://127.0.0.1:{server.server_port}",
-                       "JEV_FLAPPY_SOCKET": control_path}.items():
-        env["BMUX_PLAYBOOK_APP_ENV_" + key] = value
+    for key, value in {"JEV_API_KEY": "smoke-only-key", "JEV_BASE_URL": f"http://127.0.0.1:{server.server_port}"}.items():
+        env[key] = value
+    (root / "jev_flappy.py").write_bytes(Path(__file__).with_name("jev_flappy.py").read_bytes())
     (root / "jev-flappy.dsl").write_bytes(Path(__file__).with_name("jev-flappy.dsl").read_bytes())
     deck = root / "deck.md"
     deck.write_text('# Jev rehearsal\n\n<!-- bmux:block-id demo-jev -->\n'
@@ -111,6 +109,13 @@ def main():
                     return file
             return None
         evidence = wait("real game startup and script completion", runner)
+        def game_socket():
+            for locator in root.rglob(".jev-flappy-control.json"):
+                path = json.loads(locator.read_text())["socket"]
+                if Path(path).exists():
+                    return path
+            return None
+        control_path = wait("generated control socket", game_socket)
         wait("provider requests", lambda: count[0] >= 3)
         status = APP.send_control(control_path, "pause")
         assert status["paused"] and not status["in_flight"]
@@ -153,6 +158,7 @@ def main():
                     return file
             return None
         evidence = wait("explicit restart after re-entry", restarted_runner)
+        control_path = wait("restarted generated control socket", game_socket)
         wait("request after re-entry", lambda: APP.send_control(control_path, "status")["in_flight"])
         process.send(b"q")
         wait("presenter exit", lambda: process.child.poll() is not None, 40)

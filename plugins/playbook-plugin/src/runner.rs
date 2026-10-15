@@ -234,7 +234,14 @@ impl Owner {
         .map_err(message)?;
         fs::write(runtime.join("playbook-owner.json"), &manifest).map_err(message)?;
         fs::write(root.join("runtime.json"), &manifest).map_err(message)?;
-        let application_environment = application_environment(std::env::vars_os())?;
+        let application_environment = deck
+            .config
+            .application_environment(|name| std::env::var_os(name))
+            .map_err(message)?
+            .into_iter()
+            .filter(|(name, _)| deck.config.env_from.contains(name))
+            .map(|(name, value)| (name, value.into()))
+            .collect();
         // Ownership now transfers to Run; failed/unacknowledged attempts retain
         // the path rather than letting a temporary guard delete a live socket.
         let _runtime = temporary.keep();
@@ -383,53 +390,6 @@ impl Owner {
         }
         Ok(run)
     }
-}
-
-fn application_environment(
-    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-) -> Result<BTreeMap<String, std::ffi::OsString>> {
-    const PREFIX: &str = "BMUX_PLAYBOOK_APP_ENV_";
-    let mut selected = BTreeMap::new();
-    let mut bytes = 0;
-    for (key, value) in environment {
-        let Some(name) = key.to_str().and_then(|key| key.strip_prefix(PREFIX)) else {
-            continue;
-        };
-        // This is application data, never a runtime/configuration selector or
-        // dynamic-loader/interpreter injection channel. Values stay private.
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-            || !name.as_bytes()[0].is_ascii_uppercase()
-            || ["BMUX_", "XDG_", "LD_", "DYLD_", "PYTHON", "RUST", "CARGO"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-            || [
-                "PATH",
-                "HOME",
-                "USER",
-                "SHELL",
-                "ENV",
-                "BASH_ENV",
-                "TERM",
-                "TERMINFO",
-                "TERMINFO_DIRS",
-                "TMPDIR",
-                "LANG",
-                "LC_ALL",
-            ]
-            .contains(&name)
-        {
-            return Err("invalid application environment name".into());
-        }
-        bytes += value.len();
-        if selected.len() >= 32 || bytes > 64 * 1024 {
-            return Err("application environment exceeds limit".into());
-        }
-        selected.insert(name.to_owned(), value);
-    }
-    Ok(selected)
 }
 
 impl Run {
@@ -725,15 +685,14 @@ mod tests {
 
     #[test]
     fn application_environment_is_explicit_bounded_and_not_a_runtime_selector() {
-        let selected = application_environment([
-            ("JEV_API_KEY".into(), "not-forwarded".into()),
-            ("BMUX_PLAYBOOK_APP_ENV_JEV_API_KEY".into(), "private".into()),
-        ])
-        .unwrap();
+        let mut config = bmux_playbook::types::PlaybookConfig::default();
+        config.env_from.insert("APP_TOKEN".into());
+        let selected = config
+            .application_environment(|name| (name == "APP_TOKEN").then(|| "private".into()))
+            .unwrap();
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected["JEV_API_KEY"], "private");
+        assert_eq!(selected["APP_TOKEN"], "private");
         for name in [
-            "",
             "BMUX_CONFIG",
             "XDG_STATE_HOME",
             "HOME",
@@ -743,20 +702,14 @@ mod tests {
             "lowercase",
             "9INVALID",
         ] {
-            assert!(
-                application_environment([(
-                    format!("BMUX_PLAYBOOK_APP_ENV_{name}").into(),
-                    "value".into()
-                )])
-                .is_err()
-            );
+            config.env_from = [name.to_owned()].into();
+            assert!(config.application_environment(|_| None).is_err());
         }
+        config.env_from = ["BIG".to_owned()].into();
         assert!(
-            application_environment([(
-                "BMUX_PLAYBOOK_APP_ENV_BIG".into(),
-                "x".repeat(65537).into()
-            )])
-            .is_err()
+            config
+                .application_environment(|_| Some("x".repeat(65537).into()))
+                .is_err()
         );
     }
 

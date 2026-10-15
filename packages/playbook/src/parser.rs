@@ -44,8 +44,10 @@ pub fn parse_stdin() -> Result<Playbook> {
 
     // Resolve includes relative to CWD
     let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_resources(&mut playbook.config, &base_dir, None)?;
     let mut seen = BTreeSet::new();
     resolve_includes(&mut playbook, &includes, &base_dir, &mut seen, 0, None)?;
+    playbook.config.validate_application_inputs()?;
 
     Ok(playbook)
 }
@@ -86,6 +88,7 @@ fn parse_file_recursive(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
+    resolve_resources(&mut playbook.config, &base_dir, allowed_root)?;
     resolve_includes(
         &mut playbook,
         &includes,
@@ -95,7 +98,42 @@ fn parse_file_recursive(
         allowed_root,
     )?;
 
+    playbook.config.validate_application_inputs()?;
     Ok(playbook)
+}
+
+fn resource_relative(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || !path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        bail!("resource path must be relative without traversal");
+    }
+    Ok(())
+}
+
+fn resolve_resources(
+    config: &mut types::PlaybookConfig,
+    base: &Path,
+    allowed: Option<&Path>,
+) -> Result<()> {
+    for path in config.resources.values_mut() {
+        resource_relative(path)?;
+        let resolved = base
+            .join(&*path)
+            .canonicalize()
+            .context("application resource not found")?;
+        if let Some(allowed) = allowed {
+            anyhow::ensure!(
+                resolved.starts_with(allowed.canonicalize()?),
+                "resource escapes allowed root"
+            );
+        }
+        anyhow::ensure!(resolved.is_file(), "resource must be a regular file");
+        *path = resolved;
+    }
+    Ok(())
 }
 
 #[allow(clippy::similar_names)]
@@ -189,6 +227,13 @@ fn merge_included_config(parent: &mut types::PlaybookConfig, included: &types::P
             .or_insert_with(|| value.clone());
     }
 
+    parent.env_from.extend(included.env_from.iter().cloned());
+    for (name, path) in &included.resources {
+        parent
+            .resources
+            .entry(name.clone())
+            .or_insert_with(|| path.clone());
+    }
     // vars: insert included entries that don't already exist in parent.
     for (key, value) in &included.vars {
         parent
@@ -260,6 +305,7 @@ pub fn freeze_sources_verified(
 struct SourceClosure {
     entry: PathBuf,
     files: std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    resources: BTreeSet<PathBuf>,
 }
 
 fn read_source_closure(source: &Path, allowed: &Path) -> Result<SourceClosure> {
@@ -272,6 +318,7 @@ fn read_source_closure(source: &Path, allowed: &Path) -> Result<SourceClosure> {
     let mut closure = SourceClosure {
         entry: relative.clone(),
         files: std::collections::BTreeMap::new(),
+        resources: BTreeSet::new(),
     };
     let mut budget = 4 * 1024 * 1024;
     read_source_one(&root, &relative, &mut closure, &mut budget, 0)?;
@@ -332,8 +379,38 @@ fn read_source_one(
     }
     *budget -= bytes.len();
     let content = std::str::from_utf8(&bytes)?;
-    let (_, includes) = parse_content(content)?;
+    let (playbook, includes) = parse_content(content)?;
     closure.files.insert(relative.clone(), bytes);
+    for path in playbook.config.resources.values() {
+        resource_relative(path)?;
+        let resource = normalize_relative(
+            &relative
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(path),
+        )?;
+        if closure.files.contains_key(&resource) {
+            anyhow::ensure!(
+                closure.resources.contains(&resource),
+                "resource cannot also be a playbook script"
+            );
+        } else {
+            anyhow::ensure!(
+                closure.files.len() < 128,
+                "managed resource file limit exceeded"
+            );
+            let file = open_beneath(root, &resource)?;
+            let mut data = Vec::new();
+            file.take(1024 * 1024 + 1).read_to_end(&mut data)?;
+            anyhow::ensure!(
+                data.len() <= 1024 * 1024 && data.len() <= *budget,
+                "managed resource byte limit exceeded"
+            );
+            *budget -= data.len();
+            closure.resources.insert(resource.clone());
+            closure.files.insert(resource, data);
+        }
+    }
     for (_, include) in includes {
         let include = relative
             .parent()
@@ -397,6 +474,114 @@ fn open_beneath(_root: &std::fs::File, _relative: &Path) -> Result<std::fs::File
 mod tests {
     use super::*;
     use types::{PlaybookConfig, PluginConfig, SandboxEnvMode};
+
+    #[test]
+    fn resources_are_approved_frozen_and_resolved_relative_to_declaring_include() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        let source = root.path().join("main.dsl");
+        std::fs::write(&source, "@include nested/child.dsl\nnew-session\n").unwrap();
+        std::fs::write(
+            root.path().join("nested/child.dsl"),
+            "@resource APP=game.py\n@env-from APP_TOKEN\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("nested/game.py"), "approved bytes").unwrap();
+        let approved = source_closure_sha256(&source, root.path()).unwrap();
+        let frozen =
+            freeze_sources_verified(&source, root.path(), &root.path().join("frozen"), &approved)
+                .unwrap();
+        let parsed = parse_file_scoped(&frozen, Some(&root.path().join("frozen"))).unwrap();
+        assert_eq!(
+            parsed.config.resources["APP"],
+            root.path().join("frozen/nested/game.py")
+        );
+        assert!(parsed.config.env_from.contains("APP_TOKEN"));
+        std::fs::write(root.path().join("nested/game.py"), "changed bytes").unwrap();
+        assert_ne!(
+            approved,
+            source_closure_sha256(&source, root.path()).unwrap()
+        );
+        assert!(
+            freeze_sources_verified(
+                &source,
+                root.path(),
+                &root.path().join("rejected"),
+                &approved
+            )
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&parsed.config.resources["APP"]).unwrap(),
+            "approved bytes"
+        );
+    }
+
+    #[test]
+    fn resource_paths_and_environment_bindings_are_validated_without_values() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("main.dsl");
+        for path in ["/tmp/absolute", "../escape", "missing.py"] {
+            std::fs::write(&source, format!("@resource APP={path}\nnew-session\n")).unwrap();
+            assert!(source_closure_sha256(&source, root.path()).is_err());
+        }
+        for input in [
+            "@env-from PATH\n",
+            "@resource BMUX_RUNTIME_DIR=a\n",
+            "@env-from TOKEN\n@env TOKEN=literal\n",
+            "@resource TOKEN=a\n@env-from TOKEN\n",
+        ] {
+            assert!(parse_dsl::parse_dsl(input).is_err());
+        }
+        let (parsed, _) = parse_dsl::parse_dsl("@env-from APP_TOKEN\n").unwrap();
+        let resolved = parsed
+            .config
+            .application_environment(|_| Some("private-value".into()))
+            .unwrap();
+        assert_eq!(resolved["APP_TOKEN"], "private-value");
+        assert!(!format!("{:?}", parsed.config).contains("private-value"));
+        assert!(
+            parsed
+                .config
+                .application_environment(|_| None)
+                .unwrap()
+                .is_empty()
+        );
+        let (toml, _) = parse_toml::parse_toml(
+            "[playbook]\nenv_from=['APP_TOKEN']\n[playbook.resources]\nAPP='game.py'\n",
+        )
+        .unwrap();
+        assert_eq!(toml.config.resources["APP"], Path::new("game.py"));
+    }
+
+    #[test]
+    fn resource_limits_and_script_aliases_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("main.dsl");
+        std::fs::write(root.path().join("large.bin"), vec![0; 1024 * 1024 + 1]).unwrap();
+        std::fs::write(&source, "@resource APP=large.bin\nnew-session\n").unwrap();
+        assert!(source_closure_sha256(&source, root.path()).is_err());
+        std::fs::write(&source, "@resource APP=main.dsl\nnew-session\n").unwrap();
+        assert!(source_closure_sha256(&source, root.path()).is_err());
+        std::fs::write(root.path().join("app.bin"), [0, 255, 1]).unwrap();
+        std::fs::write(
+            &source,
+            "@resource APP=app.bin OTHER=app.bin\nnew-session\n",
+        )
+        .unwrap();
+        assert!(source_closure_sha256(&source, root.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_symlinks_are_not_approved() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("app.py"), "bytes").unwrap();
+        std::os::unix::fs::symlink("app.py", root.path().join("link.py")).unwrap();
+        let source = root.path().join("main.dsl");
+        std::fs::write(&source, "@resource APP=link.py\nnew-session\n").unwrap();
+        assert!(source_closure_sha256(&source, root.path()).is_err());
+    }
 
     fn default_config() -> PlaybookConfig {
         PlaybookConfig::default()

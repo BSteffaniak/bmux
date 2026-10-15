@@ -61,6 +61,7 @@ pub fn parse_dsl(input: &str) -> Result<(Playbook, Vec<(usize, String)>)> {
         }
     }
 
+    config.validate_application_inputs()?;
     Ok((Playbook { config, steps }, includes))
 }
 
@@ -143,6 +144,27 @@ fn parse_config_directive(
                 } else {
                     bail!("@var requires NAME=VALUE format");
                 }
+            }
+        }
+        "env-from" => {
+            for name in rest.split_whitespace() {
+                super::types::validate_application_env_name(name)?;
+                config.env_from.insert(name.to_owned());
+            }
+            anyhow::ensure!(
+                !rest.trim().is_empty(),
+                "@env-from requires environment names"
+            );
+        }
+        "resource" => {
+            let args = parse_kv_args(rest)?;
+            anyhow::ensure!(!args.is_empty(), "@resource requires NAME=relative-path");
+            for (name, path) in args {
+                super::types::validate_application_env_name(&name)?;
+                anyhow::ensure!(
+                    config.resources.insert(name, path.into()).is_none(),
+                    "duplicate resource name"
+                );
             }
         }
         "env" => {
