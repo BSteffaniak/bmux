@@ -4,7 +4,7 @@
 @input-profile tmux_compat
 # Declare public executable inputs separately from private host environment values.
 @resource FLAPPY_APP=jev_flappy.py
-@env-from JEV_API_KEY TYPESAFE_API_KEY JEV_BACKEND JEV_MODEL JEV_BASE_URL
+@env-from JEV_API_KEY JEV_MODEL
 @env-mode clean
 @env PS1='$ '
 @timeout 45000

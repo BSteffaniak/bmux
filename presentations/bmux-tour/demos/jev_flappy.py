@@ -39,30 +39,25 @@ class DemoError(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class Config:
-    backend: str
     base_url: str
     model: str
     key: str = dataclasses.field(repr=False)
 
     @classmethod
     def environment(cls):
-        backend = os.environ.get("JEV_BACKEND", "hosted")
-        if backend not in ("hosted", "official"):
-            raise DemoError("JEV_BACKEND must be hosted or official")
-        official = backend == "official"
-        key = os.environ.get("TYPESAFE_API_KEY" if official else "JEV_API_KEY", "")
+        key = os.environ.get("JEV_API_KEY", "")
         if not key or any(ord(c) < 33 or ord(c) > 126 for c in key):
-            raise DemoError("Set the API key for the selected backend")
-        base = os.environ.get("JEV_BASE_URL", "https://api.typesafe.ai" if official
-                              else "https://jevtypesafeai.com").rstrip("/")
-        validate_endpoint(base, backend)
+            raise DemoError("Set JEV_API_KEY to an official TypeSafe API key")
+        # Single production route. Legacy backend/base/key variables are not
+        # consulted: they must never silently send this credential to a gateway.
+        base = "https://api.typesafe.ai"
         model = os.environ.get("JEV_MODEL", MODEL)
         if not model or len(model) > 128 or not all(c.isalnum() or c in "-._" for c in model):
             raise DemoError("Invalid JEV_MODEL")
-        return cls(backend, base, model, key)
+        return cls(base, model, key)
 
 
-def validate_endpoint(base, backend):
+def validate_endpoint(base):
     try:
         url = urlsplit(base)
         port = url.port
@@ -74,9 +69,9 @@ def validate_endpoint(base, backend):
             or (url.scheme != "https" and not
                 (url.scheme == "http" and url.hostname == "127.0.0.1"))):
         raise DemoError("Jev endpoint must be HTTPS (HTTP only on 127.0.0.1)")
-    if ((url.hostname == "api.typesafe.ai" and backend != "official")
-            or (url.hostname == "jevtypesafeai.com" and backend != "hosted")):
-        raise DemoError("Jev endpoint does not match selected backend")
+    if base != "https://api.typesafe.ai" and not (
+            url.scheme == "http" and url.hostname == "127.0.0.1"):
+        raise DemoError("Jev uses the direct TypeSafe API only")
 
 
 @dataclasses.dataclass
@@ -249,7 +244,7 @@ def decode_answer(body, model):
 class JevClient:
     """One private transport owner; reuse the verified TLS session between calls."""
     def __init__(self, config):
-        validate_endpoint(config.base_url, config.backend)
+        validate_endpoint(config.base_url)
         self.config = config
         self.connection = None
 
@@ -273,7 +268,7 @@ class JevClient:
                 # No redirects, ambient proxies, or unverified TLS contexts.
                 self.connection.connect()
                 setup_ms = (time.monotonic() - started) * 1000
-            path = "/v1/systemone" if config.backend == "official" else "/api/v1/decide"
+            path = "/v1/systemone"
             body = json.dumps(request_payload(config, observation), separators=(",", ":"))
             sent = time.monotonic()
             self.connection.request("POST", path, body,

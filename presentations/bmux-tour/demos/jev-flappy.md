@@ -12,16 +12,19 @@ and matching plugins described in [the tour README](../README.md). Explicitly
 start the demo on the final slide. No application-path, socket, model, backend,
 or `BMUX_PLAYBOOK_APP_ENV_` variables are required.
 
-The default is hosted Jev at `https://jevtypesafeai.com/api/v1/decide`, model
-`jev-1.13.0`. Python 3 with curses must be on the runtime's PATH; no pip packages
-are needed. The key must be in the **playbook owner's launch environment**;
-exporting it after an existing owner started cannot change that process.
-Prefer a fresh, separately owned presenter runtime rather than a shared server.
+The demo calls the official TypeSafe API directly at
+`https://api.typesafe.ai/v1/systemone`, model `jev-1.13.0`. Set **only
+`JEV_API_KEY`**, using a key issued by the TypeSafe console (not a gateway key).
+Python 3 with curses must be on the runtime's PATH; no pip packages are needed.
+The key must be in the **playbook owner's launch environment**; exporting it
+after an existing owner started cannot change that process. Prefer a fresh,
+separately owned presenter runtime rather than a shared server.
 
-Optional overrides: `JEV_MODEL`, `JEV_BASE_URL`, and `JEV_BACKEND`. For the official
-TypeSafe endpoint, select `JEV_BACKEND=official` and set `TYPESAFE_API_KEY` instead.
-There is no implicit backend/credential fallback. HTTPS is required except for
-loopback HTTP used by offline tests. Redirects and upstream diagnostic bodies
+`JEV_MODEL` is an optional pinned-model override. There is no gateway/backend
+selection or credential fallback. Legacy `JEV_BACKEND`, `JEV_BASE_URL`, and
+`TYPESAFE_API_KEY` settings are ignored and are not forwarded by the playbook.
+Production always uses verified HTTPS to the direct API; only offline tests
+can construct a loopback HTTP client. Redirects and upstream diagnostic bodies
 are never displayed.
 
 Opening the presentation or the slide alone does not execute the demo. If the
@@ -34,7 +37,7 @@ The playbook declares:
 
 ```text
 @resource FLAPPY_APP=jev_flappy.py
-@env-from JEV_API_KEY TYPESAFE_API_KEY JEV_BACKEND JEV_MODEL JEV_BASE_URL
+@env-from JEV_API_KEY JEV_MODEL
 @env-mode clean
 ```
 

@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import jev_flappy as demo
 
 
-CONFIG = demo.Config("hosted", "https://jevtypesafeai.com", demo.MODEL, "test-only-key")
+CONFIG = demo.Config("https://api.typesafe.ai", demo.MODEL, "test-only-key")
 
 
 def answer(action="FLAP", confidence=0.9):
@@ -209,21 +209,32 @@ class ProtocolTests(unittest.TestCase):
     def test_configuration_is_explicit_and_secret_is_not_repr(self):
         with patch.dict(os.environ, {"JEV_API_KEY": "private-key"}, clear=True):
             config = demo.Config.environment()
-            self.assertEqual(config.backend, "hosted")
+            self.assertEqual(config.base_url, "https://api.typesafe.ai")
+            self.assertEqual(config.model, demo.MODEL)
             self.assertNotIn("private-key", repr(config))
-        with patch.dict(os.environ, {"TYPESAFE_API_KEY": "official-key", "JEV_BACKEND": "official"}, clear=True):
-            self.assertEqual(demo.Config.environment().base_url, "https://api.typesafe.ai")
+        # Stale settings cannot select a gateway or a different credential.
+        with patch.dict(os.environ, {"JEV_API_KEY": "direct-key",
+                                   "TYPESAFE_API_KEY": "other-key", "JEV_BACKEND": "hosted",
+                                   "JEV_BASE_URL": "https://jevtypesafeai.com"}, clear=True):
+            config = demo.Config.environment()
+            self.assertEqual(config.base_url, "https://api.typesafe.ai")
+            self.assertEqual(config.key, "direct-key")
+        with patch.dict(os.environ, {"TYPESAFE_API_KEY": "other-key"}, clear=True):
+            with self.assertRaises(demo.DemoError):
+                demo.Config.environment()
         with patch.dict(os.environ, {}, clear=True), self.assertRaises(demo.DemoError):
             demo.Config.environment()
 
     def test_unsafe_endpoints_rejected(self):
         for url in ("http://example.com", "https://user:secret@example.com",
                     "https://example.com?key=x", "https://example.com/#x",
-                    "https://example.com/custom", "https://api.typesafe.ai",
+                    "https://example.com/custom", "https://jevtypesafeai.com",
+                    "https://other.example.com",
                     "file:///tmp/a", "https://example.com:invalid"):
             with self.subTest(url=url), self.assertRaises(demo.DemoError):
-                demo.validate_endpoint(url, "hosted")
-        demo.validate_endpoint("http://127.0.0.1:1234", "hosted")
+                demo.validate_endpoint(url)
+        demo.validate_endpoint("http://127.0.0.1:1234")
+        demo.validate_endpoint("https://api.typesafe.ai")
 
     def test_response_validation(self):
         def body(response=None, **kwargs):
@@ -272,13 +283,10 @@ class ProtocolTests(unittest.TestCase):
                 config = dataclasses.replace(CONFIG, base_url=f"http://127.0.0.1:{server.server_port}")
                 direct = demo.judge(config, demo.Game().observation())
                 self.assertEqual({k: direct[k] for k in answer()}, answer())
-                self.assertEqual(observed[-1][0], "/api/v1/decide")
+                self.assertEqual(observed[-1][0], "/v1/systemone")
                 self.assertEqual(observed[-1][1], "Bearer test-only-key")
                 self.assertEqual(observed[-1][2]["questions"]["action"]["type"], "choice")
                 self.assertEqual(set(observed[-1][2]["questions"]["action"]["criteria"]), {"FLAP", "WAIT"})
-                direct = demo.judge(dataclasses.replace(config, backend="official"), {})
-                self.assertEqual({k: direct[k] for k in answer()}, answer())
-                self.assertEqual(observed[-1][0], "/v1/systemone")
                 # Exercise the real spawned transport, not only the direct client.
                 transport = demo.Transport(config)
                 request = transport(config, demo.Game().observation())
