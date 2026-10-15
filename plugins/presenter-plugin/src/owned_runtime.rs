@@ -96,8 +96,8 @@ impl OwnedRuntime {
     ) -> Arc<Self> {
         Arc::new(Self {
             executable,
-            // Short unique basename keeps ordinary selected state roots below
-            // sockaddr_un limits without changing the harness discovery layout.
+            // Durable service state and diagnostics remain discoverable here;
+            // socket runtime is separately allocated only on admitted Run.
             root: attempts_root.join(format!(
                 "service-{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..16]
@@ -131,6 +131,47 @@ impl OwnedRuntime {
         config.plugins.search_paths.clone_from(&self.search_roots);
         config
     }
+    fn allocate_paths(&self) -> Result<(ConfigPaths, tempfile::TempDir), String> {
+        // Socket paths are ephemeral transport addresses, not durable state.
+        // Use the selected temporary root just as managed attempts do; never
+        // shorten the user's state path, use a symlink, or fall back to a host.
+        let temporary = tempfile::Builder::new()
+            .prefix("bps-")
+            .tempdir()
+            .map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+        }
+        let paths = ConfigPaths::new(
+            self.root.join("config"),
+            temporary.path().to_path_buf(),
+            self.root.join("data"),
+            self.root.join("state"),
+        );
+        #[cfg(unix)]
+        if paths.server_socket().as_os_str().as_encoded_bytes().len() >= 104 {
+            return Err(
+                "selected temporary root cannot accommodate owned presenter Unix socket paths"
+                    .into(),
+            );
+        }
+        Ok((paths, temporary))
+    }
+    fn cleanup_paths(&self, state: &ServiceState) -> Result<(), String> {
+        // Called only once the owned child has exited after stop acknowledgment.
+        if let Some(paths) = &state.paths {
+            match std::fs::remove_dir_all(&paths.runtime_dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        std::fs::remove_dir_all(&self.root).map_err(|error| error.to_string())
+    }
+
     fn command(&self, paths: &ConfigPaths) -> Command {
         let mut command = Command::new(&self.executable);
         // Preserve shell/slot environment. Override only this owned child's paths;
@@ -181,23 +222,7 @@ impl OwnedRuntime {
                 std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))
                     .map_err(|error| error.to_string())?;
             }
-            let paths = ConfigPaths::new(
-                self.root.join("config"),
-                self.root.join("runtime"),
-                self.root.join("data"),
-                self.root.join("state"),
-            );
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStrExt;
-                // Portable sockaddr_un limit (BSD 104, Linux 108), including NUL.
-                if paths.server_socket().as_os_str().as_bytes().len() >= 104 {
-                    return Err(format!(
-                        "owned presenter socket path too long: {}; select a shorter state root",
-                        paths.server_socket().display()
-                    ));
-                }
-            }
+            let (paths, temporary) = self.allocate_paths()?;
             for directory in [
                 &paths.config_dir,
                 &paths.runtime_dir,
@@ -217,6 +242,9 @@ impl OwnedRuntime {
                     .spawn()
                     .map_err(|error| error.to_string())?,
             );
+            // Transfer directory ownership only after the child is retained. An
+            // unacknowledged exit must keep its runtime for diagnosis/recovery.
+            let _runtime = temporary.keep();
             state.paths = Some(paths);
         }
         let paths = state.paths.clone().ok_or("owned service paths missing")?;
@@ -321,7 +349,7 @@ impl OwnedRuntime {
         {
             state.child.take();
             if state.stop_acknowledged {
-                std::fs::remove_dir_all(&self.root).map_err(|error| error.to_string())?;
+                self.cleanup_paths(&state)?;
                 return Ok(());
             }
             state.closed = true;
@@ -358,8 +386,8 @@ impl OwnedRuntime {
                 .is_some()
             {
                 state.child.take();
-                std::fs::remove_dir_all(&self.root).map_err(|error| {
-                    format!("owned service reaped; root cleanup failed: {error}")
+                self.cleanup_paths(&state).map_err(|error| {
+                    format!("owned service reaped; path cleanup failed: {error}")
                 })?;
                 return Ok(());
             }
@@ -434,6 +462,84 @@ mod tests {
         assert!(runtime.ensure_started().await.is_err());
         assert!(!root.exists());
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn long_macos_state_path_uses_private_short_socket_and_acknowledged_cleanup() {
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let state_root = tempfile::tempdir().unwrap();
+        let attempts = state_root
+            .path()
+            .join("Users/braden/Library/Application Support/bmux/State/presenter-playbooks");
+        let runtime = OwnedRuntime::new(PathBuf::from("/explicit/bmux"), attempts, vec![]);
+        assert!(
+            runtime
+                .root
+                .join("runtime/server.sock")
+                .as_os_str()
+                .as_encoded_bytes()
+                .len()
+                >= 104
+        );
+        assert!(!runtime.root.exists());
+        let (paths, temporary) = runtime.allocate_paths().unwrap();
+        let socket = paths.server_socket();
+        assert!(socket.as_os_str().as_encoded_bytes().len() < 104);
+        assert!(!paths.runtime_dir.starts_with(&runtime.root));
+        assert!(paths.state_dir.starts_with(&runtime.root));
+        assert_eq!(
+            std::fs::metadata(&paths.runtime_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let listener = UnixListener::bind(&socket).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&socket).is_ok());
+        drop(listener);
+        let (other, other_temporary) = runtime.allocate_paths().unwrap();
+        assert_ne!(paths.runtime_dir, other.runtime_dir);
+        drop(other_temporary);
+        assert!(!other.runtime_dir.exists());
+        std::fs::create_dir_all(&runtime.root).unwrap();
+        // Model an owned, exited child after the stop acknowledgment. Shutdown
+        // must remove both its short transport directory and durable service root.
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        child.wait().unwrap();
+        let _retained = temporary.keep();
+        {
+            let mut state = runtime.state.lock().await;
+            state.child = Some(child);
+            state.paths = Some(paths.clone());
+            state.stop_acknowledged = true;
+        }
+        runtime.shutdown().await.unwrap();
+        assert!(!paths.runtime_dir.exists());
+        assert!(!runtime.root.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unacknowledged_exit_preserves_short_runtime_and_diagnostics() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime =
+            OwnedRuntime::new(PathBuf::from("/explicit/bmux"), root.path().into(), vec![]);
+        let (paths, temporary) = runtime.allocate_paths().unwrap();
+        std::fs::create_dir_all(&runtime.root).unwrap();
+        std::fs::write(runtime.root.join("server.stderr.log"), "diagnostic").unwrap();
+        let mut child = Command::new("sh").args(["-c", "exit 1"]).spawn().unwrap();
+        child.wait().unwrap();
+        {
+            let mut state = runtime.state.lock().await;
+            state.child = Some(child);
+            state.paths = Some(paths.clone());
+        }
+        assert!(runtime.shutdown().await.is_err());
+        assert!(paths.runtime_dir.exists());
+        assert!(runtime.root.join("server.stderr.log").exists());
+        drop(temporary);
+    }
+
     #[test]
     fn worker_ownership_is_shared_and_released_explicitly() {
         let runtime = OwnedRuntime::new(

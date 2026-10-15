@@ -130,6 +130,16 @@ reload retains the active attempt and frozen source; rejected executable changes
 retain the last approved deck and run. Stop/Restart and exit acknowledge owned
 cleanup. This is not a claim of crash recovery or arbitrary terminal-input support.
 
+The lazy presenter-owned service keeps configuration, data, state, and diagnostics
+under the selected `state/presenter-playbooks/service-*` directory. Its socket
+runtime is a separately owned `bps-*` directory in the selected temporary root,
+with Unix mode 0700, so long macOS `Library/Application Support` state paths do
+not consume the Unix socket address budget. Successful acknowledged service
+shutdown removes both directories; an unacknowledged exit preserves them for
+diagnosis. Construction and inert shutdown allocate no socket directory. An
+explicitly selected temporary root that is itself too long still fails clearly;
+there is no silent host-runtime or alternate temporary-root fallback.
+
 ### Isolated regression acceptance
 
 Use explicit coordinator-built artifacts (no build or installation in the harness):
