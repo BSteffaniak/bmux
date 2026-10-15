@@ -15,6 +15,8 @@ async function fixture() {
   let failDraw = false;
   let failCommit = false;
   let metadata = 0;
+  let projections = [];
+  const composites = [];
   const body = {appendChild(element) { element.parent = this; }};
   const mount = {appendChild(element) { element.parent = this; }};
   const document = {
@@ -35,7 +37,9 @@ async function fixture() {
           height = value; this.pixels = null;
         },
         getContext() {
-          return {drawImage(other) {
+          return {save() {}, restore() {}, beginPath() {}, rect(...args) { composites.push({clip:args}); }, clip() {},
+            drawImage(other, ...args) {
+            if (args.length) composites.push({destination:args, source:[other.width, other.height]});
             assert.ok(other.width > 0 && other.height > 0, 'cannot draw a zero-size canvas');
             if (element.id === 'bmux' && failDraw) { failDraw = false; throw new Error('draw failed'); }
             element.pixels = other.pixels;
@@ -59,6 +63,7 @@ async function fixture() {
       paints.push(this.pending);
       return new TextEncoder().encode(JSON.stringify(this.pending));
     }
+    pending_surfaces_json() { return JSON.stringify(projections); }
     commit() {
       if (failCommit) { failCommit = false; throw new Error('engine failed'); }
       this.committed = this.pending; this.pending = null;
@@ -75,11 +80,14 @@ async function fixture() {
       this.cellWidth = width; this.cellHeight = height;
       renderers.push(this);
     }
-    set_metrics() { throw new Error('must not repaint the old grid with new density'); }
+    set_metrics(width, height) {
+      assert.ok(this.canvas.id.startsWith('bmux-presenter-surface-'), 'must not repaint old main grid');
+      this.cellWidth = width; this.cellHeight = height;
+    }
     async present_json(json) {
       const frame = JSON.parse(json);
-      const width = Math.ceil(frame.cols * this.cellWidth);
-      const height = Math.ceil(frame.rows * this.cellHeight);
+      const width = Math.ceil((frame.cols ?? frame.buffer.area.width) * this.cellWidth);
+      const height = Math.ceil((frame.rows ?? frame.buffer.area.height) * this.cellHeight);
       assert.ok(width <= 16384 && height <= 16384 && width * height <= 16777216);
       this.canvas.width = width; this.canvas.height = height;
       this.canvas.pixels = ++metadata;
@@ -106,7 +114,8 @@ async function fixture() {
   const snapshot = () => JSON.stringify({width:visible.width, height:visible.height,
     cssWidth:visible.style.width, cssHeight:visible.style.height, pixels:visible.pixels,
     authority:engines[0].committed, metadata:adapter.inspectCommittedFrame()});
-  return {adapter, visible, staging, elements, engines, renderers, paints, envelope, viewport, snapshot,
+  return {adapter, visible, staging, elements, engines, renderers, paints, envelope, viewport, snapshot, composites,
+    project(value) { projections = value; },
     failDraw() { failDraw = true; }, failCommit() { failCommit = true; }};
 }
 
@@ -232,6 +241,23 @@ async function main() {
   assert.equal(f.visible.width, 0);
   assert.equal(f.staging.width, 0);
   assert.equal(f.visible.listeners.size, 0);
+  // The nested authored terminal scales, while the main grid metrics do not.
+  const p = await fixture();
+  p.project([{block_id:'demo', x:1, y:4, width:40, height:10,
+    clip:{x:1,y:4,width:40,height:10}, frame:{buffer:{area:{width:120,height:30}}}}]);
+  const projected = await p.adapter.prepare(p.envelope(1), p.viewport(390, 844, 2));
+  assert.equal(p.adapter.inspectCommittedFrame(), null);
+  projected.commit();
+  assert.deepEqual(p.composites.find(value => value.destination?.length === 4).destination, [18,144,720,360]);
+  assert.equal(p.adapter.inspectCommittedFrame().embedded_surfaces[0].source_width, 120);
+  assert.equal(p.adapter.inspectCommittedFrame().embedded_surfaces[0].width, 40);
+  assert.ok(p.elements.filter(e => e.id.startsWith('bmux-presenter-surface-')).every(e => !e.parent && !e.width && !e.height));
+  const retained = p.snapshot();
+  p.failCommit();
+  const rejected = await p.adapter.prepare(p.envelope(2), p.viewport(390,844,2));
+  assert.throws(() => rejected.commit(), /engine failed/);
+  assert.equal(p.snapshot(), retained);
+  p.adapter.free();
   console.log('presenter adapter contracts: PASS');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

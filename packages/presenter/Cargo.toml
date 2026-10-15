@@ -14,16 +14,20 @@ version     = { workspace = true }
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-bmux_markdown       = { workspace = true }
-bmux_tui            = { workspace = true, features = ["serde"] }
-bmux_tui_components = { workspace = true, features = ["scroll-view", "button"] }
-bmux_web_renderer   = { workspace = true }
-image               = { version = "0.25.10", default-features = false, features = ["png"] }
-pulldown-cmark      = { workspace = true }
-serde               = { workspace = true, features = ["derive"] }
-serde_json          = { workspace = true }
-serde_yaml          = { workspace = true }
-sha2                = { workspace = true }
+bmux_markdown = { workspace = true }
+bmux_tui = { workspace = true, features = ["serde"] }
+bmux_tui_components = { workspace = true, features = [
+    "scroll-view",
+    "button",
+    "progress-bar",
+] }
+bmux_web_renderer = { workspace = true }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+pulldown-cmark = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { version = "0.2.126", optional = true }

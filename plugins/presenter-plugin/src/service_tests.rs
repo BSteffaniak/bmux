@@ -197,6 +197,7 @@ mod tests {
         let surfaces = vec![MirrorFrame {
             interaction_revision: None,
             private_scene: None,
+            playbook: None,
             surface_id: "control".into(),
             slide_id: "slide".into(),
             revision: 81,

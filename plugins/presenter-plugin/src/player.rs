@@ -1213,6 +1213,7 @@ pub(crate) fn audience_surfaces(
                     .context("missing surface preparation")?;
                 Ok(bmux_presenter::audience::AudienceSurface {
                     block_id: surface.surface_id.clone(),
+                    playbook: surface.playbook.clone(),
                     frame: bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
                         generation, revision, &prepared,
                     )?,
@@ -1297,8 +1298,17 @@ pub(crate) fn audience_surfaces(
                     |cx| component.paint(&layout, cx),
                 )?
                 .context("missing custom preparation")?;
+            let playbook = player
+                .live_demos
+                .as_ref()
+                .and_then(|demos| demos.entries.get(&block_id))
+                .filter(|demo| demo.open)
+                .map(|demo| demo.audience_playbook(generation, revision))
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
             Ok(bmux_presenter::audience::AudienceSurface {
                 block_id,
+                playbook,
                 frame: bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
                     generation, revision, &prepared,
                 )?,
@@ -1732,6 +1742,24 @@ mod tests {
                 .map(|c| c.symbol.as_str())
                 .collect::<String>();
             assert_eq!(text.contains("Preview"), open);
+            assert_eq!(surfaces[0].playbook.is_some(), open);
+            if let Some(playbook) = &surfaces[0].playbook {
+                let demo = &player.live_demos.as_ref().unwrap().entries["demo"];
+                let area = playbook.terminal.buffer().area();
+                assert_eq!(area.width, demo.preview_size.width);
+                assert_eq!(area.height, demo.preview_size.height);
+                assert!(
+                    playbook
+                        .terminal
+                        .buffer()
+                        .cells()
+                        .iter()
+                        .all(|cell| cell.symbol == " ")
+                );
+                assert!(playbook.status.contains("Terminal preview"));
+                assert_eq!(playbook.progress, 0);
+                playbook.validate().unwrap();
+            }
             assert!(
                 player.live_demos.as_ref().unwrap().entries["demo"]
                     .snapshot
@@ -2064,6 +2092,7 @@ mod tests {
         let surface = MirrorFrame {
             interaction_revision: None,
             private_scene: None,
+            playbook: None,
             surface_id: "demo".into(),
             slide_id: "s".into(),
             revision: 4,
@@ -2092,6 +2121,26 @@ mod tests {
             updates: receiver,
             receive_only: false,
         });
+        let prepared = bmux_tui::presentation::PresentationState::new(Rect::new(0, 0, 80, 24))
+            .prepare(bmux_tui::damage::Damage::Full, |_| {})
+            .unwrap();
+        player.surfaces[0].playbook = Some(bmux_presenter::audience::AudiencePlaybook {
+            title: "Managed demo".into(),
+            status: "Ready".into(),
+            progress: 2500,
+            terminal: bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
+                "audience-run",
+                4,
+                &prepared,
+            )
+            .unwrap(),
+        });
+        let audience = audience_surfaces(&mut player, "audience-run", 4).unwrap();
+        let playbook = audience[0].playbook.as_ref().unwrap();
+        assert_eq!(playbook.title, "Managed demo");
+        assert_eq!(playbook.progress, 2500);
+        assert_eq!(playbook.terminal.buffer().area(), Rect::new(0, 0, 80, 24));
+        assert_eq!(audience[0].frame.buffer().area(), Rect::new(0, 0, 1, 1));
         for (shift, expected) in [(false, "r"), (true, "R")] {
             let key = KeyStroke::with_modifiers(
                 KeyCode::Char('r'),
@@ -2122,6 +2171,7 @@ mod tests {
         let surface = MirrorFrame {
             interaction_revision: None,
             private_scene: None,
+            playbook: None,
             surface_id: "demo".into(),
             slide_id: "s".into(),
             revision: 4,

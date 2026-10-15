@@ -280,7 +280,14 @@ impl LinkedOwner {
             )?;
             if overlay.is_some_and(|(active, _)| active == id) {
                 surface.private_scene = private_scene.clone();
+                if let Some((_, demo)) = overlay {
+                    surface.playbook = Some(
+                        demo.audience_playbook(&context.cursor.run_id, revision)
+                            .map_err(|_| HostError::Invalid)?,
+                    );
+                }
             }
+            surface.validate(16_384, 2 * 1024 * 1024)?;
             let interaction_revision = self
                 .layouts
                 .get(&(context.instance.to_owned(), id.clone()))
@@ -666,6 +673,66 @@ impl Owner for LinkedOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn managed_open_demo_publishes_optional_terminal_with_wire_budgets() {
+        use crate::playbook_live::reload_tests::{Fixture, deck};
+        let fixture = Fixture::new();
+        let running = fixture.running();
+        let mut owner =
+            LinkedOwner::new(deck("s", "old"), &[], crate::demo::linked_registry()).unwrap();
+        let state = bmux_presenter::PresentationState::new(&owner.deck);
+        let cursor = bmux_presenter_runtime::Cursor {
+            run_id: "audience-run".into(),
+            deck_revision: 1,
+            revision: 1,
+        };
+        owner.demos.insert("shared".into(), running.demos);
+        let context = || OwnerContext {
+            participant: "p",
+            instance: "shared",
+            state: &state,
+            cursor: &cursor,
+        };
+        let open = owner.scenes(context()).unwrap();
+        let frame = &open[0];
+        let playbook = frame.playbook.as_ref().unwrap();
+        let source = &owner.demos["shared"].entries["demo"]
+            .snapshot
+            .surface
+            .as_ref()
+            .unwrap()
+            .frame;
+        assert_eq!(playbook.terminal.buffer(), source.buffer());
+        assert_eq!(playbook.terminal.cursor(), source.cursor());
+        assert_eq!(playbook.terminal.generation(), "audience-run");
+        assert_eq!(playbook.terminal.revision(), frame.revision);
+        frame.validate(16_384, 2 * 1024 * 1024).unwrap();
+        let total_cells = frame.cells.len() + playbook.terminal.buffer().cells().len();
+        assert!(frame.validate(total_cells - 1, 2 * 1024 * 1024).is_err());
+        let wire = serde_json::to_vec(frame).unwrap();
+        assert!(frame.validate(16_384, wire.len() - 1).is_err());
+        frame.validate(16_384, wire.len()).unwrap();
+        let restored: MirrorFrame = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(restored.playbook.as_ref().unwrap().title, playbook.title);
+        let mut invalid = restored;
+        invalid.playbook.as_mut().unwrap().progress = 10001;
+        assert!(invalid.validate(16_384, 2 * 1024 * 1024).is_err());
+        owner
+            .demos
+            .get_mut("shared")
+            .unwrap()
+            .entries
+            .get_mut("demo")
+            .unwrap()
+            .open = false;
+        let closed = owner.scenes(context()).unwrap();
+        assert!(closed[0].playbook.is_none());
+        let json = serde_json::to_string(&closed[0]).unwrap();
+        assert!(!json.contains("\"playbook\""));
+        let restored: MirrorFrame = serde_json::from_str(&json).unwrap();
+        assert!(restored.playbook.is_none());
+    }
 
     #[tokio::test]
     async fn managed_reload_handoff_preserves_active_epoch_surface_and_approval() {

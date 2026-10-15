@@ -357,6 +357,7 @@ fn malformed_owner_scene_and_stale_surface_input_are_rejected() {
     let mut frame = MirrorFrame {
         interaction_revision: None,
         private_scene: None,
+        playbook: None,
         surface_id: "demo".into(),
         slide_id: "one".into(),
         revision: 7,

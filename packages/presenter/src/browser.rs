@@ -1,8 +1,9 @@
 //! Presentation-owned native engine and optional WASM binding; paint performs no IO.
-use crate::audience::{AudienceDocument, resource_id};
+use crate::audience::{AudienceDocument, AudiencePlaybook, resource_id};
 use crate::custom::{CustomComponentFactory, CustomRegistry, RichContent};
 use crate::model::{Block, BlockKind, TextFormat};
 use crate::{ImageComponent, PresentationTheme, ViewerComponent, ViewerState};
+use bmux_tui::component::{ChildLayout, LogicalSize};
 use bmux_tui::damage::Damage;
 use bmux_tui::embedded_surface::{
     EmbeddedSurface, RetainedSurface, SurfaceIdentity, SurfaceLimits,
@@ -16,9 +17,13 @@ use bmux_tui::prelude::{
 use bmux_tui::presentation::{
     PreparedPresentation, PresentationLimits, PresentationState as Scene,
 };
+use bmux_tui::style::Style;
+use bmux_tui_components::progress_bar::{ProgressBarComponent, ProgressBarValue};
 use bmux_web_renderer::{BrowserFrame, encode_json};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -93,19 +98,20 @@ struct AdmittedContent {
 }
 
 struct Pending {
-    content: Arc<AdmittedContent>,
+    content: Rc<AdmittedContent>,
     scene: Scene,
     prepared: PreparedPresentation,
     viewer: ViewerState,
     generation: String,
     revision: u64,
     digest: [u8; 32],
+    surfaces_json: String,
 }
 
 /// Each browser view has its own scroll and committed compositor authority.
 #[cfg_attr(all(target_arch = "wasm32", feature = "wasm"), wasm_bindgen)]
 pub struct AudienceRenderer {
-    admitted: Option<Arc<AdmittedContent>>,
+    admitted: Option<Rc<AdmittedContent>>,
     #[cfg(test)]
     content_preparations: usize,
     #[cfg(test)]
@@ -206,7 +212,7 @@ impl AudienceRenderer {
             && !self
                 .admitted
                 .as_ref()
-                .is_some_and(|admitted| Arc::ptr_eq(admitted, &pending.content))
+                .is_some_and(|admitted| Rc::ptr_eq(admitted, &pending.content))
         {
             residency.add(pending.content.budget)?;
         }
@@ -302,7 +308,7 @@ impl AudienceRenderer {
                 .as_ref()
                 .is_some_and(|admitted| admitted.source == content)
         {
-            Arc::clone(
+            Rc::clone(
                 self.admitted
                     .as_ref()
                     .ok_or("missing admitted audience content")?,
@@ -323,7 +329,7 @@ impl AudienceRenderer {
             {
                 self.content_preparations += 1;
             }
-            Arc::new(AdmittedContent {
+            Rc::new(AdmittedContent {
                 budget,
                 source: content.to_owned(),
                 document,
@@ -356,25 +362,34 @@ impl AudienceRenderer {
                     .unwrap_or_else(|| self.viewer.scroll.get()),
             );
         }
+        rich.terminal_rows.borrow_mut().clear();
+        rich.projections.borrow_mut().clear();
         let theme = PresentationTheme::for_deck(&document.deck);
         let component =
             ViewerComponent::new(&document.deck, &document.state, &viewer, &theme, &custom)
                 .rich_content(rich);
-        let layout = component.layout(
+        let layout = rich.layout_fitted(
+            &component,
             Constraints::tight(Size::new(cols, rows)),
-            &mut LayoutCx::default(),
-        );
+            &format!(
+                "presentation/{}/viewer/viewport/content",
+                document.deck.id.as_str()
+            ),
+        )?;
         let scene = Scene::new(Rect::new(0, 0, cols, rows));
-        let mut prepared = scene
-            .prepare_bounded(
-                PresentationLimits {
-                    max_cells: 262_144,
-                    max_entries: 65_536,
-                    max_bytes: 32 * 1024 * 1024,
-                },
-                Damage::Full,
-                |cx| component.paint(&layout, cx),
-            )
+        let preparation = scene.prepare_bounded(
+            PresentationLimits {
+                max_cells: 262_144,
+                max_entries: 65_536,
+                max_bytes: 32 * 1024 * 1024,
+            },
+            Damage::Full,
+            |cx| component.paint(&layout, cx),
+        );
+        // Do not retain speculative frame clones in the reusable content cache,
+        // including when scene admission or subsequent serialization fails.
+        let projections = rich.projections.take();
+        let mut prepared = preparation
             .map_err(|error| format!("audience presentation: {error:?}"))?
             .ok_or("empty audience preparation")?;
         if let Some(slide) = document.state.current_slide(&document.deck) {
@@ -405,7 +420,7 @@ impl AudienceRenderer {
         };
         residency.add(admitted.budget)?;
         if let Some(previous) = &self.admitted
-            && !Arc::ptr_eq(previous, &admitted)
+            && !Rc::ptr_eq(previous, &admitted)
         {
             residency.add(previous.budget)?;
         }
@@ -430,18 +445,37 @@ impl AudienceRenderer {
         let bytes = encode_json(&frame)
             .map_err(|error| error.to_string())?
             .into_bytes();
+        if let Some(error) = &projections.error {
+            return Err(error.clone());
+        }
+        let surfaces_json =
+            serde_json::to_string(&projections.surfaces).map_err(|error| error.to_string())?;
+        if surfaces_json.len() > crate::audience::MAX_DOCUMENT_BYTES {
+            return Err("audience projected surface byte limit".into());
+        }
         // Local revisions never repeat, including discarded or failed adapter transactions.
         self.frame_revision = frame_revision;
         self.pending = Some(Pending {
-            content: Arc::clone(&admitted),
+            content: Rc::clone(&admitted),
             scene,
             prepared,
             viewer,
             generation,
             revision,
             digest,
+            surfaces_json,
         });
         Ok(bytes)
+    }
+    /// Paint-time projections for the current speculative frame only. Coordinates
+    /// and clip are in main logical cells (9x18 CSS pixels), not device pixels.
+    /// Consumers render `frame_json` directly, without a JS parse/stringify
+    /// round-trip: numeric u64 revisions require exact wire digits.
+    pub fn pending_surfaces_json(&self) -> Result<String, String> {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.surfaces_json.clone())
+            .ok_or_else(|| "no prepared audience frame".into())
     }
     pub fn commit(&mut self) -> Result<(), String> {
         let Some(mut pending) = self.pending.take() else {
@@ -485,13 +519,272 @@ impl AudienceRenderer {
     }
 }
 
+const MAX_PROJECTED_SURFACES: usize = 128;
+
+#[derive(serde::Serialize)]
+struct ProjectedSurface {
+    block_id: String,
+    frame: BrowserFrame,
+    frame_json: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    clip: Rect,
+}
+
+#[derive(Default)]
+struct ProjectionBatch {
+    surfaces: Vec<ProjectedSurface>,
+    cells: usize,
+    bytes: usize,
+    error: Option<String>,
+}
+impl ProjectionBatch {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+    fn push(
+        &mut self,
+        block_id: &str,
+        frame: &BrowserFrame,
+        clip: Rect,
+        area: bmux_tui::paint::LocalRect,
+        fit: TerminalFit,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        let source = frame.buffer().area();
+        let cells = usize::from(source.width) * usize::from(source.height);
+        // Validate and bound the exact nested wire representation before cloning.
+        let frame_json = match encode_json(frame) {
+            Ok(json) => json,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return;
+            }
+        };
+        // Account for both the wire object and its escaped lossless JSON string.
+        let string_bytes = match serde_json::to_string(&frame_json) {
+            Ok(json) => json.len(),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return;
+            }
+        };
+        let bytes = frame_json
+            .len()
+            .saturating_add(string_bytes)
+            .saturating_add(512);
+        if self.surfaces.len() >= MAX_PROJECTED_SURFACES
+            || self.cells.saturating_add(cells) > 262_144
+            || self.bytes.saturating_add(bytes) > crate::audience::MAX_DOCUMENT_BYTES
+        {
+            self.error = Some("aggregate audience projected surface limit".into());
+            return;
+        }
+        let Ok(local_y) = i32::try_from(area.y) else {
+            self.error = Some("audience projection origin limit".into());
+            return;
+        };
+        self.cells += cells;
+        self.bytes += bytes;
+        self.surfaces.push(ProjectedSurface {
+            block_id: block_id.to_owned(),
+            frame: frame.clone(),
+            frame_json,
+            x: f64::from(clip.x) - f64::from(area.x),
+            y: f64::from(clip.y) - f64::from(local_y),
+            width: fit.width,
+            height: fit.height,
+            clip,
+        });
+    }
+}
+
+/// The header is ordinary shared TUI content. Only the empty terminal slot is
+/// projected at fractional scale; it never exports terminal input/selection.
+struct BrowserPlaybook<'a> {
+    block_id: &'a str,
+    playbook: &'a AudiencePlaybook,
+    terminal_rows: Option<u64>,
+    projections: &'a RefCell<ProjectionBatch>,
+}
+
+#[derive(Clone, Copy)]
+struct TerminalFit {
+    width: f64,
+    height: f64,
+    rows: u64,
+    cols: u64,
+}
+impl BrowserPlaybook<'_> {
+    fn header(&self) -> Element<'_> {
+        Element::new(
+            Column::new()
+                .id(format!("audience/{}/chrome", self.block_id))
+                .child(
+                    TextBlock::new(self.playbook.title.as_str())
+                        .id(format!("audience/{}/title", self.block_id))
+                        .wrap(TextWrap::None),
+                )
+                .child(
+                    TextBlock::new(self.playbook.status.as_str())
+                        .id(format!("audience/{}/status", self.block_id))
+                        .wrap(TextWrap::None),
+                )
+                .child(ProgressBarComponent::new(
+                    format!("audience/{}/progress", self.block_id),
+                    ProgressBarValue::ratio(u64::from(self.playbook.progress), 10000),
+                )),
+        )
+    }
+    fn fit(&self, width: u64, allocated_rows: Option<u64>) -> TerminalFit {
+        let source = self.playbook.terminal.buffer().area();
+        let source_width = u64::from(source.width);
+        let source_height = u64::from(source.height);
+        // Measured unscrolled shared layout owns the remaining terminal height.
+        let available_height = self.terminal_rows.unwrap_or(source_height);
+        let available_height = available_height.min(allocated_rows.unwrap_or(available_height));
+        let available_width = width.min(source_width);
+        let (numerator, denominator) =
+            if available_width * source_height <= available_height * source_width {
+                (available_width, source_width)
+            } else {
+                (available_height.min(source_height), source_height)
+            };
+        let denominator = denominator.max(1);
+        // Both terms are bounded by source u16 dimensions, so conversion is exact.
+        let scale = f64::from(u16::try_from(numerator).unwrap_or(0))
+            / f64::from(u16::try_from(denominator).unwrap_or(1));
+        TerminalFit {
+            width: f64::from(source.width) * scale,
+            height: f64::from(source.height) * scale,
+            rows: (source_height * numerator).div_ceil(denominator),
+            cols: (source_width * numerator).div_ceil(denominator),
+        }
+    }
+}
+impl Component for BrowserPlaybook<'_> {
+    fn layout(&self, constraints: Constraints, cx: &mut LayoutCx) -> LayoutNode {
+        let width = constraints.max_width();
+        let header = self.header().layout(Constraints::for_width(width), cx);
+        let fit = self.fit(
+            width,
+            constraints
+                .max_height()
+                .map(|height| height.saturating_sub(header.size.height)),
+        );
+        let header_rows = header.size.height;
+        LayoutNode::with_children(
+            format!("audience/{}/playbook", self.block_id).into(),
+            constraints.constrain(LogicalSize::new(
+                width,
+                header_rows.saturating_add(fit.rows),
+            )),
+            vec![
+                ChildLayout::new(0, 0, header),
+                ChildLayout::new(
+                    0,
+                    header_rows,
+                    LayoutNode::leaf(
+                        format!("audience/{}/terminal", self.block_id).into(),
+                        LogicalSize::new(fit.cols, fit.rows),
+                    ),
+                ),
+            ],
+        )
+    }
+    fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        cx.with_child_size(0, 0, layout.size, |cx| self.paint_content(layout, cx));
+    }
+}
+impl BrowserPlaybook<'_> {
+    fn paint_content(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
+        let [header, slot] = layout.children.as_slice() else {
+            return;
+        };
+        cx.with_child_size(0, 0, header.node.size, |child| {
+            self.header().paint(&header.node, child);
+        });
+        let fit = self.fit(
+            layout.size.width,
+            Some(layout.size.height.saturating_sub(header.node.size.height)),
+        );
+        if fit.width <= 0.0 || fit.height <= 0.0 {
+            return;
+        }
+        cx.with_child_size(
+            0,
+            i64::try_from(slot.y).unwrap_or(i64::MAX),
+            slot.node.size,
+            |child| {
+                let clip = child.clip();
+                let area = child.area();
+                child.fill(area, " ", Style::new());
+                child.declare_metadata_availability(area, false, false);
+                let mut projections = self.projections.borrow_mut();
+                projections.push(self.block_id, &self.playbook.terminal, clip, area, fit);
+            },
+        );
+    }
+}
+
 struct BrowserRich {
     surfaces: BTreeMap<String, RetainedSurface>,
+    playbooks: BTreeMap<String, AudiencePlaybook>,
+    terminal_rows: RefCell<BTreeMap<String, u64>>,
+    projections: Rc<RefCell<ProjectionBatch>>,
     images: BTreeMap<String, ImagePayload>,
     custom_names: BTreeMap<String, String>,
     theme: PresentationTheme,
 }
 impl BrowserRich {
+    /// Measure against the shared scroll viewport, never a guessed chrome size
+    /// or a paint-time (already scrolled/clipped) rectangle. Re-layout makes the
+    /// fractional projection and its ceil-cell reservation agree before paint.
+    fn layout_fitted(
+        &self,
+        component: &impl Component,
+        constraints: Constraints,
+        viewport_id: &str,
+    ) -> Result<LayoutNode, String> {
+        let viewport_id = bmux_tui::component::LayoutId::new(viewport_id.to_owned());
+        // Earlier fitted blocks may move later blocks. At most one dependency
+        // per admitted playbook can settle on each pass; reject non-convergence.
+        for _ in 0..=MAX_PROJECTED_SURFACES {
+            let layout = component.layout(constraints, &mut LayoutCx::default());
+            let Some(viewport) = layout.find(&viewport_id) else {
+                if self.playbooks.is_empty() {
+                    return Ok(layout);
+                }
+                return Err("missing shared audience scroll viewport".into());
+            };
+            let mut budgets = BTreeMap::new();
+            for block_id in self.playbooks.keys() {
+                let slot_id =
+                    bmux_tui::component::LayoutId::new(format!("audience/{block_id}/terminal"));
+                if let Some(slot) = viewport.find_logical_rect(&slot_id) {
+                    // Layout offsets are document-relative, with no scroll
+                    // translation. A slot entirely below the first viewport
+                    // gets a whole viewport for ordinary scroll-to-content;
+                    // a visible slot uses only its actual remaining rows.
+                    let remaining = if slot.y < viewport.size.height {
+                        viewport.size.height - slot.y
+                    } else {
+                        viewport.size.height
+                    };
+                    budgets.insert(block_id.clone(), remaining);
+                }
+            }
+            if *self.terminal_rows.borrow() == budgets {
+                return Ok(layout);
+            }
+            *self.terminal_rows.borrow_mut() = budgets;
+        }
+        Err("audience terminal fit layout did not converge".into())
+    }
     // Count every alias before cloning: two names of one PNG still own two Vecs.
     // Surface projection likewise owns a document copy and a retained scene copy.
     fn budget(
@@ -499,6 +792,19 @@ impl BrowserRich {
         resources: &BTreeMap<String, Resource>,
     ) -> Result<ImageBudget, String> {
         let mut budget = ImageBudget::default();
+        let mut projected_cells = 0usize;
+        let mut projected_count = 0usize;
+        for surface in &document.surfaces {
+            if let Some(playbook) = &surface.playbook {
+                let area = playbook.terminal.buffer().area();
+                projected_count += 1;
+                projected_cells = projected_cells
+                    .saturating_add(usize::from(area.width) * usize::from(area.height));
+            }
+        }
+        if projected_count > MAX_PROJECTED_SURFACES || projected_cells > 262_144 {
+            return Err("aggregate audience projected surface limit".into());
+        }
         for id in document.assets.values() {
             let resource = resources
                 .get(id)
@@ -506,10 +812,24 @@ impl BrowserRich {
             budget.add(ImageBudget::payload(&resource.image)?)?;
         }
         for surface in &document.surfaces {
-            for placement in surface.frame.image_scene().placements() {
-                let payload = ImageBudget::payload(&placement.payload)?;
-                budget.add(payload)?;
-                budget.add(payload)?;
+            for frame in std::iter::once(&surface.frame)
+                .chain(surface.playbook.iter().map(|playbook| &playbook.terminal))
+            {
+                for placement in frame.image_scene().placements() {
+                    let payload = ImageBudget::payload(&placement.payload)?;
+                    budget.add(payload)?;
+                    budget.add(payload)?;
+                    if surface
+                        .playbook
+                        .as_ref()
+                        .is_some_and(|playbook| std::ptr::eq(frame, &playbook.terminal))
+                    {
+                        // Reusable playbook, speculative full-frame projection,
+                        // and lossless JSON coexist until adapter commit/discard.
+                        budget.add(payload)?;
+                        budget.add(payload)?;
+                    }
+                }
             }
         }
         Ok(budget)
@@ -527,7 +847,12 @@ impl BrowserRich {
             images.insert(destination.clone(), resource.image.clone());
         }
         let mut surfaces = BTreeMap::new();
+        let mut playbooks = BTreeMap::new();
         for surface in &document.surfaces {
+            if let Some(playbook) = &surface.playbook {
+                playbooks.insert(surface.block_id.clone(), playbook.clone());
+                continue;
+            }
             let retained = RetainedSurface::new(
                 SurfaceIdentity {
                     owner: surface.block_id.clone(),
@@ -565,6 +890,9 @@ impl BrowserRich {
         }
         Ok(Self {
             surfaces,
+            playbooks,
+            terminal_rows: RefCell::default(),
+            projections: Rc::default(),
             images,
             custom_names,
             theme: PresentationTheme::for_deck(&document.deck),
@@ -573,6 +901,14 @@ impl BrowserRich {
 }
 impl RichContent for BrowserRich {
     fn build<'a>(&'a self, block: &'a Block) -> Option<Element<'a>> {
+        if let Some(playbook) = self.playbooks.get(block.id.as_str()) {
+            return Some(Element::new(BrowserPlaybook {
+                block_id: block.id.as_str(),
+                playbook,
+                terminal_rows: self.terminal_rows.borrow().get(block.id.as_str()).copied(),
+                projections: &self.projections,
+            }));
+        }
         if let Some(surface) = self.surfaces.get(block.id.as_str()) {
             return Some(Element::new(EmbeddedSurface::new(surface)));
         }
@@ -766,6 +1102,314 @@ mod tests {
         })
         .unwrap()
     }
+    fn terminal_frame(width: u16, height: u16) -> BrowserFrame {
+        let scene = Scene::new(Rect::new(0, 0, width, height));
+        let prepared = scene
+            .prepare(Damage::Full, |cx| {
+                cx.set_cell(0, 0, "A", Style::new());
+                cx.set_cell(
+                    i32::from(width - 1),
+                    i64::from(height - 1),
+                    "Z",
+                    Style::new(),
+                );
+            })
+            .unwrap();
+        BrowserFrame::from_prepared(9_007_199_254_740_993, &prepared).unwrap()
+    }
+    fn playbook() -> AudiencePlaybook {
+        AudiencePlaybook {
+            title: "Authored terminal".into(),
+            status: "Running".into(),
+            progress: 5000,
+            terminal: terminal_frame(100, 40),
+        }
+    }
+    #[test]
+    fn playbook_fit_reserves_only_scaled_terminal_and_keeps_chrome_cells() {
+        let playbook = playbook();
+        let projections = RefCell::default();
+        let component = BrowserPlaybook {
+            block_id: "demo",
+            playbook: &playbook,
+            terminal_rows: Some(24),
+            projections: &projections,
+        };
+        let mut cx = LayoutCx::default();
+        let narrow = component.layout(Constraints::for_width(25), &mut cx);
+        assert_eq!(narrow.children[0].node.size.height, 3);
+        assert_eq!(narrow.children[1].node.size.height, 10);
+        assert_eq!(narrow.size.height, 13);
+        let wide = component.layout(Constraints::for_width(120), &mut cx);
+        assert_eq!(wide.children[0].node.size.height, 3);
+        assert_eq!(wide.children[1].node.size.height, 24);
+        let scene = Scene::new(Rect::new(0, 0, 25, 30));
+        let prepared = scene
+            .prepare(Damage::Full, |cx| component.paint(&narrow, cx))
+            .unwrap();
+        let cells = prepared.buffer().cells();
+        assert_eq!(cells[0].symbol, "A");
+        assert_eq!(cells[1].symbol, "u");
+        assert!(cells[75..325].iter().all(|cell| cell.symbol == " "));
+        assert_eq!(prepared.metadata_availability().len(), 1);
+        assert_eq!(
+            prepared.metadata_availability()[0].area,
+            Rect::new(0, 3, 25, 10)
+        );
+        assert!(!prepared.metadata_availability()[0].selection);
+        assert!(!prepared.metadata_availability()[0].semantics);
+        let batch = projections.borrow();
+        let projected = &batch.surfaces[0];
+        assert_eq!(projected.frame, playbook.terminal);
+        assert_eq!(projected.width, 25.0);
+        assert_eq!(projected.height, 10.0);
+        assert!(projected.frame_json.contains("9007199254740993"));
+    }
+    #[test]
+    fn playbook_fractional_destination_and_scrolled_clip_share_paint_origin() {
+        let playbook = playbook();
+        let projections = RefCell::default();
+        let component = BrowserPlaybook {
+            block_id: "demo",
+            playbook: &playbook,
+            terminal_rows: None,
+            projections: &projections,
+        };
+        let layout = component.layout(Constraints::for_width(23), &mut LayoutCx::default());
+        assert_eq!(layout.size.height, 13);
+        let scene = Scene::new(Rect::new(0, 0, 30, 12));
+        let prepared = scene
+            .prepare(Damage::Full, |cx| {
+                cx.with_child(4, -5, bmux_tui::paint::LocalRect::new(0, 0, 23, 13), |cx| {
+                    component.paint(&layout, cx);
+                });
+            })
+            .unwrap();
+        let batch = projections.borrow();
+        let projected = &batch.surfaces[0];
+        assert_eq!((projected.x, projected.y), (4.0, -2.0));
+        assert!((projected.height - 9.2).abs() < 0.00001);
+        assert_eq!(projected.clip, Rect::new(4, 0, 23, 8));
+        assert_eq!(prepared.metadata_availability()[0].area, projected.clip);
+        assert_eq!(projected.frame.buffer().area(), Rect::new(0, 0, 100, 40));
+        assert_eq!(projected.frame.buffer().cells().last().unwrap().symbol, "Z");
+    }
+    #[test]
+    fn preceding_prose_and_reduced_landscape_height_fit_before_paint() {
+        let deck = crate::DeckBuilder::new("fit")
+            .slide(
+                crate::SlideBuilder::new("slide")
+                    .markdown("intro", "Introductory prose.\n\nSecond paragraph.")
+                    .custom("demo", "playbook", serde_json::Value::Null)
+                    .markdown(
+                        "tail",
+                        (0..40)
+                            .map(|_| "Trailing paragraph.\n\n")
+                            .collect::<String>(),
+                    )
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let mut playbook = playbook();
+        playbook.terminal = terminal_frame(136, 24);
+        let document = AudienceDocument {
+            state: crate::PresentationState::new(&deck),
+            deck,
+            assets: BTreeMap::new(),
+            surfaces: vec![crate::audience::AudienceSurface {
+                block_id: "demo".into(),
+                frame: terminal_frame(1, 1),
+                playbook: Some(playbook),
+            }],
+        };
+        let source = serde_json::to_string(&document).unwrap();
+        let mut renderer = AudienceRenderer::new();
+        let mut heights = Vec::new();
+        for rows in [24, 20, 16] {
+            renderer
+                .prepare(&source, 70, rows, "one".into(), 1)
+                .unwrap();
+            let wire: serde_json::Value =
+                serde_json::from_str(&renderer.pending_surfaces_json().unwrap()).unwrap();
+            let surface = &wire[0];
+            let height = surface["height"].as_f64().unwrap();
+            let width = surface["width"].as_f64().unwrap();
+            let y = surface["y"].as_f64().unwrap();
+            let clip_bottom = surface["clip"]["y"].as_f64().unwrap()
+                + surface["clip"]["height"].as_f64().unwrap();
+            assert!(y + height <= clip_bottom);
+            assert!((width / 136.0 - height / 24.0).abs() < 0.00001);
+            let pending = renderer.pending.as_ref().unwrap();
+            let rich = &pending.content.rich;
+            let mut custom = CustomRegistry::new();
+            custom
+                .register("playbook", SurfaceFactory { rich })
+                .unwrap();
+            let theme = PresentationTheme::for_deck(&document.deck);
+            let viewer = ViewerComponent::new(
+                &document.deck,
+                &document.state,
+                &pending.viewer,
+                &theme,
+                &custom,
+            )
+            .rich_content(rich);
+            let layout = rich
+                .layout_fitted(
+                    &viewer,
+                    Constraints::tight(Size::new(70, rows)),
+                    "presentation/fit/viewer/viewport/content",
+                )
+                .unwrap();
+            let slot = layout
+                .find(&bmux_tui::component::LayoutId::new(
+                    "audience/demo/terminal",
+                ))
+                .unwrap();
+            assert_eq!(
+                f64::from(u16::try_from(slot.size.height).unwrap()),
+                height.ceil()
+            );
+            let available = rich.terminal_rows.borrow()["demo"];
+            assert!(height <= f64::from(u16::try_from(available).unwrap()));
+            heights.push(height);
+            drop(custom);
+            renderer.discard();
+        }
+        assert!(heights[2] < heights[1] && heights[1] <= heights[0]);
+        renderer.prepare(&source, 70, 20, "one".into(), 1).unwrap();
+        let initial: serde_json::Value =
+            serde_json::from_str(&renderer.pending_surfaces_json().unwrap()).unwrap();
+        renderer.commit().unwrap();
+        renderer.scroll_by(12);
+        renderer.prepare(&source, 70, 20, "one".into(), 1).unwrap();
+        let scrolled: serde_json::Value =
+            serde_json::from_str(&renderer.pending_surfaces_json().unwrap()).unwrap();
+        assert_eq!(initial[0]["width"], scrolled[0]["width"]);
+        assert_eq!(initial[0]["height"], scrolled[0]["height"]);
+        assert!(scrolled[0]["y"].as_f64().unwrap() < 0.0);
+        assert_eq!(scrolled[0]["clip"]["y"], 0);
+    }
+    #[test]
+    fn pending_playbook_surfaces_are_transaction_local_and_lossless() {
+        let deck = crate::DeckBuilder::new("test")
+            .slide(
+                crate::SlideBuilder::new("slide")
+                    .custom("demo", "playbook", serde_json::Value::Null)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let document = AudienceDocument {
+            state: crate::PresentationState::new(&deck),
+            deck,
+            assets: BTreeMap::new(),
+            surfaces: vec![crate::audience::AudienceSurface {
+                block_id: "demo".into(),
+                frame: terminal_frame(10, 5),
+                playbook: Some(playbook()),
+            }],
+        };
+        let source = serde_json::to_string(&document).unwrap();
+        let mut renderer = AudienceRenderer::new();
+        assert!(renderer.pending_surfaces_json().is_err());
+        renderer.prepare(&source, 30, 20, "one".into(), 1).unwrap();
+        let json = renderer.pending_surfaces_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let frame = bmux_web_renderer::decode_json(
+            value[0]["frame_json"].as_str().unwrap(),
+            bmux_web_renderer::Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(frame.revision(), 9_007_199_254_740_993);
+        assert!(
+            renderer
+                .pending
+                .as_ref()
+                .unwrap()
+                .content
+                .rich
+                .projections
+                .borrow()
+                .surfaces
+                .is_empty()
+        );
+        renderer.discard();
+        assert!(renderer.pending_surfaces_json().is_err());
+        assert!(renderer.identity.is_none());
+        renderer.prepare(&source, 30, 20, "one".into(), 1).unwrap();
+        renderer.commit().unwrap();
+        assert!(renderer.pending_surfaces_json().is_err());
+        renderer.prepare(&source, 30, 20, "one".into(), 1).unwrap();
+        renderer.reset();
+        assert!(renderer.pending_surfaces_json().is_err());
+        let mut fallback = document;
+        fallback.surfaces[0].playbook = None;
+        let source = serde_json::to_string(&fallback).unwrap();
+        renderer.prepare(&source, 30, 20, "two".into(), 1).unwrap();
+        assert_eq!(renderer.pending_surfaces_json().unwrap(), "[]");
+    }
+    #[test]
+    fn playbook_image_budget_counts_fallback_and_projection_residency() {
+        use bmux_tui::image::{
+            ImageContribution, ImageFit, ImageKey, ImageLifecycle, ImagePixelFormat, ImagePlacement,
+        };
+        let scene = Scene::new(Rect::new(0, 0, 1, 1));
+        let prepared = scene
+            .prepare(Damage::Full, |cx| {
+                cx.push_image(ImageContribution::Present(ImagePlacement {
+                    key: ImageKey::new("pixel"),
+                    payload: ImagePayload::Pixels {
+                        bytes: vec![255; 4],
+                        width: 1,
+                        height: 1,
+                        format: ImagePixelFormat::Rgba8,
+                    },
+                    destination: Rect::new(0, 0, 1, 1),
+                    fit: ImageFit::Contain,
+                    allocation: None,
+                    clip: Rect::new(0, 0, 1, 1),
+                    lifecycle: ImageLifecycle::Frame,
+                }))
+            })
+            .unwrap();
+        let frame = BrowserFrame::from_prepared(1, &prepared).unwrap();
+        let mut document = AudienceDocument::decode(&content()).unwrap();
+        let mut playbook = playbook();
+        playbook.terminal = frame.clone();
+        document.surfaces.push(crate::audience::AudienceSurface {
+            block_id: "demo".into(),
+            frame,
+            playbook: Some(playbook),
+        });
+        let budget = BrowserRich::budget(&document, &BTreeMap::new()).unwrap();
+        assert_eq!(budget.encoded, 24);
+        assert_eq!(budget.decoded, 24);
+    }
+    #[test]
+    fn playbook_projection_cannot_escape_constrained_component_allocation() {
+        let playbook = playbook();
+        let projections = RefCell::default();
+        let component = BrowserPlaybook {
+            block_id: "demo",
+            playbook: &playbook,
+            terminal_rows: None,
+            projections: &projections,
+        };
+        let layout = component.layout(
+            Constraints::tight(Size::new(23, 5)),
+            &mut LayoutCx::default(),
+        );
+        let scene = Scene::new(Rect::new(0, 0, 80, 40));
+        let _prepared = scene
+            .prepare(Damage::Full, |cx| component.paint(&layout, cx))
+            .unwrap();
+        let batch = projections.borrow();
+        assert_eq!(batch.surfaces[0].clip, Rect::new(0, 3, 5, 2));
+        assert_eq!(batch.surfaces[0].width, 5.0);
+        assert_eq!(batch.surfaces[0].height, 2.0);
+    }
     #[test]
     fn resize_and_discard_do_not_advance_committed_identity() {
         let mut renderer = AudienceRenderer::new();
@@ -855,12 +1499,12 @@ mod tests {
         let mut renderer = AudienceRenderer::new();
         renderer.prepare(&source, 30, 10, "one".into(), 1).unwrap();
         renderer.commit().unwrap();
-        let admitted = Arc::clone(renderer.admitted.as_ref().unwrap());
+        let admitted = Rc::clone(renderer.admitted.as_ref().unwrap());
         assert_eq!(renderer.content_preparations, 1);
         renderer.resources.clear(); // committed rich preparation owns its immutable content
         renderer.prepare(&source, 50, 15, "one".into(), 1).unwrap();
         assert_eq!(renderer.content_preparations, 1);
-        assert!(Arc::ptr_eq(
+        assert!(Rc::ptr_eq(
             &admitted,
             &renderer.pending.as_ref().unwrap().content
         ));
@@ -873,19 +1517,19 @@ mod tests {
                 .unwrap();
             renderer.commit().unwrap();
             assert_eq!(renderer.content_preparations, 1);
-            assert!(Arc::ptr_eq(&admitted, renderer.admitted.as_ref().unwrap()));
+            assert!(Rc::ptr_eq(&admitted, renderer.admitted.as_ref().unwrap()));
         }
         assert!(
             renderer
                 .prepare("invalid", 30, 10, "one".into(), 2)
                 .is_err()
         );
-        assert!(Arc::ptr_eq(&admitted, renderer.admitted.as_ref().unwrap()));
+        assert!(Rc::ptr_eq(&admitted, renderer.admitted.as_ref().unwrap()));
         renderer
             .prepare(&document_content("candidate"), 30, 10, "one".into(), 2)
             .unwrap();
         renderer.discard();
-        assert!(Arc::ptr_eq(&admitted, renderer.admitted.as_ref().unwrap()));
+        assert!(Rc::ptr_eq(&admitted, renderer.admitted.as_ref().unwrap()));
         renderer.prepare(&source, 60, 15, "one".into(), 1).unwrap();
         assert_eq!(renderer.content_preparations, 2);
     }

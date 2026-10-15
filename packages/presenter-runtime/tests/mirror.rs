@@ -6,6 +6,7 @@ fn frame() -> MirrorFrame {
     MirrorFrame {
         interaction_revision: None,
         private_scene: None,
+        playbook: None,
         surface_id: "surface".into(),
         slide_id: "slide".into(),
         revision: 1,

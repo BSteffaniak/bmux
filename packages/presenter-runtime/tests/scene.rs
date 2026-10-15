@@ -31,6 +31,7 @@ impl Owner for Scenes {
         Ok(vec![MirrorFrame {
             interaction_revision: None,
             private_scene: None,
+            playbook: None,
             surface_id: "demo".into(),
             slide_id: cx.state.slide_id.as_ref().unwrap().as_str().into(),
             revision: cx.cursor.revision,

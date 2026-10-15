@@ -63,6 +63,54 @@ fn bounded_diagnostic(source: &str) -> String {
     diagnostic
 }
 
+/// The audience receives the same bounded status as the native header, not diagnostics.
+pub(crate) fn header_status(snapshot: &LifecycleSnapshot) -> String {
+    let status = snapshot.attempt.as_ref().map_or_else(
+        || {
+            snapshot
+                .acknowledgment
+                .clone()
+                .unwrap_or_else(|| "Not running · speed normal".into())
+        },
+        |a| {
+            if a.phase == "script-complete" {
+                format!(
+                    "Complete · {}/{} actions · session retained · {}",
+                    a.step, a.action_count, a.playback_speed
+                )
+            } else {
+                format!(
+                    "{}{} · action {}/{} · {} · {}",
+                    a.phase,
+                    if a.paused { " · paused" } else { "" },
+                    a.step,
+                    a.action_count,
+                    a.playback_speed,
+                    a.current_action
+                )
+            }
+        },
+    );
+    bounded_diagnostic(&status)
+}
+
+pub(crate) fn progress_basis_points(snapshot: &LifecycleSnapshot) -> u16 {
+    let progress = snapshot.attempt.as_ref().map_or(0, |a| {
+        if a.phase == "script-complete" && a.diagnostic.is_none() {
+            return 10000;
+        }
+        let completed = a.step.min(a.action_count).saturating_mul(10000);
+        let fraction = a
+            .typing_done
+            .min(a.typing_total)
+            .saturating_mul(10000)
+            .checked_div(a.typing_total)
+            .unwrap_or(0);
+        completed.saturating_add(fraction) / a.action_count.max(1)
+    });
+    u16::try_from(progress.min(10000)).unwrap_or(10000)
+}
+
 pub struct PlaybookDemo<'a> {
     title: &'a str,
     controller: &'a Controller,
@@ -174,19 +222,7 @@ impl<'a> PlaybookDemo<'a> {
         use bmux_tui_components::progress_bar::{
             ProgressBarComponent, ProgressBarPolicy, ProgressBarStyles, ProgressBarValue,
         };
-        let progress = self.snapshot.attempt.as_ref().map_or(0, |a| {
-            if a.phase == "script-complete" && a.diagnostic.is_none() {
-                return 10000;
-            }
-            let completed = a.step.min(a.action_count).saturating_mul(10000);
-            let fraction = a
-                .typing_done
-                .min(a.typing_total)
-                .saturating_mul(10000)
-                .checked_div(a.typing_total)
-                .unwrap_or(0);
-            (completed + fraction) / a.action_count.max(1)
-        });
+        let progress = u64::from(progress_basis_points(self.snapshot));
         let mut column = Column::new().child(
             ProgressBarComponent::new(
                 "playbook-progress",
@@ -244,35 +280,10 @@ impl<'a> PlaybookDemo<'a> {
         Element::new(column)
     }
     fn header(&self) -> Element<'_> {
-        let status = self.snapshot.attempt.as_ref().map_or_else(
-            || {
-                self.snapshot
-                    .acknowledgment
-                    .clone()
-                    .unwrap_or_else(|| "Not running · speed normal".into())
-            },
-            |a| {
-                if a.phase == "script-complete" {
-                    format!(
-                        "Complete · {}/{} actions · session retained · {}",
-                        a.step, a.action_count, a.playback_speed
-                    )
-                } else {
-                    format!(
-                        "{}{} · action {}/{} · {} · {}",
-                        a.phase,
-                        if a.paused { " · paused" } else { "" },
-                        a.step,
-                        a.action_count,
-                        a.playback_speed,
-                        a.current_action
-                    )
-                }
-            },
-        );
+        let status = header_status(self.snapshot);
         let mut column = Column::new()
             .child(TextBlock::new(self.title))
-            .child(TextBlock::new(bounded_diagnostic(&status)));
+            .child(TextBlock::new(status));
         if !self.audience
             && let Some(error) = &self.snapshot.error
         {

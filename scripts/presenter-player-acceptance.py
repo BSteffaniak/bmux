@@ -64,6 +64,8 @@ class Acceptance(OWNED.Acceptance):
         self.last_click_revision = -1
         self.player = self.audience = None
         self.active = None
+        if args.playbook_fit:
+            self.env["BMUX_PRESENTER_WEB_DELIVERY"] = "document"
 
     def terminal(self):
         if not self.evidence.exists():
@@ -183,7 +185,37 @@ class Acceptance(OWNED.Acceptance):
         require(control["generation"] == self.attempt()["generation"], "speed control generation mismatch")
         return control.get("playback_speed")
 
+    def document(self, url, marker=TITLE):
+        # This fixture has different sentinels from presenter-web-acceptance.py.
+        # Never ask /snapshot for a document audience. Preserve its document
+        # envelope/resource/privacy validation, then match actual nested cells.
+        def ready():
+            envelope, public = super(Acceptance, self).document(url, marker="")
+            text = json.dumps(public, ensure_ascii=False)
+            for surface in public.get("surfaces", []):
+                text += WEB.text(surface["frame"])
+                if surface.get("playbook"):
+                    text += WEB.text(surface["playbook"]["terminal"])
+            return (envelope, public) if marker in text else None
+        return wait_for("player audience document marker", ready, 20)
+
     def audience_capture(self, marker):
+        if self.args.playbook_fit:
+            envelope, public = self.document(self.audience_url, marker)
+            self.document_commit(self.audience, envelope)
+            inspection = self.inspection(self.audience)
+            visible_text = json.dumps(inspection["frame"].get("selection_text", {}))
+            require(not any(label in visible_text for label in
+                            ("[ Half ]", "[ Normal ]", "[ Double ]", "[ Instant ]", "[ Restart ]")),
+                    "document audience contains presenter controls")
+            self.capture_sequence += 1
+            stem = self.root / f"audience-{self.capture_sequence:03d}"
+            stem.with_suffix(".json").write_text(json.dumps({"document": public,
+                "inspection": self.inspection(self.audience)}, indent=2))
+            screenshot = self.audience.call("Page.captureScreenshot", {"format": "png"})
+            stem.with_suffix(".png").write_bytes(base64.b64decode(screenshot["data"], validate=True))
+            stem.with_suffix(".terminal.json").write_text(json.dumps(self.terminal(), indent=2))
+            return public
         if any(marker == payload[:32] for payload in self.payloads):
             # Fixed-canvas embedding clips centrally. Capture a real payload
             # segment visible in both retained projections, not a guessed row.
@@ -220,6 +252,169 @@ class Acceptance(OWNED.Acceptance):
         stem.with_suffix(".terminal.json").write_text(json.dumps(terminal, indent=2))
         require(frame.get("unsupported_metadata") is not None, "compositor metadata availability absent")
         return frame
+
+    def playbook_fit(self):
+        # Run only after the real demo is open and paused with accepted shell
+        # echo drained. Keep existing PTY modal clicks and lifecycle unchanged.
+        import math
+        import fcntl
+        import struct
+        import termios
+
+        def winsize():
+            return list(struct.unpack("HHHH", fcntl.ioctl(self.player.fd,
+                        termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))))
+
+        def authored():
+            envelope, public = self.document(self.audience_url, TITLE)
+            surfaces = [surface for surface in public.get("surfaces", []) if surface.get("playbook")]
+            require(len(surfaces) == 1, "open demo structured playbook surface missing/ambiguous")
+            surface = surfaces[0]
+            playbook = surface["playbook"]
+            require(isinstance(playbook.get("title"), str) and playbook["title"] and
+                    isinstance(playbook.get("status"), str) and playbook["status"] and
+                    isinstance(playbook.get("progress"), int) and 0 <= playbook["progress"] <= 10000,
+                    "structured playbook chrome missing/invalid")
+            return envelope, surface
+
+        envelope, source = authored()
+        terminal = source["playbook"]["terminal"]
+        area = terminal["buffer"]["area"]
+        dimensions = re.search(r'@viewport cols=(\d+) rows=(\d+)', self.approved)
+        require(dimensions is not None and (area["width"], area["height"]) ==
+                tuple(map(int, dimensions.groups())), "structured terminal lost authored rows/cols")
+        terminal_before = self.terminal()
+        pty_before = winsize()
+        require(self.paused(), "fit observation requires paused real demo")
+        observer = self.browser(self.audience_url, 1000, 740, delivery="document")
+        self.document_commit(observer, envelope)
+        observer_before = self.local_scene(observer)
+        observer_pixels = observer.evaluate(WEB.PIXELS)
+        samples, desktop = [], None
+        scenarios = [(1280, 800, False), (390, 844, True), (844, 390, True),
+                     (1280, 800, False)]
+        try:
+            for index, (width, height, mobile) in enumerate(scenarios):
+                self.audience.call("Emulation.setDeviceMetricsOverride", {"width": width,
+                    "height": height, "deviceScaleFactor": 1, "mobile": mobile})
+                previous, stable = None, 0
+                def ready():
+                    nonlocal previous, stable
+                    value = self.viewport_geometry(self.audience)
+                    if not value or value["css"] != [width, height]:
+                        return None
+                    inspection = value.get("inspection")
+                    viewport = inspection and inspection.get("viewport")
+                    if not viewport or abs(viewport["width"] - value["mount"]["width"]) > 1 or abs(
+                            viewport["height"] - value["mount"]["height"]) > 1:
+                        return None
+                    projections = inspection["frame"].get("embedded_surfaces", [])
+                    projections = [p for p in projections if p["block_id"] == source["block_id"]]
+                    if len(projections) != 1:
+                        return None
+                    key = {"viewport": viewport, "projection": projections[0]}
+                    stable = stable + 1 if key == previous else 0
+                    previous = key
+                    return value if stable >= 2 else None
+                value = wait_for("committed live playbook fitted projection", ready, 20)
+                metadata = value["inspection"]["frame"]
+                projection = next(p for p in metadata["embedded_surfaces"]
+                                  if p["block_id"] == source["block_id"])
+                samples.append({"viewport": [width, height], "geometry": value})
+                self.assert_viewport_fit(value, "document")
+                sw, sh = projection["source_width"], projection["source_height"]
+                x, y, pw, ph = (projection[key] for key in ("x", "y", "width", "height"))
+                clip = projection["clip"]
+                require((sw, sh) == (area["width"], area["height"]),
+                        "embedded metadata source dimensions differ from authored terminal")
+                require(all(math.isfinite(number) for number in (x, y, pw, ph)) and
+                        0 < pw <= sw and 0 < ph <= sh and abs(pw / sw - ph / sh) < 1e-8,
+                        "playbook projection is not uniform downscale-to-fit")
+                epsilon = 1e-6
+                require(x >= clip["x"] - epsilon and y >= clip["y"] - epsilon and
+                        x + pw <= clip["x"] + clip["width"] + epsilon and
+                        y + ph <= clip["y"] + clip["height"] + epsilon,
+                        "playbook projection crops source edges outside authoritative clip")
+                viewport = value["inspection"]["viewport"]
+                cols, rows = int(viewport["width"] // 9), int(viewport["height"] // 18)
+                require(clip["x"] >= 0 and clip["y"] >= 0 and
+                        clip["x"] + clip["width"] <= cols and clip["y"] + clip["height"] <= rows,
+                        "playbook clip exceeds committed base Canvas grid")
+                require(math.ceil(ph - epsilon) <= clip["height"] <= math.ceil(ph + epsilon) + 1,
+                        "scaled terminal reserves original-height blank rows")
+                progress_id = "audience/" + source["block_id"] + "/progress"
+                progress = [region for region in metadata["semantics"]["regions"]
+                            if region["id"] == progress_id and region["role"] == "progress"]
+                require(len(progress) == 1 and progress[0]["area"]["height"] == 1 and
+                        progress[0]["area"]["width"] > 0 and
+                        progress[0]["area"]["y"] < y,
+                        "playbook progress is not normal-cell base Canvas chrome")
+                require(not any(region["role"] == "button" for region in metadata["semantics"]["regions"]),
+                        "audience playbook exposes presenter buttons")
+                progress_area = progress[0]["area"]
+                # Plain TextBlock chrome does not promise selection fragments.
+                # Verify its two normal-sized rows from committed raster ink,
+                # using the progress region's authoritative row as the anchor.
+                header_ink = self.audience.evaluate("""(() => {
+ const c=document.getElementById('bmux'), ctx=c.getContext('2d');
+ const cw=c.width/Math.floor(innerWidth/9), ch=c.height/Math.floor(document.getElementById('viewport').clientHeight/18);
+ return """ + json.dumps([progress_area["y"] - 2, progress_area["y"] - 1]) + """.map(row=>{
+ const d=ctx.getImageData(Math.ceil(""" + str(progress_area["x"]) + """*cw),Math.ceil(row*ch),
+ Math.max(1,Math.floor(""" + str(progress_area["width"]) + """*cw)),Math.max(1,Math.floor(ch))).data;
+ let ink=0;for(let i=0;i<d.length;i+=4)if(d[i]+d[i+1]+d[i+2]>180&&d[i+3])ink++;return ink;
+ });})()""")
+                require(all(count > 0 for count in header_ink),
+                        "playbook title/status lack normal-cell base Canvas text rows")
+                if index == 0:
+                    desktop = projection
+                elif index == 1:
+                    require(pw < desktop["width"] and ph < desktop["height"] and
+                            clip["height"] < sh,
+                            "portrait phone playbook did not shrink projection and consumed rows")
+                elif index == 2:
+                    require(pw <= desktop["width"] and ph <= desktop["height"],
+                            "phone landscape projection exceeds desktop scale")
+                else:
+                    require(projection == desktop, "desktop resize retained stale playbook placement")
+                # Observe actual ink in the nested placement, not just a declared
+                # projection. This is not an OCR/content-completeness claim.
+                pixels = self.audience.evaluate("""(() => {
+ const i=window.__bmuxDocumentInspection(),c=document.getElementById('bmux');
+ const p=i.frame.embedded_surfaces.find(p=>p.block_id===%s);
+ const cols=Math.max(1,Math.floor(i.viewport.width/9)),rows=Math.max(1,Math.floor(i.viewport.height/18));
+ const sx=c.width/cols,sy=c.height/rows;
+ const x=Math.ceil(p.x*sx),y=Math.ceil(p.y*sy),w=Math.floor(p.width*sx)-1,h=Math.floor(p.height*sy)-1;
+ if(w<1||h<1)return {ink:false};
+ const b=c.getContext('2d').getImageData(x,y,w,h).data;
+ let varied=false;for(let n=4;n<b.length;n+=4)if(b[n]!==b[0]||b[n+1]!==b[1]||b[n+2]!==b[2]){varied=true;break;}
+ return {ink:varied,width:w,height:h};
+})()""" % json.dumps(source["block_id"]))
+                require(pixels and pixels["ink"], "nested terminal has no actual composited Canvas ink")
+                samples[-1]["nested_pixels"] = pixels
+                current_envelope, current = authored()
+                require(current["playbook"]["terminal"]["buffer"] == terminal["buffer"],
+                        "browser resize changed paused authored terminal scene")
+                current_terminal = self.terminal()
+                require(winsize() == pty_before and
+                        all(current_terminal[key] == terminal_before[key]
+                            for key in ("width", "height", "rows", "controls", "demo")),
+                        "browser resize changed independent committed controlling-terminal evidence")
+                require(self.local_scene(observer) == observer_before and
+                        observer.evaluate(WEB.PIXELS)["checksum"] == observer_pixels["checksum"],
+                        "phone resize changed independent simultaneous audience")
+                samples[-1]["terminal"] = current_terminal
+                samples[-1]["pty_winsize"] = winsize()
+                samples[-1]["publication_revision"] = current_envelope["publication_revision"]
+            self.passed("live playbook document fit: authored terminal; uniform projection; normal chrome; "
+                        "phone rotation/resize; Canvas ink; independent audience and terminal")
+        finally:
+            (self.root / "playbook-fit.private.json").write_text(json.dumps({
+                "source": source, "terminal_baseline": terminal_before,
+                "pty_baseline": pty_before, "samples": samples,
+                "edge_pixel_gap": "fixture has no explicit four-edge sentinel; full source coverage checked geometrically"}, indent=2))
+            # Restore the original audience viewport for subsequent PTY lifecycle.
+            self.audience.call("Emulation.setDeviceMetricsOverride", {"width": 1000,
+                "height": 720, "deviceScaleFactor": 1, "mobile": False})
 
     def separate_host(self):
         host_root = self.root / "managed"
@@ -285,7 +480,8 @@ class Acceptance(OWNED.Acceptance):
         self.player = self.start_player()
         self.own(self.player.child.pid)
         self.audience_url = self.url(self.player)
-        self.audience = self.browser(self.audience_url)
+        self.audience = self.browser(self.audience_url,
+                                     delivery="document" if self.args.playbook_fit else "frame")
         self.audience_capture(TITLE)
         self.player.send(b"\t")
         self.player.send(b"o")
@@ -334,6 +530,16 @@ class Acceptance(OWNED.Acceptance):
         self.stable("Pause changed partial shell input", lambda: self.typed_prefix(0) == paused_prefix
                     and self.lines() == [] and self.attempt()["step"] == progress["step"], seconds=0.6)
         self.audience_capture(self.payloads[0][:32])
+        if self.args.playbook_fit:
+            self.playbook_fit()
+            if self.args.fit_only:
+                self.click("stop")
+                wait_for("fit acceptance explicit Stop cleanup", lambda: self.cleaned(self.active), 25)
+                self.player.send(b"q")
+                wait_for("fit acceptance viewer exit", lambda: self.player.child.poll() is not None, 25)
+                require(self.player.child.returncode == 0, "fit acceptance viewer exit failed")
+                self.unrelated_alive()
+                return
         # Idle Pause is not a transport timeout. Only a deliberately terminated
         # owned observer should expose view recovery, never restart execution.
         self.stable("idle Pause disconnected terminal observer", lambda:
@@ -404,8 +610,14 @@ class Acceptance(OWNED.Acceptance):
         self.audience_capture(self.payloads[2][:32])
         self.click("close")
         wait_for("navigation modal closed", lambda: self.terminal() and not self.terminal()["controls"], 15)
-        wait_for("audience modal hidden after Close", lambda:
-                 self.snapshot(self.audience_url) and "session retained" not in WEB.text(self.snapshot(self.audience_url)), 15)
+        def audience_modal_closed():
+            if self.args.playbook_fit:
+                envelope, public = self.document(self.audience_url, TITLE)
+                self.document_commit(self.audience, envelope)
+                return not any(surface.get("playbook") for surface in public.get("surfaces", []))
+            snapshot = self.snapshot(self.audience_url)
+            return snapshot and "session retained" not in WEB.text(snapshot)
+        wait_for("audience modal hidden after Close", audience_modal_closed, 15)
         self.player.send(b"\x1b[C")
         self.audience_capture("Retained final view")
         require(self.attempt()["generation"] == generation and not self.attempt()["cleanup_acknowledged"],
@@ -478,13 +690,21 @@ def main():
         parser.add_argument("--" + name, type=lambda value: Path(value).resolve(strict=True), required=True)
     parser.add_argument("--state-parent", type=lambda value: Path(value).resolve(strict=True), default=Path("/tmp"))
     parser.add_argument("--auto-assets", action="store_true", help="exercise first-use resolver in owned isolated cache")
+    parser.add_argument("--playbook-fit", action="store_true",
+                        help="document audience live-playbook fit plus existing full PTY player lifecycle")
+    parser.add_argument("--fit-only", action="store_true", help="stop cleanly after focused playbook fit acceptance")
     parser.add_argument("--managed", action="store_true", help="distinct owned provider-enabled managed host")
     args = parser.parse_args()
+    require(not args.fit_only or args.playbook_fit, "--fit-only requires --playbook-fit")
     require(Path("/proc/self/stat").is_file(), "Linux process identity required")
     for name in ("binary", "browser"):
         require(getattr(args, name).is_file() and os.access(getattr(args, name), os.X_OK), "explicit executable required")
     require(args.plugins.is_dir() and args.assets.is_dir(), "explicit staged artifacts required")
-    for name in WEB.ASSETS:
+    required_assets = WEB.ASSETS
+    if args.playbook_fit:
+        required_assets = (*required_assets, "presenter-adapter.js", "bmux_presenter.js",
+                           "bmux_presenter_bg.wasm")
+    for name in required_assets:
         require((args.assets / name).is_file(), "missing built browser asset")
     suite = Acceptance(args)
     try:

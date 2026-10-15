@@ -387,6 +387,99 @@ impl DemoEntry {
     fn compatible(&self, next: &Self) -> bool {
         self.config.playbook == next.config.playbook && self.execution_key == next.execution_key
     }
+    /// Public projection of the full authored terminal, never the native panned viewport.
+    pub(crate) fn audience_playbook(
+        &self,
+        generation: &str,
+        revision: u64,
+    ) -> Result<bmux_presenter::audience::AudiencePlaybook, String> {
+        use bmux_tui::{
+            damage::Damage,
+            geometry::Rect,
+            image::{ImageContribution, ImageKey, ImageLifecycle},
+            paint::LocalRect,
+            presentation::{PresentationLimits, PresentationState},
+        };
+        let source = self.snapshot.surface.as_ref().map(|capture| &capture.frame);
+        if let Some(frame) = source {
+            frame
+                .validate(bmux_web_renderer::Limits::default())
+                .map_err(|error| error.to_string())?;
+            let area = frame.buffer().area();
+            if area.x != 0 || area.y != 0 {
+                return Err("audience terminal must have an origin-zero snapshot".into());
+            }
+        }
+        let size = source.map_or(self.preview_size, |frame| {
+            let area = frame.buffer().area();
+            bmux_tui::geometry::Size::new(area.width, area.height)
+        });
+        if size.width == 0 || size.height == 0 {
+            return Err("empty authored audience terminal dimensions".into());
+        }
+        let scene = PresentationState::new(Rect::new(0, 0, size.width, size.height));
+        let prepared = scene
+            .prepare_bounded(
+                PresentationLimits {
+                    max_cells: 262_144,
+                    max_entries: 16_384,
+                    max_bytes: 16 * 1024 * 1024,
+                },
+                Damage::Full,
+                |cx| {
+                    cx.declare_metadata_availability(
+                        LocalRect::new(0, 0, size.width, size.height),
+                        false,
+                        false,
+                    );
+                    if let Some(frame) = source {
+                        let area = frame.buffer().area();
+                        for (index, cell) in frame.buffer().cells().iter().enumerate() {
+                            if cell.is_wide_continuation() {
+                                continue;
+                            }
+                            let x = u16::try_from(index % usize::from(area.width)).unwrap_or(0);
+                            let y = u16::try_from(index / usize::from(area.width)).unwrap_or(0);
+                            cx.set_cell(i32::from(x), i64::from(y), &cell.symbol, cell.style);
+                        }
+                        for (index, image) in frame.image_scene().placements().enumerate() {
+                            let mut image = image.clone();
+                            // Managed keys can encode owner/session identity. Preserve
+                            // complete image geometry/payload, not private transport IDs.
+                            image.key = ImageKey::new(format!("audience-terminal-{index}"));
+                            image.lifecycle = ImageLifecycle::Frame;
+                            cx.push_image(ImageContribution::Present(image));
+                        }
+                        if let Some(cursor) = frame.cursor() {
+                            cx.set_cursor_local(
+                                cursor.position.x,
+                                cursor.position.y,
+                                cursor.visible,
+                            );
+                        }
+                    }
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or("missing audience terminal preparation")?;
+        let terminal = bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
+            generation, revision, &prepared,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut status = crate::playbook_component::header_status(&self.snapshot);
+        if source.is_none() {
+            status.push_str(" · Terminal preview");
+        }
+        let playbook = bmux_presenter::audience::AudiencePlaybook {
+            title: self.config.title.clone(),
+            status,
+            progress: crate::playbook_component::progress_basis_points(&self.snapshot),
+            terminal,
+        };
+        playbook.validate()?;
+        Ok(playbook)
+    }
+
     pub fn view(&self, audience: bool) -> Element<'_> {
         let mut component = crate::playbook_component::PlaybookDemo::new(
             &self.config.title,
@@ -402,6 +495,123 @@ impl DemoEntry {
         Element::new(component)
     }
 }
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+    use bmux_tui::{
+        damage::Damage,
+        embedded_surface::{RetainedSurface, SurfaceIdentity, SurfaceLimits},
+        geometry::Rect,
+        image::{
+            ImageContribution, ImageFit, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement,
+        },
+        presentation::PresentationState,
+        style::Style,
+    };
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn full_terminal_keeps_corners_images_and_cursor_without_private_identity() {
+        let fixture = reload_tests::Fixture::new();
+        let mut demos =
+            LiveDemos::detached(&reload_tests::deck("s", "old"), &fixture.environment).unwrap();
+        let entry = demos.entries.get_mut("demo").unwrap();
+        entry.open = true;
+        entry.viewport = (99, 88);
+        let area = Rect::new(0, 0, 300, 140);
+        let prepared = PresentationState::new(area)
+            .prepare(Damage::Full, |cx| {
+                for (x, y, text) in [(0, 0, "A"), (299, 0, "B"), (0, 139, "C"), (299, 139, "D")] {
+                    cx.set_cell(x, y, text, Style::new());
+                }
+                cx.set_cursor_local(299, 139, true);
+                cx.push_image(ImageContribution::Present(ImagePlacement {
+                    key: ImageKey::new("private-session-image"),
+                    payload: ImagePayload::Pixels {
+                        bytes: vec![255, 0, 0, 255],
+                        width: 1,
+                        height: 1,
+                        format: bmux_tui::image::ImagePixelFormat::Rgba8,
+                    },
+                    destination: Rect::new(250, 130, 10, 5),
+                    clip: area,
+                    fit: ImageFit::Stretch,
+                    allocation: None,
+                    lifecycle: ImageLifecycle::Frame,
+                }));
+            })
+            .unwrap();
+        let frame = bmux_web_renderer::BrowserFrame::from_prepared_in_generation(
+            "private-session-identity",
+            42,
+            &prepared,
+        )
+        .unwrap();
+        let retained = RetainedSurface::new(
+            SurfaceIdentity {
+                owner: "private-owner".into(),
+                generation: 1,
+                revision: 42,
+            },
+            Arc::new(frame.buffer().clone()),
+            Arc::new(frame.image_scene().clone()),
+            SurfaceLimits {
+                max_cells: 262_144,
+                max_bytes: 16 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        entry.snapshot.error = Some("private diagnostic".into());
+        entry.snapshot.surface = Some(Arc::new(crate::playbook_capture::CaptureSnapshot {
+            attempt_generation: 1,
+            epoch: uuid::Uuid::new_v4(),
+            session: uuid::Uuid::new_v4(),
+            frame: Arc::new(frame),
+            surface: Arc::new(retained),
+        }));
+        let playbook = entry.audience_playbook("public", 7).unwrap();
+        assert_eq!(playbook.terminal.buffer().area(), area);
+        let text = playbook
+            .terminal
+            .buffer()
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect::<String>();
+        for corner in ['A', 'B', 'C', 'D'] {
+            assert!(text.contains(corner));
+        }
+        let cursor = playbook.terminal.cursor().unwrap();
+        assert_eq!(
+            (cursor.position.x, cursor.position.y, cursor.visible),
+            (299, 139, true)
+        );
+        let image = playbook.terminal.image_scene().placements().next().unwrap();
+        assert_eq!(image.destination, Rect::new(250, 130, 10, 5));
+        assert_eq!(
+            image.payload,
+            entry
+                .snapshot
+                .surface
+                .as_ref()
+                .unwrap()
+                .frame
+                .image_scene()
+                .placements()
+                .next()
+                .unwrap()
+                .payload
+        );
+        assert_eq!(playbook.terminal.generation(), "public");
+        assert_eq!(playbook.terminal.revision(), 7);
+        let json = serde_json::to_string(&playbook).unwrap();
+        assert!(!json.contains("private-"));
+        assert!(!json.contains("private diagnostic"));
+        assert_eq!(entry.viewport, (99, 88));
+        assert!(entry.snapshot.attempt.is_none());
+    }
+}
+
 /// Inert allowlist registration. No controller or executable resources in JSON.
 pub(crate) struct DemoFactory;
 impl bmux_presenter::custom::LinkedComponentFactory for DemoFactory {

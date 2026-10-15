@@ -79,6 +79,9 @@ pub struct MirrorFrame {
     pub height: u16,
     pub cells: Vec<WireCell>,
     pub images: Vec<WireImage>,
+    /// Audience-safe authored terminal and chrome; native rendering uses fallback cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playbook: Option<bmux_presenter::audience::AudiencePlaybook>,
     /// Retained target revision, independent of output-only damage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interaction_revision: Option<u64>,
@@ -244,6 +247,7 @@ impl MirrorFrame {
             height: area.height,
             cells,
             images: wire_images,
+            playbook: None,
             interaction_revision: None,
             private_scene: None,
         };
@@ -262,7 +266,10 @@ impl MirrorFrame {
         decode_png: bool,
     ) -> Result<(), HostError> {
         if let Some(scene) = &self.private_scene {
-            if scene.frame.private_scene.is_some() || scene.interactions.len() > 64 {
+            if scene.frame.private_scene.is_some()
+                || scene.frame.playbook.is_some()
+                || scene.interactions.len() > 64
+            {
                 return Err(HostError::Limit);
             }
             scene
@@ -289,6 +296,33 @@ impl MirrorFrame {
             }
         }
         let count = usize::from(self.width) * usize::from(self.height);
+        if let Some(playbook) = &self.playbook {
+            playbook.validate().map_err(|_| HostError::Invalid)?;
+            let terminal = &playbook.terminal;
+            // Optional public data must not smuggle authenticated source geometry,
+            // selection text or operator control identities into audience snapshots.
+            if !terminal.surfaces().is_empty()
+                || !terminal.hits().regions().is_empty()
+                || terminal.focus_scope().is_some()
+                || !terminal.selection_text().is_empty()
+                || !terminal.selection().fragments().is_empty()
+                || !terminal.semantics().regions().is_empty()
+                || terminal.focus().active().is_some()
+            {
+                return Err(HostError::Invalid);
+            }
+            if count
+                .checked_add(terminal.buffer().cells().len())
+                .is_none_or(|total| total > max_cells)
+                || self
+                    .images
+                    .len()
+                    .checked_add(terminal.image_scene().placements().count())
+                    .is_none_or(|total| total > max_cells)
+            {
+                return Err(HostError::Limit);
+            }
+        }
         if count == 0
             || count > max_cells
             || self.cells.len() != count
@@ -384,19 +418,51 @@ fn validate_images(
         {
             return Err(HostError::Invalid);
         }
-        let (bytes, width, height, channels) = match &image.payload {
-            WireImagePayload::Png {
-                bytes,
-                width,
-                height,
-            } => (bytes, *width, *height, 4_usize),
-            WireImagePayload::Pixels {
-                bytes,
-                width,
-                height,
-                rgba,
-            } => (bytes, *width, *height, if *rgba { 4 } else { 3 }),
-        };
+    }
+    let fallback = frame.images.iter().map(|image| match &image.payload {
+        WireImagePayload::Png {
+            bytes,
+            width,
+            height,
+        } => (bytes, *width, *height, 4_usize, true),
+        WireImagePayload::Pixels {
+            bytes,
+            width,
+            height,
+            rgba,
+        } => (bytes, *width, *height, if *rgba { 4 } else { 3 }, false),
+    });
+    let terminal = frame.playbook.iter().flat_map(|playbook| {
+        playbook
+            .terminal
+            .image_scene()
+            .placements()
+            .map(|image| match &image.payload {
+                ImagePayload::Png {
+                    bytes,
+                    width,
+                    height,
+                } => (bytes, *width, *height, 4_usize, true),
+                ImagePayload::Pixels {
+                    bytes,
+                    width,
+                    height,
+                    format,
+                } => (
+                    bytes,
+                    *width,
+                    *height,
+                    if *format == ImagePixelFormat::Rgba8 {
+                        4
+                    } else {
+                        3
+                    },
+                    false,
+                ),
+            })
+    });
+    // Both projections share encoded-wire and decoded-image allocation budgets.
+    for (bytes, width, height, channels, png) in fallback.chain(terminal) {
         if width == 0 || height == 0 || width > 4096 || height > 4096 {
             return Err(HostError::Limit);
         }
@@ -409,26 +475,23 @@ fn validate_images(
         if decoded > 16 * 1024 * 1024 || total > 32 * 1024 * 1024 || bytes.len() > max_bytes {
             return Err(HostError::Limit);
         }
-        match &image.payload {
-            WireImagePayload::Pixels { .. } if bytes.len() != decoded => {
+        if !png && bytes.len() != decoded {
+            return Err(HostError::Invalid);
+        }
+        if png && decode_png {
+            let mut reader = image::ImageReader::with_format(
+                std::io::Cursor::new(bytes),
+                image::ImageFormat::Png,
+            );
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(width);
+            limits.max_image_height = Some(height);
+            limits.max_alloc = Some(32 * 1024 * 1024);
+            reader.limits(limits);
+            let decoded = reader.decode().map_err(|_| HostError::Invalid)?;
+            if decoded.width() != width || decoded.height() != height {
                 return Err(HostError::Invalid);
             }
-            WireImagePayload::Png { .. } if decode_png => {
-                let mut reader = image::ImageReader::with_format(
-                    std::io::Cursor::new(bytes),
-                    image::ImageFormat::Png,
-                );
-                let mut limits = image::Limits::default();
-                limits.max_image_width = Some(width);
-                limits.max_image_height = Some(height);
-                limits.max_alloc = Some(32 * 1024 * 1024);
-                reader.limits(limits);
-                let decoded = reader.decode().map_err(|_| HostError::Invalid)?;
-                if decoded.width() != width || decoded.height() != height {
-                    return Err(HostError::Invalid);
-                }
-            }
-            _ => {}
         }
     }
     Ok(())

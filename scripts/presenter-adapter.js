@@ -142,6 +142,11 @@ export async function createDocumentRenderer({mount}) {
       if (cols > 65535 || rows > 65535 || cols * rows > 262144) throw new Error('Audience viewport cell limit');
       const {cellWidth, cellHeight} = rasterMetrics(cols, rows, ratio);
       const frame = engine.prepare(content, cols, rows, envelope.generation, BigInt(envelope.revision));
+      // Capture the exact speculative Rust layout before another preparation.
+      const projectionsText = engine.pending_surfaces_json();
+      if (projectionsText.length > MAX_BYTES) throw new Error('Audience projection byte limit');
+      const projections = JSON.parse(projectionsText);
+      if (!Array.isArray(projections) || projections.length > 128) throw new Error('Audience projection limit');
       live(token, signal);
       const json = decoder.decode(frame);
       const presentation = presentationQueue.catch(() => {}).then(async () => {
@@ -175,7 +180,48 @@ export async function createDocumentRenderer({mount}) {
           const preparedContext = preparedCanvas.getContext('2d');
           if (!preparedContext) throw new Error('Audience prepared canvas context unavailable');
           preparedContext.drawImage(staging, 0, 0);
-          return {metadata:output.metadata_json(), canvas:preparedCanvas};
+          // Rust owns slot placement and clipping. Rasterize the complete authored
+          // scene independently, then composite it before this transaction commits.
+          for (const projection of projections) {
+            live(token, signal);
+            const {x, y, width:pw, height:ph, clip, frame:source} = projection;
+            const area = source?.buffer?.area;
+            if (![x, y, pw, ph, clip?.x, clip?.y, clip?.width, clip?.height].every(Number.isFinite) ||
+                pw <= 0 || ph <= 0 || !area || !Number.isSafeInteger(area.width) ||
+                !Number.isSafeInteger(area.height) || area.width <= 0 || area.height <= 0 ||
+                area.width * area.height > 262144 || clip.x < 0 || clip.y < 0 ||
+                clip.width < 0 || clip.height < 0 || clip.x + clip.width > cols || clip.y + clip.height > rows)
+              throw new Error('Invalid audience surface projection');
+            const sourceMetrics = rasterMetrics(area.width, area.height,
+              Math.max(cellWidth / 9 * pw / area.width, cellHeight / 18 * ph / area.height));
+            const nested = document.createElement('canvas');
+            nested.id = `bmux-presenter-surface-${++nextCanvasId}`;
+            nested.hidden = true;
+            nested.style.setProperty('display', 'none', 'important');
+            document.body.appendChild(nested);
+            let renderer;
+            try {
+              renderer = new CanvasRenderer(nested.id, sourceMetrics.cellWidth, sourceMetrics.cellHeight);
+              renderer.set_metrics(sourceMetrics.cellWidth, sourceMetrics.cellHeight,
+                `${sourceMetrics.cellHeight * 0.8}px monospace`, sourceMetrics.cellHeight * 0.8);
+              await renderer.present_json(projection.frame_json ?? JSON.stringify(source));
+              live(token, signal);
+              preparedContext.save();
+              try {
+                preparedContext.beginPath();
+                preparedContext.rect(clip.x * cellWidth, clip.y * cellHeight,
+                  clip.width * cellWidth, clip.height * cellHeight);
+                preparedContext.clip();
+                preparedContext.drawImage(nested, x * cellWidth, y * cellHeight, pw * cellWidth, ph * cellHeight);
+              } finally { preparedContext.restore(); }
+            } finally {
+              renderer?.free(); nested.remove(); nested.width = 0; nested.height = 0;
+            }
+          }
+          const metadata = JSON.parse(output.metadata_json());
+          metadata.embedded_surfaces = projections.map(({frame:source, frame_json:_frameJson, ...placement}) =>
+            ({...placement, source_width:source.buffer.area.width, source_height:source.buffer.area.height}));
+          return {metadata:JSON.stringify(metadata), canvas:preparedCanvas};
         } catch (error) {
           preparedCanvas.width = 0; preparedCanvas.height = 0;
           throw error;
@@ -199,8 +245,8 @@ export async function createDocumentRenderer({mount}) {
             live(token, signal);
             const context = canvas.getContext('2d');
             if (!context) throw new Error('Audience canvas context unavailable');
-            // At most four adapter stores coexist: visible, staging, immutable
-            // prepared frame and rollback. Each has the same hard pixel cap.
+            // Rollback and one bounded nested surface store may also coexist.
+            // Every store has the same hard pixel cap; nested stores are released serially.
             backup = document.createElement('canvas');
             backup.width = oldWidth; backup.height = oldHeight;
             const backupContext = backup.getContext('2d');
