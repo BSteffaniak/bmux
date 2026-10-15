@@ -45,9 +45,15 @@ class DeployTests(unittest.TestCase):
 from pathlib import Path
 args=sys.argv[1:]
 if args[0]=='version': print('{"terraform_version":"1.10.9"}')
+elif args[0]=='state':
+ with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('tofu state\\n')
+ if os.environ.get('TEST_FAIL')=='state': sys.exit(1)
+ print(os.environ.get('TEST_MANAGED', ''))
 elif args[0]=='show': print(os.environ['TEST_PLAN'])
 else:
  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('tofu '+args[0]+'\\n')
+ if args[0]=='plan':
+  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('plan args '+ ' '.join(args[1:])+'\\n')
  if os.environ.get('TEST_FAIL')==args[0]:
   print('private-secret',file=sys.stderr); sys.exit(1)
 ''')
@@ -106,6 +112,33 @@ else:
         result, effects = self.run_deploy()
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('pages upload', effects)
+
+    def test_partial_configure_deploys_migration_before_runtime_and_upload(self):
+        self.env['TEST_MANAGED'] = 'cloudflare_worker.live'
+        result, effects = self.run_deploy('configure')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plans = [line for line in effects.splitlines() if line.startswith('plan args')]
+        self.assertEqual(len(plans), 2)
+        self.assertIn('-var=live_migration_only=true', plans[0])
+        self.assertIn('-target=cloudflare_workers_deployment.live', plans[0])
+        self.assertNotIn('-target', plans[1])
+        self.assertNotIn('live_migration_only', plans[1])
+        self.assertEqual(effects.count('tofu apply'), 2)
+        self.assertLess(effects.rindex('state archive'), effects.index('pages upload'))
+        self.assertNotIn('state begin', effects)
+        self.log.unlink()
+        self.env['TEST_FAIL'] = 'apply'
+        result, effects = self.run_deploy('configure')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(effects.count('tofu plan'), 1)
+        self.assertNotIn('pages upload', effects)
+
+    def test_completed_migration_resumes_without_redeploying_migration(self):
+        self.env['TEST_MANAGED'] = 'cloudflare_worker.live\ncloudflare_workers_deployment.live'
+        result, effects = self.run_deploy('configure')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(effects.count('tofu plan'), 1)
+        self.assertNotIn('live_migration_only', effects)
 
     def test_existing_state_list_errors_are_not_treated_as_first_use(self):
         self.env['TEST_FAIL'] = 'state'

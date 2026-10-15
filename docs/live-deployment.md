@@ -274,7 +274,16 @@ ownership. Do not delete/recreate the existing website to make deployment pass.
 
 The workflow owns the Pages project/domain, proxied DNS record, Worker,
 immutable Worker version/deployment, SQLite Durable Object migration/binding,
-and exact `bmux.dev/api/live/*` route. OpenTofu is the only Worker owner; pinned
+and exact `bmux.dev/api/live/*` route. First configure deploys a binding-free
+`v1` class migration before creating the bound runtime version; the route is
+excluded from that migration stage. Resume partial configure from the existing
+encrypted state, without supplying the first-bootstrap completion again. A
+managed Worker may exist before its first version/deployment; an existing managed
+deployment skips the migration stage. Each successful stage archives encrypted
+state before proceeding. Runtime releases omit migrations and replace immutable
+version/deployment records create-before-destroy (the pinned provider's deployment
+delete is state-only), so the new deployment is active before retiring its old
+state record. OpenTofu is the only Worker owner; pinned
 Wrangler is used only for Pages static uploads. All approved infrastructure
 changes and deployment uploads share the same non-cancelling CI concurrency
 lock. State archives preserve encrypted remote bytes, not plaintext state dumps.

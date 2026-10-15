@@ -14,10 +14,27 @@ def plan(address, actions, **extra):
 
 
 class PlanPolicyTests(unittest.TestCase):
+    def test_migration_stage_is_binding_free_and_excludes_route(self):
+        after = {'bindings': [], 'migrations': {'new_tag': 'v1', 'new_sqlite_classes': ['LiveChannel']}}
+        migration = plan('cloudflare_worker_version.live', ['create'], after=after)
+        self.assertTrue(m.validate(migration, configure=True, migration=True))
+        with self.assertRaises(ValueError):
+            m.validate(migration, migration=True)
+        for bindings in (None, [{'name': 'LIVE_CHANNELS'}]):
+            with self.subTest(bindings=bindings), self.assertRaises(ValueError):
+                m.validate(plan('cloudflare_worker_version.live', ['create'],
+                                after=dict(after, bindings=bindings)), configure=True, migration=True)
+        for address in ('cloudflare_workers_route.live', 'cloudflare_pages_project.live'):
+            with self.subTest(address=address), self.assertRaises(ValueError):
+                m.validate(plan(address, ['create']), configure=True, migration=True)
+
     def test_release_updates_version_and_deployment(self):
         for address in m.RELEASE_RESOURCES:
             self.assertTrue(m.validate(plan(address, ['update'])))
         self.assertTrue(m.validate(plan('cloudflare_worker_version.live', ['delete', 'create'])))
+        self.assertTrue(m.validate(plan('cloudflare_workers_deployment.live', ['create', 'delete'])))
+        with self.assertRaises(ValueError):
+            m.validate(plan('cloudflare_workers_deployment.live', ['delete', 'create']), configure=True)
         self.assertTrue(m.validate({'resource_changes': []}))
 
     def test_infrastructure_drift_is_not_release(self):

@@ -261,8 +261,9 @@ def discover(api, config, managed):
     if classic is not None and worker is None:
         raise ImportErrorSafe('Existing classic Worker ownership requires manual reconciliation')
     if worker is not None:
-        # Never guess Worker/version/deployment/DO migration ownership from a name.
-        if not set(ADDRESSES[3:6]).issubset(managed):
+        # Managed Worker identity permits resuming a partial configure even if
+        # version/deployment creation failed. Unmanaged names are never adopted.
+        if ADDRESSES[3] not in managed:
             raise ImportErrorSafe('Existing Worker/version/Durable Object ownership requires manual reconciliation')
     route = unique(api.listing(f'zones/{zone}/workers/routes'), 'pattern', config['hostname'] + '/api/live/*')
     if route is not None:

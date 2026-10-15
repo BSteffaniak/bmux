@@ -75,6 +75,12 @@ resource "cloudflare_worker" "live" {
   lifecycle { prevent_destroy = true }
 }
 
+variable "live_migration_only" {
+  type        = bool
+  default     = false
+  description = "Configure-only first deployment stage: deploy class migration before referencing its binding"
+}
+
 resource "cloudflare_worker_version" "live" {
   account_id         = var.account_id
   worker_id          = cloudflare_worker.live.id
@@ -85,18 +91,21 @@ resource "cloudflare_worker_version" "live" {
     content_file = "${var.relay_directory}/${path}"
     content_type = "application/javascript+module"
   }]
-  bindings = [
+  bindings = [for binding in [
     { name = "LIVE_CHANNELS", type = "durable_object_namespace", class_name = "LiveChannel" },
     { name = "CHANNEL", type = "plain_text", text = "main" },
     { name = "PUBLISHER_KEY_SHA256", type = "plain_text", text = var.publisher_key_sha256 }
-  ]
-  migrations = { new_tag = "v1", new_sqlite_classes = ["LiveChannel"] }
+  ] : binding if !var.live_migration_only]
+  migrations = var.live_migration_only ? { new_tag = "v1", new_sqlite_classes = ["LiveChannel"] } : null
 }
 resource "cloudflare_workers_deployment" "live" {
   account_id  = var.account_id
   script_name = cloudflare_worker.live.name
-  strategy    = "percentage"
-  versions    = [{ percentage = 100, version_id = cloudflare_worker_version.live.id }]
+  # Deployment resources are immutable in pinned provider 5.17.0; Delete is
+  # state-only. Activate the next deployment before retiring the old record.
+  lifecycle { create_before_destroy = true }
+  strategy = "percentage"
+  versions = [{ percentage = 100, version_id = cloudflare_worker_version.live.id }]
 }
 resource "cloudflare_workers_route" "live" {
   zone_id    = var.zone_id

@@ -82,18 +82,36 @@ if [[ "$MODE" == configure ]]; then
     --imports "$WORK/imports.json" "${IMPORT_ARGS[@]}"
 fi
 python3 "$ROOT/scripts/archive-live-state.py" archive "${ADMISSION_ARGS[@]}" > "$WORK/archive-before.json"
-run_private tofu plan -input=false -lock-timeout=5m -out="$WORK/plan"
-if ! tofu show -json "$WORK/plan" > "$WORK/plan.json" 2> "$WORK/deploy.log"; then
-  echo 'Plan inspection failed; provider output suppressed' >&2; exit 1
-fi
 POLICY_ARGS=()
 [[ "$MODE" != configure ]] || POLICY_ARGS+=(--configure)
-python3 "$ROOT/scripts/live-plan-policy.py" "$WORK/plan.json" "${POLICY_ARGS[@]}"
-if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
-  python3 "$ROOT/scripts/archive-live-state.py" begin "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
+MIGRATION_ARGS=()
+if [[ "$MODE" == configure ]]; then
+  MIGRATION_NEEDED="$(python3 -c 'import json,sys; managed=json.load(open(sys.argv[1])); assert isinstance(managed,list) and all(isinstance(x,str) for x in managed); print(str("cloudflare_workers_deployment.live" not in managed).lower())' "$WORK/managed.json")"
+  if [[ "$MIGRATION_NEEDED" == true ]]; then
+    MIGRATION_ARGS=(-var=live_migration_only=true)
+  fi
 fi
-run_private tofu apply -input=false -lock-timeout=5m "$WORK/plan"
-python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-after.json"
+apply_plan() {
+  run_private tofu plan -input=false -lock-timeout=5m "$@" -out="$WORK/plan"
+  if ! tofu show -json "$WORK/plan" > "$WORK/plan.json" 2> "$WORK/deploy.log"; then
+    echo 'Plan inspection failed; provider output suppressed' >&2; exit 1
+  fi
+  local stage_policy=()
+  [[ "${1:-}" != -var=live_migration_only=true ]] || stage_policy=(--migration)
+  python3 "$ROOT/scripts/live-plan-policy.py" "$WORK/plan.json" "${POLICY_ARGS[@]}" "${stage_policy[@]}"
+  if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
+    python3 "$ROOT/scripts/archive-live-state.py" begin "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
+    BOOTSTRAP_COMPLETION=''
+  fi
+  run_private tofu apply -input=false -lock-timeout=5m "$WORK/plan"
+  python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-after.json"
+}
+if [[ ${#MIGRATION_ARGS[@]} -gt 0 ]]; then
+  # Target excludes the route. The migration must be deployed before a runtime
+  # version may bind to its class (Cloudflare error 100123).
+  apply_plan "${MIGRATION_ARGS[@]}" -target=cloudflare_workers_deployment.live
+fi
+apply_plan
 # Pages uploads use the same immutable candidate; Worker deployment remains OpenTofu-owned.
 run_private node "$ARTIFACT/tools/node_modules/wrangler/bin/wrangler.js" pages deploy "$ARTIFACT/site" \
   --project-name="$LIVE_PAGES_PROJECT" --branch=master --commit-hash="$(cat "$ARTIFACT/REVISION")"

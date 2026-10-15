@@ -121,7 +121,9 @@ class Tests(unittest.TestCase):
         api.data[f'accounts/{ACCOUNT}/workers/workers'] = [{'name': 'bmux-live-production', 'id': 'd' * 32}]
         with self.assertRaises(MODULE.ImportErrorSafe):
             MODULE.discover(api, MODULE.configuration(ENV), set())
-        managed = set(MODULE.ADDRESSES[3:6])
+        managed = {'cloudflare_worker.live'}
+        # Resume after Worker creation but before its first version/deployment.
+        MODULE.discover(api, MODULE.configuration(ENV), managed)
         api.data[f'zones/{ZONE}/workers/routes'] = [{'pattern': 'bmux.dev/api/live/*', 'script': 'foreign', 'id': DNS}]
         with self.assertRaises(MODULE.ImportErrorSafe):
             MODULE.discover(api, MODULE.configuration(ENV), managed)
