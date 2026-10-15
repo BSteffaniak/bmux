@@ -1,10 +1,7 @@
-import init, { CanvasRenderer } from '/bmux_web_renderer.js';
-
 // Capability bootstrap is explicit and memory-only. Remove it before any I/O.
 let token = new URLSearchParams(location.hash.slice(1)).get('token');
 history.replaceState(null, '', location.pathname + location.search);
 const status = document.getElementById('status');
-const canvas = document.getElementById('bmux');
 const container = document.getElementById('viewport');
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 let stopped = false;
@@ -116,33 +113,42 @@ function transportRevision(value) {
   if (parsed > 18446744073709551615n) throw new Error('transport revision exceeds u64');
   return parsed;
 }
-function measure() {
-  const style = getComputedStyle(container);
-  const fontSize = Number.parseFloat(style.fontSize);
-  const probe = document.createElement('canvas').getContext('2d');
-  probe.font = `${style.fontSize} ${style.fontFamily}`;
-  const metrics = probe.measureText('M');
-  const height = Number.parseFloat(style.lineHeight);
-  const ascent = metrics.fontBoundingBoxAscent ?? metrics.actualBoundingBoxAscent;
-  const descent = metrics.fontBoundingBoxDescent ?? metrics.actualBoundingBoxDescent;
-  const dpr = window.devicePixelRatio;
-  if (![fontSize, metrics.width, height, ascent, descent, dpr].every(Number.isFinite)
-      || metrics.width <= 0 || height <= 0 || dpr <= 0 || dpr > 8) {
-    throw new Error('font metrics unavailable');
-  }
-  return { width: metrics.width, height, dpr,
-    font: `${fontSize * dpr}px ${style.fontFamily}`,
-    baseline: Math.max(0, Math.min(height, (height - ascent - descent) / 2 + ascent)) * dpr };
-}
 async function run() {
+  // Canvas measurement and WASM are exclusive to fixed-frame delivery.
+  function measure() {
+    const style = getComputedStyle(container);
+    const fontSize = Number.parseFloat(style.fontSize);
+    const probe = document.createElement('canvas').getContext('2d');
+    probe.font = `${style.fontSize} ${style.fontFamily}`;
+    const metrics = probe.measureText('M');
+    const height = Number.parseFloat(style.lineHeight);
+    const ascent = metrics.fontBoundingBoxAscent ?? metrics.actualBoundingBoxAscent;
+    const descent = metrics.fontBoundingBoxDescent ?? metrics.actualBoundingBoxDescent;
+    const requestedDpr = window.devicePixelRatio;
+    if (![fontSize, metrics.width, height, ascent, descent, requestedDpr].every(Number.isFinite)
+        || metrics.width <= 0 || height <= 0 || requestedDpr <= 0) {
+      throw new Error('font metrics unavailable');
+    }
+    // Fixed-frame raster metrics obey the native per-cell limit. CSS cell
+    // metrics (and therefore leased producer resize requests) stay unchanged.
+    const dpr = Math.min(requestedDpr, 4, 256 / metrics.width, 256 / height);
+    return { width: metrics.width, height, dpr,
+      font: `${fontSize * dpr}px ${style.fontFamily}`,
+      baseline: Math.max(0, Math.min(height, (height - ascent - descent) / 2 + ascent)) * dpr };
+  }
   if (token !== null && (!token || token.length > 4096 || /[\r\n]/.test(token))) {
     status.textContent = 'Missing or invalid bootstrap token.';
     token = null;
     return;
   }
+  const { default: init, CanvasRenderer } = await import('/bmux_web_renderer.js');
   await init('/bmux_web_renderer_bg.wasm');
   await document.fonts.ready;
   if (stopped) return;
+  const canvas = document.createElement('canvas');
+  canvas.id = 'bmux';
+  canvas.setAttribute('aria-label', 'Read-only terminal presentation');
+  container.append(canvas);
   const initial = measure();
   const renderer = new CanvasRenderer('bmux', initial.width * initial.dpr, initial.height * initial.dpr);
   renderer.set_metrics(initial.width * initial.dpr, initial.height * initial.dpr, initial.font, initial.baseline);
@@ -166,7 +172,7 @@ async function run() {
       animation = null;
       if (!rendering) {
         try { applyLayout(); }
-        catch { status.textContent = 'Unsupported font or Canvas allocation.'; expire(); }
+        catch { status.textContent = 'Local layout failed; last complete frame retained.'; }
       }
     });
   }
@@ -174,8 +180,9 @@ async function run() {
     if (!layoutPending || stopped) return;
     const metric = measure();
     renderer.set_metrics(metric.width * metric.dpr, metric.height * metric.dpr, metric.font, metric.baseline);
-    canvas.style.width = `${canvas.width / metric.dpr}px`;
-    canvas.style.height = `${canvas.height / metric.dpr}px`;
+    const scale = Math.min(container.clientWidth / canvas.width, container.clientHeight / canvas.height);
+    canvas.style.width = `${canvas.width * scale}px`;
+    canvas.style.height = `${canvas.height * scale}px`;
     layoutPending = false;
     if (!info?.viewport_allowed) return; // Mirror mode never sends resize.
     const cols = Math.min(65535, Math.floor(container.clientWidth / metric.width));
@@ -268,7 +275,7 @@ async function run() {
       status.textContent = `Presentation paused · ${next.presentation_status} · showing last complete frame`;
     }
     info = next;
-    container.style.overflow = next.viewport_allowed ? 'hidden' : 'auto';
+    container.style.overflow = 'hidden';
     pendingViewport = null;
     lastViewport = null;
     scheduleLayout();
@@ -277,6 +284,8 @@ async function run() {
   }
   const observer = new ResizeObserver(scheduleLayout);
   observer.observe(container);
+  addEventListener('resize', scheduleLayout);
+  window.visualViewport?.addEventListener('resize', scheduleLayout);
   document.fonts.addEventListener('loadingdone', scheduleLayout);
   watchDpr();
   // Transport publications and native presentation revisions are independent.
@@ -349,7 +358,10 @@ async function run() {
         try {
           await renderer.present_binary(bytes);
         }
-        finally { rendering = false; }
+        finally {
+          rendering = false;
+          if (layoutPending) scheduleLayout();
+        }
         if (stopped) break;
         pollCursor = announced;
         generation = nextGeneration;
@@ -375,6 +387,8 @@ async function run() {
   } finally {
     expire();
     observer.disconnect();
+    removeEventListener('resize', scheduleLayout);
+    window.visualViewport?.removeEventListener('resize', scheduleLayout);
     document.fonts.removeEventListener('loadingdone', scheduleLayout);
     dprQuery?.removeEventListener('change', onDpr);
     if (animation !== null) cancelAnimationFrame(animation);
@@ -425,7 +439,7 @@ async function runDocument(adapterPath) {
     throw new Error('invalid bootstrap token');
   }
   const module = await import(documentAdapterPath(adapterPath));
-  const adapter = await module.createDocumentRenderer({ canvas });
+  const adapter = await module.createDocumentRenderer({ mount: container });
   if (!adapter || typeof adapter.capability !== 'string' || typeof adapter.prepare !== 'function' ||
       typeof adapter.reset !== 'function' || typeof adapter.free !== 'function') {
     throw new Error('invalid document adapter');
@@ -443,6 +457,9 @@ async function runDocument(adapterPath) {
   }
   let drawTask = null;
   let layoutEpoch = 0;
+  let layoutPending = false;
+  let animation = null;
+  let dprQuery;
   let cursor = null;
   let highWater = null;
   let consecutiveFailures = 0;
@@ -455,9 +472,11 @@ async function runDocument(adapterPath) {
   addEventListener('pagehide', stop);
   function viewport() {
     const bounds = container.getBoundingClientRect();
-    return Object.freeze({ width: Math.max(1, Math.min(16384, Math.floor(bounds.width))),
-      height: Math.max(1, Math.min(16384, Math.floor(bounds.height))),
-      device_pixel_ratio: Math.max(1, Math.min(4, devicePixelRatio || 1)) });
+    // CSS geometry is not a raster allocation. The adapter bounds raster density.
+    const dimension = value => Number.isFinite(value) ? Math.max(1, value) : 1;
+    const density = window.devicePixelRatio;
+    return Object.freeze({ width: dimension(bounds.width), height: dimension(bounds.height),
+      device_pixel_ratio: Number.isFinite(density) && density > 0 ? density : 1 });
   }
   async function resourceFor(document, id) {
     const descriptor = document.resources.find(resource => resource.id === id);
@@ -524,6 +543,7 @@ async function runDocument(adapterPath) {
     }
     for (let attempts = 0; attempts < 8; attempts++) {
       const epoch = layoutEpoch;
+      layoutPending = false;
       const nextViewport = viewport();
       let transaction = null;
       try {
@@ -534,7 +554,10 @@ async function runDocument(adapterPath) {
           throw new Error('invalid document transaction');
         }
         if (stopped || lifetime.signal.aborted) return;
-        if (epoch !== layoutEpoch) continue;
+        const latestViewport = viewport();
+        if (epoch !== layoutEpoch || nextViewport.width !== latestViewport.width ||
+            nextViewport.height !== latestViewport.height ||
+            nextViewport.device_pixel_ratio !== latestViewport.device_pixel_ratio) continue;
         // Adapter commit must be synchronous and all-or-nothing, including metadata.
         transaction.commit();
         transaction = null;
@@ -547,23 +570,46 @@ async function runDocument(adapterPath) {
     throw new Error('local layout changed too frequently');
   }
   async function apply(document) {
-    if (drawTask) await drawTask;
+    // Re-check after awaiting: a queued publication must not race a local reflow.
+    while (drawTask) await drawTask.catch(() => {});
     if (stopped) return;
-    drawTask = draw(document);
-    try { await drawTask; } finally { drawTask = null; }
+    const task = draw(document);
+    drawTask = task;
+    try { await task; } finally {
+      if (drawTask === task) drawTask = null;
+      if (layoutPending) scheduleReflow();
+    }
   }
-  function reflow() {
-    layoutEpoch++;
-    if (committed && !drawTask && !stopped) {
+  function scheduleReflow() {
+    if (animation !== null || stopped) return;
+    animation = requestAnimationFrame(() => {
+      animation = null;
+      if (!layoutPending || !committed || drawTask || stopped) return;
       void apply(committed).catch(() => {
         if (!stopped) status.textContent = 'Local reflow failed; last committed output retained.';
       });
-    }
+    });
   }
+  function reflow() {
+    // Invalidate immediately, even when a prepare is in flight. Its finally block
+    // drains the latest pending layout after success OR failure.
+    layoutEpoch++;
+    layoutPending = true;
+    scheduleReflow();
+  }
+  function watchDpr() {
+    dprQuery?.removeEventListener('change', onDpr);
+    dprQuery = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    dprQuery.addEventListener('change', onDpr, { once: true });
+  }
+  function onDpr() { watchDpr(); reflow(); }
   const observer = new ResizeObserver(reflow);
   observer.observe(container);
   addEventListener('resize', reflow);
   document.fonts.addEventListener('loadingdone', reflow);
+  window.visualViewport?.addEventListener('resize', reflow);
+  watchDpr();
+  void document.fonts.ready.then(() => { if (!stopped) reflow(); });
   try {
     while (!stopped) {
       const controller = new AbortController();
@@ -608,6 +654,9 @@ async function runDocument(adapterPath) {
     removeEventListener('resize', reflow);
     removeEventListener('pagehide', stop);
     document.fonts.removeEventListener('loadingdone', reflow);
+    window.visualViewport?.removeEventListener('resize', reflow);
+    dprQuery?.removeEventListener('change', onDpr);
+    if (animation !== null) cancelAnimationFrame(animation);
     if (drawTask) await drawTask.catch(() => {});
     cache.clear();
     if (window.__bmuxDocumentInspection === inspection) delete window.__bmuxDocumentInspection;

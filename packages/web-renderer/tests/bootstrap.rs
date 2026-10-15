@@ -54,6 +54,40 @@ fn document_delivery_is_explicit_and_does_not_claim_a_shared_viewport() {
 }
 
 #[test]
+fn document_host_is_mount_based_and_canvas_initialization_is_fixed_frame_only() {
+    let source = include_str!("../browser/bootstrap.js");
+    assert!(!source.starts_with("import "));
+    let fixed = source
+        .find("async function run() {")
+        .expect("fixed-frame entry");
+    let canvas_import = source
+        .find("await import('/bmux_web_renderer.js')")
+        .expect("lazy Canvas import");
+    let document = source
+        .find("async function runDocument(adapterPath)")
+        .expect("document entry");
+    assert!(fixed < canvas_import && canvas_import < document);
+    let host = &source[document..];
+    assert!(host.contains("createDocumentRenderer({ mount: container })"));
+    assert!(!host.contains("canvas"));
+    assert!(!host.contains("CanvasRenderer"));
+    assert!(host.contains("layoutPending = true"));
+    assert!(host.contains("if (layoutPending) scheduleReflow()"));
+    assert!(host.contains("if (epoch !== layoutEpoch ||"));
+    assert!(host.contains("window.visualViewport?.addEventListener('resize', reflow)"));
+    assert!(host.contains("dprQuery?.removeEventListener('change', onDpr)"));
+    let shell = include_str!("../browser/index.html");
+    assert!(!shell.contains("<canvas"));
+    assert!(shell.contains("viewport-fit=cover"));
+    let style = include_str!("../browser/style.css");
+    assert!(style.contains("height: 100dvh"));
+    assert!(style.contains("min-width: 0"));
+    assert!(style.contains("min-height: 0"));
+    assert!(style.contains("safe-area-inset-bottom"));
+    assert!(style.contains("contain: size layout"));
+}
+
+#[test]
 fn transport_cursor_is_independent_from_native_presentation_revision() {
     let source = include_str!("../browser/bootstrap.js");
     assert!(source.contains("let pollCursor = null;"));

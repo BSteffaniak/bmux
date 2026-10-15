@@ -4,11 +4,43 @@ import initCanvas, { CanvasRenderer } from './bmux_web_renderer.js';
 
 const CAPABILITY = 'bmux.presenter.audience.v1';
 const MAX_BYTES = 16 * 1024 * 1024;
+const MAX_CANVAS_DIMENSION = 16384;
+const MAX_CANVAS_PIXELS = 16777216;
+
+// Canvas metrics are raster policy only. Never shrink Rust's logical grid to
+// satisfy a backing-store budget. Account for ceil rounding before allocating.
+function rasterMetrics(cols, rows, requestedRatio) {
+  const fits = ratio => {
+    const width = Math.ceil(cols * (9 * ratio));
+    const height = Math.ceil(rows * (18 * ratio));
+    return width <= MAX_CANVAS_DIMENSION && height <= MAX_CANVAS_DIMENSION &&
+      width * height <= MAX_CANVAS_PIXELS;
+  };
+  // The generic Canvas backend supports cell widths >= 1 and heights >= 1.
+  let low = 1 / 9;
+  if (!fits(low)) throw new Error('Audience logical grid exceeds Canvas raster limits');
+  let high = Math.max(low, Math.min(requestedRatio, 128 / 9));
+  if (fits(high)) low = high;
+  else for (let i = 0; i < 48; ++i) {
+    const middle = (low + high) / 2;
+    if (fits(middle)) low = middle;
+    else high = middle;
+  }
+  return {cellWidth:9 * low, cellHeight:18 * low};
+}
 let nextCanvasId = 0;
 const initialized = Promise.all([initPresenter(), initCanvas()]);
 
-export async function createDocumentRenderer({canvas}) {
+export async function createDocumentRenderer({mount}) {
   await initialized;
+  if (!mount || typeof mount.appendChild !== 'function') throw new Error('Audience mount unavailable');
+  const canvas = document.createElement('canvas');
+  canvas.id = 'bmux';
+  canvas.width = 0; canvas.height = 0;
+  canvas.style.width = '0px'; canvas.style.height = '0px';
+  canvas.style.display = 'block';
+  canvas.style.flex = 'none';
+  mount.appendChild(canvas);
   const engine = new AudienceRenderer();
   const staging = document.createElement('canvas');
   staging.id = `bmux-presenter-staging-${++nextCanvasId}`;
@@ -21,6 +53,8 @@ export async function createDocumentRenderer({canvas}) {
   let inFlight = 0;
   let presentationQueue = Promise.resolve();
   let outputGeneration = null;
+  let outputMetrics = null;
+  let pendingTransaction = null;
   let output = null;
   let serial = 0;
   let freed = false;
@@ -33,17 +67,27 @@ export async function createDocumentRenderer({canvas}) {
   const live = (token, signal) => {
     if (freed || token !== serial || signal?.aborted) throw abortError();
   };
-  function releaseOutput() { output?.free(); output = null; }
+  function releaseOutput() {
+    output?.free(); output = null; outputGeneration = null; outputMetrics = null;
+    staging.width = 0; staging.height = 0;
+  }
 
   async function prepare(envelope, viewport, options = {}, scrollRows = 0) {
     if (inFlight >= 2) throw new Error('Audience preparation backpressure');
     ++inFlight;
-    try { return await prepareInner(envelope, viewport, options, scrollRows); }
+    try {
+      // Retained local scrolling must reuse the exact committed CSS viewport,
+      // not a caller-owned object that can change during asynchronous work.
+      const snapshot = Object.freeze({width:viewport.width, height:viewport.height,
+        device_pixel_ratio:viewport.device_pixel_ratio});
+      return await prepareInner(envelope, snapshot, options, scrollRows);
+    }
     finally { --inFlight; }
   }
 
   async function prepareInner(envelope, viewport, {requestResource, signal} = {}, scrollRows = 0) {
     if (freed) throw new Error('Presenter renderer freed');
+    pendingTransaction?.discard();
     const token = ++serial;
     engine.discard();
     if (scrollRows !== 0) engine.scroll_by(scrollRows);
@@ -90,21 +134,30 @@ export async function createDocumentRenderer({canvas}) {
       }
       live(token, signal);
       const {width, height, device_pixel_ratio: ratio = 1} = viewport;
-      if (![width, height, ratio].every(Number.isFinite) || width <= 0 || height <= 0 || ratio <= 0 || ratio > 8)
+      if (![width, height, ratio].every(Number.isFinite) || width <= 0 || height <= 0 || ratio <= 0)
         throw new Error('Invalid audience viewport');
       // Cell metrics are backend policy, not slide layout. Rust performs all wrapping and responsive composition.
-      const cellWidth = 9 * ratio;
-      const cellHeight = 18 * ratio;
       const cols = Math.max(1, Math.floor(width / 9));
       const rows = Math.max(1, Math.floor(height / 18));
       if (cols > 65535 || rows > 65535 || cols * rows > 262144) throw new Error('Audience viewport cell limit');
+      const {cellWidth, cellHeight} = rasterMetrics(cols, rows, ratio);
       const frame = engine.prepare(content, cols, rows, envelope.generation, BigInt(envelope.revision));
       live(token, signal);
       const json = decoder.decode(frame);
       const presentation = presentationQueue.catch(() => {}).then(async () => {
         live(token, signal);
-        if (!output) output = new CanvasRenderer(staging.id, cellWidth, cellHeight);
-        else output.set_metrics(cellWidth, cellHeight, `${cellHeight * 0.8}px monospace`, cellHeight * 0.8);
+        // set_metrics repaints the OLD grid. Recreate on a density change so an
+        // old wide/tall frame cannot allocate beyond the new frame's budget.
+        const metrics = `${cellWidth},${cellHeight}`;
+        if (outputMetrics !== metrics) releaseOutput();
+        if (!output) {
+          output = new CanvasRenderer(staging.id, cellWidth, cellHeight);
+          outputMetrics = metrics;
+        }
+        // Clear the non-authoritative destination before a shape change. Setting
+        // width first on an old tall canvas could transiently exceed the pixel
+        // cap even when both old and new frame sizes individually fit.
+        staging.width = 0; staging.height = 0;
         if (outputGeneration !== null && outputGeneration !== envelope.generation) await output.repair_json(json);
         else await output.present_json(json);
         outputGeneration = envelope.generation;
@@ -118,10 +171,15 @@ export async function createDocumentRenderer({canvas}) {
         const preparedCanvas = document.createElement('canvas');
         preparedCanvas.width = expectedWidth;
         preparedCanvas.height = expectedHeight;
-        const preparedContext = preparedCanvas.getContext('2d');
-        if (!preparedContext) throw new Error('Audience prepared canvas context unavailable');
-        preparedContext.drawImage(staging, 0, 0);
-        return {metadata:output.metadata_json(), canvas:preparedCanvas};
+        try {
+          const preparedContext = preparedCanvas.getContext('2d');
+          if (!preparedContext) throw new Error('Audience prepared canvas context unavailable');
+          preparedContext.drawImage(staging, 0, 0);
+          return {metadata:output.metadata_json(), canvas:preparedCanvas};
+        } catch (error) {
+          preparedCanvas.width = 0; preparedCanvas.height = 0;
+          throw error;
+        }
       });
       presentationQueue = presentation;
       const preparedOutput = await presentation;
@@ -130,39 +188,62 @@ export async function createDocumentRenderer({canvas}) {
       const releasePrepared = () => { preparedCanvas.width = 0; preparedCanvas.height = 0; };
       try { live(token, signal); } catch (error) { releasePrepared(); throw error; }
       let settled = false;
-      return {
+      const transaction = {
         commit() {
           if (settled) throw new Error('Audience transaction already settled');
-          live(token, signal);
-          const context = canvas.getContext('2d');
-          if (!context) throw new Error('Audience canvas context unavailable');
-          // Retain prior pixels and dimensions until both output and Rust authority commit succeed.
-          const backup = document.createElement('canvas');
-          backup.width = canvas.width; backup.height = canvas.height;
-          backup.getContext('2d').drawImage(canvas, 0, 0);
+          let backup = null;
+          let changed = false;
+          const oldWidth = canvas.width, oldHeight = canvas.height;
+          const oldCssWidth = canvas.style.width, oldCssHeight = canvas.style.height;
           try {
+            live(token, signal);
+            const context = canvas.getContext('2d');
+            if (!context) throw new Error('Audience canvas context unavailable');
+            // At most four adapter stores coexist: visible, staging, immutable
+            // prepared frame and rollback. Each has the same hard pixel cap.
+            backup = document.createElement('canvas');
+            backup.width = oldWidth; backup.height = oldHeight;
+            const backupContext = backup.getContext('2d');
+            if (!backupContext) throw new Error('Audience rollback canvas context unavailable');
+            if (oldWidth && oldHeight) backupContext.drawImage(canvas, 0, 0);
+            changed = true;
+            canvas.width = 0; canvas.height = 0;
             canvas.width = preparedCanvas.width; canvas.height = preparedCanvas.height;
             context.drawImage(preparedCanvas, 0, 0);
+            // Display the logical grid footprint without stretching cells to
+            // absorb viewport remainders. The host centers the unused space.
+            canvas.style.width = `${cols * 9}px`; canvas.style.height = `${rows * 18}px`;
             engine.commit();
+            committed = {envelope, viewport, requestResource, metadata:preparedMetadata};
           } catch (error) {
-            canvas.width = backup.width; canvas.height = backup.height;
-            context.drawImage(backup, 0, 0);
-            engine.discard();
+            try {
+              if (changed) {
+                canvas.width = 0; canvas.height = 0;
+                canvas.width = oldWidth; canvas.height = oldHeight;
+                canvas.style.width = oldCssWidth; canvas.style.height = oldCssHeight;
+                if (oldWidth && oldHeight) canvas.getContext('2d').drawImage(backup, 0, 0);
+              }
+            } finally {
+              if (token === serial) engine.discard();
+            }
+            throw error;
+          } finally {
             settled = true;
             releasePrepared();
-            throw error;
+            if (backup) { backup.width = 0; backup.height = 0; }
+            if (pendingTransaction === transaction) pendingTransaction = null;
           }
-          settled = true;
-          releasePrepared();
-          committed = {envelope, viewport, requestResource, metadata:preparedMetadata};
         },
         discard() {
           if (settled) return;
           settled = true;
           releasePrepared();
+          if (pendingTransaction === transaction) pendingTransaction = null;
           if (token === serial) { engine.discard(); }
         },
       };
+      pendingTransaction = transaction;
+      return transaction;
     } catch (error) {
       if (token === serial) { engine.discard(); }
       throw error;
@@ -171,7 +252,7 @@ export async function createDocumentRenderer({canvas}) {
 
   // View-local input never changes authoritative slide/reveal state.
   async function scroll(rows) {
-    if (!committed || inputPending || freed) return;
+    if (!committed || inputPending || freed || inFlight || pendingTransaction) return;
     inputPending = true;
     localAbort = new AbortController();
     const previous = committed;
@@ -183,8 +264,15 @@ export async function createDocumentRenderer({canvas}) {
       if (error.name !== 'AbortError') console.error('Audience local scroll rejected', error);
     } finally { inputPending = false; localAbort = null; }
   }
-  const wheel = event => { if (committed && event.deltaY !== 0) { event.preventDefault(); void scroll(event.deltaY > 0 ? 3 : -3); } };
+  const wheel = event => {
+    // Leave browser zoom and horizontal gestures to the browser.
+    if (committed && !event.defaultPrevented && !event.ctrlKey && !event.metaKey &&
+        Number.isFinite(event.deltaY) && event.deltaY !== 0 && Math.abs(event.deltaY) >= Math.abs(event.deltaX || 0)) {
+      event.preventDefault(); void scroll(event.deltaY > 0 ? 3 : -3);
+    }
+  };
   const key = event => {
+    if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.isComposing) return;
     const offsets = {ArrowDown:1, ArrowUp:-1, PageDown:Math.max(1, Math.floor((committed?.viewport.height ?? 18) / 18) - 1),
       PageUp:-Math.max(1, Math.floor((committed?.viewport.height ?? 18) / 18) - 1), Home:-2147483647, End:2147483647};
     if (committed && Object.hasOwn(offsets, event.key)) { event.preventDefault(); void scroll(offsets[event.key]); }
@@ -195,11 +283,17 @@ export async function createDocumentRenderer({canvas}) {
   return {
     capability:CAPABILITY, prepare,
     inspectCommittedFrame() { return committed ? JSON.parse(committed.metadata) : null; },
-    reset() { ++serial; localAbort?.abort(); committed = null; engine.reset(); loaded.clear(); presentationQueue.finally(() => { if (!freed) { output?.reset(); outputGeneration = null; } }).catch(() => {}); },
+    reset() {
+      pendingTransaction?.discard(); ++serial; localAbort?.abort(); committed = null;
+      engine.reset(); loaded.clear();
+      presentationQueue.finally(() => { if (!freed) releaseOutput(); }).catch(() => {});
+    },
     free() {
       if (freed) return;
+      pendingTransaction?.discard();
       freed = true; ++serial; localAbort?.abort();
       canvas.removeEventListener('wheel', wheel); canvas.removeEventListener('keydown', key);
+      canvas.remove(); canvas.width = 0; canvas.height = 0;
       engine.free(); presentationQueue.finally(() => { releaseOutput(); staging.remove(); }).catch(() => {}); loaded.clear(); committed = null;
     },
   };

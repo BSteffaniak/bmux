@@ -256,7 +256,8 @@ class Acceptance:
             return match[0].decode() if match else None
         return wait_for("presenter browser URL", ready, 30)
 
-    def browser(self, url, width=1000, height=720, rejected=False, delivery="frame"):
+    def browser(self, url, width=1000, height=720, rejected=False, delivery="frame",
+                dpr=1, mobile=False):
         parts = urllib.parse.urlsplit(url)
         query = dict(urllib.parse.parse_qsl(parts.query))
         query["delivery"] = delivery
@@ -295,7 +296,7 @@ class Acceptance:
         client.call("Page.enable")
         client.call("Network.enable")
         client.call("Emulation.setDeviceMetricsOverride", {"width": width, "height": height,
-                    "deviceScaleFactor": 1, "mobile": False})
+                    "deviceScaleFactor": dpr, "mobile": mobile})
         if delivery == "document":
             client.call("Page.addScriptToEvaluateOnNewDocument", {"source": DOCUMENT_PROBE +
                         "\nwindow.__audiencePixels = () => " + WEB.PIXELS + ";"})
@@ -381,14 +382,14 @@ class Acceptance:
         self.cases.append(label)
         print("PASS " + label, flush=True)
 
-    def stop(self, process, url=None):
+    def stop(self, process, url=None, feed_path="/snapshot"):
         process.child.send_signal(signal.SIGINT)
         wait_for("owned presenter shutdown", lambda: process.child.poll() is not None, 10)
         require(process.child.returncode == 0, "presenter shutdown failed")
         if url:
             origin, token = self.endpoint(url)
             try:
-                status, _ = WEB.http(origin, "/snapshot", token)
+                status, _ = WEB.http(origin, feed_path, token)
             except (OSError, urllib.error.URLError):
                 status = 0
             require(status != 200, "shutdown retained healthy browser feed")
@@ -514,6 +515,201 @@ class Acceptance:
                 screenshot = client.call("Page.captureScreenshot", {"format": "png"})
                 stem.with_suffix(".png").write_bytes(base64.b64decode(screenshot["data"]))
         return result
+
+    def viewport_geometry(self, client):
+        # Read layout, not screenshots: clipping/overflow must not masquerade as fit.
+        return client.evaluate("""(() => {
+ const canvas=document.querySelector('#viewport canvas#bmux');
+ const mount=document.getElementById('viewport');
+ if(!canvas||!mount)return null;
+ const rect=e=>e.getBoundingClientRect().toJSON();
+ const style=getComputedStyle(canvas);
+ return {surface:rect(canvas),mount:rect(mount),backing:[canvas.width,canvas.height],
+  visible:style.display!=='none'&&style.visibility!=='hidden'&&Number(style.opacity)>0,
+  count:mount.querySelectorAll('canvas#bmux').length,
+  css:[innerWidth,innerHeight],dpr:devicePixelRatio,
+  document:[document.documentElement.scrollWidth,document.documentElement.scrollHeight,
+            document.body.scrollWidth,document.body.scrollHeight],
+  longStatus:document.getElementById('status')?.textContent.includes('LONG_STATUS_TOKEN_'),
+  staging:Array.from(document.querySelectorAll('canvas[hidden]'),c=>
+    ({id:c.id,rect:rect(c),display:getComputedStyle(c).display})),
+  inspection:window.__bmuxDocumentInspection?.()??null};
+})()""")
+
+    def viewport_fit(self, delivery):
+        # Real product pipeline with a live terminal mirror. Browser resizes are
+        # view-local; the PTY and authoritative fixed publication stay untouched.
+        process = self.spawn(["present", "play", self.deck, "--presenter", "--web-assets",
+                              self.args.assets, "--web-port", "0", "--web-auth", "none"],
+                             mirror=True, env=dict(self.env, BMUX_PRESENTER_WEB_DELIVERY=delivery))
+        url = self.url(process)
+        def terminal_geometry():
+            # Query the actual owned controlling PTY, not browser-derived scene
+            # metadata. Document delivery intentionally has no /snapshot API.
+            rows, cols, xpixel, ypixel = struct.unpack("HHHH", fcntl.ioctl(
+                process.fd, termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0)))
+            require(rows > 0 and cols > 0, "owned PTY geometry unavailable")
+            evidence = {"pty_winsize": {"rows": rows, "cols": cols,
+                                        "xpixel": xpixel, "ypixel": ypixel}}
+            if delivery == "frame":
+                evidence["snapshot_area"] = dict(self.frame(url)["buffer"]["area"])
+            return evidence
+
+        terminal_baseline = terminal_geometry()
+        envelope = self.document(url)[0] if delivery == "document" else None
+        observer = self.browser(url, 960, 700, delivery=delivery)
+        viewer = self.browser(url, 1280, 800, delivery=delivery)
+        if envelope:
+            self.document_commit(observer, envelope)
+            self.document_commit(viewer, envelope)
+        else:
+            frame = self.frame(url)
+            self.commit(observer, frame)
+            self.commit(viewer, frame)
+        observer_scene = self.local_scene(observer) if envelope else None
+        observer_pixels = observer.evaluate(WEB.PIXELS)
+        observer_geometry = self.viewport_geometry(observer)
+        observer_geometry.pop("inspection", None)
+        samples = [{"terminal_baseline": terminal_baseline}]
+        baselines = {}
+        long_status = False
+        # Repeat desktop after rotation, then a narrow desktop client resize.
+        # mobile=True plus the real viewport meta exercises CSS mobile sizing.
+        scenarios = [(1280, 800, False), (390, 844, True), (844, 390, True),
+                     (1280, 800, False), (620, 480, False)]
+        try:
+            for dpr in (1, 1.25, 2, 3):
+                for index, (width, height, mobile) in enumerate(scenarios):
+                    viewer.call("Emulation.setDeviceMetricsOverride", {"width": width,
+                                "height": height, "deviceScaleFactor": dpr, "mobile": mobile})
+                    previous, stable = None, 0
+                    def settled():
+                        nonlocal previous, stable
+                        value = self.viewport_geometry(viewer)
+                        if not value or value["css"] != [width, height] or value["dpr"] != dpr:
+                            return None
+                        # A successful renderer reflow restores the normal status
+                        # banner. The injected text need not survive that commit.
+                        inspection = value["inspection"]
+                        if envelope:
+                            viewport = inspection and inspection.get("viewport")
+                            if not viewport or viewport.get("device_pixel_ratio") != dpr:
+                                return None
+                            if (abs(viewport["width"] - value["mount"]["width"]) > 1 or
+                                    abs(viewport["height"] - value["mount"]["height"]) > 1):
+                                return None
+                        baseline = None if long_status else baselines.get(index)
+                        if baseline and any(abs(actual - original * dpr) > 3 for actual, original
+                                            in zip(value["backing"], baseline["backing"])):
+                            return None
+                        # Publication counters are not geometry and may keep advancing.
+                        key = {k: v for k, v in value.items() if k != "inspection"}
+                        stable = stable + 1 if key == previous else 0
+                        previous = key
+                        return value if stable >= 2 else None
+                    value = wait_for("viewport-fit layout/density commit", settled)
+                    samples.append({"dpr": dpr, "scenario": index, "geometry": value})
+                    self.assert_viewport_fit(value, delivery)
+                    if dpr == 1:
+                        baselines[index] = value
+                    else:
+                        baseline = baselines[index]
+                        require(all(abs(value["surface"][key] - baseline["surface"][key]) <= 1
+                                    for key in ("x", "y", "width", "height")),
+                                "DPR changed displayed CSS surface size/placement")
+                    if envelope and dpr != 1:
+                        before_frame = dict(baselines[index]["inspection"]["frame"])
+                        after_frame = dict(value["inspection"]["frame"])
+                        before_frame.pop("revision", None)
+                        after_frame.pop("revision", None)
+                        require(before_frame == after_frame,
+                                "DPR changed client-local Rust logical layout")
+                    if index == 3:
+                        require(all(abs(value["surface"][key] - baselines[0]["surface"][key]) <= 1
+                                    for key in ("x", "y", "width", "height")),
+                                "returning from mobile rotation retained stale CSS geometry")
+                    terminal = terminal_geometry()
+                    samples.append({"dpr": dpr, "scenario": index, "terminal": terminal})
+                    require(terminal == terminal_baseline,
+                            "browser viewport/DPR changed owned PTY or fixed publication geometry")
+                    current_observer = self.viewport_geometry(observer)
+                    current_observer.pop("inspection", None)
+                    current_pixels = observer.evaluate(WEB.PIXELS)
+                    if current_observer != observer_geometry or current_pixels["checksum"] != observer_pixels["checksum"]:
+                        (self.root / "independent-observer.private.json").write_text(json.dumps({
+                            "before": observer_geometry, "after": current_observer,
+                            "pixels_before": observer_pixels, "pixels_after": current_pixels}, indent=2))
+                    # Fixed-frame cursor blink may change pixels between
+                    # publications without any layout change. Compare stable
+                    # content/image geometry there; document output is static.
+                    stable_pixels = (current_pixels["checksum"] == observer_pixels["checksum"] if envelope else
+                                     all(current_pixels[key] == observer_pixels[key] for key in
+                                         ("width", "height", "ink", "red", "minX", "minY", "maxX", "maxY")))
+                    require(current_observer == observer_geometry and stable_pixels,
+                            "resizing one audience changed the simultaneous observer")
+                    if envelope:
+                        require(self.local_scene(observer) == observer_scene,
+                                "resizing one audience changed another's local Rust scene")
+            # Safe DOM-only stress of status wrapping; no fake renderer/transport.
+            # Check outer fit, not whether all slide content fits without scrolling.
+            long_status = True
+            viewer.evaluate("document.getElementById('status').textContent = " +
+                            json.dumps("Read-only · " + "LONG_STATUS_TOKEN_" * 32))
+            previous, stable = None, 0
+            value = wait_for("long status viewport relayout", settled)
+            samples.append({"long_status": True, "geometry": value})
+            self.assert_viewport_fit(value, delivery)
+            terminal = terminal_geometry()
+            samples.append({"long_status": True, "terminal": terminal})
+            require(terminal == terminal_baseline,
+                    "long status relayout changed owned PTY or fixed publication geometry")
+            self.stop(process, url, feed_path="/document?version=1" if envelope else "/snapshot")
+            self.passed(delivery + " viewport fit: DPR 1/1.25/2/3; desktop/mobile rotation/resize; "
+                        "density; staging; independent audience; owned PTY geometry; long status")
+        finally:
+            samples.append({"final_geometry": self.viewport_geometry(viewer)})
+            (self.root / ("viewport-fit-" + delivery + ".private.json")).write_text(
+                json.dumps(samples, indent=2))
+
+    def assert_viewport_fit(self, value, delivery):
+        tolerance = 1  # CSS pixels: fractional metrics and scroll dimensions round differently.
+        width, height = value["css"]
+        surface, mount = value["surface"], value["mount"]
+        require(value["visible"] and value["count"] == 1 and
+                surface["width"] > 0 and surface["height"] > 0,
+                "visible mounted audience surface missing/duplicated")
+        for rect in (surface, mount):
+            require(rect["left"] >= -tolerance and rect["top"] >= -tolerance and
+                    rect["right"] <= width + tolerance and rect["bottom"] <= height + tolerance,
+                    "audience surface/mount exceeds CSS viewport")
+        require(surface["left"] >= mount["left"] - tolerance and
+                surface["top"] >= mount["top"] - tolerance and
+                surface["right"] <= mount["right"] + tolerance and
+                surface["bottom"] <= mount["bottom"] + tolerance,
+                "audience surface exceeds available mount")
+        require(all(size <= limit + tolerance for size, limit in
+                    zip(value["document"], (width, height, width, height))),
+                "document has horizontal/vertical overflow")
+        require(all(item["display"] == "none" and item["rect"]["width"] == 0 and
+                    item["rect"]["height"] == 0 for item in value["staging"]),
+                "hidden staging Canvas participates in layout")
+        if delivery == "document":
+            require(value["staging"], "document renderer staging coverage missing")
+            require(all(abs(backing - surface[axis] * value["dpr"]) <= 2 for backing, axis in
+                        zip(value["backing"], ("width", "height"))),
+                    "document CSS pixels conflated with backing density")
+        else:
+            # Fixed-frame contain must scale both axes equally. Its native font
+            # raster may be upscaled to contain; DPR growth is checked against
+            # each scenario's DPR-1 backing above, not against display scaling.
+            # Backing aspect is authoritative, modulo one raster rounding pixel.
+            require(min(abs(surface["width"] - mount["width"]),
+                        abs(surface["height"] - mount["height"])) <= tolerance,
+                    "fixed mirror did not fill the limiting contain dimension")
+            require(abs(surface["width"] * value["backing"][1] -
+                        surface["height"] * value["backing"][0]) <=
+                    value["backing"][0] + value["backing"][1],
+                    "fixed terminal mirror was distorted instead of proportionally contained")
 
     def semantic_audience(self):
         # Dedicated source: long prose must wrap locally, code must remain native,
@@ -1014,6 +1210,10 @@ flowchart LR
             return result.returncode == 0 and json.loads(result.stdout).get("running")
         wait_for("isolated owned server", ready, 30)
         self.cli("present", "check", self.deck)
+        self.run_case(self.viewport_fit, "document")
+        self.run_case(self.viewport_fit, "frame")
+        if self.args.viewport_fit_only:
+            return
         self.run_case(self.play, False)
         self.run_case(self.play, True)
         self.run_case(self.host)
@@ -1067,6 +1267,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("binary", "plugins", "assets", "browser"):
         parser.add_argument("--" + name, type=lambda s: Path(s).resolve(strict=True), required=True)
+    parser.add_argument("--viewport-fit-only", action="store_true",
+                        help="run only C1 document/fixed-mirror real-browser geometry cases")
     parser.add_argument("--state-parent", type=Path, default=Path("/tmp"))
     parser.add_argument("--lan-address", required=True,
                         help="owned machine's non-loopback IPv4 address; required real LAN bind/browser test")

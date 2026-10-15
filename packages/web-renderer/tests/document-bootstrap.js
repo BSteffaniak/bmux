@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { webcrypto } = require('node:crypto');
 let source = fs.readFileSync(`${__dirname}/../browser/bootstrap.js`, 'utf8');
-source = source.replace(/^import .*\n/, '').split('\nconst delivery =')[0]
+source = source.split('\nconst delivery =')[0]
   .replace('await import(documentAdapterPath(adapterPath))', 'await loadAdapter(documentAdapterPath(adapterPath))');
 
 async function audience(width) {
@@ -25,11 +25,18 @@ async function audience(width) {
     content: [123, 125], resources: [{ id, mime_type: 'image/png', length: 3 }] });
   let polls = 0;
   const status = { textContent: '' };
+  const mount = { getBoundingClientRect: () => ({ width, height: 480 }) };
+  const dprListeners = new Set();
+  const visualListeners = new Map();
+  let mounted = false;
   const adapter = {
     capability: 'test.content.v1',
     async prepare(document, viewport, { requestResource, signal }) {
       assert.equal(signal.aborted, false);
       assert.equal(viewport.width, width);
+      assert.equal(viewport.height, 480);
+      assert.equal(viewport.device_pixel_ratio, 0.75);
+      assert.equal(mounted, true);
       assert.equal(Object.isFrozen(document), true);
       assert.deepEqual(Array.from(await requestResource(id)), [1, 2, 3]);
       prepared++;
@@ -56,18 +63,38 @@ async function audience(width) {
     URLSearchParams, TextDecoder, Uint8Array, BigInt, AbortController, Response,
     crypto: webcrypto, performance, console, devicePixelRatio: 2,
       location: { hash: '#token=secret', pathname: '/', search: '?inspect=1' },
-    window: {},
+    window: { devicePixelRatio: 0.75, visualViewport: {
+      addEventListener: (name, fn) => visualListeners.set(name, fn),
+      removeEventListener: name => visualListeners.delete(name),
+    } },
     history: { replaceState() {} },
     document: {
-      getElementById: name => name === 'status' ? status : name === 'viewport'
-        ? { getBoundingClientRect: () => ({ width, height: 480 }) } : {},
-      fonts: { addEventListener() {}, removeEventListener() {} },
+      getElementById: name => {
+        if (name === 'status') return status;
+        if (name === 'viewport') return mount;
+        throw new Error('generic document host must not look up a Canvas');
+      },
+      createElement() { throw new Error('generic document host must not initialize Canvas'); },
+      fonts: { ready: Promise.resolve(), addEventListener() {}, removeEventListener() {} },
     },
     addEventListener: (name, fn) => listeners.set(name, fn),
     removeEventListener: name => listeners.delete(name),
     ResizeObserver: class { constructor(fn) { observers.push(fn); } observe() {} disconnect() {} },
     setTimeout: (fn, ms) => setTimeout(fn, ms === 1000 ? 0 : ms), clearTimeout,
-    loadAdapter: async path => { assert.equal(path, '/adapter.js'); return { createDocumentRenderer: async () => adapter }; },
+    requestAnimationFrame: fn => setTimeout(fn, 0), cancelAnimationFrame: clearTimeout,
+    matchMedia: () => ({
+      addEventListener: (name, fn) => dprListeners.add(fn),
+      removeEventListener: (name, fn) => dprListeners.delete(fn),
+    }),
+    loadAdapter: async path => {
+      assert.equal(path, '/adapter.js');
+      return { createDocumentRenderer: async options => {
+        assert.deepEqual(Object.keys(options), ['mount']);
+        assert.equal(options.mount, mount);
+        mounted = true;
+        return adapter;
+      } };
+    },
     fetch: async (path, options) => {
       paths.push(path);
       assert.equal(options.headers.Authorization, 'Bearer secret');
@@ -123,6 +150,8 @@ async function audience(width) {
   assert.equal(discarded, 2);
   assert.equal(reset, 1);
   assert.equal(freed, 1);
+  assert.equal(dprListeners.size, 0);
+  assert.equal(visualListeners.size, 0);
   assert.equal(context.window.__bmuxDocumentInspection, undefined);
   assert.deepEqual(paths.filter(path => path.startsWith('/document')), [
     '/document?version=1', '/document?version=1&after=1', '/document?version=1', '/document?version=1&after=2',
@@ -132,7 +161,103 @@ async function audience(width) {
   return commits;
 }
 
+// A layout invalidation arriving during a failed prepare must not be lost.
+// This mock is deliberately DOM-only: there is no Canvas/WASM implementation.
+async function failedReflow() {
+  let context;
+  let width = 300;
+  let observer;
+  let prepareCount = 0;
+  let frame = null;
+  let resolveReflow;
+  const finished = new Promise(resolve => { resolveReflow = resolve; });
+  const events = new Map();
+  const fontEvents = new Map();
+  const visualEvents = new Map();
+  let densityChange;
+  const mount = { getBoundingClientRect: () => ({ width, height: 200 }) };
+  const adapter = {
+    capability: 'test.content.v1',
+    async prepare(document, viewport) {
+      prepareCount++;
+      if (prepareCount === 2) {
+        assert.equal(viewport.width, 400);
+        width = 500.25;
+        context.window.devicePixelRatio = 3;
+        // All notification sources coalesce, but invalidate in-flight work now.
+        observer();
+        events.get('resize')();
+        fontEvents.get('loadingdone')();
+        visualEvents.get('resize')();
+        densityChange();
+        await Promise.resolve();
+        throw new Error('failed obsolete preparation');
+      }
+      return {
+        commit() {
+          frame = { ...viewport };
+          if (prepareCount === 3) resolveReflow();
+        },
+        discard() {},
+      };
+    },
+    inspectCommittedFrame: () => frame,
+    reset() {}, free() {},
+  };
+  let polls = 0;
+  context = vm.createContext({
+    URLSearchParams, TextDecoder, Uint8Array, BigInt, AbortController, Response,
+    performance, console,
+    location: { hash: '', pathname: '/', search: '?inspect=1' },
+    history: { replaceState() {} },
+    window: { devicePixelRatio: 1, visualViewport: {
+      addEventListener: (name, fn) => visualEvents.set(name, fn),
+      removeEventListener: name => visualEvents.delete(name),
+    } },
+    document: {
+      getElementById: name => name === 'status' ? { textContent: '' } : mount,
+      fonts: { ready: new Promise(() => {}),
+        addEventListener: (name, fn) => fontEvents.set(name, fn),
+        removeEventListener: name => fontEvents.delete(name) },
+    },
+    addEventListener: (name, fn) => events.set(name, fn),
+    removeEventListener: name => events.delete(name),
+    ResizeObserver: class { constructor(fn) { observer = fn; } observe() {} disconnect() {} },
+    matchMedia: () => ({ addEventListener: (name, fn) => { densityChange = fn; }, removeEventListener() {} }),
+    requestAnimationFrame: fn => setTimeout(fn, 0), cancelAnimationFrame: clearTimeout,
+    setTimeout, clearTimeout,
+    loadAdapter: async () => ({ createDocumentRenderer: async ({ mount: target }) => {
+      assert.equal(target, mount);
+      return adapter;
+    } }),
+    fetch: async () => {
+      if (++polls === 1) return new Response(JSON.stringify({ version: 1,
+        publication_revision: '1', generation: 'source', revision: '1',
+        capability: adapter.capability, content: [123, 125], resources: [] }), {
+        headers: { 'Content-Type': 'application/vnd.bmux.document-v1+json', 'X-Snapshot-Revision': '1' },
+      });
+      width = 400;
+      observer();
+      await finished;
+      const inspection = context.window.__bmuxDocumentInspection();
+      assert.equal(inspection.revision, '1');
+      assert.equal(inspection.viewport.width, 500.25);
+      assert.equal(inspection.viewport.device_pixel_ratio, 3);
+      vm.runInContext('expire()', context);
+      return new Response(null, { status: 204 });
+    },
+  });
+  vm.runInContext(source, context);
+  const watchdog = setTimeout(() => { vm.runInContext('expire()', context); resolveReflow(); }, 2000);
+  try { await vm.runInContext('runDocument("/adapter.js")', context); }
+  finally { clearTimeout(watchdog); }
+  assert.equal(prepareCount, 3);
+  assert.equal(frame.width, 500.25);
+  assert.equal(frame.device_pixel_ratio, 3);
+}
+
 (async () => {
-  assert.deepEqual(await audience(320), await audience(1200));
+  await failedReflow();
+  assert.deepEqual(await audience(320.5), await audience(20000.25));
   console.log('PASS document validation, independent viewports, resource integrity/cache, superseded layout, atomic commit repair, lifecycle, no lease');
 })().catch(error => { console.error(error); process.exitCode = 1; });
