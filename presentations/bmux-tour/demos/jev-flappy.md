@@ -57,6 +57,16 @@ applications or put keys in `@env`, scripts, slide content, or command text.
 
 ## Lifecycle and controls
 
+Jev uses an explicit `choice` judgement with stable `FLAP` and `WAIT` IDs.
+The selected ID is executed directly: confidence and probabilities are displayed
+and validated, never converted into a flap threshold. Each observation includes
+safe gap edges, contact/clear times, ceiling/floor clearance, and exact forecasts
+for both actions using the same physics as the game. Five ticks are committed;
+10/15-tick coasting samples illustrate momentum only, not a mandatory action
+horizon. Forecasting never changes live state or chooses an action. The prompt
+prioritizes immediate survival and tick-5 alignment, not the distant coasting
+endpoint. No recommendation or safety pilot overrides Jev's choice.
+
 Jev chooses flap/wait for five simulation ticks at a time; physics waits for
 each judgement. There is no hidden pilot. Game-over automatically starts another
 attempt. Failed requests freeze physics and retry with bounded backoff. There
@@ -84,7 +94,13 @@ python3 presentations/bmux-tour/demos/jev_flappy.py \
   --control-file /private/attempt/sandbox/.jev-flappy-control.json --control pause
 ```
 
-Other actions are `resume`, `restart`, `status`, and `stop`. Round restart keeps
+Other actions are `resume`, `restart`, `status`, `trace`, and `stop`. `trace`
+returns the newest four retained events with explicit completeness metadata;
+the in-memory ring holds at most 32 events. Decision events contain the exact
+credential-free observation, normalized choice/probabilities/confidence, and
+executed action. Collision events identify ceiling, floor, or pipe. No HTTP
+headers, credential configuration, or upstream diagnostic bodies are retained.
+Round restart keeps
 the best score and discards outstanding decisions. Re-entering the slide is
 inert until explicit presenter Play/Restart.
 
