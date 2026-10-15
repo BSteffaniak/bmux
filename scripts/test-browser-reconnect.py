@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real-browser regression for retained document layout during transport loss."""
 import argparse
+import hashlib
 import http.server
 import importlib.util
 import json
@@ -30,6 +31,9 @@ def wait_for(predicate):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     online = True
+    resource = b'HTTP LAN verified resource'
+    corrupt = False
+    resource_id = hashlib.sha256(resource).hexdigest()
 
     def log_message(self, *_args):
         pass
@@ -48,14 +52,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             data = json.dumps(dict(version=1, publication_revision="1", generation="test",
-                                   capability="test", revision="1", content=[1], resources=[])).encode()
+                                   capability="test", revision="1", content=[1], resources=[dict(
+                                       id=self.resource_id, mime_type='application/octet-stream',
+                                       length=len(self.resource))])).encode()
             mime = "application/vnd.bmux.document-v1+json"
+        elif path == '/resource/' + self.resource_id:
+            data = b'X' + self.resource[1:] if self.corrupt else self.resource
+            mime = 'application/octet-stream'
         elif path == "/test-adapter.js":
             data = b"""export function createDocumentRenderer() {
               window.draws = [];
-              return {capability: 'test', prepare: async (d, v) => ({
-                commit() { window.draws.push(v); }, discard() {}
-              }), reset() {}, free() {}};
+              return {capability: 'test', prepare: async (d, v, host) => {
+                await host.requestResource(d.resources[0].id);
+                return {commit() { window.draws.push(v); }, discard() {}};
+              }, reset() {}, free() {}};
             }"""
         else:
             file = ROOT / "packages/web-renderer/browser" / ("index.html" if path == "/" else path[1:])
@@ -80,6 +90,7 @@ def main():
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         browser = subprocess.Popen([args.browser, "--headless", "--disable-gpu", "--no-first-run",
+                                    '--host-resolver-rules=MAP bmux-lan.test 127.0.0.1', '--no-proxy-server',
                                     "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
                                     "--user-data-dir=" + profile, "about:blank"],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -91,9 +102,11 @@ def main():
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/json", timeout=3) as response:
                 page = next(p for p in json.load(response) if p["type"] == "page")
             client = CDP.CDP(page["webSocketDebuggerUrl"])
-            client.call("Page.navigate", {"url": f"http://127.0.0.1:{server.server_port}/?delivery=document&adapter=/test-adapter.js"})
+            client.call("Page.navigate", {"url": f"http://bmux-lan.test:{server.server_port}/?delivery=document&adapter=/test-adapter.js"})
             evaluate = client.evaluate
             wait_for(lambda: evaluate("window.draws?.length > 0"))
+            assert evaluate('isSecureContext') is False
+            assert evaluate('typeof crypto.subtle') == 'undefined'
             time.sleep(0.2)
             baseline = evaluate("({count:draws.length,height:document.getElementById('viewport').clientHeight})")
             Handler.online = False
@@ -109,7 +122,12 @@ def main():
             Handler.online = True
             wait_for(lambda: evaluate("window.__bmuxDiagnostics().events.some(e => e.code === 'recovered')"))
             assert "Read-only" in evaluate("document.getElementById('status').textContent")
-            print("browser reconnect layout/status/recovery: PASS")
+            # A fresh page has no cached bytes: corruption must prevent commit.
+            Handler.corrupt = True
+            client.call('Page.reload')
+            wait_for(lambda: evaluate("document.getElementById('status').textContent.includes('resource digest mismatch')"))
+            assert evaluate('draws.length') == 0, 'corrupt resource was committed'
+            print("browser HTTP-LAN resource verification, corruption, reconnect: PASS")
         finally:
             if client:
                 client.close()

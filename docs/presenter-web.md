@@ -102,7 +102,10 @@ IPv6. Do not publish a wildcard address as the audience URL. Authentication
 `none` makes the reachable read-only audience public. Authentication `token`
 requires the printed bootstrap URL; treat it as a capability and do not share
 it in logs. Plain HTTP is not a confidential transport; use a trusted network
-or a separately secured deployment. Rebuild native and WASM artifacts together
+or a separately secured deployment. Document resources are SHA-256 verified on
+both HTTPS/localhost (Web Crypto) and plain HTTP LAN origins (a bounded JavaScript
+fallback). This integrity check does not authenticate or encrypt HTTP traffic;
+host/origin allowlists and token settings still apply. Rebuild native and WASM artifacts together
 when their presentation protocol changes.
 
 ## Real-browser acceptance
