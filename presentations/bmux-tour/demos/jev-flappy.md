@@ -105,11 +105,26 @@ pipe positions 488/632 px. Gap tops use its fixed random range. Bird bounds
 are approximated by a 34×24 px box. A flap skips gravity for that tick;
 the top is not lethal, and flapping is disabled above the top boundary.
 
-These values never ramp with score or attempt. The reference is an open-source
-recreation, not verification of the proprietary original binary. Terminal
-rectangular collision/rendering (no sprite hit masks/rotation), seeded randomness,
-center-based scoring, and five-tick agent decisions remain explicit demo
-approximations. Offline tests establish exact forecasts, reference constants,
+These values never ramp with score or attempt. Rendering fits a centered portrait
+playfield with the reference 288×404.48 pixel aspect ratio, assuming terminal
+cells are twice as tall as wide. At the default 100×30 viewport the playfield
+is 31×22 cells: pipes are about 5–6 columns wide and gaps about 5–6 rows tall.
+The unused horizontal space is intentional, not extra game world. Resizing
+letterboxes rather than stretching. Bird art uses the same 34×24 reference box
+as collision geometry (rounded to at least one row), instead of a fixed two-cell
+symbol with an invisible, much wider collision body. Different font cell aspect
+ratios and coarse cell rounding remain visual approximations.
+
+Pipe overlap is unchanged: a 52px pipe plus 34px bird at 128px/s is about
+0.67 simulation seconds (20.2 ticks). At five ticks per API decision, this spans
+roughly four to five decisions; provider latency above 166.7ms still stretches
+wall-clock time. Correcting the camera does not secretly shrink collisions,
+widen gaps, accelerate physics, or claim to eliminate network slow motion.
+
+The reference is an open-source recreation, not verification of the proprietary
+original binary. Terminal rectangular collision/rendering (no sprite hit
+masks/rotation), seeded randomness, center-based scoring, and five-tick agent
+decisions remain explicit demo approximations. Offline tests establish exact forecasts, reference constants,
 lifecycle, and a constant-gap multi-pipe fixture—not Jev's live score or ability
 to survive arbitrary random courses. No live provider benchmark was run.
 

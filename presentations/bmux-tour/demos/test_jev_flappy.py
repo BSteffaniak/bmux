@@ -46,6 +46,73 @@ class FakeRequest:
         self.closed = True
 
 
+class RenderingTests(unittest.TestCase):
+    def test_portrait_aspect_is_preserved_in_wide_and_tall_terminals(self):
+        for rows, cols in [(30, 100), (40, 120), (60, 45), (15, 45)]:
+            field = demo.Playfield.fit(rows, cols)
+            self.assertGreater(field.width, 0)
+            self.assertGreater(field.height, 0)
+            self.assertLessEqual(field.x + field.width, cols - 1)
+            self.assertLessEqual(field.y + field.height, rows - 3)
+            # Physical width/height matches reference to within one column.
+            expected_width = field.height * 2 * 288 / (512 * 0.79)
+            self.assertLessEqual(abs(field.width - expected_width), 1)
+            self.assertLessEqual(abs(field.x - (cols - field.width) / 2), 0.5)
+        self.assertEqual(demo.Playfield.fit(30, 100).width, 31)
+
+    def test_pipe_and_bird_share_reference_geometry_not_independent_glyph_sizes(self):
+        game = demo.Game()
+        field = demo.Playfield.fit(30, 100)
+        pipe = demo.Pipe(game.bird_x + 20, 15)
+        left, right = field.horizontal_bounds(game, pipe.x, game.pipe_width)
+        self.assertIn(right - left, (5, 6))  # Previously 18-19 columns.
+        self.assertLessEqual(abs((right - left) - 52 / 288 * field.width), 1)
+        bird_left, top, bird_right, bottom = field.bird_bounds(game)
+        self.assertIn(bird_right - bird_left, (3, 4))
+        self.assertGreater(bottom, top)
+        self.assertLessEqual(abs((bird_right - bird_left) - 34 / 288 * field.width), 1)
+        # Original 52px pipe + 34px bird takes ~20.2 simulation ticks to cross.
+        crossing_ticks = (game.pipe_width + 2 * game.bird_half_width) / game.pipe_speed
+        self.assertAlmostEqual(crossing_ticks, 86 / (128 / 30))
+
+    def test_draw_clips_offscreen_pipes_and_draws_scaled_bird(self):
+        class Screen:
+            def __init__(self):
+                self.cells = {}
+            def getmaxyx(self):
+                return 30, 100
+            def erase(self):
+                self.cells.clear()
+            def addnstr(self, y, x, value, count, color):
+                for offset, char in enumerate(value[:count]):
+                    self.cells[x + offset, y] = char
+        controller = demo.Controller(CONFIG, request_factory=FakeRequest)
+        game = controller.game
+        game.pipes = [demo.Pipe(40, 15), demo.Pipe(-game.pipe_width - 1, 15),
+                      demo.Pipe(game.width + 1, 15)]
+        screen = Screen()
+        with patch.object(demo.curses, "color_pair", return_value=0):
+            demo.draw(screen, controller)
+        field = demo.Playfield.fit(30, 100)
+        left, right = field.horizontal_bounds(game, 40, game.pipe_width)
+        self.assertEqual({x for (x, y), ch in screen.cells.items() if y == field.y and ch == "█"},
+                         set(range(field.x + left, field.x + right)))
+        # No playfield pixels leak into the unused horizontal margins.
+        for (x, y), char in screen.cells.items():
+            if field.y <= y < field.y + field.height and char != " ":
+                self.assertTrue(field.x <= x < field.x + field.width)
+        bird_left, top, bird_right, bottom = field.bird_bounds(game)
+        for y in range(top, bottom):
+            self.assertEqual("".join(screen.cells[x, y + field.y]
+                                     for x in range(field.x + bird_left, field.x + bird_right)), "██o>")
+        # Bird entirely above the viewport is not pinned to the top row.
+        game.y = -10
+        with patch.object(demo.curses, "color_pair", return_value=0):
+            demo.draw(screen, controller)
+        self.assertNotIn(">", [ch for (x, y), ch in screen.cells.items()
+                               if field.y <= y < field.y + field.height])
+
+
 class GameTests(unittest.TestCase):
     def test_deterministic_and_bounded_across_many_attempts(self):
         a, b = demo.Game(7), demo.Game(7)

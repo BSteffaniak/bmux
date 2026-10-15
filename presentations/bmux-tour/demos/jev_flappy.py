@@ -626,6 +626,44 @@ def send_control(path, command):
             return json.loads(client.recv(65536))
 
 
+@dataclasses.dataclass(frozen=True)
+class Playfield:
+    """Portrait reference viewport, assuming cells are twice as tall as wide.
+
+    Game coordinates are independently normalized on each axis, NOT square
+    pixels. Undo that normalization before fitting into the terminal; never
+    stretch 288x404.48 reference pixels across a wide terminal rectangle.
+    """
+    x: int
+    y: int
+    width: int
+    height: int
+    cell_aspect = 2.0
+    reference_width = 288
+    reference_height = 512 * 0.79
+
+    @classmethod
+    def fit(cls, rows, cols):
+        available_width, available_height = cols - 3, rows - 8
+        columns_per_row = cls.reference_width / cls.reference_height * cls.cell_aspect
+        height = min(available_height, math.floor(available_width / columns_per_row))
+        width = max(1, round(height * columns_per_row))
+        return cls((cols - width) // 2, 5, width, height)
+
+    def horizontal_bounds(self, game, x, width):
+        # Round shared edges once so equal world sizes stay equal on screen.
+        left = round(x / game.width * self.width)
+        right = round((x + width) / game.width * self.width)
+        return max(0, left), min(self.width, right)
+
+    def bird_bounds(self, game):
+        left, right = self.horizontal_bounds(
+            game, game.bird_x - game.bird_half_width, 2 * game.bird_half_width)
+        top = round((game.y - game.bird_half_height) / game.height * self.height)
+        bottom = max(top + 1, round((game.y + game.bird_half_height) / game.height * self.height))
+        return left, max(0, top), right, min(self.height, bottom)
+
+
 def draw(screen, controller):
     rows, cols = screen.getmaxyx()
     screen.erase()
@@ -651,20 +689,22 @@ def draw(screen, controller):
     if rows < 15 or cols < 45:
         text(6, 1, "Resize terminal to at least 45 x 15")
         return
-    field_height = rows - 8
-    field_width = cols - 3
+    field = Playfield.fit(rows, cols)
+    # World dimensions, pipe spacing, collision bounds, and timing do not change
+    # with terminal size. Only the single aspect-preserving camera is resized.
     for pipe in game.pipes:
-        left = max(0, math.floor(pipe.x / game.width * field_width))
-        right = min(field_width, math.ceil((pipe.x + game.pipe_width) / game.width * field_width))
-        for y in range(field_height):
-            world_y = (y + 0.5) / field_height * game.height
-            if abs(world_y - pipe.gap_y) >= game.gap_height / 2:
-                text(y + 5, left + 1, "#" * max(0, right - left), green)
-    x = round(game.bird_x / game.width * field_width) + 1
-    y = min(field_height - 1, max(0, int(game.y / game.height * field_height))) + 5
-    if game.y >= -game.bird_half_height:
-        text(y, x, ">o", yellow)
-    text(rows - 3, 1, "=" * field_width, green)
+        left, right = field.horizontal_bounds(game, pipe.x, game.pipe_width)
+        for y in range(field.height):
+            world_y = (y + 0.5) / field.height * game.height
+            if abs(world_y - pipe.gap_y) >= game.gap_height / 2 and right > left:
+                text(y + field.y, left + field.x, "█" * (right - left), green)
+    left, top, right, bottom = field.bird_bounds(game)
+    for y in range(top, bottom):
+        width = right - left
+        if width > 0:
+            bird = ("█" * max(0, width - 2) + "o>")[-width:]
+            text(y + field.y, left + field.x, bird, yellow)
+    text(field.y + field.height, field.x, "=" * field.width, green)
 
 
 def run(screen, controller, controls):
