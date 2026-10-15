@@ -27,7 +27,7 @@ class AssetParser(HTMLParser):
                     self.bases.add(match[1])
 
 
-def smoke(url):
+def smoke(url, component='all'):
     opener = urllib.request.build_opener(NoRedirect())
     def get(path, limit):
         with opener.open(url + path, timeout=10) as response:
@@ -37,12 +37,15 @@ def smoke(url):
             if not body or len(body) > limit:
                 raise ValueError('Response out of bounds')
             return body
-    for path in ('/api/live/main/health', '/api/live/main/status'):
+    paths = ('/api/live/main/health', '/api/live/main/status') if component != 'site' else ()
+    for path in paths:
         data = json.loads(get(path, 4096))
         if data.get('protocol') != 1 or data.get('renderer') != 'bmwp-3':
             raise ValueError('Unsupported public protocol')
         if path.endswith('/status') and data.get('state') not in ('offline', 'starting', 'live', 'paused'):
             raise ValueError('Unsupported public state')
+    if component == 'backend':
+        return
     parser = AssetParser()
     parser.feed(get('/live', 2 * 1024 * 1024).decode('utf-8'))
     if len(parser.bases) != 1:
@@ -79,16 +82,17 @@ def smoke(url):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url', required=True)
+    parser.add_argument('--component', choices=('all', 'site', 'backend'), default='all')
     args = parser.parse_args()
     parsed = urlsplit(args.url)
     if (parsed.scheme != 'https' and not (parsed.scheme == 'http' and parsed.hostname in ('127.0.0.1', 'localhost'))) or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ('', '/'):
         parser.error('Use HTTPS origin or loopback HTTP; no credentials/query/path')
     try:
-        smoke(args.url.rstrip('/'))
+        smoke(args.url.rstrip('/'), args.component)
     except Exception:
         print('Public smoke failed; transport details suppressed')
         return 1
-    print('Public protocol, status and immutable viewer/WASM integrity passed')
+    print('Public ' + args.component + ' smoke passed')
     return 0
 
 

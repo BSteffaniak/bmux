@@ -17,6 +17,23 @@ on:
       approve_import:
         type: boolean
         default: false
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/live-promote.yml'
+      - 'infra/live-relay/**'
+      - 'infra/live-terraform/**'
+      - 'scripts/build-live-artifact.sh'
+      - 'scripts/live-deploy.sh'
+      - 'scripts/live-plan-policy.py'
+      - 'scripts/archive-live-state.py'
+      - 'scripts/configure-live-imports.py'
+      - 'scripts/live-install.py'
+      - 'plugins/broadcast-plugin/**'
+      - 'plugins/broadcast-plugin-api/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'flake.lock'
   workflow_dispatch:
   pull_request:
     paths: ['infra/live-**', 'scripts/*live*', '.github/workflows/live-*.yml']

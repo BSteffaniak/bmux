@@ -4,16 +4,24 @@ on:
     branches: [master]
     paths:
       - '.github/workflows/docs-deploy.yml'
-      - '.github/workflows/live-*.yml'
       - 'packages/docs-site/**'
       - 'packages/web-renderer/**'
+      - 'packages/presenter/**'
+      - 'packages/presenter-runtime/**'
+      - 'packages/scene-protocol/**'
+      - 'packages/scene-protocol-render/**'
+      - 'packages/snapshot-protocol/**'
+      - 'packages/tui/**'
       - 'packages/cli-schema/**'
       - 'packages/config/**'
       - 'packages/config-doc/**'
       - 'packages/config-doc-derive/**'
-      - 'infra/live-**'
-      - 'scripts/*live*'
+      - 'scripts/build-site-artifact.sh'
       - 'scripts/build-web-renderer.sh'
+      - 'scripts/presenter-adapter.js'
+      - 'infra/live-terraform/tools/package*.json'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'flake.lock'
       - 'docs/**'
       - 'README.md'
@@ -25,8 +33,69 @@ on:
 permissions:
   contents: read
 jobs:
-  # Single Pages owner: live assets are copied BEFORE docs gen, then the same
-  # native/viewer/relay/site artifact goes directly through protected production.
-  promote:
-    uses: ./.github/workflows/live-promote.yml
-    secrets: inherit
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: {node-version: '22.16.0'}
+      - name: Build complete immutable site without deployment secrets
+        run: |
+          bash scripts/dev.sh bash scripts/build-site-artifact.sh "$RUNNER_TEMP/site-candidate"
+          tar -C "$RUNNER_TEMP/site-candidate" -czf "$RUNNER_TEMP/site-candidate.tar.gz" .
+          cd "$RUNNER_TEMP"
+          sha256sum site-candidate.tar.gz > site-candidate.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: site-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/site-candidate.tar.gz
+            ${{ runner.temp }}/site-candidate.tar.gz.sha256
+          retention-days: 14
+          if-no-files-found: error
+  approve:
+    if: github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: production-approval
+    steps:
+      - run: echo 'Approved immutable BMUX static site'
+  deploy:
+    if: github.ref == 'refs/heads/master'
+    needs: [build, approve]
+    environment: Production
+    concurrency:
+      group: bmux-production-pages
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '22.16.0'}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: site-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/site-download
+      # The sole publisher uploads docs AND the content-addressed live viewer.
+      # No OpenTofu, state credentials, Worker apply, or backend health dependency.
+      - name: Publish verified complete site
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          LIVE_PAGES_PROJECT: ${{ secrets.LIVE_PAGES_PROJECT }}
+          LIVE_HOSTNAME: ${{ secrets.LIVE_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/site-download"
+          sha256sum -c site-candidate.tar.gz.sha256
+          mkdir "$RUNNER_TEMP/site-candidate"
+          tar -xzf site-candidate.tar.gz -C "$RUNNER_TEMP/site-candidate"
+          cd "$RUNNER_TEMP/site-candidate"
+          test "$(cat REVISION)" = "$GITHUB_SHA"
+          sha256sum -c SHA256SUMS
+          node tools/node_modules/wrangler/bin/wrangler.js pages deploy site \
+            --project-name="$LIVE_PAGES_PROJECT" --branch=master --commit-hash="$GITHUB_SHA"
+          python3 "$GITHUB_WORKSPACE/scripts/smoke-live-broadcast.py" --url "https://$LIVE_HOSTNAME" --component site

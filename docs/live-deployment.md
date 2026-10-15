@@ -284,23 +284,47 @@ state before proceeding. Runtime releases omit migrations and replace immutable
 version/deployment records create-before-destroy (the pinned provider's deployment
 delete is state-only), so the new deployment is active before retiring its old
 state record. OpenTofu is the only Worker owner; pinned
-Wrangler is used only for Pages static uploads. All approved infrastructure
-changes and deployment uploads share the same non-cancelling CI concurrency
-lock. State archives preserve encrypted remote bytes, not plaintext state dumps.
+Wrangler is used only for Pages static uploads. Approved infrastructure changes
+and backend deployments share the non-cancelling infrastructure concurrency lock;
+Pages uploads use their own non-cancelling lock. State archives preserve encrypted
+remote bytes, not plaintext state dumps.
 
 ## Subsequent releases
 
-Docs pushes on `master` call **Live production release**, or dispatch that
-workflow manually. CI builds once without deployment secrets, verifies the
-artifact checksum and revision, waits for production approval, updates Worker
-code/version deployment and uploads matching website/viewer assets. It rejects
+**Deploy Docs Site** builds and publishes the complete Pages site: docs plus the
+content-addressed live viewer/WASM assets. It is the sole static-site publisher;
+Pages uploads replace the whole site, so never upload separate partial docs/viewer
+directories. Its secret-free build does not compile the native CLI/plugins or
+package the relay. The approved deploy job needs only the Cloudflare token/account,
+Pages project and public hostname, not R2 credentials, an encryption passphrase,
+or OpenTofu. Scope its deployment token to Pages where practical. It verifies the
+candidate archive, inventory and revision, then checks public viewer asset integrity
+without depending on backend availability.
+
+**Live production release** runs independently for backend/infrastructure changes
+on `master`, or by manual dispatch. It packages native/relay/infrastructure assets,
+verifies the candidate checksum and revision, waits for production approval, and
+updates Worker code/version deployment. It never uploads Pages or builds docs or
+viewer assets. Its post-deploy smoke checks only backend health/status. It rejects
 infrastructure creation, imports, DNS/project changes, and destructive changes;
 run Configure Production Infrastructure for deliberate topology changes.
 Immutable Worker-version replacement is the expected release exception.
 No local frontend build, candidate upload, or staging promotion is required.
 
+Independent releases must preserve the explicit `protocol: 1`, `renderer: bmwp-3`
+contract; the viewer rejects unsupported backend representations. A Git revision
+match is not a compatibility mechanism. For an evolving protocol, first ship a
+backend that explicitly supports both old and new representations, then update
+the viewer, and retire old support only after old viewers/publishers are no longer
+supported. Roll back each component independently within that compatibility window.
+Do not bypass compatibility checks to make a deployment pass. The default
+`smoke-live-broadcast.py --url https://bmux.dev` still checks both components for
+end-to-end acceptance.
+
 The normal native installer also supports `bmux broadcast deploy` for separately
-hosted installations; that is not the normal bmux.dev CI deployment path.
+hosted installations; it now applies only the backend, never Pages. Legacy
+ambiguous Pages-upload ledgers still require explicit reconciliation; they are
+not blindly replayed. This is not the normal bmux.dev CI deployment path.
 Installer/provider assets are embedded and verified in a private cache, not
 installed as mutable sidecars. Candidate precedence is explicit absolute
 `--artifact`, then approved saved/explicit release URL plus independently trusted

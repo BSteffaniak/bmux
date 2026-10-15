@@ -20,7 +20,7 @@ class DeployTests(unittest.TestCase):
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         self.artifact = self.root / 'candidate'
-        for directory in ('infrastructure', 'relay', 'site', 'tools/node_modules/wrangler/bin'):
+        for directory in ('infrastructure', 'relay', 'tools/node_modules/wrangler/bin'):
             (self.artifact / directory).mkdir(parents=True)
         (self.artifact / 'REVISION').write_text('a' * 40 + '\n')
         (self.artifact / 'infrastructure/main.tf').write_text('# immutable test module\n')
@@ -85,10 +85,11 @@ else:
         self.assertNotIn('private-secret', result.stdout + result.stderr)
         return result, self.log.read_text() if self.log.exists() else ''
 
-    def test_release_uses_r2_and_uploads_after_apply(self):
+    def test_release_uses_r2_and_smokes_backend_without_pages(self):
         result, effects = self.run_deploy()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(effects.index('tofu apply'), effects.index('pages upload'))
+        self.assertNotIn('pages upload', effects)
+        self.assertLess(effects.index('tofu apply'), effects.index('public smoke'))
         self.assertIn('public smoke', effects)
         self.assertNotIn('imports checked', effects)
 
@@ -113,7 +114,7 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('pages upload', effects)
 
-    def test_partial_configure_deploys_migration_before_runtime_and_upload(self):
+    def test_partial_configure_deploys_migration_before_runtime_and_smoke(self):
         self.env['TEST_MANAGED'] = 'cloudflare_worker.live'
         result, effects = self.run_deploy('configure')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -124,7 +125,8 @@ else:
         self.assertNotIn('-target', plans[1])
         self.assertNotIn('live_migration_only', plans[1])
         self.assertEqual(effects.count('tofu apply'), 2)
-        self.assertLess(effects.rindex('state archive'), effects.index('pages upload'))
+        self.assertNotIn('pages upload', effects)
+        self.assertLess(effects.rindex('state archive'), effects.index('public smoke'))
         self.assertNotIn('state begin', effects)
         self.log.unlink()
         self.env['TEST_FAIL'] = 'apply'

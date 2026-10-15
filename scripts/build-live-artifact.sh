@@ -18,16 +18,6 @@ HOME="$ISOLATED/home" XDG_CONFIG_HOME="$ISOLATED/config" XDG_RUNTIME_DIR="$ISOLA
   BMUX_CONFIG_DIR="$ISOLATED/config" BMUX_RUNTIME_DIR="$ISOLATED/runtime" \
   BMUX_DATA_DIR="$ISOLATED/data" BMUX_STATE_DIR="$ISOLATED/state" BMUX_NO_BASE_CONFIG=1 \
   "$CARGO_TARGET_DIR/release/bmux" plugin rebuild --all-workspace-plugins
-BMUX_WEB_ASSET_OUTPUT="$OUTPUT/viewer" bash scripts/build-web-renderer.sh
-for asset in canvas-viewer.js live-viewer.js live-page.js; do
-  test -s "$OUTPUT/viewer/$asset"
-done
-# build-web-renderer.sh stages only the SHA-256 named immutable bundle in docs
-# public assets BEFORE docs compilation. Do not add an unversioned second copy.
-test -s packages/docs-site/public/live-assets/current-version
-VERSION="$(cat packages/docs-site/public/live-assets/current-version)"
-test -d "packages/docs-site/public/live-assets/$VERSION"
-cargo run --locked --release -p bmux_docs_site -- gen --output "$OUTPUT/site"
 mkdir "$OUTPUT/native" "$OUTPUT/relay" "$OUTPUT/tools"
 cp "$CARGO_TARGET_DIR/release/bmux" "$OUTPUT/native/bmux"
 cp -R infra/live-relay/src/. "$OUTPUT/relay/"

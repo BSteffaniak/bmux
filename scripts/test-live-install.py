@@ -165,16 +165,13 @@ class InstallerTests(unittest.TestCase):
 
     def test_pages_ambiguity_has_separate_ack_no_worker_reapply(self):
         d, operation = self.reviewed()
-        self.tools.fail = 'pages'
-        with self.assertRaises(m.InstallError):
-            d.apply(operation, False)
-        self.assertEqual(d.ledger['phase'], 'pages-uploading')
+        d.phase('pages-uploading')  # Retained ledger from the old combined publisher.
         with self.assertRaises(m.InstallError):
             d.apply(operation, False)
         self.tools.fail = None
         d.ack_pages(operation)
         d.apply(operation, False)
-        self.assertEqual(sum(args[0] == 'apply' for args in self.tools.calls), 1)
+        self.assertEqual(sum(args[0] == 'apply' for args in self.tools.calls), 0)
 
     def test_operation_and_content_identity(self):
         d, operation = self.reviewed()
@@ -218,6 +215,18 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn(SECRET, (self.root / 'ledger.json').read_text())
         self.assertNotIn(SECRET, json.dumps(d.review()))
         self.assertEqual((self.root / 'ledger.json').stat().st_mode & 0o777, 0o600)
+
+    def test_backend_apply_never_uploads_pages(self):
+        shutil.rmtree(self.artifact / 'site')
+        inventory(self.artifact)
+        m.verify_artifact(self.artifact)
+        d, operation = self.reviewed()
+        d.apply(operation, False)
+        self.assertEqual(d.ledger['phase'], 'complete')
+        self.assertNotIn('site/', '\n'.join(str(p.relative_to(self.artifact)) for p in self.artifact.rglob('*')))
+        self.assertFalse(any('pages' in args for args in self.tools.calls))
+        smoke = next(args for args in self.tools.calls if any('smoke-live-broadcast.py' in arg for arg in args))
+        self.assertEqual(smoke[-2:], ['--component', 'backend'])
 
     def test_profile_and_ledger_corrupt_fail_closed(self):
         m.save(self.root / 'ledger.json', {'schema': 999})
@@ -583,9 +592,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_pages_ack_requires_authoritative_revision(self):
         d, operation = self.reviewed()
-        self.tools.fail = 'pages'
-        with self.assertRaises(m.InstallError):
-            d.apply(operation, False)
+        d.phase('pages-uploading')  # Legacy ambiguous upload still needs reconciliation.
         with patch.object(self.tools, 'cf', return_value={'result': {'latest_deployment': {'deployment_trigger': {'metadata': {'commit_hash': '0' * 40, 'branch': 'master'}}}}}):
             with self.assertRaises(m.InstallError):
                 d.ack_pages(operation)

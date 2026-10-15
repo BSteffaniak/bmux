@@ -207,8 +207,8 @@ def verify_artifact(root):
                 raise InstallError('Candidate missing required asset: ' + required)
         if not re.fullmatch(r'[a-f0-9]{40,64}\n?', (root / 'REVISION').read_text()):
             raise InstallError('Invalid immutable candidate revision')
-        if not any(p.startswith('site/') for p in files) or not any(p.startswith('relay/') for p in files):
-            raise InstallError('Candidate missing compiled site or relay')
+        if not any(p.startswith('relay/') for p in files):
+            raise InstallError('Candidate missing relay')
         return digest(manifest)
     except OSError:
         raise InstallError('Candidate unavailable at ' + json.dumps(str(root), ensure_ascii=True) +
@@ -550,14 +550,10 @@ class Deployment:
             self.tools.run([sys.executable, '-I', str(HERE / 'archive-live-state.py'), 'archive'])
             self.phase('applied')
         if self.ledger['phase'] == 'applied':
-            self.phase('pages-uploading')
-            self.tools.run([self.tools.node, str(self.artifact / 'tools/node_modules/wrangler/bin/wrangler.js'),
-                            'pages', 'deploy', str(self.artifact / 'site'),
-                            '--project-name=' + self.choices['pages_project'], '--branch=master',
-                            '--commit-hash=' + (self.artifact / 'REVISION').read_text().strip()])
+            # Static Pages publishing belongs exclusively to the site workflow.
             self.phase('published')
         self.tools.run([sys.executable, '-I', str(HERE / 'smoke-live-broadcast.py'),
-                        '--url', 'https://' + self.choices['hostname']])
+                        '--url', 'https://' + self.choices['hostname'], '--component', 'backend'])
         self.phase('complete')
 
     def reconcile(self, operation):

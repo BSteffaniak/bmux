@@ -53,6 +53,24 @@ class SmokeTests(unittest.TestCase):
         with patch.object(m.urllib.request, 'build_opener', return_value=opener):
             m.smoke('https://test.example')
 
+    def test_site_smoke_does_not_contact_backend(self):
+        routes, opener, _ = self.fixture()
+        del routes['/api/live/main/health']
+        del routes['/api/live/main/status']
+        with patch.object(m.urllib.request, 'build_opener', return_value=opener):
+            m.smoke('https://test.example', 'site')
+
+    def test_backend_smoke_does_not_contact_site(self):
+        routes, opener, _ = self.fixture()
+        for path in list(routes):
+            if not path.startswith('/api/'):
+                del routes[path]
+        with patch.object(m.urllib.request, 'build_opener', return_value=opener):
+            m.smoke('https://test.example', 'backend')
+            routes['/api/live/main/health'] = b'{"protocol":2,"renderer":"bmwp-3"}'
+            with self.assertRaises(ValueError):
+                m.smoke('https://test.example', 'backend')
+
     def test_corruption_rejected(self):
         routes, opener, base = self.fixture()
         routes[base + 'live-viewer.js'] = b'corrupted'

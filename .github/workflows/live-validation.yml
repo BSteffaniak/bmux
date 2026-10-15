@@ -7,6 +7,7 @@ on:
     branches: [master]
     paths:
       - '.github/workflows/live-*.yml'
+      - '.github/workflows/docs-deploy.yml'
       - '.github/workflows/configure-production-infra.yml'
       - 'scripts/**'
       - 'infra/live-*/**'

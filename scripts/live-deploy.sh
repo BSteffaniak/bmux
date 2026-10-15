@@ -112,8 +112,6 @@ if [[ ${#MIGRATION_ARGS[@]} -gt 0 ]]; then
   apply_plan "${MIGRATION_ARGS[@]}" -target=cloudflare_workers_deployment.live
 fi
 apply_plan
-# Pages uploads use the same immutable candidate; Worker deployment remains OpenTofu-owned.
-run_private node "$ARTIFACT/tools/node_modules/wrangler/bin/wrangler.js" pages deploy "$ARTIFACT/site" \
-  --project-name="$LIVE_PAGES_PROJECT" --branch=master --commit-hash="$(cat "$ARTIFACT/REVISION")"
-python3 "$ROOT/scripts/smoke-live-broadcast.py" --url "https://$LIVE_HOSTNAME"
+# Pages has a separate publisher; backend releases never upload static assets.
+python3 "$ROOT/scripts/smoke-live-broadcast.py" --url "https://$LIVE_HOSTNAME" --component backend
 echo 'Production candidate deployed; public read-only smoke passed.'
