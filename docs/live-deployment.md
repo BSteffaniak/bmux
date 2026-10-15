@@ -289,6 +289,36 @@ and backend deployments share the non-cancelling infrastructure concurrency lock
 Pages uploads use their own non-cancelling lock. State archives preserve encrypted
 remote bytes, not plaintext state dumps.
 
+## Public smoke diagnostics and fast retries
+
+Backend and site probes are independent:
+
+```sh
+python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --component backend
+python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --component site
+```
+
+**Live public smoke** (`live-smoke.yml`) is manually dispatched with `all`,
+`backend`, or `site`. It checks out the selected workflow revision, performs no
+build, deployment, state access, or publisher operation, and retains a JSONL
+report for 14 days. Smoke-script changes can be tested against an existing
+production deployment without replacing its artifact. The probe identifies itself
+as `bmux-public-smoke/1`; Cloudflare can reject Python's default user agent with
+HTTP 403/error 1010 even when the application is healthy.
+
+Reports include endpoint, status, timing, byte count, validated Cloudflare Ray ID,
+and fixed failure codes. They exclude response bodies, credentials, redirects,
+and raw exception messages. A passing backend check does not prove `/live`
+serves the viewer; use `all` before declaring public readiness.
+
+The live backend build is a Nix/Cargo artifact build, not a Docker image build.
+GitHub's **Re-run failed jobs** reuses a successful build job's immutable artifact
+while it is retained, but also uses the original run's code: it does not pick up
+new deployment-script fixes. Use the standalone smoke workflow for probe changes.
+Reusing an older artifact with newer deployment code requires explicit artifact
+run/revision/checksum selection and the normal production approval; do not swap
+files inside a checksummed candidate or replay bootstrap to retry deployment.
+
 ## Subsequent releases
 
 **Deploy Docs Site** builds and publishes the complete Pages site: docs plus the

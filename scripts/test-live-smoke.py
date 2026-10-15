@@ -52,6 +52,43 @@ class SmokeTests(unittest.TestCase):
         _, opener, _ = self.fixture()
         with patch.object(m.urllib.request, 'build_opener', return_value=opener):
             m.smoke('https://test.example')
+        self.assertEqual(opener.addheaders, [('User-Agent', 'bmux-public-smoke/1')])
+
+    def test_failure_metadata_is_bounded_and_never_echoes_remote_content(self):
+        import io
+        import urllib.error
+        from unittest.mock import Mock
+        opener = Mock()
+        opener.open.side_effect = urllib.error.HTTPError(
+            'https://private-secret.example', 403, 'private-secret',
+            {'cf-ray': 'a4af00430a08d6d0-IAD', 'Location': 'private-secret'},
+            io.BytesIO(b'error code: 1010\n'))
+        with patch.object(m.urllib.request, 'build_opener', return_value=opener):
+            with self.assertRaises(m.SmokeFailure) as error:
+                m.smoke('https://test.example')
+        self.assertEqual(error.exception.details, {
+            'code': 'cloudflare_1010', 'endpoint': '/api/live/main/health',
+            'http_status': 403, 'cf_ray': 'a4af00430a08d6d0-IAD'})
+        self.assertNotIn('private-secret', json.dumps(error.exception.details))
+        self.assertEqual(m.safe_endpoint('/secret?token=private-secret'), '[invalid-endpoint]')
+        response = Mock(headers={'cf-ray': 'private-secret'})
+        self.assertEqual(m.response_metadata(response), {'cf_ray': None})
+
+    def test_timeout_and_invalid_json_have_safe_endpoint_diagnostics(self):
+        from unittest.mock import Mock
+        opener = Mock()
+        opener.open.side_effect = TimeoutError('private-secret')
+        with patch.object(m.urllib.request, 'build_opener', return_value=opener):
+            with self.assertRaises(m.SmokeFailure) as error:
+                m.smoke('https://test.example')
+        self.assertEqual(error.exception.details['code'], 'timeout')
+        routes, opener, _ = self.fixture()
+        routes['/api/live/main/health'] = b'private-secret-not-json'
+        with patch.object(m.urllib.request, 'build_opener', return_value=opener):
+            with self.assertRaises(m.SmokeFailure) as error:
+                m.smoke('https://test.example')
+        self.assertEqual(error.exception.details['code'], 'invalid_json')
+        self.assertNotIn('private-secret', str(error.exception))
 
     def test_site_smoke_does_not_contact_backend(self):
         routes, opener, _ = self.fixture()
