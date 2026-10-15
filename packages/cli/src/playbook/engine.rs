@@ -1112,6 +1112,7 @@ mod tests {
         let binary = executable.parent().unwrap().parent().unwrap().join("bmux");
         let sandbox = SandboxServer::start(super::super::sandbox::SandboxStartOptions {
             shell: Some("sh"),
+            input_profile: None,
             plugin_config: &super::super::types::PluginConfig::default(),
             startup_timeout: Duration::from_secs(15),
             env: &BTreeMap::new(),
@@ -1161,6 +1162,7 @@ mod tests {
         let binary = executable.parent().unwrap().parent().unwrap().join("bmux");
         let sandbox = SandboxServer::start(super::super::sandbox::SandboxStartOptions {
             shell: Some("sh"),
+            input_profile: None,
             plugin_config: &super::super::types::PluginConfig::default(),
             startup_timeout: Duration::from_secs(15),
             env: &BTreeMap::new(),
@@ -1229,6 +1231,7 @@ mod tests {
         let binary = executable.parent().unwrap().parent().unwrap().join("bmux");
         let sandbox = SandboxServer::start(super::super::sandbox::SandboxStartOptions {
             shell: Some("sh"),
+            input_profile: None,
             plugin_config: &super::super::types::PluginConfig::default(),
             startup_timeout: Duration::from_secs(15),
             env: &BTreeMap::new(),
@@ -1321,6 +1324,7 @@ mod tests {
         let binary = executable.parent().unwrap().parent().unwrap().join("bmux");
         let sandbox = SandboxServer::start(SandboxStartOptions {
             shell: Some("sh"),
+            input_profile: None,
             plugin_config: &crate::playbook::types::PluginConfig::default(),
             startup_timeout: std::time::Duration::from_secs(15),
             env: &std::collections::BTreeMap::new(),

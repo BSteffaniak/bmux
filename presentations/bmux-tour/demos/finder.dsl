@@ -1,7 +1,9 @@
 @name Find work by intent
-@viewport cols=80 rows=24
+@viewport cols=100 rows=30
 @shell sh
-@timeout 45000
+@input-profile tmux_compat
+@env PS1='$ '
+@timeout 60000
 @plugin enable=bmux.sessions
 @plugin enable=bmux.contexts
 @plugin enable=bmux.clients
@@ -10,29 +12,45 @@
 @plugin enable=bmux.tab_bar
 @plugin enable=bmux.finder
 new-session name='api'
-send-keys keys="printf '\\033[2J\\033[HAPI / ready\\n'\r"
-wait-for pattern='API / ready'
-# Invoke actual attach actions without depending on the presenter's keybindings.
-attach-command action='plugin:bmux.tabs:new-tab --name build'
-sleep ms=700
-send-keys keys="printf '\\033[2J\\033[HBUILD / ready\\n'\r"
-wait-for pattern='BUILD / ready'
-attach-command action='plugin:bmux.workspaces:new-workspace --name operations'
-sleep ms=700
-attach-command action='plugin:bmux.tabs:new-tab --name logs'
-sleep ms=700
-send-keys keys="printf '\\033[2J\\033[HLOGS / ready\\n'\r"
-wait-for pattern='LOGS / ready'
-sleep ms=1000
-attach-command action='plugin:bmux.finder:show'
-sleep ms=1000
-wait-rendered contains='Find Tab'
-send-attach key='a'
-send-attach key='p'
-send-attach key='i'
+send-attach key='ctrl+b'
+send-attach key='escape'
+paste-attach text='uname -sr'
+send-attach key='enter'
+sleep ms=500
+send-attach key='ctrl+b'
+wait-for pattern='Linux'
 sleep ms=1500
+send-attach key='c'
+sleep ms=700
+send-attach key='escape'
+paste-attach text='date -u'
+send-attach key='enter'
+sleep ms=500
+send-attach key='ctrl+b'
+wait-for pattern='UTC'
+sleep ms=1500
+send-attach key='shift+w'
+sleep ms=1000
+send-attach key='c'
+sleep ms=700
+send-attach key='escape'
+paste-attach text='pwd'
+send-attach key='enter'
+sleep ms=500
+send-attach key='ctrl+b'
+sleep ms=1500
+# The same default shortcut a user presses; prompt input stays in its modal scope.
+send-attach key='f'
+wait-rendered contains='Find Tab'
+sleep ms=1500
+send-attach key='a'
+sleep ms=250
+send-attach key='p'
+sleep ms=250
+send-attach key='i'
+sleep ms=1800
 wait-rendered contains='api'
 send-attach key='enter'
 sleep ms=700
-assert-screen contains='API / ready'
-sleep ms=1500
+assert-screen contains='Linux'
+sleep ms=2000

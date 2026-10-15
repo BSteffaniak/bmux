@@ -48,6 +48,7 @@ enum ServerHandle {
 
 pub struct SandboxStartOptions<'a> {
     pub shell: Option<&'a str>,
+    pub input_profile: Option<super::types::InputProfile>,
     pub plugin_config: &'a PluginConfig,
     pub startup_timeout: Duration,
     pub env: &'a std::collections::BTreeMap<String, String>,
@@ -93,6 +94,7 @@ impl SandboxServer {
         write_sandbox_config(
             &paths,
             options.shell,
+            options.input_profile,
             options.plugin_config,
             options.sandbox_config_file,
             options.bundled_plugin_ids,
@@ -409,6 +411,7 @@ fn apply_sandbox_env(
 fn write_sandbox_config(
     paths: &ConfigPaths,
     shell: Option<&str>,
+    input_profile: Option<super::types::InputProfile>,
     plugin_config: &PluginConfig,
     sandbox_config_file: Option<&Path>,
     bundled_plugin_ids: &[String],
@@ -474,6 +477,17 @@ fn write_sandbox_config(
         }
     }
 
+    if let Some(profile) = input_profile {
+        anyhow::ensure!(
+            sandbox_config_file.is_none(),
+            "input-profile cannot be combined with custom sandbox-config"
+        );
+        writeln!(
+            toml,
+            "\n[composition]\nactive_profile = '{}'",
+            profile.name()
+        )?;
+    }
     std::fs::write(&config_path, toml)
         .with_context(|| format!("failed writing sandbox config {}", config_path.display()))
 }
@@ -819,6 +833,44 @@ mod tests {
     }
 
     #[test]
+    fn generated_input_profile_is_isolated_and_conflicts_with_custom_config() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = ConfigPaths::new(
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
+        );
+        write_sandbox_config(
+            &paths,
+            Some("sh"),
+            Some(super::super::types::InputProfile::TmuxCompat),
+            &PluginConfig::default(),
+            None,
+            &[],
+        )
+        .unwrap();
+        let value: toml::Value =
+            toml::from_str(&std::fs::read_to_string(paths.config_file()).unwrap()).unwrap();
+        assert_eq!(
+            value["composition"]["active_profile"].as_str(),
+            Some("tmux_compat")
+        );
+        let source = root.path().join("custom.toml");
+        std::fs::write(&source, "").unwrap();
+        let error = write_sandbox_config(
+            &paths,
+            None,
+            Some(super::super::types::InputProfile::Vim),
+            &PluginConfig::default(),
+            Some(&source),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
     fn copied_sandbox_config_preserves_theme_settings_without_default_plugin_disable() {
         let root = std::env::temp_dir().join(format!(
             "bmux-playbook-config-preserve-test-{}-{}",
@@ -841,6 +893,7 @@ mod tests {
 
         write_sandbox_config(
             &paths,
+            None,
             None,
             &PluginConfig::default(),
             Some(&source),
@@ -874,6 +927,7 @@ mod tests {
 
         let error = write_sandbox_config(
             &paths,
+            None,
             None,
             &PluginConfig {
                 enable: vec!["bmux.theme".to_string()],

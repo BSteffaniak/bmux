@@ -24,6 +24,8 @@ pub struct PlaybookConfig {
     pub description: Option<String>,
     pub viewport: Viewport,
     pub shell: Option<String>,
+    /// Built-in input profile applied inside the generated sandbox only.
+    pub input_profile: Option<InputProfile>,
     pub timeout: Duration,
     pub record: bool,
     pub plugins: PluginConfig,
@@ -109,6 +111,7 @@ impl Default for PlaybookConfig {
             description: None,
             viewport: Viewport::default(),
             shell: None,
+            input_profile: None,
             timeout: Duration::from_secs(30),
             record: false,
             plugins: PluginConfig::default(),
@@ -121,6 +124,25 @@ impl Default for PlaybookConfig {
             verbose: false,
             render_trace: false,
             driver: PlaybookDriver::Sandbox,
+        }
+    }
+}
+
+/// Closed set of built-in profiles; never a custom configuration path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputProfile {
+    Vim,
+    TmuxCompat,
+    ZellijCompat,
+}
+
+impl InputProfile {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Vim => "vim",
+            Self::TmuxCompat => "tmux_compat",
+            Self::ZellijCompat => "zellij_compat",
         }
     }
 }

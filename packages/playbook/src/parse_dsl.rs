@@ -84,6 +84,14 @@ fn parse_config_directive(
         "shell" => {
             config.shell = Some(rest.trim().to_string());
         }
+        "input-profile" => {
+            config.input_profile = Some(match rest.trim() {
+                "vim" => super::types::InputProfile::Vim,
+                "tmux_compat" => super::types::InputProfile::TmuxCompat,
+                "zellij_compat" => super::types::InputProfile::ZellijCompat,
+                other => bail!("unknown built-in input profile: {other}"),
+            });
+        }
         "timeout" => {
             let ms: u64 = rest.trim().parse().context("invalid timeout ms")?;
             config.timeout = Duration::from_millis(ms);
@@ -714,6 +722,23 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn built_in_input_profiles_are_closed() {
+        for (name, profile) in [
+            ("vim", super::super::types::InputProfile::Vim),
+            ("tmux_compat", super::super::types::InputProfile::TmuxCompat),
+            (
+                "zellij_compat",
+                super::super::types::InputProfile::ZellijCompat,
+            ),
+        ] {
+            let (playbook, _) =
+                parse_dsl(&format!("@input-profile {name}\nnew-session\n")).unwrap();
+            assert_eq!(playbook.config.input_profile, Some(profile));
+        }
+        assert!(parse_dsl("@input-profile /tmp/custom.toml\n").is_err());
+    }
 
     #[test]
     fn parse_simple_playbook() {

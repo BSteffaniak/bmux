@@ -2243,6 +2243,7 @@ async fn run_playbook_inner(
         let sb = SandboxServer::start(
             SandboxStartOptions {
                 shell: playbook.config.shell.as_deref(),
+                input_profile: playbook.config.input_profile,
                 plugin_config: &playbook.config.plugins,
                 startup_timeout: SERVER_STARTUP_TIMEOUT,
                 env: &playbook.config.env,

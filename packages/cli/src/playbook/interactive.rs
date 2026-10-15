@@ -697,6 +697,7 @@ pub async fn run_interactive(
     let env = std::collections::BTreeMap::new();
     let sandbox = SandboxServer::start(SandboxStartOptions {
         shell,
+        input_profile: None,
         plugin_config: &plugins,
         startup_timeout: SERVER_STARTUP_TIMEOUT,
         env: &env,

@@ -1,16 +1,36 @@
-@name Rendering is retained state
-@viewport cols=80 rows=24
+@name Real output and scrollback
+@viewport cols=100 rows=30
 @shell sh
-@timeout 30000
+@input-profile tmux_compat
+@env PS1='$ '
+@timeout 45000
+@plugin enable=bmux.sessions
+@plugin enable=bmux.contexts
+@plugin enable=bmux.clients
+@plugin enable=bmux.tabs
+@plugin enable=bmux.tab_bar
 new-session name='rendering'
-send-keys keys="printf '\\033[2J\\033[H'; i=1; while [ $i -le 18 ]; do printf 'event %02d | retained terminal output\\n' $i; i=$((i+1)); done\r"
-wait-for pattern='event 18'
-assert-screen contains='event 01'
-sleep ms=1500
-send-keys keys="printf '\\033[3;1H\\033[2Kevent 03 | updated in place\\n'\r"
-wait-for pattern='updated in place'
-sleep ms=1500
-send-keys keys="printf '\\033[24;1H'; i=19; while [ $i -le 30 ]; do printf 'event %02d | scrolling continues\\n' $i; i=$((i+1)); done\r"
-wait-for pattern='event 30'
-assert-screen contains='scrolling continues'
-sleep ms=1500
+send-attach key='ctrl+b'
+# Genuine utility output exercises terminal scrolling, not hand-painted ANSI rows.
+send-attach key='escape'
+paste-attach text='seq 1 100'
+send-attach key='enter'
+sleep ms=500
+send-attach key='ctrl+b'
+wait-for pattern='100'
+sleep ms=1800
+send-attach key='['
+sleep ms=1200
+send-attach key='page_up'
+sleep ms=1800
+send-attach key='page_down'
+sleep ms=1800
+send-attach key='escape'
+sleep ms=700
+send-attach key='escape'
+paste-attach text='date -u'
+send-attach key='enter'
+sleep ms=500
+send-attach key='ctrl+b'
+wait-for pattern='UTC'
+sleep ms=1800

@@ -23,16 +23,16 @@ All ten fenced excerpts in the main deck match contiguous literal source text, i
 
 ## Demonstrated scenarios and limits
 
-Acceptance uses [scripts/presenter-tour-acceptance.py](../../scripts/presenter-tour-acceptance.py) with explicit prebuilt artifacts; see [usage](README.md#repeat-acceptance-with-explicit-artifacts). It starts the actual scripts as embedded components in isolated presenters, manually opens/starts them through presenter input, checks managed completion without diagnostics, observes retained HTTP audience snapshots, and checks clean presenter exit. Managed single-authority attach support supplies the actual attach commands/input used by navigation, finder, and themes without admitting real-attach or custom sandbox configuration.
+Acceptance uses [scripts/presenter-tour-acceptance.py](../../scripts/presenter-tour-acceptance.py) with explicit prebuilt artifacts; see [usage](README.md#repeat-acceptance-with-explicit-artifacts). It starts the actual scripts as embedded components in isolated presenters, manually opens/starts them through presenter input, checks managed completion without diagnostics, observes retained HTTP audience snapshots, and checks clean presenter exit. Managed single-authority attach support supplies actual modal key events and shell paste/Enter for every demo. The closed `@input-profile tmux_compat` selector configures only the generated sandbox; real-attach and custom sandbox configuration remain disallowed.
 
 | Component / source | Passed behavior | Limit |
 | --- | --- | --- |
-| `demo-panes` / [panes.dsl](demos/panes.dsl) | Three panes, focus, layout/screen assertions | Printed test-count labels are fixture text, not repository test outcomes |
-| `demo-navigation` / [navigation.dsl](demos/navigation.dsl) | Original API shell state survives tab switching; operations/deploy and return to existing tests work | Not a second-attachment or independent-client-focus test; disconnect is not machine restart |
-| `demo-finder` / [finder.dsl](demos/finder.dsl) | Actual Find Tab prompt, fuzzy `api` query from operations, Enter selects default's API tab | Not exhaustive matching/order coverage; settings can change scope and matching mode |
+| `demo-panes` / [panes.dsl](demos/panes.dsl) | Three panes through split shortcuts, focus navigation, real listing/kernel/clock output and layout assertion | Commands depend on Linux utilities, not repository test outcomes |
+| `demo-navigation` / [navigation.dsl](demos/navigation.dsl) | Original shell PID survives tab switching; generated workspace and return to existing work | Not a second-attachment or independent-client-focus test; disconnect is not machine restart |
+| `demo-finder` / [finder.dsl](demos/finder.dsl) | Actual Find Tab prompt, fuzzy `api` query from a generated second workspace, Enter selects default's API tab | Not exhaustive matching/order coverage; settings can change scope and matching mode |
 | `demo-themes` / [themes.dsl](demos/themes.dsl) | Actual Select Theme, Down previews rendered cyberpunk, Enter confirms, shell continues | Not preview cancellation, revision conflicts, or every layer composition |
-| `demo-rendering` / [rendering.dsl](demos/rendering.dsl) | Text population, in-place update, scrolling, screen assertions | **Not fault injection**, image protocol acceptance, or universal host compatibility |
-| `demo-evidence` / [evidence.dsl](demos/evidence.dsl) | Real shell execution, layout/screen assertions, `verified-demo` snapshot | PASS label alone is not evidence; snapshot does not establish unasserted behavior |
+| `demo-rendering` / [rendering.dsl](demos/rendering.dsl) | Real `seq` output, scrollback Page Up/Page Down, return to live shell | **Not fault injection**, image protocol acceptance, or universal host compatibility |
+| `demo-evidence` / [evidence.dsl](demos/evidence.dsl) | Computed arithmetic results, two-pane layout/screen assertions, `verified-demo` snapshot | Snapshot does not establish unasserted behavior |
 
 The retained evidence path is private and ephemeral, not a distributable public artifact. Review/redact PTY output, status, capability URLs, and runtime paths before sharing. Do not copy secrets or reusable credentials into ordinary diagnostics or presentation assets.
 

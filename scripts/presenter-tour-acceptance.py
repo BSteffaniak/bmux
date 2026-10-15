@@ -5,6 +5,7 @@ Requires explicit prebuilt artifacts. Never attaches to an existing user runtime
 Private evidence retains PTY output and runner results, not public diagnostics.
 """
 import argparse
+import base64
 from collections import deque
 import importlib.util
 import json
@@ -41,12 +42,35 @@ class Tour(H.Acceptance):
         process.send(b"o")
         time.sleep(0.3)
         process.send(b"r")
-        observed = deque(maxlen=64)
+        observed = deque(maxlen=256)
+        expected = {
+            "panes": ("Linux", "UTC"),
+            "navigation": ("42", "UTC", "Linux"),
+            "finder": ("Find Tab", "api", "Linux"),
+            "themes": ("Select Theme", "cyberpunk", "UTC"),
+            "rendering": ("100", "UTC"),
+            "evidence": ("42",),
+        }[name]
+        visible = set()
+        captures = set()
 
         def settled():
             status, body = H.WEB.http(origin, "/snapshot", token)
             if status == 200:
-                text = H.WEB.text(json.loads(body))
+                frame = json.loads(body)
+                text = H.WEB.text(frame)
+                for marker in expected:
+                    if marker in text:
+                        visible.add(marker)
+                # Commit intermediate feature frames, not just the final status.
+                milestone = next((marker for marker in expected
+                                  if marker in text and marker not in captures), None)
+                if milestone is not None:
+                    self.commit(browser, frame)
+                    screenshot = browser.call("Page.captureScreenshot", {"format": "png"})
+                    (self.root / f"{name}-{len(captures)}.png").write_bytes(
+                        base64.b64decode(screenshot["data"]))
+                    captures.add(milestone)
                 if not observed or observed[-1] != text:
                     observed.append(text)
             for path in set(self.root.rglob("runner.json")) - before:
@@ -61,6 +85,7 @@ class Tour(H.Acceptance):
         frame = json.loads(H.WEB.http(origin, "/snapshot", token)[1])
         self.commit(browser, frame)
         H.require(result.get("phase") == "script-complete", f"{name} result did not pass")
+        H.require(set(expected) <= visible, f"{name} feature output missing: {set(expected) - visible}")
         H.require(any(name in text for text in observed), f"{name} audience output missing")
         process.send(b"q")
         H.wait_for(f"{name} presenter exit", lambda: process.child.poll() is not None, 20)

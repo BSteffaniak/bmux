@@ -27,15 +27,15 @@ Transition: “Start with a small, useful workspace.”
 # One workspace, several useful surfaces
 
 <!-- bmux:block-id splits-feature -->
-Keep an application, tests, and logs visible together. Split the space; move focus without moving the work.
+Keep several real commands visible together. Split the space; move focus without moving the work.
 
 <!-- bmux:block-id demo-panes -->
 <!-- bmux:component playbook-demo {"playbook":"demos/panes.dsl","title":"Splits and focus","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Quick path: Focus the component with Tab, open with o, then manually start with r. Narrate the three labeled pane surfaces and the change in focus. The printed test label is fixture text, not this repository's test result.
+Quick path: Focus the component with Tab, open with o, then manually start with r. Narrate the directory listing, kernel version, UTC clock, and the change in focus. These are actual command results, not simulated application/test status.
 Deeper path: Pause with p; n executes a whole action including its waits; c resumes. Distinguish pane geometry, selected input target, and the program running underneath. This script demonstrates splits and focus, not resize or zoom.
-Rehearsal: confirm pane labels are legible at the venue size. The managed run enables its required plugins and checks pane/focus assertions. The audience observer is output-only; script attach actions use the managed single-authority attach path, not arbitrary audience shell access. Leaving requests stop; verify cleanup acknowledgment before restart.
+Rehearsal: confirm command output is legible at the venue size. The managed run enables its required plugins and checks pane/focus assertions. The audience observer is output-only; script attach actions use the managed single-authority attach path, not arbitrary audience shell access. Leaving requests stop; verify cleanup acknowledgment before restart.
 Transition: “The UI action has a typed contract.”
 <!-- bmux:end-notes -->
 
@@ -79,7 +79,7 @@ Sessions describe execution lifetime. Tabs expose attachable work. Workspaces or
 <!-- bmux:component playbook-demo {"playbook":"demos/navigation.dsl","title":"Tabs and workspace navigation","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Quick path: Manually run navigation. Watch the original API shell's demo_identity survive tab switching, then move to operations/deploy and return to the tests tab in the previous workspace.
+Quick path: Manually run navigation. The original shell stores its PID; after a tab switch, a successful identity check computes 42. Create a generated workspace, run uname there, then return to the existing clock tab with Alt-L.
 Deeper path: Personal arrangements are distinct from deliberately shared arrangements. Changing an attachment's selection does not imply that a shared layout mutation is private. Removing a personal reference is not destroying the running resource. Disconnect survival is not machine-restart survival.
 Rehearsal: keep the state marker visible long enough to explain it. This passed managed script exercises real tab/workspace commands and preserved shell state, not a second attachment or independent client-focus demonstration.
 Transition: “Discovery must not quietly rewrite the organization it reads.”
@@ -247,7 +247,7 @@ Layout, text, cursor, and interaction must describe the same committed scene—n
 <!-- bmux:component playbook-demo {"playbook":"demos/rendering.dsl","title":"Rendering and retained output","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Quick path: Start manually. Follow numbered event lines, the in-place update of event 03, and subsequent scrolling. This passed scenario exercises text updates, not image protocols.
+Quick path: Start manually. Follow seq 1 100, entry into scrollback, Page Up/Page Down, and return to the live shell. This exercises genuine output and scrolling, not image protocols or synthetic ANSI row updates.
 Deeper path: The retained compositor is the common authority for damage, clipping, focus, hit testing, and pointer routing. Different transports do not get independent scene ownership. A correct-looking screenshot alone does not prove flush-failure or stale-input handling.
 Rehearsal: verify text and scrolling at actual audience dimensions. This script does not inject write/flush failures. The following code explains the failure boundary; successful text rendering is not fault-injection evidence.
 Transition: “The smallest important implementation detail is only four lines.”
@@ -318,9 +318,9 @@ Scripted actions, explicit waits, assertions, and retained output make the story
 <!-- bmux:component playbook-demo {"playbook":"demos/evidence.dsl","title":"Actions, checks, and evidence","on_leave":"stop"} -->
 
 <!-- bmux:notes -->
-Quick path: Start manually. Point to assert-layout pane_count=1, assert-screen, and snapshot verified-demo in the real script. The passed run checks actual shell output before printing its PASS label; the label alone is not the evidence.
+Quick path: Start manually. Point to the computed 42 in each pane, assert-layout pane_count=2, assert-screen, and snapshot verified-demo in the real script. There is no printed PASS banner; checks inspect actual arithmetic output.
 Deeper path: A playbook is executable input, not a passive slide asset. Parser-only consumers do not enable native execution. CLI and managed workers share the playbook executor; a host adapter supplies platform primitives rather than implementing a separate action language. Evidence only supports the assertions actually made.
-Rehearsal: review the frozen source/include closure and redact retained artifacts before sharing. The six-script acceptance run passed; synthetic fixture labels are still not repository test/benchmark outcomes. A retained snapshot supports the actual assertions, not arbitrary claims about unseen behavior.
+Rehearsal: review the frozen source/include closure and redact retained artifacts before sharing. The six scripts exercise real commands through the owned attach; their arithmetic results are not repository test/benchmark outcomes. A retained snapshot supports the actual assertions, not arbitrary claims about unseen behavior.
 Transition: “Embedding execution requires restrictions, not just a pretty component.”
 <!-- bmux:end-notes -->
 

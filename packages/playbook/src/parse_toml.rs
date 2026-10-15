@@ -86,6 +86,7 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         description: raw.description,
         viewport,
         shell: raw.shell,
+        input_profile: raw.input_profile,
         timeout,
         record: raw.record.unwrap_or(false),
         plugins,
@@ -384,6 +385,7 @@ struct RawPlaybookConfig {
     description: Option<String>,
     viewport: Option<RawViewport>,
     shell: Option<String>,
+    input_profile: Option<super::types::InputProfile>,
     timeout_ms: Option<u64>,
     record: Option<bool>,
     render_trace: Option<bool>,
@@ -475,6 +477,16 @@ struct RawStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn built_in_input_profile_parses_and_rejects_custom_names() {
+        let (playbook, _) = parse_toml("[playbook]\ninput_profile = 'tmux_compat'\n").unwrap();
+        assert_eq!(
+            playbook.config.input_profile,
+            Some(super::super::types::InputProfile::TmuxCompat)
+        );
+        assert!(parse_toml("[playbook]\ninput_profile = '/tmp/custom.toml'\n").is_err());
+    }
 
     #[test]
     fn parse_owned_attach_controls() {

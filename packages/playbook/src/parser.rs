@@ -172,6 +172,10 @@ fn merge_included_config(parent: &mut types::PlaybookConfig, included: &types::P
         parent.shell.clone_from(&included.shell);
     }
 
+    if parent.input_profile.is_none() {
+        parent.input_profile = included.input_profile;
+    }
+
     // env_mode: fill if parent hasn't set one.
     if parent.env_mode.is_none() && included.env_mode.is_some() {
         parent.env_mode = included.env_mode;
@@ -499,6 +503,20 @@ mod tests {
         merge_included_config(&mut parent, &first);
         merge_included_config(&mut parent, &second);
         assert_eq!(parent.shell.as_deref(), Some("sh"));
+    }
+
+    #[test]
+    fn input_profile_include_fills_only_unset_parent() {
+        let mut parent = default_config();
+        let included = PlaybookConfig {
+            input_profile: Some(types::InputProfile::TmuxCompat),
+            ..default_config()
+        };
+        merge_included_config(&mut parent, &included);
+        assert_eq!(parent.input_profile, included.input_profile);
+        parent.input_profile = Some(types::InputProfile::Vim);
+        merge_included_config(&mut parent, &included);
+        assert_eq!(parent.input_profile, Some(types::InputProfile::Vim));
     }
 
     // ── env_mode merging ───────────────────────────────────────────────

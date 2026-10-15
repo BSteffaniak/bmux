@@ -14,18 +14,18 @@ Preserve stable `bmux:slide-id` and `bmux:block-id` identities when editing. Com
 
 ## What the demos establish
 
-All six actual embedded demos passed managed execution acceptance, with private evidence retained at `/tmp/pw-oa5bi7zp`. They use generated isolated configuration and managed single-authority attach support, not a user's running session.
+The demos use generated isolated configuration with the built-in `tmux_compat` input profile and managed single-authority attach support, not a user's running session. `Ctrl-B` enters normal mode, Escape returns to shell input; visible UI actions use real key events and commands use attach paste plus Enter. No custom sandbox config or fabricated test/application status is needed.
 
 | Block ID / source | Demonstrated behavior |
 | --- | --- |
 | `demo-panes` / `demos/panes.dsl` | Three panes, focus changes, layout/screen assertions |
 | `demo-navigation` / `demos/navigation.dsl` | Original shell state survives tab switching; workspace switching returns to existing work |
-| `demo-finder` / `demos/finder.dsl` | Real fuzzy `api` query across default/operations, Enter selects the API tab |
+| `demo-finder` / `demos/finder.dsl` | Real fuzzy `api` query from a generated second workspace, Enter selects the API tab |
 | `demo-themes` / `demos/themes.dsl` | Select Theme opens, Down previews rendered cyberpunk, Enter confirms; shell continues |
-| `demo-rendering` / `demos/rendering.dsl` | Numbered text, in-place update, scrolling; **not fault injection** |
-| `demo-evidence` / `demos/evidence.dsl` | Real layout/screen assertions and `verified-demo` snapshot |
+| `demo-rendering` / `demos/rendering.dsl` | Actual `seq` output, Page Up/Page Down scrollback, return to live shell; **not fault injection** |
+| `demo-evidence` / `demos/evidence.dsl` | Actual arithmetic results, two-pane layout/screen assertions and `verified-demo` snapshot |
 
-The acceptance harness observes HTTP frames and managed results. **It does not establish browser/Canvas rendering, audience geometry, or final note privacy.** A fixture label such as “12 passed” is not a repository test result. Demo acceptance is not a claim that all project validation is complete.
+The acceptance harness observes intermediate feature output and commits it to browser Canvas, retaining screenshots as well as managed results. **This does not establish venue legibility, final audience geometry, or final note privacy.** Demo acceptance is not a claim that all project validation is complete.
 
 ## Present with an approved executable
 
@@ -69,7 +69,7 @@ python3 scripts/presenter-tour-acceptance.py \
 
 Mermaid rendering is embedded in the matching native presenter artifact; no separate renderer executable is needed. The tour demos do not cover Mermaid rendering; the dedicated `semantic_mermaid` case in `scripts/presenter-web-acceptance.py` checks loader PNG substitution and actual browser Canvas output at two widths.
 
-All six demos run by default; `--demos finder themes` selects a subset. The current harness requires `--browser` as an explicit artifact input but checks HTTP snapshots, not a browser/Canvas scene. Keep its printed evidence directory private: PTY output and runner artifacts may contain sensitive details. Compare the actual artifacts and source bytes when repeating a run; the recorded pass is not approval for arbitrary replacements.
+All six demos run by default; `--demos finder themes` selects a subset. The harness checks HTTP snapshots, expected visible feature milestones, and browser/Canvas commits, retaining intermediate screenshots. Keep its printed evidence directory private: PTY output and runner artifacts may contain sensitive details. Compare the actual artifacts and source bytes when repeating a run; the recorded pass is not approval for arbitrary replacements.
 
 ## Final audience and privacy rehearsal
 
