@@ -100,7 +100,7 @@ Using a bundled BMUX executable that supports managed playbooks and the private
 retained observer protocol:
 
 ```sh
-bmux --target local present play plugins/presenter-plugin/examples/live-demo.md --allow-playbooks --presenter --web
+bmux --target local present play plugins/presenter-plugin/examples/live-demo.md --presenter --web
 ```
 
 Tab focuses `live-demo`; `o` opens the overlay, `r` manually starts the run,
@@ -118,7 +118,7 @@ execution when that provider is missing.
 Managed creation uses the explicit versioned approval contract:
 
 ```sh
-bmux present host plugins/presenter-plugin/examples/live-demo.md --managed --allow-playbooks --presenter-credential PRIVATE_FILE --public-read --no-reload
+bmux present host plugins/presenter-plugin/examples/live-demo.md --managed --presenter-credential PRIVATE_FILE --public-read --no-reload
 bmux present join bmux:HOST_ID --credential PRIVATE_FILE --presenter --mode shared
 ```
 
@@ -216,3 +216,9 @@ private, regular, single-link 32-byte file; unavailable/rotated/rejected proof l
 local playback usable and retries without exposing proof bytes or filesystem
 errors. Unix opens pin the owned runtime directory and reject symlinks; platforms
 without this secure reader fail closed. A local source ID is not a publisher credential.
+
+Playbook demos are enabled by default for `present play` and `present host`.
+Use `--no-playbooks` to opt out. Opening a deck remains inert: the presenter
+must explicitly open and run a demo. Original-source approval and changed-source
+rejection still apply; audience/join and check operations gain no execution
+rights. The former `--allow-playbooks` flag remains a compatibility alias.

@@ -51,7 +51,7 @@ Review scripts/includes as executable input before approval. Isolated runtime/co
 From the repository root, replace the placeholder with an explicitly approved immutable native artifact:
 
 ```sh
-/path/to/approved/bmux present play presentations/bmux-tour/deck.md --allow-playbooks --no-reload
+/path/to/approved/bmux present play presentations/bmux-tour/deck.md --no-reload
 ```
 
 Add `--presenter` for private local speaker notes. Select matching presenter/playbook plugins and managed-worker/observer protocols. Record executable identity/hash; protocol compatibility alone does not authenticate content. Approval covers the actual frozen script/include bytes; changed executable input requires fresh approval. `--no-reload` keeps presentation inputs stable.

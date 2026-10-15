@@ -165,7 +165,7 @@ impl Command {
             "play" => {
                 let presenter = args.flag("--presenter")?;
                 let reload = !args.flag("--no-reload")?;
-                let allow_playbooks = args.flag("--allow-playbooks")?;
+                let allow_playbooks = args.playbooks_enabled()?;
                 let web = WebOptions::parse(&mut args)?;
                 args.finish()?;
                 Ok(Self::Play {
@@ -198,7 +198,7 @@ impl Command {
                 let audience_credential = args.value("--audience-credential")?.map(PathBuf::from);
                 let public_read = args.flag("--public-read")?;
                 let reload = !args.flag("--no-reload")?;
-                let allow_playbooks = args.flag("--allow-playbooks")?;
+                let allow_playbooks = args.playbooks_enabled()?;
                 let web = WebOptions::parse(&mut args)?;
                 ensure!(
                     public_read || audience_credential.is_some(),
@@ -308,6 +308,17 @@ impl<'a> Arguments<'a> {
         ensure!(found.len() <= 1, "duplicate {flag}");
         Ok(found.first().copied())
     }
+    fn playbooks_enabled(&mut self) -> Result<bool> {
+        // Retain the former opt-in as a compatibility alias, not a requirement.
+        let allow = self.flag("--allow-playbooks")?;
+        let disable = self.flag("--no-playbooks")?;
+        ensure!(
+            !(allow && disable),
+            "--allow-playbooks conflicts with --no-playbooks"
+        );
+        Ok(!disable)
+    }
+
     fn flag(&mut self, flag: &str) -> Result<bool> {
         if let Some(index) = self.index(flag)? {
             self.used[index] = true;
@@ -432,11 +443,11 @@ mod tests {
         }
     }
     #[test]
-    fn executable_input_approval_is_creation_only_and_explicit() {
+    fn playbooks_default_on_with_creation_only_opt_out() {
         assert!(matches!(
             parse("play", &["deck.md"]).unwrap(),
             Command::Play {
-                allow_playbooks: false,
+                allow_playbooks: true,
                 ..
             }
         ));
@@ -462,6 +473,31 @@ mod tests {
             panic!("host")
         };
         assert!(options.allow_playbooks);
+        assert!(matches!(
+            parse("play", &["deck.md", "--no-playbooks"]).unwrap(),
+            Command::Play {
+                allow_playbooks: false,
+                ..
+            }
+        ));
+        for flags in [vec![], vec!["--no-playbooks"]] {
+            let mut arguments = vec![
+                "deck.md",
+                "--managed",
+                "--presenter-credential",
+                "p",
+                "--public-read",
+            ];
+            arguments.extend(flags.iter().copied());
+            let Command::Host(options) = parse("host", &arguments).unwrap() else {
+                panic!("host")
+            };
+            assert_eq!(options.allow_playbooks, flags.is_empty());
+        }
+        assert!(parse("play", &["deck.md", "--allow-playbooks", "--no-playbooks"]).is_err());
+        assert!(parse("play", &["deck.md", "--no-playbooks", "--no-playbooks"]).is_err());
+        assert!(parse("check", &["deck.md", "--no-playbooks"]).is_err());
+        assert!(parse("join", &["bmux:host", "--no-playbooks"]).is_err());
         assert!(parse("check", &["deck.md", "--allow-playbooks"]).is_err());
         assert!(parse("join", &["bmux:host", "--allow-playbooks"]).is_err());
         assert!(

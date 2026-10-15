@@ -4,7 +4,11 @@ use crate::{
     playbook_controller::{Control, Controller, LifecycleSnapshot},
 };
 use bmux_presenter::{Block, BlockKind, Deck};
-use bmux_tui::prelude::{Element, TextBlock};
+use bmux_tui::{
+    prelude::{Element, TextBlock},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+};
 use std::{collections::BTreeMap, path::PathBuf};
 
 #[cfg(test)]
@@ -644,13 +648,19 @@ impl bmux_presenter::custom::LinkedComponentFactory for DemoFactory {
             return Err("custom block required".into());
         };
         let text = if config.is_null() {
-            "Live playbook\nOwner display pending".to_owned()
+            Text::from("Live playbook\nOwner display pending")
         } else {
             let config = DemoConfig::parse(config).map_err(|error| error.to_string())?;
-            format!(
-                "{}\no: open live demo (execution requires --allow-playbooks)",
-                config.title
-            )
+            Text::from_lines(vec![
+                Line::raw(config.title),
+                Line::from_spans(vec![Span::styled(
+                    " ▶ Open live demo [o] ",
+                    Style::new()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )]),
+            ])
         };
         Ok(Element::new(
             TextBlock::new(text).id(format!("playbook-demo/{}", block.id.as_str())),
@@ -661,6 +671,38 @@ impl bmux_presenter::custom::LinkedComponentFactory for DemoFactory {
 #[cfg(test)]
 mod owned_runtime_tests {
     use super::*;
+    #[test]
+    fn live_demo_launcher_is_green_and_contains_no_execution_flag_hint() {
+        use bmux_presenter::custom::LinkedComponentFactory;
+        use bmux_tui::prelude::{Constraints, LayoutCx};
+        let deck = reload_tests::deck("s", "Demo");
+        let block = &deck.slides[0].blocks[0];
+        let state = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+        let component = DemoFactory.build(block, state).unwrap();
+        let area = bmux_tui::geometry::Rect::new(0, 0, 60, 4);
+        let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::default());
+        let prepared = bmux_tui::presentation::PresentationState::new(area)
+            .prepare(bmux_tui::damage::Damage::Full, |cx| {
+                component.paint(&layout, cx)
+            })
+            .unwrap();
+        let text: String = prepared
+            .buffer()
+            .cells()
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(text.contains("Open live demo [o]"));
+        assert!(!text.contains("allow-playbooks"));
+        let green_cells = prepared
+            .buffer()
+            .cells()
+            .iter()
+            .filter(|cell| cell.style.bg == Some(Color::Green))
+            .count();
+        assert!(green_cells >= 20);
+    }
+
     #[tokio::test]
     async fn overlays_and_reload_leave_local_runtime_untouched() {
         let fixture = reload_tests::Fixture::new();
