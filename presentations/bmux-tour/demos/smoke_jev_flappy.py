@@ -52,12 +52,13 @@ def main():
             payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             assert self.path == "/api/v1/decide"
             assert self.headers["Authorization"] == "Bearer smoke-only-key"
-            assert payload["questions"]["flap"]["type"] == "noul"
+            assert payload["questions"]["action"]["type"] == "choice"
             count[0] += 1
             time.sleep(delay[0])
             # Deliberately bad pilot proves game-over and automatic retry.
             body = json.dumps({"model": payload["model"], "answers": {
-                "flap": {"type": "noul", "noul": 0.0}}}).encode()
+                "action": {"type": "choice", "choice": "WAIT", "confidence": 1.0,
+                           "probabilities": {"FLAP": 0.0, "WAIT": 1.0}}}}).encode()
             try:
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))

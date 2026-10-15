@@ -17,9 +17,19 @@ import jev_flappy as demo
 CONFIG = demo.Config("hosted", "https://jevtypesafeai.com", demo.MODEL, "test-only-key")
 
 
+def answer(action="FLAP", confidence=0.9):
+    return {"action": action, "confidence": confidence,
+            "probabilities": {"FLAP": 0.7, "WAIT": 0.3}}
+
+
+def wire_answer(action="FLAP"):
+    return {"type": "choice", "choice": action, "confidence": 0.9,
+            "probabilities": {"FLAP": 0.7, "WAIT": 0.3}}
+
+
 class FakeRequest:
     instances = []
-    result = {"probability": 0.9}
+    result = answer()
 
     def __init__(self, config, observation):
         self.started = 0
@@ -47,6 +57,61 @@ class GameTests(unittest.TestCase):
             self.assertEqual(a.observation(), b.observation())
             self.assertEqual(len(a.pipes), 3)
         self.assertGreater(a.attempt, 1)
+
+    def test_forecasts_are_exact_and_do_not_change_live_state(self):
+        import copy
+        for y, velocity in [(15, 0), (1.5, -0.5), (28.5, 1.0), (12, 0.3)]:
+            game = demo.Game()
+            game.y, game.velocity = y, velocity
+            before = copy.deepcopy(game.__dict__)
+            random_state = game.random.getstate()
+            for flap in (False, True):
+                forecast = game.forecast(flap)
+                projected = copy.deepcopy(game)
+                expected = []
+                collision = None
+                for tick in range(1, 16):
+                    projected.tick(flap and tick == 1)
+                    if tick % demo.DECISION_TICKS == 0 or projected.dead:
+                        expected.append({"tick": tick, "y": round(projected.y, 3),
+                                         "velocity_y": round(projected.velocity, 3)})
+                    if projected.dead:
+                        collision = tick
+                        break
+                self.assertEqual(forecast["samples"], expected)
+                self.assertEqual(forecast["collision_tick_if_coasting"], collision)
+            self.assertEqual(game.y, before["y"])
+            self.assertEqual(game.velocity, before["velocity"])
+            self.assertEqual(game.pipes, before["pipes"])
+            self.assertEqual(game.random.getstate(), random_state)
+
+    def test_ceiling_requires_wait_and_floor_requires_flap(self):
+        game = demo.Game()
+        game.y, game.velocity = 1.5, 0
+        observation = game.observation()
+        self.assertFalse(observation["action_forecasts"]["FLAP"]["safe_through_next_decision"])
+        self.assertTrue(observation["action_forecasts"]["WAIT"]["safe_through_next_decision"])
+        game.y, game.velocity = 28, 0.6
+        observation = game.observation()
+        self.assertTrue(observation["action_forecasts"]["FLAP"]["safe_through_next_decision"])
+        self.assertFalse(observation["action_forecasts"]["WAIT"]["safe_through_next_decision"])
+
+    def test_observations_support_multiple_pipes_with_test_only_choice_policy(self):
+        # This is an offline observability/physics check, NOT a production pilot
+        # or evidence that the remote model will choose the same actions.
+        for seed in range(10):
+            game = demo.Game(seed)
+            for _ in range(200):
+                observation = game.observation()
+                def cost(action):
+                    forecast = observation["action_forecasts"][action]
+                    return (not forecast["safe_through_next_decision"],
+                            abs(forecast["samples"][0]["y"] - observation["target"]["center_y"]))
+                action = min(("WAIT", "FLAP"), key=cost)
+                for tick in range(demo.DECISION_TICKS):
+                    game.tick(action == "FLAP" and tick == 0)
+                self.assertFalse(game.dead)
+            self.assertGreaterEqual(game.score, 10)
 
     def test_collision_and_score(self):
         game = demo.Game()
@@ -88,12 +153,23 @@ class ProtocolTests(unittest.TestCase):
         demo.validate_endpoint("http://127.0.0.1:1234", "hosted")
 
     def test_response_validation(self):
-        def body(probability=0.9, **kwargs):
+        def body(response=None, **kwargs):
             return json.dumps({"model": demo.MODEL, "answers": {
-                "flap": {"type": "noul", "noul": probability}}, **kwargs})
-        self.assertEqual(demo.decode_answer(body(), demo.MODEL), 0.9)
-        for invalid in (body(True), body(-1), body(2), body(float("nan")),
-                        body(model="wrong"), body(answers={}), '[]', 'not json'):
+                "action": wire_answer() if response is None else response}, **kwargs})
+        self.assertEqual(demo.decode_answer(body(), demo.MODEL), answer())
+        # Explicit WAIT wins even with tied probabilities/high confidence.
+        response = wire_answer("WAIT")
+        response["probabilities"] = {"FLAP": 0.5, "WAIT": 0.5}
+        self.assertEqual(demo.decode_answer(body(response), demo.MODEL)["action"], "WAIT")
+        for response in ({**wire_answer(), "choice": "unknown"},
+                         {**wire_answer(), "type": "noul"},
+                         {**wire_answer(), "confidence": True},
+                         {**wire_answer(), "probabilities": {"FLAP": float("nan"), "WAIT": 0}},
+                         {**wire_answer(), "probabilities": {"FLAP": 0.7}},
+                         {**wire_answer(), "probabilities": {"FLAP": 0.7, "WAIT": 0.9}}):
+            with self.subTest(response=response), self.assertRaises(demo.DemoError):
+                demo.decode_answer(body(response), demo.MODEL)
+        for invalid in (body(model="wrong"), body(answers={}), '[]', 'not json'):
             with self.subTest(invalid=invalid), self.assertRaises(demo.DemoError):
                 demo.decode_answer(invalid, demo.MODEL)
 
@@ -103,7 +179,7 @@ class ProtocolTests(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             status = 200
             body = json.dumps({"model": demo.MODEL, "answers": {
-                "flap": {"type": "noul", "noul": 0.7}}}).encode()
+                "action": wire_answer()}}).encode()
 
             def do_POST(self):
                 observed.append((self.path, self.headers["Authorization"],
@@ -121,11 +197,12 @@ class ProtocolTests(unittest.TestCase):
             thread.start()
             try:
                 config = dataclasses.replace(CONFIG, base_url=f"http://127.0.0.1:{server.server_port}")
-                self.assertEqual(demo.judge(config, demo.Game().observation()), 0.7)
+                self.assertEqual(demo.judge(config, demo.Game().observation()), answer())
                 self.assertEqual(observed[-1][0], "/api/v1/decide")
                 self.assertEqual(observed[-1][1], "Bearer test-only-key")
-                self.assertEqual(observed[-1][2]["questions"]["flap"]["type"], "noul")
-                self.assertEqual(demo.judge(dataclasses.replace(config, backend="official"), {}), 0.7)
+                self.assertEqual(observed[-1][2]["questions"]["action"]["type"], "choice")
+                self.assertEqual(set(observed[-1][2]["questions"]["action"]["criteria"]), {"FLAP", "WAIT"})
+                self.assertEqual(demo.judge(dataclasses.replace(config, backend="official"), {}), answer())
                 self.assertEqual(observed[-1][0], "/v1/systemone")
                 # Exercise the real spawned transport, not only the direct client.
                 request = demo.Request(config, demo.Game().observation())
@@ -135,7 +212,7 @@ class ProtocolTests(unittest.TestCase):
                     while result is None and time.monotonic() < deadline:
                         result = request.poll()
                         time.sleep(0.01)
-                    self.assertEqual(result, {"probability": 0.7})
+                    self.assertEqual(result, answer())
                 finally:
                     if result is None:
                         request.close()
@@ -157,7 +234,7 @@ class ProtocolTests(unittest.TestCase):
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         FakeRequest.instances = []
-        FakeRequest.result = {"probability": 0.9}
+        FakeRequest.result = answer()
         self.controller = demo.Controller(CONFIG, request_factory=FakeRequest)
 
     def test_waits_for_decision_and_no_overlapping_requests(self):
@@ -168,12 +245,43 @@ class LifecycleTests(unittest.TestCase):
             c.update(i / 30)
         self.assertEqual(c.game.observation(), initial)
         self.assertEqual(len(FakeRequest.instances), 1)
-        FakeRequest.result = {"probability": 0.9}
+        FakeRequest.result = answer()
         c.update(4)
         self.assertEqual(c.remaining, demo.DECISION_TICKS)
         c.update(5)
         self.assertLess(c.game.velocity, 0)
         self.assertEqual(c.game.ticks, 1)
+
+    def test_explicit_wait_with_tied_probabilities_never_flaps(self):
+        c = self.controller
+        FakeRequest.result = answer("WAIT", confidence=0.5)
+        FakeRequest.result["probabilities"] = {"FLAP": 0.5, "WAIT": 0.5}
+        c.update(0)
+        c.update(0.1)
+        for tick in range(demo.DECISION_TICKS):
+            c.update(1 + tick)
+        self.assertEqual(c.game.ticks, demo.DECISION_TICKS)
+        self.assertGreater(c.game.velocity, 0)
+        self.assertEqual(c.trace[-1]["executed_action"], "WAIT")
+
+    def test_flap_is_applied_once_and_trace_is_bounded_credential_free(self):
+        c = self.controller
+        c.update(0)
+        c.update(0.1)
+        for tick in range(demo.DECISION_TICKS):
+            c.update(1 + tick)
+        self.assertAlmostEqual(c.game.velocity, c.game.flap_velocity + demo.DECISION_TICKS * c.game.gravity)
+        entry = c.trace[-1]
+        for _ in range(100):
+            c.trace.append(entry)
+        response = c.command("trace")
+        self.assertEqual(response["retained"], 32)
+        self.assertEqual(response["returned"], 4)
+        self.assertFalse(response["complete"])
+        self.assertNotIn(CONFIG.key, json.dumps(response))
+        self.assertLess(len(json.dumps(response).encode()), 60000)
+        self.assertEqual(entry["observation"]["decision_tick"], 0)
+        self.assertEqual(entry["response"]["action"], entry["executed_action"])
 
     def test_pause_cancels_and_restart_discards_stale_result(self):
         c = self.controller

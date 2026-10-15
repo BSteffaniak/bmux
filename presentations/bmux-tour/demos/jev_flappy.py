@@ -8,6 +8,8 @@ are printed. One disposable HTTP worker bounds cancellation and request lifetime
 from __future__ import annotations
 
 import argparse
+import copy
+from collections import deque
 import curses
 import dataclasses
 import http.client
@@ -134,9 +136,45 @@ class Game:
             self.pipes.append(Pipe(self.pipes[-1].x + self.spacing,
                                    self.random.uniform(10, 20)))
 
+    def forecast(self, flap):
+        """Counterfactual only: same physics, no policy, no mutation of live state.
+
+        Apply this action once, then coast for 15 ticks. The first five ticks
+        are the committed action; later ticks show momentum if no further flap
+        occurs, NOT a promise that the agent must coast for the whole horizon.
+        """
+        projected = copy.deepcopy(self)
+        samples = []
+        collision_tick = None
+        for tick in range(1, 16):
+            projected.tick(flap and tick == 1)
+            if tick % DECISION_TICKS == 0 or projected.dead:
+                samples.append({"tick": tick, "y": round(projected.y, 3),
+                                "velocity_y": round(projected.velocity, 3)})
+            if projected.dead:
+                collision_tick = tick
+                break
+        return {"samples": samples, "collision_tick_if_coasting": collision_tick,
+                "safe_through_next_decision": collision_tick is None or collision_tick > DECISION_TICKS}
+
     def observation(self):
+        upcoming = [p for p in self.pipes if p.x + self.pipe_width >= self.bird_x - 1]
+        pipe = upcoming[0]
         return {
-            "coordinates": "x rightwards, y downwards; units per simulation tick",
+            "decision_tick": self.ticks,
+            "attempt": self.attempt,
+            "clearance": {"ceiling": round(self.y - 0.7, 3),
+                          "floor": round(self.height - 0.7 - self.y, 3)},
+            "target": {"gap_top": round(pipe.gap_y - self.gap_height / 2, 3),
+                       "gap_bottom": round(pipe.gap_y + self.gap_height / 2, 3),
+                       "safe_bird_center_min": round(pipe.gap_y - self.gap_height / 2 + 0.7, 3),
+                       "safe_bird_center_max": round(pipe.gap_y + self.gap_height / 2 - 0.7, 3),
+                       "center_y": round(pipe.gap_y, 3),
+                       "contact_in_ticks": max(0, math.ceil((pipe.x - 1 - self.bird_x) / self.pipe_speed)),
+                       "clear_in_ticks": max(0, math.floor((pipe.x + self.pipe_width + 1 - self.bird_x) / self.pipe_speed) + 1)},
+            "action_forecasts": {"FLAP": self.forecast(True), "WAIT": self.forecast(False)},
+            "forecast_semantics": "Each action occurs once NOW, then coast. Only ticks 1-5 execute before a fresh decision. Ticks 6-15 illustrate momentum, not a commitment.",
+            "coordinates": "x rightwards, y downwards; negative velocity_y means rising; units per simulation tick",
             "world": {"width": self.width, "height": self.height},
             "bird": {"x": self.bird_x, "y": round(self.y, 3),
                      "velocity_y": round(self.velocity, 3), "radius": 0.7},
@@ -152,26 +190,45 @@ class Game:
 
 def request_payload(config, observation):
     return {"model": config.model, "state": observation, "questions": {
-        "flap": {"type": "noul", "instructions": (
-            "Should the bird flap NOW to survive and pass the next pipe? "
-            "Return the probability that flapping is better than waiting. "
-            "The game advances exactly advance_ticks after this decision. "
-            "Flap sets vertical velocity, it does not add to it. Predict gravity, "
-            "avoid floor and ceiling, and align with the upcoming pipe gap. "
-            "No other pilot or safety controller will correct your action.")}}}
+        "action": {"type": "choice", "criteria": {
+            "FLAP": "Set upward velocity once now, then advance five ticks with gravity.",
+            "WAIT": "Do not flap; preserve momentum and advance five ticks with gravity."},
+            "instructions": (
+                "Choose exactly one immediate action: FLAP or WAIT. Maximize survival and pipes passed. "
+                "Y increases DOWNWARD: small y is near the ceiling; negative velocity means rising. "
+                "Use the supplied exact action_forecasts, clearances, and target safe center interval. "
+                "If both survive, prefer the tick-5 bird position closer to target.center_y, unless its momentum "
+                "would create an imminent boundary collision. Do not optimize the tick-15 coasting endpoint "
+                "as though no further decision were possible. Avoid actions that collide before the next decision. "
+                "If both survive, consider momentum: "
+                "repeated FLAP resets upward velocity and drives the bird into the ceiling. "
+                "WAIT lets an already rising bird arc and descend; FLAP arrests dangerous falling. "
+                "When the pipe is far away, maintain altitude near its gap without hitting world boundaries; "
+                "when overlapping a pipe, stay inside its safe center interval until clear_in_ticks. "
+                "Forecasts after tick 5 assume no further flaps only to illustrate momentum; you decide again "
+                "after tick 5. Do not confuse needing a flap later with needing one NOW. "
+                "There is no corrective pilot. Choose WAIT if the two actions are equally useful.")}}}
 
 
 def decode_answer(body, model):
     try:
         wire = json.loads(body)
-        if wire["model"] != model or set(wire["answers"]) != {"flap"}:
+        if wire["model"] != model or set(wire["answers"]) != {"action"}:
             raise ValueError
-        answer = wire["answers"]["flap"]
-        probability = answer["noul"]
-        if (answer["type"] != "noul" or type(probability) not in (float, int)
-                or not math.isfinite(probability) or not 0 <= probability <= 1):
+        answer = wire["answers"]["action"]
+        action = answer["choice"]
+        probabilities = answer["probabilities"]
+        confidence = answer["confidence"]
+        if (answer["type"] != "choice" or action not in ("FLAP", "WAIT")
+                or set(probabilities) != {"FLAP", "WAIT"}):
             raise ValueError
-        return float(probability)
+        for value in (*probabilities.values(), confidence):
+            if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError
+        if not math.isclose(sum(probabilities.values()), 1.0, abs_tol=0.01):
+            raise ValueError
+        # Execute the explicit choice, NOT argmax or a confidence threshold.
+        return {"action": action, "confidence": confidence, "probabilities": probabilities}
     except (ValueError, TypeError, KeyError, RecursionError):
         raise DemoError("Invalid Jev response or model mismatch") from None
 
@@ -204,7 +261,7 @@ def judge(config, observation):
 
 def request_worker(sender, config, observation):
     try:
-        result = {"probability": judge(config, observation)}
+        result = judge(config, observation)
     except DemoError as error:
         result = {"error": str(error)}
     except Exception:
@@ -267,7 +324,9 @@ class Controller:
         self.stopped = False
         self.remaining = 0
         self.flap = False
-        self.probability = None
+        self.confidence = None
+        self.trace = deque(maxlen=32)
+        self.pending_observation = None
         self.latency_ms = 0
         self.requests = 0
         self.failures = 0
@@ -295,6 +354,10 @@ class Controller:
         elif command == "stop":
             self.stopped = True
             self.cancel()
+        elif command == "trace":
+            return {"entries": list(self.trace)[-4:], "retained": len(self.trace),
+                    "capacity": self.trace.maxlen, "returned": min(4, len(self.trace)),
+                    "complete": len(self.trace) <= 4}
         elif command != "status":
             raise DemoError("Unknown control")
         return self.status()
@@ -321,6 +384,10 @@ class Controller:
                 if self.game.dead:
                     self.remaining = 0
                     self.retry_at = now + 1.5
+                    self.trace.append({"event": "collision", "attempt": self.game.attempt,
+                                       "tick": self.game.ticks, "y": round(self.game.y, 3),
+                                       "cause": "ceiling" if self.game.y < 0.7 else
+                                       "floor" if self.game.y >= self.game.height - 0.7 else "pipe"})
                     self.message = "Crashed! Next attempt shortly..."
             return
         if self.request is not None:
@@ -335,18 +402,21 @@ class Controller:
                 self.message = result["error"] + " - paused physics; retrying"
                 return
             self.failures = 0
-            self.probability = result["probability"]
-            self.flap = self.probability >= 0.5
+            self.confidence = result["confidence"]
+            self.flap = result["action"] == "FLAP"
+            self.trace.append({"event": "decision", "observation": self.pending_observation,
+                               "response": result, "executed_action": result["action"]})
             self.remaining = DECISION_TICKS
             self.next_tick = now
             self.message = "FLAP" if self.flap else "WAIT"
         elif now >= self.retry_at:
-            self.request = self.request_factory(self.config, self.game.observation())
+            self.pending_observation = self.game.observation()
+            self.request = self.request_factory(self.config, self.pending_observation)
             self.requests += 1
             self.message = "Jev deciding... (physics waiting)"
 
 
-COMMANDS = ("pause", "resume", "restart", "stop", "status")
+COMMANDS = ("pause", "resume", "restart", "stop", "status", "trace")
 
 
 class Controls:
@@ -422,7 +492,7 @@ def send_control(path, command):
             client.settimeout(2)
             client.bind(str(Path(directory) / "s"))
             client.sendto(command.encode(), path)
-            return json.loads(client.recv(4096))
+            return json.loads(client.recv(65536))
 
 
 def draw(screen, controller):
@@ -441,8 +511,8 @@ def draw(screen, controller):
     text(1, 1, f"Score {game.score}   Best {game.best}   Attempt {game.attempt}   Requests {controller.requests}")
     status = "PAUSED" if controller.paused else controller.message
     text(2, 1, status, yellow)
-    probability = "--" if controller.probability is None else f"{controller.probability:.2f}"
-    text(3, 1, f"P(flap) {probability}   Last latency {controller.latency_ms} ms   {controller.config.model}")
+    confidence = "--" if controller.confidence is None else f"{controller.confidence:.2f}"
+    text(3, 1, f"Choice confidence {confidence}   Last latency {controller.latency_ms} ms   {controller.config.model}")
     text(rows - 2, 1, "p pause/resume | r restart | q quit | private CLI controls available", cyan)
     if rows < 15 or cols < 45:
         text(6, 1, "Resize terminal to at least 45 x 15")
