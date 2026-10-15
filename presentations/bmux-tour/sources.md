@@ -36,6 +36,20 @@ Acceptance uses [scripts/presenter-tour-acceptance.py](../../scripts/presenter-t
 
 The retained evidence path is private and ephemeral, not a distributable public artifact. Review/redact PTY output, status, capability URLs, and runtime paths before sharing. Do not copy secrets or reusable credentials into ordinary diagnostics or presentation assets.
 
+## Diagram provenance and scope
+
+These are explanatory models, not generated dependency graphs. The adjacent implementation excerpts remain the exact-source evidence.
+
+| Slide ID | Source anchors | Deliberate simplification |
+| --- | --- | --- |
+| `command-route` | `AGENTS.md` core/plugin and foundational-service rules; `plugins/tabs-plugin-api/bpdl/tabs-plugin.bpdl` split command | Logical route only. “Service” means a foundational plugin service; “Host” means generic kernel primitives, not a tabs-specific core API. |
+| `ownership-map` | `docs/concepts.md` vocabulary; `INVARIANTS.md` arrangement, optional presentation, and input-target rules | Tab/context is compressed; current session backing is not a universal one-to-one identity. Dashed tab-bar edge is presentation only. |
+| `preview-lifecycle` | `plugins/theme-plugin/bpdl/theme-plugin.bpdl` `theme-control-v1` | Revision checked at begin; preview/cancel/confirm use a token. Repeated candidates, renewal, expiry, and failed operations are not drawn. |
+| `frame-transaction` | `packages/attach_pipeline/src/terminal.rs` `write_frame`; `packages/cli/src/runtime/attach/runtime.rs` `render_attach_frame_inner` | Pending cursor/graphics promotion versus failed-delivery invalidation. Host pixels cannot be rolled back atomically; browser paint acknowledgment is a separate boundary. |
+| `demo-authority` | `plugins/presenter-plugin/src/playbook.rs`; `packages/playbook/src/managed_display.rs`; `plugins/presenter-plugin/src/playbook_capture.rs` and `playbook_observer.rs` | Approval/admission and identity checks are summarized. Latest repair is bounded, not complete history; stop/cleanup/restart are separate lifecycle facts. |
+
+All five diagram slides were separately prepared as PNG assets through the embedded renderer and committed to browser Canvas at 1280×720 and 800×600. This checks real rendering, not venue legibility or every native terminal's image protocol. Speaker notes are explanatory/private, not required labels missing from the audience graph.
+
 ## Architectural sources and boundaries
 
 - [Concepts](../../docs/concepts.md) and [invariants](../../INVARIANTS.md): execution lifetime versus organization versus attachment-local selection. Personal-reference removal is not resource destruction; deliberate shared edits remain shared. Optional tab bars/decorations do not own authoritative resource creation, destruction, or ordering.

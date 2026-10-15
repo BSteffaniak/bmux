@@ -12,6 +12,20 @@ A feature-led narrative: **feature + embedded run on the same slide**, followed 
 
 Preserve stable `bmux:slide-id` and `bmux:block-id` identities when editing. Component identity participates in controller/reload behavior; do not reuse an ID for a different execution casually.
 
+## Architecture diagrams
+
+Five dedicated Mermaid slides explain specific boundaries rather than inventorying crates:
+
+| Slide ID | Question answered | Read the arrows as |
+| --- | --- | --- |
+| `command-route` | Where does product behavior belong? | Logical call/output boundaries; not an exhaustive call stack |
+| `ownership-map` | What changes when I navigate? | Organization, selection, and execution relationships; not exclusive ownership |
+| `preview-lifecycle` | Why is preview not a saved choice? | Successful token-owned preview/confirm/cancel paths; not all error transitions |
+| `frame-transaction` | When is a rendering baseline safe to reuse? | Delivery success versus invalidation/full repaint; not atomic rollback |
+| `demo-authority` | Who can send input to an embedded demo? | One worker-owned attach and a read-only output projection; not a second controller |
+
+Each slide includes one takeaway and source/limitation notes. Colors reinforce the labels; no relationship depends on color alone. The diagrams are prepared by the native embedded Mermaid renderer, not browser-side Mermaid JavaScript. They remain fixed images within a responsive slide, so narrower screens shrink diagram labels rather than reflowing the graph. Rehearse readability at the actual audience dimensions.
+
 ## What the demos establish
 
 The demos use generated isolated configuration with the built-in `tmux_compat` input profile and managed single-authority attach support, not a user's running session. `Ctrl-B` enters normal mode, Escape returns to shell input; visible UI actions use real key events and commands use attach paste plus Enter. No custom sandbox config or fabricated test/application status is needed.

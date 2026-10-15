@@ -68,6 +68,32 @@ Transition: “Now organize those surfaces without confusing organization with e
 <!-- bmux:end-notes -->
 
 ---
+<!-- bmux:slide-id command-route -->
+<!-- bmux:block-id command-route-title -->
+# The shortcut is not the architecture
+
+<!-- bmux:block-id command-route-diagram -->
+```mermaid
+flowchart LR
+  K[Input] -->|intent| P[Plugin]
+  P -->|BPDL| F[Service]
+  F -->|kernel| H[Host]
+  H -->|output| R[Scene]
+  classDef domain fill:#164e63,stroke:#22d3ee,color:#ffffff
+  classDef host fill:#312e81,stroke:#a5b4fc,color:#ffffff
+  class P,F domain
+  class H,R host
+```
+
+<!-- bmux:block-id command-route-takeaway -->
+**Plugins own product behavior.** Generic host mechanisms execute it; the keymap is only an entry point.
+
+<!-- bmux:notes -->
+Question: Where should a new product behavior live? Follow intent left to right, distinguishing domain decisions from execution mechanisms. Cyan is plugin-owned behavior; violet is host/rendering machinery. Arrows are logical boundaries, not every function in one literal stack. The retained scene governs interaction as well as pixels.
+Sources: AGENTS.md architecture boundary; tabs-commands.split-pane; ServiceCaller::execute_kernel_request. Non-foundational plugins reach domain state through foundational services, not direct kernel shortcuts. This is the required architecture, not a claim that every historical dependency is already ideal.
+<!-- bmux:end-notes -->
+
+---
 <!-- bmux:slide-id ownership -->
 <!-- bmux:block-id ownership-title -->
 # Running work ≠ its place in your view
@@ -83,6 +109,33 @@ Quick path: Manually run navigation. The original shell stores its PID; after a 
 Deeper path: Personal arrangements are distinct from deliberately shared arrangements. Changing an attachment's selection does not imply that a shared layout mutation is private. Removing a personal reference is not destroying the running resource. Disconnect survival is not machine-restart survival.
 Rehearsal: keep the state marker visible long enough to explain it. This passed managed script exercises real tab/workspace commands and preserved shell state, not a second attachment or independent client-focus demonstration.
 Transition: “Discovery must not quietly rewrite the organization it reads.”
+<!-- bmux:end-notes -->
+
+---
+<!-- bmux:slide-id ownership-map -->
+<!-- bmux:block-id ownership-map-title -->
+# Switching the view does not restart the work
+
+<!-- bmux:block-id ownership-map-diagram -->
+```mermaid
+flowchart LR
+  W[Workspace] -->|groups| T[Tab / context]
+  T -->|backed by| S[Session]
+  S -->|runs| P[Programs]
+  A[Attachment] -->|selects| T
+  B[Tab bar] -.->|shows| W
+  classDef domain fill:#164e63,stroke:#22d3ee,color:#ffffff
+  classDef execution fill:#312e81,stroke:#a5b4fc,color:#ffffff
+  class W,T,A domain
+  class S,P execution
+```
+
+<!-- bmux:block-id ownership-map-takeaway -->
+**Navigation changes selection, not process lifetime.** Removing a personal reference is not destroying the resource.
+
+<!-- bmux:notes -->
+Question: What changes when I switch tabs? Trace the attachment's selection edge, not the session-to-program edge. Solid arrows name relationships, not data flow or exclusive ownership. The dashed edge is presentation only: replacing a tab bar cannot allocate, destroy, or reorder authoritative resources.
+Sources: docs/concepts.md vocabulary and INVARIANTS.md arrangement/input rules. Tab/context is compressed for this diagram; a tab is backed by a context and currently one session. Personal references and shared edits have different semantics. Independent attachment focus does not make a shared layout mutation private. Do not infer machine-restart survival.
 <!-- bmux:end-notes -->
 
 ---
@@ -210,6 +263,32 @@ Transition: “A picker is one client of revisioned state.”
 <!-- bmux:end-notes -->
 
 ---
+<!-- bmux:slide-id preview-lifecycle -->
+<!-- bmux:block-id preview-lifecycle-title -->
+# Preview is temporary authority, not a saved choice
+
+<!-- bmux:block-id preview-lifecycle-diagram -->
+```mermaid
+flowchart LR
+  C[Committed] -->|revision| T[Preview token]
+  T --> V[Temporary look]
+  V -->|confirm| N[Save choice]
+  V -->|cancel| O[Restore choice]
+  classDef stable fill:#164e63,stroke:#22d3ee,color:#ffffff
+  classDef temporary fill:#78350f,stroke:#fbbf24,color:#ffffff
+  class C,N,O stable
+  class T,V temporary
+```
+
+<!-- bmux:block-id preview-lifecycle-takeaway -->
+**Revision checks protect entry; the token owns the preview.** Moving the highlight is not confirmation.
+
+<!-- bmux:notes -->
+Question: Why not save on every Down key? A preview must be reversible and owned. Cyan is committed state; amber is temporary authority/appearance. Moving among candidates changes live appearance without treating each highlight as a saved selection. That repeated preview step is compressed into Temporary look; Save choice and Restore choice are outcomes, not additional state owners. Confirm and cancel are distinct operations.
+Source: plugins/theme-plugin/bpdl/theme-plugin.bpdl, theme-control-v1. This is a successful-path lifecycle, not a complete error state machine. Begin can reject a stale expected revision; token operations can fail and are not unconditional transitions. Renew-preview and cleanup/expiry handling are intentionally omitted. The demo shows previews and confirmation, not all races or cancellation cases.
+<!-- bmux:end-notes -->
+
+---
 <!-- bmux:slide-id themes-control -->
 <!-- bmux:block-id themes-control-title -->
 # Stale controls must not silently win
@@ -251,6 +330,34 @@ Quick path: Start manually. Follow seq 1 100, entry into scrollback, Page Up/Pag
 Deeper path: The retained compositor is the common authority for damage, clipping, focus, hit testing, and pointer routing. Different transports do not get independent scene ownership. A correct-looking screenshot alone does not prove flush-failure or stale-input handling.
 Rehearsal: verify text and scrolling at actual audience dimensions. This script does not inject write/flush failures. The following code explains the failure boundary; successful text rendering is not fault-injection evidence.
 Transition: “The smallest important implementation detail is only four lines.”
+<!-- bmux:end-notes -->
+
+---
+<!-- bmux:slide-id frame-transaction -->
+<!-- bmux:block-id frame-transaction-title -->
+# Only delivered output becomes the next baseline
+
+<!-- bmux:block-id frame-transaction-diagram -->
+```mermaid
+flowchart LR
+  S[Stage] --> W[Write + flush]
+  W -->|success| C[Promote]
+  C --> N[Incremental]
+  W -->|error| I[Invalidate]
+  I --> F[Full repaint]
+  F --> S
+  classDef committed fill:#164e63,stroke:#22d3ee,color:#ffffff
+  classDef repair fill:#7f1d1d,stroke:#fca5a5,color:#ffffff
+  class C,N committed
+  class I,F repair
+```
+
+<!-- bmux:block-id frame-transaction-takeaway -->
+**A failed flush leaves host output uncertain.** Do not promote pending cursor/graphics state or trust the old row baseline.
+
+<!-- bmux:notes -->
+Question: Why can a screenshot look right while the renderer is wrong? Incremental work depends on a known delivered baseline, not just a successfully constructed buffer. Cyan is promotion; red is repair. A partial write is not reversible: invalidation and full repaint repair assumptions, not an atomic rollback of terminal pixels.
+Sources: packages/attach_pipeline/src/terminal.rs write_frame; packages/cli/src/runtime/attach/runtime.rs render_attach_frame_inner write_result branch and following cache promotion. Successfully written/flushed frames enter display capture. This diagram is terminal delivery, not a claim that a browser has already painted a received frame. The demo does not inject output failures.
 <!-- bmux:end-notes -->
 
 ---
@@ -322,6 +429,33 @@ Quick path: Start manually. Point to the computed 42 in each pane, assert-layout
 Deeper path: A playbook is executable input, not a passive slide asset. Parser-only consumers do not enable native execution. CLI and managed workers share the playbook executor; a host adapter supplies platform primitives rather than implementing a separate action language. Evidence only supports the assertions actually made.
 Rehearsal: review the frozen source/include closure and redact retained artifacts before sharing. The six scripts exercise real commands through the owned attach; their arithmetic results are not repository test/benchmark outcomes. A retained snapshot supports the actual assertions, not arbitrary claims about unseen behavior.
 Transition: “Embedding execution requires restrictions, not just a pretty component.”
+<!-- bmux:end-notes -->
+
+---
+<!-- bmux:slide-id demo-authority -->
+<!-- bmux:block-id demo-authority-title -->
+# One input authority; many read-only views
+
+<!-- bmux:block-id demo-authority-diagram -->
+```mermaid
+flowchart LR
+  A[Script] -->|start| W[Worker]
+  W -->|input| T[Attach]
+  T -->|frame| R[Repair]
+  R -->|validate| P[Presenter]
+  P -->|view| B[Audience]
+  classDef control fill:#164e63,stroke:#22d3ee,color:#ffffff
+  classDef readonly fill:#312e81,stroke:#a5b4fc,color:#ffffff
+  class A,W,T control
+  class R,P,B readonly
+```
+
+<!-- bmux:block-id demo-authority-takeaway -->
+**The audience sees the execution owner's view.** It does not get a second attach, shell input, or authority to start work.
+
+<!-- bmux:notes -->
+Question: Is the embedded demo a real UI, a recording, or another controller? The worker drives the actual owned attach. The presenter reads a bounded latest complete repair, validates lifetime identity/revision, and paints retained output; it does not reconstruct the scene from pane text. Cyan is execution/input authority; violet is the read-only projection. Arrows show the data path, not extra processes: browser output is optional.
+Sources: plugins/presenter-plugin/src/playbook.rs admission; packages/playbook/src/managed_display.rs DisplayPacket; plugins/presenter-plugin/src/playbook_capture.rs ManagedCaptureCursor; playbook_observer.rs. Generation/epoch/revision fencing are simplified here. A missing repair is not completion. Stop requests, cleanup acknowledgment, and restart are separate lifecycle facts; output retention is bounded, not a complete output history.
 <!-- bmux:end-notes -->
 
 ---
