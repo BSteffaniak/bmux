@@ -21,7 +21,7 @@ bmux_config = { workspace = true }
 bmux_fonts = { workspace = true, features = ["bundled-nerd-fonts"] }
 bmux_image = { workspace = true }
 bmux_keyboard = { workspace = true }
-bmux_mermaid_render = { workspace = true, features = ["wasm"] }
+bmux_mermaid_render = { workspace = true }
 bmux_playbook = { workspace = true }
 bmux_playbook_plugin_api = { workspace = true }
 bmux_plugin_sdk = { workspace = true }

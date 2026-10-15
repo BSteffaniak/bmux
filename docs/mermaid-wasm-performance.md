@@ -1,4 +1,8 @@
-# Mermaid native-process / embedded-WASM measurement protocol (v1)
+# Historical Mermaid native-process / embedded-WASM measurements
+
+The process renderer has been removed. Commands below describe historical
+artifacts and cannot be used with the current checkout. Current benchmarking
+uses WASM modes only; see `packages/mermaid-render/README.md`.
 
 **Status: v4 prototype measurements recorded; migration NOT accepted.**
 Coordinator granted the exclusive benchmark CPU lane for the runs below. Font/

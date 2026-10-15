@@ -570,11 +570,11 @@ mod platform_tests {
     use super::*;
     use serde_json::json;
 
-    fn mermaid() -> Value {
+    fn helper_declaration() -> Value {
         json!({
-            "owner": "bmux.presenter", "id": "mermaid-worker",
-            "cargo_package": "bmux_mermaid_render", "cargo_binary": "bmux-mermaid-worker",
-            "relative_path": "bmux-mermaid-worker", "protocol_version": 1,
+            "owner": "fixture.plugin", "id": "fixture-helper",
+            "cargo_package": "fixture_helper", "cargo_binary": "fixture-helper",
+            "relative_path": "fixture-helper", "protocol_version": 1,
             "supported_platforms": ["unix", "windows"]
         })
     }
@@ -584,7 +584,7 @@ mod platform_tests {
         let legacy = json!({});
         assert!(supports_target(&legacy, "x86_64-unknown-linux-gnu").unwrap());
         assert!(!supports_target(&legacy, "x86_64-pc-windows-msvc").unwrap());
-        assert!(supports_target(&mermaid(), "x86_64-pc-windows-msvc").unwrap());
+        assert!(supports_target(&helper_declaration(), "x86_64-pc-windows-msvc").unwrap());
         for platforms in [
             json!([]),
             json!(["win32"]),
@@ -599,7 +599,7 @@ mod platform_tests {
                 .is_err()
             );
         }
-        assert!(supports_target(&mermaid(), "unknown-target").is_err());
+        assert!(supports_target(&helper_declaration(), "unknown-target").is_err());
     }
 
     #[test]
@@ -607,11 +607,11 @@ mod platform_tests {
         let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let build = root.path().join("build");
         fs::create_dir(&build).unwrap();
-        for name in ["bmux.exe", "xtask.exe", "bmux-mermaid-worker.exe"] {
+        for name in ["bmux.exe", "xtask.exe", "fixture-helper.exe"] {
             fs::write(build.join(name), format!("fixture:{name}")).unwrap();
         }
         let legacy = json!({"relative_path": "unix-helper", "cargo_binary": "unix-helper"});
-        let declarations = vec![mermaid(), legacy.clone()];
+        let declarations = vec![helper_declaration(), legacy.clone()];
         let destination = root.path().join("stage");
         stage(
             &build,
@@ -626,15 +626,15 @@ mod platform_tests {
         let helper = inventory
             .artifacts
             .iter()
-            .find(|item| item.relative_path == "bmux-mermaid-worker.exe")
+            .find(|item| item.relative_path == "fixture-helper.exe")
             .unwrap();
-        assert_eq!(helper.declaration, Some(mermaid()));
-        assert!(!destination.join("bmux-mermaid-worker").exists());
+        assert_eq!(helper.declaration, Some(helper_declaration()));
+        assert!(!destination.join("fixture-helper").exists());
         let installed = root.path().join("installed");
         install(&destination, &installed, None).unwrap();
         assert_eq!(
-            fs::read(installed.join("bmux-mermaid-worker.exe")).unwrap(),
-            b"fixture:bmux-mermaid-worker.exe"
+            fs::read(installed.join("fixture-helper.exe")).unwrap(),
+            b"fixture:fixture-helper.exe"
         );
         verify(&installed).unwrap();
 
@@ -642,7 +642,7 @@ mod platform_tests {
         invalid
             .artifacts
             .iter_mut()
-            .find(|item| item.relative_path == "bmux-mermaid-worker.exe")
+            .find(|item| item.relative_path == "fixture-helper.exe")
             .unwrap()
             .declaration
             .as_mut()
@@ -656,15 +656,15 @@ mod platform_tests {
         invalid
             .artifacts
             .iter_mut()
-            .find(|item| item.relative_path == "bmux-mermaid-worker.exe")
+            .find(|item| item.relative_path == "fixture-helper.exe")
             .unwrap()
-            .declaration = Some(mermaid());
+            .declaration = Some(helper_declaration());
         fs::write(
             destination.join("artifacts.json"),
             serde_json::to_vec(&invalid).unwrap(),
         )
         .unwrap();
-        fs::write(destination.join("bmux-mermaid-worker.exe"), b"tampered").unwrap();
+        fs::write(destination.join("fixture-helper.exe"), b"tampered").unwrap();
         assert!(verify(&destination).is_err());
     }
 
@@ -679,14 +679,30 @@ mod platform_tests {
         let destination = root.path().join("stage");
         stage(&build, &destination, "x86_64-pc-windows-msvc", &[]).unwrap();
         let previous = fs::read(destination.join("artifacts.json")).unwrap();
-        assert!(stage(&build, &destination, "x86_64-pc-windows-msvc", &[mermaid()]).is_err());
+        assert!(
+            stage(
+                &build,
+                &destination,
+                "x86_64-pc-windows-msvc",
+                &[helper_declaration()]
+            )
+            .is_err()
+        );
         assert_eq!(
             fs::read(destination.join("artifacts.json")).unwrap(),
             previous
         );
         verify(&destination).unwrap();
         let absent = root.path().join("absent");
-        assert!(stage(&build, &absent, "x86_64-pc-windows-msvc", &[mermaid()]).is_err());
+        assert!(
+            stage(
+                &build,
+                &absent,
+                "x86_64-pc-windows-msvc",
+                &[helper_declaration()]
+            )
+            .is_err()
+        );
         assert!(!absent.exists());
     }
 }

@@ -45,8 +45,8 @@ The guest consumes <https://github.com/BSteffaniak/mermaid-rs-renderer>, branch
 ordinary locked builds do not automatically follow branch updates.
 It is based on upstream release 0.3.1 commit
 `2f993bd79a55235eb59a34d807852276ba25bea7`; no unrelated master updates are included.
-There is no vendored source or submodule. Native workspace rendering continues
-using the crates.io release, unchanged.
+There is no vendored source or submodule. The host workspace contains no native Mermaid renderer; this guest is the
+sole renderer implementation.
 
 Fork changes are general-purpose: clock-free diagnostic timings on wasm32 unknown,
 no system-font/cache IO on that target, and `set_text_measurement_font` accepting
@@ -68,8 +68,8 @@ it. Font SHA-256:
 `0ec29a68b539ece7078fc714cebff0c0accb2f4948f8f7963d9f5e86633b12d9`.
 
 Measurements use this fixed regular font regardless of requested family.
-This deliberately differs from the current native system-font baseline, so
-SVG geometry need not match native. SVG font-family styling is not rewritten;
+This differs from the historical native system-font baseline, so
+SVG geometry need not match historical native output. SVG font-family styling is not rewritten;
 a later SVG rasterizer/viewer may substitute fonts. Deterministic measurement
 is not a claim of pixel-identical rendering or complete Unicode glyph coverage.
 The font bytes are compiled into WASM; there are no WASI/filesystem/network

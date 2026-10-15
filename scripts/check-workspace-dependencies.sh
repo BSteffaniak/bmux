@@ -27,6 +27,17 @@ local_packages = {
 errors = []
 
 
+def owning_dependencies(path):
+    # Nested independent workspaces (the portable Mermaid guest) own their
+    # inheritance tables; dependencies must never resolve against the host.
+    for parent in pathlib.Path(path).parents:
+        candidate = str(parent / "Cargo.toml")
+        manifest = manifests.get(candidate)
+        if manifest is not None and "workspace" in manifest:
+            return manifest["workspace"].get("dependencies", {})
+    return workspace_dependencies
+
+
 def check(path, table, section=()):
     for key, value in table.items():
         current = section + (key,)
@@ -41,7 +52,7 @@ def check(path, table, section=()):
                     errors.append(f"{location}: define paths in workspace.dependencies only")
                 if spec.get("package", name) in local_packages and not inherited:
                     errors.append(f"{location}: local packages must use workspace = true")
-                if inherited and name not in workspace_dependencies:
+                if inherited and name not in owning_dependencies(path):
                     errors.append(f"{location}: missing workspace.dependencies definition")
         elif isinstance(value, dict):
             check(path, value, current)

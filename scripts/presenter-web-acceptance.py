@@ -170,8 +170,7 @@ class Acceptance:
         self.config = self.root / "config/bmux.toml"
         self.env.update(BMUX_CONFIG=str(self.config), BMUX_NO_BASE_CONFIG="1",
                         BMUX_RUNTIME_NAME="default", BMUX_TARGET="local", TERM="xterm-256color",
-                        BMUX_PRESENTER_WEB_DELIVERY="frame",
-                        BMUX_MERMAID_WORKER_PATH=str(args.mermaid_worker))
+                        BMUX_PRESENTER_WEB_DELIVERY="frame")
         self.command = [str(args.binary), "--runtime", "default", "--target", "local",
                         "--config", str(self.config)]
         self.processes, self.clients, self.cases = [], [], []
@@ -185,7 +184,6 @@ class Acceptance:
         (self.root / "presenter").write_text(self.credential)
         (self.root / "presenter").chmod(0o600)
         self.identity = {"binary": WEB.digest(args.binary), "browser": WEB.digest(args.browser),
-                         "mermaid_worker": WEB.digest(args.mermaid_worker),
                          "assets": {name: WEB.digest(args.assets / name) for name in
                                     (*WEB.ASSETS, "presenter-adapter.js", "bmux_presenter.js", "bmux_presenter_bg.wasm")},
                          "plugins": {str(p.relative_to(args.plugins)): WEB.digest(p)
@@ -1069,15 +1067,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("binary", "plugins", "assets", "browser"):
         parser.add_argument("--" + name, type=lambda s: Path(s).resolve(strict=True), required=True)
-    parser.add_argument("--mermaid-worker", type=lambda s: Path(s).resolve(strict=True),
-                        help="explicit packaged worker; defaults to bmux-mermaid-worker beside --binary")
     parser.add_argument("--state-parent", type=Path, default=Path("/tmp"))
     parser.add_argument("--lan-address", required=True,
                         help="owned machine's non-loopback IPv4 address; required real LAN bind/browser test")
     args = parser.parse_args()
-    args.mermaid_worker = args.mermaid_worker or args.binary.with_name("bmux-mermaid-worker")
-    require(args.mermaid_worker.is_file() and os.access(args.mermaid_worker, os.X_OK),
-            "packaged Mermaid worker required; supply --mermaid-worker")
     require(args.binary.is_file() and os.access(args.binary, os.X_OK), "explicit bmux binary not executable")
     require(args.browser.is_file() and os.access(args.browser, os.X_OK), "explicit Chromium not executable")
     require(args.plugins.is_dir() and args.assets.is_dir(), "explicit staged directories required")

@@ -1,5 +1,3 @@
-#![cfg(feature = "wasm")]
-
 use std::time::{Duration, Instant};
 
 use bmux_mermaid_render::{
@@ -71,7 +69,7 @@ fn synthetic_guest_abi_bounds_and_settlement() {
     for response in [b"".as_slice(), b"\x02<svg/>", b"\0\xff", b"\0not svg"] {
         assert!(matches!(
             render(&guest("", response)),
-            Err(MermaidRenderError::InvalidWorkerResponse { .. })
+            Err(MermaidRenderError::InvalidGuestResponse { .. })
         ));
     }
     let mut small = request();
@@ -100,18 +98,18 @@ fn synthetic_guest_abi_bounds_and_settlement() {
         let invalid = guest(&format!("i64.const {packed} return"), b"\0<svg/>");
         assert!(matches!(
             render(&invalid),
-            Err(MermaidRenderError::InvalidWorkerResponse { .. })
+            Err(MermaidRenderError::InvalidGuestResponse { .. })
         ));
     }
     let missing = module_renderer("(module (memory (export \"memory\") 1))");
     assert!(matches!(
         render(&missing),
-        Err(MermaidRenderError::InvalidWorkerResponse { .. })
+        Err(MermaidRenderError::InvalidGuestResponse { .. })
     ));
     let imported = wat::parse_str("(module (import \"env\" \"host\" (func)))").unwrap();
     assert!(matches!(
         WasmMermaidRenderer::from_module_bytes(&imported),
-        Err(MermaidRenderError::WorkerUnavailable { .. })
+        Err(MermaidRenderError::RendererUnavailable { .. })
     ));
 
     cancellation_and_settlement(&renderer);

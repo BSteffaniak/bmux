@@ -11,38 +11,22 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-libc                = { workspace = true }
-mermaid-rs-renderer = { workspace = true }
-sha2                = { workspace = true }
-tempfile            = { workspace = true }
-tokio               = { workspace = true, optional = true, features = ["rt", "sync", "time"] }
-wasmtime            = { workspace = true, optional = true }
+sha2     = { workspace = true }
+tokio    = { workspace = true, features = ["rt", "sync", "time"] }
+wasmtime = { workspace = true }
 
 [build-dependencies]
 # Enable destination backends directly: Wasmtime's all-arch feature resolves an
 # unpublished winch-codegen 38.0.4, though this renderer only uses Cranelift.
 cranelift-codegen = { workspace = true }
-wasmtime          = { workspace = true, optional = true }
+wasmtime          = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 # Exercise destination AOT generation with the same backends as the build script.
 cranelift-codegen = { workspace = true }
 wat               = { workspace = true }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
-
-[[bin]]
-name = "bmux-mermaid-worker"
-path = "src/bin/worker.rs"
-
 [features]
 default          = []
 fail-on-warnings = []
-wasm             = ["dep:wasmtime", "dep:tokio"]

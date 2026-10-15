@@ -15,19 +15,17 @@ cargo run -p bmux_cli -- present play packages/presenter/examples/quickstart.md
 
 Add `--presenter` to playback to show speaker notes. The quickstart includes
 code, columns, reveals, and live reload without images, Mermaid, or custom
-component registration. For the richer image/Mermaid deck, build the helper in
-this same dev shell, profile, and target directory, then check and play:
+component registration. For the richer image/Mermaid deck, check and play in
+the development shell (including the WASM guest target):
 
 ```sh
-cargo build -p bmux_mermaid_render --bin bmux-mermaid-worker
 cargo run -p bmux_cli -- present check packages/presenter/examples/deck.md
 cargo run -p bmux_cli -- present play packages/presenter/examples/deck.md
 ```
 
 `examples/deck.md` uses the bundled `architecture.png` beside it and requires no
 custom component registration. Keep that image beside the deck when copying it.
-The helper is discovered beside the BMUX executable; if you build it elsewhere,
-set `BMUX_MERMAID_WORKER_PATH` to its absolute executable path. Images need a
+Mermaid uses embedded WASM and needs no helper executable. Images need a
 terminal with a supported image protocol to display graphically.
 
 `cargo run -p bmux_presenter --example linked_deck` is a headless Rust
@@ -152,8 +150,8 @@ linked components need an explicitly reviewed public configuration projection.
 ## Examples and validation
 
 `examples/deck.md` is a runnable CLI deck covering metadata, reveals, notes, code,
-tables, columns, a bundled image, and Mermaid. Build `bmux-mermaid-worker` as
-shown above before checking or playing it; no custom registration is needed.
+tables, columns, a bundled image, and embedded WASM Mermaid. No helper binary
+or custom registration is needed.
 `examples/linked_deck.rs` builds a Rust
 deck, registers a canonical interactive button with caller-owned state, injects
 an authorized pixel asset, and stages an offscreen canonical frame. A runtime

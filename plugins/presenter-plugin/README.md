@@ -61,7 +61,6 @@ For the bundled image/Mermaid deck, run from the repository root in the same dev
 shell and Cargo profile:
 
 ```sh
-cargo build -p bmux_mermaid_render --bin bmux-mermaid-worker
 cargo run -p bmux_cli -- present check packages/presenter/examples/deck.md
 cargo run -p bmux_cli -- present play packages/presenter/examples/deck.md
 ```

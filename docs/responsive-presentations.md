@@ -84,15 +84,13 @@ when allocating a test slot:
 python3 scripts/presenter-web-acceptance.py \
   --binary /absolute/bmux --plugins /absolute/plugins \
   --assets /absolute/web-assets --browser /absolute/chromium \
-  --mermaid-worker /absolute/bmux-mermaid-worker \
   --state-parent /owned/private-state --lan-address OWNED_NON_LOOPBACK_IPV4
 ```
 
 The harness sets frame mode for legacy play/host/config/network launches and
 document mode for semantic launches. It requires presenter adapter/JS/WASM assets,
 and records their hashes along with the native binary, plugins, browser, and
-Mermaid worker. The worker defaults to `bmux-mermaid-worker` beside the binary;
-an explicit `--mermaid-worker` selects another coordinator-built artifact.
+embedded WASM Mermaid renderer. No helper executable is needed.
 
 The harness retains private artifact hashes and per-case results. It runs the
 existing fixed-frame suite plus a document-mode case with simultaneous narrow and

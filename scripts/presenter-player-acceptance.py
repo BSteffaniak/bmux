@@ -233,7 +233,6 @@ class Acceptance(OWNED.Acceptance):
         host_env = {key: value.replace(str(self.root), str(host_root))
                     for key, value in self.env.items()}
         # Artifacts and source/evidence paths do not move with host state.
-        host_env["BMUX_MERMAID_WORKER_PATH"] = str(self.args.mermaid_worker)
         host_env["BMUX_PRESENTER_FRAME_EVIDENCE"] = str(self.evidence)
         command = [str(self.args.binary), "--runtime", "default", "--target", "local", "--config", str(config)]
         local_command = self.command
@@ -475,7 +474,7 @@ class Acceptance(OWNED.Acceptance):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("binary", "plugins", "assets", "browser", "mermaid-worker"):
+    for name in ("binary", "plugins", "assets", "browser"):
         parser.add_argument("--" + name, type=lambda value: Path(value).resolve(strict=True), required=True)
     parser.add_argument("--state-parent", type=lambda value: Path(value).resolve(strict=True), default=Path("/tmp"))
     parser.add_argument("--auto-assets", action="store_true", help="exercise first-use resolver in owned isolated cache")

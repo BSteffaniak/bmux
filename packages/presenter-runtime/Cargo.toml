@@ -11,7 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_mermaid_render = { workspace = true, features = ["wasm"] }
+bmux_mermaid_render = { workspace = true }
 bmux_presenter = { workspace = true }
 bmux_tui = { workspace = true, features = ["serde"] }
 image = { workspace = true }

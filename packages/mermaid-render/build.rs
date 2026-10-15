@@ -6,17 +6,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[cfg(feature = "wasm")]
 mod wasm_config;
 
 const TARGET: &str = "wasm32-unknown-unknown";
 const ARTIFACT: &str = "bmux_mermaid_guest.wasm";
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WASM");
-    if env::var_os("CARGO_FEATURE_WASM").is_none() {
-        return;
-    }
     if let Err(error) = build() {
         panic!("could not build embedded Mermaid guest: {error}");
     }
@@ -107,7 +102,6 @@ fn build() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "wasm")]
 fn precompile(wasm: &[u8], target: &str, out_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let destination = target
         .parse()
@@ -125,15 +119,6 @@ fn precompile(wasm: &[u8], target: &str, out_dir: &Path) -> Result<(), Box<dyn s
         fs::write(out_dir.join(filename), artifact)?;
     }
     Ok(())
-}
-
-#[cfg(not(feature = "wasm"))]
-fn precompile(
-    _wasm: &[u8],
-    _target: &str,
-    _out_dir: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    Err("WASM build requested without the WASM build dependency".into())
 }
 
 fn watch_tree(path: &Path) -> io::Result<()> {

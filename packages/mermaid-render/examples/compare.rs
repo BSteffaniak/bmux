@@ -4,74 +4,33 @@ use std::{
     error::Error,
     fmt::Write as _,
     io::{self, BufRead, Write},
-    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use bmux_mermaid_render::{
-    CapturedMermaidWorker, IsolatedMermaidRenderer, MermaidCancellationToken, MermaidRenderError,
-    MermaidRenderRequest, MermaidRendered, MermaidRenderedOutput, render_mermaid,
+    MermaidCancellationToken, MermaidRenderError, MermaidRenderRequest, MermaidRendered,
+    MermaidRenderedOutput, WasmMermaidRenderer,
 };
 use sha2::{Digest, Sha256};
 
-#[cfg(feature = "wasm")]
-use bmux_mermaid_render::WasmMermaidRenderer;
-
 type RenderResult = Result<MermaidRendered, MermaidRenderError>;
-
-// Exact compile-time corpus bytes, not caller-provided trust assertions. Do not add
-// malformed, dense or limit cases here: native timeout does not stop its thread.
-const NATIVE_TRUSTED: [&str; 6] = [
-    include_str!("../bench-corpus/flowchart.mmd"),
-    include_str!("../bench-corpus/sequence.mmd"),
-    include_str!("../bench-corpus/class.mmd"),
-    include_str!("../bench-corpus/state.mmd"),
-    include_str!("../bench-corpus/er.mmd"),
-    include_str!("../bench-corpus/pie.mmd"),
-];
 
 struct Driver {
     mode: String,
-    capture: Option<CapturedMermaidWorker>,
-    acquired: Option<IsolatedMermaidRenderer>,
-    #[cfg(feature = "wasm")]
     wasm: Option<WasmMermaidRenderer>,
 }
 
 impl Driver {
-    fn new(mode: String, worker: &Path, fuel: u64) -> Result<Self, Box<dyn Error>> {
-        #[cfg(not(feature = "wasm"))]
-        let _ = fuel;
-        let mut driver = Self {
-            mode,
-            capture: None,
-            acquired: None,
-            #[cfg(feature = "wasm")]
-            wasm: None,
-        };
+    fn new(mode: String, fuel: u64) -> Result<Self, Box<dyn Error>> {
+        let mut driver = Self { mode, wasm: None };
         match driver.mode.as_str() {
-            "current" => driver.capture = Some(CapturedMermaidWorker::capture(worker)?),
-            "worker" => {
-                let mut capture = CapturedMermaidWorker::capture(worker)?;
-                driver.acquired = Some(capture.acquire()?);
-                driver.capture = Some(capture);
-            }
-            "native" => (),
-            #[cfg(feature = "wasm")]
             "wasm-warm" => driver.wasm = Some(WasmMermaidRenderer::new()?),
-            #[cfg(feature = "wasm")]
             "wasm-jit-warm" => driver.wasm = Some(WasmMermaidRenderer::new_jit()?),
-            #[cfg(feature = "wasm")]
             "wasm-fuel" => driver.wasm = Some(WasmMermaidRenderer::new_with_fuel(fuel)?),
-            #[cfg(feature = "wasm")]
             "wasm-cold" | "wasm-jit-cold" => (),
             _ => {
-                return Err(format!(
-                    "unsupported mode: {} (WASM requires feature wasm)",
-                    driver.mode
-                )
-                .into());
+                return Err(format!("unsupported WASM mode: {}", driver.mode).into());
             }
         }
         Ok(driver)
@@ -83,7 +42,6 @@ impl Driver {
         token: &MermaidCancellationToken,
     ) -> (RenderResult, u128, u128) {
         let mut construction_ns = 0;
-        #[cfg(feature = "wasm")]
         let cold = if matches!(self.mode.as_str(), "wasm-cold" | "wasm-jit-cold") {
             let started = Instant::now();
             let renderer = if self.mode == "wasm-cold" {
@@ -99,36 +57,13 @@ impl Driver {
         } else {
             None
         };
-        #[cfg(not(feature = "wasm"))]
-        let _ = &mut construction_ns;
         let render_started = Instant::now();
         let result = match self.mode.as_str() {
-            "current" => {
-                // Presenter acquire -> loader pin -> render. Both snapshots drop
-                // before the timer stops; capture persists like plugin activation.
-                // Keep fallible snapshot setup inside the timed result closure.
-                (|| {
-                    let acquired = self
-                        .capture
-                        .as_mut()
-                        .expect("initialized capture")
-                        .acquire()?;
-                    IsolatedMermaidRenderer::pin(acquired.executable())?.render(request, token)
-                })()
-            }
-            "worker" => self
-                .acquired
-                .as_ref()
-                .expect("initialized snapshot")
-                .render(request, token),
-            "native" => render_mermaid(request, token),
-            #[cfg(feature = "wasm")]
             "wasm-warm" | "wasm-jit-warm" | "wasm-fuel" => self
                 .wasm
                 .as_ref()
                 .expect("initialized module")
                 .render(request, token),
-            #[cfg(feature = "wasm")]
             "wasm-cold" | "wasm-jit-cold" => cold
                 .as_ref()
                 .expect("constructed cold renderer")
@@ -141,17 +76,17 @@ impl Driver {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let arguments: Vec<String> = std::env::args().collect();
-    if !(3..=4).contains(&arguments.len()) {
-        return Err("usage: compare MODE ABSOLUTE_WORKER_PATH [FUEL_BUDGET=1000000000]".into());
+    if !(2..=3).contains(&arguments.len()) {
+        return Err("usage: compare MODE [FUEL_BUDGET=1000000000]".into());
     }
     let fuel = arguments
-        .get(3)
+        .get(2)
         .map_or(Ok(1_000_000_000_u64), |value| value.parse())?;
     if fuel == 0 {
         return Err("fuel budget must be positive".into());
     }
     let setup = Instant::now();
-    let mut driver = Driver::new(arguments[1].clone(), Path::new(&arguments[2]), fuel)?;
+    let mut driver = Driver::new(arguments[1].clone(), fuel)?;
     println!("READY\t{}", setup.elapsed().as_nanos());
     io::stdout().flush()?;
     // Input: absolute source path TAB cancellation delay ms or '-' TAB SVG path or '-'.
@@ -163,12 +98,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err("benchmark source exceeds largest corpus case".into());
         }
         let source = std::fs::read_to_string(path)?;
-        if driver.mode == "native" && (cancel != "-" || !NATIVE_TRUSTED.contains(&source.as_str()))
-        {
-            return Err(
-                "native diagnostic accepts only exact small trusted corpus; no cancellation".into(),
-            );
-        }
         let request = MermaidRenderRequest::svg(source, 800, 600);
         let token = MermaidCancellationToken::default();
         let cancelled_at = Arc::new(Mutex::new(None));
@@ -227,11 +156,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             ended.duration_since(started).as_nanos()
         );
         io::stdout().flush()?;
-        // Never continue after a native timeout/error: its backend thread may
-        // still be running. Process exit is the only hard-stop boundary here.
-        if driver.mode == "native" && result.is_err() {
-            std::process::exit(2);
-        }
     }
     Ok(())
 }

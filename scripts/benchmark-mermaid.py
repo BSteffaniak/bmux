@@ -23,7 +23,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 CORPUS = ROOT / "packages/mermaid-render/bench-corpus"
-MODES = ("current", "worker", "native", "wasm-cold", "wasm-warm", "wasm-jit-cold", "wasm-jit-warm", "wasm-fuel")
+MODES = ("wasm-cold", "wasm-warm", "wasm-jit-cold", "wasm-jit-warm", "wasm-fuel")
 
 
 def sha(path):
@@ -92,9 +92,9 @@ def process_tree(pid):
 
 
 class Trial:
-    def __init__(self, binary, worker, mode, timeout, sample_ms, fuel):
+    def __init__(self, binary, mode, timeout, sample_ms, fuel):
         self.started = time.monotonic_ns()
-        self.process = subprocess.Popen([str(binary), mode, str(worker), str(fuel)], stdin=subprocess.PIPE,
+        self.process = subprocess.Popen([str(binary), mode, str(fuel)], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                         start_new_session=True, bufsize=0)
         self.selector = selectors.DefaultSelector()
@@ -206,12 +206,11 @@ def quantile(values, fraction):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--worker", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True, help="new evidence directory outside checkout")
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--trials", type=int, default=10)
     parser.add_argument("--rounds", type=int, default=5)
-    parser.add_argument("--cases", nargs="+", help="explicit corpus subset; native still restricted to trusted diagnostic intersection")
+    parser.add_argument("--cases", nargs="+", help="explicit corpus subset")
     parser.add_argument("--fuel", type=int, default=1_000_000_000, help="positive per-render wasm-fuel budget; not calibrated")
     parser.add_argument("--concurrency", type=int, choices=range(1, 5), default=1, help="1..4 independent host replicas; NOT shared-module async contention")
     parser.add_argument("--seed", type=int, default=20261014)
@@ -229,13 +228,13 @@ def main():
         parser.error("trials/rounds/timeout/sample interval must be positive; cancel delay nonnegative")
     if not 0 < args.fuel <= 2**64 - 1:
         parser.error("fuel must fit positive u64")
-    if args.concurrency > 1 and (args.phase == "correctness" or "native" in args.modes):
-        parser.error("concurrent replicas exclude native diagnostics and correctness; choose explicit modes")
+    if args.concurrency > 1 and (args.phase == "correctness"):
+        parser.error("concurrent replicas exclude correctness; choose explicit modes")
     args.output = args.output.resolve()
     if args.output == ROOT or ROOT in args.output.parents:
         parser.error("evidence output must be outside the shared checkout")
-    args.binary, args.worker = args.binary.resolve(), args.worker.resolve()
-    if any(any(char in str(path) for char in "\t\n\r") for path in (args.output, args.binary, args.worker, CORPUS)):
+    args.binary = args.binary.resolve()
+    if any(any(char in str(path) for char in "\t\n\r") for path in (args.output, args.binary, CORPUS)):
         parser.error("line-protocol paths cannot contain tabs or newlines")
     args.output.mkdir(parents=True, exist_ok=False)
     manifest, sources = corpus(args.output)
@@ -247,7 +246,7 @@ def main():
                 "affinity": sorted(os.sched_getaffinity(0)), "clock": time.get_clock_info("monotonic")._asdict() if hasattr(time.get_clock_info("monotonic"), "_asdict") else str(time.get_clock_info("monotonic")),
                 "git": command("git", "rev-parse", "HEAD"), "dirty": command("git", "status", "--porcelain"),
                 "rustc": command("rustc", "-Vv"), "cargo": command("cargo", "-V"),
-                "hashes": {str(path): sha(path) for path in [args.binary, args.worker, ROOT / "Cargo.lock", ROOT / "flake.lock", Path(__file__), ROOT / "packages/mermaid-render/examples/compare.rs", CORPUS / "manifest.json"]},
+                "hashes": {str(path): sha(path) for path in [args.binary, ROOT / "Cargo.lock", ROOT / "flake.lock", Path(__file__), ROOT / "packages/mermaid-render/examples/compare.rs", CORPUS / "manifest.json"]},
                 "corpus": {name: {"sha256": sha(path), "bytes": path.stat().st_size} for name, path in sources.items()},
                 "build": json.loads(args.build_record.read_text()),
                 "build_record_sha256": sha(args.build_record),
@@ -263,23 +262,22 @@ def main():
     for index in range(args.trials):
         modes = list(args.modes)
         rng.shuffle(modes)
-        schedule.extend((index, mode) for mode in modes if not (args.phase == "cancellation" and mode == "native"))
+        schedule.extend((index, mode) for mode in modes)
     (args.output / "schedule.json").write_text(json.dumps(schedule, indent=2))
     rows, trials, comparisons, batches = [], [], {}, []
     with (args.output / "raw.jsonl").open("w") as raw:
         for index, mode in schedule:
-            names = list(manifest["diagnostic_native"] if mode == "native" else manifest["typical"] + manifest["stress"])
+            names = list(manifest["typical"] + manifest["stress"])
             if args.cases:
                 names = [name for name in names if name in args.cases]
-            # Native only bounded diagnostics, never bulk throughput/stress.
-            rounds = 1 if mode == "native" or args.phase == "correctness" else args.rounds
+            rounds = 1 if args.phase == "correctness" else args.rounds
             jobs = names * rounds
             rng.shuffle(jobs)
             replicas = []
             group_started = time.monotonic_ns()
             try:
                 for _ in range(args.concurrency):
-                    replicas.append(Trial(args.binary, args.worker, mode, args.timeout, args.sample_ms, args.fuel))
+                    replicas.append(Trial(args.binary, mode, args.timeout, args.sample_ms, args.fuel))
                 with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
                     for sequence, name in enumerate(jobs):
                         svg = args.output / f"{index}-{mode}-{sequence}-{name}.svg" if args.phase == "correctness" else "-"
@@ -304,8 +302,6 @@ def main():
                                 comparisons.setdefault(name, []).append((mode, row, svg))
                             raw.write(json.dumps(row) + "\n")
                         raw.flush()
-                        if mode == "native" and batch_rows[0]["status"] != "ok":
-                            break
             finally:
                 for replica, trial in enumerate(replicas):
                     record = trial.close()
@@ -317,9 +313,9 @@ def main():
                                      "concurrency": args.concurrency, "wall_ns": time.monotonic_ns() - group_started}}) + "\n")
     correctness = []
     for name, variants in comparisons.items():
-        baseline = next((entry for entry in variants if entry[0] == "current"), None)
+        baseline = next((entry for entry in variants if entry[0] == "wasm-warm"), None)
         if baseline is None:
-            correctness.append({"case": name, "omission": "no current baseline"})
+            correctness.append({"case": name, "omission": "no wasm-warm baseline"})
             continue
         _, base, base_path = baseline
         for mode, row, path in variants:
@@ -330,10 +326,10 @@ def main():
                 left, right = base_path.read_bytes(), path.read_bytes()
                 offset = next((i for i, (a, b) in enumerate(zip(left, right)) if a != b), min(len(left), len(right)))
                 first_difference = {"byte_offset": offset,
-                                    "current": left[max(0, offset - 80):offset + 160].decode(errors="replace"),
+                                    "wasm-warm": left[max(0, offset - 80):offset + 160].decode(errors="replace"),
                                     "candidate": right[max(0, offset - 80):offset + 160].decode(errors="replace")}
                 diff = list(difflib.unified_diff(base_path.read_text().splitlines(), path.read_text().splitlines(),
-                                               fromfile="current", tofile=mode))[:40]
+                                               fromfile="wasm-warm", tofile=mode))[:40]
                 diff = [line[:500] for line in diff]
             correctness.append({"case": name, "mode": mode, "exact_match": match,
                                 "baseline_status": base["status"], "status": row["status"],

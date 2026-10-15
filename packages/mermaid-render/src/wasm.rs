@@ -533,13 +533,13 @@ fn bounded_message(message: &str) -> String {
 }
 
 fn unavailable(message: &str) -> MermaidRenderError {
-    MermaidRenderError::WorkerUnavailable {
+    MermaidRenderError::RendererUnavailable {
         message: bounded_message(message),
     }
 }
 
 fn invalid_abi(message: &str) -> MermaidRenderError {
-    MermaidRenderError::InvalidWorkerResponse {
+    MermaidRenderError::InvalidGuestResponse {
         message: bounded_message(message),
     }
 }
@@ -705,7 +705,7 @@ mod async_tests {
             }
             assert!(matches!(
                 renderer.render_async(&request, &shared).await,
-                Err(MermaidRenderError::WorkerUnavailable { .. })
+                Err(MermaidRenderError::RendererUnavailable { .. })
             ));
             drop(queued);
             wait_until(|| ASYNC_JOBS.load(Ordering::Acquire) == 2).await;

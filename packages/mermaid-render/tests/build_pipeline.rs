@@ -1,5 +1,4 @@
 //! The artifact is embedded at compile time; no installed runtime file is read.
-#![cfg(feature = "wasm")]
 
 #[path = "../wasm_config.rs"]
 mod wasm_config;
@@ -36,7 +35,6 @@ fn ordinary_build_embeds_a_portable_wasm_module() {
     assert!(GUEST.len() > 8);
 }
 
-#[cfg(feature = "wasm")]
 mod abi {
     use wasmtime::{Engine, Instance, Module, Store};
 
