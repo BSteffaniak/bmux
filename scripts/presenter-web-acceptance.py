@@ -747,7 +747,7 @@ flowchart LR
         require(all(count > 100 for count in colored_counts),
                 "Mermaid prepared PNG missing from actual Canvas output")
         self.stop(process, url)
-        self.passed("document Mermaid: explicit worker; loader PNG substitution; real Canvas in two widths")
+        self.passed("document Mermaid: embedded WASM renderer; loader PNG substitution; real Canvas in two widths")
 
     def play(self, mirror):
         argv = ["present", "play", self.deck, "--presenter", "--web-assets", self.args.assets,

@@ -72,12 +72,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("binary", "plugins", "assets", "browser"):
         parser.add_argument("--" + name, type=lambda value: Path(value).resolve(strict=True), required=True)
-    parser.add_argument("--mermaid-worker", type=lambda value: Path(value).resolve(strict=True))
     parser.add_argument("--state-parent", type=Path, default=Path("/tmp"))
     parser.add_argument("--demos", nargs="+", choices=("panes", "navigation", "finder", "themes", "rendering", "evidence"),
                         default=["panes", "navigation", "finder", "themes", "rendering", "evidence"])
     args = parser.parse_args()
-    args.mermaid_worker = args.mermaid_worker or args.binary.with_name("bmux-mermaid-worker")
     suite = Tour(args)
     print(f"Private tour evidence: {suite.root}")
     try:

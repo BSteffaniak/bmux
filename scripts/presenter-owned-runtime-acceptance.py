@@ -423,7 +423,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("binary", "plugins", "assets", "browser"):
         parser.add_argument("--" + name, type=lambda value: Path(value).resolve(strict=True), required=True)
-    parser.add_argument("--mermaid-worker", type=lambda value: Path(value).resolve(strict=True), required=True)
     parser.add_argument("--state-parent", type=lambda value: Path(value).resolve(strict=True), default=Path("/tmp"))
     args = parser.parse_args()
     require(Path("/proc/self/stat").is_file(), "Linux /proc required")

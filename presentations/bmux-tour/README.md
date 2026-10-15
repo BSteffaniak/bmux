@@ -64,9 +64,10 @@ python3 scripts/presenter-tour-acceptance.py \
   --plugins /absolute/path/to/matching/plugins \
   --assets /absolute/path/to/matching/web-assets \
   --browser /absolute/path/to/browser \
-  --mermaid-worker /absolute/path/to/matching/bmux-mermaid-worker \
   --state-parent /tmp
 ```
+
+Mermaid rendering is embedded in the matching native presenter artifact; no separate renderer executable is needed. The tour demos do not cover Mermaid rendering; the dedicated `semantic_mermaid` case in `scripts/presenter-web-acceptance.py` checks loader PNG substitution and actual browser Canvas output at two widths.
 
 All six demos run by default; `--demos finder themes` selects a subset. The current harness requires `--browser` as an explicit artifact input but checks HTTP snapshots, not a browser/Canvas scene. Keep its printed evidence directory private: PTY output and runner artifacts may contain sensitive details. Compare the actual artifacts and source bytes when repeating a run; the recorded pass is not approval for arbitrary replacements.
 
