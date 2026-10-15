@@ -67,12 +67,51 @@ horizon. Forecasting never changes live state or chooses an action. The prompt
 prioritizes immediate survival and tick-5 alignment, not the distant coasting
 endpoint. No recommendation or safety pilot overrides Jev's choice.
 
-Jev chooses flap/wait for five simulation ticks at a time; physics waits for
-each judgement. There is no hidden pilot. Game-over automatically starts another
-attempt. Failed requests freeze physics and retry with bounded backoff. There
-is no overall lifetime/request/spend cap; provider usage continues while active.
-Individual requests have a 15-second total deadline, one worker at a time, and
-bounded response size. Cancelling a local request cannot undo remote billing.
+Jev chooses flap/wait for five simulation ticks at a time. The target period is
+five ticks at 30 Hz (166.7 ms). Request latency counts **inside** that period:
+ticks run as their deadlines arrive, or catch up immediately when a slower
+response arrives. The step takes `max(request latency, 166.7 ms)` plus bounded
+local polling/work, not latency plus a fresh animation period. Physics never
+advances speculatively while waiting. Rendering stays capped at 30 Hz; the
+transport is polled every 2 ms. Slow responses can still look stepped—this is
+latency-adaptive gameplay, not a claim of real-time original Flappy Bird timing.
+There is no hidden pilot. Game-over automatically starts another attempt.
+Failed requests freeze physics and retry with bounded backoff. There is no
+overall lifetime/request/spend cap; provider usage continues while active.
+
+One spawned worker owns one reusable verified HTTPS connection, with at most
+one request in flight and no queue. Successful decisions reuse both worker and
+connection when the server permits keep-alive. Errors discard the connection;
+there is no transparent POST replay. Pause, restart, stop, or a 15-second total
+deadline terminate and reap the worker and close its socket before replacement.
+Responses and IPC messages are size-bounded. Cancellation cannot undo remote
+billing. Redirects, unverified TLS, and ambient proxy configuration are not used.
+
+Status/decision traces report dispatch (including first worker spawn), connection
+setup (DNS/TCP/TLS together), request-to-headers, body/decode, transport total,
+and end-to-end time including polling. Setup is zero on reused connections.
+These are local measurements: headers time includes network and server work,
+not an invented server-inference-only duration. The display shows the dominant
+components; private `status` and `trace` expose the full breakdown without keys.
+
+## Fixed reference gameplay
+
+Physics/proportions are normalized from the classic
+[FlapPyBird reference, pinned commit](https://github.com/sourabhv/FlapPyBird/blob/b7cc55bdd82e2c940d9a24fb910bf3415753ee11/flappy.py):
+288×512 screen, floor at 79% height, 30 Hz, gravity 1 px/tick²,
+flap velocity −9 px/tick, maximum descent 10 px/tick, pipe gap 100 px,
+pipe width 52 px, spacing 144 px, horizontal speed 128 px/s, and initial
+pipe positions 488/632 px. Gap tops use its fixed random range. Bird bounds
+are approximated by a 34×24 px box. A flap skips gravity for that tick;
+the top is not lethal, and flapping is disabled above the top boundary.
+
+These values never ramp with score or attempt. The reference is an open-source
+recreation, not verification of the proprietary original binary. Terminal
+rectangular collision/rendering (no sprite hit masks/rotation), seeded randomness,
+center-based scoring, and five-tick agent decisions remain explicit demo
+approximations. Offline tests establish exact forecasts, reference constants,
+lifecycle, and a constant-gap multi-pipe fixture—not Jev's live score or ability
+to survive arbitrary random courses. No live provider benchmark was run.
 
 After successful startup, the existing managed runner retains the actual sandbox
 past the playbook startup timeout. Presenter **Stop**, **Restart**, closing the

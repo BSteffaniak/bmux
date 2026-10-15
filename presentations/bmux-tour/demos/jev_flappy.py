@@ -3,7 +3,7 @@
 
 Uses the Jev judgement wire contract also used by Bcode, without its runtime.
 Only Python's standard library is required. No credentials or upstream bodies
-are printed. One disposable HTTP worker bounds cancellation and request lifetime.
+are printed. One persistent HTTP worker bounds cancellation and request lifetime.
 """
 from __future__ import annotations
 
@@ -89,13 +89,21 @@ class Pipe:
 class Game:
     width = 100
     height = 30
-    bird_x = 20
-    gravity = 0.06
-    flap_velocity = -0.65
-    pipe_speed = 0.45
-    pipe_width = 5
-    gap_height = 11
-    spacing = 34
+    # Normalized from the classic 288x512 FlapPyBird reference (30 Hz),
+    # floor at 79% screen height. See jev-flappy.md for pinned provenance and
+    # terminal collision approximations; this is not the original binary.
+    scale_x = 100 / 288
+    scale_y = 30 / (512 * 0.79)
+    bird_half_width = 17 * scale_x
+    bird_half_height = 12 * scale_y
+    bird_x = (int(288 * 0.2) + 17) * scale_x
+    gravity = scale_y
+    flap_velocity = -9 * scale_y
+    max_fall_velocity = 10 * scale_y
+    pipe_speed = (128 / 30) * scale_x
+    pipe_width = 52 * scale_x
+    gap_height = 100 * scale_y
+    spacing = 144 * scale_x
 
     def __init__(self, seed=7):
         self.random = random.Random(seed)
@@ -106,35 +114,39 @@ class Game:
     def reset(self):
         self.attempt += 1
         self.y = self.height / 2
-        self.velocity = 0.0
+        self.velocity = self.flap_velocity
         self.score = 0
         self.dead = False
         self.ticks = 0
-        self.pipes = [Pipe(x, self.random.uniform(10, 20)) for x in (56, 90, 124)]
+        self.pipes = [self.new_pipe(x * self.scale_x) for x in (488, 632, 776)]
+
+    def new_pipe(self, x):
+        top = self.random.randrange(int(512 * 0.79 * 0.6 - 100)) + int(512 * 0.79 * 0.2)
+        return Pipe(x, (top + 50) * self.scale_y)
 
     def tick(self, flap=False):
         if self.dead:
             return
-        if flap:
+        if flap and self.y > -self.bird_half_height:
             self.velocity = self.flap_velocity
-        self.velocity += self.gravity
+        else:
+            self.velocity = min(self.max_fall_velocity, self.velocity + self.gravity)
         self.y += self.velocity
         self.ticks += 1
         for pipe in self.pipes:
             pipe.x -= self.pipe_speed
-            if not pipe.scored and pipe.x + self.pipe_width < self.bird_x - 1:
+            if not pipe.scored and pipe.x + self.pipe_width / 2 < self.bird_x:
                 pipe.scored = True
                 self.score += 1
                 self.best = max(self.best, self.score)
-            if (pipe.x - 1 <= self.bird_x <= pipe.x + self.pipe_width + 1
-                    and abs(self.y - pipe.gap_y) + 0.7 >= self.gap_height / 2):
+            if (pipe.x - self.bird_half_width <= self.bird_x <= pipe.x + self.pipe_width + self.bird_half_width
+                    and abs(self.y - pipe.gap_y) + self.bird_half_height >= self.gap_height / 2):
                 self.dead = True
-        if self.y < 0.7 or self.y >= self.height - 0.7:
+        if self.y >= self.height - self.bird_half_height:
             self.dead = True
         self.pipes = [p for p in self.pipes if p.x + self.pipe_width >= 0]
         while len(self.pipes) < 3:
-            self.pipes.append(Pipe(self.pipes[-1].x + self.spacing,
-                                   self.random.uniform(10, 20)))
+            self.pipes.append(self.new_pipe(self.pipes[-1].x + self.spacing))
 
     def forecast(self, flap):
         """Counterfactual only: same physics, no policy, no mutation of live state.
@@ -158,31 +170,32 @@ class Game:
                 "safe_through_next_decision": collision_tick is None or collision_tick > DECISION_TICKS}
 
     def observation(self):
-        upcoming = [p for p in self.pipes if p.x + self.pipe_width >= self.bird_x - 1]
+        upcoming = [p for p in self.pipes if p.x + self.pipe_width >= self.bird_x - self.bird_half_width]
         pipe = upcoming[0]
         return {
             "decision_tick": self.ticks,
             "attempt": self.attempt,
-            "clearance": {"ceiling": round(self.y - 0.7, 3),
-                          "floor": round(self.height - 0.7 - self.y, 3)},
+            "clearance": {"ceiling": round(self.y - self.bird_half_height, 3),
+                          "floor": round(self.height - self.bird_half_height - self.y, 3)},
             "target": {"gap_top": round(pipe.gap_y - self.gap_height / 2, 3),
                        "gap_bottom": round(pipe.gap_y + self.gap_height / 2, 3),
-                       "safe_bird_center_min": round(pipe.gap_y - self.gap_height / 2 + 0.7, 3),
-                       "safe_bird_center_max": round(pipe.gap_y + self.gap_height / 2 - 0.7, 3),
+                       "safe_bird_center_min": round(pipe.gap_y - self.gap_height / 2 + self.bird_half_height, 3),
+                       "safe_bird_center_max": round(pipe.gap_y + self.gap_height / 2 - self.bird_half_height, 3),
                        "center_y": round(pipe.gap_y, 3),
-                       "contact_in_ticks": max(0, math.ceil((pipe.x - 1 - self.bird_x) / self.pipe_speed)),
-                       "clear_in_ticks": max(0, math.floor((pipe.x + self.pipe_width + 1 - self.bird_x) / self.pipe_speed) + 1)},
+                       "contact_in_ticks": max(0, math.ceil((pipe.x - self.bird_half_width - self.bird_x) / self.pipe_speed)),
+                       "clear_in_ticks": max(0, math.floor((pipe.x + self.pipe_width + self.bird_half_width - self.bird_x) / self.pipe_speed) + 1)},
             "action_forecasts": {"FLAP": self.forecast(True), "WAIT": self.forecast(False)},
             "forecast_semantics": "Each action occurs once NOW, then coast. Only ticks 1-5 execute before a fresh decision. Ticks 6-15 illustrate momentum, not a commitment.",
             "coordinates": "x rightwards, y downwards; negative velocity_y means rising; units per simulation tick",
             "world": {"width": self.width, "height": self.height},
             "bird": {"x": self.bird_x, "y": round(self.y, 3),
-                     "velocity_y": round(self.velocity, 3), "radius": 0.7},
+                     "velocity_y": round(self.velocity, 3), "half_width": self.bird_half_width, "half_height": self.bird_half_height},
             "physics": {"gravity": self.gravity, "flap_velocity": self.flap_velocity,
                         "pipe_speed": self.pipe_speed, "pipe_width": self.pipe_width,
-                        "gap_height": self.gap_height},
+                        "gap_height": self.gap_height, "max_fall_velocity": self.max_fall_velocity,
+                        "top_boundary": "not lethal; flaps disabled while bird center is above minus half_height; gravity brings it back"},
             "next_pipes": [{"x": round(p.x, 3), "gap_y": round(p.gap_y, 3)}
-                           for p in self.pipes if p.x + self.pipe_width >= self.bird_x - 1],
+                           for p in self.pipes if p.x + self.pipe_width >= self.bird_x - self.bird_half_width],
             "advance_ticks": DECISION_TICKS,
             "score": self.score,
         }
@@ -195,13 +208,13 @@ def request_payload(config, observation):
             "WAIT": "Do not flap; preserve momentum and advance five ticks with gravity."},
             "instructions": (
                 "Choose exactly one immediate action: FLAP or WAIT. Maximize survival and pipes passed. "
-                "Y increases DOWNWARD: small y is near the ceiling; negative velocity means rising. "
+                "Y increases DOWNWARD: small y is near the screen top; negative velocity means rising. "
                 "Use the supplied exact action_forecasts, clearances, and target safe center interval. "
                 "If both survive, prefer the tick-5 bird position closer to target.center_y, unless its momentum "
                 "would create an imminent boundary collision. Do not optimize the tick-15 coasting endpoint "
                 "as though no further decision were possible. Avoid actions that collide before the next decision. "
                 "If both survive, consider momentum: "
-                "repeated FLAP resets upward velocity and drives the bird into the ceiling. "
+                "repeated FLAP resets upward velocity and drives the bird off the top of the screen. "
                 "WAIT lets an already rising bird arc and descend; FLAP arrests dangerous falling. "
                 "When the pipe is far away, maintain altitude near its gap without hitting world boundaries; "
                 "when overlapping a pipe, stay inside its safe center interval until clear_in_ticks. "
@@ -233,92 +246,199 @@ def decode_answer(body, model):
         raise DemoError("Invalid Jev response or model mismatch") from None
 
 
+class JevClient:
+    """One private transport owner; reuse the verified TLS session between calls."""
+    def __init__(self, config):
+        validate_endpoint(config.base_url, config.backend)
+        self.config = config
+        self.connection = None
+
+    def close(self):
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+    def judge(self, observation):
+        config = self.config
+        url = urlsplit(config.base_url)
+        started = time.monotonic()
+        reused = self.connection is not None and self.connection.sock is not None
+        setup_ms = 0.0
+        try:
+            if not reused:
+                self.close()
+                kind = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+                self.connection = kind(url.hostname, url.port, timeout=REQUEST_TIMEOUT)
+                # Default HTTPSConnection validates system trust and hostname.
+                # No redirects, ambient proxies, or unverified TLS contexts.
+                self.connection.connect()
+                setup_ms = (time.monotonic() - started) * 1000
+            path = "/v1/systemone" if config.backend == "official" else "/api/v1/decide"
+            body = json.dumps(request_payload(config, observation), separators=(",", ":"))
+            sent = time.monotonic()
+            self.connection.request("POST", path, body,
+                                    {"Authorization": "Bearer " + config.key,
+                                     "Content-Type": "application/json"})
+            response = self.connection.getresponse()
+            headers_at = time.monotonic()
+            if response.status != 200:
+                errors = {401: "Credential rejected", 403: "Credential rejected",
+                          402: "Quota exhausted", 429: "Rate limited"}
+                raise DemoError(errors.get(response.status, "Jev service unavailable"))
+            body = response.read(MAX_RESPONSE + 1)
+            if len(body) > MAX_RESPONSE:
+                raise DemoError("Jev response exceeds size limit")
+            result = decode_answer(body, config.model)
+            finished = time.monotonic()
+            result["timing"] = {"connection_reused": reused,
+                                "connection_setup_ms": round(setup_ms, 3),
+                                "request_to_headers_ms": round((headers_at - sent) * 1000, 3),
+                                "body_decode_ms": round((finished - headers_at) * 1000, 3),
+                                "transport_ms": round((finished - started) * 1000, 3)}
+            return result
+        except (OSError, http.client.HTTPException):
+            self.close()
+            raise DemoError("Jev transport unavailable") from None
+        except BaseException:
+            self.close()
+            raise
+
+
 def judge(config, observation):
-    """No redirects, proxy environment, retries, upstream error text, or unbounded body."""
-    validate_endpoint(config.base_url, config.backend)
-    url = urlsplit(config.base_url)
-    connection_type = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
-    connection = connection_type(url.hostname, url.port, timeout=REQUEST_TIMEOUT)
-    path = "/v1/systemone" if config.backend == "official" else "/api/v1/decide"
+    """One-shot helper for tests; production uses the persistent worker client."""
+    client = JevClient(config)
     try:
-        connection.request("POST", path, json.dumps(request_payload(config, observation)),
-                           {"Authorization": "Bearer " + config.key,
-                            "Content-Type": "application/json"})
-        response = connection.getresponse()
-        if response.status != 200:
-            errors = {401: "Credential rejected", 403: "Credential rejected",
-                      402: "Quota exhausted", 429: "Rate limited"}
-            raise DemoError(errors.get(response.status, "Jev service unavailable"))
-        body = response.read(MAX_RESPONSE + 1)
-        if len(body) > MAX_RESPONSE:
-            raise DemoError("Jev response exceeds size limit")
-        return decode_answer(body, config.model)
-    except (OSError, http.client.HTTPException):
-        raise DemoError("Jev transport unavailable") from None
+        return client.judge(observation)
     finally:
-        connection.close()
+        client.close()
 
 
-def request_worker(sender, config, observation):
+def request_worker(channel, config):
+    client = JevClient(config)
     try:
-        result = judge(config, observation)
-    except DemoError as error:
-        result = {"error": str(error)}
-    except Exception:
-        result = {"error": "Jev request failed"}
-    try:
-        sender.send_bytes(json.dumps(result).encode())
+        while True:
+            try:
+                envelope = json.loads(channel.recv_bytes(MAX_RESPONSE))
+            except EOFError:
+                break
+            received = time.monotonic()
+            try:
+                result = client.judge(envelope["observation"])
+                result["timing"]["dispatch_ms"] = round((received - envelope["started"]) * 1000, 3)
+            except DemoError as error:
+                result = {"error": str(error)}
+            except Exception:
+                client.close()
+                result = {"error": "Jev request failed"}
+            result["request_id"] = envelope["request_id"]
+            channel.send_bytes(json.dumps(result).encode())
+    except (OSError, ValueError):
+        pass
     finally:
-        sender.close()
+        client.close()
+        channel.close()
+
+
+class Transport:
+    """Single reusable worker, no queue, at most one admitted request.
+
+    Cancellation kills and reaps the worker (and its socket) before replacement.
+    No retry of a potentially accepted POST is performed behind the caller's back.
+    """
+    def __init__(self, config):
+        self.config = config
+        self.process = None
+        self.channel = None
+        self.active = None
+        self.sequence = 0
+
+    def __call__(self, config, observation):
+        if self.active is not None:
+            raise DemoError("Jev request already in flight")
+        started = time.monotonic()
+        if self.process is None:
+            ctx = multiprocessing.get_context("spawn")
+            self.channel, child = ctx.Pipe(duplex=True)
+            self.process = ctx.Process(target=request_worker, args=(child, self.config), daemon=True)
+            try:
+                self.process.start()
+            except BaseException:
+                child.close()
+                self.close()
+                raise
+            child.close()
+        self.sequence += 1
+        request = Request(self, started, self.sequence)
+        self.active = request
+        envelope = {"request_id": self.sequence, "started": started, "observation": observation}
+        try:
+            body = json.dumps(envelope).encode()
+            if len(body) > MAX_RESPONSE:
+                raise DemoError("Jev request exceeds size limit")
+            self.channel.send_bytes(body)
+        except DemoError:
+            self.close()
+            raise
+        except (OSError, ValueError):
+            self.close()
+            raise DemoError("Jev worker unavailable") from None
+        return request
+
+    def close(self):
+        process, channel = self.process, self.channel
+        self.process = self.channel = self.active = None
+        if channel is not None:
+            channel.close()
+        if process is not None:
+            if process.pid is not None:
+                if process.is_alive():
+                    process.terminate()
+                process.join(timeout=0.2)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=0.2)
+            process.close()
 
 
 class Request:
-    """One in-flight process. Termination reaps it before another can be admitted."""
-    def __init__(self, config, observation):
-        ctx = multiprocessing.get_context("spawn")
-        self.receiver, sender = ctx.Pipe(duplex=False)
-        self.process = ctx.Process(target=request_worker, args=(sender, config, observation), daemon=True)
-        self.started = time.monotonic()
-        try:
-            self.process.start()
-        except BaseException:
-            self.receiver.close()
-            sender.close()
-            raise
-        sender.close()
+    def __init__(self, transport, started, request_id):
+        self.transport = transport
+        self.started = started
+        self.request_id = request_id
 
     def poll(self):
+        owner = self.transport
+        if owner.active is not self:
+            return {"error": "Jev request cancelled"}
         if time.monotonic() - self.started >= REQUEST_TIMEOUT:
             self.close()
             return {"error": "Jev request timed out"}
-        if self.receiver.poll():
+        if owner.channel.poll():
             try:
-                result = json.loads(self.receiver.recv_bytes(MAX_RESPONSE))
-            except (EOFError, OSError, ValueError):
-                result = {"error": "Jev request failed"}
-            self.close()
+                result = json.loads(owner.channel.recv_bytes(MAX_RESPONSE))
+                if result.pop("request_id") != self.request_id:
+                    raise ValueError
+            except (EOFError, OSError, ValueError, KeyError):
+                self.close()
+                return {"error": "Jev request failed"}
+            owner.active = None
             return result
-        if not self.process.is_alive():
+        if not owner.process.is_alive():
             self.close()
             return {"error": "Jev worker exited"}
         return None
 
     def close(self):
-        if self.process.is_alive():
-            self.process.terminate()
-        self.process.join(timeout=0.2)
-        if self.process.is_alive():
-            self.process.kill()
-            self.process.join(timeout=0.2)
-        self.receiver.close()
-        self.process.close()
+        if self.transport.active is self:
+            self.transport.close()
 
 
 class Controller:
-    def __init__(self, config, seed=7, request_factory=Request):
+    def __init__(self, config, seed=7, request_factory=None):
         self.game = Game(seed)
         self.config = config
-        self.request_factory = request_factory
+        self.transport = Transport(config) if request_factory is None else None
+        self.request_factory = self.transport if request_factory is None else request_factory
         self.request = None
         self.paused = False
         self.stopped = False
@@ -327,6 +447,8 @@ class Controller:
         self.confidence = None
         self.trace = deque(maxlen=32)
         self.pending_observation = None
+        self.last_timing = {}
+        self.request_started = 0.0
         self.latency_ms = 0
         self.requests = 0
         self.failures = 0
@@ -338,6 +460,8 @@ class Controller:
         if self.request is not None:
             self.request.close()
             self.request = None
+        if self.transport is not None:
+            self.transport.close()
 
     def command(self, command):
         if command == "pause":
@@ -366,6 +490,8 @@ class Controller:
         return {"paused": self.paused, "stopped": self.stopped,
                 "attempt": self.game.attempt, "score": self.game.score,
                 "best": self.game.best, "requests": self.requests,
+                "timing": self.last_timing,
+                "target_step_ms": round(DECISION_TICKS * TICK_SECONDS * 1000, 3),
                 "in_flight": self.request is not None, "message": self.message}
 
     def update(self, now):
@@ -376,25 +502,29 @@ class Controller:
                 self.game.reset()
             return
         if self.remaining:
-            if now >= self.next_tick:
+            while self.remaining and now >= self.next_tick:
                 self.game.tick(self.flap)
                 self.flap = False
                 self.remaining -= 1
-                self.next_tick = now + TICK_SECONDS
+                self.next_tick += TICK_SECONDS
                 if self.game.dead:
                     self.remaining = 0
                     self.retry_at = now + 1.5
                     self.trace.append({"event": "collision", "attempt": self.game.attempt,
                                        "tick": self.game.ticks, "y": round(self.game.y, 3),
-                                       "cause": "ceiling" if self.game.y < 0.7 else
-                                       "floor" if self.game.y >= self.game.height - 0.7 else "pipe"})
+                                       "cause": "floor" if self.game.y >= self.game.height - self.game.bird_half_height else "pipe"})
                     self.message = "Crashed! Next attempt shortly..."
+                    break
             return
         if self.request is not None:
             result = self.request.poll()
             if result is None:
                 return
-            self.latency_ms = round((now - self.request.started) * 1000)
+            self.request_started = self.request.started
+            self.latency_ms = round((now - self.request_started) * 1000)
+            if "timing" in result:
+                result["timing"]["end_to_end_ms"] = self.latency_ms
+                self.last_timing = dict(result["timing"])
             self.request = None
             if "error" in result:
                 self.failures = min(self.failures + 1, 6)
@@ -407,8 +537,9 @@ class Controller:
             self.trace.append({"event": "decision", "observation": self.pending_observation,
                                "response": result, "executed_action": result["action"]})
             self.remaining = DECISION_TICKS
-            self.next_tick = now
+            self.next_tick = self.request_started + TICK_SECONDS
             self.message = "FLAP" if self.flap else "WAIT"
+            self.update(now)
         elif now >= self.retry_at:
             self.pending_observation = self.game.observation()
             self.request = self.request_factory(self.config, self.pending_observation)
@@ -507,13 +638,16 @@ def draw(screen, controller):
     cyan = curses.color_pair(1)
     green = curses.color_pair(2)
     yellow = curses.color_pair(3) | curses.A_BOLD
-    text(0, 1, "JEV FLAPPY BIRD | agent-paced | LIVE", cyan | curses.A_BOLD)
+    text(0, 1, "JEV FLAPPY BIRD | latency-adaptive | LIVE", cyan | curses.A_BOLD)
     text(1, 1, f"Score {game.score}   Best {game.best}   Attempt {game.attempt}   Requests {controller.requests}")
     status = "PAUSED" if controller.paused else controller.message
     text(2, 1, status, yellow)
     confidence = "--" if controller.confidence is None else f"{controller.confidence:.2f}"
     text(3, 1, f"Choice confidence {confidence}   Last latency {controller.latency_ms} ms   {controller.config.model}")
     text(rows - 2, 1, "p pause/resume | r restart | q quit | private CLI controls available", cyan)
+    timing = controller.last_timing
+    text(4, 1, f"Setup {timing.get('connection_setup_ms', 0):.0f}ms  Headers {timing.get('request_to_headers_ms', 0):.0f}ms  "
+         f"Dispatch {timing.get('dispatch_ms', 0):.0f}ms  {'reused connection' if timing.get('connection_reused') else 'new connection'}", cyan)
     if rows < 15 or cols < 45:
         text(6, 1, "Resize terminal to at least 45 x 15")
         return
@@ -528,7 +662,8 @@ def draw(screen, controller):
                 text(y + 5, left + 1, "#" * max(0, right - left), green)
     x = round(game.bird_x / game.width * field_width) + 1
     y = min(field_height - 1, max(0, int(game.y / game.height * field_height))) + 5
-    text(y, x, ">o", yellow)
+    if game.y >= -game.bird_half_height:
+        text(y, x, ">o", yellow)
     text(rows - 3, 1, "=" * field_width, green)
 
 
@@ -540,6 +675,7 @@ def run(screen, controller, controls):
         curses.use_default_colors()
         for index, color in ((1, curses.COLOR_CYAN), (2, curses.COLOR_GREEN), (3, curses.COLOR_YELLOW)):
             curses.init_pair(index, color, -1)
+    next_draw = 0.0
     while not controller.stopped:
         key = screen.getch()
         if key in (ord("q"), 27):
@@ -551,9 +687,12 @@ def run(screen, controller, controls):
         if controls:
             controls.poll(controller)
         controller.update(time.monotonic())
-        draw(screen, controller)
-        screen.refresh()
-        time.sleep(1 / 30)
+        now = time.monotonic()
+        if now >= next_draw:
+            draw(screen, controller)
+            screen.refresh()
+            next_draw = now + TICK_SECONDS
+        time.sleep(0.002)
 
 
 def main():
