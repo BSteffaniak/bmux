@@ -97,39 +97,42 @@ These are local measurements: headers time includes network and server work,
 not an invented server-inference-only duration. The display shows the dominant
 components; private `status` and `trace` expose the full breakdown without keys.
 
-## Fixed reference gameplay
+## Fixed widescreen demo gameplay
 
-Physics/proportions are normalized from the classic
-[FlapPyBird reference, pinned commit](https://github.com/sourabhv/FlapPyBird/blob/b7cc55bdd82e2c940d9a24fb910bf3415753ee11/flappy.py):
-288×512 screen, floor at 79% height, 30 Hz, gravity 1 px/tick²,
-flap velocity −9 px/tick, maximum descent 10 px/tick, pipe gap 100 px,
-pipe width 52 px, spacing 144 px, horizontal speed 128 px/s, and initial
-pipe positions 488/632 px. Gap tops use its fixed random range. Bird bounds
-are approximated by a 34×24 px box. A flap skips gravity for that tick;
-the top is not lethal, and flapping is disabled above the top boundary.
+The demo uses the classic
+[FlapPyBird reference, pinned commit](https://github.com/sourabhv/FlapPyBird/blob/b7cc55bdd82e2c940d9a24fb910bf3415753ee11/flappy.py)
+for 30 Hz gravity (1 px/tick²), flap velocity (−9 px/tick), maximum descent
+(10 px/tick), pipe width (52 px), spacing (144 px), horizontal speed (128 px/s),
+and the approximate 34×24 px bird collision box. A flap skips gravity that tick;
+the top is not lethal and flapping is disabled above the top boundary.
 
-These values never ramp with score or attempt. Rendering fits a centered portrait
-playfield with the reference 288×404.48 pixel aspect ratio, assuming terminal
-cells are twice as tall as wide. At the default 100×30 viewport the playfield
-is 31×22 cells: pipes are about 5–6 columns wide and gaps about 5–6 rows tall.
-The unused horizontal space is intentional, not extra game world. Resizing
-letterboxes rather than stretching. Bird art uses the same 34×24 reference box
-as collision geometry (rounded to at least one row), instead of a fixed two-cell
-symbol with an invisible, much wider collision body. Different font cell aspect
-ratios and coarse cell rounding remain visual approximations.
+This is deliberately an easier widescreen demo, not a faithful difficulty clone:
 
-Pipe overlap is unchanged: a 52px pipe plus 34px bird at 128px/s is about
-0.67 simulation seconds (20.2 ticks). At five ticks per API decision, this spans
-roughly four to five decisions; provider latency above 166.7ms still stretches
-wall-clock time. Correcting the camera does not secretly shrink collisions,
-widen gaps, accelerate physics, or claim to eliminate network slow motion.
+- The playfield fills the available terminal width and height below the HUD.
+  At 100×30 this is 97×22 cells, not a narrow portrait strip.
+- The horizontal world is expanded to match that widescreen camera, assuming
+  cells twice as tall as wide. Pipes remain about 5–6 columns wide and the bird
+  about 3–4 columns, rather than stretching them to fill the extra space.
+- The actual pipe opening is **160 reference pixels**, up from 100: about
+  **nine rows** at the default viewport instead of five/six. Collision-safe
+  bird-center clearance increases from 76 to 136 reference pixels. Rendering,
+  collisions, forecasts, and the agent's safe interval all use this same gap.
+- Gap centers are seeded random values with 40px minimum top/bottom pipe
+  segments. The first pipe starts at 60% of the world width; following pipes
+  keep the fixed spacing. Difficulty never ramps with score or attempt.
+
+Art and collisions share world geometry, rounded to terminal cells (the bird
+uses at least one row). Resizing fills the new viewport without changing the
+physics. Different terminal aspect ratios and coarse cell rounding remain
+visual approximations. Pipe overlap remains about 0.67 simulation seconds;
+provider latency above 166.7ms can still stretch wall-clock time.
 
 The reference is an open-source recreation, not verification of the proprietary
-original binary. Terminal rectangular collision/rendering (no sprite hit
-masks/rotation), seeded randomness, center-based scoring, and five-tick agent
-decisions remain explicit demo approximations. Offline tests establish exact forecasts, reference constants,
-lifecycle, and a constant-gap multi-pipe fixture—not Jev's live score or ability
-to survive arbitrary random courses. No live provider benchmark was run.
+original binary. Rectangular collision (no sprite hit masks/rotation), seeded
+randomness, center-based scoring, and five-tick agent decisions are explicit
+demo approximations. Offline tests cover full-width rendering, widened collision
+clearance, exact forecasts, lifecycle, and a constant-gap multi-pipe fixture—not
+Jev's live score or survival on arbitrary random courses.
 
 After successful startup, the existing managed runner retains the actual sandbox
 past the playbook startup timeout. Presenter **Stop**, **Restart**, closing the

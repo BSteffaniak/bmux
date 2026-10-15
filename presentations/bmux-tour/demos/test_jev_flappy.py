@@ -47,18 +47,12 @@ class FakeRequest:
 
 
 class RenderingTests(unittest.TestCase):
-    def test_portrait_aspect_is_preserved_in_wide_and_tall_terminals(self):
+    def test_playfield_uses_full_available_width_and_height(self):
         for rows, cols in [(30, 100), (40, 120), (60, 45), (15, 45)]:
             field = demo.Playfield.fit(rows, cols)
-            self.assertGreater(field.width, 0)
-            self.assertGreater(field.height, 0)
-            self.assertLessEqual(field.x + field.width, cols - 1)
-            self.assertLessEqual(field.y + field.height, rows - 3)
-            # Physical width/height matches reference to within one column.
-            expected_width = field.height * 2 * 288 / (512 * 0.79)
-            self.assertLessEqual(abs(field.width - expected_width), 1)
-            self.assertLessEqual(abs(field.x - (cols - field.width) / 2), 0.5)
-        self.assertEqual(demo.Playfield.fit(30, 100).width, 31)
+            self.assertEqual((field.x, field.y), (1, 5))
+            self.assertEqual((field.width, field.height), (cols - 3, rows - 8))
+        self.assertEqual(demo.Playfield.fit(30, 100).width, 97)
 
     def test_pipe_and_bird_share_reference_geometry_not_independent_glyph_sizes(self):
         game = demo.Game()
@@ -66,14 +60,40 @@ class RenderingTests(unittest.TestCase):
         pipe = demo.Pipe(game.bird_x + 20, 15)
         left, right = field.horizontal_bounds(game, pipe.x, game.pipe_width)
         self.assertIn(right - left, (5, 6))  # Previously 18-19 columns.
-        self.assertLessEqual(abs((right - left) - 52 / 288 * field.width), 1)
+        self.assertLessEqual(abs((right - left) - game.pipe_width / game.width * field.width), 1)
         bird_left, top, bird_right, bottom = field.bird_bounds(game)
         self.assertIn(bird_right - bird_left, (3, 4))
         self.assertGreater(bottom, top)
-        self.assertLessEqual(abs((bird_right - bird_left) - 34 / 288 * field.width), 1)
+        self.assertLessEqual(abs((bird_right - bird_left) - 2 * game.bird_half_width / game.width * field.width), 1)
         # Original 52px pipe + 34px bird takes ~20.2 simulation ticks to cross.
         crossing_ticks = (game.pipe_width + 2 * game.bird_half_width) / game.pipe_speed
         self.assertAlmostEqual(crossing_ticks, 86 / (128 / 30))
+
+    def test_widened_gap_is_real_collision_clearance_at_every_attempt(self):
+        game = demo.Game()
+        field = demo.Playfield.fit(30, 100)
+        # 60% larger opening: about nine rows, versus five/six previously.
+        self.assertAlmostEqual(game.gap_height / game.scale_y, 160)
+        self.assertGreaterEqual(game.gap_height / game.height * field.height, 8.5)
+        self.assertAlmostEqual((game.gap_height - 2 * game.bird_half_height) / game.scale_y, 136)
+        for direction in (-1, 1):
+            game.reset()
+            game.pipes[0] = demo.Pipe(game.bird_x, 15)
+            # This position was outside the OLD 100px gap but must now survive.
+            game.y = 15 + direction * 55 * game.scale_y
+            game.velocity = -game.gravity
+            game.tick()
+            self.assertFalse(game.dead)
+            game.y = 15 + direction * (game.gap_height / 2 - game.bird_half_height + 0.01)
+            game.velocity = -game.gravity
+            game.tick()
+            self.assertTrue(game.dead)
+        for _ in range(100):
+            game.reset()
+            self.assertEqual(game.gap_height, 160 * game.scale_y)
+            for pipe in game.pipes:
+                self.assertGreater(pipe.gap_y - game.gap_height / 2, 0)
+                self.assertLess(pipe.gap_y + game.gap_height / 2, game.height)
 
     def test_draw_clips_offscreen_pipes_and_draws_scaled_bird(self):
         class Screen:
@@ -104,7 +124,7 @@ class RenderingTests(unittest.TestCase):
         bird_left, top, bird_right, bottom = field.bird_bounds(game)
         for y in range(top, bottom):
             self.assertEqual("".join(screen.cells[x, y + field.y]
-                                     for x in range(field.x + bird_left, field.x + bird_right)), "██o>")
+                                     for x in range(field.x + bird_left, field.x + bird_right)), "█o>")
         # Bird entirely above the viewport is not pinned to the top row.
         game.y = -10
         with patch.object(demo.curses, "color_pair", return_value=0):
@@ -460,7 +480,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertAlmostEqual(game.gravity / game.scale_y, 1)
         self.assertAlmostEqual(game.flap_velocity / game.scale_y, -9)
         self.assertAlmostEqual(game.max_fall_velocity / game.scale_y, 10)
-        self.assertAlmostEqual(game.gap_height / game.scale_y, 100)
+        self.assertAlmostEqual(game.gap_height / game.scale_y, 160)
         self.assertAlmostEqual(game.pipe_speed / game.scale_x * 30, 128)
         self.assertAlmostEqual(game.spacing / game.scale_x, 144)
         game.y = 15

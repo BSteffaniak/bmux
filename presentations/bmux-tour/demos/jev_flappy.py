@@ -84,20 +84,20 @@ class Pipe:
 class Game:
     width = 100
     height = 30
-    # Normalized from the classic 288x512 FlapPyBird reference (30 Hz),
-    # floor at 79% screen height. See jev-flappy.md for pinned provenance and
-    # terminal collision approximations; this is not the original binary.
-    scale_x = 100 / 288
+    # Widescreen demo: expand the reference camera, not the pipe/bird sprites.
+    # Match square reference pixels at the default 97x22-cell playfield with
+    # 2:1 cell height/width. Resizing never changes collision geometry.
+    scale_x = 100 / ((512 * 0.79) * (97 / 22) / 2)
     scale_y = 30 / (512 * 0.79)
     bird_half_width = 17 * scale_x
     bird_half_height = 12 * scale_y
-    bird_x = (int(288 * 0.2) + 17) * scale_x
+    bird_x = width * 0.2
     gravity = scale_y
     flap_velocity = -9 * scale_y
     max_fall_velocity = 10 * scale_y
     pipe_speed = (128 / 30) * scale_x
     pipe_width = 52 * scale_x
-    gap_height = 100 * scale_y
+    gap_height = 160 * scale_y
     spacing = 144 * scale_x
 
     def __init__(self, seed=7):
@@ -113,11 +113,14 @@ class Game:
         self.score = 0
         self.dead = False
         self.ticks = 0
-        self.pipes = [self.new_pipe(x * self.scale_x) for x in (488, 632, 776)]
+        self.pipes = [self.new_pipe(self.width * 0.6 + i * self.spacing) for i in range(3)]
 
     def new_pipe(self, x):
-        top = self.random.randrange(int(512 * 0.79 * 0.6 - 100)) + int(512 * 0.79 * 0.2)
-        return Pipe(x, (top + 50) * self.scale_y)
+        # Keep both pipe segments visible and the whole widened gap reachable.
+        margin = 40 * self.scale_y
+        center = self.random.uniform(self.gap_height / 2 + margin,
+                                     self.height - self.gap_height / 2 - margin)
+        return Pipe(x, center)
 
     def tick(self, flap=False):
         if self.dead:
@@ -623,27 +626,15 @@ def send_control(path, command):
 
 @dataclasses.dataclass(frozen=True)
 class Playfield:
-    """Portrait reference viewport, assuming cells are twice as tall as wide.
-
-    Game coordinates are independently normalized on each axis, NOT square
-    pixels. Undo that normalization before fitting into the terminal; never
-    stretch 288x404.48 reference pixels across a wide terminal rectangle.
-    """
+    """Full available terminal playfield; shared camera for art and collisions."""
     x: int
     y: int
     width: int
     height: int
-    cell_aspect = 2.0
-    reference_width = 288
-    reference_height = 512 * 0.79
 
     @classmethod
     def fit(cls, rows, cols):
-        available_width, available_height = cols - 3, rows - 8
-        columns_per_row = cls.reference_width / cls.reference_height * cls.cell_aspect
-        height = min(available_height, math.floor(available_width / columns_per_row))
-        width = max(1, round(height * columns_per_row))
-        return cls((cols - width) // 2, 5, width, height)
+        return cls(1, 5, cols - 3, rows - 8)
 
     def horizontal_bounds(self, game, x, width):
         # Round shared edges once so equal world sizes stay equal on screen.
@@ -686,7 +677,7 @@ def draw(screen, controller):
         return
     field = Playfield.fit(rows, cols)
     # World dimensions, pipe spacing, collision bounds, and timing do not change
-    # with terminal size. Only the single aspect-preserving camera is resized.
+    # with terminal size. Only the full-width camera is resized.
     for pipe in game.pipes:
         left, right = field.horizontal_bounds(game, pipe.x, game.pipe_width)
         for y in range(field.height):
