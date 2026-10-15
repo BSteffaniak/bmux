@@ -63,7 +63,6 @@ reserved for adapters that supply no logical category at all. Declarations are
 bounded and viewport-validated. JSON v2 and binary `BMWP\\x02` are rejected; rebuild
 matching native/WASM consumers after this positional schema upgrade.
 
-
 Wire v3 requires `unsupported_metadata`: a bounded list of the typed
 `MetadataKind::{Selection, Semantics}` values, serialized as `selection` and
 `semantics`. V1 is explicitly rejected: it cannot establish whether an empty

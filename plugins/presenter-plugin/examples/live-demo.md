@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD025 -->
+<!-- Slide decks intentionally have one top-level heading per slide. -->
 # Live BMUX playbook
 
 Tab focuses the demo. Press `o` to open it, then `r` to run.

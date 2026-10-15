@@ -63,7 +63,7 @@ bmux attach --follow "<LAPTOP_CLIENT_UUID>" --global --web-only
 
 Use `--web` instead of `--web-only` to mirror an interactive terminal attachment. In mirror mode the terminal owns viewport dimensions; browser resizing only changes local pixel metrics, not terminal layout. Native provider-only attachment is explicitly unsupported by this entry point.
 
-The default browser URL is **http://127.0.0.1:8080/**: fixed loopback port,
+The default browser URL is **<http://127.0.0.1:8080/>**: fixed loopback port,
 no token, and ordinary reload works. Any local user/process can read this output.
 Host/Origin and Fetch Metadata checks still reject cross-site access; viewport
 control still requires the leased controller. No remote interface is exposed.

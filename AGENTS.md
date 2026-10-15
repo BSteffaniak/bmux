@@ -9,7 +9,6 @@ This file defines REQUIRED validation steps for coding agents working in this re
 Do not use floating rustup stable or override the Nix-selected compiler/target
 directory. See `docs/development-toolchain.md` for editor and native CI setup.
 
-
 ## Core Architecture Boundary (REQUIRED)
 
 BMUX core must remain domain-agnostic. Tabs, sessions, contexts, clients, and permissions are all plugin domains, not core architecture. Core crates provide generic primitives; plugins own product-specific behavior.

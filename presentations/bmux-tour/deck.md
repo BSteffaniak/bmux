@@ -4,6 +4,8 @@ title: BMUX — work, views, and evidence
 author: Braden
 theme: dark
 ---
+<!-- markdownlint-disable MD025 -->
+<!-- Slide decks intentionally have one top-level heading per slide. -->
 <!-- bmux:slide-id opening -->
 <!-- bmux:block-id opening-title -->
 # BMUX

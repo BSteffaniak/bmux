@@ -1,2 +1,4 @@
 **/target/**
 **/dist/**
+# Parser fixtures intentionally exercise malformed and nonstandard Markdown.
+packages/markdown/tests/fixtures/**

@@ -93,6 +93,7 @@ Only explicit subcommands are supported. `present` is a namespace, not an execut
 leaf; `present deck.md` shorthand is intentionally unsupported because the registry
 rejects a leaf that is also a parent of commands. No core parser special case is
 introduced.
+
 ## Live playbook demo
 
 Using a bundled BMUX executable that supports managed playbooks and the private

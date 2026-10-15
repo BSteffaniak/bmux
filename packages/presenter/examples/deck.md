@@ -4,6 +4,8 @@ title: BMUX presentations
 author: BMUX
 theme: dark
 ---
+<!-- markdownlint-disable MD025 -->
+<!-- Slide decks intentionally have one top-level heading per slide. -->
 <!-- bmux:slide-id intro -->
 
 # BMUX presentations

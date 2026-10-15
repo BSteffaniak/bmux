@@ -521,8 +521,19 @@ class InstallerTests(unittest.TestCase):
         self.discovery.stop()
         tools = unittest.mock.Mock()
         tools.admission_args = []
-        tools.cf_list.side_effect = [[], [{'name': CHOICES['bucket'], 'storage_class': 'Standard', 'creation_date': '2026-01-01'}],
-                                     [], [], [], [], [], []]
+        bucket = {'name': CHOICES['bucket'], 'storage_class': 'Standard', 'creation_date': '2026-01-01'}
+        responses = {
+            f'accounts/{CHOICES["account_id"]}/pages/projects': [],
+            f'accounts/{CHOICES["account_id"]}/r2/buckets': [bucket],
+            f'accounts/{CHOICES["account_id"]}/r2/buckets/{CHOICES["bucket"]}': [bucket],
+            f'accounts/{CHOICES["account_id"]}/r2/buckets/{CHOICES["bucket"]}/lock': [],
+            f'accounts/{CHOICES["account_id"]}/r2/buckets/{CHOICES["bucket"]}/lifecycle': [],
+            f'zones/{CHOICES["zone_id"]}/dns_records?name=live.example.com': [],
+            f'accounts/{CHOICES["account_id"]}/workers/workers': [],
+            f'accounts/{CHOICES["account_id"]}/workers/scripts': [],
+            f'zones/{CHOICES["zone_id"]}/workers/routes': [],
+        }
+        tools.cf_list.side_effect = responses.__getitem__
         result = m.discover(tools, CHOICES)
         self.assertEqual(result, {'cloudflare_r2_bucket.state': CHOICES['account_id'] + '/' + CHOICES['bucket'] + '/default'})
 

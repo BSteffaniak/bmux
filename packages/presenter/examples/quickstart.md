@@ -4,9 +4,11 @@ title: BMUX presentation quickstart
 author: BMUX
 theme: dark
 ---
+<!-- markdownlint-disable MD025 -->
+<!-- Slide decks intentionally have one top-level heading per slide. -->
 <!-- bmux:slide-id welcome -->
 
-# Hello, BMUX!
+# Hello, BMUX
 
 A self-contained terminal presentation. No external assets or custom components.
 

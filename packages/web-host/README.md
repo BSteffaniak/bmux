@@ -155,12 +155,12 @@ No cookies, durable credentials, token query parameters or CORS support.
 
 Default exact allowlist (caller can replace `HostConfig.assets`, at most 16 entries):
 
-| URL | File | Type |
-|---|---|---|
-| `/`, `/index.html` | `index.html` | HTML |
-| `/bootstrap.js` | `bootstrap.js` | JavaScript |
-| `/bmux_web_renderer.js` | `bmux_web_renderer.js` | JavaScript |
-| `/bmux_web_renderer_bg.wasm` | `bmux_web_renderer_bg.wasm` | WASM |
+| URL                          | File                        | Type       |
+| ---------------------------- | --------------------------- | ---------- |
+| `/`, `/index.html`           | `index.html`                | HTML       |
+| `/bootstrap.js`              | `bootstrap.js`              | JavaScript |
+| `/bmux_web_renderer.js`      | `bmux_web_renderer.js`      | JavaScript |
+| `/bmux_web_renderer_bg.wasm` | `bmux_web_renderer_bg.wasm` | WASM       |
 
 Assets must be real build output in an explicit absolute directory. Every directory
 component and asset is opened descriptor-relative without following symlinks.
