@@ -430,6 +430,15 @@ impl Controller {
         Ok(state.source_state(id))
     }
     pub fn unregister(&self, owner: Uuid, id: &str) -> Result<bool, &'static str> {
+        self.unregister_with_error(owner, id, None)
+    }
+
+    fn unregister_with_error(
+        &self,
+        owner: Uuid,
+        id: &str,
+        observer_error: Option<&'static str>,
+    ) -> Result<bool, &'static str> {
         let mut state = self.state.lock().map_err(|_| "controller_unavailable")?;
         if state.sources.get(id).is_none_or(|s| s.owner != owner) {
             return Err("source_not_owned");
@@ -444,6 +453,9 @@ impl Controller {
         if state.selected.as_deref() == Some(id) && state.local != "stopped" {
             state.invalidate();
             state.local = "unavailable";
+            if let Some(code) = observer_error {
+                state.error = Some(code);
+            }
             self.gate.send_replace(state.refresh);
         }
         Ok(true)
@@ -488,14 +500,16 @@ impl Controller {
                     tokio::pin!(observation);
                     let mut tick = tokio::time::interval(Duration::from_secs(1));
                     let mut sent = None;
-                    loop {
+                    let observer_error = loop {
                         tokio::select! {
-                            _ = &mut observation => break,
+                            result = &mut observation => break result.err(),
                             _ = tick.tick() => {},
-                            result = latest.changed() => { if result.is_err() { break; } },
+                            result = latest.changed() => {
+                                if result.is_err() { break observation.await.err(); }
+                            },
                         }
                         let Ok(source) = controller.source(owner, &id, false) else {
-                            break;
+                            break None;
                         };
                         if !source.selected {
                             continue;
@@ -511,8 +525,8 @@ impl Controller {
                                 sent = Some(identity);
                             }
                         }
-                    }
-                    let _ = controller.unregister(owner, &id);
+                    };
+                    let _ = controller.unregister_with_error(owner, &id, observer_error);
                 });
             })
             .map_err(|_| "executor_unavailable")?;
@@ -672,7 +686,12 @@ async fn worker(
                     },
                 };
                 if let Ok(mut state) = state.lock() {
-                    state.error = result.err();
+                    // A source observer may fail while the relay request is in
+                    // flight. A successful relay reply must not erase that local
+                    // failure or make its unavailable source appear healthy.
+                    if result.is_err() || state.local != "unavailable" {
+                        state.error = result.err();
+                    }
                     match state.local {
                         "starting" if result.is_ok() => { state.local = "running"; state.remote = "starting"; source_paused = false; }
                         "starting" => { state.local = "unavailable"; state.remote = "unknown"; }

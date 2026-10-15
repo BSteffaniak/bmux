@@ -4,6 +4,49 @@ use std::{
     net::TcpListener,
 };
 
+#[test]
+fn observer_failure_survives_unregister_without_affecting_other_sources() {
+    let controller = Controller::new().unwrap();
+    let owner = Uuid::new_v4();
+    let id = Uuid::new_v4().to_string();
+    let other = Uuid::new_v4().to_string();
+    controller.source(owner, &id, true).unwrap();
+    controller.source(owner, &other, true).unwrap();
+    {
+        let mut state = controller.state.lock().unwrap();
+        state.selected = Some(id.clone());
+        state.local = "running";
+    }
+    controller
+        .unregister_with_error(owner, &other, Some("observer_closed"))
+        .unwrap();
+    assert_eq!(controller.status().unwrap().local, "running");
+    assert_eq!(controller.status().unwrap().error_code, None);
+    controller
+        .unregister_with_error(owner, &id, Some("observer_timeout"))
+        .unwrap();
+    let status = controller.status().unwrap();
+    assert_eq!(status.local, "unavailable");
+    assert_eq!(status.error_code.as_deref(), Some("observer_timeout"));
+    assert!(controller.sources().unwrap().is_empty());
+    controller.shutdown();
+}
+
+#[test]
+fn stopped_observer_does_not_overwrite_stopped_status() {
+    let controller = Controller::new().unwrap();
+    let owner = Uuid::new_v4();
+    let id = Uuid::new_v4().to_string();
+    controller.source(owner, &id, true).unwrap();
+    controller.state.lock().unwrap().selected = Some(id.clone());
+    controller
+        .unregister_with_error(owner, &id, Some("observer_closed"))
+        .unwrap();
+    assert_eq!(controller.status().unwrap().local, "stopped");
+    assert_eq!(controller.status().unwrap().error_code, None);
+    controller.shutdown();
+}
+
 fn frame(generation: &str, revision: u64) -> Vec<u8> {
     let scene =
         bmux_tui::presentation::PresentationState::new(bmux_tui::geometry::Rect::new(0, 0, 2, 1));
