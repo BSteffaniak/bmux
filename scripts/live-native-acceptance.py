@@ -73,7 +73,10 @@ class Harness:
         self.env.update(BMUX_CONFIG=str(self.config), BMUX_NO_BASE_CONFIG='1',
                         BMUX_RUNTIME_NAME='default', BMUX_TARGET='local', TERM='xterm-256color')
         producer = root / 'terminal-producer'
-        producer.write_text('#!' + sys.executable + '\nimport time\nprint("NATIVE_TERMINAL_PUBLIC_5831", flush=True)\ntime.sleep(180)\n')
+        producer.write_text('#!' + sys.executable + '\nimport time\n'
+                            'for revision in range(900):\n'
+                            ' print("NATIVE_TERMINAL_PUBLIC_5831", revision, flush=True)\n'
+                            ' time.sleep(.2)\n')
         producer.chmod(0o700)
         self.config.write_text('[general]\ndefault_shell = ' + json.dumps(str(producer)) + '\n'
             '[plugins]\nenabled = ["bmux.sessions", "bmux.contexts", "bmux.clients", '
@@ -398,6 +401,11 @@ class Harness:
 
     def inspect_terminal(self):
         try:
+            # Validate the mounted audience viewer, not just the independent
+            # diagnostic decoder. A continuously advancing producer previously
+            # decoded fine in isolation while the page rejected every frame.
+            if not self.cdp.evaluate("document.getElementById('live-status')?.textContent === 'Live · read-only' && Array.from(document.querySelectorAll('#live-broadcast canvas')).some(c => !c.hidden && c.width > 0 && c.height > 0)"):
+                return False
             self.inspect('NATIVE_TERMINAL_PUBLIC_5831', ['NATIVE_AUDIENCE_PUBLIC_5831', 'NATIVE_SPEAKER_PRIVATE_5831'])
             return True
         except AssertionError:

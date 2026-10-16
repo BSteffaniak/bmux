@@ -65,7 +65,7 @@ class DeploymentBoundaryTests(unittest.TestCase):
             self.assertIsNotNone(bash)
             commands = {
                 'bash': 'test "$1" = scripts/build-web-renderer.sh\nmkdir -p "$BMUX_WEB_ASSET_OUTPUT"\necho viewer > "$BMUX_WEB_ASSET_OUTPUT/live-page.js"',
-                'cargo': 'test "$*" = "run --locked --release -p bmux_docs_site -- gen --output $9"\nmkdir -p "$9"\necho docs > "$9/index.html"\ncp "$(dirname "$9")/viewer/live-page.js" "$9/live-page.js"',
+                'cargo': 'test "$*" = "run --locked --release -p bmux_docs_site -- gen --output $9"\nmkdir -p "$9"\necho \'<title>MoosicBox</title><meta name="description" content="MoosicBox: A music app for cows">\' > "$9/index.html"\ncp "$(dirname "$9")/viewer/live-page.js" "$9/live-page.js"',
                 'npm': 'test "$*" = "ci --ignore-scripts --no-audit --no-fund"\nmkdir -p node_modules/wrangler/bin\necho pinned-tool > node_modules/wrangler/bin/wrangler.js',
             }
             for name, body in commands.items():
@@ -80,6 +80,9 @@ class DeploymentBoundaryTests(unittest.TestCase):
             for name in ('site/index.html', 'site/live-page.js', 'REVISION',
                          'tools/node_modules/wrangler/bin/wrangler.js'):
                 self.assertTrue((output / name).is_file(), name)
+            html = (output / 'site/index.html').read_text()
+            self.assertIn('<title>bmux — Live broadcasts and documentation</title>', html)
+            self.assertNotIn('MoosicBox', html)
             self.assertFalse((output / 'relay').exists())
             self.assertFalse((output / 'native').exists())
             for line in (output / 'SHA256SUMS').read_text().splitlines():

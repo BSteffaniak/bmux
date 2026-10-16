@@ -74,7 +74,11 @@ pub static SITE: LazyLock<DocsSite> = LazyLock::new(|| {
 /// Initialize the application builder with default configuration.
 #[must_use]
 pub fn init() -> AppBuilder {
-    let mut app = SITE.clone().init();
+    let mut app = SITE
+        .clone()
+        .init()
+        .with_title("bmux — Live broadcasts and documentation".into())
+        .with_description("bmux terminal multiplexer documentation and live broadcasts".into());
 
     #[cfg(feature = "assets")]
     for assets in ASSETS.iter().cloned() {

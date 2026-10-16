@@ -107,11 +107,12 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
       if (state?.epoch === next.epoch && BigInt(next.revision) < BigInt(state.revision)) {
         throw new Error('regressing cursor');
       }
-      if (!state || next.epoch !== state.epoch || next.revision !== state.revision || next.state !== state.state) {
-        if (deltaCapable && state?.state === 'live' && next.state === 'live' && next.epoch === state.epoch) {
-          ticket++;
-          frameController?.abort();
-        } else hide(next.state === 'live' ? 'Loading live output…' : `Broadcast ${next.state}`);
+      // Revisions are content watermarks, not authorization transitions.
+      // A busy producer can advance between every status and frame request.
+      // Keep retained output and in-flight decoding within the same live epoch;
+      // current() still rejects frames behind the latest observed watermark.
+      if (!state || next.epoch !== state.epoch || next.state !== state.state) {
+        hide(next.state === 'live' ? 'Loading live output…' : `Broadcast ${next.state}`);
       }
       state = next;
       clearTimeout(leaseTimer);
@@ -127,8 +128,9 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
     if (disposed || frameBusy || state?.state !== 'live') return;
     const admitted = state;
     const admittedTicket = ticket;
+    let deliveredRevision = admitted.revision;
     const current = () => !disposed && ticket === admittedTicket && state?.state === 'live'
-      && state.epoch === admitted.epoch && state.revision === admitted.revision
+      && state.epoch === admitted.epoch && BigInt(state.revision) <= BigInt(deliveredRevision)
       && state.lease_expires_at > now();
     frameBusy = true;
     try {
@@ -138,12 +140,15 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
       let isDelta = false;
       const bytes = await request(path, async response => {
         if (response.status === 204) { await response.body?.cancel(); return null; }
+        const receivedRevision = revision(response.headers.get('X-Snapshot-Revision'));
         if (response.status !== 200 || response.headers.get('Content-Type')?.split(';')[0] !== 'application/octet-stream'
             || response.headers.get('X-Bmux-Epoch') !== admitted.epoch
-            || revision(response.headers.get('X-Snapshot-Revision')) !== admitted.revision) {
+            || BigInt(receivedRevision) < BigInt(admitted.revision)
+            || (cursor !== null && BigInt(receivedRevision) < BigInt(cursor))) {
           await response.body?.cancel();
           throw new Error('presentation not admitted');
         }
+        deliveredRevision = receivedRevision;
         const negotiated = response.headers.get('X-Bmux-Capabilities');
         if (negotiated && negotiated !== 'bmwp-delta-v1') throw new Error('unsupported capability');
         if (negotiated === 'bmwp-delta-v1') {
@@ -180,7 +185,7 @@ export async function mountLiveViewer({ container, status, apiBase, assetBase,
         return;
       }
       if (presented) {
-        cursor = admitted.revision;
+        cursor = deliveredRevision;
         frameIdentity = deliveredIdentity;
         count(isDelta ? 'delta' : 'full');
         status.textContent = 'Live · read-only';

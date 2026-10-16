@@ -41,6 +41,66 @@ async function fixture(capabilities = []) {
     setStatus(next) { value = next; }, setFrame(next) { frame = next; }, setPresentation(next) { presentation = next; } };
 }
 
+for (const capabilities of [[], ['bmwp-delta-v1']]) {
+  test(`continuously advancing frames render without exact status revision (${capabilities.length ? 'negotiated' : 'legacy'})`, async () => {
+    const f = await fixture(capabilities);
+    try {
+      for (let index = 1; index <= 20; index++) {
+        const observed = String(index * 10);
+        const delivered = String(index * 10 + 3);
+        f.setStatus(statusValue('live', { revision: observed }));
+        await f.handle.pollStatus();
+        f.setFrame(async () => frameResponse({ 'X-Snapshot-Revision': delivered }));
+        await f.handle.pollFrame();
+        assert.equal(f.visible, true);
+        assert.equal(f.status.textContent, 'Live · read-only');
+        // The cursor must be the delivered revision, not the earlier status.
+        await f.handle.pollFrame();
+        assert.match(f.requests.at(-1).url, new RegExp(`after=${delivered}$`));
+      }
+      f.setStatus(statusValue('paused', { revision: '203' }));
+      await f.handle.pollStatus();
+      assert.equal(f.visible, false);
+    } finally { f.handle.dispose(); }
+  });
+}
+
+test('status catching up during newer frame decode preserves the commit', async () => {
+  const f = await fixture();
+  const entered = deferred(); const release = deferred();
+  try {
+    await f.handle.pollStatus();
+    f.setFrame(async () => frameResponse({ 'X-Snapshot-Revision': '4' }));
+    f.setPresentation(async (_data, current) => { entered.resolve(); await release.promise; return current(); });
+    const pending = f.handle.pollFrame();
+    await entered.promise;
+    f.setStatus(statusValue('live', { revision: '3' })); await f.handle.pollStatus();
+    release.resolve(); await pending;
+    assert.equal(f.visible, true);
+    const clears = f.clears;
+    f.setStatus(statusValue('live', { revision: '4' })); await f.handle.pollStatus();
+    assert.equal(f.visible, true); assert.equal(f.clears, clears);
+  } finally { release.resolve(); f.handle.dispose(); }
+});
+
+test('newer frame still cannot commit after pause, stop, epoch replacement or lease expiry', async () => {
+  for (const transition of ['paused', 'offline', 'epoch', 'expired']) {
+    const f = await fixture();
+    const entered = deferred(); const release = deferred();
+    try {
+      await f.handle.pollStatus();
+      f.setFrame(async () => frameResponse({ 'X-Snapshot-Revision': '8' }));
+      f.setPresentation(async (_data, current) => { entered.resolve(); await release.promise; return current(); });
+      const pending = f.handle.pollFrame(); await entered.promise;
+      f.setStatus(transition === 'epoch' ? statusValue('live', { epoch: secondEpoch, revision: '8' })
+        : transition === 'expired' ? statusValue('live', { revision: '8', lease_expires_at: 1 })
+        : statusValue(transition, { revision: '8' }));
+      await f.handle.pollStatus(); release.resolve(); await pending;
+      assert.equal(f.visible, false, transition);
+    } finally { release.resolve(); f.handle.dispose(); }
+  }
+});
+
 test('explicit protocol, epoch, lease and lossless u64 compatibility', () => {
   assert.equal(revision('18446744073709551615'), '18446744073709551615');
   for (const value of ['01', '-1', '18446744073709551616', 1, null]) assert.throws(() => revision(value));
@@ -82,7 +142,7 @@ for (const transition of ['paused', 'offline', 'epoch', 'revision', 'incompatibl
       await f.handle.pollStatus();
       release.resolve(); await pending;
       assert.equal(f.visible, false);
-      assert.ok(f.clears >= 2);
+      assert.ok(f.clears >= (transition === 'revision' ? 1 : 2));
     } finally { release.resolve(); f.handle.dispose(); }
   });
 }
@@ -117,6 +177,8 @@ test('offline/network failure and mismatched response cursor clear already visib
     f.setFrame(async () => { throw new Error('private diagnostic'); });
     await f.handle.pollFrame(); assert.equal(f.visible, false);
     assert.ok(!f.status.textContent.includes('private'));
+    await f.handle.pollStatus();
+    f.setStatus(statusValue('live', { revision: '3' }));
     await f.handle.pollStatus();
     f.setFrame(async () => frameResponse({ 'X-Snapshot-Revision': '2' }));
     await f.handle.pollFrame(); assert.equal(f.visible, false);

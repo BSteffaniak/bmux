@@ -11,6 +11,19 @@ OUTPUT="$(cd "$OUTPUT" && pwd)"
 # Stage the content-addressed viewer bundle BEFORE docs compilation.
 BMUX_WEB_ASSET_OUTPUT="$OUTPUT/viewer" bash scripts/build-web-renderer.sh
 cargo run --locked --release -p bmux_docs_site -- gen --output "$OUTPUT/site"
+# HyperChad's static generator currently hardcodes its upstream demo metadata,
+# ignoring AppBuilder's title/description (the dynamic renderer honors them).
+# Normalize that known generator fallback at the static artifact boundary only.
+python3 - "$OUTPUT/site" <<'PY'
+from pathlib import Path
+import sys
+for page in Path(sys.argv[1]).rglob('*.html'):
+    text = page.read_text()
+    text = text.replace('<title>MoosicBox</title>', '<title>bmux — Live broadcasts and documentation</title>')
+    text = text.replace('content="MoosicBox: A music app for cows"',
+                        'content="bmux terminal multiplexer documentation and live broadcasts"')
+    page.write_text(text)
+PY
 mkdir "$OUTPUT/tools"
 cp infra/live-terraform/tools/package*.json "$OUTPUT/tools/"
 (cd "$OUTPUT/tools" && npm ci --ignore-scripts --no-audit --no-fund)
