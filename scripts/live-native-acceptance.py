@@ -305,7 +305,10 @@ class Harness:
         replacement = launch('--broadcast', replacement_source)
         wait('legacy replacement registration only', lambda: b': registered;' in replacement.bytes())
         require(self.control('status')['source_id'] == named_source, 'legacy UUID unexpectedly started publishing')
-        self.run('broadcast', 'start', '--profile', 'acceptance', '--source', replacement_source)
+        # Explicitly stop before starting the replacement: neither start path
+        # may steal an active publication. The old token remains fenced.
+        self.control('stop')
+        self.control('start', self.url, 'main', str(self.key), replacement_source)
         wait('replacement profile publishing', self.live)
         require(self.control('status')['source_id'] == replacement_source, 'profile source selection failed')
         quit_presenter(named)
@@ -327,10 +330,65 @@ class Harness:
         require(self.control('status')['local'] in ('offline', 'stopped'), 'missing profile opened upload gate')
         require(missing.child.poll() is None, 'missing profile stopped local playback')
         quit_presenter(missing)
+        self.inline_broadcast()
         self.cases.append('missing-profile-no-default-fallback-local-playback-independent')
         secret = self.key.read_bytes().strip()
         require(all(secret not in mirror.bytes() for mirror in (automatic, named, replacement, missing)),
                 'publisher key leaked into turnkey terminal')
+
+    def inline_broadcast(self):
+        import termios
+        # Use the same real terminal fixture and selected isolated daemon.
+        mirror = PRESENTER.Mirror(self.command + ['broadcast', 'start'], self.env)
+        self.terminals.append(mirror)
+        wait('inline source picker', lambda: b'Choose a terminal' in mirror.bytes())
+        mirror.send(b'native-acceptance')
+        time.sleep(.3)
+        mirror.send(b'\r')
+        wait('inline review', lambda: b'Review public sharing' in mirror.bytes())
+        require(self.control('status')['local'] in ('offline', 'stopped'),
+                'merely selecting a terminal published output')
+        # Enter must not double-submit the review.
+        mirror.send(b'\r')
+        time.sleep(.2)
+        require(mirror.child.poll() is None, 'review accepted accidental second Enter')
+        mirror.send(b'\x13')  # Ctrl-S: explicit public sharing action.
+        wait('inline start finished', lambda: mirror.child.poll() is not None, 40)
+        require(mirror.child.returncode == 0, 'inline broadcast did not reach first frame acknowledgement')
+        require(self.live(), 'inline start returned without live frame')
+        wait('inline terminal reaches browser', self.inspect_terminal)
+        output = mirror.bytes()
+        require(b'\x1b[?1049h' not in output and b'\x1b[?47h' not in output,
+                'inline broadcast entered alternate screen')
+        require(b'\x1b[?2004h' in output and b'\x1b[?2004l' in output,
+                'inline paste mode lifecycle missing')
+        modes = termios.tcgetattr(mirror.fd)
+        require(modes[3] & termios.ICANON and modes[3] & termios.ECHO,
+                'inline broadcast left terminal in raw mode')
+        self.control('pause')
+        wait('inline pause', lambda: self.status()['state'] == 'paused')
+        self.control('resume')
+        wait('inline resume', self.live)
+        self.control('stop')
+        wait('inline stop', lambda: self.status()['state'] == 'offline')
+        cancelled = PRESENTER.Mirror(self.command + ['broadcast', 'start'], self.env)
+        self.terminals.append(cancelled)
+        wait('inline cancellation picker', lambda: b'Choose a terminal' in cancelled.bytes())
+        import fcntl
+        import struct
+        fcntl.ioctl(cancelled.fd, termios.TIOCSWINSZ, struct.pack('HHHH', 10, 50, 0, 0))
+        os.kill(cancelled.child.pid, signal.SIGWINCH)
+        cancelled.send(b'\x1b[200~no-such-terminal\x1b[201~')
+        time.sleep(.25)
+        cancelled.send(b'\x1b')
+        wait('inline cancelled cleanly', lambda: cancelled.child.poll() is not None)
+        require(self.control('status')['local'] in ('offline', 'stopped'),
+                'cancelled source picker changed broadcast state')
+        modes = termios.tcgetattr(cancelled.fd)
+        require(modes[3] & termios.ICANON and modes[3] & termios.ECHO,
+                'cancelled inline picker left raw terminal modes')
+        self.cases.append('inline-resize-paste-cancel-no-publication-terminal-restoration')
+        self.cases.append('inline-picker-review-confirm-first-frame-browser-pause-resume-stop-terminal-restoration')
 
     def inspect_terminal(self):
         try:

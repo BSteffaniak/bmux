@@ -21,8 +21,11 @@ pub fn delivery_counters() -> Option<DeliveryCounters> {
 }
 mod guided;
 mod identity;
+mod inline_ui;
 mod relay;
+mod setup_ui;
 mod start_identity;
+mod startup_ui;
 pub mod terminal;
 use bmux_broadcast_plugin_api::{
     broadcast_control_v1 as control, broadcast_output_v1 as output, broadcast_turnkey_v1 as turnkey,
@@ -201,7 +204,7 @@ fn run_command(mut context: NativeCommandContext) -> Result<i32, PluginCommandEr
         if context.arguments.first().is_some_and(|arg| arg == "deploy") { return deploy::run(&context, &context.arguments[1..]).await; }
         if guided::local(&context).await? { return Ok(bmux_plugin_sdk::EXIT_OK); }
         let paths = bmux_config::ConfigPaths::new(context.connection.config_dir.clone().into(), context.connection.runtime_dir.clone().into(), context.connection.data_dir.clone().into(), context.connection.state_dir.clone().into());
-        let mut client = bmux_client::BmuxClient::connect_with_paths(&paths, "broadcast-control").await.map_err(|_| PluginCommandError::failed("broadcast service unavailable"))?;
+        let mut client = bmux_client::BmuxClient::connect_with_paths_and_timeout(&paths, "broadcast-control", std::time::Duration::from_secs(30)).await.map_err(|_| PluginCommandError::failed("broadcast service unavailable"))?;
         control::client::prepare_local(&mut client).await.map_err(|_| PluginCommandError::failed("broadcast local authorization unavailable"))?;
         let proof = authorization::local_proof(&paths.runtime_dir).map_err(|_| PluginCommandError::failed("broadcast local authorization unavailable"))?;
         control::client::authorize(&mut client, proof).await.map_err(|_| PluginCommandError::failed("broadcast local authorization rejected"))?;

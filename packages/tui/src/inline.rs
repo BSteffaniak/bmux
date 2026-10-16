@@ -30,7 +30,11 @@ impl<W: Write> InlineTerminal<W> {
         if restore_raw {
             crossterm::terminal::enable_raw_mode()?;
         }
-        if let Err(error) = writer.write_all(b"\x1b[?25l") {
+        if let Err(error) = writer.write_all(if restore_raw {
+            b"\x1b[?25l\x1b[?2004h"
+        } else {
+            b"\x1b[?25l"
+        }) {
             if restore_raw {
                 let _ = crossterm::terminal::disable_raw_mode();
             }
@@ -98,6 +102,34 @@ impl<W: Write> InlineTerminal<W> {
         Ok(())
     }
 
+    /// Clear the owned region and restore modes, reporting cleanup failures.
+    /// Drop remains a best-effort fallback for unwinding and early returns.
+    ///
+    /// # Errors
+    /// Returns the first output or terminal mode restoration error after
+    /// attempting every cleanup step.
+    pub fn finish(&mut self) -> io::Result<()> {
+        let cleared = self.clear();
+        let cursor = self
+            .writer
+            .write_all(if self.restore_raw {
+                b"\x1b[?2004l\x1b[0m\x1b[?25h"
+            } else {
+                b"\x1b[0m\x1b[?25h"
+            })
+            .and_then(|()| self.writer.flush());
+        let raw = if self.restore_raw {
+            let result = crossterm::terminal::disable_raw_mode();
+            if result.is_ok() {
+                self.restore_raw = false;
+            }
+            result
+        } else {
+            Ok(())
+        };
+        cleared.and(cursor).and(raw)
+    }
+
     /// Clear owned visible rows and leave the cursor at their beginning.
     ///
     /// # Errors
@@ -124,7 +156,11 @@ impl<W: Write> InlineTerminal<W> {
 impl<W: Write> Drop for InlineTerminal<W> {
     fn drop(&mut self) {
         let _ = self.clear();
-        let _ = self.writer.write_all(b"\x1b[0m\x1b[?25h");
+        let _ = self.writer.write_all(if self.restore_raw {
+            b"\x1b[?2004l\x1b[0m\x1b[?25h"
+        } else {
+            b"\x1b[0m\x1b[?25h"
+        });
         let _ = self.writer.flush();
         if self.restore_raw {
             let _ = crossterm::terminal::disable_raw_mode();

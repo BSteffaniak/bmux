@@ -17,15 +17,19 @@ bmux broadcast profiles
 ```
 
 No-argument start explicitly chooses and confirms one active terminal; it never
-shares a default session. The CLI offers numbered choices showing session names,
-attached-client counts, and pane names / active commands (or shells) when the
-optional pane-runtime read service is available. The palette uses the same labels.
-Choose a displayed number or paste a full UUID; invalid choices retry, and an
-empty answer or `q` cancels. Confirmation repeats the terminal details and warns
-that all of its output will be public. Names are bounded, control-character-filtered
-display hints, not selection authority; duplicate names retain distinct UUIDs.
-No terminal output preview is fetched. Standalone prompts require a real TTY; palette prompts
-use the host's structured prompt UI, never raw terminal output. Explicit
+shares a default session. The CLI uses a bounded, styled inline BMUX TUI on the
+normal screen: type to filter, use arrows or paging to navigate, Enter to review,
+and Ctrl-S to explicitly start public sharing. Escape cancels selection or returns
+from review; Ctrl-C cancels. Optional pane details load asynchronously without
+blocking navigation. Only the selected source's details are shown; UUIDs are not
+required for interactive input. Setup fields use inline text-input components too.
+Names are bounded, control-character-filtered display hints, not selection authority.
+Duplicate names retain distinct UUIDs. The palette retains host-owned structured
+prompts. No terminal output preview is fetched. Standalone prompts require a real TTY.
+Interactive start waits up to 15 seconds for first-frame relay acknowledgement;
+closing that monitor does not stop the daemon-owned broadcast. Noninteractive starts
+retain accepted-start semantics and must inspect status to establish readiness.
+Explicit
 `--session` selects a terminal without a prompt, creates a source UUID and hashes
 and verifies the currently executing installed bmux (never PATH). Explicit
 `--executable`, `--sha256`, `--version`, `--cols`, `--rows` remain available.

@@ -1,4 +1,7 @@
 //! Private retained terminal adapter. Never invokes PATH or creates an input surface.
+#[cfg(all(test, unix))]
+#[path = "terminal_tests.rs"]
+mod tests;
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tokio::{io::AsyncReadExt, sync::watch};
@@ -54,6 +57,18 @@ impl RuntimeSelection {
     }
 }
 
+#[cfg(unix)]
+fn observer_directory() -> Result<tempfile::TempDir, &'static str> {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::Builder::new()
+        .prefix("bmux-bo-")
+        .tempdir_in("/tmp")
+        .map_err(|_| "observer_directory")?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| "observer_directory")?;
+    Ok(directory)
+}
+
 /// Latest complete self-contained retained output; EOF invalidates the channel.
 /// Parent explicitly selects the target and admits exactly one worker's BMAO1 epoch.
 #[cfg(unix)]
@@ -65,7 +80,6 @@ pub async fn observe(
     sender: watch::Sender<Option<Arc<[u8]>>>,
     mut stop: watch::Receiver<bool>,
 ) -> Result<(), &'static str> {
-    use std::os::unix::fs::PermissionsExt;
     selection.verify().await?;
     if *stop.borrow() {
         sender.send_replace(None);
@@ -74,14 +88,12 @@ pub async fn observe(
     if cols == 0 || rows == 0 || usize::from(cols) * usize::from(rows) > 262_144 {
         return Err("viewport_bound");
     }
-    let directory = selection
-        .paths
-        .runtime_dir
-        .join(format!("broadcast-observer-{}", Uuid::new_v4()));
-    std::fs::create_dir(&directory).map_err(|_| "observer_directory")?;
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
-        .map_err(|_| "observer_directory")?;
-    let socket = directory.join("output.sock");
+    // sockaddr_un is only 104 bytes on macOS. Runtime roots (especially
+    // Library/Application Support paths) plus a UUID can exceed that limit.
+    // This is only a private output rendezvous; the observer still connects to
+    // the explicitly selected daemon through the unchanged ConfigPaths.
+    let directory = observer_directory()?;
+    let socket = directory.path().join("out.sock");
     let result = async {
         let listener = tokio::net::UnixListener::bind(&socket).map_err(|_| "observer_socket")?;
         let mut command = tokio::process::Command::new(&selection.executable);
@@ -111,10 +123,15 @@ pub async fn observe(
             .spawn()
             .map_err(|_| "observer_launch")?;
         let result = async {
-            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .map_err(|_| "observer_timeout")?
-                .map_err(|_| "observer_connect")?;
+            let (stream, _) = tokio::select! {
+                accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept()) => {
+                    accepted.map_err(|_| "observer_timeout")?.map_err(|_| "observer_connect")?
+                }
+                status = child.wait() => {
+                    return Err(if status.is_ok() { "observer_exited" } else { "observer_wait" });
+                }
+                _ = stop.changed() => return Ok(()),
+            };
             tokio::select! {
                 result = read_output(stream, target, &sender) => result,
                 _ = stop.changed() => Ok(()),
@@ -128,7 +145,7 @@ pub async fn observe(
     .await;
     sender.send_replace(None);
     let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_dir(&directory);
+    let _ = directory.close();
     result
 }
 

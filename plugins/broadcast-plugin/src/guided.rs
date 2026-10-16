@@ -2,11 +2,7 @@
 use crate::{profiles, relay};
 use bmux_broadcast_plugin_api::{broadcast_control_v1 as control, broadcast_turnkey_v1 as turnkey};
 use bmux_plugin_sdk::{NativeCommandContext, NativeCommandInvocationSource, PluginCommandError};
-use std::{
-    collections::BTreeMap,
-    io::{BufRead, IsTerminal, Read, Write},
-    path::Path,
-};
+use std::{collections::BTreeMap, path::Path};
 fn failed(code: &'static str) -> PluginCommandError {
     PluginCommandError::failed(code)
 }
@@ -76,30 +72,15 @@ async fn prompt(context: &NativeCommandContext, label: &str) -> Result<String, P
     if context.invocation_source == NativeCommandInvocationSource::AttachKeybinding {
         return structured_text(label).await;
     }
-    if context.invocation_source != NativeCommandInvocationSource::Cli
-        || !std::io::stdin().is_terminal()
-        || !std::io::stderr().is_terminal()
-    {
-        return Err(failed(
-            "interactive selection requires a TTY; pass explicit --source UUID or setup flags",
-        ));
+    if context.invocation_source == NativeCommandInvocationSource::Cli {
+        return crate::setup_ui::text(label)
+            .await
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?
+            .ok_or_else(|| failed("broadcast cancelled"));
     }
-    eprint!("{label}: ");
-    std::io::stderr()
-        .flush()
-        .map_err(|_| failed("prompt unavailable"))?;
-    let mut bytes = Vec::new();
-    std::io::stdin()
-        .lock()
-        .take(4097)
-        .read_until(b'\n', &mut bytes)
-        .map_err(|_| failed("prompt unavailable"))?;
-    if bytes.len() > 4096 || !bytes.ends_with(b"\n") {
-        return Err(failed("prompt input exceeds limit"));
-    }
-    String::from_utf8(bytes)
-        .map(|s| s.trim().to_owned())
-        .map_err(|_| failed("invalid prompt input"))
+    Err(failed(
+        "interactive selection unavailable for this invocation; pass explicit --source or --session",
+    ))
 }
 async fn value(
     context: &NativeCommandContext,
@@ -294,7 +275,7 @@ pub(crate) async fn local(context: &NativeCommandContext) -> Result<bool, Plugin
         _ => Ok(false),
     }
 }
-fn display_hint(value: &str) -> String {
+pub(super) fn display_hint(value: &str) -> String {
     value
         .chars()
         .filter(|ch| {
@@ -337,12 +318,18 @@ fn terminal_choice(input: &str, choices: &[TerminalChoice]) -> Result<usize, &'s
 
 async fn terminal_choices(
     client: &mut bmux_client::BmuxClient,
+    enrich: bool,
 ) -> Result<Vec<TerminalChoice>, PluginCommandError> {
     use bmux_pane_runtime_plugin_api::pane_runtime_state;
     let sessions = bmux_sessions_plugin_api::sessions_state::client::list_sessions(client)
         .await
         .map_err(|_| failed("session list unavailable; specify --session UUID or --source UUID"))?;
     let mut choices = Vec::with_capacity(sessions.len());
+    if sessions.len() > 256 {
+        return Err(failed(
+            "too many terminals for interactive selection; use explicit --session UUID",
+        ));
+    }
     for session in sessions {
         let name = session
             .name
@@ -351,6 +338,14 @@ async fn terminal_choices(
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "Unnamed terminal".into());
         let mut label = format!("{name} — {} attached", session.client_count);
+        if !enrich {
+            label.push_str(&format!(" [{}]", session.id));
+            choices.push(TerminalChoice {
+                id: session.id,
+                label,
+            });
+            continue;
+        }
         // Optional enrichment only: missing/denied pane metadata must not
         // prevent selecting a session through the sessions contract.
         match pane_runtime_state::client::list_panes(client, Some(session.id)).await {
@@ -362,6 +357,14 @@ async fn terminal_choices(
                     .map(|pane| {
                         let name = pane.name.as_deref().unwrap_or("pane");
                         let command = pane.active_command.as_deref().unwrap_or(&pane.shell);
+                        let command = if pane.active_command.is_none() {
+                            Path::new(command)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(command)
+                        } else {
+                            command
+                        };
                         format!("{}: {}", display_hint(name), display_hint(command))
                     })
                     .collect();
@@ -401,15 +404,59 @@ pub(crate) async fn connected(
     {
         let mut map = options(args.get(1..).unwrap_or_default())?;
         if !map.contains_key("--source") && !map.contains_key("--session") {
-            let choices = terminal_choices(client).await?;
+            let choices = terminal_choices(
+                client,
+                context.invocation_source != NativeCommandInvocationSource::Cli,
+            )
+            .await?;
             if choices.is_empty() {
                 return Err(failed(
                     "no terminal sessions available; register a presentation source first",
                 ));
             }
-            let session = if context.invocation_source
-                == NativeCommandInvocationSource::AttachKeybinding
-            {
+            let inline = context.invocation_source == NativeCommandInvocationSource::Cli;
+            let session = if inline {
+                let destination = profiles::selected(
+                    Path::new(&context.connection.config_dir),
+                    map.get("--profile").map(String::as_str),
+                )
+                .ok()
+                .and_then(|profile| viewer_url(&profile.endpoint, &profile.channel).ok())
+                .unwrap_or_else(|| "configured broadcast profile".into());
+                let items = choices
+                    .iter()
+                    .map(|choice| {
+                        let summary = choice
+                            .label
+                            .rsplit_once(" [")
+                            .map_or(choice.label.as_str(), |(label, _)| label);
+                        crate::inline_ui::Choice {
+                            id: choice.id.to_string(),
+                            title: summary.split(" — ").take(2).collect::<Vec<_>>().join(" · "),
+                            details: format!(
+                                "{}\nSession {}",
+                                summary.replace(" — ", "\n"),
+                                choice.id
+                            ),
+                        }
+                    })
+                    .collect();
+                crate::inline_ui::select(
+                    items,
+                    destination,
+                    bmux_config::ConfigPaths::new(
+                        context.connection.config_dir.clone().into(),
+                        context.connection.runtime_dir.clone().into(),
+                        context.connection.data_dir.clone().into(),
+                        context.connection.state_dir.clone().into(),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    failed("inline picker unavailable; use --session UUID or --source UUID")
+                })?
+                .ok_or_else(|| failed("broadcast cancelled"))?
+            } else if context.invocation_source == NativeCommandInvocationSource::AttachKeybinding {
                 use bmux_plugin::prompt::{
                     PromptOption, PromptRequest, PromptResponse, PromptValue,
                 };
@@ -448,8 +495,8 @@ pub(crate) async fn connected(
             };
             let selected_index = terminal_choice(&session, &choices).map_err(failed)?;
             let selected = &choices[selected_index];
-            let confirmed =
-                if context.invocation_source == NativeCommandInvocationSource::AttachKeybinding {
+            let confirmed = inline
+                || if context.invocation_source == NativeCommandInvocationSource::AttachKeybinding {
                     use bmux_plugin::prompt::{PromptRequest, PromptResponse, PromptValue};
                     matches!(
                         bmux_plugin::prompt::request(PromptRequest::confirm(format!(
@@ -582,26 +629,58 @@ pub(crate) async fn connected(
                 p.endpoint.clone(),
                 p.channel.clone(),
                 p.credential_file.to_string_lossy().into_owned(),
-                id,
+                id.clone(),
             )
             .await
             .map_err(|_| failed("broadcast start rejected"))?;
+            let live = crate::startup_ui::wait(
+                client,
+                &id,
+                context.invocation_source == NativeCommandInvocationSource::Cli,
+            )
+            .await
+            .map_err(PluginCommandError::failed)?;
             emit!(
                 context,
                 "{} / {} source={} {}",
-                status.local,
-                status.remote,
+                if live {
+                    "running"
+                } else {
+                    status.local.as_str()
+                },
+                if live { "live" } else { status.remote.as_str() },
                 status.source_id.as_deref().unwrap_or("none"),
                 viewer_url(&p.endpoint, &p.channel).map_err(failed)?
             );
         } else {
-            let result = turnkey::client::start_profile(client,map.get("--profile").cloned(),id).await.map_err(|_| failed("broadcast start rejected; run broadcast setup and register an explicit source"))?;
+            let result = turnkey::client::start_profile(
+                client,
+                map.get("--profile").cloned(),
+                id.clone(),
+            )
+            .await
+            .map_err(|_| {
+                failed(
+                    "broadcast start rejected; run broadcast setup and register an explicit source",
+                )
+            })?;
+            let live = crate::startup_ui::wait(
+                client,
+                &id,
+                context.invocation_source == NativeCommandInvocationSource::Cli,
+            )
+            .await
+            .map_err(PluginCommandError::failed)?;
             // Ownership token is private teardown authority: do not print/log it.
             emit!(
                 context,
                 "{} / {} source={} {}",
-                result.local,
-                result.remote,
+                if live {
+                    "running"
+                } else {
+                    result.local.as_str()
+                },
+                if live { "live" } else { result.remote.as_str() },
                 result.source_id.as_deref().unwrap_or("none"),
                 result.viewer_url.as_deref().unwrap_or("")
             );
