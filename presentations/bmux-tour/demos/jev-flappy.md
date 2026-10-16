@@ -119,7 +119,9 @@ This is deliberately an easier widescreen demo, not a faithful difficulty clone:
   collisions, forecasts, and the agent's safe interval all use this same gap.
 - Gap centers are seeded random values with 40px minimum top/bottom pipe
   segments. The first pipe starts at 60% of the world width; following pipes
-  keep the fixed spacing. Difficulty never ramps with score or attempt.
+  keep the fixed spacing through and beyond the right edge. New pipes are
+  generated offscreen, never recycled into the middle of the playfield.
+  Difficulty never ramps with score or attempt.
 
 Art and collisions share world geometry, rounded to terminal cells (the bird
 uses at least one row). Resizing fills the new viewport without changing the

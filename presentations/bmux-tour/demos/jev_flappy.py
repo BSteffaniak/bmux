@@ -113,7 +113,14 @@ class Game:
         self.score = 0
         self.dead = False
         self.ticks = 0
-        self.pipes = [self.new_pipe(self.width * 0.6 + i * self.spacing) for i in range(3)]
+        self.pipes = [self.new_pipe(self.width * 0.6)]
+        self.fill_pipes()
+
+    def fill_pipes(self):
+        # Keep the next pipe beyond the camera, not a fixed-size pool that
+        # eventually recycles into the middle of the widened playfield.
+        while self.pipes[-1].x < self.width:
+            self.pipes.append(self.new_pipe(self.pipes[-1].x + self.spacing))
 
     def new_pipe(self, x):
         # Keep both pipe segments visible and the whole widened gap reachable.
@@ -143,8 +150,7 @@ class Game:
         if self.y >= self.height - self.bird_half_height:
             self.dead = True
         self.pipes = [p for p in self.pipes if p.x + self.pipe_width >= 0]
-        while len(self.pipes) < 3:
-            self.pipes.append(self.new_pipe(self.pipes[-1].x + self.spacing))
+        self.fill_pipes()
 
     def forecast(self, flap):
         """Counterfactual only: same physics, no policy, no mutation of live state.

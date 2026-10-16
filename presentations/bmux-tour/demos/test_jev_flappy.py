@@ -170,8 +170,32 @@ class GameTests(unittest.TestCase):
             a.tick(a.velocity > 0.3)
             b.tick(b.velocity > 0.3)
             self.assertEqual(a.observation(), b.observation())
-            self.assertEqual(len(a.pipes), 3)
+            self.assertLessEqual(len(a.pipes), int((a.width + a.pipe_width) / a.spacing) + 2)
         self.assertGreater(a.attempt, 1)
+
+    def test_pipes_cover_camera_and_spawn_beyond_right_edge(self):
+        game = demo.Game()
+        game.new_pipe = lambda x: demo.Pipe(x, 15)
+        for pipe in game.pipes:
+            pipe.gap_y = 15
+        self.assertAlmostEqual(game.pipes[0].x, game.width * 0.6)
+        spawned = 0
+        for _ in range(1500):
+            previous = list(game.pipes)
+            # Isolate scrolling/spawning from flight policy and random gaps.
+            game.y, game.velocity = 15, 0
+            game.tick()
+            self.assertFalse(game.dead)
+            self.assertGreaterEqual(game.pipes[-1].x, game.width)
+            self.assertLess(game.pipes[-1].x, game.width + game.spacing)
+            for left, right in zip(game.pipes, game.pipes[1:]):
+                self.assertAlmostEqual(right.x - left.x, game.spacing)
+            for pipe in game.pipes:
+                if all(pipe is not old for old in previous):
+                    spawned += 1
+                    self.assertGreaterEqual(pipe.x, game.width)
+            self.assertLessEqual(len(game.pipes), 8)
+        self.assertGreater(spawned, 30)
 
     def test_forecasts_are_exact_and_do_not_change_live_state(self):
         import copy
