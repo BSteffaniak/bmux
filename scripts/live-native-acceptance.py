@@ -342,17 +342,23 @@ class Harness:
         mirror = PRESENTER.Mirror(self.command + ['broadcast', 'start'], self.env)
         self.terminals.append(mirror)
         wait('inline source picker', lambda: b'Choose a terminal' in mirror.bytes())
-        mirror.send(b'native-acceptance')
+        # Exercise ordinary keys, not paste: raw policy previously ignored
+        # all typing, and a one-session fixture still appeared to pass.
+        mirror.send(b'no-such-terminal')
+        time.sleep(.3)
+        mirror.send(b'\r')
+        time.sleep(.3)
+        require(b'Review public sharing' not in mirror.bytes(),
+                'typing did not filter out the unmatched terminal')
+        mirror.send(b'\x15')  # Readline clear query.
+        mirror.send(b'terminal-producer')
         time.sleep(.3)
         mirror.send(b'\r')
         wait('inline review', lambda: b'Review public sharing' in mirror.bytes())
         require(self.control('status')['local'] in ('offline', 'stopped'),
                 'merely selecting a terminal published output')
-        # Enter must not double-submit the review.
+        # A second Enter confirms the separate public-sharing review.
         mirror.send(b'\r')
-        time.sleep(.2)
-        require(mirror.child.poll() is None, 'review accepted accidental second Enter')
-        mirror.send(b'\x13')  # Ctrl-S: explicit public sharing action.
         wait('inline start finished', lambda: mirror.child.poll() is not None, 40)
         require(mirror.child.returncode == 0, 'inline broadcast did not reach first frame acknowledgement')
         require(self.live(), 'inline start returned without live frame')

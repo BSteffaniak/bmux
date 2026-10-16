@@ -19,7 +19,7 @@ bmux broadcast profiles
 No-argument start explicitly chooses and confirms one active terminal; it never
 shares a default session. The CLI uses a bounded, styled inline BMUX TUI on the
 normal screen: type to filter, use arrows or paging to navigate, Enter to review,
-and Ctrl-S to explicitly start public sharing. Escape cancels selection or returns
+and Enter again to explicitly start public sharing. Escape cancels selection or returns
 from review; Ctrl-C cancels. Optional pane details load asynchronously without
 blocking navigation. Only the selected source's details are shown; UUIDs are not
 required for interactive input. Setup fields use inline text-input components too.

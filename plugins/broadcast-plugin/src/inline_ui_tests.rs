@@ -42,13 +42,28 @@ fn filtering_preserves_identity_and_paste_is_bounded() {
     assert_eq!(picker.search.borrow().buffer().text(), "terminal-1");
 }
 #[test]
-fn review_never_accepts_enter_and_requires_distinct_confirmation() {
+fn ordinary_typing_filters_and_backspace_edits_the_query() {
+    let mut picker = picker();
+    for ch in "terminal-99".chars() {
+        key(&mut picker, KeyCode::Char(ch), false);
+    }
+    assert_eq!(picker.search.borrow().buffer().text(), "terminal-99");
+    assert_eq!(picker.visible.len(), 1);
+    assert_eq!(picker.selected().unwrap().id, "source-99");
+    key(&mut picker, KeyCode::Backspace, false);
+    assert_eq!(picker.search.borrow().buffer().text(), "terminal-9");
+    assert_eq!(picker.visible.len(), 11);
+    key(&mut picker, KeyCode::Char('u'), true);
+    assert_eq!(picker.search.borrow().buffer().text(), "");
+}
+
+#[test]
+fn enter_selects_then_confirms_review() {
     let mut picker = picker();
     key(&mut picker, KeyCode::Enter, false);
     assert!(picker.review);
-    key(&mut picker, KeyCode::Enter, false);
     assert!(picker.accepted.is_none());
-    key(&mut picker, KeyCode::Char('s'), true);
+    key(&mut picker, KeyCode::Enter, false);
     assert_eq!(picker.accepted.as_deref(), Some("source-0"));
 }
 #[test]

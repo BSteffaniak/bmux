@@ -12,9 +12,7 @@ use bmux_tui::{
     paint::PaintCx,
     style::{Color, Style},
 };
-use bmux_tui_components::text_input::{
-    TextInputComponent, TextInputControl, TextInputPolicy, TextInputState,
-};
+use bmux_tui_components::text_input::{TextInputComponent, TextInputControl, TextInputState};
 use bmux_tui_runtime::{
     PresentReport, Presenter, Program, ResetReason, Runtime, RuntimeConfig, RuntimeError,
     RuntimeEvent, TerminalInput, Update,
@@ -53,7 +51,7 @@ impl Program for Field {
                 {
                     return Ok(Update::none());
                 }
-                TextInputControl::new(&TextInputPolicy::raw())
+                TextInputControl::new(&super::inline_ui::editing_policy())
                     .handle_event(&mut self.state.borrow_mut(), &event);
             }
             _ => return Ok(Update::none()),
@@ -70,7 +68,7 @@ impl Presenter<Field> for FieldPresenter {
     fn present(&mut self, field: &mut Field) -> io::Result<PresentReport> {
         let width = field.size.width.saturating_sub(1).min(90);
         let height = field.size.height.saturating_sub(1).min(6);
-        let policy = TextInputPolicy::raw();
+        let policy = super::inline_ui::editing_policy();
         let root = Column::new()
             .child(TextBlock::new("Broadcast · Setup").style(Style::new().fg(Color::Cyan)))
             .child(TextBlock::new(field.label.as_str()))
@@ -114,4 +112,35 @@ pub(super) async fn text(label: &str) -> io::Result<Option<String>> {
     };
     output.presenter.terminal.finish()?;
     Ok(output.program.result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_keyboard::{KeyStroke, Modifiers};
+
+    #[test]
+    fn ordinary_typing_edits_setup_and_enter_submits() {
+        let mut field = Field {
+            label: "Profile name".into(),
+            state: RefCell::new(TextInputState::new(TextEditBuffer::new())),
+            size: Size::new(80, 24),
+            result: None,
+        };
+        for key in [
+            KeyCode::Char('a'),
+            KeyCode::Char('b'),
+            KeyCode::Backspace,
+            KeyCode::Char('c'),
+            KeyCode::Enter,
+        ] {
+            field
+                .update(RuntimeEvent::Terminal(Event::Key(KeyStroke {
+                    key,
+                    modifiers: Modifiers::default(),
+                })))
+                .unwrap();
+        }
+        assert_eq!(field.result.as_deref(), Some("ac"));
+    }
 }

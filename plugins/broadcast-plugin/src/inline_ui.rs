@@ -19,7 +19,10 @@ use bmux_tui::{
 use bmux_tui_components::{
     key_hint_bar::{KeyHint, KeyHintBarComponent},
     selectable_list::{SelectableListComponent, SelectableListItem, SelectableListState},
-    text_input::{TextInputComponent, TextInputControl, TextInputPolicy, TextInputState},
+    text_input::{
+        EnterBehavior, KeyboardPolicy, TextInputComponent, TextInputControl, TextInputPolicy,
+        TextInputState,
+    },
 };
 use bmux_tui_runtime::{
     PresentReport, Presenter, Program, ResetReason, Runtime, RuntimeConfig, RuntimeError,
@@ -29,6 +32,17 @@ use std::{
     cell::{Cell, RefCell},
     io::{self, IsTerminal},
 };
+
+pub(super) fn editing_policy() -> TextInputPolicy {
+    TextInputPolicy {
+        keyboard: KeyboardPolicy {
+            enter: EnterBehavior::Ignore,
+            shift_enter: None,
+            ..KeyboardPolicy::chat_composer()
+        },
+        ..TextInputPolicy::raw()
+    }
+}
 
 pub(super) struct Choice {
     pub id: String,
@@ -128,7 +142,7 @@ impl Picker {
             "Broadcast · Choose a terminal"
         })
         .style(Style::new().fg(Color::Cyan));
-        let policy = TextInputPolicy::raw();
+        let policy = editing_policy();
         let items = self.items();
         let list = SelectableListComponent::new("sources", &items, &self.list);
         let selected = self.selected();
@@ -146,7 +160,7 @@ impl Picker {
             vec![
                 KeyHint::new("Esc", "back"),
                 KeyHint::new("Ctrl-C", "cancel"),
-                KeyHint::new("Ctrl-S", "start broadcasting"),
+                KeyHint::new("Enter", "start broadcasting"),
             ]
         } else {
             vec![
@@ -203,7 +217,7 @@ impl Picker {
     }
 }
 fn key_is_confirm(event: &Event) -> bool {
-    matches!(event, Event::Key(key) if key.key == KeyCode::Enter || (key.key == KeyCode::Char('s') && key.modifiers.ctrl))
+    matches!(event, Event::Key(key) if key.key == KeyCode::Enter)
 }
 
 impl Program for Picker {
@@ -240,7 +254,7 @@ impl Program for Picker {
                 return Ok(Update::exit());
             }
             if self.review {
-                if key.key == KeyCode::Char('s') && key.modifiers.ctrl {
+                if key.key == KeyCode::Enter {
                     self.accepted = self.selected().map(|choice| choice.id.clone());
                     return Ok(Update::exit());
                 }
@@ -286,7 +300,7 @@ impl Program for Picker {
             return Ok(Update::none());
         }
         if !self.review {
-            TextInputControl::new(&TextInputPolicy::raw())
+            TextInputControl::new(&editing_policy())
                 .handle_event(&mut self.search.borrow_mut(), &event);
             self.filter();
         }
