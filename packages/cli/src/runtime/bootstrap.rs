@@ -542,7 +542,7 @@ async fn run_server_start_inner(
             None => std::future::pending::<Result<()>>().await,
         }
     };
-    tokio::pin!(gateway_loop);
+    let mut gateway_loop = Box::pin(gateway_loop);
     let run_result = if loaded_plugins.is_empty() {
         tokio::select! {
             biased;
@@ -573,6 +573,9 @@ async fn run_server_start_inner(
             }
         }
     };
+    // Cancellation must release gateway listeners before plugin teardown, which
+    // can take time. A pinned reference would keep the underlying future alive.
+    drop(gateway_loop);
     if let Err(error) =
         dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_stopping"))
     {

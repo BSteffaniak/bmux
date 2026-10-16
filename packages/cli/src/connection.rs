@@ -303,6 +303,13 @@ fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
+pub async fn target_is_local(context: ConnectionContext<'_>) -> Result<bool> {
+    Ok(matches!(
+        resolve_active_target(context).await?,
+        ActiveTarget::Local
+    ))
+}
+
 async fn resolve_active_target(context: ConnectionContext<'_>) -> Result<ActiveTarget> {
     let config = BmuxConfig::load().context("failed loading bmux config")?;
     let selected = context

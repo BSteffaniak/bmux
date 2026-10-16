@@ -97,6 +97,41 @@ pub(super) async fn wait_until_server_stopped(
     Ok(false)
 }
 
+pub(super) async fn wait_for_process_exit_async(pid: u32, timeout: Duration) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !is_pid_running(pid)? || process_has_exited(pid)? {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + SERVER_POLL_INTERVAL))
+            .await;
+    }
+}
+
+// An exited foreground server can remain a zombie until its launching parent
+// reaps it. It has released its resources even though kill -0 still succeeds.
+fn process_has_exited(pid: u32) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        let output = ProcessCommand::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .context("failed inspecting server process state")?;
+        Ok(output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('Z'))
+    }
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        Ok(false)
+    }
+}
+
 pub(super) fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -256,6 +291,63 @@ mod tests {
             }),
             "profile:traditional (450ms)"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_exit_wait_does_not_report_a_live_process_as_stopped() {
+        // No IPC endpoint exists for this child. IPC failure alone must not
+        // authorize reporting a completed local shutdown.
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        assert!(
+            !wait_for_process_exit_async(pid, Duration::from_millis(20))
+                .await
+                .unwrap()
+        );
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+        assert!(
+            wait_for_process_exit_async(pid, Duration::from_secs(1))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_exit_wait_accepts_an_unreaped_child() {
+        let mut child = ProcessCommand::new("/bin/sleep")
+            .arg("0.1")
+            .spawn()
+            .unwrap();
+        // Do not reap until after the wait, matching a foreground server whose
+        // parent is synchronously waiting for the stop command to return.
+        let exited = wait_for_process_exit_async(child.id(), Duration::from_secs(5)).await;
+        let status = child.wait().unwrap();
+        assert!(status.success());
+        assert!(exited.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_exit_wait_waits_for_delayed_exit() {
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("0.2")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let (exited, status) = tokio::join!(
+            wait_for_process_exit_async(pid, Duration::from_secs(5)),
+            child.wait(),
+        );
+        assert!(status.unwrap().success());
+        assert!(exited.unwrap());
     }
 
     #[test]

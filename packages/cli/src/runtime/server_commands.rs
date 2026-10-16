@@ -442,7 +442,15 @@ fn plugin_bus_event_name(kind: &str, payload: &[u8]) -> &'static str {
 }
 
 pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -> Result<u8> {
-    cleanup_stale_pid_file().await?;
+    let local = crate::connection::target_is_local(connection_context).await?;
+    // Capture the process before requesting shutdown: the server removes its PID
+    // file during cleanup, before the process itself has necessarily exited.
+    let pid = if local {
+        cleanup_stale_pid_file().await?;
+        read_server_pid_file()?
+    } else {
+        None
+    };
     let graceful_stopped = match tokio::time::timeout(
         SERVER_STOP_TIMEOUT,
         connect_raw_with_context("bmux-cli-stop", connection_context),
@@ -450,27 +458,46 @@ pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -
     .await
     {
         Ok(Ok(mut client)) => {
-            client.stop_server().await.map_err(map_cli_client_error)?;
-            wait_until_server_stopped(SERVER_STOP_TIMEOUT, connection_context).await?
+            tokio::time::timeout(SERVER_STOP_TIMEOUT, client.stop_server())
+                .await
+                .context("timed out requesting server shutdown")?
+                .map_err(map_cli_client_error)?;
+            let stopped = if local {
+                let pid = pid.context(
+                    "shutdown requested, but no server PID is available to verify process exit",
+                )?;
+                super::server_runtime::wait_for_process_exit_async(pid, SERVER_STOP_TIMEOUT).await?
+            } else {
+                wait_until_server_stopped(SERVER_STOP_TIMEOUT, connection_context).await?
+            };
+            anyhow::ensure!(
+                stopped,
+                "server shutdown is still in progress; timed out waiting for completion"
+            );
+            true
         }
         Ok(Err(_)) | Err(_) => false,
     };
 
     if graceful_stopped {
         println!("bmux server stopped gracefully");
-        let _ = remove_server_pid_file();
         return Ok(0);
     }
 
-    if let Some(pid) = read_server_pid_file()? {
+    if let Some(pid) = pid {
         if try_kill_pid(pid)? {
             if wait_for_process_exit(pid, SERVER_STOP_TIMEOUT)? {
                 println!("bmux server stop fallback succeeded (pid {pid})");
                 let _ = remove_server_pid_file();
                 return Ok(0);
             }
+            anyhow::bail!(
+                "server process {pid} is still running after the stop fallback timed out"
+            );
         } else if !is_pid_running(pid)? {
             let _ = remove_server_pid_file();
+        } else {
+            anyhow::bail!("failed to stop server process {pid}; it is still running");
         }
     }
 
