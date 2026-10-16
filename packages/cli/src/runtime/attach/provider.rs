@@ -102,6 +102,10 @@ impl ResolvedProviderAttach {
         self.provider.requires_fallback_client()
     }
 
+    pub fn render_provider(&self) -> Arc<dyn AttachProvider> {
+        Arc::clone(&self.provider)
+    }
+
     pub async fn open(
         self,
         resume: Option<bmux_client::AttachResumeState>,

@@ -141,7 +141,8 @@ macro_rules! declare_bundled_plugins {
 #[cfg(any(
     feature = "bundled-plugin-cluster",
     feature = "bundled-plugin-tab-bar",
-    feature = "bundled-plugin-sidebar"
+    feature = "bundled-plugin-sidebar",
+    feature = "bundled-plugin-pane-runtime"
 ))]
 #[allow(unused_variables, clippy::missing_const_for_fn)]
 fn install_bundled_client_adapter(
@@ -149,6 +150,10 @@ fn install_bundled_client_adapter(
     settings: Option<&toml::Value>,
     paths: &ConfigPaths,
 ) {
+    #[cfg(feature = "bundled-plugin-pane-runtime")]
+    if plugin_id == "bmux.pane_runtime" {
+        bmux_pane_runtime_plugin::observation::install();
+    }
     #[cfg(feature = "bundled-plugin-broadcast")]
     if plugin_id == "bmux.broadcast" {
         let paths = paths.clone();

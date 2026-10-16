@@ -4947,6 +4947,61 @@ fn pane_pty_size(
     (rows, cols)
 }
 
+/// Return shared geometry without taking sizing authority. Only an unset
+/// viewport may be seeded from the explicit detached fallback.
+pub(crate) fn observe_viewport(
+    session_id: SessionId,
+    client_id: ClientId,
+    cols: u16,
+    rows: u16,
+) -> Result<AttachViewport, SessionRuntimeError> {
+    let handle = pane_padding_handle().ok_or(SessionRuntimeError::NotFound)?;
+    let (result, seeded) = {
+        let mut manager = handle.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
+        let unset = manager
+            .runtimes
+            .get(&session_id)
+            .is_some_and(|runtime| runtime.attach_viewport.is_none());
+        let result = manager.observe_viewport(session_id, client_id, cols, rows);
+        let seeded = unset && result.is_ok();
+        (result, seeded)
+    };
+    if seeded {
+        // Notify after releasing the manager; this path is used only when no
+        // authoritative geometry existed yet, never for ordinary observation.
+        emit_attach_view_changed_for_layout(session_id);
+    }
+    result
+}
+
+impl SessionRuntimeManager {
+    fn observe_viewport(
+        &mut self,
+        session_id: SessionId,
+        client_id: ClientId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<AttachViewport, SessionRuntimeError> {
+        let runtime = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if !runtime.attached_clients.contains(&client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
+        if let Some(viewport) = runtime.attach_viewport {
+            return Ok(viewport);
+        }
+        if cols == 0 || rows == 0 || usize::from(cols) * usize::from(rows) > 262_144 {
+            return Err(SessionRuntimeError::Closed);
+        }
+        let viewport = AttachViewport::normalized(cols, rows, 0, 0, 0, 0);
+        runtime.attach_viewport = Some(viewport);
+        resize_session_ptys(&self.padding_config, runtime);
+        Ok(viewport)
+    }
+}
+
 fn resize_session_ptys(padding_config: &PanePaddingConfig, runtime: &SessionRuntimeHandle) {
     let root = scene_root_from_viewport(runtime.attach_viewport);
 
@@ -12978,6 +13033,51 @@ exit 7"#
                 h: 35,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn observation_preserves_sizing_authority_and_last_detached_geometry() {
+        let session = SessionId(Uuid::new_v4());
+        let owner = ClientId(Uuid::new_v4());
+        let observer = ClientId(Uuid::new_v4());
+        let pane = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane]);
+        runtime.attached_clients.extend([owner, observer]);
+        runtime.attach_viewport = None;
+        let mut manager = manager_with_runtime(session, runtime);
+        // An unset viewport is seeded once, never reasserted by observation.
+        let seeded = manager.observe_viewport(session, observer, 80, 24).unwrap();
+        assert_eq!((seeded.cols, seeded.rows), (80, 24));
+        manager
+            .set_attach_viewport(session, owner, 120, 40, 2, 7, 3, 11, 0, 0)
+            .unwrap();
+        let expected = manager.runtimes[&session].attach_viewport.unwrap();
+        let size = *manager.runtimes[&session].panes[&pane]
+            .last_requested_size
+            .lock()
+            .unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                manager.observe_viewport(session, observer, 80, 24).unwrap(),
+                expected
+            );
+            assert_eq!(
+                *manager.runtimes[&session].panes[&pane]
+                    .last_requested_size
+                    .lock()
+                    .unwrap(),
+                size
+            );
+        }
+        manager.end_attach(session, owner);
+        assert_eq!(
+            manager.observe_viewport(session, observer, 90, 30).unwrap(),
+            expected
+        );
+        assert!(matches!(
+            manager.observe_viewport(session, ClientId(Uuid::new_v4()), 80, 24),
+            Err(SessionRuntimeError::NotAttached)
+        ));
     }
 
     #[tokio::test]

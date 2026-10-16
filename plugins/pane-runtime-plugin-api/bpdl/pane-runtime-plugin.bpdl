@@ -865,6 +865,12 @@ interface attach-runtime-commands {
         max_bytes: u32,
     ) -> result<attach-output, attach-command-error>;
 
+    command observe-viewport(
+        session_id: uuid,
+        cols: u16,
+        rows: u16,
+    ) -> result<attach-viewport-set, attach-command-error>;
+
     command attach-set-viewport(
         session_id: uuid,
         cols: u16,

@@ -167,6 +167,29 @@ pub trait AttachProvider: fmt::Debug + Send + Sync + 'static {
         false
     }
 
+    /// Whether external selection changes may retarget this opened view.
+    /// Fixed-output adapters preserve the explicitly selected source identity.
+    fn allows_retarget(&self) -> bool {
+        true
+    }
+
+    /// Resolve the authoritative rendering viewport without claiming sizing authority.
+    /// Providers own selection and detached fallback policy. Unsupported backends
+    /// return an error rather than silently turn an observer into a sizing client.
+    fn observe_viewport<'a>(
+        &'a self,
+        _client: &'a mut crate::StreamingBmuxClient,
+        _target: &'a str,
+        _fallback: crate::AttachProviderViewport,
+    ) -> AttachProviderFuture<'a, crate::AttachProviderViewport> {
+        Box::pin(async move {
+            Err(AttachProviderError::OpenFailed {
+                provider_id: self.id().to_string(),
+                reason: "non-sizing observation is unsupported".to_string(),
+            })
+        })
+    }
+
     /// Resolve target syntax/configuration into a provider-private plan.
     ///
     /// # Errors

@@ -20,6 +20,7 @@ mod atomic_state;
 mod capture_handshake;
 mod commands;
 mod handlers;
+pub mod observation;
 mod padding;
 mod padding_api;
 mod private_input;

@@ -6,6 +6,9 @@ Owns only fresh temporary paths and child process groups. Never prints child log
 publisher credentials, proofs, deck contents, or response bodies on failure.
 """
 import argparse
+import fcntl
+import struct
+import termios
 import hashlib
 import importlib.util
 import json
@@ -250,6 +253,7 @@ class Harness:
             self.inspect('NATIVE_TERMINAL_PUBLIC_5831', [public, private, hidden])
         require(presenter.child.poll() is None, 'switch broke local presenter')
         self.cases.append('terminal-observer-switch-old-presenter-fenced-local-playback-survives')
+        self.verify_observed_resizing(sessions[0]['id'])
         self.control('source', source)
         wait('presenter source switched back', self.live)
         wait('presenter repaired audience', lambda: self.inspect_presenter(public, private, hidden))
@@ -398,6 +402,66 @@ class Harness:
                 'cancelled inline picker left raw terminal modes')
         self.cases.append('inline-resize-paste-cancel-no-publication-terminal-restoration')
         self.cases.append('inline-picker-review-confirm-first-frame-browser-pause-resume-stop-terminal-restoration')
+
+    def verify_observed_resizing(self, target):
+        """Normal attach sizes the PTY; observation follows without competing."""
+        local = PRESENTER.Mirror(self.command + ['attach', target], self.env)
+        self.terminals.append(local)
+        wait('normal terminal attached', lambda: b'NATIVE_TERMINAL_PUBLIC_5831' in local.bytes())
+
+        def progressing(label, geometry=None):
+            wait(label + ' visible', self.inspect_terminal)
+            if geometry is not None:
+                cols, rows = geometry
+                wait(label + ' authoritative canvas geometry', lambda: self.cdp.evaluate(f"Array.from(document.querySelectorAll('#live-broadcast canvas')).some(c=>!c.hidden && c.width === {cols * 10} && c.height === {rows * 20})"))
+            inspected = self.inspect('NATIVE_TERMINAL_PUBLIC_5831', [])
+            require(inspected['info']['generation'].endswith(':' + target), 'tab selection silently retargeted public source')
+            previous, _ = self.frame()
+            revision = int(self.status()['revision'])
+            wait(label + ' changing frame', lambda: int(self.status()['revision']) > revision and self.frame()[0] != previous)
+            # Require sustained progress, not just the single resize repair.
+            time.sleep(.5)
+            previous, _ = self.frame()
+            canvas = self.cdp.evaluate("Array.from(document.querySelectorAll('#live-broadcast canvas')).find(c=>!c.hidden)?.toDataURL()")
+            revision = int(self.status()['revision'])
+            wait(label + ' sustained progress', lambda: int(self.status()['revision']) > revision and self.frame()[0] != previous)
+            wait(label + ' audience canvas changes', lambda: self.cdp.evaluate("Array.from(document.querySelectorAll('#live-broadcast canvas')).find(c=>!c.hidden)?.toDataURL()") != canvas)
+            return True
+
+        progressing('120x40 attach over 80x24 observer', (120, 40))
+        for cols, rows in [(100, 32), (60, 18), (120, 40), (80, 24)]:
+            fcntl.ioctl(local.fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+            progressing(f'{cols}x{rows} resize', (cols, rows))
+        local.stop()
+        self.terminals.remove(local)
+        progressing('detached observer retains size')
+        local = PRESENTER.Mirror(self.command + ['attach', target], self.env)
+        self.terminals.append(local)
+        progressing('reattached 120x40')
+        self.run('split-pane', '--session', target, '--direction', 'vertical')
+        progressing('split pane layout')
+        self.run('new-tab', '--session', target)
+        progressing('new tab selection')
+        tabs = self.run('list-tabs', '--json').stdout
+        tab_values = json.loads(tabs)
+        if isinstance(tab_values, dict):
+            tab_values = tab_values.get('tabs', tab_values.get('contexts', []))
+        require(bool(tab_values), 'list-tabs returned no stable selection')
+        tab = tab_values[0]
+        tab_id = tab.get('context_id', tab.get('id'))
+        require(bool(tab_id), 'list-tabs missing stable identity')
+        self.run('switch-tab', str(tab_id), '--session', target)
+        progressing('return to first tab')
+        self.control('pause')
+        wait('resized observation pause clears', lambda: self.status()['state'] == 'paused' and self.cdp.evaluate("!Array.from(document.querySelectorAll('#live-broadcast canvas')).some(c=>!c.hidden)"))
+        fcntl.ioctl(local.fd, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 100, 0, 0))
+        time.sleep(.5)
+        require(self.http('presentation?epoch=' + self.status()['epoch'])[0] in (409, 503), 'resize bypassed paused audience gate')
+        self.control('resume')
+        progressing('resumed at changed geometry')
+        local.stop()
+        self.terminals.remove(local)
+        self.cases.append('non-sizing-observer-mismatch-resize-detach-reattach-pause-resume-sustained-frames')
 
     def inspect_terminal(self):
         try:

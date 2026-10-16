@@ -5,6 +5,21 @@ The controller persists across CLI invocations, while fresh plugin activation
 starts offline. Relay failure cannot interrupt local presentation or terminal
 operation. No terminal input or presenter navigation is exposed to viewers.
 
+## Terminal observation and sizing
+
+Terminal broadcasts follow the selected session's authoritative viewport. Starting
+an observer does not resize an already-sized terminal. `--cols`/`--rows` seed only
+an unset viewport; they do not lock the terminal to a competing broadcast size.
+Normal attached clients continue to control sizing. Resize events update observer
+geometry and trigger a complete retained-frame repair before incremental updates
+resume. With no interactive client attached, the last authoritative size remains.
+An explicitly selected terminal source stays selected when another client changes
+tabs; select another broadcast source explicitly to change what is public.
+
+After updating this native adapter, rebuild BMUX and its bundled plugins on the
+broadcasting machine and restart its daemon with the updated executable. Updating
+only the website does not update the native observer.
+
 ## Guided publishing and profiles
 
 ```sh

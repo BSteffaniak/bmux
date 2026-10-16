@@ -2015,6 +2015,7 @@ dependencies = [
  "bmux_attach_image_protocol",
  "bmux_attach_layout_protocol",
  "bmux_attach_token_state",
+ "bmux_client",
  "bmux_client_state",
  "bmux_clients_plugin_api",
  "bmux_config",

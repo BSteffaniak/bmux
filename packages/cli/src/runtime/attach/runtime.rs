@@ -107,6 +107,13 @@ pub trait AttachTerminal: Write {
         None
     }
     fn geometry(&self) -> TerminalGeometry;
+    /// Optional provider-owned sizing observation; never claims a viewport.
+    fn render_provider(&self) -> Option<Arc<dyn bmux_client::AttachProvider>> {
+        None
+    }
+    fn accept_geometry(&mut self, _geometry: TerminalGeometry) -> Result<()> {
+        anyhow::bail!("driver cannot follow provider geometry")
+    }
 
     fn enter_attach_mode(
         &mut self,
@@ -2699,6 +2706,9 @@ pub async fn run_session_attach_with_client_headless(
     observer: super::observer::AttachObserverPublisher,
 ) -> Result<AttachRunOutcome> {
     let provider = super::provider::resolve(target)?;
+    if driver.observe_only {
+        driver.render_provider = Some(provider.render_provider());
+    }
     let session = provider
         .open(
             None,
@@ -3704,6 +3714,9 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
     let mut view_state = AttachViewState::with_private_presentation(attach_info);
     view_state.presentation_only = terminal.presentation_only();
     view_state.viewport_guard = terminal.viewport_guard();
+    view_state.allow_retarget = terminal
+        .render_provider()
+        .is_none_or(|provider| provider.allows_retarget());
     if let Some(publisher) = observer {
         view_state.set_observer(publisher);
     }
@@ -3795,6 +3808,7 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
 
     let mut layout_revision_rx = view_state.presentation_layouts.subscribe();
     let mut surface_revision_rx = view_state.presentation_surfaces.subscribe();
+    refresh_observed_geometry(terminal, &mut client, view_state.attached_id).await?;
     view_state.driver_geometry = Some(terminal.geometry());
     update_attach_viewport_with_geometry(&mut client, &view_state, terminal.geometry()).await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
@@ -4394,6 +4408,22 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
         let mut scene_hydrated = false;
 
         if dirty_layout_frame {
+            if refresh_observed_geometry(terminal, &mut client, view_state.attached_id).await? {
+                view_state.driver_geometry = Some(terminal.geometry());
+                // Old retained rows and damage refer to a different coordinate
+                // system. Hydrate a complete repair before publishing anything.
+                view_state
+                    .dirty
+                    .mark_full_frame(AttachDirtySource::LayoutChanged);
+                hydrate_attach_state_from_snapshot_mode(
+                    &mut client,
+                    &mut view_state,
+                    SnapshotHydrationMode::FullResync,
+                )
+                .await?;
+                scene_hydrated = true;
+                frame_needs_render = true;
+            }
             let previous_layout = view_state.cached_layout_state.clone();
             let layout_state = match client.attach_layout(view_state.attached_id).await {
                 Ok(state) => state,
@@ -5777,6 +5807,9 @@ pub async fn retarget_attach_to_context(
     view_state: &mut AttachViewState,
     context_id: Uuid,
 ) -> std::result::Result<(), ClientError> {
+    if !view_state.allow_retarget {
+        return Ok(());
+    }
     let started_at = Instant::now();
     let from_context_id = view_state.attached_context_id;
     let from_session_id = view_state.attached_id;
@@ -10119,6 +10152,41 @@ fn queue_active_attach_input_mode_restore<W: Write>(
 
 fn queue_attach_input_mode_restore<W: Write>(writer: &mut W) -> io::Result<()> {
     queue!(writer, DisableMouseCapture, DisableBracketedPaste)
+}
+
+/// Refresh derived driver geometry through the selected provider, without
+/// publishing a viewport back to it. Layout invalidations drive this refresh.
+async fn refresh_observed_geometry<T: AttachTerminal + ?Sized>(
+    terminal: &mut T,
+    client: &mut StreamingBmuxClient,
+    target: Uuid,
+) -> Result<bool> {
+    let Some(provider) = terminal.render_provider() else {
+        return Ok(false);
+    };
+    let old = terminal.geometry();
+    let viewport = provider
+        .observe_viewport(
+            client,
+            &target.to_string(),
+            bmux_client::AttachProviderViewport {
+                command_sequence: 0,
+                columns: old.cols,
+                rows: old.rows,
+                pixel_width: None,
+                pixel_height: None,
+            },
+        )
+        .await?;
+    let next = TerminalGeometry {
+        cols: viewport.columns,
+        rows: viewport.rows,
+    };
+    if old.cols == next.cols && old.rows == next.rows {
+        return Ok(false);
+    }
+    terminal.accept_geometry(next)?;
+    Ok(true)
 }
 
 pub async fn update_attach_viewport(

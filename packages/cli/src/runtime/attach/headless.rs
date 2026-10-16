@@ -58,6 +58,8 @@ impl HeadlessViewportSender {
 pub struct HeadlessAttachDriver {
     viewport: watch::Receiver<ViewportUpdate>,
     accepted: TerminalGeometry,
+    pub(super) observe_only: bool,
+    pub(super) render_provider: Option<std::sync::Arc<dyn bmux_client::AttachProvider>>,
     guard: std::sync::Arc<std::sync::Mutex<Option<ViewportGuard>>>,
 }
 
@@ -78,6 +80,8 @@ pub fn headless_attach_channel(
         HeadlessAttachDriver {
             viewport,
             accepted: initial,
+            observe_only: false,
+            render_provider: None,
             guard: std::sync::Arc::default(),
         },
         HeadlessViewportSender(sender),
@@ -116,7 +120,18 @@ impl AttachTerminal for HeadlessAttachDriver {
     fn geometry(&self) -> TerminalGeometry {
         self.accepted
     }
+    fn render_provider(&self) -> Option<std::sync::Arc<dyn bmux_client::AttachProvider>> {
+        self.render_provider.clone()
+    }
+    fn accept_geometry(&mut self, geometry: TerminalGeometry) -> Result<()> {
+        validate(geometry)?;
+        self.accepted = geometry;
+        Ok(())
+    }
     fn viewport_guard(&self) -> Option<ViewportGuard> {
+        if self.observe_only {
+            return Some(std::sync::Arc::new(|| false));
+        }
         let current = self.guard.clone();
         Some(std::sync::Arc::new(move || {
             current
@@ -171,6 +186,36 @@ impl AttachTerminal for HeadlessAttachDriver {
 mod tests {
     use super::super::runtime::AttachTerminal;
     use super::*;
+
+    #[tokio::test]
+    async fn observed_geometry_is_derived_without_publishing_resize_input() {
+        let (mut driver, sender) =
+            headless_attach_channel(TerminalGeometry { cols: 80, rows: 24 }).unwrap();
+        driver.observe_only = true;
+        assert!(!driver.viewport_guard().unwrap()());
+        driver
+            .accept_geometry(TerminalGeometry {
+                cols: 120,
+                rows: 40,
+            })
+            .unwrap();
+        assert_eq!(driver.geometry().cols, 120);
+        assert!(!driver.viewport_guard().unwrap()());
+        assert!(
+            driver
+                .accept_geometry(TerminalGeometry { cols: 0, rows: 40 })
+                .is_err()
+        );
+        assert_eq!(driver.geometry().cols, 120);
+        // Observation never injects a resize event (or an input event).
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), driver.next_event())
+                .await
+                .is_err()
+        );
+        sender.close();
+        assert!(driver.next_event().await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn viewport_is_latest_only_guarded_and_orderly_closed() {

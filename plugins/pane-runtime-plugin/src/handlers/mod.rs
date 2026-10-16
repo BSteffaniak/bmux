@@ -262,6 +262,9 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "attach-runtime-commands", "attach-output" => |req: attach_commands::AttachOutputArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_commands::attach_output(&req, ctx))
         },
+        "attach-runtime-commands", "observe-viewport" => |req: attach_commands::ObserveViewportArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_commands::observe_viewport(&req, ctx))
+        },
         "attach-runtime-commands", "attach-set-viewport" => |req: attach_commands::AttachSetViewportArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_commands::attach_set_viewport(&req, ctx))
         },

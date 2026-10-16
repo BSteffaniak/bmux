@@ -163,7 +163,8 @@ where
         !session_id.is_nil(),
         "observer requires an explicit session UUID"
     );
-    let (driver, viewport) = super::super::headless::headless_attach_channel(geometry)?;
+    let (mut driver, viewport) = super::super::headless::headless_attach_channel(geometry)?;
+    driver.observe_only = true;
     let (publisher, epoch, mut receiver) = encoded_channel(session_id);
     tokio::time::timeout(IO_DEADLINE, async {
         writer.write_all(STREAM_MAGIC).await?;

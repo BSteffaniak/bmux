@@ -672,6 +672,36 @@ pub fn attach_output(
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObserveViewportArgs {
+    pub session_id: Uuid,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+pub fn observe_viewport(
+    req: &ObserveViewportArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachViewportSet, AttachCommandError> {
+    let client_id = caller_client_id(ctx)?;
+    let viewport =
+        crate::runtime::observe_viewport(SessionId(req.session_id), client_id, req.cols, req.rows)
+            .map_err(|error| failed(format!("viewport observation failed: {error:?}")))?;
+    Ok(AttachViewportSet {
+        session_id: req.session_id,
+        cols: viewport.cols,
+        rows: viewport.rows,
+        top_inset: viewport.top_inset,
+        right_inset: viewport.right_inset,
+        bottom_inset: viewport.bottom_inset,
+        left_inset: viewport.left_inset,
+        context_id: context_state()?
+            .0
+            .current_for_client(client_id)
+            .map(|context| context.id),
+    })
+}
+
 pub fn attach_set_viewport(
     req: &AttachSetViewportArgs,
     ctx: &NativeServiceContext,
