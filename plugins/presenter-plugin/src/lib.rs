@@ -4,6 +4,7 @@ mod broadcast;
 mod cli;
 mod commands;
 mod demo;
+mod gallery;
 mod mirror;
 mod owned_runtime;
 mod owner;

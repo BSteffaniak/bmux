@@ -109,6 +109,9 @@ impl Component for ExampleControl {
 pub fn linked_registry() -> LinkedRegistry {
     let mut registry = LinkedRegistry::default();
     registry
+        .register("tui-gallery", crate::gallery::GalleryFactory)
+        .expect("unique gallery registration");
+    registry
         .register("counter", CounterFactory)
         .expect("unique example registration");
     registry

@@ -1,6 +1,6 @@
 # BMUX tour
 
-A tour of BMUX’s terminal workflows, composable themes, screen-level tests, and reusable Rust UI libraries. The 51-slide route includes a fast 24-slide component gallery; do not spend equal time on every slide.
+A tour of BMUX’s terminal workflows, composable themes, screen-level tests, and reusable Rust UI libraries. The 53-slide route includes a fast 24-slide component gallery; do not spend equal time on every slide.
 
 ## Files
 
@@ -39,7 +39,17 @@ Checking the deck does not execute its demos. Start demos manually. The embedded
 
 The last demo needs an explicitly approved provider configuration and can incur charges. See [its setup guide](demos/jev-flappy.md). Do not expose credentials or configuration while presenting.
 
-The component gallery shows illustrative API calls, not embedded applications. The image-runtime commands are optional manual examples and depend on terminal protocol support.
+The component gallery combines short API calls, simplified architectural walkthroughs, and embedded native controls. Simplified listings identify their source and schematic helpers; they are not standalone compilable examples. Long slides use the existing overflow viewer rather than reducing code size. See the presenter guide for scrolling and audience-view behavior. The image-runtime commands are optional manual examples and depend on terminal protocol support.
+
+## Native examples
+
+All 24 component slides embed real controls through `tui-gallery`. Tab focuses
+an example; Escape returns to navigation. Keyboard-interactive examples include
+button, checkbox, breadcrumbs, radio, list, tabs, tree, table, and text input.
+Others are display-only fixtures. Code is explanatory, not evaluated Rust.
+The terminal viewer renders a fixed transcript and launches no process.
+Long walkthroughs follow the live example so it appears without scrolling.
+Use a rebuilt presenter plugin; older builds do not register `tui-gallery`.
 
 ## Rehearse
 

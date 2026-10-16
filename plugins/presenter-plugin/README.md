@@ -55,6 +55,28 @@ file path. Successful native presentation commits atomically replace a private
 publication errors are reported, not treated as successful capture. Speaker notes
 are suppressed on the terminal while this explicit test evidence mode is enabled.
 
+## Native TUI gallery
+
+Markdown references an application-linked factory:
+
+```markdown
+<!-- bmux:block-id example-breadcrumbs -->
+<!-- bmux:component tui-gallery {"kind":"breadcrumbs"} -->
+```
+
+The plugin registers `tui-gallery`, which returns real `bmux_tui_components`
+controls. Rust snippets are never evaluated and no external process is started.
+The existing `LinkedComponentFactory` extension point can return any application-
+linked `Component`; unregistered names are not implicitly activated.
+
+The tour includes 24 native examples. Tab focuses an example; Escape returns to
+navigation. Button, checkbox, breadcrumbs, radio, list, tabs, tree, table, and text
+input support keyboard input. Text input also accepts paste, capped at 4096 bytes.
+Other fixtures are display-only, including the dropdown shown open. Viewer helpers
+use real row-projection APIs; form validation is composed with native field controls.
+State survives rebuilding; layout/paint never change canonical owner state.
+Managed audiences use the existing read-only mirror, not another controller.
+
 ## Runnable examples
 
 For Markdown playback, start with `packages/presenter/examples/quickstart.md`.

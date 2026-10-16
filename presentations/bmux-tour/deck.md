@@ -269,24 +269,43 @@ Point: content region, dirty-only, byte/rate limits. No Pong-specific core API.
 # A collision check is a word lookup and a bit test
 
 <!-- bmux:block-id visual-adapter-lookup-body -->
+How does a fast-moving ball avoid tunneling through terminal text?
+
 ```lua
-    local word_index = y * visual.words_per_row + math.floor(x / 32)
-    local word = visual_bitset_word(visual, word_index)
-    local bit = x % 32
-    return math.floor(word / (2 ^ bit)) % 2 == 1
+local function occupied(mask, x, y)
+    if mask == nil or x < 0 or y < 0
+        or x >= mask.width or y >= mask.height then
+        return false
+    end
+    local index = y * mask.words_per_row + math.floor(x / 32)
+    local word = visual_bitset_word(mask, index)
+    return math.floor(word / (2 ^ (x % 32))) % 2 == 1
+end
+
+-- Schematic traversal: helpers abbreviate the real grid-crossing loop.
+-- Reconcile inside/outside state when the mask revision changes.
+local inside = reconcile_visual_revision(game)
+for crossing in crossed_cells(game, max_ms) do
+    local filled = occupied(game.visual, crossing.x, crossing.y)
+    if filled and not inside then
+        local hit_x, hit_y = resolve_content_hit_axes(
+            game, crossing.x, crossing.y,
+            crossing.prev_x, crossing.prev_y,
+            crossing.hit_x, crossing.hit_y)
+        return collision_at(crossing.time, hit_x, hit_y)
+    end
+    inside = filled
+end
 ```
 
-Each word covers **32 cells**. Choose the row and word, then test the cell’s bit.
-The surrounding function rejects missing masks and out-of-range coordinates.
+**Test the path, not just the destination.** Neighbor occupancy resolves corner hits;
+the collision candidate feeds the later bounce response. Traversal helpers above
+are schematic, not Lua APIs provided by BMUX.
 
-Collision handling follows the ball’s path across cells and uses the occupied
-neighbors to choose a bounce direction—not just a test of its final position.
-
-Source: `plugins/decoration-plugin/assets/decorations/pong.lua`
-· `visual_bitset_occupied`, `visual_collision_candidate`
+Simplified from `plugins/decoration-plugin/assets/decorations/pong.lua` · `visual_bitset_occupied`, `visual_collision_candidate`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
-Four lines for lookup. Full collision code also handles path crossings and normals.
+Lookup first; scroll to crossed cells and hit axes. Revision changes reconcile occupancy. This is simplified algorithm structure, not copy/paste Lua.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id playbooks-intro -->
@@ -418,23 +437,100 @@ Follow a split request forward, then output back. Keystrokes target the program.
 # The plugin makes three concrete decisions
 
 <!-- bmux:block-id command-route-diagram -->
+Who decides what a split means? Follow the policy, request, and result.
+
 ```rust
-    let session_id = resolve_session_id(caller, session)?;
-    let target = resolve_target_pane_id(caller, session_id, target)?;
-    let ratio = ratio_pct.unwrap_or(50).clamp(10, 90) as u8;
+// Tabs plugin: choose policy before crossing the service boundary.
+if policy != RuntimeDefault {
+    validate_directory_split_target(target)?;
+}
+let session_id = resolve_session_id(caller, session)?;
+let target = resolve_target_pane_id(caller, session_id, target)?;
+let ratio = ratio_pct.unwrap_or(50).clamp(10, 90) as u8;
+let mut client = dispatch_client(caller);
+
+let ack = if policy == RuntimeDefault {
+    block_on_typed_dispatch(pane_commands::client::split_pane(
+        &mut client, session_id, target, direction, ratio,
+    ))??  // Transport failure and service failure are distinct.
+} else {
+    let target = target.ok_or("explicit target required")?;
+    let options = resolve_split_options(caller, policy, session_id, target)?;
+    block_on_typed_dispatch(spawn_commands::client::split_shell(
+        &mut client, session_id, target, direction, ratio, options,
+    ))??
+};
+emit_pane_event(PaneEvent::Opened {
+    pane_id: ack.pane_id, session_id: ack.session_id,
+});
+Ok(ack)
 ```
 
-<!-- bmux:block-id command-route-provenance -->
-`plugins/tabs-plugin/src/lib.rs` · `split_pane_with_policy`
+**Resolve → choose policy → call a generated client → publish the result.**
+The tabs plugin owns the policy; it does not reach into another plugin’s private runtime.
 
-<!-- bmux:block-id command-route-takeaway -->
-**Which session? Which pane? How much space?**
-
-`unwrap_or(50)` chooses half when no ratio is given.
-`clamp(10, 90)` bounds the percentage. The tabs plugin then delegates through a typed service.
+Simplified from `plugins/tabs-plugin/src/lib.rs` · `split_pane_with_policy`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
-Session, target pane, ratio, typed request. No product policy in generic host.
+Pause at target validation, then the two generated calls, then the event. Scroll as needed. Double ? abbreviates separate transport/service error mapping.
+<!-- bmux:end-notes -->
+---
+<!-- bmux:slide-id plugin-contract -->
+<!-- bmux:block-id plugin-contract-title -->
+# A typed contract connects plugins—not private Rust state
+
+<!-- bmux:block-id plugin-contract-body -->
+**Declare → generate → implement → invoke → return a typed result.**
+
+The pane-runtime API declares the split operation in BPDL:
+
+```text
+command split-pane(
+    session_id: uuid,
+    target: uuid?,
+    direction: string,
+    ratio_percent: u8,
+) -> result<pane-ack, pane-command-error>;
+```
+
+The tabs plugin consumes its generated client (shortened namespaces):
+
+```rust
+let reply = block_on_typed_dispatch(
+    pane_commands::client::split_pane(
+        &mut client, session_id, target, direction, ratio,
+    ),
+)?;                 // Invocation/transport error.
+let ack = reply?;   // Typed service rejection.
+```
+
+On the provider side, service dispatch reaches the pane-runtime handler:
+
+```rust
+let direction = parse_split_direction(&req.direction)?;
+let session_id = SessionId(req.session_id);
+ensure_session_mutation_allowed(ctx, session_id, "pane.split")?;
+let pane_id = handle.split_pane(
+    session_id, target_selector(req.target), direction,
+)?;
+emit_attach_view_changed_scene(session_id);
+Ok(PaneAck { session_id: req.session_id, pane_id })
+```
+
+The provider owns execution state and authorization. The caller imports neither
+its runtime manager nor its storage layout.
+
+Simplified from `plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl`,
+`plugins/pane-runtime-plugin/src/handlers/pane_commands.rs` · `split_pane`,
+and `plugins/tabs-plugin/src/lib.rs` · `split_pane_with_policy`.
+The declaration is an excerpt; client error conversions are omitted.
+
+**Bundling/loading is a deployment choice; typed contracts are the composition boundary.**
+This is not a claim that arbitrary plugin versions are interchangeable.
+
+<!-- bmux:notes -->
+Contract first, generated client second, provider-owned implementation third.
+No handwritten transport envelope or private runtime import. Scroll to the result layers.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id rendering -->
@@ -508,25 +604,43 @@ Three libraries, not a monolithic app framework. Product-neutral, directional de
 # Compose controls with measured layout and scoped paint
 
 <!-- bmux:block-id tui-compose-body -->
+A control is more than a constructor: it participates in a shared geometry contract.
+
 ```rust
-let save_state = Cell::new(ButtonState::new());
-let save = ButtonComponent::new("profile.save", "Save", &save_state);
-let save_layout = save.layout(Constraints::tight(save_area.size()), &mut LayoutCx::new());
-cx.with_child(
-    i32::from(save_area.x),
-    i64::from(save_area.y),
-    LocalRect::new(0, 0, save_area.width, save_area.height),
-    |cx| save.paint(&save_layout, cx),
-);
+// Schematic component lifecycle; state belongs to the application.
+struct SavePanel { save: ButtonState, saved: bool }
+
+fn layout(&self, constraints, cx) -> LayoutNode {
+    ButtonComponent::new("save", "Save", &self.save)
+        .layout(constraints, cx)
+}
+
+fn paint(&self, committed_layout, cx) {
+    ButtonComponent::new("save", "Save", &self.save)
+        .paint(committed_layout, cx);
+}
+
+fn event(&mut self, event, committed_layout, cx) -> EventOutcome {
+    // visible_rect abbreviates conversion through the scoped event context.
+    let area = visible_rect(committed_layout, cx);
+    let outcome = Button::new("Save").handle_event(area, &mut self.save, event);
+    if outcome == ButtonOutcome::Pressed {
+        self.saved = true; // Application decision, not framework policy.
+    }
+    if outcome.needs_redraw() { EventOutcome::Redraw }
+    else if outcome.is_handled() { EventOutcome::Handled }
+    else { EventOutcome::Ignored }
+}
 ```
 
-`save_area` and `cx` are supplied by the containing component.
-Each control registers its own focus and hit regions during paint.
+**One geometry for measurement, painting, and interaction.** A parent scopes both
+paint and event contexts to the same child placement. This sketch abbreviates
+trait signatures and geometry conversion, not application ownership.
 
-Source excerpt: `docs/tui-runtime.md` · minimal webpage-like surface
+Simplified from `docs/tui-runtime.md` and `packages/tui-components/src/button.rs`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
-Stable ID → measure within constraints → paint that exact layout. State stays with the caller.
+State → layout → paint → event. Emphasize same committed geometry and caller-owned state; no independent hit rectangles.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id tui-features -->
@@ -545,8 +659,9 @@ bmux_tui_components = { version = "0.0.1-alpha.1", default-features = false, fea
 No default component set. Composed controls enable their own prerequisites.
 Bundles include `forms`, `navigation`, `data-display`, `overlays`, and `text-editing`.
 
-Next: a quick tour of the component APIs. Calls are illustrative, not complete apps;
-each names the real source API and leaves inputs and state with the application.
+Next: code paired with the real native components. The examples below are linked
+into the presenter; the code snippets are explanations, not evaluated source.
+Tab focuses a component; Escape returns to slide navigation.
 
 Source: `packages/tui-components/README.md`
 
@@ -565,8 +680,10 @@ An action with caller-owned pressed/focus state. Use for Save, Cancel, or a comm
 ButtonComponent::new("save", "Save", &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/button.rs`
+Save button with activation count. Enter/Space activates.
+
+<!-- bmux:block-id gallery-button -->
+<!-- bmux:component tui-gallery {"kind":"button"} -->
 
 <!-- bmux:notes -->
 Buttons: An action with caller-owned pressed/focus state. Next.
@@ -583,8 +700,10 @@ An independent on/off setting; keep the setting in application state.
 CheckboxComponent::new("enabled", "Enable", &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/checkbox.rs`
+Enable starts unchecked. Space toggles it.
+
+<!-- bmux:block-id gallery-checkbox -->
+<!-- bmux:component tui-gallery {"kind":"checkbox"} -->
 
 <!-- bmux:notes -->
 Checkboxes: An independent on/off setting; keep the setting in application state. Next.
@@ -601,8 +720,10 @@ Choose one option from a small visible set, such as a delivery mode.
 RadioGroupComponent::new("choice", &options, &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/radio_group.rs`
+Live / Frozen / Automatic. Arrow keys move; Space selects.
+
+<!-- bmux:block-id gallery-radio-group -->
+<!-- bmux:component tui-gallery {"kind":"radio-group"} -->
 
 <!-- bmux:notes -->
 Radio groups: Choose one option from a small visible set, such as a delivery mode. Next.
@@ -613,19 +734,51 @@ Radio groups: Choose one option from a small visible set, such as a delivery mod
 # Text input boxes
 
 <!-- bmux:block-id tui-text-input-box-body -->
-Compose editing state, input policy, and box styling for a search field or composer.
+Follow text from initialization through an edit to the next painted frame.
 
 ```rust
-TextInputBoxComponent::new(
-    "search", TextInputPolicy::chat_composer(), &state,
-);
+TextInputBoxComponent::new("name", policy, &text)
+    .policy(TextInputBoxPolicy::field().focused(true));
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/text_input_box.rs`
+<!-- bmux:block-id gallery-text-input-box -->
+<!-- bmux:component tui-gallery {"kind":"text-input-box"} -->
+
+Implementation walkthrough:
+
+```rust
+// Application setup: buffer, editing policy, and viewport.
+let text = RefCell::new(TextInputState::new(TextEditBuffer::from_text("Ada")));
+let policy = TextInputPolicy::chat_composer();
+text.borrow_mut().set_content_area(content_area, &policy);
+
+// Application event handler; release the mutable borrow before painting.
+{
+    let mut state = text.borrow_mut();
+    state.set_content_area(content_area, &policy);
+    match TextInputControl::new(&policy).handle_event(&mut state, event) {
+        TextInputOutcome::Edited => {
+            message = format!("Text: {}", state.buffer().text());
+            request_redraw(); // Schematic application action.
+        }
+        TextInputOutcome::Redraw => request_redraw(),
+        _ => {}
+    }
+}
+
+// Paint from that same caller-owned state, not a second text buffer.
+let input = TextInputBoxComponent::new("name", policy, &text);
+let layout = input.layout(constraints, layout_cx);
+input.paint(&layout, paint_cx);
+```
+
+**The application owns the buffer; the control interprets edits.** The containing
+application routes focus and supplies geometry. `request_redraw` is schematic.
+
+Simplified from `examples/tui-components-inputs/src/lib.rs` · `new`, `handle_text_event`; `packages/tui-components/src/text_input_box.rs`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
-Text input boxes: Compose editing state, input policy, and box styling for a search field or composer. Next.
+Pause on caller-owned buffer, then Edited versus Redraw, then painting the same state.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id tui-select-dropdown -->
@@ -639,8 +792,10 @@ Choose from a larger option set without keeping every option on screen.
 SelectDropdownComponent::new("status", &options, &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/select_dropdown.rs`
+Ready / Running / Done, shown open. Display-only preview.
+
+<!-- bmux:block-id gallery-select-dropdown -->
+<!-- bmux:component tui-gallery {"kind":"select-dropdown"} -->
 
 <!-- bmux:notes -->
 Select dropdowns: Choose from a larger option set without keeping every option on screen. Next.
@@ -657,8 +812,10 @@ Compose modal content and actions; reusable interaction state is separate from a
 DialogComponent::new("confirm", dialog, &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/dialog.rs`
+“Save changes before leaving?” with Save and Cancel. Display-only preview.
+
+<!-- bmux:block-id gallery-dialog -->
+<!-- bmux:component tui-gallery {"kind":"dialog"} -->
 
 <!-- bmux:notes -->
 Dialogs: Compose modal content and actions; reusable interaction state is separate from application decisions. Next.
@@ -675,8 +832,10 @@ Keyboard and pointer selection for a picker. The application supplies items and 
 SelectableListComponent::new("results", &items, &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/selectable_list.rs`
+Build / Test / Ship. Arrow keys move; Enter selects.
+
+<!-- bmux:block-id gallery-selectable-list -->
+<!-- bmux:component tui-gallery {"kind":"selectable-list"} -->
 
 <!-- bmux:notes -->
 Selectable lists: Keyboard and pointer selection for a picker. Next.
@@ -693,8 +852,10 @@ Browse hierarchical content with expansion and selection state.
 TreeViewComponent::new("files", &items, &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/tree_view.rs`
+src → main.rs / lib.rs. Arrow keys navigate and expand.
+
+<!-- bmux:block-id gallery-tree-view -->
+<!-- bmux:component tui-gallery {"kind":"tree-view"} -->
 
 <!-- bmux:notes -->
 Tree views: Browse hierarchical content with expansion and selection state. Next.
@@ -708,11 +869,15 @@ Tree views: Browse hierarchical content with expansion and selection state. Next
 Present row-and-column data; keep row identity separate from its current screen position.
 
 ```rust
+let columns = [TableColumn::new("Job").fixed(16),
+    TableColumn::new("Status").fixed(16)];
 TableComponent::new("jobs", &columns, &rows, &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/table.rs`
+build: passed · test: running · release: waiting. Arrow keys navigate.
+
+<!-- bmux:block-id gallery-table -->
+<!-- bmux:component tui-gallery {"kind":"table"} -->
 
 <!-- bmux:notes -->
 Tables: Present row-and-column data; keep row identity separate from its current screen position. Next.
@@ -723,23 +888,49 @@ Tables: Present row-and-column data; keep row identity separate from its current
 # Scroll views
 
 <!-- bmux:block-id tui-scroll-view-body -->
-Wrap content in a bounded viewport. Content size and viewport size are distinct.
+Measure → clip → route child input → scroll unhandled input → repaint.
 
 ```rust
-ScrollViewComponent::new(
-    "details",
-    LogicalSize::new(4, 1),
-    ScrollViewState::new(),
-    TextBlock::new("abcdef"),
-)
-.content_width(6);
+ScrollViewComponent::new("details", viewport, state, content);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/scroll_view.rs`
+<!-- bmux:block-id gallery-scroll-view -->
+<!-- bmux:component tui-gallery {"kind":"scroll-view"} -->
+
+Implementation walkthrough:
+
+```rust
+// Schematic lifecycle adapted from the presentation viewer itself.
+let viewport_size = available_size(constraints);
+let viewport = ScrollViewComponent::new(
+    "slide/content", viewport_size, state.scroll.get(), content,
+).retain_state(&state.scroll);
+let layout = viewport.layout(viewport_constraints, layout_cx);
+viewport.paint(&layout, paint_cx);
+
+// Event routing uses the layout that was actually painted.
+let outcome = viewport.event(event, &layout, event_cx);
+if outcome.is_handled() {
+    return outcome; // Child controls get first refusal.
+}
+let mut scroll = state.scroll.get();
+scroll.interaction.focused = true;
+let outcome = ScrollView::new().handle_event(
+    visible_area, &layout, &mut scroll, event,
+);
+state.scroll.set(scroll);
+// Reconcile/clamp against measured content and paint scroll chrome.
+// Translate the scroll outcome into Ignored or Redraw.
+```
+
+**Overflow uses a viewport, not smaller text.** Retained offsets, clipped paint,
+and event transforms agree; scrolling does not invent offscreen interaction targets.
+Sizing helpers above are schematic.
+
+Simplified from `packages/presenter/src/viewer.rs` · `ViewerViewport`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
-Scroll views: Wrap content in a bounded viewport. Next.
+This is the mechanism viewing this slide. Scroll to child-first events, then retained offset and clipping.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id tui-bar-chart -->
@@ -753,8 +944,10 @@ Compare quantities in a compact terminal view.
 BarChartComponent::new("usage", &items);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/bar_chart.rs`
+build: 8 · test: 5 · lint: 3.
+
+<!-- bmux:block-id gallery-bar-chart -->
+<!-- bmux:component tui-gallery {"kind":"bar-chart"} -->
 
 <!-- bmux:notes -->
 Bar charts: Compare quantities in a compact terminal view. Next.
@@ -771,8 +964,10 @@ Show a trend inline alongside a label or numeric value.
 SparklineComponent::new("latency", &samples);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/sparkline.rs`
+Samples: 2, 4, 3, 7, 5, 9, 6, 8, 4, 6, 8, 10.
+
+<!-- bmux:block-id gallery-sparkline -->
+<!-- bmux:component tui-gallery {"kind":"sparkline"} -->
 
 <!-- bmux:notes -->
 Sparklines: Show a trend inline alongside a label or numeric value. Next.
@@ -787,12 +982,14 @@ Show determinate progress or an indeterminate pulse without inventing a percenta
 
 ```rust
 ProgressBarComponent::new(
-    "loading", ProgressBarValue::indeterminate(offset),
+    "loading", ProgressBarValue::determinate(7, 10),
 );
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/progress_bar.rs`
+Completed: 7 of 10.
+
+<!-- bmux:block-id gallery-progress-bar -->
+<!-- bmux:component tui-gallery {"kind":"progress-bar"} -->
 
 <!-- bmux:notes -->
 Progress bars: Show determinate progress or an indeterminate pulse without inventing a percentage. Next.
@@ -809,8 +1006,10 @@ A compact status label that can be composed into lists, headers, or details.
 BadgeComponent::new("status", "Running");
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/badge.rs`
+Label: Running.
+
+<!-- bmux:block-id gallery-badge -->
+<!-- bmux:component tui-gallery {"kind":"badge"} -->
 
 <!-- bmux:notes -->
 Badges: A compact status label that can be composed into lists, headers, or details. Next.
@@ -827,8 +1026,10 @@ Reusable navigation for any application—not BMUX tab policy.
 TabBarComponent::new("sections", &items, &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/tab_bar.rs`
+Overview / Activity / Settings. Arrow keys change tabs.
+
+<!-- bmux:block-id gallery-tab-bar -->
+<!-- bmux:component tui-gallery {"kind":"tab-bar"} -->
 
 <!-- bmux:notes -->
 Tab bars: Reusable navigation for any application—not BMUX tab policy. Next.
@@ -842,11 +1043,16 @@ Tab bars: Reusable navigation for any application—not BMUX tab policy. Next.
 Show the current path through hierarchical application content.
 
 ```rust
+let items = [BreadcrumbItem::new("home", "Home"),
+    BreadcrumbItem::new("projects", "Projects"),
+    BreadcrumbItem::new("bmux", "BMUX")];
 BreadcrumbsComponent::new("path", &items, &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/breadcrumbs.rs`
+Home / Projects / BMUX. Arrow keys move; Enter activates.
+
+<!-- bmux:block-id gallery-breadcrumbs -->
+<!-- bmux:component tui-gallery {"kind":"breadcrumbs"} -->
 
 <!-- bmux:notes -->
 Breadcrumbs: Show the current path through hierarchical application content. Next.
@@ -863,8 +1069,10 @@ Display transient notifications separately from the main work area.
 ToastStackComponent::new("notifications", &toasts, &state);
 ```
 
-Illustrative call; inputs and state are supplied by the application.
-Source: `packages/tui-components/src/toast_stack.rs`
+Saved — Your changes are ready. Display-only preview.
+
+<!-- bmux:block-id gallery-toast-stack -->
+<!-- bmux:component tui-gallery {"kind":"toast-stack"} -->
 
 <!-- bmux:notes -->
 Toast stacks: Display transient notifications separately from the main work area. Next.
@@ -875,18 +1083,47 @@ Toast stacks: Display transient notifications separately from the main work area
 # Virtual lists: measure and paint the visible range
 
 <!-- bmux:block-id tui-virtual-list-body -->
-For long collections, retain measured geometry and paint the visible viewport. Synchronize after item, width, layout-revision, or environment changes—not merely a scroll-offset change.
+Large collection → retained measurements → visible range → clipped rows.
 
 ```rust
-VirtualList::new("cards");
-VirtualListItem::new(item_id, layout_revision, component);
+VirtualList::new("jobs").component(job_id, row);
 ```
 
-Illustrative calls; inputs and state are supplied by the application.
-Source API: `packages/tui-components/src/virtual_list.rs`
+<!-- bmux:block-id gallery-virtual-list -->
+<!-- bmux:component tui-gallery {"kind":"virtual-list"} -->
+
+Implementation walkthrough:
+
+```rust
+// Schematic application lifecycle: synchronize when geometry changes.
+let mut list = VirtualList::new("jobs");
+for item in &items {
+    list = list.item(item.key, item.layout_revision, &item.component);
+}
+list.sync_with_environment(width, environment, &mut state, layout_cx);
+// Stable item keys + layout revisions identify retained measurements.
+
+// Simplified paint algorithm (helper names abbreviate the implementation).
+let offset = state.scroll.vertical_offset();
+let clip = intersect(viewport, paint_cx.area());
+if clip.is_empty() { return; }
+let range = state.index.visible_range(offset + clip.top, clip.height);
+for index in range.start..range.end {
+    let item = &items[index];
+    let layout = retained_layout(item.key, item.layout_revision, width);
+    let y = state.index.item_offset(index) - offset;
+    paint_clipped_child(item, layout, y, clip, paint_cx);
+}
+```
+
+**Retain geometry; paint only intersecting rows.** Synchronization may measure the
+collection: this is bounded visible painting, not a claim of free measurement.
+The indexing and clipped-paint helpers above are schematic.
+
+Simplified from `packages/tui-components/src/virtual_list.rs` · `sync_with_environment`, `paint`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
-Virtual lists. Keep moving; source linked for depth.
+Pause at synchronization cost, then visible range, then keyed retained layout. Gallery remains below the code.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id tui-source-viewer -->
@@ -902,8 +1139,10 @@ and truncation limit. Selection registration is a separate API.
 source_viewer_rows(input, width);
 ```
 
-Illustrative calls; inputs and state are supplied by the application.
-Source API: `packages/tui-components/src/source_viewer.rs`
+hello.rs: a three-line Hello, BMUX program, with line numbers.
+
+<!-- bmux:block-id gallery-source-viewer -->
+<!-- bmux:component tui-gallery {"kind":"source-viewer"} -->
 
 <!-- bmux:notes -->
 Source viewers. Keep moving; source linked for depth.
@@ -917,11 +1156,13 @@ Source viewers. Keep moving; source linked for depth.
 Present changed source inside the same component and scrolling model as the rest of an application.
 
 ```rust
-diff_from_text("config.toml", old_text, new_text);
+diff_viewer_rows(input, width);
 ```
 
-Illustrative calls; inputs and state are supplied by the application.
-Source API: `packages/tui-components/src/diff_viewer.rs`
+config.toml: theme changes from dark to pong.
+
+<!-- bmux:block-id gallery-diff-viewer -->
+<!-- bmux:component tui-gallery {"kind":"diff-viewer"} -->
 
 <!-- bmux:notes -->
 Diff viewers. Keep moving; source linked for depth.
@@ -940,8 +1181,10 @@ The application owns acquisition; selection registration is a separate API.
 terminal_viewer_rows(input, width);
 ```
 
-Illustrative calls; inputs and state are supplied by the application.
-Source API: `packages/tui-components/src/terminal_viewer.rs`
+Recorded sample: cargo check, green Finished, exit code 0. No process is launched.
+
+<!-- bmux:block-id gallery-terminal-viewer -->
+<!-- bmux:component tui-gallery {"kind":"terminal-viewer"} -->
 
 <!-- bmux:notes -->
 Terminal viewers. Keep moving; source linked for depth.
@@ -960,8 +1203,10 @@ Canvas::new(
 );
 ```
 
-Illustrative calls; inputs and state are supplied by the application.
-Source API: `packages/tui-components/src/canvas.rs`
+Five points in normalized coordinates; six-row drawing area.
+
+<!-- bmux:block-id gallery-canvas -->
+<!-- bmux:component tui-gallery {"kind":"canvas"} -->
 
 <!-- bmux:notes -->
 Canvas. Keep moving; source linked for depth.
@@ -976,12 +1221,14 @@ Compose plotted datasets with ordinary UI controls; the application owns samplin
 
 ```rust
 Chart::new(
-    &datasets, ChartBounds::new(0.0, 1.0, 0.0, 1.0),
+    &datasets, ChartBounds::new(0.0, 3.0, 0.0, 6.0),
 );
 ```
 
-Illustrative calls; inputs and state are supplied by the application.
-Source API: `packages/tui-components/src/chart.rs`
+Line dataset: (0,1), (1,3), (2,2), (3,5); six-row chart.
+
+<!-- bmux:block-id gallery-chart -->
+<!-- bmux:component tui-gallery {"kind":"chart"} -->
 
 <!-- bmux:notes -->
 Charts. Keep moving; source linked for depth.
@@ -992,19 +1239,48 @@ Charts. Keep moving; source linked for depth.
 # Forms: coordinate validation and field navigation
 
 <!-- bmux:block-id tui-form-body -->
-Group field state and validation; the application decides what submission means.
-`validate_ids` returns invalid field IDs; `handle_event` returns a `FormOutcome`.
+A form coordinates fields; it does not become the application’s data owner.
 
 ```rust
-form.validate_ids();
-form.handle_event(&mut state, &event);
+let invalid = form.validate_ids();
+// Compose field controls with the returned validation errors.
 ```
 
-Illustrative calls; inputs and state are supplied by the application.
-Source API: `packages/tui-components/src/form.rs`
+<!-- bmux:block-id gallery-form -->
+<!-- bmux:component tui-gallery {"kind":"form"} -->
+
+Implementation walkthrough:
+
+```rust
+let fields = [
+    FormFieldItem::new("name").required(true),
+    FormFieldItem::new("email").required(true),
+];
+let values = [Some(name_text), Some(email_text)];
+let form = Form::new(&fields, &values);
+
+// Application checks values before committing its own action.
+let invalid = form.validate_ids();
+if invalid.is_empty() {
+    save_profile(); // Schematic application action, not a Form API.
+} else {
+    show_invalid_fields(invalid);
+}
+
+// Focus traversal belongs to caller-owned FormState.
+let outcome = form.handle_event(&mut form_state, event);
+// Application routes field edits to the focused control and handles outcome.
+// Text buffers remain owned by those fields, not copied into the form.
+```
+
+**Compose validation and navigation without taking ownership of field data.**
+Required-field checks are not full application-specific email validation.
+Save/display helpers above are schematic.
+
+Simplified from `packages/tui-components/src/form.rs` · `validate_ids`, `handle_event`; `examples/tui-components-inputs/src/lib.rs`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
-Forms. Keep moving; source linked for depth.
+Fields → required values → application save decision → focus. Build on the text-input state example.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id tui-runtime-update -->
@@ -1012,23 +1288,40 @@ Forms. Keep moving; source linked for depth.
 # The runtime schedules; your program decides
 
 <!-- bmux:block-id tui-runtime-update-body -->
+Show an application decision, not just the update method’s signature.
+
 ```rust
-fn update(
-    &mut self,
-    event: RuntimeEvent<Self::Message>,
-) -> Result<Update<Self::Message>, Self::Error>;
+// Schematic Program::update implementation using real runtime concepts.
+match event {
+    RuntimeEvent::Terminal(Event::Key(key)) if is_refresh(key) => {
+        self.loading = true;
+        // Schedule application work; return its result as Message::Loaded.
+        let command = load_command(); // Schematic Command<Message> factory.
+        Ok(Update { commands: vec![command], ..Update::redraw() })
+    }
+    RuntimeEvent::Message(Message::Loaded(result)) => {
+        self.loading = false;
+        self.rows = result?;
+        Ok(Update::redraw())
+    }
+    RuntimeEvent::Timer(id) => {
+        self.expire_notification(id);
+        Ok(Update::redraw())
+    }
+    _ => Ok(Update::none()),
+}
+// Runtime schedules commands and serializes returned messages into update.
+// Presentation commits are acknowledged separately, after successful output.
 ```
 
-A `Program` receives runtime events and returns an `Update`.
-The application chooses state changes and effects; the runtime handles bounded
-admission, fair scheduling, timers, and redraw coalescing.
+**Events in → application decisions → commands out → messages back.**
+The runtime controls scheduling and presentation; the program owns product state.
+Refresh detection, message types, and loading helpers are illustrative application code.
 
-Use it for a dashboard, picker, editor, or long-running terminal tool.
-
-API excerpt: `packages/tui-runtime/src/program.rs` · `Program`
+Simplified from `packages/tui-runtime/src/program.rs` · `RuntimeEvent`, `Update`, `Program`; `command_scheduler.rs`. Names and plumbing are shortened; not a standalone program.
 
 <!-- bmux:notes -->
-Events in, application decisions out. Runtime does not know what Save or Split means.
+Event → command → message → redraw. Timers also enter the serialized update path. Presentation success is a separate acknowledgement.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id tui-runtime-images -->
@@ -1051,6 +1344,33 @@ Source: `packages/tui-runtime/README.md`
 
 <!-- bmux:notes -->
 Optional runnable examples—not embedded demos. Protocol support depends on host terminal.
+<!-- bmux:end-notes -->
+---
+<!-- bmux:slide-id whats-next -->
+<!-- bmux:block-id whats-next-title -->
+# What’s next for BMUX
+
+<!-- bmux:block-id whats-next-body -->
+*Strengthen the foundations. Expand how you use them.*
+
+- **A stronger plugin ecosystem** — statically bundled or dynamically loaded;
+  better tooling to build, share, and manage first-class extensions.
+- **Polished BMUX-native remote access** — smoother setup, discovery, and
+  reconnection to running work, building on the existing SSH-like experience.
+- **Agent-ready SDK and CLI** — robust interfaces to discover capabilities,
+  inspect state, control work, and understand results.
+- **Reliable rendering and browser access** — better terminal compatibility
+  and shared-view resilience; explore full browser interaction.
+- **Workspaces across devices and machines** — explore federation and mobile
+  access while preserving the identity of your running work.
+
+Directions, not delivery promises.
+
+<!-- bmux:notes -->
+45–60 seconds. Existing foundations; robustness and usability are the next step.
+Emphasize plugins, native remote access, and agent interfaces. Browser interaction,
+federation, and mobile are exploratory directions, not delivery commitments.
+And speaking of giving agents better tools—let’s see how Jev handles this one.
 <!-- bmux:end-notes -->
 ---
 <!-- bmux:slide-id jev-finale -->

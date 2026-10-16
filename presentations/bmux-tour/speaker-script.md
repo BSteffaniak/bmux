@@ -52,7 +52,7 @@ Point: content region, dirty-only, byte/rate limits. No Pong-specific core API.
 
 ## A collision check is a word lookup and a bit test
 
-Four lines for lookup. Full collision code also handles path crossings and normals.
+Lookup first; scroll to crossed cells and hit axes. Revision changes reconcile occupancy. This is simplified algorithm structure, not copy/paste Lua.
 
 ## What if the demo could check itself?
 
@@ -76,7 +76,12 @@ Follow a split request forward, then output back. Keystrokes target the program.
 
 ## The plugin makes three concrete decisions
 
-Session, target pane, ratio, typed request. No product policy in generic host.
+Pause at target validation, then the two generated calls, then the event. Scroll as needed. Double ? abbreviates separate transport/service error mapping.
+
+## A typed contract connects plugins—not private Rust state
+
+Contract first, generated client second, provider-owned implementation third.
+No handwritten transport envelope or private runtime import. Scroll to the result layers.
 
 ## Output has to stay understandable as it moves
 
@@ -92,7 +97,7 @@ Three libraries, not a monolithic app framework. Product-neutral, directional de
 
 ## Compose controls with measured layout and scoped paint
 
-Stable ID → measure within constraints → paint that exact layout. State stays with the caller.
+State → layout → paint → event. Emphasize same committed geometry and caller-owned state; no independent hit rectangles.
 
 ## Bring the controls you need
 
@@ -112,7 +117,7 @@ Radio groups: Choose one option from a small visible set, such as a delivery mod
 
 ## Text input boxes
 
-Text input boxes: Compose editing state, input policy, and box styling for a search field or composer. Next.
+Pause on caller-owned buffer, then Edited versus Redraw, then painting the same state.
 
 ## Select dropdowns
 
@@ -136,7 +141,7 @@ Tables: Present row-and-column data; keep row identity separate from its current
 
 ## Scroll views
 
-Scroll views: Wrap content in a bounded viewport. Next.
+This is the mechanism viewing this slide. Scroll to child-first events, then retained offset and clipping.
 
 ## Bar charts
 
@@ -168,7 +173,7 @@ Toast stacks: Display transient notifications separately from the main work area
 
 ## Virtual lists: measure and paint the visible range
 
-Virtual lists. Keep moving; source linked for depth.
+Pause at synchronization cost, then visible range, then keyed retained layout. Gallery remains below the code.
 
 ## Source viewers: more than a wall of text
 
@@ -192,15 +197,22 @@ Charts. Keep moving; source linked for depth.
 
 ## Forms: coordinate validation and field navigation
 
-Forms. Keep moving; source linked for depth.
+Fields → required values → application save decision → focus. Build on the text-input state example.
 
 ## The runtime schedules; your program decides
 
-Events in, application decisions out. Runtime does not know what Save or Split means.
+Event → command → message → redraw. Timers also enter the serialized update path. Presentation success is a separate acknowledgement.
 
 ## The same runtime can present images
 
 Optional runnable examples—not embedded demos. Protocol support depends on host terminal.
+
+## What’s next for BMUX
+
+45–60 seconds. Existing foundations; robustness and usability are the next step.
+Emphasize plugins, native remote access, and agent interfaces. Browser interaction,
+federation, and mobile are exploratory directions, not delivery commitments.
+And speaking of giving agents better tools—let’s see how Jev handles this one.
 
 ## One more thing: can Jev fly?
 
