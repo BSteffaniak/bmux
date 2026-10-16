@@ -485,6 +485,26 @@ jobs:
           run-matrix-debug-shells: "fish,bash"
           run-matrix-auto-upload: true
 
+      # Feature randomization is useful for ordinary tests, but must not decide
+      # whether native clipboard interoperability is exercised. These opt-in tests
+      # mutate only a disposable GitHub-hosted runner's clipboard, never a local
+      # developer desktop. Explicit selectors avoid Linux display-only fixtures.
+      - name: Check native clipboard backend
+        if: matrix.package.name == 'bmux_clipboard' && (matrix.package.os == 'windows-latest' || matrix.package.os == 'macos-latest')
+        run: cargo clippy -p bmux_clipboard --all-targets --features native-clipboard -- -D warnings
+
+      - name: Test native clipboard without command fallbacks
+        if: matrix.package.name == 'bmux_clipboard' && (matrix.package.os == 'windows-latest' || matrix.package.os == 'macos-latest')
+        env:
+          BMUX_CLIPBOARD_ISOLATED_TEST: "1"
+        run: cargo test -p bmux_clipboard --features native-clipboard --lib native::tests::isolated_native_roundtrip_without_command_fallback -- --ignored --exact --test-threads=1 --nocapture
+
+      - name: Test native clipboard public roundtrips
+        if: matrix.package.name == 'bmux_clipboard' && (matrix.package.os == 'windows-latest' || matrix.package.os == 'macos-latest')
+        env:
+          BMUX_CLIPBOARD_ISOLATED_TEST: "1"
+        run: cargo test -p bmux_clipboard --features native-clipboard --test native_interop native_text_and_image_roundtrip -- --ignored --exact --test-threads=1 --nocapture
+
       - name: Verify bmux_tui_components feature isolation
         if: matrix.package.os == 'ubuntu-latest' && matrix.package.name == 'bmux_tui_components'
         shell: bash

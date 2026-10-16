@@ -176,7 +176,7 @@ fn unique_wayland_display(runtime_dir: &Path) -> Option<OsString> {
 }
 
 #[cfg(not(unix))]
-fn unique_wayland_display(_runtime_dir: &Path) -> Option<OsString> {
+const fn unique_wayland_display(_runtime_dir: &Path) -> Option<OsString> {
     None
 }
 
