@@ -23,4 +23,4 @@ two-face = { workspace = true, features = ["syntect-fancy"] }
 
 [features]
 default          = []
-fail-on-warnings = []
+fail-on-warnings = ["bmux_tui/fail-on-warnings"]

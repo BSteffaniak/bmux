@@ -273,6 +273,35 @@ fail-on-warnings = [
     "bmux_broadcast_plugin?/fail-on-warnings",
     "bmux_presenter_plugin?/fail-on-warnings",
     "bmux_finder_plugin?/fail-on-warnings",
+    "bmux_application_resurrection_plugin?/fail-on-warnings",
+    "bmux_attach_image_protocol/fail-on-warnings",
+    "bmux_attach_token_state/fail-on-warnings",
+    "bmux_clients_plugin_api/fail-on-warnings",
+    "bmux_clipboard/fail-on-warnings",
+    "bmux_codec/fail-on-warnings",
+    "bmux_context_state/fail-on-warnings",
+    "bmux_contexts_plugin_api/fail-on-warnings",
+    "bmux_control_catalog_plugin_api/fail-on-warnings",
+    "bmux_env/fail-on-warnings",
+    "bmux_pane_runtime_plugin_api/fail-on-warnings",
+    "bmux_performance_plugin_api/fail-on-warnings",
+    "bmux_performance_state/fail-on-warnings",
+    "bmux_playbook/fail-on-warnings",
+    "bmux_recording_plugin?/fail-on-warnings",
+    "bmux_recording_plugin_api/fail-on-warnings",
+    "bmux_recording_protocol/fail-on-warnings",
+    "bmux_scene_protocol/fail-on-warnings",
+    "bmux_session_models/fail-on-warnings",
+    "bmux_sessions_plugin_api/fail-on-warnings",
+    "bmux_slots/fail-on-warnings",
+    "bmux_snapshot_plugin_api/fail-on-warnings",
+    "bmux_tabs_plugin_api/fail-on-warnings",
+    "bmux_text_edit/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+    "bmux_tui_components/fail-on-warnings",
+    "bmux_visual_adapters_plugin_renderer?/fail-on-warnings",
+    "bmux_web_host/fail-on-warnings",
+    "bmux_web_renderer/fail-on-warnings",
 ]
 
 # Semantic bracketed-paste capture and pane forwarding
@@ -356,10 +385,22 @@ bundled-visual-adapters = ["dep:bmux_visual_adapters_plugin_renderer"]
 bundled-fonts = ["bmux_recording_plugin?/bundled-fonts"]
 
 # IPC compression support
-compression = ["bmux_ipc/compression", "bmux_server/compression"]
+compression = [
+    "bmux_ipc/compression",
+    "bmux_server/compression",
+    "bmux_codec/compression",
+]
 
 # Serialization features
-serde = ["bmux_client/serde", "bmux_keyboard/serde", "bmux_server/serde"]
+serde = [
+    "bmux_client/serde",
+    "bmux_keyboard/serde",
+    "bmux_server/serde",
+    "bmux_codec/serde",
+    "bmux_session_models/serde",
+    "bmux_text_edit/serde",
+    "bmux_tui/serde",
+]
 
 # Terminal image protocol support
 image-iterm2 = [
@@ -375,7 +416,12 @@ image-kitty = [
     "bmux_decoration_plugin_renderer?/image-kitty",
     "bmux_pane_runtime_plugin/image-registry",
 ]
-image-protocols = ["image-sixel", "image-kitty", "image-iterm2"]
+image-protocols = [
+    "image-sixel",
+    "image-kitty",
+    "image-iterm2",
+    "bmux_decoration_plugin_renderer?/image-protocols",
+]
 image-sixel = [
     "dep:bmux_image",
     "bmux_image/sixel",

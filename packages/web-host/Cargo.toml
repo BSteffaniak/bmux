@@ -42,6 +42,9 @@ sha2 = { workspace = true }
 toml = { workspace = true, features = ["parse"] }
 
 [features]
-default          = []
-fail-on-warnings = []
-presentation     = ["dep:anyhow", "dep:bmux_tui", "dep:bmux_web_renderer"]
+default = []
+fail-on-warnings = [
+    "bmux_tui?/fail-on-warnings",
+    "bmux_web_renderer?/fail-on-warnings",
+]
+presentation = ["dep:anyhow", "dep:bmux_tui", "dep:bmux_web_renderer"]

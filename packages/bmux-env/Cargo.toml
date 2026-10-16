@@ -28,4 +28,4 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
-fail-on-warnings = []
+fail-on-warnings = ["bmux_slots/fail-on-warnings"]

@@ -23,8 +23,13 @@ unicode-segmentation = { workspace = true, optional = true }
 unicode-width        = { workspace = true, optional = true }
 
 [features]
-default          = []
-fail-on-warnings = []
+default = []
+fail-on-warnings = [
+    "bmux_keyboard?/fail-on-warnings",
+    "bmux_terminal_grid?/fail-on-warnings",
+    "bmux_text_edit?/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+]
 
 # Individual components. Composed controls enable their implementation prerequisites.
 action-row = ["button"]

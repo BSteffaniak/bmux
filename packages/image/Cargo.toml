@@ -38,6 +38,7 @@ default = []
 fail-on-warnings = [
     "bmux_attach_image_protocol/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
 ]
 iterm2 = []
 kitty = []

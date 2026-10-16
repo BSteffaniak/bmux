@@ -171,10 +171,10 @@ version    = "0.0.1-alpha.1"
 
 [workspace.dependencies]
 arc-swap = { version = "1.9", default-features = false }
-cranelift-codegen = { version = "0.125.4", default-features = false, features = [
+cranelift-codegen = { version = "0.136.3", default-features = false, features = [
     "all-native-arch",
 ] }
-wasmtime = { version = "38", default-features = false, features = [
+wasmtime = { version = "49.0.3", default-features = false, features = [
     "cranelift",
     "runtime",
     "std",
@@ -319,7 +319,7 @@ hyperchad_markdown = { version = "0.4.0", default-features = false, git = "https
 ] }
 insta = { version = "1.48.0", default-features = false }
 pulldown-cmark = { version = "0.13.4", default-features = false }
-serde_yaml = { version = "0.9.34", default-features = false }
+serde_yaml = { package = "yaml_serde", version = "0.10.7", default-features = false }
 smallvec = { version = "1.15.2", default-features = false, features = [
     "union",
 ] }
@@ -353,7 +353,7 @@ flate2 = { version = "1", default-features = false, features = [
     "rust_backend",
 ] }
 font8x8 = { version = "0.3.1", features = ["unicode"] }
-fontdb = { version = "0.23.0" }
+fontdb = { version = "0.24.0" }
 futures-util = { version = "0.3.32", default-features = false }
 gif = { version = "0.14.2" }
 image = { version = "0.25", default-features = false, features = [
@@ -381,7 +381,7 @@ reqwest = { version = "0.13.3", default-features = false, features = [
     "json",
     "rustls-no-provider",
 ] }
-resvg = { version = "0.47.0", default-features = true }
+resvg = { version = "0.48.1", default-features = true }
 roxmltree = "0.21.1"
 rustls = { version = "0.23.40", default-features = false, features = [
     "std",
@@ -397,6 +397,7 @@ serde_json = { version = "1.0.149", default-features = false, features = [
     "std",
 ] }
 sha2 = { version = "0.11.0", default-features = false }
+sha2_010 = { package = "sha2", version = "0.10.9", default-features = false }
 ssh2 = { version = "0.9.5" }
 sshenv_vault = { version = "0.0.1-alpha.4", git = "https://github.com/BSteffaniak/sshenv", branch = "master", features = [
     "macos-keychain",

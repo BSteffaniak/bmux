@@ -54,6 +54,16 @@ uuid = { workspace = true, features = ["v4"] }
 bmux_codec = { workspace = true }
 
 [features]
-default          = []
-fail-on-warnings = []
-static-bundled   = []
+default = []
+fail-on-warnings = [
+    "bmux_broadcast_plugin_api/fail-on-warnings",
+    "bmux_client/fail-on-warnings",
+    "bmux_config/fail-on-warnings",
+    "bmux_pane_runtime_plugin_api/fail-on-warnings",
+    "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_presentation_state/fail-on-warnings",
+    "bmux_sessions_plugin_api/fail-on-warnings",
+    "bmux_web_renderer/fail-on-warnings",
+]
+static-bundled = []

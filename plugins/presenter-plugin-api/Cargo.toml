@@ -31,5 +31,10 @@ ignored = [
 ]
 
 [features]
-default          = []
-fail-on-warnings = []
+default = []
+fail-on-warnings = [
+    "bmux_codec/fail-on-warnings",
+    "bmux_ipc/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]

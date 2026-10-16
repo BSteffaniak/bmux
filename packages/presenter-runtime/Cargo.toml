@@ -38,5 +38,9 @@ uuid = { workspace = true, features = ["v4"] }
 rcgen = { workspace = true }
 
 [features]
-default          = []
-fail-on-warnings = []
+default = []
+fail-on-warnings = [
+    "bmux_mermaid_render/fail-on-warnings",
+    "bmux_presenter/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+]

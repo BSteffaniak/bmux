@@ -35,9 +35,9 @@ fail-on-warnings = [
 ]
 
 # Compression support (optional, feature-gated)
-compression      = ["compression-zstd", "compression-lz4"]
-compression-lz4  = ["dep:lz4_flex"]
-compression-zstd = ["dep:zstd"]
+compression      = ["compression-zstd", "compression-lz4", "bmux_codec/compression"]
+compression-lz4  = ["dep:lz4_flex", "bmux_codec/compression-lz4"]
+compression-zstd = ["dep:zstd", "bmux_codec/compression-zstd"]
 
 [dev-dependencies]
 bmux_performance_state  = { workspace = true }

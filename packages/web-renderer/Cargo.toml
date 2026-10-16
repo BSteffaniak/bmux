@@ -39,7 +39,7 @@ web-sys = { version = "0.3.103", optional = true, features = [
 
 [features]
 default = []
-fail-on-warnings = []
+fail-on-warnings = ["bmux_codec/fail-on-warnings", "bmux_tui/fail-on-warnings"]
 wasm = [
     "dep:js-sys",
     "dep:wasm-bindgen",

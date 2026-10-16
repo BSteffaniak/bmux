@@ -24,6 +24,9 @@ tracing                                  = { workspace = true }
 uuid                                     = { workspace = true, features = ["serde", "v4"] }
 
 [features]
-default          = []
-fail-on-warnings = []
-static-bundled   = []
+default = []
+fail-on-warnings = [
+    "bmux_application_resurrection_plugin_api/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]
+static-bundled = []

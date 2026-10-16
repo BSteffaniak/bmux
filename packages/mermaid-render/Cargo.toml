@@ -12,18 +12,18 @@ version     = { workspace = true }
 
 [dependencies]
 roxmltree = { workspace = true }
-sha2      = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio    = { workspace = true, features = ["rt", "sync", "time"] }
 wasmtime = { workspace = true }
 
 [build-dependencies]
-# Enable destination backends directly: Wasmtime's all-arch feature resolves an
-# unpublished winch-codegen 38.0.4, though this renderer only uses Cranelift.
+# Enable only the destination Cranelift backends needed for renderer AOT artifacts.
 cranelift-codegen = { workspace = true }
 wasmtime          = { workspace = true }
 
 [dev-dependencies]
+# The benchmark hashes output; match Cranelift's digest generation.
+sha2_010 = { workspace = true }
 tempfile = { workspace = true }
 # Exercise destination AOT generation with the same backends as the build script.
 cranelift-codegen = { workspace = true }

@@ -33,5 +33,8 @@ fail-on-warnings = [
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_permissions_plugin_api/fail-on-warnings",
     "bmux_pane_runtime_plugin_api/fail-on-warnings",
+    "bmux_clients_plugin_api/fail-on-warnings",
+    "bmux_contexts_plugin_api/fail-on-warnings",
+    "bmux_sessions_plugin_api/fail-on-warnings",
 ]
 static-bundled = []

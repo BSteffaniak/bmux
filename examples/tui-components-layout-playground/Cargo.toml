@@ -22,4 +22,8 @@ bmux_tui_components = { workspace = true, features = [
 ] }
 
 [features]
-fail-on-warnings = ["bmux_tui_components/fail-on-warnings"]
+fail-on-warnings = [
+    "bmux_tui_components/fail-on-warnings",
+    "bmux_keyboard/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+]

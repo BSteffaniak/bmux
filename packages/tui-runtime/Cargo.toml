@@ -27,20 +27,24 @@ name              = "image_protocols"
 required-features = ["image-kitty", "image-sixel", "image-iterm2", "crossterm"]
 
 [dependencies]
-bmux_image   = { workspace = true, optional = true }
+bmux_image    = { workspace = true, optional = true }
 bmux_keyboard = { workspace = true }
-bmux_tui     = { workspace = true }
-futures-util = { workspace = true, features = ["std"] }
-tokio        = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-zeroize      = { workspace = true }
+bmux_tui      = { workspace = true }
+futures-util  = { workspace = true, features = ["std"] }
+tokio         = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+zeroize       = { workspace = true }
 
 [features]
 # Image protocol bundle, independent of the terminal input/lifecycle backend.
-all-protocols    = ["image-kitty", "image-sixel", "image-iterm2"]
-crossterm        = ["bmux_tui/crossterm"]
-default          = ["all-protocols", "crossterm"]
-fail-on-warnings = ["bmux_image?/fail-on-warnings"]
-image-iterm2     = ["images", "bmux_image/iterm2"]
-image-kitty      = ["images", "bmux_image/kitty"]
-image-sixel      = ["images", "bmux_image/sixel"]
-images           = ["dep:bmux_image"]
+all-protocols = ["image-kitty", "image-sixel", "image-iterm2"]
+crossterm = ["bmux_tui/crossterm", "bmux_keyboard/crossterm"]
+default = ["all-protocols", "crossterm"]
+fail-on-warnings = [
+    "bmux_image?/fail-on-warnings",
+    "bmux_keyboard/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+]
+image-iterm2 = ["images", "bmux_image/iterm2"]
+image-kitty = ["images", "bmux_image/kitty"]
+image-sixel = ["images", "bmux_image/sixel"]
+images = ["dep:bmux_image"]

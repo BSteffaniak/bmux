@@ -36,4 +36,5 @@ fail-on-warnings = [
     "bmux_event_models/fail-on-warnings",
     "bmux_keybind/fail-on-warnings",
     "bmux_slots/fail-on-warnings",
+    "bmux_config_doc/fail-on-warnings",
 ]

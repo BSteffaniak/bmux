@@ -34,5 +34,8 @@ crossterm = [
     "crossterm/events",
 ]
 default = []
-fail-on-warnings = []
-serde = ["dep:serde"]
+fail-on-warnings = [
+    "bmux_keyboard/fail-on-warnings",
+    "bmux_text_edit/fail-on-warnings",
+]
+serde = ["dep:serde", "bmux_keyboard/serde", "bmux_text_edit/serde"]

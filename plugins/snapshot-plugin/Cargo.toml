@@ -30,5 +30,7 @@ tokio    = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_snapshot_plugin_api/fail-on-warnings",
+    "bmux_snapshot_runtime/fail-on-warnings",
 ]
 static-bundled = []

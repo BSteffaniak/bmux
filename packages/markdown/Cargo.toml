@@ -31,5 +31,9 @@ unicode-width = { workspace = true }
 hyperchad_markdown = { workspace = true, features = ["syntax-highlighting"] }
 
 [features]
-default          = []
-fail-on-warnings = []
+default = []
+fail-on-warnings = [
+    "bmux_mermaid_render/fail-on-warnings",
+    "bmux_syntax_render/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+]

@@ -58,10 +58,21 @@ fail-on-warnings = [
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
     "bmux_session_models/fail-on-warnings",
+    "bmux_attach_token_state/fail-on-warnings",
+    "bmux_client_state/fail-on-warnings",
+    "bmux_context_state/fail-on-warnings",
+    "bmux_pane_runtime_state/fail-on-warnings",
+    "bmux_perf_telemetry/fail-on-warnings",
+    "bmux_performance_state/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_recording_protocol/fail-on-warnings",
+    "bmux_recording_runtime/fail-on-warnings",
+    "bmux_session_state/fail-on-warnings",
+    "bmux_snapshot_runtime/fail-on-warnings",
 ]
 
 # IPC compression support
-compression = ["bmux_ipc/compression"]
+compression = ["bmux_ipc/compression", "bmux_codec/compression"]
 
 # Serialization features
-serde = ["bmux_session_models/serde"]
+serde = ["bmux_session_models/serde", "bmux_codec/serde"]

@@ -21,4 +21,10 @@ bmux_tui_runtime    = { workspace = true, features = ["crossterm"] }
 tokio               = { workspace = true, features = ["macros", "rt"] }
 
 [features]
-fail-on-warnings = ["bmux_tui_components/fail-on-warnings"]
+fail-on-warnings = [
+    "bmux_tui_components/fail-on-warnings",
+    "bmux_keyboard/fail-on-warnings",
+    "bmux_text_edit/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+    "bmux_tui_runtime/fail-on-warnings",
+]

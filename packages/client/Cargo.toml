@@ -45,10 +45,12 @@ fail-on-warnings = [
     "bmux_config/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_keyboard/fail-on-warnings",
+    "bmux_perf_telemetry/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
 ]
 
 # Serialization features
-serde = []
+serde = ["bmux_codec/serde", "bmux_keyboard/serde"]
 
 [package.metadata.cargo-machete]
 ignored = ["bmux_server"] # dev-dependency used in integration tests

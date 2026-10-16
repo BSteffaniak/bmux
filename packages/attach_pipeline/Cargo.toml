@@ -52,4 +52,6 @@ fail-on-warnings = [
     "bmux_scene_protocol/fail-on-warnings",
     "bmux_scene_protocol_render/fail-on-warnings",
     "bmux_terminal_grid/fail-on-warnings",
+    "bmux_attach_image_protocol/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
 ]

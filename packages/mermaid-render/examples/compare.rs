@@ -12,7 +12,7 @@ use bmux_mermaid_render::{
     MermaidCancellationToken, MermaidRenderError, MermaidRenderRequest, MermaidRendered,
     MermaidRenderedOutput, WasmMermaidRenderer,
 };
-use sha2::{Digest, Sha256};
+use sha2_010::{Digest, Sha256};
 
 type RenderResult = Result<MermaidRendered, MermaidRenderError>;
 
