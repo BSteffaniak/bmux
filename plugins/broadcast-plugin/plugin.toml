@@ -1,7 +1,7 @@
 execution_class = "native_fast"
 id = "bmux.broadcast"
 name = "bmux Broadcast"
-optional_capabilities = ["bmux.sessions.read"]
+optional_capabilities = ["bmux.sessions.read", "bmux.pane_runtime.read"]
 owns_namespaces = ["broadcast"]
 provided_capabilities = [
     "bmux.broadcast.control.v1",

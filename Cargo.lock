@@ -1237,6 +1237,7 @@ dependencies = [
  "bmux_client",
  "bmux_codec",
  "bmux_config",
+ "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_presentation_state",

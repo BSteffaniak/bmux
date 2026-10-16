@@ -294,6 +294,94 @@ pub(crate) async fn local(context: &NativeCommandContext) -> Result<bool, Plugin
         _ => Ok(false),
     }
 }
+fn display_hint(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| {
+            !ch.is_control() && !matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(96)
+        .collect()
+}
+
+struct TerminalChoice {
+    id: uuid::Uuid,
+    label: String,
+}
+
+// Resolve only against this displayed snapshot. Names are hints, never identity;
+// duplicate names cannot silently select the wrong terminal.
+fn terminal_choice(input: &str, choices: &[TerminalChoice]) -> Result<usize, &'static str> {
+    let input = input.trim();
+    let input = input
+        .strip_prefix("\x1b[200~")
+        .and_then(|value| value.strip_suffix("\x1b[201~"))
+        .unwrap_or(input)
+        .trim();
+    if input.is_empty() || input.eq_ignore_ascii_case("q") {
+        return Err("broadcast cancelled");
+    }
+    if let Ok(number) = input.parse::<usize>() {
+        return number
+            .checked_sub(1)
+            .filter(|index| *index < choices.len())
+            .ok_or("choose a listed number or full session UUID (q cancels)");
+    }
+    let id = uuid::Uuid::parse_str(input)
+        .map_err(|_| "choose a listed number or full session UUID (q cancels)")?;
+    choices
+        .iter()
+        .position(|choice| choice.id == id)
+        .ok_or("terminal is not in the displayed list; cancel and retry to refresh")
+}
+
+async fn terminal_choices(
+    client: &mut bmux_client::BmuxClient,
+) -> Result<Vec<TerminalChoice>, PluginCommandError> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_state;
+    let sessions = bmux_sessions_plugin_api::sessions_state::client::list_sessions(client)
+        .await
+        .map_err(|_| failed("session list unavailable; specify --session UUID or --source UUID"))?;
+    let mut choices = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let name = session
+            .name
+            .as_deref()
+            .map(display_hint)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "Unnamed terminal".into());
+        let mut label = format!("{name} — {} attached", session.client_count);
+        // Optional enrichment only: missing/denied pane metadata must not
+        // prevent selecting a session through the sessions contract.
+        match pane_runtime_state::client::list_panes(client, Some(session.id)).await {
+            Ok(Ok(list)) => {
+                let hints: Vec<_> = list
+                    .panes
+                    .iter()
+                    .take(3)
+                    .map(|pane| {
+                        let name = pane.name.as_deref().unwrap_or("pane");
+                        let command = pane.active_command.as_deref().unwrap_or(&pane.shell);
+                        format!("{}: {}", display_hint(name), display_hint(command))
+                    })
+                    .collect();
+                label.push_str(&format!(
+                    " — {} pane(s): {}",
+                    list.panes.len(),
+                    hints.join("; ")
+                ));
+            }
+            _ => label.push_str(" — pane details unavailable"),
+        }
+        label.push_str(&format!(" [{}]", session.id));
+        choices.push(TerminalChoice {
+            id: session.id,
+            label,
+        });
+    }
+    Ok(choices)
+}
+
 pub(crate) async fn connected(
     context: &NativeCommandContext,
     client: &mut bmux_client::BmuxClient,
@@ -313,62 +401,60 @@ pub(crate) async fn connected(
     {
         let mut map = options(args.get(1..).unwrap_or_default())?;
         if !map.contains_key("--source") && !map.contains_key("--session") {
-            use bmux_sessions_plugin_api::sessions_state;
-            let sessions = sessions_state::client::list_sessions(client)
-                .await
-                .map_err(|_| {
-                    failed("session list unavailable; specify --session UUID or --source UUID")
-                })?;
-            if sessions.is_empty() {
+            let choices = terminal_choices(client).await?;
+            if choices.is_empty() {
                 return Err(failed(
                     "no terminal sessions available; register a presentation source first",
                 ));
             }
-            let session =
-                if context.invocation_source == NativeCommandInvocationSource::AttachKeybinding {
-                    use bmux_plugin::prompt::{
-                        PromptOption, PromptRequest, PromptResponse, PromptValue,
-                    };
-                    let choices = sessions
-                        .iter()
-                        .map(|session| {
-                            PromptOption::new(
-                                session.id.to_string(),
-                                format!("Terminal {}", session.id),
-                            )
-                        })
-                        .collect();
-                    match bmux_plugin::prompt::request(PromptRequest::single_select(
-                        "Select ONE terminal to share",
-                        choices,
-                    ))
-                    .await
-                    .map_err(|_| failed("source prompt unavailable"))?
-                    {
-                        PromptResponse::Submitted(PromptValue::Single(id)) => id,
-                        _ => return Err(failed("broadcast cancelled")),
-                    }
-                } else {
-                    for session in &sessions {
-                        output(context, &format!("Terminal {}", session.id)).await;
-                    }
-                    prompt(
-                        context,
-                        "Terminal SESSION UUID to share (explicit selection required)",
-                    )
-                    .await?
+            let session = if context.invocation_source
+                == NativeCommandInvocationSource::AttachKeybinding
+            {
+                use bmux_plugin::prompt::{
+                    PromptOption, PromptRequest, PromptResponse, PromptValue,
                 };
-            let selected =
-                uuid::Uuid::parse_str(&session).map_err(|_| failed("invalid session UUID"))?;
-            if !sessions.iter().any(|session| session.id == selected) {
-                return Err(failed("selected terminal is not active"));
-            }
+                let options = choices
+                    .iter()
+                    .map(|choice| PromptOption::new(choice.id.to_string(), choice.label.clone()))
+                    .collect();
+                match bmux_plugin::prompt::request(PromptRequest::single_select(
+                    "Select ONE terminal to share",
+                    options,
+                ))
+                .await
+                .map_err(|_| failed("source prompt unavailable"))?
+                {
+                    PromptResponse::Submitted(PromptValue::Single(id)) => id,
+                    _ => return Err(failed("broadcast cancelled")),
+                }
+            } else {
+                output(
+                    context,
+                    "Choose one terminal to share publicly. Nothing is selected automatically.",
+                )
+                .await;
+                for (index, choice) in choices.iter().enumerate() {
+                    output(context, &format!("  {}. {}", index + 1, choice.label)).await;
+                }
+                loop {
+                    let input =
+                        prompt(context, "Terminal number (or full UUID; q cancels)").await?;
+                    match terminal_choice(&input, &choices) {
+                        Ok(index) => break choices[index].id.to_string(),
+                        Err("broadcast cancelled") => return Err(failed("broadcast cancelled")),
+                        Err(message) => output(context, message).await,
+                    }
+                }
+            };
+            let selected_index = terminal_choice(&session, &choices).map_err(failed)?;
+            let selected = &choices[selected_index];
             let confirmed =
                 if context.invocation_source == NativeCommandInvocationSource::AttachKeybinding {
                     use bmux_plugin::prompt::{PromptRequest, PromptResponse, PromptValue};
                     matches!(
                         bmux_plugin::prompt::request(PromptRequest::confirm(format!(
-                            "Share terminal {selected} output publicly?"
+                            "Share ALL output of {} publicly?",
+                            selected.label
                         )))
                         .await
                         .map_err(|_| failed("confirmation unavailable"))?,
@@ -377,7 +463,7 @@ pub(crate) async fn connected(
                 } else {
                     prompt(
                         context,
-                        &format!("Share terminal {selected} publicly? Type yes"),
+                        &format!("Share ALL output of {} publicly? Type yes", selected.label),
                     )
                     .await?
                         == "yes"
@@ -550,6 +636,41 @@ pub(crate) async fn connected(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn picker_resolves_numbers_and_pasted_uuids_only_in_displayed_snapshot() {
+        let id = uuid::Uuid::parse_str("17af57cf-c912-4809-8b0d-5a10fba78569").unwrap();
+        let choices = vec![
+            TerminalChoice {
+                id,
+                label: "editor".into(),
+            },
+            TerminalChoice {
+                id: uuid::Uuid::new_v4(),
+                label: "editor".into(),
+            },
+        ];
+        assert_eq!(terminal_choice("1", &choices), Ok(0));
+        assert_eq!(terminal_choice(" 2\r\n", &choices), Ok(1));
+        assert_eq!(terminal_choice(&format!(" {id}\r\n"), &choices), Ok(0));
+        assert_eq!(
+            terminal_choice(&format!("\x1b[200~{id}\x1b[201~"), &choices),
+            Ok(0)
+        );
+        for invalid in ["0", "3", "editor", "99999999999999999999999999", "-1"] {
+            assert!(terminal_choice(invalid, &choices).is_err());
+        }
+        assert!(terminal_choice(&uuid::Uuid::new_v4().to_string(), &choices).is_err());
+        assert!(terminal_choice("1", &[]).is_err());
+        assert_eq!(terminal_choice("q", &choices), Err("broadcast cancelled"));
+        assert_eq!(terminal_choice("", &choices), Err("broadcast cancelled"));
+    }
+
+    #[test]
+    fn terminal_display_hints_are_bounded_single_line_text() {
+        assert_eq!(display_hint("editor\n\r\x1b\u{202e}"), "editor");
+        assert_eq!(display_hint(&"猫".repeat(200)).chars().count(), 96);
+    }
+
     #[tokio::test]
     async fn structured_palette_prompt_is_host_owned() {
         use bmux_plugin::prompt::{PromptResponse, PromptValue};

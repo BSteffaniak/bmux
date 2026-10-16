@@ -17,7 +17,14 @@ bmux broadcast profiles
 ```
 
 No-argument start explicitly chooses and confirms one active terminal; it never
-shares a default session. Standalone prompts require a real TTY; palette prompts
+shares a default session. The CLI offers numbered choices showing session names,
+attached-client counts, and pane names / active commands (or shells) when the
+optional pane-runtime read service is available. The palette uses the same labels.
+Choose a displayed number or paste a full UUID; invalid choices retry, and an
+empty answer or `q` cancels. Confirmation repeats the terminal details and warns
+that all of its output will be public. Names are bounded, control-character-filtered
+display hints, not selection authority; duplicate names retain distinct UUIDs.
+No terminal output preview is fetched. Standalone prompts require a real TTY; palette prompts
 use the host's structured prompt UI, never raw terminal output. Explicit
 `--session` selects a terminal without a prompt, creates a source UUID and hashes
 and verifies the currently executing installed bmux (never PATH). Explicit
