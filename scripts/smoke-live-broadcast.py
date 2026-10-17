@@ -91,7 +91,7 @@ def smoke(url, component='all', report=None, relay_url='https://live.bmux.dev'):
             raise SmokeFailure('invalid_json', safe_endpoint(path)) from None
     if component != 'site':
         data = get_json('/health', 4096)
-        if data.get('protocol') != 1 or data.get('renderer') != 'bmwp-4':
+        if not isinstance(data, dict) or data.get('status') != 'ok' or data.get('renderer') != 'bmwp-4':
             raise SmokeFailure('unsupported_protocol', '/health')
     if component == 'backend':
         return
