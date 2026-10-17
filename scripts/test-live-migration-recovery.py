@@ -37,6 +37,22 @@ def evidence():
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_plan_diagnostics_exclude_private_values(self):
+        candidate = plan()
+        candidate['resource_changes'].append(FIX.resource('PRIVATE_ADDRESS', ['PRIVATE_ACTION'],
+                                                         {'secret': 'PRIVATE_VALUE'}))
+        report = M.plan_diagnostics(candidate)
+        text = json.dumps(report)
+        self.assertNotIn('PRIVATE', text)
+        self.assertIn('fly_app.live', text)
+        self.assertEqual(report['changes'][-1]['actions'], ['unknown'])
+        changed = next(r for r in candidate['resource_changes'] if r['address'] == 'fly_app.live')
+        changed['change']['actions'] = ['update']
+        report = M.plan_diagnostics(candidate)
+        self.assertEqual(report['changes'][0]['actions'], ['update'])
+        with self.assertRaises(ValueError):
+            M.validate(candidate)
+
     def test_policy_preserves_app_and_rejects_destructive_and_unrelated_changes(self):
         M.validate(plan())
         for resource in (FIX.resource('fly_app.live', ['create']),

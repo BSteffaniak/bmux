@@ -45,6 +45,30 @@ def validate(plan):
     return resources
 
 
+def plan_diagnostics(plan):
+    """Only allowlisted addresses/actions and booleans; no provider/state values."""
+    known = PLAN.POLICY.CONFIGURE_RESOURCES | PLAN.POLICY.WORKER_RESOURCES
+    changes = plan.get('resource_changes', [])
+    if not isinstance(changes, list):
+        return {'invalid_changes': True}
+    actions = ('no-op', 'read', 'create', 'update', 'delete', 'forget')
+    rows = []
+    for item in changes:
+        if not isinstance(item, dict):
+            rows.append({'invalid_resource': True})
+            continue
+        change = item.get('change', {})
+        if not isinstance(change, dict):
+            rows.append({'invalid_change': True})
+            continue
+        raw = change.get('actions')
+        rows.append({'address': item.get('address') if item.get('address') in known else 'unknown',
+                     'actions': raw if isinstance(raw, list) and all(a in actions for a in raw) else ['unknown'],
+                     'importing': bool(change.get('importing')), 'deposed': bool(item.get('deposed'))})
+    return {'errored': bool(plan.get('errored')), 'incomplete': plan.get('complete') is False,
+            'deferred': bool(plan.get('deferred_changes')), 'changes': rows}
+
+
 def snapshot(store):
     store.migration_authority()
     remote = store.migration_marker()
@@ -98,6 +122,7 @@ def main():
             store.temp.cleanup()
     elif args.action == 'plan':
         plan = PLAN.read(args.plan)
+        print(json.dumps({'recovery_plan_diagnostics': plan_diagnostics(plan)}))
         evidence = PLAN.read(args.evidence)
         value = digest(plan, evidence, args.artifact, os.environ)
         if args.expected:
