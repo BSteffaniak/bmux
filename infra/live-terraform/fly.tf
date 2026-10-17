@@ -109,7 +109,9 @@ resource "cloudflare_dns_record" "relay_acme" {
   zone_id = var.zone_id
   name    = fly_cert.live.acme_challenge_name
   type    = "CNAME"
-  content = fly_cert.live.acme_challenge_target
+  # Fly returns an absolute DNS name; Cloudflare stores CNAMEs without the
+  # terminal dot. Normalize configuration to avoid a perpetual update plan.
+  content = trimsuffix(fly_cert.live.acme_challenge_target, ".")
   proxied = false
   ttl     = 60
 }

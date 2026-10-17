@@ -31,6 +31,19 @@ class FlyTests(unittest.TestCase):
         deploy = (ROOT / 'scripts/live-deploy.sh').read_text()
         self.assertIn('TF_VAR_fly_org="$LIVE_FLY_ORG"', deploy)
 
+    def test_acme_target_uses_cloudflare_canonical_dns_form(self):
+        source = (ROOT / 'infra/live-terraform/fly.tf').read_text()
+        expression = 'trimsuffix(fly_cert.live.acme_challenge_target, ".")'
+        self.assertIn('content = ' + expression, source)
+        if not shutil.which('tofu'):
+            self.skipTest('OpenTofu unavailable')
+        with tempfile.TemporaryDirectory() as temporary:
+            for target in ('target.example.net.', 'target.example.net'):
+                result = subprocess.run(['tofu', 'console'], cwd=temporary,
+                    input='trimsuffix(' + json.dumps(target) + ', ".")\n',
+                    text=True, capture_output=True, timeout=30, check=True)
+                self.assertEqual(json.loads(result.stdout), 'target.example.net')
+
     def test_required_private_volume(self):
         text = (ROOT / 'infra/live-terraform/fly.tf').read_text()
         for value in ['resource "fly_volume" "authority"', 'size_gb', 'encrypted',
