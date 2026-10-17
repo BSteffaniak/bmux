@@ -1180,10 +1180,10 @@ dependencies = [
 
 [[package]]
 name = "bmux-live-relay"
-version = "0.0.1-alpha.3"
+version = "0.0.1-alpha.4"
 dependencies = [
  "axum",
- "bmux_tui 0.0.1-alpha.3",
+ "bmux_tui 0.0.1-alpha.4",
  "bmux_web_renderer",
  "futures-util",
  "libc",
