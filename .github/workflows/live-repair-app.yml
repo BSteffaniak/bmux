@@ -1,0 +1,41 @@
+name: Repair verified live app taint
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        type: boolean
+        default: false
+        description: Clear taint only after durable identity verification
+permissions:
+  contents: read
+jobs:
+  repair:
+    if: github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: Production
+    concurrency:
+      group: bmux-production-infrastructure
+      cancel-in-progress: false
+    env:
+      LIVE_ENVIRONMENT: production
+      LIVE_STATE_REGION: auto
+      LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
+      LIVE_FLY_ORG: ${{ vars.LIVE_FLY_ORG }}
+      LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_STATE_ACCESS_KEY_ID: ${{ secrets.R2_STATE_ACCESS_KEY_ID }}
+      R2_STATE_SECRET_ACCESS_KEY: ${{ secrets.R2_STATE_SECRET_ACCESS_KEY }}
+      TOFU_STATE_ENCRYPTION_PASSPHRASE: ${{ secrets.TOFU_STATE_ENCRYPTION_PASSPHRASE }}
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f
+        with: {tofu_version: '1.10.9', tofu_wrapper: false}
+      - name: Verify and optionally repair app taint
+        env:
+          APPLY: ${{ inputs.apply }}
+        run: |
+          args=()
+          if [[ "$APPLY" == true ]]; then args+=(--apply); fi
+          python3 -B scripts/repair-live-app.py "${args[@]}"
