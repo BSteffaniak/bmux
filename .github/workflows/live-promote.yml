@@ -107,6 +107,10 @@ jobs:
   validation:
     if: github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
     uses: ./.github/workflows/live-validation.yml
+    with:
+      # Explicit one-time migration prioritizes recovery. Standalone CI and
+      # ordinary releases retain the complete runtime acceptance suite.
+      skip_acceptance: ${{ inputs.migrate || false }}
     permissions:
       contents: read
   site-build:

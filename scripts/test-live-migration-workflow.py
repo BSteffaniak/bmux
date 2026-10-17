@@ -50,7 +50,7 @@ class MigrationWorkflowTests(unittest.TestCase):
         self.assertIn('test-live-migration-deploy.py', source)
         self.assertIn('test-live-migration-fence.py', source)
         self.assertIn('test-live-guided-setup.py', source)
-        self.assertNotIn('inputs.migrate', validation)
+        self.assertIn('skip_acceptance: ${{ inputs.migrate || false }}', validation)
         for name in ('preview', 'approve', 'production'):
             self.assertIn('validation', job(self.release, name))
         for name in ('approve', 'production'):
@@ -141,6 +141,18 @@ class MigrationWorkflowTests(unittest.TestCase):
         self.assertNotIn('uses: ./.github/workflows/', source)
         for name in ('approve', 'production'):
             self.assertIn("needs.validation.result == 'success'", job(self.release, name))
+
+    def test_emergency_migration_skips_only_runtime_acceptance(self):
+        validation = job(self.release, 'validation')
+        self.assertIn('skip_acceptance: ${{ inputs.migrate || false }}', validation)
+        source = workflow('live-validation.yml')
+        self.assertRegex(source, r'(?s)skip_acceptance:\n.*?type: boolean\n        default: false')
+        self.assertIn('if: ${{ !inputs.skip_acceptance }}', job(source, 'acceptance'))
+        self.assertNotIn('skip_acceptance', job(source, 'offline'))
+        for name in ('approve', 'production'):
+            self.assertIn("needs.validation.result == 'success'", job(self.release, name))
+        self.assertIn('environment: production-approval', job(self.release, 'approve'))
+        self.assertIn('migration_digest', job(self.release, 'preview'))
 
     def test_every_workflow_shell_block_parses(self):
         for name in ('live-promote.yml', 'docs-deploy.yml', 'live-validation.yml', 'configure-production-infra.yml'):

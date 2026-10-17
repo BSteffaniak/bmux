@@ -33,7 +33,15 @@ have no atomic create-only API.
 
 In GitHub Actions, dispatch **Live production release** on `master` with
 `migrate=true`. This is the one-time cutover, not the ordinary release button.
-The workflow builds same-revision backend/site candidates and runs isolated
+The one-time `migrate=true` recovery path skips runtime acceptance so browser
+startup or unrelated terminal compatibility failures cannot block restoring live
+service. Offline infrastructure/safety checks remain required, as do the exact
+preview digest, state locks, replay fence and production approval. Standalone
+Live Validation and ordinary releases still run the complete acceptance suite.
+This deliberately accepts unverified runtime risk during the cutover; verify a
+real stream immediately afterward.
+
+The workflow builds same-revision backend/site candidates and runs the selected
 validation, then shows a read-only migration preview before approval. Review its
 resource identities/actions, downtime and paid resources. Approval is bound to
 the candidate inventory, encrypted canonical state, configuration and full private
