@@ -143,6 +143,24 @@ done
         self.assertLess(effects.index('imports checked'), effects.index('tofu plan'))
         self.assertFalse((self.artifact / 'infrastructure/approved-imports.tf.json').exists())
 
+    def test_apply_errors_use_structured_diagnostics(self):
+        self.tool('tofu', '''import json,os,sys
+args=sys.argv[1:]
+if args[0]=='version': print('{"terraform_version":"1.10.9"}')
+elif args[0]=='show': print(os.environ['TEST_PLAN'])
+elif args[0]=='apply':
+ assert '-json' in args
+ print(json.dumps({'diagnostic': {'severity': 'error', 'summary': 'Fly app creation failed',
+       'detail': 'HTTP 403 private-secret'}}))
+ sys.exit(1)
+''')
+        result, effects = self.run_deploy()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Deployment operation failed: tofu apply', result.stderr)
+        self.assertIn('Fly app creation failed', result.stderr)
+        self.assertIn('HTTP 403', result.stderr)
+        self.assertNotIn('private-secret', result.stderr)
+
     def test_apply_failure_never_uploads_and_diagnostics_are_redacted(self):
         self.env['TEST_FAIL'] = 'apply'
         result, effects = self.run_deploy()

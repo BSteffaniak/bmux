@@ -172,7 +172,7 @@ apply_plan() {
       "oci-archive:$ARTIFACT/relay/image.oci.tar" "docker://$LIVE_RELAY_IMAGE"
     rm -f "$WORK/registry-auth.json"
   fi
-  run_private tofu apply -input=false -lock-timeout=5m "$WORK/plan"
+  run_private tofu apply -json -input=false -lock-timeout=5m "$WORK/plan"
   python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-after.json"
 }
 if [[ "$MIGRATION" == true ]]; then
