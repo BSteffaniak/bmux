@@ -169,6 +169,7 @@ if [[ "$MIGRATION" == true ]]; then
     echo 'Migration preview failed; private diagnostics suppressed' >&2; exit 1
   fi
   if [[ "$MODE" == check-migration ]]; then
+    python3 "$ROOT/scripts/live-migration-plan.py" "$WORK/approved-plan.json" --state "$WORK/migration-source.json" --artifact "$ARTIFACT" --check-only
     echo 'Authenticated infrastructure plan succeeded; no resource changes applied.'
     exit 0
   fi

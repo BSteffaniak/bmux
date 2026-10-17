@@ -39,6 +39,28 @@ class MigrationPlanTests(unittest.TestCase):
         (self.artifact / 'SHA256SUMS').write_text('candidate-inventory')
         self.state = {'sha256': 'c' * 64}
 
+    def test_check_only_reports_safe_policy_reason_before_builds(self):
+        candidate = plan()
+        candidate['resource_changes'].append(resource('cloudflare_r2_bucket.state', ['update'],
+                                                     {'private': 'NEVER_PRINT'}, {'private': 'NEVER_PRINT'}))
+        plan_path = self.artifact / 'plan.json'
+        state_path = self.artifact / 'state.json'
+        plan_path.write_text(json.dumps(candidate))
+        state_path.write_text(json.dumps(self.state))
+        args = ['live-migration-plan.py', str(plan_path), '--state', str(state_path),
+                '--artifact', str(self.artifact), '--check-only']
+        error = io.StringIO()
+        with patch('sys.argv', args), contextlib.redirect_stderr(error), self.assertRaises(SystemExit):
+            MODULE.main()
+        self.assertIn('cloudflare_r2_bucket.state', error.getvalue())
+        self.assertNotIn('NEVER_PRINT', error.getvalue())
+        plan_path.write_text(json.dumps(plan()))
+        output = io.StringIO()
+        with patch('sys.argv', args), contextlib.redirect_stdout(output):
+            MODULE.main()
+        self.assertIn('policy check passed', output.getvalue())
+        self.assertNotIn('Approval digest:', output.getvalue())
+
     def test_approval_bound_to_state_candidate_config_and_private_plan(self):
         original = MODULE.digest(plan(), self.state, self.artifact, {})
         self.assertEqual(original, MODULE.digest(plan(), self.state, self.artifact, {}))

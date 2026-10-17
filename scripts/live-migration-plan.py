@@ -21,6 +21,10 @@ CONFIG = ('CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_ZONE_ID', 'LIVE_HOSTNAME',
           'LIVE_STATE_BUCKET', 'LIVE_ENVIRONMENT', 'LIVE_STATE_REGION')
 
 
+class MigrationPolicyError(ValueError):
+    """Fixed policy diagnostics only; never construct from provider values."""
+
+
 def read(path):
     if path.stat().st_size > 32 * 1024 * 1024:
         raise ValueError('Oversized private migration input')
@@ -30,7 +34,7 @@ def read(path):
 def changes(plan):
     if (not isinstance(plan, dict) or plan.get('errored')
             or plan.get('complete') is False or plan.get('deferred_changes')):
-        raise ValueError('Incomplete migration plan')
+        raise MigrationPolicyError('Incomplete migration plan')
     resources = plan.get('resource_changes', [])
     if not isinstance(resources, list):
         raise ValueError('Invalid migration changes')
@@ -38,20 +42,23 @@ def changes(plan):
     for item in resources:
         address = item.get('address')
         if address in seen or address not in POLICY.CONFIGURE_RESOURCES | POLICY.WORKER_RESOURCES:
-            raise ValueError('Unexpected migration resource')
+            raise MigrationPolicyError('Unexpected migration resource')
         seen.add(address)
         change = item['change']
         if (change.get('actions') not in (['no-op'], ['read'])
                 and address not in POLICY.WORKER_RESOURCES
                 and not address.startswith('fly_')
                 and address not in {'cloudflare_dns_record.relay', 'cloudflare_dns_record.relay_acme'}):
-            raise ValueError('Migration must preserve Pages, website DNS and state resources')
+            raise MigrationPolicyError('Migration must preserve Pages, website DNS and state resources: ' + address)
         if change.get('importing') or item.get('deposed'):
-            raise ValueError('Migration cannot import or replace resources')
-        POLICY.validate({'resource_changes': [item]}, configure=True,
-                        retire_worker=address in POLICY.WORKER_RESOURCES)
+            raise MigrationPolicyError('Migration cannot import or replace resources')
+        try:
+            POLICY.validate({'resource_changes': [item]}, configure=True,
+                            retire_worker=address in POLICY.WORKER_RESOURCES)
+        except ValueError:
+            raise MigrationPolicyError('Unsupported or destructive action for ' + address) from None
     if plan.get('applyable') is False:
-        raise ValueError('Migration plan is not applyable')
+        raise MigrationPolicyError('Migration plan is not applyable')
     return resources
 
 
@@ -60,10 +67,10 @@ def digest(plan, state, artifact, env):
     # This flow is intentionally an existing-Worker cutover, not bootstrap or
     # adoption. A separately managed Fly installation needs explicit review.
     if not any(r['address'] == 'cloudflare_worker.live' and r['change']['actions'] == ['delete'] for r in resources):
-        raise ValueError('No existing managed Worker to migrate')
+        raise MigrationPolicyError('No existing managed Worker to migrate')
     for address in ('fly_app.live', 'fly_machine.live', 'fly_volume.authority'):
         if not any(r['address'] == address and r['change']['actions'] == ['create'] for r in resources):
-            raise ValueError('Existing or partially provisioned Fly resources require explicit recovery')
+            raise MigrationPolicyError('Fly resource must be newly created: ' + address)
     revision = (artifact / 'REVISION').read_text().strip()
     source = state.get('sha256')
     if not re.fullmatch(r'[a-f0-9]{40,64}', revision) or not isinstance(source, str) or not re.fullmatch(r'[a-f0-9]{64}', source):
@@ -128,6 +135,8 @@ def main():
     parser.add_argument('plan', type=Path)
     parser.add_argument('--state', type=Path)
     parser.add_argument('--artifact', type=Path)
+    parser.add_argument('--check-only', action='store_true',
+                        help='Validate policy without emitting an approval digest')
     parser.add_argument('--expected')
     parser.add_argument('--approved-plan', type=Path)
     parser.add_argument('--stage', choices=('retire', 'app', 'resources'))
@@ -142,6 +151,9 @@ def main():
         if not args.state or not args.artifact:
             raise ValueError('Missing migration identity')
         value = digest(plan, read(args.state), args.artifact, os.environ)
+        if args.check_only:
+            print('Migration policy check passed; no approval digest emitted.')
+            return
         if args.expected:
             if not re.fullmatch(r'[a-f0-9]{64}', args.expected) or args.expected != value:
                 raise ValueError('Migration approval is stale')
@@ -173,6 +185,8 @@ def main():
         if os.environ.get('GITHUB_OUTPUT'):
             with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
                 stream.write('migration_digest=' + value + '\n')
+    except MigrationPolicyError as error:
+        parser.exit(2, 'Migration plan rejected: ' + str(error) + '. Private values suppressed.\n')
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         parser.exit(2, 'Migration plan rejected; candidate/state/configuration changed or explicit recovery required. Private values suppressed.\n')
 

@@ -66,6 +66,19 @@ elif args[0]=='plan':
         self.assertNotIn('Approval digest:', result.stdout)
         self.assertFalse((output / 'relay/image.oci.tar').exists())
 
+    def test_early_check_rejects_policy_drift_without_resource_mutation(self):
+        approved = self.configure_migration()
+        approved['resource_changes'].append(PLAN.resource(
+            'cloudflare_pages_domain.live', ['update'], {'name': 'PRIVATE'}, {'name': 'OTHER_PRIVATE'}))
+        self.env.pop('TEST_PLAN_SEQUENCE', None)
+        self.env['TEST_PLAN'] = json.dumps(approved)
+        result, effects = self.run_deploy('check-migration')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('cloudflare_pages_domain.live', result.stderr)
+        self.assertNotIn('OTHER_PRIVATE', result.stderr)
+        for forbidden in ('tofu apply', 'image ', 'state archive', 'state migration-begin'):
+            self.assertNotIn(forbidden, effects)
+
     def test_fast_infrastructure_check_never_applies_or_emits_approval(self):
         self.configure_migration()
         result, effects = self.run_deploy('check-migration')
