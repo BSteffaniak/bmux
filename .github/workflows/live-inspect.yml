@@ -15,6 +15,8 @@ jobs:
     env:
       LIVE_ENVIRONMENT: production
       LIVE_STATE_REGION: auto
+      LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
+      LIVE_FLY_ORG: ${{ vars.LIVE_FLY_ORG }}
       LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       R2_STATE_ACCESS_KEY_ID: ${{ secrets.R2_STATE_ACCESS_KEY_ID }}

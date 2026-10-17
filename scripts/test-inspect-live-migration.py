@@ -45,6 +45,8 @@ class InspectTests(unittest.TestCase):
             calls.append(args)
             self.assertNotIn('R2_STATE_SECRET_ACCESS_KEY', kwargs['env'])
             self.assertNotIn('TF_CLI_ARGS', kwargs['env'])
+            if args[1:] == ['state', 'pull']:
+                return subprocess.CompletedProcess(args, 0, json.dumps({'version': 4, 'resources': []}), '')
             return subprocess.CompletedProcess(args, 0,
                 'fly_app.live\nprivate_resource.NEVER_PRINT\n'
                 if args[1] == 'state' else '', '')
@@ -55,16 +57,32 @@ class InspectTests(unittest.TestCase):
         self.assertFalse(result['managed_resources']['fly_machine.live'])
         self.assertEqual(result['migration_phase'], 'applying')
         self.assertNotIn('NEVER_PRINT', json.dumps(result))
-        self.assertEqual([args[1] for args in calls], ['init', 'state'])
+        self.assertEqual([args[1] for args in calls], ['init', 'state', 'state'])
 
     def test_reject_changed_state_and_unknown_plaintext(self):
         fake = store()
         fake.get.side_effect = [(BODY, 'etag'), (BODY, 'changed')]
         with patch.dict(os.environ, {'TOFU_STATE_ENCRYPTION_PASSPHRASE': 'private'}):
             with self.assertRaisesRegex(ValueError, 'changed'):
-                MODULE.inspect(fake, lambda *a, **k: subprocess.CompletedProcess(a, 0, '', ''))
+                MODULE.inspect(fake, lambda *a, **k: subprocess.CompletedProcess(a, 0,
+                    json.dumps({'version': 4, 'resources': []}) if a[0][1:] == ['state', 'pull'] else '', ''))
         with self.assertRaises(MODULE.STORE.StateError):
             MODULE.inspect(store(b'{"resources": []}'))
+
+    def test_tainted_app_and_identity_are_reported_without_private_values(self):
+        state = {'version': 4, 'resources': [{'mode': 'managed', 'type': 'fly_app', 'name': 'live',
+                 'instances': [{'status': 'tainted', 'attributes': {'name': 'app', 'org': 'org',
+                                'private': 'NEVER_PRINT'}}]}]}
+        result = MODULE.app_status(state, {'LIVE_FLY_APP': 'app', 'LIVE_FLY_ORG': 'org'})
+        self.assertTrue(result['tainted'])
+        self.assertTrue(result['name_matches_configuration'])
+        self.assertTrue(result['org_matches_configuration'])
+        self.assertNotIn('NEVER_PRINT', json.dumps(result))
+        state['resources'][0]['instances'][0]['status'] = 'unknown'
+        with self.assertRaises(ValueError):
+            MODULE.app_status(state, {})
+        with self.assertRaises(ValueError):
+            MODULE.app_status({'version': 99, 'resources': []}, {})
 
     @unittest.skipUnless(shutil.which('tofu'), 'OpenTofu unavailable')
     def test_real_opentofu_encrypted_local_copy(self):

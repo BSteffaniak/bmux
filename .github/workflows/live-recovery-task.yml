@@ -82,6 +82,11 @@ jobs:
           mode=preview-recovery
           if [[ "$APPLY" == true ]]; then mode=recover; fi
           bash scripts/live-deploy.sh production "$RUNNER_TEMP/live-candidate" "$mode"
+      - name: Read-only state diagnosis after recovery failure
+        if: failure()
+        env:
+          LIVE_ENVIRONMENT: production
+        run: python3 -B scripts/inspect-live-migration.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: inputs.apply
         with:

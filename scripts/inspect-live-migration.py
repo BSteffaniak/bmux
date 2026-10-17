@@ -16,6 +16,33 @@ ADDRESSES = ('fly_app.live', 'fly_machine.live', 'fly_volume.authority',
              'cloudflare_workers_deployment.live', 'cloudflare_workers_route.live')
 
 
+def app_status(state, environ):
+    if not isinstance(state, dict) or state.get('version') != 4 or not isinstance(state.get('resources'), list):
+        raise ValueError('Unsupported state schema')
+    matches = [resource for resource in state['resources']
+               if resource.get('mode') == 'managed' and resource.get('type') == 'fly_app'
+               and resource.get('name') == 'live' and not resource.get('module')]
+    if not matches:
+        return {'present': False}
+    if len(matches) != 1:
+        raise ValueError('Ambiguous managed app state')
+    instances = matches[0].get('instances')
+    if not isinstance(instances, list) or len(instances) != 1:
+        raise ValueError('Ambiguous managed app instances')
+    instance = instances[0]
+    if instance.get('deposed') or 'index_key' in instance:
+        raise ValueError('Unsupported managed app instance')
+    status = instance.get('status', 'ready')
+    if status not in ('ready', 'tainted'):
+        raise ValueError('Unknown managed app status')
+    attributes = instance.get('attributes')
+    if not isinstance(attributes, dict):
+        raise ValueError('Missing managed app attributes')
+    return {'present': True, 'tainted': status == 'tainted',
+            'name_matches_configuration': bool(environ.get('LIVE_FLY_APP')) and attributes.get('name') == environ['LIVE_FLY_APP'],
+            'org_matches_configuration': bool(environ.get('LIVE_FLY_ORG')) and attributes.get('org') == environ['LIVE_FLY_ORG']}
+
+
 def inspect(store, runner=subprocess.run):
     store.unlocked()
     marker = store.migration_marker()
@@ -48,11 +75,17 @@ def inspect(store, runner=subprocess.run):
         resources = result.stdout.splitlines()
         if any(not line or len(line) > 512 for line in resources):
             raise ValueError('Invalid state address list')
+        pulled = runner(['tofu', 'state', 'pull'], cwd=directory, env=env,
+                        capture_output=True, text=True, timeout=90)
+        if pulled.returncode:
+            raise ValueError('Local state inspection failed; raw diagnostics suppressed')
+        app = app_status(json.loads(pulled.stdout), os.environ)
     again, again_etag = store.get(store.key)
     store.unlocked()
     if body != again or etag != again_etag or marker != store.migration_marker():
         raise ValueError('Canonical state or migration marker changed during inspection')
     return {'read_only': True, 'migration_phase': marker[0]['phase'] if marker else 'absent',
+            'fly_app': app,
             'managed_resources': {address: address in resources for address in ADDRESSES}}
 
 
