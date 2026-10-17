@@ -2,6 +2,9 @@ name: Live production release
 on:
   workflow_call:
     inputs:
+      migrate:
+        type: boolean
+        default: false
       configure:
         type: boolean
         default: false
@@ -24,8 +27,33 @@ on:
     branches: [master]
     paths:
       - '.github/workflows/live-promote.yml'
+      - '.github/workflows/docs-deploy.yml'
+      - '.github/workflows/live-validation.yml'
+      - 'packages/docs-site/**'
+      - 'packages/web-renderer/**'
+      - 'packages/presenter/**'
+      - 'packages/presenter-runtime/**'
+      - 'packages/scene-protocol/**'
+      - 'packages/scene-protocol-render/**'
+      - 'packages/snapshot-protocol/**'
+      - 'packages/tui/**'
+      - 'packages/cli-schema/**'
+      - 'packages/config/**'
+      - 'packages/config-doc/**'
+      - 'packages/config-doc-derive/**'
+      - 'scripts/build-site-artifact.sh'
+      - 'scripts/build-web-renderer.sh'
+      - 'scripts/presenter-adapter.js'
+      - 'docs/**'
+      - 'README.md'
+      - 'TESTING.md'
+      - 'packages/cli/README.md'
+      - 'packages/plugin/README.md'
+      - 'examples/native-plugin/README.md'
       - 'packages/live-relay/**'
       - 'infra/live-terraform/**'
+      - 'scripts/live-migration-plan.py'
+      - 'scripts/smoke-live-broadcast.py'
       - 'scripts/build-live-artifact.sh'
       - 'scripts/live-deploy.sh'
       - 'scripts/live-plan-policy.py'
@@ -38,6 +66,11 @@ on:
       - 'Cargo.lock'
       - 'flake.lock'
   workflow_dispatch:
+    inputs:
+      migrate:
+        description: 'Preview and approve the one-way Worker to Fly migration'
+        type: boolean
+        default: false
   pull_request:
     paths: ['infra/live-**', 'scripts/*live*', '.github/workflows/live-*.yml']
 permissions:
@@ -71,16 +104,120 @@ jobs:
             ${{ runner.temp }}/live-candidate.tar.gz.sha256
           retention-days: 14
           if-no-files-found: error
+  validation:
+    if: github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    uses: ./.github/workflows/live-validation.yml
+    permissions:
+      contents: read
+  site-build:
+    if: (!inputs.configure && !inputs.retire_worker) && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '22.16.0'}
+      - name: Build same-revision complete site without deployment secrets
+        env:
+          BMUX_LIVE_ENDPOINT_ORIGIN: https://live.bmux.dev
+        run: |
+          bash scripts/dev.sh bash scripts/build-site-artifact.sh "$RUNNER_TEMP/site-candidate"
+          test "$(cat "$RUNNER_TEMP/site-candidate/REVISION")" = "$GITHUB_SHA"
+          tar -C "$RUNNER_TEMP/site-candidate" -czf "$RUNNER_TEMP/site-candidate.tar.gz" .
+          cd "$RUNNER_TEMP"
+          sha256sum site-candidate.tar.gz > site-candidate.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: site-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/site-candidate.tar.gz
+            ${{ runner.temp }}/site-candidate.tar.gz.sha256
+          retention-days: 14
+          if-no-files-found: error
+  preview:
+    if: inputs.migrate && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    needs: [build, site-build, validation]
+    # Production credentials are required for authenticated read-only canonical
+    # state/plan inspection. The explicit production-approval job follows this.
+    environment: Production
+    concurrency:
+      group: bmux-production-infrastructure
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      migration_digest: ${{ steps.preview.outputs.migration_digest }}
+    env:
+      LIVE_STATE_REGION: auto
+      R2_STATE_ACCESS_KEY_ID: ${{ secrets.R2_STATE_ACCESS_KEY_ID }}
+      R2_STATE_SECRET_ACCESS_KEY: ${{ secrets.R2_STATE_SECRET_ACCESS_KEY }}
+      TOFU_STATE_ENCRYPTION_PASSPHRASE: ${{ secrets.TOFU_STATE_ENCRYPTION_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '22.16.0'}
+      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f
+        with: {tofu_version: '1.10.9', tofu_wrapper: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: live-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/live-download
+      - name: Preview canonical migration (no apply, push, import or bootstrap)
+        id: preview
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
+          LIVE_FLY_ORG: ${{ vars.LIVE_FLY_ORG }}
+          LIVE_FLY_REGION: ${{ vars.LIVE_FLY_REGION }}
+          LIVE_METRICS_KEY_SHA256: ${{ secrets.LIVE_METRICS_KEY_SHA256 }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          LIVE_HOSTNAME: ${{ secrets.LIVE_HOSTNAME }}
+          LIVE_PAGES_PROJECT: ${{ secrets.LIVE_PAGES_PROJECT }}
+          LIVE_PUBLISHER_KEY_SHA256: ${{ secrets.LIVE_PUBLISHER_KEY_SHA256 }}
+          LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
+          LIVE_CONFIGURE: ${{ inputs.configure || false }}
+          LIVE_RETIRE_REQUESTED: ${{ inputs.retire_worker || false }}
+          LIVE_BOOTSTRAP_COMPLETION: ${{ inputs.bootstrap_completion || '' }}
+          LIVE_BOOTSTRAP_COMPLETION_SHA256: ${{ inputs.bootstrap_completion_sha256 || '' }}
+          LIVE_REVIEWED_IMPORTS: ${{ inputs.reviewed_imports || '{}' }}
+          LIVE_APPROVE_IMPORT: ${{ inputs.approve_import || false }}
+        run: |
+          set -euo pipefail
+          test "$LIVE_CONFIGURE" = false
+          test "$LIVE_RETIRE_REQUESTED" = false
+          test -z "$LIVE_BOOTSTRAP_COMPLETION$LIVE_BOOTSTRAP_COMPLETION_SHA256"
+          test "$LIVE_REVIEWED_IMPORTS" = '{}'
+          test "$LIVE_APPROVE_IMPORT" = false
+          cd "$RUNNER_TEMP/live-download"
+          sha256sum -c live-candidate.tar.gz.sha256
+          mkdir "$RUNNER_TEMP/live-candidate"
+          tar -xzf live-candidate.tar.gz -C "$RUNNER_TEMP/live-candidate"
+          test "$(cat "$RUNNER_TEMP/live-candidate/REVISION")" = "$GITHUB_SHA"
+          bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" production "$RUNNER_TEMP/live-candidate" preview-migration
   approve:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
-    needs: build
+    if: >-
+      always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
+      github.repository == 'BSteffaniak/bmux' && needs.build.result == 'success' && needs.validation.result == 'success' &&
+      ((inputs.configure || inputs.retire_worker) || needs.site-build.result == 'success') &&
+      (!inputs.migrate || needs.preview.result == 'success')
+    needs: [build, preview, validation, site-build]
     runs-on: ubuntu-24.04
     environment: production-approval
     steps:
       - run: echo 'Approved immutable BMUX production release'
   production:
-    needs: [build, approve]
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    needs: [build, approve, preview, validation]
+    if: >-
+      always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
+      github.repository == 'BSteffaniak/bmux' && needs.build.result == 'success' && needs.approve.result == 'success' &&
+      needs.validation.result == 'success' && (!inputs.migrate || needs.preview.result == 'success')
     environment: Production
     concurrency:
       group: bmux-production-infrastructure
@@ -113,7 +250,9 @@ jobs:
           LIVE_FLY_ORG: ${{ vars.LIVE_FLY_ORG }}
           LIVE_FLY_REGION: ${{ vars.LIVE_FLY_REGION }}
           LIVE_METRICS_KEY_SHA256: ${{ secrets.LIVE_METRICS_KEY_SHA256 }}
-          LIVE_RETIRE_WORKER: ${{ inputs.retire_worker && 'retire-bmux-live-worker' || '' }}
+          LIVE_RETIRE_WORKER: ${{ (inputs.retire_worker || inputs.migrate) && 'retire-bmux-live-worker' || '' }}
+          LIVE_MIGRATE: ${{ inputs.migrate || false }}
+          LIVE_MIGRATION_DIGEST: ${{ needs.preview.outputs.migration_digest }}
           LIVE_RETIRE_REQUESTED: ${{ inputs.retire_worker }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -139,6 +278,14 @@ jobs:
             test "$mode" = configure
             mode=retire-worker
           fi
+          if [[ "$LIVE_MIGRATE" == true ]]; then
+            test "$mode" = release
+            test -z "$LIVE_BOOTSTRAP_COMPLETION$LIVE_BOOTSTRAP_COMPLETION_SHA256"
+            test "$LIVE_REVIEWED_IMPORTS" = '{}'
+            test "$LIVE_APPROVE_IMPORT" = false
+            [[ "$LIVE_MIGRATION_DIGEST" =~ ^[a-f0-9]{64}$ ]]
+            mode=migrate
+          fi
           bootstrap_args=()
           if [[ -n "$LIVE_BOOTSTRAP_COMPLETION$LIVE_BOOTSTRAP_COMPLETION_SHA256" ]]; then
             test "$mode" = configure
@@ -163,3 +310,32 @@ jobs:
             bootstrap_args=(--bootstrap-completion "$RUNNER_TEMP/bmux-bootstrap-completion.json")
           fi
           bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" production "$RUNNER_TEMP/live-candidate" "$mode" "${bootstrap_args[@]}"
+  site:
+    needs: [production, site-build]
+    if: >-
+      always() && needs.production.result == 'success' && needs.site-build.result == 'success' &&
+      (!inputs.configure && !inputs.retire_worker) && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    # No caller lock; only the reusable publisher owns the Pages lock.
+    uses: ./.github/workflows/docs-deploy.yml
+    with:
+      reuse_candidate: true
+    secrets: inherit
+  migration-summary:
+    needs: [production, site]
+    if: inputs.migrate && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Public read-only backend and site smoke
+        run: |
+          set -euo pipefail
+          # Fixed public endpoints; this job receives no deployment credentials.
+          python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --relay-url https://live.bmux.dev
+          {
+            echo '### Migration public smoke'
+            echo "Revision: $GITHUB_SHA"
+            echo 'Backend and complete site public read-only smoke passed.'
+            echo 'This is not proof of a live interactive native/browser broadcast.'
+            echo 'A partial migration failure must be inspected; do not automatically retry.'
+          } >> "$GITHUB_STEP_SUMMARY"

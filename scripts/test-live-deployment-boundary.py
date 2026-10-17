@@ -32,6 +32,17 @@ class DeploymentBoundaryTests(unittest.TestCase):
                          'scripts/live-deploy.sh'):
             self.assertIn(required, source)
 
+    def test_reusable_validation_has_no_deploy_authority(self):
+        release = (ROOT / '.github/workflows/live-promote.yml').read_text()
+        validation = release.split('  validation:\n', 1)[1].split('  site-build:\n', 1)[0]
+        self.assertIn('uses: ./.github/workflows/live-validation.yml', validation)
+        for forbidden in ('secrets:', 'environment:', 'concurrency:', 'run:'):
+            self.assertNotIn(forbidden, validation)
+        docs = (ROOT / '.github/workflows/docs-deploy.yml').read_text()
+        for forbidden in ('scripts/test-', 'cargo test', 'cargo clippy', 'cargo nextest',
+                          'smoke-pty-runtime.sh', 'compat-matrix.sh', 'smoke-live-local.py'):
+            self.assertNotIn(forbidden, docs)
+
     def test_site_and_backend_have_separate_publishers(self):
         workflow = (ROOT / '.github/workflows/docs-deploy.yml').read_text()
         for forbidden in ('live-promote.yml', 'live-deploy.sh', 'R2_STATE_', 'TOFU_', 'setup-opentofu'):
@@ -53,7 +64,7 @@ class DeploymentBoundaryTests(unittest.TestCase):
         self.assertNotIn('bmux_docs_site', backend)
         release = (ROOT / '.github/workflows/live-promote.yml').read_text()
         self.assertIn('  push:', release)
-        self.assertNotIn('packages/docs-site/**', release)
+        self.assertIn('packages/docs-site/**', release)
 
     def test_site_builder_packages_complete_site_without_backend_tools(self):
         with tempfile.TemporaryDirectory() as directory:

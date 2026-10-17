@@ -12,6 +12,61 @@ Production remains blocked until an operator supplies Fly credentials/variables,
 reviews existing ownership, approves retirement, and validates the packaged image
 and runtime against the real services. Downtime is intentionally accepted.
 
+## Guided automation (recommended)
+
+After these changes are merged to `master`, run:
+
+```sh
+bash scripts/setup-live.sh --fly --repo BSteffaniak/bmux
+bash scripts/setup-live.sh --fly --repo BSteffaniak/bmux --approve
+```
+
+The first command lists missing configuration names without writing anything.
+The approved run discovers Fly organizations and current non-deprecated regions,
+asks for missing public settings, checks app-name availability, and installs only
+missing GitHub values. Existing values are preserved. You supply the Fly token
+privately and keep the separate metrics bearer key backed up independently.
+Account creation, billing authorization and token scope/expiry remain operator
+responsibilities. Installation requires explicit billing and key-backup
+acknowledgments. Do not run concurrent installers: GitHub variable/secret writes
+have no atomic create-only API.
+
+In GitHub Actions, dispatch **Live production release** on `master` with
+`migrate=true`. This is the one-time cutover, not the ordinary release button.
+The workflow builds same-revision backend/site candidates and runs isolated
+validation, then shows a read-only migration preview before approval. Review its
+resource identities/actions, downtime and paid resources. Approval is bound to
+the candidate inventory, encrypted canonical state, configuration and full private
+plan; any mismatch stops before resource effects. No plaintext plan is uploaded.
+The approved backend stages retirement, Fly app creation, image publication and
+remaining resources under the existing infrastructure lock. The separate Pages
+publisher then uploads the matching site and public smoke checks report results.
+Ordinary releases also validate and publish the matching backend/site revision.
+Standalone Docs push runs build only, preventing a premature viewer cutover;
+explicit Docs dispatch remains available for a reviewed site-only recovery.
+GitHub environment protections still apply: if `Production` itself requires
+approval, its read-only preview job may need that additional approval before
+`production-approval` displays the migration gate.
+
+A durable conditional-write marker under `migration/<canonical-state-key>.json`
+fences the one-way operation. It is an operational replay guard, **not another
+infrastructure state authority**. Completed migration cannot be rerun. If a phase
+fails or its acknowledgement is lost, the workflow stops without automatic retry
+or rollback. Preserve the marker, encrypted canonical state and archive history;
+inspect actual resources under the same infrastructure lock before a separately
+reviewed recovery. Do not delete markers, force-unlock, choose another app name,
+rebootstrap, or repeat migration to bypass an ambiguous result. A Pages failure
+after backend completion needs only the matching site publisher/review, not
+another infrastructure migration.
+
+The lower-level configure and retirement commands below remain available for
+explicitly reviewed recovery; they are not alternate automatic resume paths.
+Public smoke checks do not prove production interactive broadcasting, volume
+persistence, metrics retention or successful native installation. Install the
+matching native BMUX version and perform a deliberate publisher/viewer check
+before production acceptance. Monitoring destination/retention/alerts remain
+unprovisioned rather than silently choosing another paid service.
+
 ## Declarative ownership
 
 OpenTofu 1.10.9 owns the existing Cloudflare Pages project/domain/DNS, R2 state

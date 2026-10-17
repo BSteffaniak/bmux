@@ -7,7 +7,25 @@ ENVIRONMENT="${1:?Usage: live-deploy.sh production ARTIFACT_DIRECTORY [configure
 [[ "$ENVIRONMENT" == staging || "$ENVIRONMENT" == production ]] || exit 2
 ARTIFACT="$(cd "${2:?Artifact directory required}" && pwd)"
 MODE="${3:-release}"
-[[ "$MODE" == release || "$MODE" == configure || "$MODE" == retire-worker ]] || exit 2
+[[ "$MODE" == release || "$MODE" == configure || "$MODE" == retire-worker || "$MODE" == preview-migration || "$MODE" == migrate ]] || exit 2
+MIGRATION=false
+if [[ "$MODE" == preview-migration || "$MODE" == migrate ]]; then
+  MIGRATION=true
+  MIGRATION_PHASE=preflight
+  migration_failure() {
+    echo "Migration stopped during $MIGRATION_PHASE. Canonical encrypted state remains authoritative; inspect its archived history and migration fence before recovery. Do not blindly rerun or remove locks." >&2
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+      printf '\nMigration stopped during %s. Inspect canonical encrypted state, archive history and the migration fence before reviewed recovery. No automatic rollback or retry.\n' "$MIGRATION_PHASE" >> "$GITHUB_STEP_SUMMARY"
+    fi
+  }
+  trap migration_failure ERR
+  set -E
+  [[ "$ENVIRONMENT" == production ]] || { echo 'Migration is production-only' >&2; exit 2; }
+  [[ -z "${LIVE_BOOTSTRAP_COMPLETION:-}" && ( -z "${LIVE_REVIEWED_IMPORTS:-}" || "${LIVE_REVIEWED_IMPORTS:-}" == '{}' ) && "${LIVE_APPROVE_IMPORT:-false}" != true ]] || { echo 'Migration cannot bootstrap or adopt resources' >&2; exit 2; }
+fi
+if [[ "$MODE" == migrate ]]; then
+  [[ "${LIVE_RETIRE_WORKER:-}" == retire-bmux-live-worker && "${LIVE_MIGRATION_DIGEST:-}" =~ ^[a-f0-9]{64}$ ]] || { echo 'Exact reviewed migration approval required' >&2; exit 2; }
+fi
 if [[ "$MODE" == retire-worker ]]; then
   [[ "${LIVE_RETIRE_WORKER:-}" == retire-bmux-live-worker ]] || { echo 'Explicit reviewed Worker retirement approval required' >&2; exit 2; }
 fi
@@ -31,9 +49,9 @@ fi
 : "${TOFU_STATE_ENCRYPTION_PASSPHRASE:?Private client-side encryption passphrase required}"
 [[ -z "${LIVE_STATE_ROLE_ARN:-}${LIVE_STATE_ACCESS_KEY_ID:-}${LIVE_STATE_SECRET_ACCESS_KEY:-}" ]] || { echo 'Legacy AWS state configuration rejected; manual migration required' >&2; exit 2; }
 # Clear ambient AWS/Tofu configuration before binding the single R2 authority.
-for name in $(compgen -e); do
+while IFS= read -r name; do
   case "$name" in AWS_*|TF_*|TOFU_*) [[ "$name" == TOFU_STATE_ENCRYPTION_PASSPHRASE ]] || unset "$name" ;; esac
-done
+done < <(python3 -c 'import os; print("\n".join(k for k in os.environ if k.startswith(("AWS_", "TF_", "TOFU_")))))')
 export AWS_ACCESS_KEY_ID="$R2_STATE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_STATE_SECRET_ACCESS_KEY"
 export AWS_REGION=auto AWS_DEFAULT_REGION=auto AWS_EC2_METADATA_DISABLED=true
 export AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_PAGER=''
@@ -55,7 +73,7 @@ WORK="$(mktemp -d)"
 chmod 700 "$WORK"
 IMPORT_FILE="$ARTIFACT/infrastructure/approved-imports.tf.json"
 [[ ! -e "$IMPORT_FILE" && ! -L "$IMPORT_FILE" ]] || { echo 'Unexpected import file in immutable candidate' >&2; exit 2; }
-trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$WORK/registry-auth.json" "$IMPORT_FILE"' EXIT
+trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/approved-plan.json" "$WORK/migration-receipt.json" "$WORK/migration-source.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$WORK/registry-auth.json" "$IMPORT_FILE"' EXIT
 export TF_DATA_DIR="$WORK/tofu"
 python3 "$ROOT/scripts/live-state.py" --environment "$ENVIRONMENT" --output "$WORK/backend.json"
 export TF_VAR_environment="$ENVIRONMENT" TF_VAR_account_id="$CLOUDFLARE_ACCOUNT_ID"
@@ -69,7 +87,7 @@ cd "$ARTIFACT/infrastructure"
 run_private() {
   if ! "$@" > "$WORK/deploy.log" 2>&1; then
     echo 'Deployment operation failed; provider output suppressed. Inspect protected state before retry.' >&2
-    exit 1
+    return 1
   fi
 }
 ADMISSION_ARGS=()
@@ -79,7 +97,7 @@ if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
 fi
 python3 "$ROOT/scripts/archive-live-state.py" check "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
 run_private tofu init -input=false -lockfile=readonly -backend-config="$WORK/backend.json"
-if [[ "$MODE" == configure ]]; then
+if [[ "$MODE" == configure || "$MIGRATION" == true ]]; then
   if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
     # Only the verified admission path may have no state. Recheck the remote
     # marker-only inventory after init; do not swallow arbitrary state-list errors.
@@ -101,10 +119,14 @@ if [[ "$MODE" == configure ]]; then
     --output "$ARTIFACT/infrastructure/approved-imports.tf.json" --managed "$WORK/managed.json" \
     --imports "$WORK/imports.json" "${IMPORT_ARGS[@]}"
 fi
-if [[ "$MODE" == configure ]]; then
+if [[ "$MODE" == configure || "$MIGRATION" == true ]]; then
   python3 "$ROOT/scripts/live-fly-preflight.py" "$WORK/managed.json"
 fi
-python3 "$ROOT/scripts/archive-live-state.py" archive "${ADMISSION_ARGS[@]}" > "$WORK/archive-before.json"
+if [[ "$MIGRATION" == true ]]; then
+  python3 "$ROOT/scripts/archive-live-state.py" migration-check > "$WORK/migration-source.json"
+else
+  python3 "$ROOT/scripts/archive-live-state.py" archive "${ADMISSION_ARGS[@]}" > "$WORK/archive-before.json"
+fi
 POLICY_ARGS=()
 [[ "$MODE" == release ]] || POLICY_ARGS+=(--configure)
 if [[ "$MODE" == retire-worker ]]; then POLICY_ARGS+=(--retire-worker); fi
@@ -112,11 +134,16 @@ if [[ "$MODE" == retire-worker ]]; then POLICY_ARGS+=(--retire-worker); fi
 # the exact saved plan. Credentials remain in a private, transient auth file.
 # skopeo --preserve-digests rejects any registry rewrite of image identity.
 apply_plan() {
-  run_private tofu plan -input=false -lock-timeout=5m "$@" -out="$WORK/plan"
+  if [[ "${MIGRATION_SAVED_RETIRE:-false}" != true ]]; then
+    run_private tofu plan -input=false -lock-timeout=5m "$@" -out="$WORK/plan"
+  fi
   if ! tofu show -json "$WORK/plan" > "$WORK/plan.json" 2> "$WORK/deploy.log"; then
     echo 'Plan inspection failed; provider output suppressed' >&2; exit 1
   fi
   python3 "$ROOT/scripts/live-plan-policy.py" "$WORK/plan.json" "${POLICY_ARGS[@]}"
+  if [[ "$MIGRATION" == true ]]; then
+    python3 "$ROOT/scripts/live-migration-plan.py" "$WORK/plan.json" --approved-plan "$WORK/approved-plan.json" --stage "$MIGRATION_STAGE"
+  fi
   if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
     python3 "$ROOT/scripts/archive-live-state.py" begin "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
     BOOTSTRAP_COMPLETION=''
@@ -131,6 +158,51 @@ apply_plan() {
   run_private tofu apply -input=false -lock-timeout=5m "$WORK/plan"
   python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-after.json"
 }
+if [[ "$MIGRATION" == true ]]; then
+  # Preview the entire cutover, before any resource effect. Approval binds full
+  # private resource values but publishes only fixed addresses/actions + digest.
+  run_private tofu plan -input=false -lock-timeout=5m -out="$WORK/plan"
+  if ! tofu show -json "$WORK/plan" > "$WORK/approved-plan.json" 2> "$WORK/deploy.log"; then
+    echo 'Migration preview failed; private diagnostics suppressed' >&2; exit 1
+  fi
+  if [[ "$MODE" == preview-migration ]]; then
+    python3 "$ROOT/scripts/live-migration-plan.py" "$WORK/approved-plan.json" --state "$WORK/migration-source.json" --artifact "$ARTIFACT"
+    exit 0
+  fi
+  MIGRATION_PHASE=approval-revalidation
+  python3 "$ROOT/scripts/live-migration-plan.py" "$WORK/approved-plan.json" --state "$WORK/migration-source.json" --artifact "$ARTIFACT" --expected "$LIVE_MIGRATION_DIGEST"
+  python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-before.json"
+  source_sha256="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' "$WORK/migration-source.json")"
+  # Prepare the exact retirement saved plan before beginning. Its state serial
+  # must be the approved serial; apply never replans after the durable fence.
+  MIGRATION_STAGE=retire
+  run_private tofu plan -input=false -lock-timeout=5m -destroy -target=cloudflare_workers_route.live -target=cloudflare_workers_deployment.live -target=cloudflare_worker_version.live -target=cloudflare_worker.live -out="$WORK/plan"
+  if ! tofu show -json "$WORK/plan" > "$WORK/plan.json" 2> "$WORK/deploy.log"; then exit 1; fi
+  python3 "$ROOT/scripts/live-migration-plan.py" "$WORK/plan.json" --approved-plan "$WORK/approved-plan.json" --stage retire
+  MIGRATION_SAVED_RETIRE=true
+  MIGRATION_PHASE=begin-fence
+  python3 "$ROOT/scripts/archive-live-state.py" migration-begin --migration-digest "$LIVE_MIGRATION_DIGEST" --source-sha256 "$source_sha256" > "$WORK/migration-receipt.json"
+  MIGRATION_PHASE=worker-retirement
+  MODE=retire-worker
+  POLICY_ARGS=(--configure --retire-worker)
+  apply_plan -destroy -target=cloudflare_workers_route.live -target=cloudflare_workers_deployment.live \
+    -target=cloudflare_worker_version.live -target=cloudflare_worker.live
+  MIGRATION_SAVED_RETIRE=false
+  MIGRATION_STAGE=app
+  MIGRATION_PHASE=fly-app
+  MODE=configure
+  POLICY_ARGS=(--configure)
+  apply_plan -target=fly_app.live
+  MIGRATION_STAGE=resources
+  MIGRATION_PHASE=fly-resources
+  apply_plan
+  MIGRATION_PHASE=backend-health
+  python3 "$ROOT/scripts/smoke-live-broadcast.py" --url "https://$LIVE_HOSTNAME" --relay-url "https://${LIVE_RELAY_HOSTNAME:-live.bmux.dev}" --component backend
+  MIGRATION_PHASE=completion-fence
+  python3 "$ROOT/scripts/archive-live-state.py" migration-complete --migration-receipt "$WORK/migration-receipt.json" > "$WORK/state-check.json"
+  echo 'Backend migration completed; encrypted state archived. Matching site publisher runs next. Do not repeat migration.'
+  exit 0
+fi
 if [[ "$MODE" == retire-worker ]]; then
   # Explicitly bounded destroy. No R2, Pages, DNS, Fly, or other Workers.
   apply_plan -destroy -target=cloudflare_workers_route.live -target=cloudflare_workers_deployment.live \

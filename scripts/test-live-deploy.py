@@ -53,7 +53,12 @@ elif args[0]=='state':
  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('tofu state\\n')
  if os.environ.get('TEST_FAIL')=='state': sys.exit(1)
  print(os.environ.get('TEST_MANAGED', ''))
-elif args[0]=='show': print(os.environ['TEST_PLAN'])
+elif args[0]=='show':
+ sequence=json.loads(os.environ.get('TEST_PLAN_SEQUENCE','[]'))
+ counter=Path(os.environ['TEST_EFFECTS']+'.shows')
+ index=int(counter.read_text()) if counter.exists() else 0
+ counter.write_text(str(index+1))
+ print(json.dumps(sequence[min(index,len(sequence)-1)]) if sequence else os.environ['TEST_PLAN'])
 else:
  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('tofu '+args[0]+'\\n')
  if args[0]=='plan':
@@ -68,6 +73,8 @@ from pathlib import Path
 args=sys.argv[1:]
 if args and args[0].endswith('archive-live-state.py'):
  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('state '+args[1]+'\\n')
+ if os.environ.get('TEST_FAIL')==args[1]: sys.exit(1)
+ print(json.dumps({'sha256': os.environ.get('TEST_STATE_SHA256','f'*64)}))
 elif args and args[0].endswith('live-fly-preflight.py'):
  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('fly ownership checked\\n')
 elif args and args[0].endswith('configure-live-imports.py'):

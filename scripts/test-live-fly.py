@@ -37,32 +37,53 @@ class FlyTests(unittest.TestCase):
     def test_credentials_pipe_only_no_state_bootstrap(self):
         module = load('setup-live-fly')
         calls = []
+        variables = {'LIVE_FLY_APP': 'bmux-test', 'LIVE_FLY_ORG': 'example', 'LIVE_FLY_REGION': 'iad'}
+        secrets = set()
         def run(args, **kwargs):
             calls.append((args, kwargs))
-            return subprocess.CompletedProcess(args, 0, stdout=b'[]')
+            if args[2] == 'set':
+                secrets.add(args[3])
+                return subprocess.CompletedProcess(args, 0, stdout=b'')
+            rows = ([{'name': n, 'value': v} for n, v in variables.items()]
+                    if args[1] == 'variable' else [{'name': n} for n in secrets])
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(rows).encode())
+        discovery = {'organizations': {'nodes': [{'slug': 'example'}], 'pageInfo': {'hasNextPage': False}},
+                     'platform': {'regions': [{'code': 'iad', 'deprecated': False}]}}
         output = io.StringIO()
-        with patch.object(module.subprocess, 'run', side_effect=run), \
+        with patch.object(module, 'run_gh', side_effect=run), \
+             patch.object(module, 'graphql', side_effect=[discovery, {'appNameAvailable': True}]), \
+             patch.dict(module.os.environ, {}, clear=True), \
+             patch('builtins.input', side_effect=['BACKED UP', 'I ACKNOWLEDGE BILLING']), \
              patch.object(module.getpass, 'getpass', side_effect=['private-fly-token', 'm' * 48, 'm' * 48]), \
              patch('sys.argv', ['setup-live-fly.py', '--approve']), contextlib.redirect_stdout(output):
             module.main()
         self.assertNotIn('private-fly-token', output.getvalue())
         self.assertNotIn('m' * 48, output.getvalue())
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[1][1]['input'], b'private-fly-token')
+        writes = [(args, opts) for args, opts in calls if args[2] == 'set']
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(writes[0][1]['input'], b'private-fly-token')
         for args, _ in calls:
             self.assertNotIn('private-fly-token', args)
-            self.assertIn('Production', args)
+            if args[1] == 'secret':
+                self.assertIn('Production', args)
 
     def test_existing_credentials_unchanged(self):
         module = load('setup-live-fly')
-        result = subprocess.CompletedProcess([], 0, stdout=json.dumps([
-            {'name': 'FLY_API_TOKEN'}, {'name': 'LIVE_METRICS_KEY_SHA256'}]).encode())
-        with patch.object(module.subprocess, 'run', return_value=result) as run, \
+        def inventory(args, **kwargs):
+            rows = ([{'name': 'LIVE_FLY_APP', 'value': 'bmux-test'},
+                     {'name': 'LIVE_FLY_ORG', 'value': 'example'},
+                     {'name': 'LIVE_FLY_REGION', 'value': 'iad'}]
+                    if args[1] == 'variable' else [
+                        {'name': 'FLY_API_TOKEN'}, {'name': 'LIVE_METRICS_KEY_SHA256'}])
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(rows).encode())
+        with patch.object(module, 'run_gh', side_effect=inventory) as run, \
              patch.object(module.getpass, 'getpass') as prompt, \
+             patch.object(module, 'graphql') as network, \
              patch('sys.argv', ['setup-live-fly.py', '--approve']), contextlib.redirect_stdout(io.StringIO()):
             module.main()
-        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_count, 2)
         prompt.assert_not_called()
+        network.assert_not_called()
 
     def test_setup_wrapper_routes_fly_without_r2_bootstrap(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -15,6 +15,7 @@ on:
       - 'packages/web-renderer/**'
       - 'packages/docs-site/**'
       - 'flake.*'
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -32,6 +33,7 @@ jobs:
         with: {tofu_version: '1.10.9', tofu_wrapper: false}
       - name: Offline infrastructure and setup validation
         run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           tofu -chdir=infra/live-terraform init -backend=false -input=false -lockfile=readonly
           tofu -chdir=infra/live-terraform fmt -check
           tofu -chdir=infra/live-terraform validate
@@ -49,6 +51,11 @@ jobs:
           python3 scripts/test-live-state.py
           python3 scripts/test-archive-live-state.py
           python3 scripts/test-live-smoke.py
+          python3 scripts/test-live-migration-workflow.py
+          python3 scripts/test-live-migration-plan.py
+          python3 scripts/test-live-migration-deploy.py
+          python3 scripts/test-live-migration-fence.py
+          python3 scripts/test-live-guided-setup.py
           python3 scripts/test-live-deployment-boundary.py
           # Rust relay tests belong to workspace validation, not the retired runtime.
   acceptance:
@@ -59,16 +66,39 @@ jobs:
       - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: {node-version: '22.16.0'}
+      - name: Resolve browser from the repository locked nixpkgs input
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          chromium="$(nix build --no-link --print-out-paths --impure --expr '
+            let flake = builtins.getFlake (toString ./.);
+            in flake.inputs.nixpkgs.legacyPackages.x86_64-linux.chromium
+          ')"
+          test -x "$chromium/bin/chromium"
+          echo "LIVE_ACCEPTANCE_BROWSER=$chromium/bin/chromium" >> "$GITHUB_ENV"
       - name: Native runtime and live renderer acceptance (no deployment)
         run: |
           bash scripts/dev.sh bash -euo pipefail -c '
+            test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
             bash scripts/smoke-pty-runtime.sh
             bash scripts/compat-matrix.sh
-            BMUX_WEB_ASSET_OUTPUT="$RUNNER_TEMP/viewer" bash scripts/build-web-renderer.sh
-            cargo build --locked -p bmux-live-relay
+            bash scripts/build-site-artifact.sh "$RUNNER_TEMP/acceptance-site"
+            test "$(cat "$RUNNER_TEMP/acceptance-site/REVISION")" = "$GITHUB_SHA"
+            cargo build --locked -p bmux-live-relay -p bmux_cli
             cargo build --locked -p bmux_web_renderer --example snapshot --example wire_frame
             target_dir="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c "import json,sys; print(json.load(sys.stdin)[\"target_directory\"])")"
             "$target_dir/debug/examples/snapshot" --binary > "$RUNNER_TEMP/native-frame.bmwp"
+            version="$(cat "$RUNNER_TEMP/acceptance-site/site/live-assets/current-version")"
+            assets="$RUNNER_TEMP/acceptance-site/site/live-assets/$version"
             python3 scripts/smoke-live-local.py --relay "$target_dir/debug/bmux-live-relay" \
-              --assets "$RUNNER_TEMP/viewer" --frame "$RUNNER_TEMP/native-frame.bmwp"
+              --assets "$assets" --frame "$RUNNER_TEMP/native-frame.bmwp"
+            timeout --signal=TERM --kill-after=30s 10m python3 scripts/live-browser-acceptance.py \
+              --browser "$LIVE_ACCEPTANCE_BROWSER" --site "$RUNNER_TEMP/acceptance-site/site" \
+              --fixture "$RUNNER_TEMP/native-frame.bmwp" --relay "$target_dir/debug/bmux-live-relay" \
+              --wire-tool "$target_dir/debug/examples/wire_frame"
+            binary_sha256="$(sha256sum "$target_dir/debug/bmux" | cut -d " " -f 1)"
+            timeout --signal=TERM --kill-after=30s 15m python3 scripts/live-native-acceptance.py \
+              --browser "$LIVE_ACCEPTANCE_BROWSER" --binary "$target_dir/debug/bmux" \
+              --sha256 "$binary_sha256" --assets "$assets" --relay "$target_dir/debug/bmux-live-relay" \
+              --wire-tool "$target_dir/debug/examples/wire_frame"
           '
