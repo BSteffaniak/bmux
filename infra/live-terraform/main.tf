@@ -15,7 +15,9 @@ terraform {
 }
 
 provider "cloudflare" {} # CLOUDFLARE_API_TOKEN; never tokens in tfvars.
-provider "fly" {}        # FLY_API_TOKEN; never tokens in tfvars.
+provider "fly" {
+  org_slug = var.fly_org
+} # FLY_API_TOKEN; never tokens in tfvars.
 
 variable "environment" {
   type = string

@@ -27,6 +27,11 @@ def diagnostics(text, environ):
         message = '\n'.join(value for value in fields if isinstance(value, str))
         for secret in secrets:
             message = message.replace(secret, '[redacted]')
+        if diagnostic.get('summary') == 'Missing required argument':
+            # Schema identifiers, not supplied values: preserve this fixed error
+            # shape while all other quoted provider text stays private.
+            message = re.sub(r'The argument "([a-z][a-z0-9_]{0,63})" is required, but no definition was found\.',
+                             r'The argument \1 is required, but no definition was found.', message)
         message = re.sub(r'https?://\S+', '[redacted URL]', message)
         message = re.sub(r'"[^"\n]*"|\x1b\[[0-9;]*[A-Za-z]', '[redacted]', message)
         message = re.sub(r'(?i)(bearer\s+|(?:token|password|secret|key)\s*[=:]\s*)\S+',

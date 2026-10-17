@@ -25,6 +25,12 @@ def load(name):
 
 
 class FlyTests(unittest.TestCase):
+    def test_provider_receives_required_organization(self):
+        source = (ROOT / 'infra/live-terraform/main.tf').read_text()
+        self.assertRegex(source, r'provider "fly"\s*\{\s*org_slug\s*=\s*var\.fly_org\s*\}')
+        deploy = (ROOT / 'scripts/live-deploy.sh').read_text()
+        self.assertIn('TF_VAR_fly_org="$LIVE_FLY_ORG"', deploy)
+
     def test_required_private_volume(self):
         text = (ROOT / 'infra/live-terraform/fly.tf').read_text()
         for value in ['resource "fly_volume" "authority"', 'size_gb', 'encrypted',

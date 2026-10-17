@@ -20,6 +20,12 @@ class DiagnosticsTests(unittest.TestCase):
         for private in ('private-token', 'private-value', 'example.test'):
             self.assertNotIn(private, result)
 
+    def test_missing_schema_argument_name_is_visible(self):
+        record = {'diagnostic': {'severity': 'error', 'summary': 'Missing required argument',
+                  'detail': 'The argument "org_slug" is required, but no definition was found.'}}
+        result = MODULE.diagnostics(json.dumps(record), {})
+        self.assertIn('The argument org_slug is required', result)
+
     def test_raw_logs_and_non_errors_are_never_printed(self):
         result = MODULE.diagnostics('raw private credentials\n' + json.dumps(
             {'diagnostic': {'severity': 'warning', 'detail': 'private warning'}}), {})
