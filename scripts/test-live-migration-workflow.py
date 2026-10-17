@@ -168,6 +168,17 @@ class MigrationWorkflowTests(unittest.TestCase):
             self.assertIn('!cancelled()', source)
             self.assertIn("!inputs.migrate || needs.infrastructure-check.result == 'success'", source)
 
+    def test_backend_reuse_is_explicit_pinned_and_migration_only(self):
+        build = job(self.release, 'build')
+        self.assertIn('run-id: 39048863096', build)
+        self.assertIn('live-candidate-e84e1b69a4f59e8174e5a4ac8aa7af18f207d480', build)
+        self.assertIn('actions: read', build)
+        self.assertIn('if: inputs.reuse_backend && inputs.migrate', build)
+        self.assertIn('scripts/reuse-live-backend.py', build)
+        self.assertIn('if: ${{ !inputs.reuse_backend }}', build)
+        self.assertIn('test "$MIGRATE" = true', build)
+        self.assertEqual(self.release.count('      reuse_backend:\n'), 2)
+
     def test_every_workflow_shell_block_parses(self):
         for name in ('live-promote.yml', 'docs-deploy.yml', 'live-validation.yml', 'configure-production-infra.yml'):
             lines = workflow(name).splitlines()

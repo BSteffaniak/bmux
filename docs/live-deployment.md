@@ -41,6 +41,16 @@ Live Validation and ordinary releases still run the complete acceptance suite.
 This deliberately accepts unverified runtime risk during the cutover; verify a
 real stream immediately afterward.
 
+For temporary migration debugging, dispatch with `migrate=true` and
+`reuse_backend=true` to reuse the backend candidate from run `39048863096`.
+This skips Rust, bundled-plugin and OCI image compilation. The archive checksums
+and full source inventory are verified; product/dependency changes since that
+build reject reuse. Current infrastructure is packaged with the original image
+and native binary, and `BACKEND_SOURCE.json` records their original revision and
+archive hash. The image remains digest-pinned and is published only during the
+approved deployment. Site builds are unchanged. Reuse is opt-in, migration-only,
+and depends on that run's artifact retention; ordinary releases still rebuild.
+
 Migration runs first perform an authenticated, read-only infrastructure plan
 before compiling backend or site candidates. This check uses a synthetic image
 reference only for planning; it never uploads an image, emits an approval digest,
