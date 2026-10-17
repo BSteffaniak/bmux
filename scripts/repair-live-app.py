@@ -55,6 +55,46 @@ def publish(store, before, etag, marker, after):
     store.call('delete-object', '--key', store.key + '.tflock', '--if-match', lock_etag)
 
 
+def canonical_checks(value):
+    """Check records are identity-keyed maps serialized by OpenTofu as lists."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError('Unsupported check result schema')
+    records = []
+    identities = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError('Invalid check record')
+        identity = (item.get('object_kind'), item.get('config_addr'))
+        if any(not isinstance(part, str) or not part for part in identity) or identity in identities:
+            raise ValueError('Invalid or duplicate check identity')
+        identities.add(identity)
+        record = dict(item)
+        if record.get('objects') is not None:
+            if not isinstance(record['objects'], list):
+                raise ValueError('Unsupported check object schema')
+            addresses = set()
+            for obj in record['objects']:
+                address = obj.get('object_addr') if isinstance(obj, dict) else None
+                if not isinstance(address, str) or not address or address in addresses:
+                    raise ValueError('Invalid or duplicate check object identity')
+                addresses.add(address)
+            record['objects'] = sorted(record['objects'], key=lambda obj: obj['object_addr'])
+        records.append(record)
+    return sorted(records, key=lambda item: (item['object_kind'], item['config_addr']))
+
+
+def state_matches(after, expected):
+    # Only these map-like lists may reorder. All fields and values, including
+    # unknown fields, must otherwise match exactly; nothing is discarded.
+    left, right = dict(after), dict(expected)
+    for state in (left, right):
+        if 'check_results' in state:
+            state['check_results'] = canonical_checks(state['check_results'])
+    return left == right
+
+
 def delta_diagnostics(before, after, expected):
     """Fixed labels/booleans only: never print state values or resource addresses."""
     fields = ('version', 'terraform_version', 'serial', 'lineage', 'outputs', 'resources', 'check_results')
@@ -118,7 +158,7 @@ def repair(store, apply):
             raise ValueError('Unapproved OpenTofu writer version')
         expected['terraform_version'] = version
         print('Repair phase: verify-local-delta', flush=True)
-        if after_state != expected:
+        if not state_matches(after_state, expected):
             print(json.dumps({'local_delta_diagnostics': delta_diagnostics(state, after_state, expected)}), flush=True)
             raise ValueError('Unexpected state mutation; canonical state unchanged')
         print('Repair phase: conditional-publication', flush=True)

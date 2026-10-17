@@ -99,6 +99,59 @@ class RepairTests(unittest.TestCase):
         self.assertNotIn('NEVER_PRINT', json.dumps(result))
         self.assertNotIn('durable', json.dumps(result))
 
+    def test_check_order_is_not_a_state_change(self):
+        checks = [{'object_kind': 'var', 'config_addr': 'var.' + name, 'status': 'pass',
+                   'objects': [{'object_addr': name + suffix, 'status': 'pass'} for suffix in ('a', 'b')]}
+                  for name in ('one', 'two')]
+        before = dict(self.state(), check_results=checks)
+        after = json.loads(json.dumps(before))
+        after['check_results'].reverse()
+        for record in after['check_results']:
+            record['objects'].reverse()
+        self.assertTrue(M.state_matches(after, before))
+        after['check_results'][0]['objects'][0]['status'] = 'fail'
+        self.assertFalse(M.state_matches(after, before))
+        after['check_results'] = []
+        self.assertFalse(M.state_matches(after, before))
+        after['check_results'] = [checks[0], checks[0]]
+        with self.assertRaises(ValueError):
+            M.state_matches(after, before)
+        duplicate_objects = json.loads(json.dumps(checks))
+        duplicate_objects[0]['objects'] *= 2
+        with self.assertRaises(ValueError):
+            M.canonical_checks(duplicate_objects)
+        for invalid in ({}, [None], [{'object_kind': 'var'}]):
+            with self.assertRaises(ValueError):
+                M.canonical_checks(invalid)
+
+    def test_real_opentofu_serialize_check_maps(self):
+        import shutil
+        import tempfile
+        if not shutil.which('tofu'):
+            self.skipTest('OpenTofu unavailable')
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = self.state()
+            state['terraform_version'] = '1.10.9'
+            state['lineage'] = 'a9d196d0-4db9-4d04-9ef4-950062a401ec'
+            state['resources'][0]['provider'] = 'provider["registry.opentofu.org/ampbase/fly"]'
+            state['resources'][0]['instances'][0]['schema_version'] = 0
+            state['outputs'] = {}
+            state['check_results'] = [{'object_kind': 'var', 'config_addr': 'var.check_' + str(i),
+                                      'status': 'pass', 'objects': [{'object_addr': 'var.check_' + str(i),
+                                                                   'status': 'pass'}]} for i in range(8)]
+            (directory / 'terraform.tfstate').write_text(json.dumps(state))
+            def run(*args):
+                return M.subprocess.run(['tofu', *args], cwd=directory, capture_output=True,
+                                        text=True, check=True, timeout=90).stdout
+            before = json.loads(run('state', 'pull'))
+            run('untaint', '-no-color', 'fly_app.live')
+            expected = json.loads(json.dumps(before))
+            expected['serial'] += 1
+            expected['resources'][0]['instances'][0].pop('status')
+            for _ in range(4):
+                self.assertTrue(M.state_matches(json.loads(run('state', 'pull')), expected))
+
     def test_changed_authority_retains_lock(self):
         for change in ('etag', 'marker', 'write'):
             store = self.store()
