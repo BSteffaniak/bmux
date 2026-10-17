@@ -27,6 +27,7 @@ pub mod image;
 pub mod image_scene;
 #[cfg(feature = "crossterm")]
 pub mod inline;
+pub mod inline_output;
 pub mod input;
 pub mod interaction;
 pub mod layout;

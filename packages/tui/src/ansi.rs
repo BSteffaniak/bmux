@@ -1,5 +1,8 @@
 //! ANSI terminal backend helpers.
 
+mod log;
+pub use log::AnsiLog;
+
 use std::io::{self, Write};
 
 use crate::buffer::Buffer;
