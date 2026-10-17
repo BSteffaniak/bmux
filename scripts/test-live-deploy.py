@@ -102,6 +102,23 @@ else:
         self.assertNotIn('private-secret', result.stdout + result.stderr)
         return result, self.log.read_text() if self.log.exists() else ''
 
+    def test_ambient_configuration_is_cleared_before_binding_state(self):
+        source = (ROOT / 'scripts/live-deploy.sh').read_text()
+        cleanup = source.split('# Clear ambient AWS/Tofu configuration', 1)[1]
+        cleanup = cleanup.split('\n', 1)[1].split('\nexport AWS_ACCESS_KEY_ID=', 1)[0]
+        probe = '''
+for name in AWS_SESSION_TOKEN TF_CLI_ARGS TOFU_TEST_OVERRIDE; do
+  [[ ! -v "$name" ]] || exit 1
+done
+[[ "$TOFU_STATE_ENCRYPTION_PASSPHRASE" == private-encryption-passphrase ]]
+'''
+        env = dict(self.env, TF_CLI_ARGS='-lock=false', TOFU_TEST_OVERRIDE='ambient',
+                   TOFU_STATE_ENCRYPTION_PASSPHRASE='private-encryption-passphrase')
+        result = subprocess.run([shutil.which('bash'), '-euc', cleanup + probe],
+                                env=env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, '')
+
     def test_release_uses_r2_and_smokes_backend_without_pages(self):
         result, effects = self.run_deploy()
         self.assertEqual(result.returncode, 0, result.stderr)

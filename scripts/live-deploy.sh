@@ -49,9 +49,11 @@ fi
 : "${TOFU_STATE_ENCRYPTION_PASSPHRASE:?Private client-side encryption passphrase required}"
 [[ -z "${LIVE_STATE_ROLE_ARN:-}${LIVE_STATE_ACCESS_KEY_ID:-}${LIVE_STATE_SECRET_ACCESS_KEY:-}" ]] || { echo 'Legacy AWS state configuration rejected; manual migration required' >&2; exit 2; }
 # Clear ambient AWS/Tofu configuration before binding the single R2 authority.
+ambient_config_names="$(python3 -c 'import os; print("\n".join(k for k in os.environ if k.startswith(("AWS_", "TF_", "TOFU_"))))')"
 while IFS= read -r name; do
   case "$name" in AWS_*|TF_*|TOFU_*) [[ "$name" == TOFU_STATE_ENCRYPTION_PASSPHRASE ]] || unset "$name" ;; esac
-done < <(python3 -c 'import os; print("\n".join(k for k in os.environ if k.startswith(("AWS_", "TF_", "TOFU_")))))')
+done <<< "$ambient_config_names"
+unset ambient_config_names
 export AWS_ACCESS_KEY_ID="$R2_STATE_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_STATE_SECRET_ACCESS_KEY"
 export AWS_REGION=auto AWS_DEFAULT_REGION=auto AWS_EC2_METADATA_DISABLED=true
 export AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null AWS_PAGER=''

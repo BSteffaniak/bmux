@@ -163,6 +163,26 @@ class Tests(unittest.TestCase):
                 MODULE.Cloudflare('SECRET_TOKEN', Opener([answer])).listing('test')
             self.assertNotIn('SECRET_TOKEN', str(error.exception))
 
+    def test_r2_cursor_metadata_without_page_size_echo(self):
+        endpoint = f'accounts/{ACCOUNT}/r2/buckets'
+        first = [{'name': str(i)} for i in range(10)]
+        for terminal in ({}, {'cursor': ''}, {'cursor': None}, {'per_page': 10}):
+            with self.subTest(terminal=terminal):
+                opener = Opener([
+                    {'success': True, 'result': {'buckets': first},
+                     'result_info': {'cursor': 'next+/='}},
+                    {'success': True, 'result': {'buckets': [{'name': 'last'}]},
+                     'result_info': terminal},
+                ])
+                self.assertEqual(len(MODULE.Cloudflare('SECRET_TOKEN', opener).listing(endpoint)), 11)
+                self.assertIn('cursor=next%2B%2F%3D', opener.requests[1][0].full_url)
+        for info in ({}, {'cursor': ''}, {'cursor': None}, {'cursor': 42},
+                     {'cursor': 'x', 'per_page': True}, {'cursor': 'x', 'per_page': '10'}):
+            with self.subTest(invalid=info), self.assertRaises(MODULE.ImportErrorSafe):
+                MODULE.Cloudflare('SECRET_TOKEN', Opener([
+                    {'success': True, 'result': {'buckets': first}, 'result_info': info},
+                ])).listing(endpoint)
+
     def test_endpoint_specific_pagination_contracts(self):
         endpoint = f'accounts/{ACCOUNT}/r2/buckets'
         answers = [

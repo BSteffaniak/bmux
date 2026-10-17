@@ -136,14 +136,17 @@ class Cloudflare:
                 if len(items) >= size:
                     raise ImportErrorSafe('R2 pagination completeness unavailable')
                 return items, None
-            if not isinstance(info, dict) or info.get('per_page') != size:
+            # R2 cursor metadata need not echo the requested page size.
+            # Validate an echo when present; do not require numbered-page fields.
+            if not isinstance(info, dict) or ('per_page' in info and
+                    (type(info['per_page']) is not int or info['per_page'] != size)):
                 raise ImportErrorSafe('Invalid R2 cursor metadata')
             next_cursor = info.get('cursor')
             if next_cursor is not None and (not isinstance(next_cursor, str) or len(next_cursor) > 4096):
                 raise ImportErrorSafe('Invalid R2 cursor')
             if len(items) > size:
                 raise ImportErrorSafe('Oversized R2 page')
-            if items and not next_cursor:
+            if len(items) >= size and not next_cursor:
                 raise ImportErrorSafe('R2 pagination completeness unavailable')
             return items, next_cursor or None
         if info is None:
