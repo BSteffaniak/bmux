@@ -47,6 +47,45 @@ class RepairTests(unittest.TestCase):
         store.call.assert_called_once_with('delete-object', '--key', 'canonical.tflock',
                                           '--if-match', '"' + 'a' * 32 + '"')
 
+    def test_repair_exact_delta_with_writer_version_stamp(self):
+        import os
+        from unittest.mock import patch
+        state = self.state()
+        state['terraform_version'] = '1.10.8'
+        after = json.loads(json.dumps(state))
+        after['serial'] += 1
+        after['terraform_version'] = '1.10.9'
+        after['resources'][0]['instances'][0].pop('status')
+        store = self.store()
+        store.migration_marker.return_value = ({'phase': 'applying'}, 'marker-etag')
+        calls = []
+        def runner(args, **kwargs):
+            calls.append(args)
+            output = ''
+            if args[1:] == ['state', 'pull']:
+                output = json.dumps(after if any('untaint' in call for call in calls) else state)
+            elif args[1:] == ['version', '-json']:
+                output = json.dumps({'terraform_version': '1.10.9'})
+            return M.subprocess.CompletedProcess(args, 0, output, '')
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = json.dumps({'name': 'app', 'id': 'durable',
+                                                'organization': {'slug': 'canonical'}}).encode()
+        with patch.dict(os.environ, {'LIVE_FLY_APP': 'app', 'LIVE_FLY_ORG': 'canonical',
+                                    'FLY_API_TOKEN': 'test', 'TOFU_STATE_ENCRYPTION_PASSPHRASE': 'test'}), \
+                patch.object(M.subprocess, 'run', side_effect=runner), \
+                patch.object(M.urllib.request, 'urlopen', return_value=response), \
+                patch.object(M, 'publish') as publish:
+            self.assertTrue(M.repair(store, True)['changed'])
+            publish.assert_called_once()
+            after['resources'][0]['instances'][0]['attributes']['id'] = 'unexpected'
+            publish.reset_mock()
+            calls.clear()
+            with self.assertRaisesRegex(ValueError, 'Unexpected state mutation'):
+                M.repair(store, True)
+            publish.assert_not_called()
+
     def test_changed_authority_retains_lock(self):
         for change in ('etag', 'marker', 'write'):
             store = self.store()

@@ -91,6 +91,7 @@ def repair(store, apply):
         tainted = verify(state, live, os.environ['LIVE_FLY_APP'], os.environ['LIVE_FLY_ORG'])
         if not apply or not tainted:
             return {'verified_durable_identity': True, 'tainted': tainted, 'changed': False}
+        print('Repair phase: local-untaint', flush=True)
         run('untaint', '-no-color', 'fly_app.live')
         after_state = json.loads(run('state', 'pull'))
         expected = json.loads(json.dumps(state))
@@ -98,8 +99,17 @@ def repair(store, apply):
                         and r.get('type') == 'fly_app' and r.get('name') == 'live' and not r.get('module'))
         resource['instances'][0].pop('status', None)
         expected['serial'] += 1
+        # OpenTofu stamps the writer version even when the input state came
+        # from another compatible release. Validate it against the actual tool,
+        # never against an arbitrary value supplied by the changed state.
+        version = json.loads(run('version', '-json'))['terraform_version']
+        if version != '1.10.9':
+            raise ValueError('Unapproved OpenTofu writer version')
+        expected['terraform_version'] = version
+        print('Repair phase: verify-local-delta', flush=True)
         if after_state != expected:
             raise ValueError('Unexpected state mutation; canonical state unchanged')
+        print('Repair phase: conditional-publication', flush=True)
         publish(store, before, etag, marker, path.read_bytes())
         return {'verified_durable_identity': True, 'tainted': False, 'changed': True}
 
