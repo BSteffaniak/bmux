@@ -37,6 +37,26 @@ def evidence():
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_acme_diagnostics_identify_normalization_without_values(self):
+        before = {'name': '_acme-challenge.private.example', 'content': 'private.flydns.net',
+                  'type': 'CNAME', 'ttl': 60, 'zone_id': 'PRIVATE_ZONE'}
+        after = dict(before, content='private.flydns.net.')
+        report = M.acme_diagnostics({'before': before, 'after': after,
+                                     'after_unknown': {'modified_on': True}})
+        self.assertTrue(report['changed_fields']['content'])
+        self.assertFalse(report['changed_fields']['name'])
+        self.assertTrue(report['content_trailing_dot_only'])
+        self.assertTrue(report['unknown_fields']['modified_on'])
+        self.assertNotIn('private', json.dumps(report).lower())
+        self.assertNotIn('PRIVATE_ZONE', json.dumps(report))
+        after['content'] = 'other.example'
+        self.assertFalse(M.acme_diagnostics({'before': before, 'after': after})['content_dns_equivalent'])
+        candidate = plan()
+        candidate['resource_changes'].append(FIX.resource('cloudflare_dns_record.relay_acme',
+                                                         ['update'], before, after))
+        with self.assertRaises(ValueError):
+            M.validate(candidate)
+
     def test_plan_diagnostics_exclude_private_values(self):
         candidate = plan()
         candidate['resource_changes'].append(FIX.resource('PRIVATE_ADDRESS', ['PRIVATE_ACTION'],

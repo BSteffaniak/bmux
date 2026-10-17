@@ -45,6 +45,36 @@ def validate(plan):
     return resources
 
 
+def acme_diagnostics(change):
+    """Report fixed field labels and normalization evidence, never DNS/state values."""
+    before, after = change.get('before'), change.get('after')
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return {'invalid_record': True}
+    fields = ('name', 'content', 'type', 'ttl', 'proxied', 'zone_id', 'id',
+              'comment', 'tags', 'settings', 'data', 'priority', 'meta',
+              'created_on', 'modified_on', 'proxiable', 'tags_modified_on', 'comment_modified_on')
+    changed = {key: (key in before) != (key in after) or before.get(key) != after.get(key)
+               for key in fields}
+    def dns_equivalent(key):
+        left, right = before.get(key), after.get(key)
+        return (isinstance(left, str) and isinstance(right, str)
+                and left.rstrip('.').lower() == right.rstrip('.').lower())
+    unknown = change.get('after_unknown', {})
+    return {'changed_fields': changed,
+            'other_fields_changed': {k: v for k, v in before.items() if k not in fields}
+                                    != {k: v for k, v in after.items() if k not in fields},
+            'name_dns_equivalent': dns_equivalent('name'),
+            'content_dns_equivalent': dns_equivalent('content'),
+            'name_trailing_dot_only': isinstance(before.get('name'), str)
+                                     and isinstance(after.get('name'), str)
+                                     and before['name'].rstrip('.') == after['name'].rstrip('.'),
+            'content_trailing_dot_only': isinstance(before.get('content'), str)
+                                        and isinstance(after.get('content'), str)
+                                        and before['content'].rstrip('.') == after['content'].rstrip('.'),
+            'unknown_fields': {key: bool(unknown.get(key)) for key in fields}
+                              if isinstance(unknown, dict) else {'invalid': True}}
+
+
 def plan_diagnostics(plan):
     """Only allowlisted addresses/actions and booleans; no provider/state values."""
     known = PLAN.POLICY.CONFIGURE_RESOURCES | PLAN.POLICY.WORKER_RESOURCES
@@ -62,9 +92,12 @@ def plan_diagnostics(plan):
             rows.append({'invalid_change': True})
             continue
         raw = change.get('actions')
-        rows.append({'address': item.get('address') if item.get('address') in known else 'unknown',
-                     'actions': raw if isinstance(raw, list) and all(a in actions for a in raw) else ['unknown'],
-                     'importing': bool(change.get('importing')), 'deposed': bool(item.get('deposed'))})
+        row = {'address': item.get('address') if item.get('address') in known else 'unknown',
+               'actions': raw if isinstance(raw, list) and all(a in actions for a in raw) else ['unknown'],
+               'importing': bool(change.get('importing')), 'deposed': bool(item.get('deposed'))}
+        if item.get('address') == 'cloudflare_dns_record.relay_acme':
+            row['field_diagnostics'] = acme_diagnostics(change)
+        rows.append(row)
     return {'errored': bool(plan.get('errored')), 'incomplete': plan.get('complete') is False,
             'deferred': bool(plan.get('deferred_changes')), 'changes': rows}
 
