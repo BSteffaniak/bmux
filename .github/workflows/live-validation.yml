@@ -62,6 +62,7 @@ jobs:
           python3 scripts/test-live-migration-plan.py
           python3 scripts/test-live-migration-deploy.py
           python3 scripts/test-live-migration-fence.py
+          python3 scripts/test-live-migration-recovery.py
           python3 scripts/test-inspect-live-migration.py
           python3 scripts/test-live-guided-setup.py
           python3 scripts/test-live-deployment-boundary.py

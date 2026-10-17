@@ -7,9 +7,9 @@ ENVIRONMENT="${1:?Usage: live-deploy.sh production ARTIFACT_DIRECTORY [configure
 [[ "$ENVIRONMENT" == staging || "$ENVIRONMENT" == production ]] || exit 2
 ARTIFACT="$(cd "${2:?Artifact directory required}" && pwd)"
 MODE="${3:-release}"
-[[ "$MODE" == release || "$MODE" == configure || "$MODE" == retire-worker || "$MODE" == preview-migration || "$MODE" == check-migration || "$MODE" == migrate ]] || exit 2
+[[ "$MODE" == release || "$MODE" == configure || "$MODE" == retire-worker || "$MODE" == preview-migration || "$MODE" == check-migration || "$MODE" == migrate || "$MODE" == preview-recovery || "$MODE" == recover ]] || exit 2
 MIGRATION=false
-if [[ "$MODE" == preview-migration || "$MODE" == check-migration || "$MODE" == migrate ]]; then
+if [[ "$MODE" == preview-migration || "$MODE" == check-migration || "$MODE" == migrate || "$MODE" == preview-recovery || "$MODE" == recover ]]; then
   MIGRATION=true
   MIGRATION_PHASE=preflight
   migration_failure() {
@@ -28,6 +28,11 @@ if [[ "$MODE" == migrate ]]; then
 fi
 if [[ "$MODE" == retire-worker ]]; then
   [[ "${LIVE_RETIRE_WORKER:-}" == retire-bmux-live-worker ]] || { echo 'Explicit reviewed Worker retirement approval required' >&2; exit 2; }
+fi
+RECOVERY=false
+if [[ "$MODE" == preview-recovery || "$MODE" == recover ]]; then
+  RECOVERY=true
+  [[ "$MODE" != recover || "${LIVE_RECOVERY_DIGEST:-}" =~ ^[a-f0-9]{64}$ ]] || { echo 'Reviewed recovery digest required' >&2; exit 2; }
 fi
 BOOTSTRAP_COMPLETION=''
 if [[ $# -gt 3 ]]; then
@@ -77,7 +82,7 @@ IMPORT_FILE="$ARTIFACT/infrastructure/approved-imports.tf.json"
 PRESERVE_FILE="$ARTIFACT/infrastructure/migration-retention_override.tf.json"
 [[ ! -e "$PRESERVE_FILE" && ! -L "$PRESERVE_FILE" ]] || { echo 'Unexpected migration override in immutable candidate' >&2; exit 2; }
 [[ ! -e "$IMPORT_FILE" && ! -L "$IMPORT_FILE" ]] || { echo 'Unexpected import file in immutable candidate' >&2; exit 2; }
-trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/approved-plan.json" "$WORK/migration-receipt.json" "$WORK/migration-source.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$WORK/registry-auth.json" "$IMPORT_FILE" "$PRESERVE_FILE"' EXIT
+trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/approved-plan.json" "$WORK/migration-receipt.json" "$WORK/migration-source.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$WORK/recovery.json" "$WORK/registry-auth.json" "$IMPORT_FILE" "$PRESERVE_FILE"' EXIT
 export TF_DATA_DIR="$WORK/tofu"
 python3 "$ROOT/scripts/live-state.py" --environment "$ENVIRONMENT" --output "$WORK/backend.json"
 export TF_VAR_environment="$ENVIRONMENT" TF_VAR_account_id="$CLOUDFLARE_ACCOUNT_ID"
@@ -139,7 +144,9 @@ fi
 if [[ "$MODE" == configure || "$MIGRATION" == true ]]; then
   python3 "$ROOT/scripts/live-fly-preflight.py" "$WORK/managed.json"
 fi
-if [[ "$MIGRATION" == true ]]; then
+if [[ "$RECOVERY" == true ]]; then
+  python3 "$ROOT/scripts/live-migration-recovery.py" snapshot --evidence "$WORK/recovery.json"
+elif [[ "$MIGRATION" == true ]]; then
   python3 "$ROOT/scripts/archive-live-state.py" migration-check > "$WORK/migration-source.json"
 else
   python3 "$ROOT/scripts/archive-live-state.py" archive "${ADMISSION_ARGS[@]}" > "$WORK/archive-before.json"
@@ -175,6 +182,28 @@ apply_plan() {
   run_private tofu apply -json -input=false -lock-timeout=5m "$WORK/plan"
   python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-after.json"
 }
+if [[ "$RECOVERY" == true ]]; then
+  MIGRATION_PHASE=recovery-plan
+  run_private tofu plan -json -input=false -lock-timeout=5m -out="$WORK/plan"
+  run_private tofu show -json "$WORK/plan"
+  cp "$WORK/deploy.log" "$WORK/plan.json"
+  RECOVERY_ARGS=()
+  [[ "$MODE" != recover ]] || RECOVERY_ARGS+=(--expected "$LIVE_RECOVERY_DIGEST")
+  python3 "$ROOT/scripts/live-migration-recovery.py" plan --evidence "$WORK/recovery.json" --plan "$WORK/plan.json" --artifact "$ARTIFACT" "${RECOVERY_ARGS[@]}"
+  [[ "$MODE" != preview-recovery ]] || exit 0
+  python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-before.json"
+  printf '%s' "$FLY_API_TOKEN" | run_private skopeo login --authfile "$WORK/registry-auth.json" --username x --password-stdin registry.fly.io
+  run_private skopeo copy --authfile "$WORK/registry-auth.json" --preserve-digests "oci-archive:$ARTIFACT/relay/image.oci.tar" "docker://$LIVE_RELAY_IMAGE"
+  python3 "$ROOT/scripts/live-migration-recovery.py" verify --evidence "$WORK/recovery.json"
+  MIGRATION_PHASE=recovery-resources
+  run_private tofu apply -json -input=false -lock-timeout=5m "$WORK/plan"
+  python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-after.json"
+  MIGRATION_PHASE=recovery-health
+  python3 "$ROOT/scripts/smoke-live-broadcast.py" --url "https://$LIVE_HOSTNAME" --relay-url "https://${LIVE_RELAY_HOSTNAME:-live.bmux.dev}" --component backend
+  MIGRATION_PHASE=recovery-completion
+  python3 "$ROOT/scripts/live-migration-recovery.py" complete --evidence "$WORK/recovery.json"
+  exit 0
+fi
 if [[ "$MIGRATION" == true ]]; then
   # Preview the entire cutover, before any resource effect. Approval binds full
   # private resource values but publishes only fixed addresses/actions + digest.

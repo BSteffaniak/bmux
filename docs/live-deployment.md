@@ -1,5 +1,24 @@
 # Live production deployment
 
+## Recover an inspected partial cutover
+
+Run `gh workflow run live-recover.yml --repo BSteffaniak/bmux --ref master`
+after pushing the recovery workflow. It reuses both pinned artifacts without
+compilation and previews missing relay resources. Approve `production-approval`
+only after reviewing that preview. Recovery requires an existing managed Fly app,
+no remaining Worker resources, and the original `applying` migration marker.
+The approval digest binds current encrypted state, marker identity/ETag, candidate
+inventory, configuration and plan. Recovery permits only missing relay-resource
+creation; no imports, app recreation, deletion, state reset or marker clearing.
+
+After applying the saved plan under normal locking, backend health must pass
+before the original marker is conditionally completed. The site publishes only
+after recovery succeeds. Apply/health failures retain the applying marker; inspect
+state before another explicit recovery preview. Completed migrations cannot use
+recovery. If only site publication fails after completion, retry the site workflow,
+not backend recovery. `live-inspect.yml` remains the read-only inspection command.
+
+
 ## End state and source-ready status
 
 The backend is one event-driven Rust `bmux-live-relay` process on Fly, not a
