@@ -122,6 +122,7 @@
             codeql
             python3
             gh
+            hcloud
             liveOpenTofu
           ];
 
