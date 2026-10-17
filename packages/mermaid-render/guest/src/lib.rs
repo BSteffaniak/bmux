@@ -34,8 +34,7 @@ pub unsafe extern "C" fn render(ptr: u32, len: u32) -> u64 {
             static FONT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
             FONT.get_or_init(|| {
                 mermaid_rs_renderer::set_text_measurement_font(
-                    include_bytes!("../../../fonts/assets/diagram/BmuxDiagram-Regular.ttf")
-                        .to_vec(),
+                    include_bytes!("../BmuxDiagram-Regular.ttf").to_vec(),
                     0,
                 )
                 .map_err(|error| error.to_string())

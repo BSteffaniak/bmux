@@ -6,8 +6,11 @@ snapshot, or worker-path environment override.
 
 ## Build and deployment
 
-Ordinary Cargo builds compile the independently locked guest and embed portable
-WASM plus destination-baseline AOT artifacts. The selected compiler must include
+Ordinary Cargo builds stage the independently locked guest under `OUT_DIR`, compile
+it, and embed portable WASM plus destination-baseline AOT artifacts. Guest
+`Cargo.toml.in` and `Cargo.lock.in` are shipped as templates so Cargo does not
+exclude the sources as a nested package. The build obtains the canonical diagram
+font from `bmux_fonts`, not a sibling checkout directory. The selected compiler must include
 `wasm32-unknown-unknown`. Cranelift destination backends are enabled for release
 cross-compilation. No runtime guest file, Rust toolchain, network connection or
 helper executable is required on deployed machines.
@@ -47,6 +50,9 @@ info diagnostic; timeout/source/output/memory budgets remain enforced. Minor nat
 See `guest/README.md` for fork and font provenance.
 
 ## Verification and measurements
+
+Run `cargo package -p bmux_mermaid_render --allow-dirty` to verify the registry
+archive in Cargo's extracted package directory without sibling sources.
 
 Run `cargo nextest run -p bmux_mermaid_render --no-fail-fast` for ABI, limits,
 interruption, destination AOT and worker-free relocated executable tests.

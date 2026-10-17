@@ -6,6 +6,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use bmux_fonts::DIAGRAM_FONT;
+
+mod guest_build;
 mod wasm_config;
 
 const TARGET: &str = "wasm32-unknown-unknown";
@@ -26,9 +29,10 @@ fn build() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("missing manifest dir")?);
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing OUT_DIR")?);
-    let guest = manifest_dir.join("guest");
-    watch_tree(&manifest_dir.join("../fonts/assets/diagram"))?;
-    watch_tree(&guest)?;
+    let guest_inputs = manifest_dir.join("guest");
+    watch_tree(&guest_inputs)?;
+    let guest = out_dir.join("guest");
+    guest_build::prepare(&guest_inputs, &guest, DIAGRAM_FONT)?;
     watch_tree(&manifest_dir.join("wasm_config.rs"))?;
     let destination_target = env::var("TARGET")?;
     println!("cargo:rustc-env=BMUX_MERMAID_WASM_TARGET={destination_target}");

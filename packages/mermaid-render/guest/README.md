@@ -1,19 +1,15 @@
 # Portable Mermaid guest
 
-This standalone workspace is a concrete build input of `../build.rs`, not a
-runtime package. Ordinary host builds with feature `wasm` compile its locked
-release artifact for `wasm32-unknown-unknown` and embed `OUT_DIR/mermaid.wasm`.
+The guest workspace is materialized under `OUT_DIR/guest` from `Cargo.toml.in`,
+`Cargo.lock.in`, and `src/lib.rs`. Templates prevent Cargo from excluding it as a
+nested package from the published archive. Ordinary native host builds compile
+its locked release artifact for `wasm32-unknown-unknown` and embed
+`OUT_DIR/mermaid.wasm`.
 The build also precompiles epoch-only and fuel-enabled AOT artifacts for Cargo's
 explicit destination `TARGET`, using `wasm_config.rs` shared with the runtime.
-Cross-architecture AOT is currently rejected explicitly: this prototype enables
-only Wasmtime's host compiler backend. Enabling Wasmtime 38.0.4 `all-arch` hit an
-unpublished `winch-codegen =38.0.4` dependency during resolution; it is not enabled.
-Build and runtime still share explicit destination-baseline settings. Platform
-execution and cross-architecture packaging require separate validation.
-Without that feature the build script does not invoke guest Cargo. No target,
-compiler, font, or renderer is installed/downloaded by the build script. Cargo
-retains its normal offline/cache/registry behavior; offline builds require the
-locked registry dependencies already cached.
+Browser (`wasm32`) host builds skip the nested guest. No target, compiler, font,
+or renderer is installed by the build script. Cargo retains its normal
+network/offline/cache behavior; offline builds require locked dependencies cached.
 
 ## Isolation exception
 
@@ -41,7 +37,8 @@ length. Panics/resource exhaustion trap and must be handled by the host.
 The guest consumes <https://github.com/BSteffaniak/mermaid-rs-renderer>, branch
 `wasm-portability`. Cargo.lock retains the exact resolved commit (currently
 `7c06c9ab2c69da15f356ccfc5c27d1b77f59bec4`). Advance it explicitly with
-`cargo update --manifest-path packages/mermaid-render/guest/Cargo.toml -p mermaid-rs-renderer`;
+`cargo update --manifest-path "$OUT_DIR/guest/Cargo.toml" -p mermaid-rs-renderer`
+after a host build, then copy the updated lockfile back to `Cargo.lock.in`;
 ordinary locked builds do not automatically follow branch updates.
 It is based on upstream release 0.3.1 commit
 `2f993bd79a55235eb59a34d807852276ba25bea7`; no unrelated master updates are included.
@@ -61,8 +58,9 @@ runtime policy need not change. No upstream PR has been created.
 
 ## Font provenance and fidelity
 
-The guest and presenter use identical `packages/fonts/assets/diagram/BmuxDiagram-Regular.ttf`
-bytes. The guest explicitly sets its SVG theme family to `BMUX Diagram`; the
+The guest and presenter use identical `bmux_fonts::DIAGRAM_FONT`
+bytes. The host build stages those bytes with the guest sources; no sibling
+checkout path or host-crate dependency is needed inside the guest. The guest explicitly sets its SVG theme family to `BMUX Diagram`; the
 presenter selects that regular face for measurement-compatible label painting.
 The derived font includes technical-label alphabets plus monochrome symbols and
 emoji. See `packages/fonts/assets/diagram/README.md` for pinned inputs, hashes,
@@ -76,8 +74,8 @@ owner-prepared SVG; they do not execute a nested Wasmtime runtime.
 ## Validation
 
 ```sh
-CARGO_TARGET_DIR="$OUT_DIR/guest-target" cargo clippy --manifest-path packages/mermaid-render/guest/Cargo.toml --target wasm32-unknown-unknown --release --locked --offline --all-targets -- -D warnings
-CARGO_TARGET_DIR="$OUT_DIR/guest-target" cargo build --manifest-path packages/mermaid-render/guest/Cargo.toml --target wasm32-unknown-unknown --release --locked --offline
+CARGO_TARGET_DIR="$OUT_DIR/guest-target" cargo clippy --manifest-path "$OUT_DIR/guest/Cargo.toml" --target wasm32-unknown-unknown --release --locked --offline --all-targets -- -D warnings
+CARGO_TARGET_DIR="$OUT_DIR/guest-target" cargo build --manifest-path "$OUT_DIR/guest/Cargo.toml" --target wasm32-unknown-unknown --release --locked --offline
 node packages/mermaid-render/guest/tests/abi.cjs "$OUT_DIR/guest-target/wasm32-unknown-unknown/release/bmux_mermaid_guest.wasm"
 ```
 
