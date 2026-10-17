@@ -86,6 +86,19 @@ class RepairTests(unittest.TestCase):
                 M.repair(store, True)
             publish.assert_not_called()
 
+    def test_delta_diagnostics_never_exposes_state_values_or_unknown_keys(self):
+        before = self.state()
+        after = json.loads(json.dumps(before))
+        after['PRIVATE_KEY_NEVER_PRINT'] = 'SECRET_NEVER_PRINT'
+        after['serial'] += 1
+        result = M.delta_diagnostics(before, after, before)
+        self.assertFalse(result['expected_fields_match']['serial'])
+        self.assertFalse(result['other_fields_match'])
+        self.assertFalse(result['serial_unchanged'])
+        self.assertTrue(result['resources_unchanged'])
+        self.assertNotIn('NEVER_PRINT', json.dumps(result))
+        self.assertNotIn('durable', json.dumps(result))
+
     def test_changed_authority_retains_lock(self):
         for change in ('etag', 'marker', 'write'):
             store = self.store()

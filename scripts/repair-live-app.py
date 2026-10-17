@@ -55,6 +55,17 @@ def publish(store, before, etag, marker, after):
     store.call('delete-object', '--key', store.key + '.tflock', '--if-match', lock_etag)
 
 
+def delta_diagnostics(before, after, expected):
+    """Fixed labels/booleans only: never print state values or resource addresses."""
+    fields = ('version', 'terraform_version', 'serial', 'lineage', 'outputs', 'resources', 'check_results')
+    return {'expected_fields_match': {key: (key in after) == (key in expected)
+                                     and after.get(key) == expected.get(key) for key in fields},
+            'other_fields_match': {k: v for k, v in after.items() if k not in fields}
+                                  == {k: v for k, v in expected.items() if k not in fields},
+            'serial_unchanged': after.get('serial') == before.get('serial'),
+            'resources_unchanged': after.get('resources') == before.get('resources')}
+
+
 def repair(store, apply):
     store.unlocked()
     marker = store.migration_marker()
@@ -108,6 +119,7 @@ def repair(store, apply):
         expected['terraform_version'] = version
         print('Repair phase: verify-local-delta', flush=True)
         if after_state != expected:
+            print(json.dumps({'local_delta_diagnostics': delta_diagnostics(state, after_state, expected)}), flush=True)
             raise ValueError('Unexpected state mutation; canonical state unchanged')
         print('Repair phase: conditional-publication', flush=True)
         publish(store, before, etag, marker, path.read_bytes())
