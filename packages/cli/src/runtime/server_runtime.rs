@@ -298,7 +298,7 @@ mod tests {
     async fn process_exit_wait_does_not_report_a_live_process_as_stopped() {
         // No IPC endpoint exists for this child. IPC failure alone must not
         // authorize reporting a completed local shutdown.
-        let mut child = tokio::process::Command::new("/bin/sleep")
+        let mut child = tokio::process::Command::new("sleep")
             .arg("30")
             .kill_on_drop(true)
             .spawn()
@@ -321,10 +321,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn process_exit_wait_accepts_an_unreaped_child() {
-        let mut child = ProcessCommand::new("/bin/sleep")
-            .arg("0.1")
-            .spawn()
-            .unwrap();
+        let mut child = ProcessCommand::new("sleep").arg("0.1").spawn().unwrap();
         // Do not reap until after the wait, matching a foreground server whose
         // parent is synchronously waiting for the stop command to return.
         let exited = wait_for_process_exit_async(child.id(), Duration::from_secs(5)).await;
@@ -336,7 +333,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn process_exit_wait_waits_for_delayed_exit() {
-        let mut child = tokio::process::Command::new("/bin/sleep")
+        let mut child = tokio::process::Command::new("sleep")
             .arg("0.2")
             .kill_on_drop(true)
             .spawn()

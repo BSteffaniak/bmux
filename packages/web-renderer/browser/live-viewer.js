@@ -6,213 +6,155 @@ export function revision(value) {
       || BigInt(value) > 18446744073709551615n) throw new Error('invalid cursor');
   return value;
 }
-export function validateStatus(value, now = Date.now()) {
-  if (value.protocol !== 1 || value.renderer !== 'bmwp-3') throw new Error('incompatible broadcast');
-  if (!['offline', 'starting', 'live', 'paused'].includes(value.state)) throw new Error('invalid state');
-  revision(value.revision);
-  if (value.epoch !== null && (typeof value.epoch !== 'string' || !UUID.test(value.epoch))) throw new Error('invalid epoch');
-  if (value.state !== 'offline' && (!value.epoch || !Number.isSafeInteger(value.lease_expires_at))) {
+export function validateStatus(value) {
+  if (value.type !== 'state' || !['offline', 'starting', 'live', 'paused'].includes(value.state)) {
+    throw new Error('invalid state');
+  }
+  revision(value.fence);
+  if (value.epoch !== null && (typeof value.epoch !== 'string' || !UUID.test(value.epoch))) {
+    throw new Error('invalid epoch');
+  }
+  if (value.state !== 'offline' && !value.epoch) throw new Error('missing epoch');
+  if (value.state !== 'offline' && (!Number.isInteger(value.lease_ms) || value.lease_ms !== 15000
+      || !Number.isInteger(value.lease_remaining_ms) || value.lease_remaining_ms <= 0
+      || value.lease_remaining_ms > value.lease_ms)) {
     throw new Error('invalid lease');
   }
-  if (value.state !== 'offline' && value.lease_expires_at <= now) return { ...value, state: 'offline' };
-  if (value.state === 'live' && value.revision === '0') throw new Error('missing frame');
   return value;
 }
-async function boundedBytes(response, maximum) {
-  const announced = response.headers.get('Content-Length');
-  if (announced && (!/^[0-9]+$/.test(announced) || Number(announced) > maximum)) {
-    await response.body?.cancel();
-    throw new Error('oversize response');
-  }
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error('missing body');
-  const bytes = new Uint8Array(maximum);
-  let size = 0;
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (size + value.byteLength > maximum) throw new Error('oversize response');
-      bytes.set(value, size);
-      size += value.byteLength;
-    }
-  } finally { await reader.cancel(); reader.releaseLock(); }
-  return bytes.subarray(0, size);
-}
 
-// Explicit DOM, same-origin API and asset locations; no local capability bootstrap.
-export async function mountLiveViewer({ container, status, apiBase, assetBase,
-  fetchImpl = globalThis.fetch.bind(globalThis), canvasFactory = mountCanvasViewer,
-  autoStart = true, now = Date.now }) {
-  const base = new URL(apiBase, container.ownerDocument.baseURI);
-  if (base.origin !== new URL(container.ownerDocument.baseURI).origin || base.search || base.hash) {
-    throw new Error('broadcast API must be same-origin');
-  }
-  if (!base.pathname.endsWith('/')) base.pathname += '/';
-  const viewer = await canvasFactory({ container, assetBase });
-  let disposed = false;
-  let state = null;
-  let ticket = 0;
-  let cursor = null;
-  let frameIdentity = null;
-  const deltaCapable = viewer.capabilities?.includes('bmwp-delta-v1') === true;
-  const counters = { wire_bytes: 0, full: 0, delta: 0, repair: 0 };
-  const count = (key, amount = 1) => { counters[key] = Math.min(Number.MAX_SAFE_INTEGER, counters[key] + amount); };
-  let statusBusy = false;
-  let frameBusy = false;
-  let statusTimer;
-  let frameTimer;
-  let leaseTimer;
-  const requests = new Set();
-  let frameController;
-  function hide(label) {
+// Exactly one incoming frame is retained until it has been admitted and ACKed.
+// A peer violating the credit contract is disconnected, never silently dropped.
+export async function mountLiveViewer({ container, status, apiBase = '/', assetBase,
+  viewerFactory = mountCanvasViewer, WebSocketImpl = globalThis.WebSocket,
+  requestFrame = callback => requestAnimationFrame(callback), cancelFrame = id => cancelAnimationFrame(id),
+  setTimer = setTimeout, clearTimer = clearTimeout, maxFps = 60, autoStart = true }) {
+  if (!Number.isFinite(maxFps) || maxFps <= 0 || maxFps > 60) throw new Error('invalid max FPS');
+  const viewer = await viewerFactory({ container, assetBase });
+  const url = new URL('/v1/viewer/ws', new URL(apiBase, container.ownerDocument.baseURI));
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  let socket, reconnect, raf, frameTimer, leaseTimer;
+  let disposed = false, ticket = 0, state = null, pending = null, busy = false, repairing = false;
+  let lastPaint = -Infinity;
+  const counters = { bytes: 0, frames: 0, repair: 0 };
+  const count = key => { counters[key] = Math.min(Number.MAX_SAFE_INTEGER, counters[key] + 1); };
+  function invalidate(label) {
     ticket++;
-    state = null;
-    cursor = null;
-    frameIdentity = null;
-    frameController?.abort();
-    clearTimeout(leaseTimer);
+    pending = null;
+    repairing = false;
+    if (raf !== undefined) cancelFrame(raf);
+    if (frameTimer !== undefined) clearTimer(frameTimer);
+    raf = frameTimer = undefined;
     viewer.clear();
     status.textContent = label;
   }
-  async function request(path, consume, isFrame = false) {
-    const controller = new AbortController();
-    if (isFrame) frameController = controller;
-    requests.add(controller);
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    try {
-      const response = await fetchImpl(new URL(path, base).href, {
-        ...(isFrame && deltaCapable ? { headers: { 'X-Bmux-Capabilities': 'bmwp-delta-v1',
-          ...(typeof DecompressionStream === 'function' ? { 'X-Bmux-Compression': 'gzip-v1' } : {}) } } : {}),
-        signal: controller.signal, credentials: 'omit', redirect: 'error', cache: 'no-store',
-      });
-      return await consume(response);
-    } finally {
-      clearTimeout(timeout);
-      requests.delete(controller);
-      if (frameController === controller) frameController = null;
-    }
+  function send(value, connection = socket) {
+    if (connection?.readyState === 1) connection.send(JSON.stringify(value));
   }
-  async function pollStatus() {
-    if (disposed || statusBusy) return;
-    statusBusy = true;
-    try {
-      const next = await request('status', async response => {
-        if (response.status !== 200 || !response.headers.get('Content-Type')?.startsWith('application/json')) {
-          throw new Error('status unavailable');
-        }
-        return validateStatus(JSON.parse(new TextDecoder().decode(await boundedBytes(response, 16 * 1024))), now());
-      });
-      if (disposed) return;
-      if (state?.epoch === next.epoch && BigInt(next.revision) < BigInt(state.revision)) {
-        throw new Error('regressing cursor');
-      }
-      // Revisions are content watermarks, not authorization transitions.
-      // A busy producer can advance between every status and frame request.
-      // Keep retained output and in-flight decoding within the same live epoch;
-      // current() still rejects frames behind the latest observed watermark.
-      if (!state || next.epoch !== state.epoch || next.state !== state.state) {
-        hide(next.state === 'live' ? 'Loading live output…' : `Broadcast ${next.state}`);
-      }
-      state = next;
-      clearTimeout(leaseTimer);
-      if (next.state !== 'offline') leaseTimer = setTimeout(() => hide('Broadcast offline'), Math.max(0, next.lease_expires_at - now()));
-    } catch {
-      if (!disposed) hide('Broadcast unavailable or incompatible');
-    } finally {
-      statusBusy = false;
-      if (autoStart && !disposed) statusTimer = setTimeout(pollStatus, 1000);
-    }
+  function repair(connection) {
+    invalidate('Repairing broadcast…');
+    repairing = true;
+    count('repair');
+    send({ type: 'repair' }, connection);
   }
-  async function pollFrame() {
-    if (disposed || frameBusy || state?.state !== 'live') return;
-    const admitted = state;
-    const admittedTicket = ticket;
-    let deliveredRevision = admitted.revision;
-    const current = () => !disposed && ticket === admittedTicket && state?.state === 'live'
-      && state.epoch === admitted.epoch && BigInt(state.revision) <= BigInt(deliveredRevision)
-      && state.lease_expires_at > now();
-    frameBusy = true;
-    try {
-      const path = `presentation?epoch=${encodeURIComponent(admitted.epoch)}${cursor === null ? '' : `&after=${cursor}`}`
-        + (deltaCapable && frameIdentity ? `&generation=${encodeURIComponent(frameIdentity.generation)}&base=${frameIdentity.revision}` : '');
-      let deliveredIdentity = null;
-      let isDelta = false;
-      const bytes = await request(path, async response => {
-        if (response.status === 204) { await response.body?.cancel(); return null; }
-        const receivedRevision = revision(response.headers.get('X-Snapshot-Revision'));
-        if (response.status !== 200 || response.headers.get('Content-Type')?.split(';')[0] !== 'application/octet-stream'
-            || response.headers.get('X-Bmux-Epoch') !== admitted.epoch
-            || BigInt(receivedRevision) < BigInt(admitted.revision)
-            || (cursor !== null && BigInt(receivedRevision) < BigInt(cursor))) {
-          await response.body?.cancel();
-          throw new Error('presentation not admitted');
-        }
-        deliveredRevision = receivedRevision;
-        const negotiated = response.headers.get('X-Bmux-Capabilities');
-        if (negotiated && negotiated !== 'bmwp-delta-v1') throw new Error('unsupported capability');
-        if (negotiated === 'bmwp-delta-v1') {
-          if (!deltaCapable) throw new Error('unnegotiated delta');
-          const kind = response.headers.get('X-Bmux-Frame');
-          const encodedGeneration = response.headers.get('X-Bmux-Generation');
-          const generation = encodedGeneration === null ? null : decodeURIComponent(encodedGeneration);
-          if (!['full', 'delta'].includes(kind) || !generation || generation.length > 128
-              || /[\u0000-\u001f\u007f]/.test(generation)) throw new Error('invalid frame identity');
-          deliveredIdentity = { generation, revision: revision(response.headers.get('X-Bmux-Frame-Revision')) };
-          isDelta = kind === 'delta';
-          if (isDelta && (!frameIdentity || frameIdentity.generation !== generation
-              || response.headers.get('X-Bmux-Base-Revision') !== cursor
-              || response.headers.get('X-Bmux-Base-Frame-Revision') !== frameIdentity.revision
-              || BigInt(deliveredIdentity.revision) <= BigInt(frameIdentity.revision))) throw new Error('missing delta base');
-        } else if (response.headers.get('X-Bmux-Frame') === 'delta') throw new Error('unnegotiated delta');
-        const wire = await boundedBytes(response, 8 * 1024 * 1024);
-        count('wire_bytes', wire.length);
-        const compression = response.headers.get('X-Bmux-Compression');
-        if (!compression) return wire;
-        if (compression !== 'gzip-v1' || !deltaCapable || typeof DecompressionStream !== 'function') throw new Error('unnegotiated compression');
-        const decoded = new Blob([wire]).stream().pipeThrough(new DecompressionStream('gzip'));
-        return boundedBytes(new Response(decoded), 8 * 1024 * 1024);
-      }, true);
-      if (bytes === null || !current()) return;
-      if (bytes.length < 5 || bytes[0] !== 66 || bytes[1] !== 77 || bytes[2] !== 87 || bytes[3] !== 80 || bytes[4] !== 3) {
-        throw new Error('incompatible presentation');
-      }
-      const presented = await viewer.present(bytes, current);
-      if (!current()) {
-        // A stateful decoder may have rejected this unadmitted update and
-        // dropped its base. Never advertise the older cursor after that race.
-        cursor = null; frameIdentity = null; viewer.clear();
+  function schedule() {
+    if (disposed || busy || !pending || raf !== undefined || frameTimer !== undefined) return;
+    raf = requestFrame(async now => {
+      raf = undefined;
+      if (!pending || disposed) return;
+      const wait = 1000 / maxFps - (now - lastPaint);
+      if (wait > 0.01) {
+        frameTimer = setTimer(() => { frameTimer = undefined; schedule(); }, wait);
         return;
       }
-      if (presented) {
-        cursor = deliveredRevision;
-        frameIdentity = deliveredIdentity;
-        count(isDelta ? 'delta' : 'full');
+      const frame = pending;
+      pending = null;
+      busy = true;
+      const current = () => !disposed && ticket === frame.ticket && socket === frame.socket;
+      try {
+        const accepted = await viewer.present(frame.bytes, current);
+        if (!current()) return;
+        const identity = viewer.identity;
+        if (!accepted || !identity || typeof identity.generation !== 'string') throw new Error('unadmitted frame');
+        revision(identity.revision);
+        send({ type: 'ack', generation: identity.generation, revision: identity.revision }, frame.socket);
+        repairing = false;
+        lastPaint = now;
+        count('frames');
         status.textContent = 'Live · read-only';
-      } else if (current()) {
-        count('repair');
-        cursor = null; frameIdentity = null; viewer.clear();
+      } catch {
+        if (current()) repair(frame.socket);
+      } finally {
+        busy = false;
+        schedule();
       }
-    } catch {
-      if (current()) { count('repair'); hide('Broadcast unavailable or incompatible'); }
-    } finally { frameBusy = false; }
+    });
   }
-  async function frameLoop() {
-    await pollFrame();
-    if (!disposed) frameTimer = setTimeout(frameLoop, 1000);
+  function connect() {
+    if (disposed || socket) return;
+    const connection = new WebSocketImpl(url.href);
+    socket = connection;
+    connection.binaryType = 'arraybuffer';
+    connection.onmessage = event => {
+      if (disposed || socket !== connection) return;
+      try {
+        if (typeof event.data === 'string') {
+          if (event.data.length > 4096) throw new Error('control bound');
+          const next = validateStatus(JSON.parse(event.data));
+          if (state && BigInt(next.fence) < BigInt(state.fence)) throw new Error('stale authority');
+          if (!state || state.epoch !== next.epoch || state.fence !== next.fence
+              || !['live', 'starting'].includes(next.state)) {
+            invalidate(next.state === 'paused' ? 'Broadcast paused' : next.state === 'offline'
+              ? 'Broadcast offline' : 'Connecting to broadcast…');
+          }
+          state = next;
+          clearTimer(leaseTimer);
+          if (next.state !== 'offline') leaseTimer = setTimer(() => {
+            if (socket !== connection) return;
+            invalidate('Broadcast lease expired');
+            connection.close();
+          }, next.lease_remaining_ms);
+          return;
+        }
+        if (!(event.data instanceof ArrayBuffer) || event.data.byteLength === 0
+            || event.data.byteLength > 8 * 1024 * 1024 || !state
+            || !['live', 'starting'].includes(state.state)) throw new Error('invalid frame');
+        if (pending || busy) throw new Error('frame credit exceeded');
+        const bytes = new Uint8Array(event.data);
+        if (bytes.length < 5 || bytes[0] !== 66 || bytes[1] !== 77 || bytes[2] !== 87
+            || bytes[3] !== 80 || bytes[4] !== 4) throw new Error('incompatible presentation');
+        counters.bytes = Math.min(Number.MAX_SAFE_INTEGER, counters.bytes + bytes.length);
+        pending = { bytes, socket: connection, ticket };
+        schedule();
+      } catch {
+        if (typeof event.data === 'string' || pending || busy || repairing) connection.close(1002, 'invalid stream');
+        else repair(connection);
+      }
+    };
+    connection.onclose = () => {
+      if (socket !== connection) return;
+      socket = null;
+      clearTimer(leaseTimer);
+      leaseTimer = undefined;
+      state = null;
+      invalidate('Broadcast disconnected');
+      if (!disposed) reconnect = setTimer(connect, 1000);
+    };
+    connection.onerror = () => connection.close();
   }
-  const handle = {
-    pollStatus, pollFrame,
+  status.textContent = 'Connecting to broadcast…';
+  if (autoStart) connect();
+  return {
+    connect,
     get counters() { return { ...counters }; },
     dispose() {
       disposed = true;
-      hide('Broadcast offline');
-      clearTimeout(statusTimer); clearTimeout(frameTimer);
-      for (const controller of requests) controller.abort();
+      clearTimer(reconnect);
+      clearTimer(leaseTimer);
+      invalidate('Broadcast offline');
+      socket?.close();
+      socket = null;
       viewer.dispose();
     },
   };
-  status.textContent = 'Connecting to broadcast…';
-  if (autoStart) { void pollStatus(); void frameLoop(); }
-  return handle;
 }

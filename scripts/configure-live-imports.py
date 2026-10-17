@@ -269,7 +269,8 @@ def discover(api, config, managed):
     if route is not None:
         if route.get('script') != config['worker'] or worker is None:
             raise ImportErrorSafe('Existing route ownership requires manual reconciliation')
-        found[ADDRESSES[6]] = zone + '/' + resource_id(route)
+        if ADDRESSES[6] not in managed:
+            raise ImportErrorSafe('Former Worker route must already be owned before retirement')
     return {address: provider_id for address, provider_id in sorted(found.items()) if address not in managed}
 
 
@@ -306,7 +307,7 @@ def managed_addresses(value):
 
 
 def reviewed_imports(value):
-    if not isinstance(value, dict) or set(value) - set(ADDRESSES + STATE_ADDRESSES):
+    if not isinstance(value, dict) or set(value) - set(ADDRESSES[:3] + STATE_ADDRESSES):
         raise ImportErrorSafe('Unsupported reviewed import addresses')
     for provider_id in value.values():
         checked(provider_id, r'[a-z0-9.-]+(?:/[a-z0-9.-]+){1,2}', 'Invalid reviewed provider identity')
@@ -323,7 +324,7 @@ def paths(artifact, output):
         if main.is_symlink() or not main.is_file() or main.stat().st_size > MAX_BYTES:
             raise ImportErrorSafe('Artifact module is invalid')
         text = main.read_text()
-        if '5.17.0' not in text or any('"' + address.split('.')[0] + '" "live"' not in text for address in ADDRESSES):
+        if '5.17.0' not in text or any('"' + address.split('.')[0] + '" "live"' not in text for address in ADDRESSES[:3]):
             raise ImportErrorSafe('Artifact is not the supported Cloudflare 5.17 live module')
         state = artifact / 'state.tf'
         if (state.is_symlink() or not state.is_file() or state.stat().st_size > MAX_BYTES

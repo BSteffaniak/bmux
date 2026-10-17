@@ -7,4 +7,8 @@ cd "$ROOT"
 if [[ -z "${BMUX_NIX_TOOLCHAIN:-}" ]]; then
   exec bash scripts/dev.sh bash scripts/setup-live.sh "$@"
 fi
+if [[ "${1:-}" == --fly ]]; then
+  shift
+  exec python3 scripts/setup-live-fly.py "$@"
+fi
 exec python3 scripts/setup-live.py "$@"

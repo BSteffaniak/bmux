@@ -1037,27 +1037,27 @@ fn playbook_from_recording_cli() {
         .output()
         .expect("failed to run bmux playbook with recording");
 
+    assert!(
+        output.status.success(),
+        "recording-producing playbook failed. stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value = match serde_json::from_str(&stdout) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("JSON parse failed (recording run): {e}\nstdout: {stdout}");
-            return; // Skip if we can't parse -- recording might not be supported in this env
-        }
-    };
-
-    let recording_id = match json["recording_id"].as_str() {
-        Some(id) => id.to_string(),
-        None => {
-            eprintln!("No recording_id in output, skipping from-recording test");
-            return; // Recording wasn't produced -- skip gracefully
-        }
-    };
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("recording-producing playbook must return JSON");
+    assert_eq!(
+        json["pass"], true,
+        "recording-producing playbook failed: {json}"
+    );
+    let recording_id = json["recording_id"]
+        .as_str()
+        .expect("successful recorded playbook must return recording_id");
 
     // Step 2: Run from-recording to generate DSL from the recording.
     let from_output = sandbox
         .command()
-        .args(["playbook", "from-recording", &recording_id])
+        .args(["playbook", "from-recording", recording_id])
         .output()
         .expect("failed to run bmux playbook from-recording");
 

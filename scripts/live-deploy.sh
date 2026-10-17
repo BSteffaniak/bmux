@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Credentialed CI/operator entry point. No implicit infrastructure adoption.
 set -euo pipefail
+umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENVIRONMENT="${1:?Usage: live-deploy.sh production ARTIFACT_DIRECTORY [configure]}"
 [[ "$ENVIRONMENT" == staging || "$ENVIRONMENT" == production ]] || exit 2
 ARTIFACT="$(cd "${2:?Artifact directory required}" && pwd)"
 MODE="${3:-release}"
-[[ "$MODE" == release || "$MODE" == configure ]] || exit 2
+[[ "$MODE" == release || "$MODE" == configure || "$MODE" == retire-worker ]] || exit 2
+if [[ "$MODE" == retire-worker ]]; then
+  [[ "${LIVE_RETIRE_WORKER:-}" == retire-bmux-live-worker ]] || { echo 'Explicit reviewed Worker retirement approval required' >&2; exit 2; }
+fi
 BOOTSTRAP_COMPLETION=''
 if [[ $# -gt 3 ]]; then
   [[ $# == 5 && "$MODE" == configure && "$4" == --bootstrap-completion ]] || { echo 'Bootstrap completion is only supported for explicit first configure' >&2; exit 2; }
@@ -17,6 +21,10 @@ fi
 : "${CLOUDFLARE_ZONE_ID:?}"
 : "${LIVE_HOSTNAME:?}"
 : "${LIVE_PUBLISHER_KEY_SHA256:?Digest only; never publisher key}"
+: "${LIVE_METRICS_KEY_SHA256:?Separate metrics digest required}"
+: "${FLY_API_TOKEN:?Fly deployment credential required}"
+: "${LIVE_FLY_APP:?}"
+: "${LIVE_FLY_ORG:?}"
 : "${LIVE_PAGES_PROJECT:?Selected Pages project required}"
 : "${R2_STATE_ACCESS_KEY_ID:?Private R2 state access key required}"
 : "${R2_STATE_SECRET_ACCESS_KEY:?Private R2 state secret required}"
@@ -34,17 +42,29 @@ export TF_VAR_state_encryption_passphrase="$TOFU_STATE_ENCRYPTION_PASSPHRASE"
 export LIVE_ENVIRONMENT="$ENVIRONMENT" LIVE_STATE_REGION="${LIVE_STATE_REGION:-auto}"
 [[ "$(tofu version -json | python3 -c 'import json,sys; print(json.load(sys.stdin)["terraform_version"])')" == 1.10.9 ]] || exit 2
 (cd "$ARTIFACT" && sha256sum --check SHA256SUMS)
+LIVE_RELAY_IMAGE="$(cat "$ARTIFACT/relay/IMAGE")"
+export LIVE_RELAY_IMAGE
+python3 - <<'PY'
+import os, re
+app = os.environ['LIVE_FLY_APP']
+image = os.environ['LIVE_RELAY_IMAGE']
+if not re.fullmatch('[a-z0-9][a-z0-9-]{0,62}', app) or not re.fullmatch(re.escape('registry.fly.io/' + app) + r'@sha256:[a-f0-9]{64}', image):
+    raise SystemExit('Invalid candidate image identity')
+PY
 WORK="$(mktemp -d)"
 chmod 700 "$WORK"
 IMPORT_FILE="$ARTIFACT/infrastructure/approved-imports.tf.json"
 [[ ! -e "$IMPORT_FILE" && ! -L "$IMPORT_FILE" ]] || { echo 'Unexpected import file in immutable candidate' >&2; exit 2; }
-trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$IMPORT_FILE"' EXIT
+trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$WORK/registry-auth.json" "$IMPORT_FILE"' EXIT
 export TF_DATA_DIR="$WORK/tofu"
 python3 "$ROOT/scripts/live-state.py" --environment "$ENVIRONMENT" --output "$WORK/backend.json"
 export TF_VAR_environment="$ENVIRONMENT" TF_VAR_account_id="$CLOUDFLARE_ACCOUNT_ID"
 export TF_VAR_zone_id="$CLOUDFLARE_ZONE_ID" TF_VAR_hostname="$LIVE_HOSTNAME"
 export TF_VAR_pages_project="$LIVE_PAGES_PROJECT" TF_VAR_publisher_key_sha256="$LIVE_PUBLISHER_KEY_SHA256"
-export TF_VAR_relay_directory="$ARTIFACT/relay"
+export TF_VAR_metrics_key_sha256="$LIVE_METRICS_KEY_SHA256"
+export TF_VAR_fly_app_name="$LIVE_FLY_APP" TF_VAR_fly_org="$LIVE_FLY_ORG"
+export TF_VAR_fly_region="${LIVE_FLY_REGION:-iad}" TF_VAR_relay_hostname="${LIVE_RELAY_HOSTNAME:-live.bmux.dev}"
+export TF_VAR_relay_image="$LIVE_RELAY_IMAGE"
 cd "$ARTIFACT/infrastructure"
 run_private() {
   if ! "$@" > "$WORK/deploy.log" 2>&1; then
@@ -81,37 +101,49 @@ if [[ "$MODE" == configure ]]; then
     --output "$ARTIFACT/infrastructure/approved-imports.tf.json" --managed "$WORK/managed.json" \
     --imports "$WORK/imports.json" "${IMPORT_ARGS[@]}"
 fi
+if [[ "$MODE" == configure ]]; then
+  python3 "$ROOT/scripts/live-fly-preflight.py" "$WORK/managed.json"
+fi
 python3 "$ROOT/scripts/archive-live-state.py" archive "${ADMISSION_ARGS[@]}" > "$WORK/archive-before.json"
 POLICY_ARGS=()
-[[ "$MODE" != configure ]] || POLICY_ARGS+=(--configure)
-MIGRATION_ARGS=()
-if [[ "$MODE" == configure ]]; then
-  MIGRATION_NEEDED="$(python3 -c 'import json,sys; managed=json.load(open(sys.argv[1])); assert isinstance(managed,list) and all(isinstance(x,str) for x in managed); print(str("cloudflare_workers_deployment.live" not in managed).lower())' "$WORK/managed.json")"
-  if [[ "$MIGRATION_NEEDED" == true ]]; then
-    MIGRATION_ARGS=(-var=live_migration_only=true)
-  fi
-fi
+[[ "$MODE" == release ]] || POLICY_ARGS+=(--configure)
+if [[ "$MODE" == retire-worker ]]; then POLICY_ARGS+=(--retire-worker); fi
+# Publish the inventory-verified prebuilt OCI image only after policy accepts
+# the exact saved plan. Credentials remain in a private, transient auth file.
+# skopeo --preserve-digests rejects any registry rewrite of image identity.
 apply_plan() {
   run_private tofu plan -input=false -lock-timeout=5m "$@" -out="$WORK/plan"
   if ! tofu show -json "$WORK/plan" > "$WORK/plan.json" 2> "$WORK/deploy.log"; then
     echo 'Plan inspection failed; provider output suppressed' >&2; exit 1
   fi
-  local stage_policy=()
-  [[ "${1:-}" != -var=live_migration_only=true ]] || stage_policy=(--migration)
-  python3 "$ROOT/scripts/live-plan-policy.py" "$WORK/plan.json" "${POLICY_ARGS[@]}" "${stage_policy[@]}"
+  python3 "$ROOT/scripts/live-plan-policy.py" "$WORK/plan.json" "${POLICY_ARGS[@]}"
   if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
     python3 "$ROOT/scripts/archive-live-state.py" begin "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
     BOOTSTRAP_COMPLETION=''
   fi
+  if [[ "$MODE" != retire-worker && "${1:-}" != -target=fly_app.live ]]; then
+    printf '%s' "$FLY_API_TOKEN" | run_private skopeo login --authfile "$WORK/registry-auth.json" \
+      --username x --password-stdin registry.fly.io
+    run_private skopeo copy --authfile "$WORK/registry-auth.json" --preserve-digests \
+      "oci-archive:$ARTIFACT/relay/image.oci.tar" "docker://$LIVE_RELAY_IMAGE"
+    rm -f "$WORK/registry-auth.json"
+  fi
   run_private tofu apply -input=false -lock-timeout=5m "$WORK/plan"
   python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-after.json"
 }
-if [[ ${#MIGRATION_ARGS[@]} -gt 0 ]]; then
-  # Target excludes the route. The migration must be deployed before a runtime
-  # version may bind to its class (Cloudflare error 100123).
-  apply_plan "${MIGRATION_ARGS[@]}" -target=cloudflare_workers_deployment.live
+if [[ "$MODE" == retire-worker ]]; then
+  # Explicitly bounded destroy. No R2, Pages, DNS, Fly, or other Workers.
+  apply_plan -destroy -target=cloudflare_workers_route.live -target=cloudflare_workers_deployment.live \
+    -target=cloudflare_worker_version.live -target=cloudflare_worker.live
+  echo 'Former managed Worker retired; encrypted state archived. Configure Fly next.'
+  exit 0
+fi
+if [[ "$MODE" == configure ]]; then
+  # Fly registry authorization requires the app to exist before image upload.
+  # Archive this genuine declarative resource stage before proceeding.
+  apply_plan -target=fly_app.live
 fi
 apply_plan
 # Pages has a separate publisher; backend releases never upload static assets.
-python3 "$ROOT/scripts/smoke-live-broadcast.py" --url "https://$LIVE_HOSTNAME" --component backend
+python3 "$ROOT/scripts/smoke-live-broadcast.py" --url "https://$LIVE_HOSTNAME" --relay-url "https://${LIVE_RELAY_HOSTNAME:-live.bmux.dev}" --component backend
 echo 'Production candidate deployed; public read-only smoke passed.'

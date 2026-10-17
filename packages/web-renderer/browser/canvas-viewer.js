@@ -9,6 +9,7 @@ export async function mountCanvasViewer({ container, assetBase, loadModule = url
   let pending = false;
   let retained = null;
   let visible = null;
+  let identity = null;
   function release(state) {
     if (!state || state.freed) return;
     state.freed = true;
@@ -17,6 +18,7 @@ export async function mountCanvasViewer({ container, assetBase, loadModule = url
   }
   function clear() {
     generation++;
+    identity = null;
     visible?.remove();
     visible = null;
     const previous = retained;
@@ -41,6 +43,7 @@ export async function mountCanvasViewer({ container, assetBase, loadModule = url
   }
   return {
     capabilities: ['bmwp-delta-v1'],
+    get identity() { return identity && { ...identity }; },
     clear,
     async present(bytes, admitted) {
       if (disposed || pending) return false;
@@ -72,6 +75,7 @@ export async function mountCanvasViewer({ container, assetBase, loadModule = url
         visible?.remove();
         visible = next;
         visible.hidden = false;
+        identity = { generation: inspection.generation, revision: inspection.revision };
         accepted = true;
         return true;
       } finally {

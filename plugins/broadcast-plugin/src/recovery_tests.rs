@@ -2,118 +2,184 @@ use super::*;
 use std::{
     io::{Read, Write},
     net::TcpListener,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
+pub(super) struct TestRelay {
+    pub events: std::sync::mpsc::Receiver<(String, Vec<u8>)>,
+    stopped: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    _credential: tempfile::NamedTempFile,
+    pub relay: Option<Relay>,
+}
+impl TestRelay {
+    pub fn new(repair_once: bool) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (send, events) = std::sync::mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = stopped.clone();
+        let worker = std::thread::spawn(move || {
+            let epoch = Uuid::new_v4();
+            let mut fence = 1_u64;
+            let mut sockets = Vec::new();
+            while !stop.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut probe = [0; 16384];
+                loop {
+                    let count = stream.peek(&mut probe).unwrap();
+                    if probe[..count].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(count < probe.len());
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if probe.starts_with(b"GET /v1/publisher/ws ") {
+                    let send = send.clone();
+                    let stop = stop.clone();
+                    sockets.push(std::thread::spawn(move || {
+                        use tokio_tungstenite::tungstenite::{accept, Message};
+                        let mut socket = accept(stream).unwrap();
+                        let mut base = None;
+                        let mut repair = repair_once;
+                        while !stop.load(Ordering::SeqCst) {
+                            let message = match socket.read() { Ok(value) => value, Err(_) => break };
+                            let Message::Binary(bytes) = message else { continue; };
+                            send.send(("frame".into(), bytes.to_vec())).unwrap();
+                            let frame = bmux_web_renderer::decode_binary(&bytes, base.as_ref()).unwrap();
+                            if repair {
+                                repair = false;
+                                socket.send(Message::Text("{\"type\":\"repair\"}".into())).unwrap();
+                                base = None;
+                                continue;
+                            }
+                            let ack = serde_json::json!({"type":"ack", "generation":frame.generation(), "revision":frame.revision().to_string()});
+                            socket.send(Message::Text(ack.to_string().into())).unwrap();
+                            base = Some(frame);
+                        }
+                    }));
+                    continue;
+                }
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    header.push(byte[0]);
+                }
+                let header = String::from_utf8(header).unwrap();
+                let route = header
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap();
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|value| value.parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body).unwrap();
+                if matches!(route, "pause" | "resume" | "stop") {
+                    fence += 1;
+                }
+                let phase = match route {
+                    "pause" => "paused",
+                    "stop" => "offline",
+                    _ => "starting",
+                };
+                let body = serde_json::json!({"type":"state", "epoch":if route == "stop" { None } else { Some(epoch) }, "fence":fence.to_string(), "state":phase, "lease_ms":15000});
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                send.send((route.into(), Vec::new())).unwrap();
+            }
+            for socket in sockets {
+                socket.join().unwrap();
+            }
+        });
+        let credential = tempfile::NamedTempFile::new().unwrap();
+        std::fs::set_permissions(credential.path(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        std::fs::write(credential.path(), "x".repeat(32)).unwrap();
+        let relay = Relay::new(&endpoint, "main", credential.path()).unwrap();
+        Self {
+            events,
+            stopped,
+            worker: Some(worker),
+            _credential: credential,
+            relay: Some(relay),
+        }
+    }
+    pub fn event(&self, expected: &str) -> Vec<u8> {
+        loop {
+            let (event, bytes) = self.events.recv_timeout(Duration::from_secs(5)).unwrap();
+            if event == expected {
+                return bytes;
+            }
+            assert_eq!(event, "heartbeat", "unexpected relay event");
+        }
+    }
+}
+impl Drop for TestRelay {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
 #[test]
-fn expired_epoch_reacquires_only_running_and_requires_fresh_repair() {
-    use std::os::unix::fs::PermissionsExt;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let (events, received) = std::sync::mpsc::channel();
-    let server = std::thread::spawn(move || {
-        let mut starts = 0;
-        let mut expired = false;
-        for stream in listener.incoming() {
-            let mut stream = stream.unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut header = Vec::new();
-            while !header.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                stream.read_exact(&mut byte).unwrap();
-                header.push(byte[0]);
-                assert!(header.len() < 16384);
-            }
-            let header = String::from_utf8(header).unwrap();
-            let route = header
-                .lines()
-                .next()
-                .unwrap()
-                .split_whitespace()
-                .nth(1)
-                .unwrap()
-                .rsplit('/')
-                .next()
-                .unwrap()
-                .to_owned();
-            let length = header
-                .lines()
-                .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("content-length: ")
-                        .map(|v| v.parse::<usize>().unwrap())
-                })
-                .unwrap_or(0);
-            let mut body = vec![0; length];
-            stream.read_exact(&mut body).unwrap();
-            let reject = route == "heartbeat" && !expired;
-            let response = if route == "start" {
-                starts += 1;
-                let epoch = Uuid::new_v4();
-                let body = format!(
-                    "{{\"protocol\":1,\"renderer\":\"bmwp-3\",\"epoch\":\"{epoch}\",\"lease_ms\":15000}}"
-                );
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-            } else if reject {
-                expired = true;
-                "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
-            } else {
-                "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into()
-            };
-            stream.write_all(response.as_bytes()).unwrap();
-            events.send((route.clone(), starts)).unwrap();
-            if route == "stop" {
-                break;
-            }
-        }
-    });
-    let directory = tempfile::tempdir().unwrap();
-    let key = directory.path().join("key");
-    std::fs::write(&key, "k".repeat(64)).unwrap();
-    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let controller = Controller::new().unwrap();
-    let owner = Uuid::new_v4();
-    let id = Uuid::new_v4().to_string();
-    controller.source(owner, &id, true).unwrap();
-    controller
-        .control(Control::Start(
-            Box::new(Relay::new(&format!("http://{address}"), "main", &key).unwrap()),
-            id.clone(),
-        ))
+fn websocket_repair_and_acknowledged_delta_baseline() {
+    let mut server = TestRelay::new(true);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .unwrap();
-    let initial = controller.source(owner, &id, false).unwrap().refresh;
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        controller.source(owner, &id, false).unwrap();
-        if let Ok((route, starts)) = received.recv_timeout(Duration::from_millis(200)) {
-            assert_ne!(
-                route, "frame",
-                "reacquisition must never replay retained bytes"
-            );
-            if route == "start" && starts == 2 {
-                break;
-            }
-        }
-        assert!(Instant::now() < deadline);
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while controller.status().unwrap().local == "recovering" {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let fresh = controller.source(owner, &id, false).unwrap();
-    assert!(fresh.refresh > initial);
-    // A pause closes recovery intent; no further start is permitted.
-    controller.control(Control::Pause).unwrap();
-    std::thread::sleep(Duration::from_millis(150));
-    assert_eq!(controller.status().unwrap().local, "paused");
-    while let Ok((route, _)) = received.try_recv() {
-        assert_ne!(route, "start");
-    }
-    controller.shutdown();
-    server.join().unwrap();
+    let mut relay = server.relay.take().unwrap();
+    runtime.block_on(async {
+        relay.start().await.unwrap();
+        server.event("start");
+        let first = super::lifecycle_tests::frame("scene", 1);
+        relay.mutation("frame", Some((1, &first))).await.unwrap();
+        assert_eq!(server.event("frame"), first);
+        assert_eq!(server.event("frame"), first);
+        let second = super::lifecycle_tests::frame("scene", 2);
+        relay.mutation("frame", Some((2, &second))).await.unwrap();
+        let delta = server.event("frame");
+        assert!(delta.len() < second.len());
+        assert!(bmux_web_renderer::decode_binary(&delta, None).is_err());
+        let base = bmux_web_renderer::decode_binary(&first, None).unwrap();
+        assert_eq!(
+            bmux_web_renderer::decode_binary(&delta, Some(&base)).unwrap(),
+            bmux_web_renderer::decode_binary(&second, None).unwrap()
+        );
+        relay.mutation("pause", None).await.unwrap();
+        server.event("pause");
+        relay.mutation("resume", None).await.unwrap();
+        server.event("resume");
+        relay.mutation("frame", Some((3, &second))).await.unwrap();
+        assert_eq!(server.event("frame"), second);
+        server.event("frame"); // Explicit repair on each newly admitted socket.
+        relay.mutation("stop", None).await.unwrap();
+        server.event("stop");
+    });
 }

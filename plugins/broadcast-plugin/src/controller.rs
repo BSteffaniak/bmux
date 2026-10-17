@@ -109,6 +109,7 @@ pub struct Controller {
     operation: Mutex<()>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     terminals: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    dirty: Arc<tokio::sync::Notify>,
 }
 impl Controller {
     pub fn new() -> Result<Self, &'static str> {
@@ -116,6 +117,8 @@ impl Controller {
         let (commands, receiver) = mpsc::channel(8);
         let worker_state = state.clone();
         let (gate, worker_gate) = tokio::sync::watch::channel(1);
+        let dirty = Arc::new(tokio::sync::Notify::new());
+        let worker_dirty = dirty.clone();
         let worker = std::thread::Builder::new()
             .name("bmux-broadcast".into())
             .spawn(move || {
@@ -123,7 +126,7 @@ impl Controller {
                     .enable_all()
                     .build()
                 {
-                    runtime.block_on(worker(worker_state, receiver, worker_gate));
+                    runtime.block_on(worker(worker_state, receiver, worker_gate, worker_dirty));
                 }
             })
             .map_err(|_| "executor_unavailable")?;
@@ -134,6 +137,7 @@ impl Controller {
             operation: Mutex::new(()),
             worker: Mutex::new(Some(worker)),
             terminals: Mutex::new(Vec::new()),
+            dirty,
         })
     }
     pub fn status(&self) -> Result<Status, &'static str> {
@@ -498,12 +502,18 @@ impl Controller {
                     let observation =
                         crate::terminal::observe(selection, target, cols, rows, frames, stopped);
                     tokio::pin!(observation);
-                    let mut tick = tokio::time::interval(Duration::from_secs(1));
+                    let mut gate = controller.gate.subscribe();
+                    // Lease renewal never creates a frame or re-encodes output.
+                    let mut lease = tokio::time::interval(SOURCE_LEASE / 2);
                     let mut sent = None;
                     let observer_error = loop {
                         tokio::select! {
                             result = &mut observation => break result.err(),
-                            _ = tick.tick() => {},
+                            _ = lease.tick() => {
+                                if controller.source(owner, &id, false).is_err() { break None; }
+                                continue;
+                            },
+                            result = gate.changed() => { if result.is_err() { break None; } },
                             result = latest.changed() => {
                                 if result.is_err() { break observation.await.err(); }
                             },
@@ -612,6 +622,7 @@ impl Controller {
             bytes,
             relay_revision: None,
         });
+        self.dirty.notify_one();
         Ok(true)
     }
 }
@@ -659,15 +670,49 @@ async fn worker(
     state: Arc<Mutex<State>>,
     mut commands: mpsc::Receiver<Request>,
     mut gate: tokio::sync::watch::Receiver<u64>,
+    dirty: Arc<tokio::sync::Notify>,
 ) {
     let mut relay: Option<Box<Relay>> = None;
     let mut revision = 0_u64;
     let mut heartbeat = Instant::now();
     let mut source_paused = false;
     let mut retry_after = Instant::now();
-    let mut tick = tokio::time::interval(Duration::from_millis(50));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let fps = std::env::var("BMUX_BROADCAST_MAX_FPS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|fps| (1..=60).contains(fps))
+        .unwrap_or(60);
+    let period = Duration::from_secs_f64(1.0 / f64::from(fps));
+    let mut next_frame = Instant::now();
     loop {
+        let deadline = {
+            let Ok(current) = state.lock() else {
+                break;
+            };
+            let now = Instant::now();
+            let mut deadline = now + Duration::from_secs(60);
+            if relay.is_some() && current.local != "stopped"
+                || current.remote == "stop_unacknowledged"
+            {
+                deadline = deadline.min(heartbeat + Duration::from_secs(3));
+            }
+            if matches!(current.local, "running" | "recovering") {
+                if let Some(source) = current
+                    .selected
+                    .as_ref()
+                    .and_then(|id| current.sources.get(id))
+                {
+                    deadline = deadline.min(source.expires);
+                }
+                if relay.is_some() && (current.local == "recovering" || current.pending.is_some()) {
+                    deadline = deadline.min(retry_after.max(next_frame));
+                }
+            }
+            if relay.is_some() && current.local == "unavailable" && !source_paused {
+                deadline = now;
+            }
+            tokio::time::Instant::from_std(deadline)
+        };
         tokio::select! {
             request = commands.recv() => {
                 let Some(request) = request else { break; };
@@ -705,14 +750,16 @@ async fn worker(
                 gate.borrow_and_update();
                 heartbeat = Instant::now();
             }
-            _ = tick.tick() => {
+            _ = dirty.notified() => { continue; }
+            result = gate.changed() => { if result.is_err() { break; } continue; }
+            _ = tokio::time::sleep_until(deadline) => {
                 let (pending, should_pause) = {
                     let Ok(mut state) = state.lock() else { break; };
                     let expired = matches!(state.local, "running" | "recovering") && !state.available();
                     if expired { state.invalidate(); state.local = "unavailable"; state.error = Some("source_expired"); }
                     let pause = state.local == "unavailable" && !source_paused;
                     gate.borrow_and_update();
-                    let pending = if state.local == "running" && Instant::now() >= retry_after { state.pending.take().filter(|p| p.refresh == state.refresh) } else { None };
+                    let pending = if relay.is_some() && state.local == "running" && Instant::now() >= retry_after.max(next_frame) { state.pending.take().filter(|p| p.refresh == state.refresh) } else { None };
                     (pending, pause)
                 };
                 let Some(remote) = relay.as_ref() else { continue; };
@@ -737,6 +784,7 @@ async fn worker(
                         code = lease_guard => Err(code),
                     };
                     revision = next;
+                    next_frame = Instant::now() + period;
                     if let Ok(mut state) = state.lock()
                         && state.refresh == pending.refresh && state.local == "running" {
                             state.error = result.err();

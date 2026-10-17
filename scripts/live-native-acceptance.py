@@ -6,6 +6,7 @@ Owns only fresh temporary paths and child process groups. Never prints child log
 publisher credentials, proofs, deck contents, or response bodies on failure.
 """
 import argparse
+import base64
 import fcntl
 import struct
 import termios
@@ -20,6 +21,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
+import traceback
 import urllib.error
 import urllib.request
 import uuid
@@ -37,6 +40,7 @@ def load(name, path):
 
 PRESENTER = load('native_presenter_helpers', ROOT / 'scripts/presenter-web-acceptance.py')
 CDP = load('native_cdp_helpers', ROOT / 'scripts/web-browser-cdp.py')
+LOCAL = load('native_relay_helpers', ROOT / 'scripts/smoke-live-local.py')
 
 
 def digest(path):
@@ -76,10 +80,18 @@ class Harness:
         self.env.update(BMUX_CONFIG=str(self.config), BMUX_NO_BASE_CONFIG='1',
                         BMUX_RUNTIME_NAME='default', BMUX_TARGET='local', TERM='xterm-256color')
         producer = root / 'terminal-producer'
-        producer.write_text('#!' + sys.executable + '\nimport time\n'
-                            'for revision in range(900):\n'
-                            ' print("NATIVE_TERMINAL_PUBLIC_5831", revision, flush=True)\n'
-                            ' time.sleep(.2)\n')
+        self.producer_mode = root / 'producer-mode'
+        self.producer_mode.write_text('idle')
+        producer.write_text('#!' + sys.executable + '\nimport time, pathlib\n'
+            + 'modefile=pathlib.Path(' + repr(str(self.producer_mode)) + ')\n'
+            + 'print("NATIVE_TERMINAL_PUBLIC_5831", flush=True)\nrevision=0\n'
+            + 'while True:\n'
+            + ' mode=modefile.read_text()\n'
+            + ' if mode=="timer":\n'
+            + '  print("\\rTIMER "+str(revision%10), end="", flush=True); revision+=1\n'
+            + ' elif mode=="stream":\n'
+            + '  print("NATIVE_TERMINAL_PUBLIC_5831", revision, flush=True); revision+=1\n'
+            + ' time.sleep(.2)\n')
         producer.chmod(0o700)
         self.config.write_text('[general]\ndefault_shell = ' + json.dumps(str(producer)) + '\n'
             '[plugins]\nenabled = ["bmux.sessions", "bmux.contexts", "bmux.clients", '
@@ -90,6 +102,7 @@ class Harness:
         self.key.write_text(secrets.token_urlsafe(48))
         self.key.chmod(0o600)
         self.cdp = None
+        self.stack = None
         self.cases = []
 
     def run(self, *args, check=True):
@@ -106,19 +119,14 @@ class Harness:
         self.children.append(child)
         return child
 
-    def http(self, path):
-        try:
-            with urllib.request.urlopen(self.url + '/api/live/main/' + path, timeout=4) as response:
-                body = response.read(8 * 1024 * 1024 + 1)
-                require(len(body) <= 8 * 1024 * 1024, 'oversized audience response')
-                return response.status, body, dict(response.headers)
-        except urllib.error.HTTPError as error:
-            return error.code, error.read(4096), dict(error.headers)
-
     def status(self):
-        code, body, _ = self.http('status')
-        require(code == 200, 'relay status unavailable')
-        return json.loads(body)
+        state, payload = self.stack.snapshot()
+        state['revision'] = '0'
+        if payload:
+            result = subprocess.run([str(self.args.wire_tool), '--inspect'], input=payload,
+                                    capture_output=True, check=True, timeout=5)
+            state['revision'] = json.loads(result.stdout)['revision']
+        return state
 
     def control(self, *args):
         return json.loads(self.run('broadcast', *args).stdout)
@@ -127,23 +135,22 @@ class Harness:
         return self.status()['state'] == 'live' and self.control('status')['local'] == 'running'
 
     def frame(self):
-        code, body, headers = self.http('presentation?epoch=' + str(self.status()['epoch']))
-        require(code == 200 and body.startswith(b'BMWP\x03'), 'complete BMWP3 audience frame missing')
-        return body, headers
+        state, body = self.stack.snapshot()
+        require(state['state'] == 'live' and body and body.startswith(b'BMWP\x04'), 'complete BMWP4 audience frame missing')
+        return body, {}
 
     def inspect(self, expected, absent):
-        # Exact HTTP-delivered bytes are fetched and decoded/presented by the real
-        # generated Rust/WASM renderer, including complete metadata and images.
+        # Decode an actual full repair delivered by viewer WSS, never a fabricated
+        # scene or an obsolete HTTP adapter response.
         self.stage = 'WASM-frame-inspection'
+        payload, _ = self.frame()
         expression = '''(async()=>{
           window.__nativeText=[];
-          const response=await fetch('/api/live/main/presentation?epoch='+encodeURIComponent((await (await fetch('/api/live/main/status')).json()).epoch));
-          if(response.status!==200)return {ready:false};
-          const bytes=new Uint8Array(await response.arrayBuffer());
+          const bytes=Uint8Array.from(atob(''' + json.dumps(base64.b64encode(payload).decode()) + '''),c=>c.charCodeAt(0));
           nativeRenderer.reset();
           const info=JSON.parse(nativeRenderer.inspect_binary(bytes));
           await nativeRenderer.present_binary(bytes);
-          return {info, text:__nativeText.join(''), metadata:JSON.parse(nativeRenderer.metadata_json())};
+          return {info,text:__nativeText.join(''),metadata:JSON.parse(nativeRenderer.metadata_json())};
         })()'''
         result = self.cdp.evaluate(expression)
         require(result.get('ready', True), 'audience not yet ready')
@@ -157,6 +164,7 @@ class Harness:
         self.stage = 'browser-launch'
         child = self.spawn([str(self.args.browser), '--headless', '--no-sandbox', '--disable-gpu',
             '--disable-background-networking', '--no-first-run', '--no-default-browser-check',
+            '--no-proxy-server', '--ignore-certificate-errors', '--host-resolver-rules=' + self.stack.chrome_rules,
             '--remote-debugging-port=0', '--remote-allow-origins=*',
             '--user-data-dir=' + str(self.root / 'browser-profile'), 'about:blank'])
         port_file = self.root / 'browser-profile/DevToolsActivePort'
@@ -166,7 +174,12 @@ class Harness:
             targets = json.load(response)
         self.cdp = CDP.CDP(next(t['webSocketDebuggerUrl'] for t in targets if t['type'] == 'page'))
         self.cdp.call('Page.enable')
-        self.cdp.call('Page.navigate', {'url': self.url + '/live/'})
+        self.cdp.call('Page.addScriptToEvaluateOnNewDocument', {'source': '''
+          window.__wire=[];const Original=WebSocket;window.WebSocket=class extends Original{
+          constructor(...args){super(...args);this.addEventListener('message',event=>{
+          if(event.data instanceof ArrayBuffer)__wire.push({bytes:event.data.byteLength,time:performance.now()})})}};
+        '''})
+        self.cdp.call('Page.navigate', {'url': 'https://bmux.dev/__acceptance.html'})
         wait('same-origin live document', lambda: self.cdp.evaluate("!!document.getElementById('live-broadcast')"))
         # Let the page own initial WASM initialization before creating the separate
         # diagnostic renderer; concurrent wasm-bindgen init can race module state.
@@ -184,19 +197,19 @@ class Harness:
 
     def execute(self):
         version = self.run('--version').stdout.decode().strip()
-        require(version == 'bmux 0.0.1-alpha.1', 'test executable version mismatch')
+        expected_version = 'bmux ' + tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version']
+        require(version == expected_version, 'test executable version mismatch')
         self.spawn(self.command + ['server', 'start', '--foreground-internal', '--no-pane-shell-integration'])
         def daemon_ready():
             result = self.run('server', 'status', '--json', check=False)
             return result.returncode == 0 and json.loads(result.stdout).get('running')
         wait('fresh compatible foreground daemon', daemon_ready)
         self.cases.append('verified-binary-fresh-daemon-compatible-client-isolated-paths')
-        ready = self.root / 'relay-ready.json'
-        self.spawn(['node', str(ROOT / 'scripts/live-dev.mjs'), '--assets', str(self.args.assets),
-                    '--key-file', str(self.key), '--state-file', str(self.root / 'relay.json'),
-                    '--ready-file', str(ready)])
-        wait('isolated relay', ready.exists)
-        self.url = json.loads(ready.read_text())['url']
+        self.stack = LOCAL.RelayStack(self.args.relay, self.root, self.args.assets)
+        # Local native control uses loopback HTTP; the real browser and snapshot
+        # clients use the temporary TLS/WSS edge. No production state is touched.
+        self.url = 'http://127.0.0.1:8080'
+        self.key.write_text(self.stack.key)
         self.asset_url = '/live-assets/' + self.args.assets.name + '/'
         source = str(uuid.uuid4())
         deck = self.root / 'audience.md'
@@ -226,13 +239,13 @@ class Harness:
         before_pause = self.status()
         self.control('pause')
         wait('pause closes audience gate', lambda: self.status()['state'] == 'paused')
-        require(self.http('presentation?epoch=' + str(self.status()['epoch']))[0] in (409,503), 'paused relay exposes content')
+        require(self.stack.snapshot()[1] is None, 'paused relay exposes content')
         wait('actual live page pause clears Canvas', lambda: self.cdp.evaluate("!Array.from(document.querySelectorAll('#live-broadcast canvas')).some(c=>!c.hidden)"))
         require(presenter.child.poll() is None, 'pause broke local playback')
         self.control('resume')
         wait('unchanged slide refresh republished', self.live)
         self.frame()
-        require(int(self.status()['revision']) > int(before_pause['revision']), 'resume did not publish a fresh relay revision')
+        require(self.status()['epoch'] == before_pause['epoch'] and self.status()['fence'] != before_pause['fence'], 'resume did not fence the previous stream')
         self.inspect(public, [private, hidden])
         self.cases.append('pause-clear-resume-unchanged-slide-refresh')
         self.run('new-session', 'native-acceptance')
@@ -246,6 +259,8 @@ class Harness:
         wait('terminal controller live', self.live)
         wait('terminal observer audience', lambda: self.inspect_terminal())
         self.frame()
+        self.timer_and_idle()
+        self.producer_mode.write_text('stream')
         for _ in range(4):
             time.sleep(.6)
             current, _ = self.frame()
@@ -259,7 +274,7 @@ class Harness:
         wait('presenter repaired audience', lambda: self.inspect_presenter(public, private, hidden))
         self.control('stop')
         wait('controller stop offline', lambda: self.status()['state'] == 'offline')
-        require(self.http('presentation?epoch=' + str(self.status()['epoch']))[0] in (409,503), 'stopped relay exposes content')
+        require(self.stack.snapshot()[1] is None, 'stopped relay exposes content')
         wait('actual live page stop clears Canvas', lambda: self.cdp.evaluate("!Array.from(document.querySelectorAll('#live-broadcast canvas')).some(c=>!c.hidden)"))
         require(presenter.child.poll() is None, 'stop broke local playback')
         presenter.send(b'q')
@@ -274,6 +289,7 @@ class Harness:
         require(all(secret not in path.read_bytes() for path in self.root.glob('child-*.log')), 'publisher key leaked into child logs')
         require(secret not in presenter.bytes(), 'publisher key leaked into presenter terminal')
         return {'binary': str(self.args.binary), 'sha256': self.args.sha256, 'version': version,
+                'relay_sha256': digest(self.args.relay), 'wire_tool_sha256': digest(self.args.wire_tool),
                 'wasm_sha256': digest(self.args.assets / 'bmux_web_renderer_bg.wasm'), 'cases': self.cases}
 
     def turnkey_profiles(self, deck, public, private, hidden):
@@ -403,6 +419,27 @@ class Harness:
         self.cases.append('inline-resize-paste-cancel-no-publication-terminal-restoration')
         self.cases.append('inline-picker-review-confirm-first-frame-browser-pause-resume-stop-terminal-restoration')
 
+    def timer_and_idle(self):
+        self.stage = 'native-event-driven-idle-and-timer'
+        time.sleep(1)  # Settle initial capture and observer admission.
+        before = self.stack.metrics()['bmux_relay_upload_bytes_total']
+        wire = self.cdp.evaluate('__wire.length')
+        canvas = self.cdp.evaluate("document.querySelector('#live-broadcast canvas:not([hidden])').toDataURL()")
+        time.sleep(2)
+        require(self.stack.metrics()['bmux_relay_upload_bytes_total'] == before, 'idle native source uploaded frames')
+        require(self.cdp.evaluate('__wire.length') == wire, 'idle browser received binary frames')
+        require(self.cdp.evaluate("document.querySelector('#live-broadcast canvas:not([hidden])').toDataURL()") == canvas, 'idle pixels changed')
+        self.producer_mode.write_text('timer')
+        wait('native timer frame', lambda: self.cdp.evaluate('__wire.length') >= wire + 4)
+        time.sleep(.4)
+        records = self.cdp.evaluate('__wire.slice(' + str(wire + 1) + ')')
+        require(len(records) >= 3 and all(row['bytes'] < 1024 for row in records), 'timer emitted a full-row/full-image bundle')
+        require(all(b['time'] - a['time'] >= 15 for a, b in zip(records, records[1:])), 'native timer exceeded 60 FPS')
+        require(self.cdp.evaluate("document.querySelector('#live-broadcast canvas:not([hidden])').toDataURL()") != canvas, 'native timer did not change pixels')
+        after = self.stack.metrics()['bmux_relay_upload_bytes_total']
+        require(0 < after - before < 12000, 'native timer source-to-relay upload not localized')
+        self.cases.append('native-idle-zero-frame-traffic-timer-tiny-both-hops-60FPS-ceiling')
+
     def verify_observed_resizing(self, target):
         """Normal attach sizes the PTY; observation follows without competing."""
         local = PRESENTER.Mirror(self.command + ['attach', target], self.env)
@@ -456,7 +493,7 @@ class Harness:
         wait('resized observation pause clears', lambda: self.status()['state'] == 'paused' and self.cdp.evaluate("!Array.from(document.querySelectorAll('#live-broadcast canvas')).some(c=>!c.hidden)"))
         fcntl.ioctl(local.fd, termios.TIOCSWINSZ, struct.pack('HHHH', 32, 100, 0, 0))
         time.sleep(.5)
-        require(self.http('presentation?epoch=' + self.status()['epoch'])[0] in (409, 503), 'resize bypassed paused audience gate')
+        require(self.stack.snapshot()[1] is None, 'resize bypassed paused audience gate')
         self.control('resume')
         progressing('resumed at changed geometry')
         local.stop()
@@ -483,6 +520,8 @@ class Harness:
             return False
 
     def close(self):
+        if self.stack:
+            self.stack.close()
         if self.cdp:
             self.cdp.close()
         for terminal in reversed(self.terminals):
@@ -501,12 +540,18 @@ class Harness:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--relay', required=True, type=Path)
+    parser.add_argument('--wire-tool', required=True, type=Path)
     parser.add_argument('--binary', required=True, type=Path)
     parser.add_argument('--sha256', required=True)
     parser.add_argument('--assets', required=True, type=Path)
     parser.add_argument('--browser', required=True, type=Path)
     args = parser.parse_args()
     args.binary, args.assets, args.browser = args.binary.resolve(), args.assets.resolve(), args.browser.resolve()
+    args.relay, args.wire_tool = args.relay.resolve(), args.wire_tool.resolve()
+    require((args.assets / 'manifest.json').is_file(),
+            '--assets must name the immutable live-assets/<bundle_sha256> directory, not raw target/web-assets')
+    LOCAL.verify_assets(args.assets)
     require(digest(args.binary) == args.sha256, 'explicit test binary SHA256 mismatch')
     with tempfile.TemporaryDirectory(prefix='bmux-live-native-') as directory:
         root = Path(directory)
@@ -517,6 +562,8 @@ def main():
         except Exception as error:
             print(json.dumps({'result': 'FAIL', 'error_type': type(error).__name__,
                               'stage': str(error) if isinstance(error, AssertionError) else getattr(harness, 'stage', 'owned-stack-operation'),
+                              'trace': [{'file': Path(frame.filename).name, 'line': frame.lineno, 'function': frame.name}
+                                        for frame in traceback.extract_tb(error.__traceback__)],
                               'passed_cases': harness.cases, 'viewer_diagnostic': getattr(harness, 'viewer_diagnostic', None)}, sort_keys=True))
             return 1
         finally:

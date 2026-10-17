@@ -428,6 +428,8 @@ class Deployment:
             raise InstallError('Candidate changed during operation')
 
     def init(self):
+        if (self.artifact / 'infrastructure/fly.tf').exists():
+            raise InstallError('Fly candidates require the approved configure/release workflow; legacy local installer cannot deploy them')
         private_dir(self.workspace)
         self.tools.env['TF_DATA_DIR'] = str(self.workspace / '.tofu')
         source = self.artifact / 'infrastructure'

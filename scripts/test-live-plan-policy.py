@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for infrastructure/release separation; no provider calls."""
+"""Offline policy regressions for the Fly-only end state."""
 import importlib.util
 from pathlib import Path
 import unittest
@@ -9,109 +9,35 @@ m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
 
-def plan(address, actions, **extra):
-    return {'resource_changes': [{'address': address, 'change': {'actions': actions, **extra}}]}
+def plan(address, actions, **values):
+    return {'resource_changes': [{'address': address, 'change': {'actions': actions, **values}}]}
 
 
-class PlanPolicyTests(unittest.TestCase):
-    def test_migration_stage_is_binding_free_and_excludes_route(self):
-        after = {'bindings': [], 'migrations': {'new_tag': 'v1', 'new_sqlite_classes': ['LiveChannel']}}
-        migration = plan('cloudflare_worker_version.live', ['create'], after=after)
-        self.assertTrue(m.validate(migration, configure=True, migration=True))
-        with self.assertRaises(ValueError):
-            m.validate(migration, migration=True)
-        for bindings in (None, [{'name': 'LIVE_CHANNELS'}]):
-            with self.subTest(bindings=bindings), self.assertRaises(ValueError):
-                m.validate(plan('cloudflare_worker_version.live', ['create'],
-                                after=dict(after, bindings=bindings)), configure=True, migration=True)
-        for address in ('cloudflare_workers_route.live', 'cloudflare_pages_project.live'):
-            with self.subTest(address=address), self.assertRaises(ValueError):
-                m.validate(plan(address, ['create']), configure=True, migration=True)
+class PolicyTests(unittest.TestCase):
+    def test_image_only_update(self):
+        before = {'image': 'old', 'region': 'iad', 'env': {'key': 'digest'}}
+        after = dict(before, image='new')
+        self.assertTrue(m.validate(plan('fly_machine.live', ['update'], before=before, after=after)))
+        after['region'] = 'lax'
+        with self.assertRaises(ValueError): m.validate(plan('fly_machine.live', ['update'], before=before, after=after))
 
-    def test_release_updates_version_and_deployment(self):
-        for address in m.RELEASE_RESOURCES:
-            self.assertTrue(m.validate(plan(address, ['update'])))
-        self.assertTrue(m.validate(plan('cloudflare_worker_version.live', ['delete', 'create'])))
-        self.assertTrue(m.validate(plan('cloudflare_workers_deployment.live', ['create', 'delete'])))
-        with self.assertRaises(ValueError):
-            m.validate(plan('cloudflare_workers_deployment.live', ['delete', 'create']), configure=True)
-        self.assertTrue(m.validate({'resource_changes': []}))
-
-    def test_infrastructure_drift_is_not_release(self):
-        for address in ('cloudflare_pages_project.live', 'cloudflare_dns_record.live',
-                        'cloudflare_worker.live', 'cloudflare_workers_route.live'):
-            with self.assertRaises(ValueError):
-                m.validate(plan(address, ['update']))
-            self.assertTrue(m.validate(plan(address, ['update']), configure=True))
-            self.assertTrue(m.validate(plan(address, ['no-op'])))
-
-    def test_first_deploy_requires_configure(self):
-        for address in ('cloudflare_pages_project.live', 'cloudflare_worker_version.live'):
-            with self.assertRaises(ValueError):
-                m.validate(plan(address, ['create']))
+    def test_configure_only_non_destructive_known_resources(self):
+        for address in m.CONFIGURE_RESOURCES:
             self.assertTrue(m.validate(plan(address, ['create']), configure=True))
+            with self.assertRaises(ValueError): m.validate(plan(address, ['delete']), configure=True)
+        with self.assertRaises(ValueError): m.validate(plan('other.resource', ['create']), configure=True)
 
-    def test_destructive_and_import_changes(self):
-        for configure in (True, False):
-            with self.assertRaises(ValueError):
-                m.validate(plan('cloudflare_pages_project.live', ['delete', 'create']), configure)
-        for actions in (['update'], ['no-op']):
-            with self.assertRaises(ValueError):
-                m.validate(plan('cloudflare_worker_version.live', actions, importing={'id': 'existing'}))
+    def test_worker_retirement_separate_and_bounded(self):
+        for address in m.WORKER_RESOURCES:
+            with self.assertRaises(ValueError): m.validate(plan(address, ['delete']), configure=True)
+            self.assertTrue(m.validate(plan(address, ['delete']), configure=True, retire_worker=True))
+        for address in ['cloudflare_r2_bucket.state', 'fly_volume.authority', 'cloudflare_pages_project.live']:
+            with self.assertRaises(ValueError): m.validate(plan(address, ['delete']), configure=True, retire_worker=True)
+        with self.assertRaises(ValueError): m.validate({}, retire_worker=True)
 
-    def test_deposed_version_cleanup_requires_current_replacement(self):
-        old = {'id': 'old', 'account_id': 'account', 'worker_id': 'worker'}
-        current = {'id': 'current', 'account_id': 'account', 'worker_id': 'worker'}
-        cleanup = plan('cloudflare_worker_version.live', ['delete'], before=old, after=None)
-        cleanup['resource_changes'][0]['deposed'] = 'deadbeef'
-        replacement = plan('cloudflare_worker_version.live', ['no-op'], after=current)
-        combined = {'resource_changes': cleanup['resource_changes'] + replacement['resource_changes']}
-        self.assertTrue(m.validate(combined))
-        self.assertTrue(m.validate(combined, configure=True))
-        with self.assertRaises(ValueError):
-            m.validate(cleanup, configure=True)
-        for key, value in (('id', 'old'), ('account_id', 'foreign'), ('worker_id', 'foreign')):
-            with self.subTest(key=key), self.assertRaises(ValueError):
-                current[key], saved = value, current[key]
-                try:
-                    m.validate(combined, configure=True)
-                finally:
-                    current[key] = saved
-        # A candidate may replace the current version while retiring a previous
-        # deposed one. The future ID is unknown; ownership and prior current ID
-        # must still prove this is not deleting the only managed version.
-        replacement['resource_changes'][0]['change'] = {
-            'actions': ['create', 'delete'], 'before': dict(current),
-            'after': {key: value for key, value in current.items() if key != 'id'}}
-        self.assertTrue(m.validate(combined, configure=True))
-        replacement['resource_changes'][0]['change']['actions'] = ['delete', 'create']
-        with self.assertRaises(ValueError):
-            m.validate(combined, configure=True)
-        replacement['resource_changes'][0]['change'] = {'actions': ['no-op'], 'after': current}
-        cleanup['resource_changes'][0].pop('deposed')
-        with self.assertRaises(ValueError):
-            m.validate(combined, configure=True)
-
-    def test_invalid_actions_rejected(self):
-        for actions in ([], ['unknown'], None):
-            with self.assertRaises(ValueError):
-                m.validate(plan('cloudflare_worker_version.live', actions))
-
-    def test_workflows_have_one_production_owner_and_shared_lock(self):
-        root = Path(__file__).resolve().parents[1]
-        release = (root / '.github/workflows/live-promote.yml').read_text()
-        configure = (root / '.github/workflows/configure-production-infra.yml').read_text()
-        self.assertNotIn('needs: [build, staging]', release)
-        self.assertIn('environment: production-approval', release)
-        self.assertIn('environment: Production', release)
-        self.assertIn('group: bmux-production-infrastructure', release)
-        self.assertIn('configure: true', configure)
-        self.assertIn('uses: ./.github/workflows/live-promote.yml', configure)
-        self.assertNotIn('id-token: write', release)
-        self.assertNotIn('configure-aws-credentials', release)
-        for name in ('R2_STATE_ACCESS_KEY_ID', 'R2_STATE_SECRET_ACCESS_KEY', 'TOFU_STATE_ENCRYPTION_PASSPHRASE'):
-            self.assertIn(name, release)
+    def test_no_release_create_or_replacement(self):
+        for actions in [['create'], ['delete'], ['delete', 'create'], ['create', 'delete']]:
+            with self.assertRaises(ValueError): m.validate(plan('fly_machine.live', actions))
 
 
-if __name__ == '__main__':
-    unittest.main()
+if __name__ == '__main__': unittest.main()

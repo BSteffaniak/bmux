@@ -89,13 +89,38 @@ class DeploymentBoundaryTests(unittest.TestCase):
                 digest, name = line.split('  ', 1)
                 self.assertEqual(hashlib.sha256((output / name).read_bytes()).hexdigest(), digest)
 
+    def test_obsolete_worker_dev_entrypoint_is_removed(self):
+        self.assertFalse((ROOT / 'scripts/live-dev.mjs').exists())
+        release = (ROOT / '.github/workflows/live-promote.yml').read_text()
+        self.assertNotIn("'infra/live-relay/**'", release)
+        product = (ROOT / 'docs/live-broadcasting.md').read_text()
+        self.assertNotIn('node scripts/live-dev.mjs', product)
+        self.assertIn('wss://live.bmux.dev/v1/viewer/ws', product)
+        self.assertIn('/data/relay/authority.json', product)
+
+    def test_acceptance_resolves_pinned_tools_and_passes_relay(self):
+        workflow = (ROOT / '.github/workflows/live-validation.yml').read_text()
+        for required in ('cargo build --locked -p bmux-live-relay',
+                         '--example snapshot --example wire_frame',
+                         'cargo metadata --locked --no-deps --format-version 1',
+                         'target_directory', '"$target_dir/debug/examples/snapshot" --binary',
+                         'scripts/smoke-live-local.py --relay "$target_dir/debug/bmux-live-relay"'):
+            self.assertIn(required, workflow)
+        self.assertNotIn('CARGO_TARGET_DIR=', workflow)
+        self.assertNotIn('target/debug/', workflow)
+        # Parse the actual outer bash -c quoting without executing any build.
+        run = workflow.split('      - name: Native runtime and live renderer acceptance (no deployment)\n        run: |\n', 1)[1]
+        command = '\n'.join(line[10:] for line in run.splitlines())
+        result = subprocess.run(['bash', '-n'], input=command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_live_tests_and_acceptance_remain_in_independent_ci(self):
         workflow = (ROOT / '.github/workflows/live-validation.yml').read_text()
         for name in ('test-live-bootstrap.py', 'test-live-github-environments.py', 'test-setup-live.py',
                      'test-live-state-recovery.py', 'test-live-state-provision.py', 'test-live-imports.py',
                      'test-live-plan-policy.py', 'test-live-deploy.py', 'test-live-install.py', 'test-live-state.py',
                      'test-archive-live-state.py', 'test-live-smoke.py', 'test-live-deployment-boundary.py',
-                     'npm test', 'smoke-pty-runtime.sh', 'compat-matrix.sh', 'smoke-live-local.py',
+                     'test-live-fly.py', 'test-live-build-artifact.py', 'smoke-pty-runtime.sh', 'compat-matrix.sh', 'smoke-live-local.py',
                      'fmt -check', 'init -backend=false', 'infra/live-terraform validate'):
             self.assertIn(name, workflow)
         self.assertNotIn('secrets.', workflow)

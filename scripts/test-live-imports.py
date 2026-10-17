@@ -128,8 +128,11 @@ class Tests(unittest.TestCase):
         with self.assertRaises(MODULE.ImportErrorSafe):
             MODULE.discover(api, MODULE.configuration(ENV), managed)
         api.data[f'zones/{ZONE}/workers/routes'][0]['script'] = 'bmux-live-production'
+        with self.assertRaises(MODULE.ImportErrorSafe):
+            MODULE.discover(api, MODULE.configuration(ENV), managed)
+        managed.add('cloudflare_workers_route.live')
         found = MODULE.discover(api, MODULE.configuration(ENV), managed)
-        self.assertEqual(found['cloudflare_workers_route.live'], ZONE + '/' + DNS)
+        self.assertNotIn('cloudflare_workers_route.live', found)
         self.assertNotIn('cloudflare_worker.live', found)
 
     def test_configuration_hostile_values_are_not_echoed(self):

@@ -4,7 +4,10 @@
 mod tests;
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
-use tokio::{io::AsyncReadExt, sync::watch};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::watch,
+};
 use uuid::Uuid;
 
 /// Explicit selected runtime, verified by artifact digest and version before launch.
@@ -155,17 +158,34 @@ async fn read_output(
     target: Uuid,
     sender: &watch::Sender<Option<Arc<[u8]>>>,
 ) -> Result<(), &'static str> {
-    let mut header = [0_u8; 37];
+    let fps = std::env::var("BMUX_BROADCAST_MAX_FPS")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|fps| (1..=60).contains(fps))
+        .unwrap_or(60);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        stream.write_all(&[b'B', b'M', b'A', b'Q', 2, 2, fps, 0]),
+    )
+    .await
+    .map_err(|_| "observer_timeout")?
+    .map_err(|_| "observer_closed")?;
+    let mut header = [0_u8; 38];
     tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut header))
         .await
         .map_err(|_| "observer_timeout")?
         .map_err(|_| "observer_closed")?;
-    if &header[..5] != b"BMAO\x01" || &header[21..] != target.as_bytes() {
+    if &header[..5] != b"BMAO\x02"
+        || &header[21..37] != target.as_bytes()
+        || header[37] == 0
+        || header[37] > fps
+    {
         return Err("observer_protocol");
     }
     let epoch = Uuid::from_slice(&header[5..21]).map_err(|_| "observer_protocol")?;
     let generation = format!("{epoch}:{target}");
     let mut revision = 0;
+    let mut baseline = None;
     loop {
         let length = stream.read_u32().await.map_err(|_| "observer_closed")? as usize;
         if length == 0 || length > crate::relay::MAX_FRAME_BYTES {
@@ -176,11 +196,16 @@ async fn read_output(
             .await
             .map_err(|_| "observer_timeout")?
             .map_err(|_| "observer_closed")?;
-        let frame = bmux_web_renderer::decode_binary(&bytes, None).map_err(|_| "invalid_frame")?;
+        let frame = bmux_web_renderer::decode_binary(&bytes, baseline.as_ref())
+            .map_err(|_| "invalid_frame")?;
         if frame.generation() != generation || frame.revision() <= revision {
             return Err("observer_protocol");
         }
         revision = frame.revision();
-        sender.send_replace(Some(bytes.into()));
+        // Reconstruct before the latest-value channel: no coalesced delta chain
+        // can lose an intermediate base. The controller retains one full repair.
+        let full = bmux_web_renderer::encode_binary(&frame).map_err(|_| "invalid_frame")?;
+        baseline = Some(frame);
+        sender.send_replace(Some(full.into()));
     }
 }

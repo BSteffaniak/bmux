@@ -20,7 +20,25 @@ HOME="$ISOLATED/home" XDG_CONFIG_HOME="$ISOLATED/config" XDG_RUNTIME_DIR="$ISOLA
   "$CARGO_TARGET_DIR/release/bmux" plugin rebuild --all-workspace-plugins
 mkdir "$OUTPUT/native" "$OUTPUT/relay" "$OUTPUT/tools"
 cp "$CARGO_TARGET_DIR/release/bmux" "$OUTPUT/native/bmux"
-cp -R infra/live-relay/src/. "$OUTPUT/relay/"
+# Coordinator owns this Dockerfile and Rust executable. Build locally only;
+# publishing this exact archive is an approved deployment operation.
+: "${LIVE_FLY_APP:?Fly app name required for immutable image reference}"
+cargo build --locked --release -p bmux-live-relay
+RELAY_TARGET="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+bash packages/live-relay/package-rootfs.sh "$RELAY_TARGET/release/bmux-live-relay" "$ISOLATED/artifacts/live-relay-rootfs"
+cp packages/live-relay/Dockerfile "$ISOLATED/Dockerfile"
+docker buildx build --platform linux/amd64 --provenance=false --file "$ISOLATED/Dockerfile" \
+  --output "type=oci,dest=$OUTPUT/relay/image.oci.tar" \
+  --metadata-file "$ISOLATED/image-metadata.json" "$ISOLATED"
+python3 - "$ISOLATED/image-metadata.json" "$OUTPUT/relay/IMAGE" <<'PY'
+import json, os, re, sys
+from pathlib import Path
+app = os.environ['LIVE_FLY_APP']
+digest = json.loads(Path(sys.argv[1]).read_text())['containerimage.digest']
+if not re.fullmatch('[a-z0-9][a-z0-9-]{0,62}', app) or not re.fullmatch('sha256:[a-f0-9]{64}', digest):
+    raise SystemExit('Invalid immutable relay image identity')
+Path(sys.argv[2]).write_text(f'registry.fly.io/{app}@{digest}\n')
+PY
 cp infra/live-terraform/tools/package*.json "$OUTPUT/tools/"
 (cd "$OUTPUT/tools" && npm ci --ignore-scripts --no-audit --no-fund)
 git rev-parse HEAD > "$OUTPUT/REVISION"

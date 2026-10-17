@@ -76,11 +76,15 @@ impl CanvasBackend {
         context: &CanvasRenderingContext2d,
         frame: &BrowserFrame,
         resources: &BTreeMap<String, Rc<Bitmap>>,
+        dirty: &[bool],
     ) -> Result<(), JsValue> {
         let area = frame.buffer().area();
         context.set_text_baseline("alphabetic");
         context.set_image_smoothing_enabled(false);
         for (index, cell) in frame.buffer().cells().iter().enumerate() {
+            if !dirty[index] {
+                continue;
+            }
             let x = f64::from(u16::try_from(index % usize::from(area.width)).map_err(error)?)
                 * self.cell_width;
             let y = f64::from(u16::try_from(index / usize::from(area.width)).map_err(error)?)
@@ -96,7 +100,10 @@ impl CanvasBackend {
         }
         // All physical backgrounds are complete before drawing wide glyphs.
         for (index, cell) in frame.buffer().cells().iter().enumerate() {
-            if cell.is_wide_continuation() || cell.style.modifiers.contains(Modifier::HIDDEN) {
+            if !dirty[index]
+                || cell.is_wide_continuation()
+                || cell.style.modifiers.contains(Modifier::HIDDEN)
+            {
                 continue;
             }
             let x = f64::from(u16::try_from(index % usize::from(area.width)).map_err(error)?)
@@ -186,7 +193,7 @@ impl BrowserBackend for CanvasBackend {
     fn render(
         &mut self,
         frame: &BrowserFrame,
-        _previous: Option<&BrowserFrame>,
+        previous: Option<&BrowserFrame>,
     ) -> Result<(), JsValue> {
         // Prepare and draw offscreen first. The visible copy is the commit point.
         let (width, height) = self.bounds(frame)?;
@@ -194,7 +201,56 @@ impl BrowserBackend for CanvasBackend {
         let staging_context = context(&staging)?;
         let prepared = self.pending.take();
         let resources = prepared.as_ref().unwrap_or(&self.resources);
-        self.paint(&staging_context, frame, resources)?;
+        let area = frame.buffer().area();
+        let previous = previous.filter(|base| {
+            base.buffer().area() == area
+                && self.canvas.width() == width
+                && self.canvas.height() == height
+                && base.image_scene() == frame.image_scene()
+        });
+        let mut dirty = vec![previous.is_none(); frame.buffer().cells().len()];
+        if let Some(base) = previous {
+            staging_context.draw_image_with_html_canvas_element(&self.canvas, 0.0, 0.0)?;
+            let columns = usize::from(area.width);
+            for (index, cell) in frame.buffer().cells().iter().enumerate() {
+                if base.buffer().cells()[index] != *cell {
+                    // Include adjacent physical cells for old/new wide glyphs.
+                    let row = index / columns * columns;
+                    let start = index.saturating_sub(1).max(row);
+                    let end = (index + 2).min(row + columns);
+                    dirty[start..end].fill(true);
+                }
+            }
+            if base.cursor() != frame.cursor() {
+                for cursor in [base.cursor(), frame.cursor()].into_iter().flatten() {
+                    if area.contains(cursor.position) {
+                        let index = usize::from(cursor.position.y - area.y) * columns
+                            + usize::from(cursor.position.x - area.x);
+                        let row = index / columns * columns;
+                        dirty[index.saturating_sub(1).max(row)..(index + 2).min(row + columns)]
+                            .fill(true);
+                    }
+                }
+            }
+        }
+        staging_context.save();
+        staging_context.begin_path();
+        for (index, changed) in dirty.iter().enumerate() {
+            if *changed {
+                staging_context.rect(
+                    f64::from(u16::try_from(index % usize::from(area.width)).map_err(error)?)
+                        * self.cell_width,
+                    f64::from(u16::try_from(index / usize::from(area.width)).map_err(error)?)
+                        * self.cell_height,
+                    self.cell_width,
+                    self.cell_height,
+                );
+            }
+        }
+        staging_context.clip();
+        let painted = self.paint(&staging_context, frame, resources, &dirty);
+        staging_context.restore();
+        painted?;
         // Keep a repair copy across resize: setting canvas dimensions clears it.
         let old_width = self.canvas.width();
         let old_height = self.canvas.height();
@@ -383,7 +439,7 @@ impl CanvasRenderer {
         backend.font = font;
         backend.baseline = baseline;
         if let Some(frame) = frame
-            && let Err(failure) = backend.render(&frame, Some(&frame))
+            && let Err(failure) = backend.render(&frame, None)
         {
             (
                 backend.cell_width,
@@ -505,6 +561,10 @@ impl CanvasRenderer {
 
 impl CanvasRenderer {
     fn decode_binary_frame(&self, bytes: &[u8]) -> Result<BrowserFrame, JsValue> {
+        // Inline and inherited immutable resources need no speculative cache load.
+        if let Ok(frame) = crate::wire::decode_binary(bytes, self.renderer.committed()) {
+            return Ok(frame);
+        }
         let resources = crate::wire::resource_requirements(bytes)
             .map_err(error)?
             .into_iter()

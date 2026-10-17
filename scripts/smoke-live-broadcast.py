@@ -38,7 +38,7 @@ class SmokeFailure(ValueError):
 
 
 def safe_endpoint(path):
-    if path in ('/api/live/main/health', '/api/live/main/status', '/live'):
+    if path in ('/health', '/live'):
         return path
     if re.fullmatch(r'/live-assets/[0-9a-f]{64}/[a-zA-Z0-9_.-]+', path):
         return path
@@ -51,7 +51,7 @@ def response_metadata(response):
     return {'cf_ray': ray if re.fullmatch(r'[a-fA-F0-9]{16,32}-[A-Z]{3}', ray) else None}
 
 
-def smoke(url, component='all', report=None):
+def smoke(url, component='all', report=None, relay_url='https://live.bmux.dev'):
     opener = urllib.request.build_opener(NoRedirect())
     opener.addheaders = [('User-Agent', 'bmux-public-smoke/1')]
     def emit(**fields):
@@ -62,7 +62,7 @@ def smoke(url, component='all', report=None):
         started = time.monotonic()
         emit(event='request', endpoint=endpoint)
         try:
-            with opener.open(url + path, timeout=10) as response:
+            with opener.open((relay_url if path == '/health' else url) + path, timeout=10) as response:
                 metadata = dict(http_status=response.status, **response_metadata(response))
                 if response.status != 200:
                     raise SmokeFailure('unexpected_http_status', endpoint, **metadata)
@@ -89,13 +89,10 @@ def smoke(url, component='all', report=None):
             return json.loads(get(path, limit))
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise SmokeFailure('invalid_json', safe_endpoint(path)) from None
-    paths = ('/api/live/main/health', '/api/live/main/status') if component != 'site' else ()
-    for path in paths:
-        data = get_json(path, 4096)
-        if data.get('protocol') != 1 or data.get('renderer') != 'bmwp-3':
-            raise SmokeFailure('unsupported_protocol', path)
-        if path.endswith('/status') and data.get('state') not in ('offline', 'starting', 'live', 'paused'):
-            raise SmokeFailure('unsupported_state', path)
+    if component != 'site':
+        data = get_json('/health', 4096)
+        if data.get('protocol') != 1 or data.get('renderer') != 'bmwp-4':
+            raise SmokeFailure('unsupported_protocol', '/health')
     if component == 'backend':
         return
     parser = AssetParser()
@@ -105,7 +102,7 @@ def smoke(url, component='all', report=None):
     base = next(iter(parser.bases))
     manifest = get_json(base + 'manifest.json', 8192)
     if (manifest.get('schema') != 1 or manifest.get('protocol') != 1 or
-            manifest.get('renderer') != 'bmwp-3' or manifest.get('bundle_sha256') != base.split('/')[2]):
+            manifest.get('renderer') != 'bmwp-4' or manifest.get('bundle_sha256') != base.split('/')[2]):
         raise SmokeFailure('unsupported_asset_manifest', base + 'manifest.json')
     required = {'live-page.js', 'live-viewer.js', 'canvas-viewer.js',
                 'bmux_web_renderer.js', 'bmux_web_renderer_bg.wasm'}
@@ -134,15 +131,17 @@ def smoke(url, component='all', report=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url', required=True)
+    parser.add_argument('--relay-url', default='https://live.bmux.dev')
     parser.add_argument('--component', choices=('all', 'site', 'backend'), default='all')
     args = parser.parse_args()
-    parsed = urlsplit(args.url)
-    if (parsed.scheme != 'https' and not (parsed.scheme == 'http' and parsed.hostname in ('127.0.0.1', 'localhost'))) or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ('', '/'):
-        parser.error('Use HTTPS origin or loopback HTTP; no credentials/query/path')
+    for origin in (args.url, args.relay_url):
+        parsed = urlsplit(origin)
+        if (parsed.scheme != 'https' and not (parsed.scheme == 'http' and parsed.hostname in ('127.0.0.1', 'localhost'))) or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in ('', '/'):
+            parser.error('Use HTTPS origin or loopback HTTP; no credentials/query/path')
     def report(fields):
         print(json.dumps(fields, sort_keys=True), flush=True)
     try:
-        smoke(args.url.rstrip('/'), args.component, report=report)
+        smoke(args.url.rstrip('/'), args.component, report=report, relay_url=args.relay_url.rstrip('/'))
     except SmokeFailure as error:
         report(dict(event='failure', component=args.component, **error.details))
         return 1

@@ -96,7 +96,7 @@ async fn value(
 async fn connectivity(endpoint: &str, channel: &str) -> Result<(), PluginCommandError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut url = relay::validate_endpoint(endpoint, channel).map_err(failed)?;
-    url.set_path(&format!("/api/live/{channel}/health"));
+    url.set_path("/health");
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(3))
@@ -123,11 +123,12 @@ async fn connectivity(endpoint: &str, channel: &str) -> Result<(), PluginCommand
         bytes.extend_from_slice(&chunk);
     }
     let health: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| failed("relay health invalid JSON"))?;
-    if health.get("renderer").and_then(serde_json::Value::as_str) != Some("bmwp-3")
-        || health.get("protocol").and_then(serde_json::Value::as_u64) != Some(1)
+        serde_json::from_slice(&bytes).map_err(|_| failed("relay health invalid response"))?;
+    let renderer = format!("bmwp-{}", bmux_web_renderer::BINARY_WIRE_VERSION);
+    if health.get("status").and_then(serde_json::Value::as_str) != Some("ok")
+        || health.get("renderer").and_then(serde_json::Value::as_str) != Some(renderer.as_str())
     {
-        return Err(failed("relay renderer mismatch: BMWP3 required"));
+        return Err(failed("relay health incompatible renderer"));
     }
     Ok(())
 }
@@ -268,7 +269,7 @@ pub(crate) async fn local(context: &NativeCommandContext) -> Result<bool, Plugin
             connectivity(&p.endpoint, &p.channel).await?;
             output(
                 context,
-                "Profile, private credential permissions and relay BMWP3 health: OK. No configuration changed.",
+                "Profile, private credential permissions and relay health: OK. No configuration changed.",
             ).await;
             Ok(true)
         }
@@ -815,9 +816,9 @@ mod tests {
             let mut bytes = [0; 4096];
             let count = stream.read(&mut bytes).unwrap();
             let request = String::from_utf8_lossy(&bytes[..count]);
-            assert!(request.starts_with("GET /api/live/main/health"));
+            assert!(request.starts_with("GET /health"));
             assert!(!request.to_lowercase().contains("authorization:"));
-            let body = r#"{"protocol":1,"renderer":"bmwp-3"}"#;
+            let body = r#"{"status":"ok","renderer":"bmwp-4"}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

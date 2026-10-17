@@ -1,247 +1,176 @@
 #!/usr/bin/env python3
-"""Real generated-site/WASM/relay browser regression; stdlib, isolated owned children."""
+"""Actual generated-site, Rust relay WSS and WASM pixel/lifecycle acceptance; no builds."""
 import argparse
+import base64
 import hashlib
-import http.client
-import http.server
 import importlib.util
 import json
-import mimetypes
-import os
 from pathlib import Path
-import secrets
 import subprocess
 import tempfile
-import threading
 import time
 import urllib.request
-import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location('cdp', ROOT / 'scripts/web-browser-cdp.py')
-cdp_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(cdp_module)
 
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module
 
-def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+CDP = load('browser_cdp', ROOT / 'scripts/web-browser-cdp.py')
+LOCAL = load('browser_local', ROOT / 'scripts/smoke-live-local.py')
+wait = LOCAL.wait
 
-
-def wait(predicate, seconds=10):
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        result = predicate()
-        if result:
-            return result
-        time.sleep(0.1)
-    raise AssertionError('bounded browser acceptance condition timed out')
+INSTRUMENT = r'''
+window.__proof={texts:[],images:0,frames:[],urls:[],acks:[],paints:0};
+const fill=CanvasRenderingContext2D.prototype.fillText;
+CanvasRenderingContext2D.prototype.fillText=function(text,...args){__proof.texts.push(String(text));return fill.call(this,text,...args)};
+const image=CanvasRenderingContext2D.prototype.drawImage;
+CanvasRenderingContext2D.prototype.drawImage=function(...args){__proof.images++;return image.apply(this,args)};
+const NativeSocket=window.WebSocket;
+window.WebSocket=class extends NativeSocket {
+ constructor(url,...args){super(url,...args);__proof.urls.push(String(url));this.addEventListener('message',event=>{
+  if(event.data instanceof ArrayBuffer)__proof.frames.push({bytes:event.data.byteLength,time:performance.now()});
+ });}
+ send(data){if(typeof data==='string'){const value=JSON.parse(data);if(value.type==='ack')__proof.acks.push({...value,time:performance.now()})}return super.send(data)}
+};
+'''
+PIXELS = r'''(() => {
+ const c=document.querySelector('#live-broadcast canvas:not([hidden])');if(!c)return null;
+ const x=c.getContext('2d'),sample=(a,b)=>Array.from(x.getImageData(a,b,1,1).data);
+ const d=x.getImageData(20,20,700,20).data;let bright=0;
+ for(let i=0;i<d.length;i+=4)if(d[i]>80||d[i+1]>80||d[i+2]>80)bright++;
+ return {width:c.width,height:c.height,brightTitlePixels:bright,red:sample(30,150),green:sample(90,150),
+ blue:sample(30,210),imageDrawCalls:__proof.images,text:__proof.texts.join('')};
+})()'''
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--browser', required=True, type=Path)
-    parser.add_argument('--site', required=True, type=Path)
-    parser.add_argument('--fixture', required=True, type=Path)
+    for name in ('browser', 'site', 'fixture', 'relay', 'wire-tool'):
+        parser.add_argument('--' + name, required=True, type=Path)
+    parser.add_argument('--evidence', type=Path, help='Write pixel screenshots and bounded JSON here')
     args = parser.parse_args()
-    site = args.site.resolve()
-    version = (site / 'live-assets/current-version').read_text().strip()
+    site = args.site.resolve(); version = (site / 'live-assets/current-version').read_text().strip()
     assets = site / 'live-assets' / version
-    frame = args.fixture.read_bytes()
-    assert frame.startswith(b'BMWP\x03')
+    frame = args.fixture.read_bytes(); assert frame.startswith(b'BMWP\x04')
     module_path = f'/live-assets/{version}/live-page.js'
-    generated_pages = list(site.rglob('*.html'))
-    assert generated_pages
-    for page in generated_pages:
-        if not page.is_relative_to(site / 'live-assets') and not page.is_relative_to(site / 'public'):
-            assert module_path in page.read_text(), f'missing immutable audience hook in {page.name}'
-    evidence = {'browser': str(args.browser), 'browser_sha256': digest(args.browser.resolve()),
-                'wasm_sha256': digest(assets / 'bmux_web_renderer_bg.wasm'),
-                'fixture_sha256': digest(args.fixture), 'bundle': version, 'cases': []}
-    children = []
-    browser = None
-    proxy = None
-    cdp = None
-    with tempfile.TemporaryDirectory(prefix='bmux-live-browser-') as temporary:
-        isolated = Path(temporary)
-        key = secrets.token_hex(32)
-        keyfile = isolated / 'key'
-        keyfile.write_text(key)
-        keyfile.chmod(0o600)
-        log = open(isolated / 'children.log', 'wb')
+    pages = list(site.rglob('*.html')); assert pages
+    for page in pages:
+        if not page.is_relative_to(site / 'live-assets') and not page.is_relative_to(site / 'web-assets'):
+            assert module_path in page.read_text(), 'generated global viewer mount missing'
+    LOCAL.verify_assets(assets)
+    timer = subprocess.run([str(args.wire_tool.resolve()), '--timer'], input=frame, capture_output=True, check=True, timeout=5).stdout
+    delta = subprocess.run([str(args.wire_tool.resolve()), '--delta', str(args.fixture.resolve())], input=timer, capture_output=True, check=True, timeout=5).stdout
+    assert delta.startswith(b'BMWP\x04') and len(delta) < 256 and len(delta) < len(frame) / 10, 'one digit must be a tiny patch'
+    evidence = {'cases': [], 'relay_sha256': hashlib.sha256(args.relay.read_bytes()).hexdigest(), 'delta_bytes': len(delta), 'full_bytes': len(frame)}
+    if args.evidence: args.evidence.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='bmux-live-browser-') as directory:
+        root = Path(directory); stack = LOCAL.RelayStack(args.relay, root, assets, site)
+        browser = cdp = None
+        log = open(root / 'browser.log', 'wb')
         try:
-            relay = subprocess.Popen(['node', str(ROOT / 'scripts/live-dev.mjs'), '--assets', str(assets),
-                '--key-file', str(keyfile), '--state-file', str(isolated / 'state'),
-                '--ready-file', str(isolated / 'ready')], stdout=log, stderr=log)
-            children.append(relay)
-            ready = wait(lambda: (isolated / 'ready').exists())
-            relay_url = json.loads((isolated / 'ready').read_text())['url']
-            relay_port = int(relay_url.rsplit(':', 1)[1])
-            network = []
-
-            class Handler(http.server.BaseHTTPRequestHandler):
-                def log_message(self, *_args):
-                    pass
-
-                def do_GET(self):
-                    if self.path.startswith('/api/live/'):
-                        network.append({'path': self.path.split('?')[0],
-                                        'authorization': bool(self.headers.get('Authorization')),
-                                        'controller': bool(self.headers.get('X-Bmux-Controller'))})
-                        upstream = http.client.HTTPConnection('127.0.0.1', relay_port, timeout=6)
-                        try:
-                            upstream.request('GET', self.path)
-                            response = upstream.getresponse()
-                            data = response.read(8 * 1024 * 1024 + 1)
-                            self.send_response(response.status)
-                            for name in ('Content-Type', 'X-Bmux-Epoch', 'X-Snapshot-Revision', 'Cache-Control'):
-                                if response.getheader(name):
-                                    self.send_header(name, response.getheader(name))
-                            self.send_header('Content-Length', str(len(data)))
-                            self.end_headers()
-                            self.wfile.write(data)
-                        finally:
-                            upstream.close()
-                        return
-                    relative = self.path.split('?')[0].lstrip('/')
-                    if relative in ('', 'live', 'live/'):
-                        relative = 'live.html' if relative else 'index.html'
-                    path = (site / relative).resolve()
-                    if not path.is_relative_to(site) or not path.is_file():
-                        self.send_error(404)
-                        return
-                    data = path.read_bytes()
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/wasm' if path.suffix == '.wasm'
-                                     else mimetypes.guess_type(path)[0] or 'application/octet-stream')
-                    self.send_header('Content-Length', str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-
-            proxy = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-            proxy.daemon_threads = True
-            thread = threading.Thread(target=proxy.serve_forever, daemon=True)
-            thread.start()
-            page_url = f'http://127.0.0.1:{proxy.server_port}/live'
-            evidence['html_mode'] = 'generated-site'
-            browser = subprocess.Popen([str(args.browser), '--headless', '--no-sandbox', '--disable-gpu',
-                '--disable-background-networking', '--no-first-run', '--no-default-browser-check',
-                '--remote-debugging-port=0', '--remote-allow-origins=*',
-                f'--user-data-dir={isolated / "profile"}', 'about:blank'], stdout=log, stderr=log)
-            children.append(browser)
-            active = isolated / 'profile/DevToolsActivePort'
-            wait(active.exists)
-            port = active.read_text().splitlines()[0]
+            browser = subprocess.Popen([str(args.browser.resolve()), '--headless', '--no-sandbox', '--disable-gpu',
+                '--disable-background-networking', '--no-first-run', '--no-default-browser-check', '--no-proxy-server',
+                '--ignore-certificate-errors', '--host-resolver-rules=' + stack.chrome_rules,
+                '--remote-debugging-port=0', '--remote-allow-origins=*', '--user-data-dir=' + str(root / 'profile'), 'about:blank'],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            ready = root / 'profile/DevToolsActivePort'; wait(lambda: ready.exists() and browser.poll() is None)
+            port = ready.read_text().splitlines()[0]
             with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/list', timeout=5) as response:
-                targets = json.load(response)
-            cdp = cdp_module.CDP(next(t['webSocketDebuggerUrl'] for t in targets if t['type'] == 'page'))
-            cdp.call('Page.enable')
-            cdp.call('Page.addScriptToEvaluateOnNewDocument', {'source': '''
-              window.__proof = {texts:[], images:0};
-              const text = CanvasRenderingContext2D.prototype.fillText;
-              CanvasRenderingContext2D.prototype.fillText = function(value,...args) {
-                __proof.texts.push(String(value)); return text.call(this,value,...args);
-              };
-              const image = CanvasRenderingContext2D.prototype.drawImage;
-              CanvasRenderingContext2D.prototype.drawImage = function(...args) {
-                __proof.images++; return image.apply(this,args);
-              };
-            '''})
-            cdp.call('Page.navigate', {'url': page_url})
+                target = next(item for item in json.load(response) if item['type'] == 'page')
+            cdp = CDP.CDP(target['webSocketDebuggerUrl']); cdp.call('Page.enable'); cdp.call('Runtime.enable')
+            cdp.call('Page.addScriptToEvaluateOnNewDocument', {'source': INSTRUMENT})
+            cdp.call('Page.navigate', {'url': 'https://bmux.dev/live/'})
             wait(lambda: cdp.evaluate("!!document.getElementById('live-broadcast')"))
-            epoch = None
-
-            def publish(action, data=None, revision=None):
-                headers = {'Authorization': f'Bearer {key}'}
-                if epoch:
-                    headers['X-Bmux-Epoch'] = epoch
-                if revision:
-                    headers['X-Bmux-Revision'] = str(revision)
-                if isinstance(data, dict):
-                    headers['Content-Type'] = 'application/json'
-                    data = json.dumps(data).encode()
-                elif data is not None:
-                    headers['Content-Type'] = 'application/octet-stream'
-                request = urllib.request.Request(relay_url + '/api/live/main/publisher/' + action,
-                    data=data if data is not None else b'', headers=headers,
-                    method='PUT' if action == 'frame' else 'POST')
-                with urllib.request.urlopen(request, timeout=6) as response:
-                    assert response.status in (200, 204)
-                    return json.load(response) if response.status == 200 else None
-
-            def start():
-                return publish('start', {'protocol': 1, 'renderer': 'bmwp-3',
-                                        'publisher_id': str(uuid.uuid4())})['epoch']
-
-            def visible():
-                return cdp.evaluate("!!document.querySelector('#live-broadcast canvas:not([hidden])')")
-
-            def hidden():
-                return not visible() and cdp.evaluate("document.querySelectorAll('#live-broadcast canvas').length === 0")
-
-            def pixels():
-                return cdp.evaluate('''(() => {
-                  const c=document.querySelector('#live-broadcast canvas:not([hidden])');
-                  const x=c.getContext('2d'); const sample=(a,b)=>Array.from(x.getImageData(a,b,1,1).data);
-                  const d=x.getImageData(20,20,700,20).data;
-                  let bright=0; for(let i=0;i<d.length;i+=4) if(d[i]>80||d[i+1]>80||d[i+2]>80) bright++;
-                  return {width:c.width,height:c.height,brightTitlePixels:bright,
-                    red:sample(30,150),green:sample(90,150),blue:sample(30,210),
-                    imageDrawCalls:__proof.images,text:__proof.texts.join('')};
-                })()''')
-
-            epoch = start()
-            publish('frame', frame, 1)
-            try:
-                wait(visible)
-            except AssertionError:
-                print(json.dumps({'diagnostic': cdp.evaluate("({status:document.getElementById('live-status')?.textContent, scripts:Array.from(document.scripts).map(s=>s.src), resources:performance.getEntriesByType('resource').map(r=>({url:r.name,status:r.responseStatus}))})"), 'audience_requests': len(network)}))
-                raise
-            proof = pixels()
+            visible = lambda: cdp.evaluate("!!document.querySelector('#live-broadcast canvas:not([hidden])')")
+            hidden = lambda: cdp.evaluate("document.querySelectorAll('#live-broadcast canvas').length===0")
+            stack.control('start'); first_ack = stack.publish(frame); wait(visible)
+            proof = cdp.evaluate(PIXELS)
             assert proof['width'] == 800 and proof['height'] == 480
-            assert proof['brightTitlePixels'] > 30
-            assert 'bmux_tui' in proof['text'] and 'browser' in proof['text']
-            assert proof['imageDrawCalls'] > 0
-            assert proof['red'][0] > 220 and proof['green'][1] > 220 and proof['blue'][2] > 220
-            evidence['canvas'] = proof
-            evidence['cases'].append('generated-live-real-wasm-text-image-pixels')
-            publish('pause'); wait(hidden)
-            time.sleep(1.2); assert hidden()
+            assert proof['brightTitlePixels'] > 30 and 'bmux_tui' in proof['text'] and 'browser' in proof['text']
+            assert proof['imageDrawCalls'] > 0 and proof['red'][0] > 220 and proof['green'][1] > 220 and proof['blue'][2] > 220
+            evidence['canvas'] = proof; evidence['cases'].append('generated-live-real-WASM-text-image-pixels')
+            if args.evidence:
+                (args.evidence / 'full.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot', {'format': 'png'})['data']))
+            cdp.evaluate("window.__beforePixels=document.querySelector('#live-broadcast canvas:not([hidden])').getContext('2d').getImageData(0,0,800,480).data.slice();true")
+            slow = stack.ws()
+            assert slow.receive()['type'] == 'state' and slow.receive() == frame
+            count = cdp.evaluate('__proof.frames.length'); stack.publish(delta)
+            wait(lambda: cdp.evaluate('__proof.frames.length') > count)
+            changed = wait(lambda: cdp.evaluate(r'''(()=>{const c=document.querySelector('#live-broadcast canvas:not([hidden])');
+              if(!c)return null;const d=c.getContext('2d').getImageData(0,0,800,480).data;let n=0,minX=800,minY=480,maxX=0,maxY=0;
+              for(let i=0;i<d.length;i+=4)if(d[i]!==__beforePixels[i]||d[i+1]!==__beforePixels[i+1]||d[i+2]!==__beforePixels[i+2]){
+                const x=(i/4)%800,y=Math.floor(i/4/800);n++;minX=Math.min(minX,x);maxX=Math.max(maxX,x);minY=Math.min(minY,y);maxY=Math.max(maxY,y)}
+              return n?{pixels:n,minX,minY,maxX,maxY,bytes:__proof.frames.at(-1).bytes}:null})()'''))
+            assert changed['bytes'] == len(delta), 'fast viewer did not receive the original delta'
+            assert changed['minX'] >= 750 and changed['maxX'] < 790 and changed['minY'] >= 440 and changed['maxY'] < 460
+            slow.send(first_ack)
+            repaired = slow.receive()
+            while isinstance(repaired, dict): repaired = slow.receive()
+            assert repaired == delta or repaired == timer, 'slow peer received no coherent continuation'
+            # Explicit browser decoder loss must always request a complete repair.
+            slow.send({'type': 'repair'})
+            repaired = slow.receive()
+            while isinstance(repaired, dict): repaired = slow.receive()
+            assert repaired == timer, 'repair did not materialize retained full snapshot'
+            slow.close()
+            evidence['cases'].append('slow-viewer-credit-and-explicit-full-baseline-repair')
+            evidence['timer_pixels'] = changed; evidence['cases'].append('one-digit-localized-pixels-and-tiny-both-hop-delta')
+            if args.evidence:
+                (args.evidence / 'timer.png').write_bytes(base64.b64decode(cdp.call('Page.captureScreenshot', {'format': 'png'})['data']))
+            before = cdp.evaluate('({frames:__proof.frames.length,text:__proof.texts.length,images:__proof.images})')
+            time.sleep(2); stack.control('heartbeat'); time.sleep(.5)
+            assert cdp.evaluate('({frames:__proof.frames.length,text:__proof.texts.length,images:__proof.images})') == before, 'idle produced frame or paint work'
+            evidence['cases'].append('idle-zero-binary-and-zero-canvas-paint-heartbeat-only')
+            # Burst publisher ACKs may outpace rendering. The relay must coalesce
+            # to a coherent repair, and the real browser decoder must reach latest.
+            burst = []; previous = timer
+            basefile = root / 'burst-base.bmwp'
+            for _ in range(12):
+                following = subprocess.run([str(args.wire_tool.resolve()), '--timer'], input=previous,
+                    capture_output=True, check=True, timeout=5).stdout
+                basefile.write_bytes(previous)
+                patch = subprocess.run([str(args.wire_tool.resolve()), '--delta', str(basefile)], input=following,
+                    capture_output=True, check=True, timeout=5).stdout
+                assert len(patch) < 256
+                burst.append(patch); previous = following
+            start_ack = cdp.evaluate('__proof.acks.length')
+            for patch in burst: last_ack = stack.publish(patch)
+            wait(lambda: cdp.evaluate('__proof.acks.at(-1)?.revision') == last_ack['revision'])
+            admitted = cdp.evaluate('__proof.acks.slice(' + str(start_ack) + ')')
+            assert admitted and all(b['time'] - a['time'] >= 15 for a, b in zip(admitted, admitted[1:])), 'browser exceeded 60 FPS'
+            evidence['burst_admitted'] = len(admitted)
+            evidence['cases'].append('burst-bounded-60FPS-latest-baseline-coherent-real-decoder')
+            stack.control('pause'); wait(hidden); time.sleep(.3); assert hidden()
             evidence['cases'].append('pause-clears')
-            publish('resume'); publish('frame', frame, 2); wait(visible)
-            evidence['cases'].append('resume-identical-static-source-frame')
-            publish('stop'); wait(hidden)
-            evidence['cases'].append('stop-clears')
-            epoch = start(); publish('frame', frame, 1); wait(visible)
+            stack.control('resume'); stack.publish(frame); wait(visible)
+            evidence['cases'].append('resume-identical-source-full-repair')
+            stack.control('stop'); wait(hidden); evidence['cases'].append('stop-clears')
+            stack.control('start'); stack.publish(frame); wait(visible)
             evidence['cases'].append('replacement-epoch-reconnect')
-            wait(hidden, 18)
-            evidence['cases'].append('actual-relay-lease-expiry-clears')
-            epoch = start(); publish('frame', frame, 1); wait(visible)
+            wait(hidden, 18); evidence['cases'].append('actual-relay-lease-expiry-clears')
+            stack.control('start'); stack.publish(frame); wait(visible)
             evidence['cases'].append('reconnect-after-expiry')
-            cdp.call('Page.navigate', {'url': f'http://127.0.0.1:{proxy.server_port}/'})
-            wait(lambda: cdp.evaluate("document.readyState === 'complete' && !document.getElementById('live-broadcast')"))
-            time.sleep(1.2)
-            count = len(network); time.sleep(1.3); assert len(network) == count
-            evidence['cases'].append('navigation-unmount-stops-polling')
-            assert network and all(not n['authorization'] and not n['controller'] for n in network)
-            assert all(n['path'] in ('/api/live/main/status', '/api/live/main/presentation') for n in network)
-            evidence['audience_requests'] = len(network)
-            evidence['cases'].append('network-output-only-no-controller-credentials')
-            evidence['status'] = 'PASS'
+            urls = cdp.evaluate('__proof.urls'); assert urls and all(url == 'wss://live.bmux.dev/v1/viewer/ws' for url in urls)
+            assert all(not row['authorization'] for row in stack.network if row['path'] == '/v1/viewer/ws')
+            evidence['cases'].append('WSS-output-only-no-browser-publisher-credentials')
+            cdp.call('Page.navigate', {'url': 'https://bmux.dev/'})
+            wait(lambda: cdp.evaluate("document.readyState==='complete'&&!document.getElementById('live-broadcast')"))
+            # A new binary would render if the previous live page had leaked its mount.
+            stack.publish(delta); time.sleep(.4)
+            assert cdp.evaluate("document.querySelectorAll('#live-broadcast canvas').length===0")
+            evidence['cases'].append('navigation-unmount-disposes-viewer')
+            evidence['result'] = 'PASS'
         finally:
-            if cdp:
-                cdp.close()
-            for child in reversed(children):
-                child.terminate()
-                try:
-                    child.wait(timeout=8)
-                except subprocess.TimeoutExpired:
-                    child.kill(); child.wait(timeout=5)
-            if proxy:
-                proxy.shutdown(); proxy.server_close()
-            log.close()
-            evidence['cleanup'] = 'owned children reaped; proxy closed; private profile/state removed'
-    print(json.dumps(evidence, ensure_ascii=False))
+            if cdp: cdp.close()
+            if browser:
+                browser.terminate()
+                try: browser.wait(timeout=5)
+                except subprocess.TimeoutExpired: browser.kill(); browser.wait(timeout=5)
+            stack.close(); log.close()
+    if args.evidence: (args.evidence / 'report.json').write_text(json.dumps(evidence, sort_keys=True))
+    print(json.dumps(evidence, sort_keys=True))
 
-
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()

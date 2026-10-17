@@ -1,68 +1,63 @@
 #!/usr/bin/env python3
-"""Reject unexpected infrastructure changes during ordinary live releases."""
+"""Fail closed on infrastructure drift; explicit, bounded Worker retirement only."""
 import argparse
 import json
 from pathlib import Path
 
-RELEASE_RESOURCES = {
+WORKER_RESOURCES = {
+    'cloudflare_worker.live',
     'cloudflare_worker_version.live',
     'cloudflare_workers_deployment.live',
+    'cloudflare_workers_route.live',
+}
+RELEASE_RESOURCES = {'fly_machine.live'}
+CONFIGURE_RESOURCES = RELEASE_RESOURCES | {
+    'fly_app.live', 'fly_volume.authority', 'fly_ip.v4', 'fly_ip.v6',
+    'fly_cert.live', 'fly_cert_validation.live',
+    'cloudflare_pages_project.live', 'cloudflare_pages_domain.live',
+    'cloudflare_dns_record.live', 'cloudflare_dns_record.relay',
+    'cloudflare_dns_record.relay_acme', 'cloudflare_r2_bucket.state',
+    'cloudflare_r2_bucket_lock.state', 'cloudflare_r2_bucket_lifecycle.state',
 }
 
 
-def validate(plan, configure=False, migration=False):
-    if migration and not configure:
-        raise ValueError('Migration deployment is configure-only')
+def validate(plan, configure=False, retire_worker=False):
+    if retire_worker and not configure:
+        raise ValueError('Worker retirement is configure-only')
     if not isinstance(plan, dict) or not isinstance(plan.get('resource_changes', []), list):
         raise ValueError('Invalid infrastructure plan')
     for resource in plan.get('resource_changes', []):
         address = resource.get('address')
         change = resource.get('change', {})
         actions = change.get('actions')
-        if not isinstance(address, str) or not isinstance(actions, list) or not actions:
-            raise ValueError('Invalid infrastructure change')
-        if any(action not in ('no-op', 'read', 'create', 'update', 'delete') for action in actions):
+        if not isinstance(address, str) or actions not in (
+                ['no-op'], ['read'], ['create'], ['update'], ['delete'],
+                ['create', 'delete'], ['delete', 'create']):
             raise ValueError('Unsupported infrastructure action')
-        version_replacement = address == 'cloudflare_worker_version.live' and actions in (
-            ['delete', 'create'], ['create', 'delete'])
-        deployment_replacement = address == 'cloudflare_workers_deployment.live' and actions == ['create', 'delete']
-        # Provider 5.17.0 WorkerVersion.Delete is state-only. A targeted
-        # create-before-destroy apply can leave the old instance deposed until
-        # the next full plan. Require its current replacement in that same plan.
-        deposed_version_cleanup = (
-            address == 'cloudflare_worker_version.live' and actions == ['delete']
-            and isinstance(resource.get('deposed'), str) and bool(resource['deposed'])
-            and change.get('after') is None and not change.get('importing')
-            and (change.get('before') or {}).get('id')
-            and all((change.get('before') or {}).get(key) for key in ('account_id', 'worker_id'))
-            and any(
-                current.get('address') == address and not current.get('deposed')
-                and current.get('change', {}).get('actions') in (['no-op'], ['create', 'delete'])
-                and isinstance(current.get('change', {}).get('after'), dict)
-                and (current['change'].get('before') or current['change']['after']).get('id')
-                and (current['change'].get('before') or current['change']['after'])['id']
-                    != (change.get('before') or {}).get('id')
-                and all(current['change']['after'].get(key) == (change.get('before') or {}).get(key)
-                        for key in ('account_id', 'worker_id'))
-                for current in plan['resource_changes']))
-        release_replacement = version_replacement or deployment_replacement or deposed_version_cleanup
-        if 'delete' in actions and not release_replacement:
-            raise ValueError('Destructive infrastructure changes require a separate reviewed migration')
-        if migration:
-            if address not in RELEASE_RESOURCES | {'cloudflare_worker.live'}:
-                raise ValueError('Migration stage must not include routes or unrelated resources')
-            after = change.get('after') or {}
-            if address == 'cloudflare_worker_version.live':
-                migration_values = {key: value for key, value in (after.get('migrations') or {}).items()
-                                    if value is not None}
-                if (after.get('bindings') != [] or migration_values != {
-                        'new_tag': 'v1', 'new_sqlite_classes': ['LiveChannel']}):
-                    raise ValueError('Migration version must introduce v1 without bindings')
-        if not configure and change.get('importing'):
-            raise ValueError('Resource adoption is restricted to infrastructure configuration')
-        if not configure and (actions not in (['no-op'], ['read'])):
-            if address not in RELEASE_RESOURCES or ('create' in actions and not release_replacement) or change.get('importing'):
-                raise ValueError('Infrastructure setup or drift detected; run Configure Production Infrastructure first')
+        if actions in (['no-op'], ['read']):
+            continue
+        if retire_worker:
+            if address not in WORKER_RESOURCES or actions != ['delete'] or change.get('importing'):
+                raise ValueError('Retirement may delete only the four former managed Worker resources')
+            continue
+        if address not in CONFIGURE_RESOURCES or 'delete' in actions:
+            raise ValueError('Unexpected resource or destructive change requires separate review')
+        if configure:
+            continue
+        if address not in RELEASE_RESOURCES or actions != ['update'] or change.get('importing'):
+            raise ValueError('Infrastructure setup or drift detected; configure first')
+        # Ordinary releases may change the immutable image only, not authority,
+        # ports, region, guest size, environment, mounts or machine ownership.
+        before, after = change.get('before'), change.get('after')
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            raise ValueError('Missing machine configuration')
+        unknown = change.get('after_unknown', {})
+        if any(value for key, value in unknown.items() if key not in ('id', 'instance_id', 'private_ip', 'state')):
+            raise ValueError('Unknown machine configuration')
+        ignored = {'image', 'id', 'instance_id', 'private_ip', 'state'}
+        if {k: v for k, v in before.items() if k not in ignored} != {
+                k: v for k, v in after.items() if k not in ignored}:
+            raise ValueError('Machine infrastructure drift detected')
     return True
 
 
@@ -70,12 +65,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('plan', type=Path)
     parser.add_argument('--configure', action='store_true')
-    parser.add_argument('--migration', action='store_true')
+    parser.add_argument('--retire-worker', action='store_true')
     args = parser.parse_args()
     try:
-        validate(json.loads(args.plan.read_text()), args.configure, args.migration)
+        validate(json.loads(args.plan.read_text()), args.configure, args.retire_worker)
     except (OSError, ValueError, TypeError, AttributeError):
-        parser.exit(2, 'Infrastructure plan rejected; configure infrastructure or review a separate migration. Plan values suppressed.\n')
+        parser.exit(2, 'Infrastructure plan rejected; review separate configuration or retirement. Plan values suppressed.\n')
 
 
 if __name__ == '__main__':

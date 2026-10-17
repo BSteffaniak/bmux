@@ -19,7 +19,7 @@ export function mountLivePage({ doc = document, Observer = MutationObserver,
     const status = doc.getElementById('live-status');
     root.style.cssText = 'min-height:12rem;display:flex;align-items:center;justify-content:center;background:#080b10;overflow:hidden';
     void viewerFactory({ container: root, status,
-      apiBase: '/api/live/main/', assetBase: new URL('.', import.meta.url).href }).then(handle => {
+      apiBase: root.dataset?.liveRelay || 'https://live.bmux.dev/', assetBase: new URL('.', import.meta.url).href }).then(handle => {
       if (ticket !== generation || !root.isConnected) handle.dispose();
       else mounted.handle = handle;
     }).catch(() => {

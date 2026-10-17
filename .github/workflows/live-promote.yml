@@ -5,6 +5,9 @@ on:
       configure:
         type: boolean
         default: false
+      retire_worker:
+        type: boolean
+        default: false
       bootstrap_completion:
         type: string
         default: ''
@@ -21,7 +24,7 @@ on:
     branches: [master]
     paths:
       - '.github/workflows/live-promote.yml'
-      - 'infra/live-relay/**'
+      - 'packages/live-relay/**'
       - 'infra/live-terraform/**'
       - 'scripts/build-live-artifact.sh'
       - 'scripts/live-deploy.sh'
@@ -50,7 +53,11 @@ jobs:
       - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: {node-version: '22.16.0'}
+      - name: Select OCI-capable isolated BuildKit builder
+        run: docker buildx create --use --driver docker-container
       - name: Build one immutable candidate without deployment secrets
+        env:
+          LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
         run: |
           bash scripts/dev.sh bash scripts/build-live-artifact.sh "$RUNNER_TEMP/live-candidate"
           tar -C "$RUNNER_TEMP/live-candidate" -czf "$RUNNER_TEMP/live-candidate.tar.gz" .
@@ -97,8 +104,17 @@ jobs:
         with:
           name: live-candidate-${{ github.sha }}
           path: ${{ runner.temp }}/live-download
+      - name: Install OCI transport (no build during deploy)
+        run: sudo apt-get update && sudo apt-get install --yes skopeo
       - name: Configure or release the verified immutable candidate
         env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
+          LIVE_FLY_ORG: ${{ vars.LIVE_FLY_ORG }}
+          LIVE_FLY_REGION: ${{ vars.LIVE_FLY_REGION }}
+          LIVE_METRICS_KEY_SHA256: ${{ secrets.LIVE_METRICS_KEY_SHA256 }}
+          LIVE_RETIRE_WORKER: ${{ inputs.retire_worker && 'retire-bmux-live-worker' || '' }}
+          LIVE_RETIRE_REQUESTED: ${{ inputs.retire_worker }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
@@ -119,6 +135,10 @@ jobs:
           test "$(cat "$RUNNER_TEMP/live-candidate/REVISION")" = "$GITHUB_SHA"
           mode=release
           if [[ "$LIVE_CONFIGURE" == true ]]; then mode=configure; fi
+          if [[ "$LIVE_RETIRE_REQUESTED" == true ]]; then
+            test "$mode" = configure
+            mode=retire-worker
+          fi
           bootstrap_args=()
           if [[ -n "$LIVE_BOOTSTRAP_COMPLETION$LIVE_BOOTSTRAP_COMPLETION_SHA256" ]]; then
             test "$mode" = configure

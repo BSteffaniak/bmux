@@ -1,398 +1,190 @@
 # Live production deployment
 
-BMUX uses the existing `bmux.dev` Cloudflare zone. Production combines PWMTF's
-local credential provisioner and separate approved infrastructure workflow with
-WWMTF/Bcode's OpenTofu state on Cloudflare R2. No AWS account, IAM role, GitHub
-OIDC customization, staging account, or staging deployment is required. The
-R2 state operations use direct signed HTTPS requests from Python's standard library.
-Ordinary local BMUX operation needs none of this infrastructure.
+## End state and source-ready status
 
-## One-time setup (one command)
+The backend is one event-driven Rust `bmux-live-relay` process on Fly, not a
+Cloudflare Worker or polling backend. Pages remains at `bmux.dev`; the relay
+origin is `https://live.bmux.dev`. Local BMUX needs neither service.
 
-From this repository, run:
+This is a **source-ready migration, not a verified production deployment**.
+No live state, credentials, resources or DNS were changed during implementation.
+Production remains blocked until an operator supplies Fly credentials/variables,
+reviews existing ownership, approves retirement, and validates the packaged image
+and runtime against the real services. Downtime is intentionally accepted.
 
-```sh
-bash scripts/setup-live.sh
-```
+## Declarative ownership
 
-The command enters the pinned Nix shell, reuses GitHub login (or opens login),
-prompts privately for a Cloudflare provisioning token when needed, discovers the
-account, and shows one combined plan for environments, backend and missing secrets.
-Defaults are `BSteffaniak/bmux`, reviewer `BSteffaniak`, and bucket
-`bmux-opentofu-state`; `--help` lists explicit overrides.
+OpenTofu 1.10.9 owns the existing Cloudflare Pages project/domain/DNS, R2 state
+bucket policies, and new Fly resources. `registry.terraform.io/ampbase-io/fly`
+0.3.2 is a maintained community Machines API provider (release 2026-10-16).
+The OpenTofu registry did not mirror it at inspection time; use the explicit
+Terraform registry source. Signed release checksums are committed for Linux
+amd64 and macOS arm64. `fly-apps/fly` is archived/unmaintained; `matifali/fly`
+is deprecated; neither is used.
 
-Approve the displayed changes/costs. For a new backend, supply and confirm a
-high-entropy encryption passphrase from your password manager and confirm its
-independent backup. There are no manual environment settings, exported secrets,
-operation IDs, or JSON/checksum copying. The provisioning token is process-local,
-not saved or installed in GitHub. Do not run with tracing or record secret input.
+Verified provider schema and tagged source support app, IP, machine, encrypted
+volume, certificate and certificate-validation resources. Machine updates use
+the Machines update API; region/app/volume changes require replacement and are
+blocked by plan policy. There is no local-exec resource emulation. Provider
+service settings are not fully refreshed from the remote API: provider docs
+explicitly describe this drift-detection limitation. Operator-side changes are
+not a supported deployment path.
 
-Rerun the **same command** to resume or verify. Existing secrets are skipped;
-original generated credentials are retained in an owned 0600 `credentials.json`
-inside the private bootstrap directory so interrupted secret uploads reuse them.
-Protect/back up that directory and publisher key; neither is a public resume
-artifact. An uncertain token creation is checkpointed and blocks automatic retry;
-an ambiguous backend apply requires explicit reconciliation, never a replacement
-backend or new credentials. The wrapper never adopts an existing bucket or changes
-an operation's bound implementation/selection. Remote drift fails closed.
+Exactly one Machine has 1 shared CPU, 1024MB RAM, configurable region (default
+`iad`), restart always, autostop off, and HTTPS port 443 forwarded to container
+8080. No autoscaler, second Machine, or create-before-destroy is declared.
+`/health` is readiness. `/metrics` is content-free and authenticated; Fly's
+unauthenticated metrics scraper is deliberately not configured. No authenticated
+collector, durable metrics retention, dashboard or alerting is provisioned either.
+The endpoint alone does not establish monitoring: counters are process-local and
+lost on restart. A separately reviewed private collector and retention policy
+are required before claiming durable observability.
 
-After success it saves private `configure-inputs.json` and prints a ready-to-run
-`gh workflow run ... --json < ...` command. **It does not dispatch CI.** That input
-file is for the first configure only; after canonical state exists, omit bootstrap
-inputs on subsequent runs. A successful rerun verifies GitHub protections, secret
-names and original local authority; it does not prove remote credential validity
-or cloud deployment acceptance. Keep existing backend/adoption/recovery workflows
-explicit rather than using setup to reset an existing installation.
+An encrypted 1GiB `fly_volume.authority` mounts at `/data`, with
+`prevent_destroy`; only `/data/relay/authority.json` authority metadata is durable.
+No frame/history storage is intended. Volume deletion, replacement or relocation
+requires an explicit recovery/migration design, never ordinary release approval.
+One Machine/volume is not HA. Region changes are not a routine release.
 
-## Interrupted bucket creation recovery
+The relay receives only SHA-256 digests, never publisher/metrics bearer keys:
+`PUBLISHER_KEY_SHA256`, independent `METRICS_KEY_SHA256`, and
+`ALLOWED_ORIGINS=https://bmux.dev,https://www.bmux.dev`. The two keys must differ.
+TLS certificate creation is asynchronous: DNS-only relay and ACME CNAME records
+precede the genuine `fly_cert_validation` gate. Cloudflare proxying is disabled
+for the relay origin.
 
-If bucket creation succeeded remotely but setup stopped with backend phase
-`applying`, retain the original private bootstrap directory and passphrase. Do not
-delete/recreate the bucket, start another operation, or edit its phase manually.
-Use its successful Cloudflare account audit UUID and exact event timestamp:
+## Credentials and setup (operator action only)
 
-```sh
-bash scripts/setup-live.sh \
-  --recover-creation-audit AUDIT_RECORD_UUID \
-  --creation-time '2026-10-14T16:38:01-04:00'
-```
+Do **not** rebootstrap or recreate the canonical R2 backend for this migration.
+The existing `bash scripts/setup-live.sh` owns Cloudflare/R2 setup and recovery,
+but does not provision Fly credentials. Its successful readiness message alone
+is not Fly deployment readiness.
 
-Use the original timestamp, not the date you run recovery. The dashboard may omit
-fractional seconds: if verification reports a mismatch, use the exact normalized
-`API=` timestamp shown for the verified audit UUID. The check remains exact and
-still requires the original operation window. The provisioning token
-additionally needs **Account → Account Settings → Read** for the selected account.
-Recovery reads the exact audit through `/accounts/ACCOUNT/audit_logs?id=UUID` and
-reads live bucket metadata; it never writes to Cloudflare. It checks successful
-API creation, account/resource identity, event time within five minutes after the
-original durable applying checkpoint, and live bucket creation time within five
-seconds of that event. Unsupported/missing fields and replacement buckets fail
-closed. It displays evidence and requires explicit confirmation, then verifies
-again before saving private evidence and an original checkpoint backup. Only then
-does it acknowledge creation in the original operation; reviewed choices, binding,
-operation ID and resource plan are unchanged. It never accepts a changed bound
-implementation to get past an error. If those implementation files changed, restore
-the original verified implementation or arrange explicit migration, never rebind.
-
-Recovery resumes ordinary setup (with its separate setup approval) and produces the
-original completion receipt without a second bucket creation request. Interrupted
-local reconciliation can be repeated with the same arguments. Audit visibility
-and timestamp correlation are required evidence, not a claim of atomic provider
-transactions. CI's first-use admission still verifies the bucket is empty and
-rejects consumed/changed authority before first state creation.
-
-## Advanced setup / explicit phases
-
-### 1. Authenticate to GitHub
-
-Enter the locked development shell from the repository root:
+A separate, additive installer accepts **existing** Fly organization credentials
+and an independent backed-up metrics key through private terminal prompts:
 
 ```sh
-nix develop --command bash
-python3 --version
-gh --version
-tofu version
-gh auth login
+bash scripts/setup-live.sh --fly --repo BSteffaniak/bmux
+# After reviewing missing secret names only:
+bash scripts/setup-live.sh --fly --repo BSteffaniak/bmux --approve
 ```
 
-The shell supplies Python, GitHub CLI, and pinned OpenTofu
-1.10.9. No AWS CLI, AWS SSO login, or AWS account is required.
-Authenticate `gh` for `BSteffaniak/bmux` with repository administration and
-Actions environment/secret write permissions.
+It installs only missing `Production` environment secrets `FLY_API_TOKEN` and
+`LIVE_METRICS_KEY_SHA256`, never replaces existing values or creates Fly resources.
+Token values travel through stdin, not argv, Terraform, files or logs. Keep the
+original metrics bearer key in an independent password manager for authorized
+private scraping. Do not record prompts or run with shell tracing.
 
-No environment dashboard setup is needed. The helper's `--approval-reviewer`
-selects a GitHub user and includes both environments in the same state operation:
+Set repository **variables** `LIVE_FLY_APP` (globally unique and available before
+build), `LIVE_FLY_ORG`, and optionally `LIVE_FLY_REGION`. Existing `Production`
+Cloudflare/R2/publisher-digest secrets remain unchanged. The first configure
+requires an organization-scoped Fly token capable of app creation, public IPs,
+volumes, certificates, Machines and registry upload; an app-only deployment token
+cannot bootstrap the app. Review least privilege and expiration with Fly before
+installation; actual token capabilities were not tested against production.
+There is no automated token creation/rotation. The `--fly` setup route is explicit
+and additive; it does not repeat the original Cloudflare/R2 bootstrap. Missing
+values fail closed. The legacy local `live-install.py` deployment path rejects
+Fly candidates; use the protected configure/release workflow.
 
-* `Production`: deployment secrets; no required reviewers.
-* `production-approval`: the selected required reviewer, self-review allowed.
-* Both: exactly branch `master` (no tags/wildcards); administrator bypass disabled.
+## Immutable build and approved deployment
 
-Plan/review only inspect remote configuration. Apply creates missing environments,
-leaves matching ones untouched, and verifies each change before proceeding to
-backend provisioning or secret writes. Existing conflicting protections are shown
-in the review and require `--approve-environment-changes` on apply. Existing wait
-timers are preserved; unknown/custom protection integrations are rejected rather
-than overwritten. API/permission failures never mean an environment is missing.
-Without `--approval-reviewer`, the helper retains its verification-only behavior.
+`Live Validation` remains separate from release; deployment does not run tests.
+`Live production release` builds a candidate without deployment credentials,
+then requires `production-approval`, then runs in `Production` under the existing
+non-cancelling `bmux-production-infrastructure` concurrency lock. Configure calls
+the same owner through `Configure Production Infrastructure`. Pages publishing
+remains a separate workflow and publisher.
 
-Existing credentials are skipped; replacement requires `--rotate` with explicit
-`--only NAME` selections. Keep the state encryption passphrase backed up securely;
-losing it prevents decrypting the state and its archives.
+`build-live-artifact.sh` uses the pinned Nix compiler and target directory:
+`cargo build --locked --release -p bmux-live-relay`, `cargo metadata` to resolve
+the explicit executable path, then `packages/live-relay/package-rootfs.sh` to
+package the complete Nix closure under `artifacts/live-relay-rootfs`. The owned
+`packages/live-relay/Dockerfile` builds the scratch image from that rootfs. Startup
+initializes the mounted `/data/relay` directory, then drops privileges before
+serving; the relay must not run permanently as root. Metadata remains exclusively
+at `/data/relay/authority.json`.
+Buildx produces an OCI archive and exact `registry.fly.io/<app>@sha256:…`
+reference. Both join the candidate SHA256 inventory, revision, Terraform files
+and provider lock. No floating Rust toolchain or deployment-time image build.
 
-### 2. Provision Cloudflare and R2 credentials
+Configure preflights app-name collisions and refuses implicit adoption. It first
+applies only `fly_app.live`, archives encrypted state, then uploads the prebuilt
+OCI image with `skopeo --preserve-digests` and applies the full reviewed saved
+plan. This ordering makes registry upload possible for a new app. Every saved
+plan passes policy before any image publication; an ordinary release permits
+only image-only in-place Machine updates. App credentials use a private transient
+registry auth file, removed on exit. Plan/provider diagnostics are suppressed;
+plaintext plans/state are not uploaded as artifacts.
 
-Supply `CLOUDFLARE_PROVISION_TOKEN` through a credential manager or protected
-environment, not command arguments. This provisioning token needs API Tokens
-Read/Edit, read access to `bmux.dev`, and authority to grant the required scoped
-Workers/Pages, DNS/routes, and R2 permissions. It is never installed in GitHub.
-Use BMUX-specific credentials, not PWMTF/WWMTF/Bcode deployment tokens.
+Existing Fly apps are not auto-imported. Provider source supports composite
+Machine imports `<app>/<machine-id>` and resource-specific imports for other
+objects, but a general reviewed Fly import UI is not implemented. If a partial
+create succeeds before state publication, stop and reconcile identity under
+explicit operator review; do not pick a new app name, force-unlock, or retry
+blindly. Nonroot volume write access and packaged runtime readiness must be
+verified before production acceptance.
 
-For Bash, securely enter the provisioning token and create private directories:
+Site build consumes `BMUX_LIVE_ENDPOINT_ORIGIN=https://live.bmux.dev` into the
+content-addressed viewer bundle. Asset manifests use protocol 1 / renderer
+`bmwp-4`; offline builder/integrity checks remain separate from live acceptance.
+
+## Canonical state, locking and recovery
+
+The existing R2 key, bucket and encrypted state remain the sole authority.
+`live-state.py`, `archive-live-state.py`, `live-state-recovery.py`, and existing
+OpenTofu encryption configuration remain in place. Preserve R2 signed conditional
+writes, OpenTofu lockfile locking, private credentials, encryption passphrase,
+non-cancelling concurrency, and encrypted immutable history retention. Never
+publish plaintext state or plan JSON. Do not change backend identity or use a
+local state file as a replacement for canonical state.
+
+Before initialization/application the deployment checks canonical state and
+archives encrypted remote bytes; after each successful stage it archives again.
+Unknown/missing/corrupt state is a recovery error, not a new installation.
+First-bootstrap completion/admission exists only for genuinely new installations,
+not this migration. Existing-state list failures must never become empty state.
+Interrupted operations require inspection of the canonical encrypted revision
+and locks through existing recovery tooling. Retain independently backed-up
+encryption and publisher credentials. No automatic force-unlock/state overwrite.
+
+## Explicit former Worker retirement (downtime)
+
+1. Review existing encrypted state lineage and exact managed identities:
+   `cloudflare_workers_route.live`, `cloudflare_workers_deployment.live`,
+   `cloudflare_worker_version.live`, `cloudflare_worker.live`. Confirm these are
+   BMUX's old route/script and not another service. Preserve all R2, Pages,
+   website DNS and unrelated Workers. Review any Durable Object data retention
+   requirements before deleting the script; snapshots of encrypted Terraform
+   state do not back up Durable Object application data.
+2. Stop publishers. Run **Configure Production Infrastructure** with
+   `retire_worker=true`, with bootstrap completion empty. The existing approval
+   environment and infrastructure lock still apply. This executes a bounded
+   targeted destroy and policy allows deletes only for those four addresses.
+   Worker version/deployment deletes may be state-only in Cloudflare provider
+   5.17.0; removing the script/route retires actual serving resources. No blanket
+   account cleanup, state rm, or automatic resource adoption.
+3. Archive/check the resulting encrypted canonical state and confirm the exact
+   route/script are gone. If the plan includes any other delete or create/update,
+   stop: the policy rejects it. Reconcile extra legacy resources individually.
+4. Run configure separately with `retire_worker=false`; review Fly resources,
+   certificate validation and new DNS. Deploy the independently built site and
+   update publishers to the new relay origin. There is no compatibility backend.
+5. Verify public health, authenticated metrics without payload content, publisher
+   connection, viewer repair/reconnect, restart authority persistence and rejection
+   of obsolete routes. Remove obsolete Worker source/dependencies through their
+   owning application lane, not by deleting unrelated Cloudflare resources.
+
+## Public read-only smoke
 
 ```sh
-read -r -s -p 'Cloudflare provisioning token: ' CLOUDFLARE_PROVISION_TOKEN
-printf '\n'
-export CLOUDFLARE_PROVISION_TOKEN
-umask 077
-mkdir -p "$HOME/.config/bmux/live" "$HOME/.local/state/bmux/live-bootstrap"
-chmod 700 "$HOME/.config/bmux/live" "$HOME/.local/state/bmux/live-bootstrap"
+python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --relay-url https://live.bmux.dev --component backend
+python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --relay-url https://live.bmux.dev --component site
 ```
 
-Do not enable shell tracing or print secret environment variables. Use the
-provider-free `--dry-run` before performing provisioning. The helper discovers
-the existing zone/account, defaults to hostname `bmux.dev` and Pages project
-`bmux`, and generates a publisher key only at its explicit private path if absent.
-Only the publisher key digest is installed in GitHub.
-
-Use the helper in explicit plan/review/apply phases. The plan prints a public
-operation ID; substitute it for `OPERATION_ID` below. Do not change checkout or
-backend choices between these phases, since the operation is implementation-bound.
-
-```sh
-bootstrap_live() {
-  python3 scripts/bootstrap-live-secrets.py --repo BSteffaniak/bmux \
-    --approval-reviewer BSteffaniak \
-    --publisher-key-file "$HOME/.config/bmux/live/publisher-key" \
-    --bootstrap-state --state-dir "$HOME/.local/state/bmux/live-bootstrap" "$@"
-}
-bootstrap_live --dry-run
-bootstrap_live --state-mode plan
-bootstrap_live --state-mode review --state-operation OPERATION_ID
-```
-
-If a bucket is already designated for this backend, set `LIVE_STATE_BUCKET`
-before planning; adopting it additionally requires `--approve-import` and its
-original encryption material. The default for a new backend is
-`bmux-opentofu-state`. Existing/adopted buckets cannot use new-bucket admission.
-Missing state there is a recovery error, never permission to reset it.
-
-Before apply, generate a high-entropy encryption passphrase in your credential
-manager and back it up independently. Load it securely without shell history:
-
-```sh
-read -r -s -p 'State encryption passphrase: ' TOFU_STATE_ENCRYPTION_PASSPHRASE
-printf '\n'
-export TOFU_STATE_ENCRYPTION_PASSPHRASE
-bootstrap_live --state-mode apply --state-operation OPERATION_ID --accept-cost \
-  --state-completion-file "$HOME/.local/state/bmux/live-bootstrap/ready.json"
-```
-
-If review reports conflicting existing GitHub environment settings, inspect the
-printed before/desired policies and explicitly add `--approve-environment-changes`
-to that apply command. It never grants approval to unplanned drift. Keep the same
-reviewer selection in every phase. Environment writes have private durable
-checkpoints: after an ambiguous response, explicitly rerun the **same** reviewed
-apply to accept only the exact expected effect or retry a confirmed absent effect.
-Unexpected remote changes require reconciliation, not a silent overwrite. GitHub
-does not offer atomic compare-and-swap for environment settings, so avoid concurrent
-administration during bootstrap; the helper rechecks before and after each write.
-
-The helper requires the original passphrase before bucket mutation; it never
-silently generates or replaces encryption material. For a confirmed new bucket,
-it writes a private completion receipt for first-deployment admission. It does
-not upload synthetic empty state. The first actual OpenTofu infrastructure apply
-creates the canonical encrypted state. Keep the receipt and independent passphrase
-backup; neither receipt nor operation metadata contains credentials.
-After success, verify names only and remove the bootstrap token from this shell:
-
-```sh
-gh secret list --repo BSteffaniak/bmux --env Production
-unset CLOUDFLARE_PROVISION_TOKEN
-```
-
-The R2 backend contract is:
-
-* `LIVE_STATE_BUCKET`: the explicitly selected R2 bucket.
-* `LIVE_STATE_REGION`: `auto`.
-* `CLOUDFLARE_ACCOUNT_ID`: selects the canonical
-  `https://ACCOUNT.r2.cloudflarestorage.com` endpoint.
-* `R2_STATE_ACCESS_KEY_ID` and `R2_STATE_SECRET_ACCESS_KEY`: dedicated bucket-scoped
-  S3-protocol credentials, not AWS IAM keys.
-* `TOFU_STATE_ENCRYPTION_PASSPHRASE`: high-entropy private encryption material,
-  mapped to `TF_VAR_state_encryption_passphrase` only for OpenTofu.
-
-Endpoint overrides, old AWS role/backend choices, and old AWS operation ledgers
-are rejected rather than silently reinterpreted as R2. Existing bucket selection
-must be explicit and consistent; never initialize a competing backend to bypass
-an error. Bootstrap metadata and operation reviews must not contain credentials.
-
-### Validation versus deployment
-
-`Live Validation` runs offline infrastructure/setup tests, relay tests, and native
-runtime/renderer acceptance on pull requests and relevant master pushes. General
-Rust tests and linting remain in `Build and Test`. These are separate from the
-configure/release workflow: deployment builds/packages the candidate without
-rerunning test/lint suites. `test-live-deployment-boundary.py` guards that separation.
-
-Artifact inventory/checksums, exact revision, production approval, encrypted backend
-locking, bootstrap admission/import ownership checks, plan policy and public
-post-deploy health checks remain part of deployment. They are operational safeguards,
-not duplicate unit tests. Separate validation workflows are not implicitly a deploy
-dependency; use repository branch protection to require their results before merge.
-
-### 3. Configure production infrastructure in CI
-
-Merge the implementation/workflows into `master`, then run **Configure Production
-Infrastructure**. CI builds and verifies one immutable candidate, waits for
-`production-approval`, and configures infrastructure under the selected R2
-backend lock. For the first configure only, supply the exact `ready.json` contents
-in `bootstrap_completion` and its file SHA-256 in `bootstrap_completion_sha256`:
-
-```sh
-sha256sum "$HOME/.local/state/bmux/live-bootstrap/ready.json"
-```
-
-The checksum covers the exact file bytes, including any trailing newline; do not
-reformat the JSON. The workflow writes a private local receipt and passes
-`--bootstrap-completion` to configure. Admission verifies the exact backend and
-remote bucket creation identity and emptiness, then consumes a conditional remote
-marker before effects. A fresh runner may resume the exact same receipt only while
-that marker is still `admitted`, the bucket generation matches, and the marker is
-the only object (no state, lock, history, or unrelated objects). This path rechecks
-admission after backend initialization and uses an empty managed-resource list
-without calling `tofu state list`, which fails when initial state does not exist.
-It never ignores ordinary state-list errors. An `applying` marker, changed receipt,
-or ambiguous mutation still requires explicit recovery; a retry cannot create
-another state lineage or repeat a first apply.
-Subsequent configure/release runs leave both inputs empty and require existing
-canonical encrypted state. OpenTofu state and saved plans use enforced client-side AES-GCM
-encryption, matching WWMTF; native S3-protocol lockfiles remain enabled.
-
-For existing Pages/domain/DNS/route resources, the first discovery reports a
-validated public `imports` map and fingerprint, then stops without adoption.
-Confirm those exact resources are no longer managed by another state/automation;
-rerun with the exact JSON map in `reviewed_imports` and `approve_import=true`.
-The pristine R2 `Default Multipart Abort Rule` (enabled, all prefixes, seven-day
-incomplete-upload abort, no other actions) is preserved by the lifecycle resource.
-Discovery permits only that exact unmanaged baseline; any custom or additional
-policy still requires ownership reconciliation. No policy is modified by discovery.
-MX/TXT records sharing the website hostname are not adoption targets; competing
-A/AAAA/CNAME records still stop discovery.
-The approval attests ownership transfer. Unexpected Worker/version/Durable Object
-ownership or ambiguous matches require reconciliation; names alone never prove
-ownership. Do not delete/recreate the existing website to make deployment pass.
-
-The workflow owns the Pages project/domain, proxied DNS record, Worker,
-immutable Worker version/deployment, SQLite Durable Object migration/binding,
-and exact `bmux.dev/api/live/*` route. First configure deploys a binding-free
-`v1` class migration before creating the bound runtime version; the route is
-excluded from that migration stage. Resume partial configure from the existing
-encrypted state, without supplying the first-bootstrap completion again. A
-managed Worker may exist before its first version/deployment; an existing managed
-deployment skips the migration stage. Each successful stage archives encrypted
-state before proceeding. Runtime releases omit migrations and replace immutable
-version/deployment records create-before-destroy (the pinned provider's deployment
-delete is state-only), so the new deployment is active before retiring its old
-state record. OpenTofu is the only Worker owner; pinned
-Wrangler is used only for Pages static uploads. Approved infrastructure changes
-and backend deployments share the non-cancelling infrastructure concurrency lock;
-Pages uploads use their own non-cancelling lock. State archives preserve encrypted
-remote bytes, not plaintext state dumps.
-
-## Public smoke diagnostics and fast retries
-
-Backend and site probes are independent:
-
-```sh
-python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --component backend
-python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --component site
-```
-
-**Live public smoke** (`live-smoke.yml`) is manually dispatched with `all`,
-`backend`, or `site`. It checks out the selected workflow revision, performs no
-build, deployment, state access, or publisher operation, and retains a JSONL
-report for 14 days. Smoke-script changes can be tested against an existing
-production deployment without replacing its artifact. The probe identifies itself
-as `bmux-public-smoke/1`; Cloudflare can reject Python's default user agent with
-HTTP 403/error 1010 even when the application is healthy.
-
-Reports include endpoint, status, timing, byte count, validated Cloudflare Ray ID,
-and fixed failure codes. They exclude response bodies, credentials, redirects,
-and raw exception messages. A passing backend check does not prove `/live`
-serves the viewer; use `all` before declaring public readiness.
-
-The live backend build is a Nix/Cargo artifact build, not a Docker image build.
-GitHub's **Re-run failed jobs** reuses a successful build job's immutable artifact
-while it is retained, but also uses the original run's code: it does not pick up
-new deployment-script fixes. Use the standalone smoke workflow for probe changes.
-Reusing an older artifact with newer deployment code requires explicit artifact
-run/revision/checksum selection and the normal production approval; do not swap
-files inside a checksummed candidate or replay bootstrap to retry deployment.
-
-## Subsequent releases
-
-**Deploy Docs Site** builds and publishes the complete Pages site: docs plus the
-content-addressed live viewer/WASM assets. It is the sole static-site publisher;
-Pages uploads replace the whole site, so never upload separate partial docs/viewer
-directories. Its secret-free build does not compile the native CLI/plugins or
-package the relay. The approved deploy job needs only the Cloudflare token/account,
-Pages project and public hostname, not R2 credentials, an encryption passphrase,
-or OpenTofu. Scope its deployment token to Pages where practical. It verifies the
-candidate archive, inventory and revision, then checks public viewer asset integrity
-without depending on backend availability.
-
-**Live production release** runs independently for backend/infrastructure changes
-on `master`, or by manual dispatch. It packages native/relay/infrastructure assets,
-verifies the candidate checksum and revision, waits for production approval, and
-updates Worker code/version deployment. It never uploads Pages or builds docs or
-viewer assets. Its post-deploy smoke checks only backend health/status. It rejects
-infrastructure creation, imports, DNS/project changes, and destructive changes;
-run Configure Production Infrastructure for deliberate topology changes.
-Immutable Worker-version replacement is the expected release exception.
-No local frontend build, candidate upload, or staging promotion is required.
-
-Independent releases must preserve the explicit `protocol: 1`, `renderer: bmwp-3`
-contract; the viewer rejects unsupported backend representations. A Git revision
-match is not a compatibility mechanism. For an evolving protocol, first ship a
-backend that explicitly supports both old and new representations, then update
-the viewer, and retire old support only after old viewers/publishers are no longer
-supported. Roll back each component independently within that compatibility window.
-Do not bypass compatibility checks to make a deployment pass. The default
-`smoke-live-broadcast.py --url https://bmux.dev` still checks both components for
-end-to-end acceptance.
-
-The normal native installer also supports `bmux broadcast deploy` for separately
-hosted installations; it now applies only the backend, never Pages. Legacy
-ambiguous Pages-upload ledgers still require explicit reconciliation; they are
-not blindly replayed. This is not the normal bmux.dev CI deployment path.
-Installer/provider assets are embedded and verified in a private cache, not
-installed as mutable sidecars. Candidate precedence is explicit absolute
-`--artifact`, then approved saved/explicit release URL plus independently trusted
-archive digest, then optional `live-candidate` beside the selected executable.
-Missing explicit candidates fail closed; doctor never downloads.
-
-## Publish and verify
-
-Keep the private publisher-key file locally. Configure a BMUX publishing profile
-with `bmux broadcast setup`, the `https://bmux.dev` endpoint, channel `main`, and
-that absolute credential-file path; then use `bmux broadcast start`. Audience
-URL: `https://bmux.dev/live?channel=main`.
-
-HTTP protocol v1 negotiates renderer `bmwp-3` / `BMWP\x03`; publishers, relay and
-viewer assets must upgrade together. See [the protocol contract](live-broadcast-protocol.md).
-Verify terminal/presenter output, pause/resume/stop, offline state, reconnects,
-and audience privacy after deployment. Public read-only smoke does not prove
-native/Canvas visual correctness or private-note exclusion by itself.
-
-## Recovery and migration
-
-Do not cancel an active apply, disable backend locking, force-unlock, or restore
-old state over active work. Reconcile actual resources and state lineage before
-explicit recovery. Keep diagnostics, plans, state, credentials and encryption
-material private. CI suppresses provider output.
-
-If an earlier AWS backend was actually deployed, this change does not migrate it
-or destroy AWS resources. Stop all writers; preserve the original state and
-credentials, establish its lineage/serial, and arrange a separately reviewed
-OpenTofu backend/encryption migration with recoverable backups before enabling
-R2 writers. Do not merely remove the old environment variables and initialize
-empty R2 state. Resume descriptors from AWS operations are not R2 authority.
-Likewise, changing the R2 account, bucket, state key, or encryption passphrase is
-an explicit migration, not ordinary credential rotation.
-
-Offline mocks, policy tests, formatting and OpenTofu validation establish local
-contracts, not actual account entitlement, provider import behavior, live R2
-concurrent lock exclusion, retention enforcement, billing, SQLite migration,
-DNS/TLS activation, or real cloud deployment success. These remain explicit
-authorized production acceptance checks. Infrastructure, token creation and
-secret writes are not run by coding-agent tests.
+Backend probes `/health` only (protocol 1, `bmwp-4`), not legacy status polling.
+Site smoke discovers immutable assets at `bmux.dev`, checks every size/hash,
+WASM magic, and aggregate bundle identity. It never publishes content or prints
+remote bodies, credentials or arbitrary diagnostic headers. Safe bounded timing,
+status and Cloudflare ray metadata may be retained. These probes do not prove
+volume write access, authenticated metrics, or interactive stream acceptance.

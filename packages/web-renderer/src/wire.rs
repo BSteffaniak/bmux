@@ -1,6 +1,6 @@
 //! Compact presentation protocol, shared by native and WASM consumers.
 //!
-//! `BMWP\x03` freezes field order and enum indices below. Changing these types,
+//! `BMWP\x04` freezes field order and enum indices below. Changing these types,
 //! or the positional TUI metadata projection, requires a new binary version.
 //! Rows retain every cell, including explicit wide continuations. This is an
 //! output projection, not a compositor or an authoritative state installer.
@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{BrowserFrame, DecodeError, Limits};
 
-pub const BINARY_WIRE_VERSION: u8 = 3;
-const MAGIC: &[u8; 5] = b"BMWP\x03";
+pub const BINARY_WIRE_VERSION: u8 = 4;
+const MAGIC: &[u8; 5] = b"BMWP\x04";
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Immutable content-addressed image payload; placement keys are independent.
@@ -107,6 +107,8 @@ enum Span {
         style: u32,
         cells: Vec<(u32, u8, bool)>,
     },
+    /// Copy physical cells from the validated delta base; never legal in snapshots.
+    Retain { count: u16 },
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Placement {
@@ -356,8 +358,10 @@ fn encode(
         metadata: None,
         images: None,
         resources: if inline {
+            let inherited = base.map(extract_resources).transpose()?.unwrap_or_default();
             extract_resources(frame)?
                 .into_iter()
+                .filter(|resource| !inherited.iter().any(|old| old.id == resource.id))
                 .map(|resource| WireResource {
                     description: requirement(&resource.payload),
                     bytes: Blob(resource.bytes().to_vec()),
@@ -394,6 +398,20 @@ fn encode(
         let mut spans = Vec::new();
         let mut x = 0;
         while x < cells.len() {
+            let unchanged = |index: usize| {
+                base.is_some_and(|base| base.buffer().cells()[start + index] == cells[index])
+            };
+            if unchanged(x) {
+                let mut end = x + 1;
+                while end < cells.len() && unchanged(end) {
+                    end += 1;
+                }
+                spans.push(Span::Retain {
+                    count: (end - x) as u16,
+                });
+                x = end;
+                continue;
+            }
             let cell = &cells[x];
             let key = pack(&cell.style)?;
             let style = *styles.entry(key).or_insert_with(|| {
@@ -402,7 +420,7 @@ fn encode(
                 index
             });
             let mut end = x + 1;
-            while end < cells.len() && cells[end] == *cell {
+            while end < cells.len() && !unchanged(end) && cells[end] == *cell {
                 end += 1;
             }
             let mut glyph_index = |symbol: &str| {
@@ -422,7 +440,11 @@ fn encode(
                 });
             } else if ascii(cell) {
                 end = x + 1;
-                while end < cells.len() && cells[end].style == cell.style && ascii(&cells[end]) {
+                while end < cells.len()
+                    && !unchanged(end)
+                    && cells[end].style == cell.style
+                    && ascii(&cells[end])
+                {
                     end += 1;
                 }
                 spans.push(Span::Ascii {
@@ -539,8 +561,22 @@ pub fn decode_binary_with_resources(
         }
         previous = Some(row.index);
         let mut x = 0_u16;
-        let mut emit =
-            |style: u32, symbol: &str, width: u8, continuation: bool| -> Result<(), DecodeError> {
+        for span in row.spans {
+            if let Span::Retain { count } = span {
+                if base.is_none() || count == 0 {
+                    return Err(DecodeError::Invalid("retain span"));
+                }
+                x = x
+                    .checked_add(count)
+                    .filter(|end| *end <= area.width)
+                    .ok_or(DecodeError::Invalid("retain span"))?;
+                continue;
+            }
+            let mut emit = |style: u32,
+                            symbol: &str,
+                            width: u8,
+                            continuation: bool|
+             -> Result<(), DecodeError> {
                 if x >= area.width
                     || width > 2
                     || (continuation && (width != 0 || !symbol.is_empty()))
@@ -564,8 +600,8 @@ pub fn decode_binary_with_resources(
                 x += 1;
                 Ok(())
             };
-        for span in row.spans {
             match span {
+                Span::Retain { .. } => return Err(DecodeError::Invalid("retain span")),
                 Span::Fill {
                     style,
                     glyph,
@@ -633,6 +669,13 @@ pub fn decode_binary_with_resources(
         return Err(DecodeError::Invalid("metadata projection"));
     }
     let mut available = BTreeMap::new();
+    // Immutable resources from a validated base remain available even when only
+    // placements change. Full repairs remain self-contained.
+    if let Some(base) = base {
+        for placement in base.image_scene().placements() {
+            available.insert(resource_id(&placement.payload), &placement.payload);
+        }
+    }
     if resources.len() + message.resources.len() > Limits::default().images * 2 {
         return Err(DecodeError::Limit("resources"));
     }

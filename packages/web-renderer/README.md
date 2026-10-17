@@ -171,9 +171,19 @@ already belong to the final buffer. Metadata is read-only; no remote input API.
 Image placements default to `Contain`; `Stretch` is explicit opt-in. Placements
 carry the policy and optional signed original
 allocation. Canvas containment uses browser cell pixel metrics before clipping;
-terminal adapters use their own cell metrics. Binary transport is `BMWP\\x03`
-(version 3): rebuild matching browser assets when upgrading from versions 1 or 2,
-rather than decoding the changed positional placement schema as v1.
+terminal adapters use their own cell metrics. Binary transport is `BMWP\\x04`
+(version 4): rebuild matching browser assets; earlier binary versions are rejected.
+V4 adds delta-only `Retain { count: u16 }` spans for unchanged physical cells.
+Snapshots cannot retain; zero-length and overflowing spans are rejected. Delta
+image placements reuse immutable resources from the validated base; full repairs
+remain self-contained. A one-digit change does not resend its row.
+
+The live viewer uses `/v1/viewer/ws`, with one unacknowledged frame, a single
+scheduled RAF only while dirty, and configurable `maxFps` in 1–60 (default 60).
+Authority renewal uses `lease_remaining_ms`; stalled authority clears output.
+The Canvas backend repaints changed physical cells and cursor damage, conservatively
+repainting fully on geometry or image scene changes. See the
+[streaming contract](../../docs/live-stream-protocol.md).
 
 Serve exactly these assets at the same localhost origin:
 

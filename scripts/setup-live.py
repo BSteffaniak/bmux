@@ -238,7 +238,7 @@ class Setup:
             manager = g.Environments(check, self.run)
             manager.execute(record['operation'], 'reconcile')
             self.ready()
-            print('Setup verified; existing credentials unchanged. No deployment dispatched.')
+            print('Cloudflare/R2 setup verified; existing credentials unchanged. Fly setup is separate. No deployment dispatched.')
             return
         if not self.env.get('CLOUDFLARE_PROVISION_TOKEN'):
             self.env['CLOUDFLARE_PROVISION_TOKEN'] = secret('Cloudflare provisioning token')
@@ -321,7 +321,7 @@ class Setup:
         self.ready()
         record['phase'] = 'complete'
         local.save(self.record_path, record)
-        print('Setup complete. No deployment dispatched. Rerun this command to verify/resume.')
+        print('Cloudflare/R2 setup complete. Fly setup is separate. No deployment dispatched. Rerun this command to verify/resume.')
 
     def ready(self):
         receipt = self.root / 'ready.json'
@@ -340,6 +340,9 @@ class Setup:
         path = self.root / 'configure-inputs.json'
         if not path.exists() or local.private_read(path) != inputs:
             local.save(path, inputs)
+        print('Cloudflare/R2 setup only. Before configure, install Fly credentials with:')
+        print('bash scripts/setup-live.sh --fly --repo ' + shlex.quote(self.args.repo) + ' --approve')
+        print('Set repository variables LIVE_FLY_APP, LIVE_FLY_ORG, and optionally LIVE_FLY_REGION.')
         print('First configure inputs saved privately at ' + str(path))
         print('When ready for FIRST configure (do not replay after state exists):')
         print('gh workflow run configure-production-infra.yml --repo ' + shlex.quote(self.args.repo)

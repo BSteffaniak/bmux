@@ -91,6 +91,59 @@ fn resources_roundtrip_and_immutable_ids() {
 }
 
 #[test]
+fn one_digit_delta_retains_unchanged_cells_not_row_payload() {
+    let base = mutate(&frame(600, 1, 1), |value| {
+        for (index, cell) in value["buffer"]["cells"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            cell["symbol"] = char::from(b'!' + (index % 90) as u8).to_string().into();
+        }
+    });
+    let next = mutate(&base, |value| {
+        value["revision"] = 2.into();
+        value["buffer"]["cells"][301]["symbol"] = "0".into();
+    });
+    let delta = encode_delta(&next, &base).unwrap();
+    let message: TestMessage = bmux_codec::from_positional_bytes(&delta[5..]).unwrap();
+    assert_eq!(message.rows.len(), 1);
+    assert_eq!(message.rows[0].spans.len(), 3);
+    assert!(matches!(
+        message.rows[0].spans[0],
+        TestSpan::Retain { count: 301 }
+    ));
+    assert!(matches!(
+        message.rows[0].spans[2],
+        TestSpan::Retain { count: 298 }
+    ));
+    assert!(delta.len() < 150, "{} bytes", delta.len());
+    assert_eq!(decode_binary(&delta, Some(&base)).unwrap(), next);
+    assert!(decode_binary(&delta, None).is_err());
+    let wrong = mutate(&base, |value| value["revision"] = 3.into());
+    assert!(decode_binary(&delta, Some(&wrong)).is_err());
+}
+
+#[test]
+fn moved_immutable_image_reuses_base_resource() {
+    let base = mutate(&frame(8, 2, 1), |value| {
+        value["image_scene"] = serde_json::json!({"active": {
+            "image": {"key":"image", "payload":{"Pixels":{"bytes":[1,2,3,255],"width":1,"height":1,"format":"Rgba8"}},
+            "destination":{"x":0,"y":0,"width":1,"height":1},
+            "clip":{"x":0,"y":0,"width":8,"height":2}, "lifecycle":"Persistent"}
+        }});
+    });
+    let next = mutate(&base, |value| {
+        value["revision"] = 2.into();
+        value["image_scene"]["active"]["image"]["destination"]["x"] = 1.into();
+    });
+    let delta = encode_delta(&next, &base).unwrap();
+    assert!(delta.len() < encode_binary(&next).unwrap().len());
+    assert_eq!(decode_binary(&delta, Some(&base)).unwrap(), next);
+}
+
+#[test]
 fn dense_600_by_300_is_compact() {
     let dense = mutate(&frame(600, 300, 1), |value| {
         for (index, cell) in value["buffer"]["cells"]
@@ -125,7 +178,7 @@ fn truncation_unknown_version_and_trailing_bytes_fail() {
     for end in 0..bytes.len() {
         assert!(decode_binary(&bytes[..end], None).is_err());
     }
-    for version in [bmux_web_renderer::BINARY_WIRE_VERSION + 1, 2] {
+    for version in [bmux_web_renderer::BINARY_WIRE_VERSION + 1, 2, 3] {
         let mut corrupt = bytes.clone();
         corrupt[4] = version;
         assert!(decode_binary(&corrupt, None).is_err());
@@ -175,6 +228,9 @@ enum TestSpan {
         style: u32,
         cells: Vec<(u32, u8, bool)>,
     },
+    Retain {
+        count: u16,
+    },
 }
 fn corrupt(change: impl FnOnce(&mut TestMessage)) {
     let bytes = encode_binary(&frame(4, 2, 1)).unwrap();
@@ -188,6 +244,7 @@ fn corrupt(change: impl FnOnce(&mut TestMessage)) {
 
 #[test]
 fn malformed_tables_widths_and_topology_fail_closed() {
+    corrupt(|m| m.rows[0].spans = vec![TestSpan::Retain { count: 4 }]);
     corrupt(|m| m.styles.clear());
     corrupt(|m| m.glyphs.clear());
     corrupt(|m| m.glyphs[0] = "x".repeat(129));

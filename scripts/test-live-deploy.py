@@ -22,6 +22,8 @@ class DeployTests(unittest.TestCase):
         self.artifact = self.root / 'candidate'
         for directory in ('infrastructure', 'relay', 'tools/node_modules/wrangler/bin'):
             (self.artifact / directory).mkdir(parents=True)
+        (self.artifact / 'relay/IMAGE').write_text('registry.fly.io/bmux-live@sha256:' + 'd' * 64 + '\n')
+        (self.artifact / 'relay/image.oci.tar').write_bytes(b'mock OCI')
         (self.artifact / 'REVISION').write_text('a' * 40 + '\n')
         (self.artifact / 'infrastructure/main.tf').write_text('# immutable test module\n')
         import hashlib
@@ -34,6 +36,8 @@ class DeployTests(unittest.TestCase):
                         TEST_EFFECTS=str(self.log), TEST_PLAN=json.dumps({'resource_changes': []}),
                         CLOUDFLARE_API_TOKEN='private-cf-token', CLOUDFLARE_ACCOUNT_ID='a' * 32,
                         CLOUDFLARE_ZONE_ID='b' * 32, LIVE_HOSTNAME='bmux.dev', LIVE_PAGES_PROJECT='bmux',
+                        LIVE_METRICS_KEY_SHA256='e' * 64, FLY_API_TOKEN='private-fly-token',
+                        LIVE_FLY_APP='bmux-live', LIVE_FLY_ORG='test-org',
                         LIVE_PUBLISHER_KEY_SHA256='c' * 64, R2_STATE_ACCESS_KEY_ID='private-access', R2_STATE_SECRET_ACCESS_KEY='private-secret', TOFU_STATE_ENCRYPTION_PASSPHRASE='private-secret',
                         LIVE_STATE_BUCKET='bmux-live-production', LIVE_STATE_REGION='auto',
                         AWS_ACCESS_KEY_ID='private-access', AWS_SECRET_ACCESS_KEY='private-secret',
@@ -57,17 +61,23 @@ else:
  if os.environ.get('TEST_FAIL')==args[0]:
   print('private-secret',file=sys.stderr); sys.exit(1)
 ''')
+        self.tool('skopeo', "import os,sys\nsys.stdin.read() if sys.argv[1]=='login' else None\nwith open(os.environ['TEST_EFFECTS'],'a') as f: f.write('image '+sys.argv[1]+'\\n')\n")
         self.tool('node', "import os\nwith open(os.environ['TEST_EFFECTS'],'a') as f: f.write('pages upload\\n')\n")
         self.tool('python3', '''import json,os,sys
 from pathlib import Path
 args=sys.argv[1:]
 if args and args[0].endswith('archive-live-state.py'):
  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('state '+args[1]+'\\n')
+elif args and args[0].endswith('live-fly-preflight.py'):
+ with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('fly ownership checked\\n')
 elif args and args[0].endswith('configure-live-imports.py'):
  output=Path(args[args.index('--output')+1]); output.write_text('{"import": []}')
  reviewed=Path(args[args.index('--imports')+1]); assert json.loads(reviewed.read_text())=={}
  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('imports checked\\n')
 elif args and args[0].endswith('smoke-live-broadcast.py'):
+ assert args[args.index('--url')+1] == 'https://bmux.dev'
+ assert args[args.index('--relay-url')+1] == 'https://live.bmux.dev'
+ assert args[args.index('--component')+1] == 'backend'
  with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('public smoke\\n')
 else:
  os.execv(REAL_PYTHON,[REAL_PYTHON,*args])
@@ -90,6 +100,7 @@ else:
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('pages upload', effects)
         self.assertLess(effects.index('tofu apply'), effects.index('public smoke'))
+        self.assertLess(effects.index('image copy'), effects.index('tofu apply'))
         self.assertIn('public smoke', effects)
         self.assertNotIn('imports checked', effects)
 
@@ -114,14 +125,13 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('pages upload', effects)
 
-    def test_partial_configure_deploys_migration_before_runtime_and_smoke(self):
+    def test_configure_creates_app_before_image_and_machine(self):
         self.env['TEST_MANAGED'] = 'cloudflare_worker.live'
         result, effects = self.run_deploy('configure')
         self.assertEqual(result.returncode, 0, result.stderr)
         plans = [line for line in effects.splitlines() if line.startswith('plan args')]
         self.assertEqual(len(plans), 2)
-        self.assertIn('-var=live_migration_only=true', plans[0])
-        self.assertIn('-target=cloudflare_workers_deployment.live', plans[0])
+        self.assertIn('-target=fly_app.live', plans[0])
         self.assertNotIn('-target', plans[1])
         self.assertNotIn('live_migration_only', plans[1])
         self.assertEqual(effects.count('tofu apply'), 2)
@@ -135,11 +145,11 @@ else:
         self.assertEqual(effects.count('tofu plan'), 1)
         self.assertNotIn('pages upload', effects)
 
-    def test_completed_migration_resumes_without_redeploying_migration(self):
+    def test_existing_configure_rechecks_app_before_release(self):
         self.env['TEST_MANAGED'] = 'cloudflare_worker.live\ncloudflare_workers_deployment.live'
         result, effects = self.run_deploy('configure')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(effects.count('tofu plan'), 1)
+        self.assertEqual(effects.count('tofu plan'), 2)
         self.assertNotIn('live_migration_only', effects)
 
     def test_existing_state_list_errors_are_not_treated_as_first_use(self):

@@ -40,6 +40,27 @@ cp packages/web-renderer/browser/index.html packages/web-renderer/browser/bootst
   packages/web-renderer/browser/style.css packages/web-renderer/browser/canvas-viewer.js \
   packages/web-renderer/browser/live-viewer.js packages/web-renderer/browser/live-page.js "$OUTPUT/"
 echo "Browser assets: $OUTPUT"
+# Bind the public relay origin into the immutable module before hashing it.
+python3 - "$OUTPUT/live-page.js" "${BMUX_LIVE_ENDPOINT_ORIGIN:-https://live.bmux.dev}" <<'PY'
+import json
+from pathlib import Path
+import re
+import sys
+from urllib.parse import urlsplit
+origin = sys.argv[2]
+parsed = urlsplit(origin)
+if (parsed.scheme != 'https' or not parsed.hostname or parsed.username is not None
+        or parsed.password is not None or parsed.path not in ('', '/')
+        or parsed.query or parsed.fragment):
+    raise SystemExit('BMUX_LIVE_ENDPOINT_ORIGIN must be an HTTPS origin without credentials')
+origin = origin.rstrip('/') + '/'
+page = Path(sys.argv[1])
+text, count = re.subn(r"apiBase: (?:root\.dataset\?\.liveRelay \|\| )?(?:'https://live\.bmux\.dev/'|'/api/live/main/')",
+                      lambda _: 'apiBase: ' + json.dumps(origin), page.read_text())
+if count != 1:
+    raise SystemExit('public live module relay-origin binding is missing or ambiguous')
+page.write_text(text)
+PY
 # Stage immutable audience assets before docs compilation/static generation.
 # Native builds never invoke this script or depend on these files.
 DOCS_ASSETS="$ROOT/packages/docs-site/public/live-assets"
@@ -58,7 +79,7 @@ for name in sys.argv[3:]:
     data = (root / name).read_bytes()
     files.append({"name": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
 (root / "manifest.json").write_text(json.dumps({"schema": 1, "protocol": 1,
-    "renderer": "bmwp-3", "bundle_sha256": sys.argv[2], "files": files}, indent=2) + "\n")
+    "renderer": "bmwp-4", "bundle_sha256": sys.argv[2], "files": files}, indent=2) + "\n")
 PY
 printf '%s\n' "$VERSION" > "$DOCS_ASSETS/current-version"
 echo "Docs audience bundle: $DOCS_ASSETS/$VERSION"

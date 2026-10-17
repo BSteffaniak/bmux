@@ -33,6 +33,7 @@ bmux_tui_components = { workspace = true, features = [
 bmux_tui_runtime = { workspace = true, features = ["crossterm"] }
 bmux_web_renderer = { workspace = true }
 crossterm = { workspace = true }
+futures-util = { workspace = true, features = ["sink"] }
 libc = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
@@ -47,6 +48,10 @@ tokio = { workspace = true, features = [
     "net",
     "io-util",
     "process",
+] }
+tokio-tungstenite = { workspace = true, features = [
+    "connect",
+    "rustls-tls-webpki-roots",
 ] }
 uuid = { workspace = true, features = ["v4"] }
 

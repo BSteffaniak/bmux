@@ -42,6 +42,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: {node-version: '22.16.0'}
       - name: Build complete immutable site without deployment secrets
+        env:
+          BMUX_LIVE_ENDPOINT_ORIGIN: https://live.bmux.dev
         run: |
           bash scripts/dev.sh bash scripts/build-site-artifact.sh "$RUNNER_TEMP/site-candidate"
           tar -C "$RUNNER_TEMP/site-candidate" -czf "$RUNNER_TEMP/site-candidate.tar.gz" .

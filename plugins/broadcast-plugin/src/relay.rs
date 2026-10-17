@@ -1,37 +1,45 @@
-//! Content-free HTTP adapter. Credentials never implement Debug and errors are codes.
+//! Fenced publisher transport. Only acknowledged frames become delta bases.
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::{io::Read, path::Path, sync::Mutex, time::Duration};
+use std::{io::Read, path::Path, time::Duration};
+use tokio::sync::Mutex;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream,
+    tungstenite::{Message, client::IntoClientRequest},
+};
 use uuid::Uuid;
 
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
-
-type RelayBase = (Uuid, u64, bmux_web_renderer::BrowserFrame);
-
+type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+#[derive(Default)]
+struct Stream {
+    socket: Option<Socket>,
+    base: Option<bmux_web_renderer::BrowserFrame>,
+}
 pub struct Relay {
     client: reqwest::Client,
     base: reqwest::Url,
     key: String,
     publisher: Uuid,
     pub epoch: Option<Uuid>,
-    delta_capable: bool,
-    base_frame: Mutex<Option<RelayBase>>,
+    fence: Mutex<Option<String>>,
+    stream: Mutex<Stream>,
 }
-
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Started {
-    protocol: u32,
-    renderer: String,
-    epoch: Uuid,
-    lease_ms: u64,
+struct Authority {
+    epoch: Option<Uuid>,
+    fence: String,
+    state: String,
 }
-
+fn decimal(value: &str) -> bool {
+    !value.is_empty()
+        && (value == "0" || !value.starts_with('0'))
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok()
+}
 impl Relay {
     pub fn new(endpoint: &str, channel: &str, credential: &Path) -> Result<Self, &'static str> {
         let base = validate_endpoint(endpoint, channel)?;
-        Self::from_base(base, credential)
-    }
-    fn from_base(base: reqwest::Url, credential: &Path) -> Result<Self, &'static str> {
         let key = credential_key(credential)?;
         let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::builder()
@@ -46,39 +54,23 @@ impl Relay {
             key,
             publisher: Uuid::new_v4(),
             epoch: None,
-            delta_capable: false,
-            base_frame: Mutex::new(None),
+            fence: Mutex::new(None),
+            stream: Mutex::new(Stream::default()),
         })
     }
     pub async fn start(&mut self) -> Result<(), &'static str> {
-        let url = self.base.join("start").map_err(|_| "invalid_endpoint")?;
-        let mut response = self.client.post(url).bearer_auth(&self.key)
-            .header("X-Bmux-Capabilities", "bmwp-delta-v1")
-            .json(&serde_json::json!({"protocol":1,"renderer":"bmwp-3","publisher_id":self.publisher}))
-            .send().await.map_err(|_| "relay_unreachable")?;
-        if response.status() != reqwest::StatusCode::OK {
-            return Err("relay_rejected");
-        }
-        self.delta_capable = response
-            .headers()
-            .get("X-Bmux-Capabilities")
-            .is_some_and(|value| value == "bmwp-delta-v1");
-        *self
-            .base_frame
-            .lock()
-            .map_err(|_| "transport_unavailable")? = None;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| "relay_unreachable")? {
-            if bytes.len() + chunk.len() > 4096 {
-                return Err("relay_protocol");
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let started: Started = serde_json::from_slice(&bytes).map_err(|_| "relay_protocol")?;
-        if started.protocol != 1 || started.renderer != "bmwp-3" || started.lease_ms != 15_000 {
-            return Err("relay_protocol");
-        }
-        self.epoch = Some(started.epoch);
+        let response = self
+            .client
+            .post(self.base.join("start").map_err(|_| "invalid_endpoint")?)
+            .bearer_auth(&self.key)
+            .json(&serde_json::json!({"publisher_id":self.publisher}))
+            .send()
+            .await
+            .map_err(|_| "relay_unreachable")?;
+        let authority = authority(response).await?;
+        self.epoch = authority.epoch;
+        *self.fence.lock().await = Some(authority.fence);
+        *self.stream.lock().await = Stream::default();
         Ok(())
     }
     pub async fn mutation(
@@ -86,92 +78,250 @@ impl Relay {
         operation: &str,
         frame: Option<(u64, &[u8])>,
     ) -> Result<(), &'static str> {
+        if operation == "frame" {
+            let (_, bytes) = frame.ok_or("invalid_frame")?;
+            return self.publish(bytes).await;
+        }
+        if !["heartbeat", "pause", "resume", "stop"].contains(&operation) {
+            return Err("invalid_operation");
+        }
+        if operation == "heartbeat" {
+            self.service_keepalive().await?;
+        }
         let epoch = self.epoch.ok_or("not_started")?;
-        let url = self.base.join(operation).map_err(|_| "invalid_endpoint")?;
-        let mut next_base = None;
-        let request = if let Some((revision, bytes)) = frame {
-            if revision == 0 || bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
-                return Err("invalid_frame");
-            }
-            let mut body = bytes.to_vec();
-            let mut base_revision = None;
-            if self.delta_capable {
-                let decoded =
-                    bmux_web_renderer::decode_binary(bytes, None).map_err(|_| "invalid_frame")?;
-                if let Some((base_epoch, relay_revision, base)) = self
-                    .base_frame
-                    .lock()
-                    .map_err(|_| "transport_unavailable")?
-                    .as_ref()
-                    && *base_epoch == epoch
-                    && revision > *relay_revision
-                    && let Ok(delta) = bmux_web_renderer::encode_delta(&decoded, base)
-                    && delta.len() < bytes.len()
-                {
-                    // One repair snapshot plus one optional delta; never a chain.
-                    body = Vec::with_capacity(4 + bytes.len() + delta.len());
-                    body.extend_from_slice(
-                        &u32::try_from(bytes.len())
-                            .map_err(|_| "invalid_frame")?
-                            .to_le_bytes(),
-                    );
-                    body.extend_from_slice(bytes);
-                    body.extend_from_slice(&delta);
-                    base_revision = Some(*relay_revision);
-                }
-                next_base = Some((epoch, revision, decoded));
-            }
-            let mut request = self
-                .client
-                .put(url)
-                .header("Content-Type", "application/octet-stream")
-                .header("X-Bmux-Revision", revision.to_string());
-            if self.delta_capable {
-                request = request.header("X-Bmux-Compression", "gzip-v1");
-            }
-            if let Some(base) = base_revision {
-                request = request
-                    .header("X-Bmux-Capabilities", "bmwp-delta-v1")
-                    .header("X-Bmux-Base-Revision", base.to_string());
-            }
-            request.body(body)
-        } else {
-            if operation != "heartbeat" {
-                *self
-                    .base_frame
-                    .lock()
-                    .map_err(|_| "transport_unavailable")? = None;
-            }
-            self.client.post(url)
-        };
-        let response = request
+        let fence = self.fence.lock().await.clone().ok_or("not_started")?;
+        let response = self
+            .client
+            .post(self.base.join(operation).map_err(|_| "invalid_endpoint")?)
             .bearer_auth(&self.key)
             .header("X-Bmux-Epoch", epoch.to_string())
+            .header("X-Bmux-Fence", fence)
             .send()
             .await
             .map_err(|_| "relay_unreachable")?;
-        if response.status() == reqwest::StatusCode::NO_CONTENT {
-            if let Some(next) = next_base {
-                *self
-                    .base_frame
-                    .lock()
-                    .map_err(|_| "transport_unavailable")? = Some(next);
+        let next = match authority(response).await {
+            Err("relay_epoch_lost") if operation == "heartbeat" => {
+                self.discover_fence().await?;
+                return Err("relay_transient");
             }
-            Ok(())
-        } else if response.status() == reqwest::StatusCode::CONFLICT
-            || response.status() == reqwest::StatusCode::GONE
-        {
-            Err("relay_epoch_lost")
-        } else if response.status().is_server_error()
-            || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-        {
-            Err("relay_transient")
-        } else {
-            Err("relay_rejected")
+            result => result?,
+        };
+        if next.epoch.is_some_and(|next| next != epoch) {
+            return Err("relay_epoch_lost");
         }
+        *self.fence.lock().await = Some(next.fence);
+        if operation != "heartbeat" {
+            *self.stream.lock().await = Stream::default();
+        }
+        Ok(())
+    }
+    /// Reconcile a durable relay restart without guessing a new authority.
+    async fn discover_fence(&self) -> Result<(), &'static str> {
+        let response = self
+            .client
+            .get(self.base.join("status").map_err(|_| "invalid_endpoint")?)
+            .bearer_auth(&self.key)
+            .header("X-Bmux-Epoch", self.epoch.ok_or("not_started")?.to_string())
+            .send()
+            .await
+            .map_err(|_| "relay_unreachable")?;
+        let next = authority(response).await?;
+        if next.epoch != self.epoch {
+            return Err("relay_epoch_lost");
+        }
+        *self.fence.lock().await = Some(next.fence);
+        *self.stream.lock().await = Stream::default();
+        Ok(())
+    }
+    async fn service_keepalive(&self) -> Result<(), &'static str> {
+        let mut stream = self.stream.lock().await;
+        let Some(socket) = stream.socket.as_mut() else {
+            return Ok(());
+        };
+        let mut failed = false;
+        // Bounded drain of transport-only traffic, independent of scene capture.
+        for _ in 0..16 {
+            match tokio::time::timeout(Duration::from_millis(1), socket.next()).await {
+                Err(_) => break,
+                Ok(Some(Ok(Message::Ping(bytes)))) => {
+                    if !matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(2),
+                            socket.send(Message::Pong(bytes))
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    ) {
+                        failed = true;
+                        break;
+                    }
+                }
+                Ok(Some(Ok(Message::Pong(_)))) => {}
+                _ => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            *stream = Stream::default();
+        }
+        Ok(())
+    }
+    async fn connect(&self) -> Result<Socket, &'static str> {
+        let mut url = self.base.join("ws").map_err(|_| "invalid_endpoint")?;
+        let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+        url.set_scheme(scheme).map_err(|_| "invalid_endpoint")?;
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|_| "invalid_endpoint")?;
+        let headers = request.headers_mut();
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", self.key)
+                .parse()
+                .map_err(|_| "invalid_credential")?,
+        );
+        headers.insert(
+            "X-Bmux-Epoch",
+            self.epoch
+                .ok_or("not_started")?
+                .to_string()
+                .parse()
+                .map_err(|_| "not_started")?,
+        );
+        headers.insert(
+            "X-Bmux-Fence",
+            self.fence
+                .lock()
+                .await
+                .clone()
+                .ok_or("not_started")?
+                .parse()
+                .map_err(|_| "not_started")?,
+        );
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_FRAME_BYTES))
+            .max_frame_size(Some(MAX_FRAME_BYTES));
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio_tungstenite::connect_async_with_config(request, Some(config), false),
+        )
+        .await
+        .map_err(|_| "relay_unreachable")?
+        .map(|(socket, _)| socket)
+        .map_err(|_| "relay_unreachable")
+    }
+    async fn publish(&self, bytes: &[u8]) -> Result<(), &'static str> {
+        if bytes.is_empty() || bytes.len() > MAX_FRAME_BYTES {
+            return Err("invalid_frame");
+        }
+        let frame = bmux_web_renderer::decode_binary(bytes, None).map_err(|_| "invalid_frame")?;
+        let mut stream = self.stream.lock().await;
+        // Take the socket before awaiting: cancellation drops it and its unACKed
+        // baseline, so the next upload must reconnect with a full repair.
+        let mut socket = match stream.socket.take() {
+            Some(socket) => socket,
+            None => {
+                stream.base = None;
+                self.connect().await?
+            }
+        };
+        let body = stream
+            .base
+            .as_ref()
+            .and_then(|base| bmux_web_renderer::encode_delta(&frame, base).ok())
+            .filter(|delta| delta.len() < bytes.len())
+            .unwrap_or_else(|| bytes.to_vec());
+        stream.base = None;
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            socket
+                .send(Message::Binary(body.into()))
+                .await
+                .map_err(|_| "relay_unreachable")?;
+            let mut repaired = false;
+            loop {
+                match socket
+                    .next()
+                    .await
+                    .ok_or("relay_unreachable")?
+                    .map_err(|_| "relay_unreachable")?
+                {
+                    Message::Text(text) => {
+                        if text.len() > 4096 {
+                            return Err("relay_rejected");
+                        }
+                        let control: serde_json::Value =
+                            serde_json::from_str(text.as_str()).map_err(|_| "relay_rejected")?;
+                        match control["type"].as_str() {
+                            Some("ack")
+                                if control["generation"].as_str() == Some(frame.generation())
+                                    && control["revision"].as_str()
+                                        == Some(frame.revision().to_string().as_str()) =>
+                            {
+                                return Ok(());
+                            }
+                            Some("repair") if !repaired => {
+                                repaired = true;
+                                socket
+                                    .send(Message::Binary(bytes.to_vec().into()))
+                                    .await
+                                    .map_err(|_| "relay_unreachable")?;
+                            }
+                            _ => return Err("relay_rejected"),
+                        }
+                    }
+                    Message::Ping(bytes) => socket
+                        .send(Message::Pong(bytes))
+                        .await
+                        .map_err(|_| "relay_unreachable")?,
+                    Message::Pong(_) => {}
+                    _ => return Err("relay_unreachable"),
+                }
+            }
+        })
+        .await
+        .map_err(|_| "relay_unreachable")?;
+        if result.is_ok() {
+            stream.socket = Some(socket);
+            stream.base = Some(frame);
+        }
+        result
     }
 }
-
+async fn authority(response: reqwest::Response) -> Result<Authority, &'static str> {
+    if !response.status().is_success() {
+        return Err(
+            if matches!(response.status().as_u16(), 409 | 410 | 401 | 403) {
+                "relay_epoch_lost"
+            } else if response.status().is_server_error() || response.status().as_u16() == 429 {
+                "relay_transient"
+            } else {
+                "relay_rejected"
+            },
+        );
+    }
+    if response.content_length().is_some_and(|size| size > 4096) {
+        return Err("relay_rejected");
+    }
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "relay_unreachable")? {
+        if bytes.len() + chunk.len() > 4096 {
+            return Err("relay_rejected");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: Authority = serde_json::from_slice(&bytes).map_err(|_| "relay_rejected")?;
+    if !decimal(&value.fence)
+        || !["starting", "live", "paused", "offline"].contains(&value.state.as_str())
+        || value.state != "offline" && value.epoch.is_none()
+    {
+        return Err("relay_rejected");
+    }
+    Ok(value)
+}
 pub(crate) fn validate_endpoint(
     endpoint: &str,
     channel: &str,
@@ -201,10 +351,9 @@ pub(crate) fn validate_endpoint(
     {
         return Err("invalid_endpoint");
     }
-    base.set_path(&format!("/api/live/{channel}/publisher/"));
+    base.set_path("/v1/publisher/");
     Ok(base)
 }
-
 pub(crate) fn credential_key(path: &Path) -> Result<String, &'static str> {
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -234,7 +383,6 @@ pub(crate) fn credential_key(path: &Path) -> Result<String, &'static str> {
     }
     Ok(key.to_owned())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

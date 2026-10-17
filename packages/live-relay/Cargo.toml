@@ -1,0 +1,28 @@
+[package]
+edition = { workspace = true }
+license = { workspace = true }
+name    = "bmux-live-relay"
+publish = false
+version = { workspace = true }
+
+[dependencies]
+axum = { workspace = true, features = ["ws", "json", "http1", "tokio"] }
+bmux_web_renderer = { workspace = true }
+futures-util = { workspace = true, features = ["sink"] }
+libc = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "time",
+    "signal",
+] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+[dev-dependencies]
+bmux_tui          = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }

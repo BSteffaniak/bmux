@@ -61,7 +61,7 @@ Explicit flags override the selected named profile, then the saved default;
 inspection never rewrites any layer. There are
 at most 32 named profiles. Private credentials are imported into owned
 0600 files in a 0700 credential directory; profiles store only local file paths.
-Setup verifies bounded public BMWP3 health before saving. Doctor validates
+Setup verifies bounded public relay health before saving. Doctor validates
 profile/credential security and public health without authenticated requests or
 configuration mutation. Full profile transactions are locked and fsync files
 and containing directories. Corrupt configuration is rejected, not reset.
@@ -125,16 +125,21 @@ output is handed off; private notes and controls are not audience content.
 
 ## Delivery guarantees
 
-The controller keeps one latest pending full inline BMWP3 repair, limited to
-8 MiB. HTTP mutation execution is serialized with pause/stop, and local gate
-changes invalidate pending and in-flight uploads. Transient uploads retry exact
-revision/bytes until acknowledged or superseded. Lost relay epochs reacquire
-only under running local intent, invalidate prior output, and require a fresh
-producer repair. Pause, stop, and unavailable sources never silently resume.
+The controller keeps one latest pending full inline BMWP4 repair, limited to
+8 MiB. WebSocket upload execution is serialized with pause/stop, and local gate
+changes invalidate pending and in-flight uploads. Only matching ACKs advance the
+publisher delta baseline. New connections and repair requests send a standalone
+full snapshot; subsequent updates choose the smaller full or cell-span delta,
+never a full-plus-delta bundle. Immutable resources are inherited from validated
+bases. BMAO v2 capture is event-driven and reconstructs deltas before coalescing.
+`BMUX_BROADCAST_MAX_FPS` sets a 1–60 FPS ceiling (default 60), not a polling clock.
+Lease renewal and WebSocket keepalive do not generate frames. Lost relay epochs
+reacquire only under running local intent and require fresh producer repair.
+Pause, stop, and unavailable sources never silently resume.
 
 Status distinguishes local state from acknowledged remote state. In particular,
 `stop_unacknowledged` means local uploads have stopped but remote revocation is
 not confirmed; the relay lease bounds exposure when unreachable.
 
-See [the HTTP contract](../../docs/live-broadcast-protocol.md) and the
+See [the streaming contract](../../docs/live-stream-protocol.md) and the
 [local broadcasting guide](../../docs/live-broadcasting.md) for integration.

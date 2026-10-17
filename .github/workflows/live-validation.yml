@@ -11,6 +11,7 @@ on:
       - '.github/workflows/configure-production-infra.yml'
       - 'scripts/**'
       - 'infra/live-*/**'
+      - 'packages/live-relay/**'
       - 'packages/web-renderer/**'
       - 'packages/docs-site/**'
       - 'flake.*'
@@ -40,6 +41,8 @@ jobs:
           python3 scripts/test-live-state-recovery.py
           python3 scripts/test-live-state-provision.py
           python3 scripts/test-live-imports.py
+          python3 scripts/test-live-build-artifact.py
+          python3 scripts/test-live-fly.py
           python3 scripts/test-live-plan-policy.py
           python3 scripts/test-live-deploy.py
           python3 scripts/test-live-install.py
@@ -47,8 +50,7 @@ jobs:
           python3 scripts/test-archive-live-state.py
           python3 scripts/test-live-smoke.py
           python3 scripts/test-live-deployment-boundary.py
-          cd infra/live-relay
-          npm test
+          # Rust relay tests belong to workspace validation, not the retired runtime.
   acceptance:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -63,6 +65,10 @@ jobs:
             bash scripts/smoke-pty-runtime.sh
             bash scripts/compat-matrix.sh
             BMUX_WEB_ASSET_OUTPUT="$RUNNER_TEMP/viewer" bash scripts/build-web-renderer.sh
-            cargo run --locked --quiet -p bmux_web_renderer --example snapshot -- --binary > "$RUNNER_TEMP/native-frame.bmwp"
-            python3 scripts/smoke-live-local.py --assets "$RUNNER_TEMP/viewer" --frame "$RUNNER_TEMP/native-frame.bmwp"
+            cargo build --locked -p bmux-live-relay
+            cargo build --locked -p bmux_web_renderer --example snapshot --example wire_frame
+            target_dir="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c "import json,sys; print(json.load(sys.stdin)[\"target_directory\"])")"
+            "$target_dir/debug/examples/snapshot" --binary > "$RUNNER_TEMP/native-frame.bmwp"
+            python3 scripts/smoke-live-local.py --relay "$target_dir/debug/bmux-live-relay" \
+              --assets "$RUNNER_TEMP/viewer" --frame "$RUNNER_TEMP/native-frame.bmwp"
           '

@@ -17,6 +17,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let base = bmux_web_renderer::decode_binary(&bytes, None)?;
         let target = bmux_web_renderer::decode_binary(&input, None)?;
         std::io::stdout().write_all(&bmux_web_renderer::encode_delta(&target, &base)?)?;
+    } else if mode.as_deref() == Some("--timer") {
+        // Acceptance fixture: one physical digit changes; metadata/images remain
+        // the real compositor snapshot. Shared codec authors both representations.
+        let frame = bmux_web_renderer::decode_binary(&input, None)?;
+        let mut value = serde_json::to_value(&frame)?;
+        value["revision"] = frame
+            .revision()
+            .checked_add(1)
+            .ok_or("revision exhausted")?
+            .into();
+        let area = frame.buffer().area();
+        if area.width < 4 || area.height < 2 {
+            return Err("timer fixture needs a grid".into());
+        }
+        let index =
+            usize::from(area.height - 2) * usize::from(area.width) + usize::from(area.width - 4);
+        let cell = &mut value["buffer"]["cells"][index];
+        let symbol = cell["symbol"].as_str().unwrap_or("");
+        let digit = symbol
+            .parse::<u8>()
+            .ok()
+            .filter(|digit| *digit < 10)
+            .map_or(7, |digit| (digit + 1) % 10);
+        cell["symbol"] = digit.to_string().into();
+        cell["width"] = 1.into();
+        cell["wide_continuation"] = false.into();
+        let target: bmux_web_renderer::BrowserFrame = serde_json::from_value(value)?;
+        target.validate(bmux_web_renderer::Limits::default())?;
+        std::io::stdout().write_all(&bmux_web_renderer::encode_binary(&target)?)?;
     } else if mode.as_deref() == Some("--dense") {
         let frame = bmux_web_renderer::decode_binary(&input, None)?;
         let mut value = serde_json::to_value(frame)?;

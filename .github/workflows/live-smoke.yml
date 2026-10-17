@@ -23,7 +23,7 @@ jobs:
           COMPONENT: ${{ inputs.component }}
         run: |
           set -o pipefail
-          python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --component "$COMPONENT" | tee smoke-report.jsonl
+          python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --relay-url https://live.bmux.dev --component "$COMPONENT" | tee smoke-report.jsonl
       - name: Retain safe smoke diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

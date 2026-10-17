@@ -53,6 +53,61 @@ type RejectionHandler = dyn FnMut(Option<&str>) + Send + Sync;
 
 type SnapshotDelivery = dyn FnMut(&AttachSnapshot) -> anyhow::Result<()> + Send + Sync;
 
+#[cfg(any(
+    test,
+    feature = "image-sixel",
+    feature = "image-kitty",
+    feature = "image-iterm2"
+))]
+#[derive(Default)]
+struct ImagePayloadCache {
+    entries: Vec<(
+        bmux_attach_image_protocol::AttachPaneImage,
+        bmux_tui::image::ImagePayload,
+    )>,
+    bytes: usize,
+}
+
+#[cfg(any(
+    test,
+    feature = "image-sixel",
+    feature = "image-kitty",
+    feature = "image-iterm2"
+))]
+impl ImagePayloadCache {
+    fn get_or_decode(
+        &mut self,
+        image: &bmux_attach_image_protocol::AttachPaneImage,
+        decode: impl FnOnce() -> Result<bmux_tui::image::ImagePayload, String>,
+    ) -> Result<bmux_tui::image::ImagePayload, String> {
+        if let Some((_, payload)) = self.entries.iter().find(|(source, _)| {
+            source.protocol == image.protocol
+                && source.compression == image.compression
+                && source.pixel_width == image.pixel_width
+                && source.pixel_height == image.pixel_height
+                && source.raw_data == image.raw_data
+        }) {
+            return Ok(payload.clone());
+        }
+        let payload = decode()?;
+        let size = image.raw_data.len().saturating_add(match &payload {
+            bmux_tui::image::ImagePayload::Png { bytes, .. }
+            | bmux_tui::image::ImagePayload::Pixels { bytes, .. } => bytes.len(),
+        });
+        // Bounded attach-local immutable payload reuse, not a source registry.
+        // Placement/occlusion are still recomputed from the retained compositor.
+        if size <= 8 * 1024 * 1024 {
+            if self.bytes.saturating_add(size) > 8 * 1024 * 1024 || self.entries.len() >= 4096 {
+                self.entries.clear();
+                self.bytes = 0;
+            }
+            self.entries.push((image.clone(), payload.clone()));
+            self.bytes += size;
+        }
+        Ok(payload)
+    }
+}
+
 /// Single publisher, owned and dropped by one attach view.
 pub struct AttachObserverPublisher {
     epoch: Uuid,
@@ -61,6 +116,14 @@ pub struct AttachObserverPublisher {
     rejection: Option<Box<RejectionHandler>>,
     last_rejection: Option<String>,
     delivery: Option<Box<SnapshotDelivery>>,
+    capture_interval: Option<std::time::Duration>,
+    last_capture: Option<std::time::Instant>,
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    image_payloads: std::sync::Mutex<ImagePayloadCache>,
 }
 
 impl std::fmt::Debug for AttachObserverPublisher {
@@ -92,6 +155,14 @@ pub fn attach_observer_channel() -> (AttachObserverPublisher, AttachObserver) {
             rejection: None,
             last_rejection: None,
             delivery: None,
+            capture_interval: None,
+            last_capture: None,
+            #[cfg(any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            ))]
+            image_payloads: std::sync::Mutex::default(),
         },
         AttachObserver { epoch, receiver },
     )
@@ -132,6 +203,22 @@ impl Drop for AttachObserverPublisher {
 }
 
 impl AttachObserverPublisher {
+    pub(super) fn set_max_fps(&mut self, fps: u8) {
+        self.capture_interval = Some(std::time::Duration::from_nanos(
+            1_000_000_000_u64.div_ceil(u64::from(fps.clamp(1, 60))),
+        ));
+    }
+
+    pub(super) const fn has_published(&self) -> bool {
+        self.revision != 0
+    }
+
+    pub(super) fn capture_deadline(&self) -> Option<std::time::Instant> {
+        self.last_capture
+            .zip(self.capture_interval)
+            .map(|(last, interval)| last + interval)
+    }
+
     pub(crate) fn set_rejection(
         &mut self,
         handler: impl FnMut(Option<&str>) + Send + Sync + 'static,
@@ -245,6 +332,7 @@ impl AttachObserverPublisher {
         }
         self.sender.send_replace(Some(snapshot));
         self.revision = revision;
+        self.last_capture = Some(std::time::Instant::now());
         self.report_rejection(None);
         Ok(())
     }
@@ -497,7 +585,14 @@ fn observed_images(
             surface.content_rect.h,
         );
         for image in view.presented_images(content_id) {
-            let payload = observed_image_payload(image)?;
+            let payload = match &view.observer {
+                Some(observer) => observer
+                    .image_payloads
+                    .lock()
+                    .map_err(|_| "observer image cache poisoned")?
+                    .get_or_decode(image, || observed_image_payload(image))?,
+                None => observed_image_payload(image)?,
+            };
             let destination = Rect::new(
                 content.x.saturating_add(image.position_col),
                 content.y.saturating_add(image.position_row),
@@ -617,6 +712,60 @@ fn observed_image_payload(
 mod tests {
     use super::*;
     use bmux_tui::{damage::Damage, presentation::PresentationState};
+
+    #[test]
+    fn immutable_payload_cache_reuses_assets_not_placement() {
+        use bmux_attach_image_protocol::{AttachImageProtocol, AttachPaneImage, CompressionId};
+        let mut image = AttachPaneImage {
+            id: 1,
+            protocol: AttachImageProtocol::KittyGraphics,
+            raw_data: vec![1, 2, 3],
+            compression: CompressionId::None,
+            position_row: 0,
+            position_col: 0,
+            cell_rows: 1,
+            cell_cols: 1,
+            pixel_width: 1,
+            pixel_height: 1,
+        };
+        let mut cache = ImagePayloadCache::default();
+        let payload = bmux_tui::image::ImagePayload::Png {
+            bytes: vec![4],
+            width: 1,
+            height: 1,
+        };
+        assert_eq!(
+            cache.get_or_decode(&image, || Ok(payload.clone())).unwrap(),
+            payload
+        );
+        image.position_col = 3;
+        image.id = 2;
+        assert_eq!(
+            cache
+                .get_or_decode(&image, || panic!("immutable asset decoded twice"))
+                .unwrap(),
+            payload
+        );
+        image.raw_data.push(4);
+        assert!(
+            cache
+                .get_or_decode(&image, || Err("changed asset".into()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn capture_deadline_is_absent_until_successful_publish() {
+        let (mut publisher, _) = attach_observer_channel();
+        publisher.set_max_fps(60);
+        assert!(publisher.capture_deadline().is_none());
+        let now = std::time::Instant::now();
+        publisher.last_capture = Some(now);
+        assert_eq!(
+            publisher.capture_deadline().unwrap() - now,
+            std::time::Duration::from_nanos(16_666_667)
+        );
+    }
 
     #[test]
     fn interactions_use_winning_clipped_spans_and_exact_native_focus() {

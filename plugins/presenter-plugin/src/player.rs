@@ -2678,7 +2678,13 @@ mod tests {
             bmux_web_renderer::BrowserFrame::from_prepared_in_generation("audience", 1, &prepared)
                 .unwrap();
         let binary = bmux_web_renderer::encode_binary(&frame).unwrap();
-        assert!(binary.starts_with(b"BMWP\x03"));
+        assert!(binary.starts_with(&[
+            b'B',
+            b'M',
+            b'W',
+            b'P',
+            bmux_web_renderer::BINARY_WIRE_VERSION
+        ]));
         let decoded = bmux_web_renderer::decode_binary(&binary, None).unwrap();
         let json = bmux_web_renderer::encode_json(&decoded).unwrap();
         let all_metadata = format!("{prepared:?} {json}");

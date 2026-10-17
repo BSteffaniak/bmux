@@ -3957,11 +3957,27 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
             .publish_state(&bmux_tabs_plugin_api::tabs_list::STATE_KIND, snapshot);
     }
 
+    let mut observer_capture_pending = false;
     loop {
         terminal.set_attached_session_id(view_state.attached_id);
         #[cfg(test)]
         terminal.observe_scrollback(view_state.scrollback_active());
+        let capture_deadline = if observer_capture_pending {
+            view_state
+                .observer
+                .as_ref()
+                .and_then(super::observer::AttachObserverPublisher::capture_deadline)
+        } else {
+            None
+        };
         tokio::select! {
+            // This timer is armed only for deferred damage, never idle polling.
+            () = async {
+                match capture_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {}
             // Server-pushed events (layout changes, session events, pane output)
             event = client.event_receiver().recv() => {
                 let Some(server_event) = event else {
@@ -4347,6 +4363,17 @@ pub async fn run_session_attach_with_terminal_config_observer<T: AttachTerminal 
         if burst_requested_exit {
             break;
         }
+
+        if view_state
+            .observer
+            .as_ref()
+            .and_then(super::observer::AttachObserverPublisher::capture_deadline)
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            observer_capture_pending = true;
+            continue;
+        }
+        observer_capture_pending = false;
 
         // ── Post-event processing: layout, output fetch, render ──────
 
@@ -9502,7 +9529,20 @@ fn render_attach_frame_inner<W: Write + ?Sized>(
     }
 
     let terminal_write_started_at = Instant::now();
-    let write_result = if view_state.observer.is_some() || view_state.presentation_only {
+    // The retained damage plan and resolved cursor are the change authority.
+    // Do not repair/copy/serialize an unchanged observer frame merely because
+    // an unrelated server event woke attach. Initial admission is always full.
+    let observer_unchanged = view_state.presentation_only
+        && view_state
+            .observer
+            .as_ref()
+            .is_some_and(super::observer::AttachObserverPublisher::has_published)
+        && !frame_plan.retained.damage.merged_damaged()
+        && !frame_plan.retained.graph_damaged()
+        && pending_cursor_state == view_state.last_cursor_state;
+    let write_result = if observer_unchanged {
+        Ok(())
+    } else if view_state.observer.is_some() || view_state.presentation_only {
         let cursor = view_state.last_cursor_state;
         view_state.last_cursor_state = pending_cursor_state;
         let operations = bmux_attach_pipeline::projection::staged_operations();

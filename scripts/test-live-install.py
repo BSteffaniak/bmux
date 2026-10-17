@@ -112,6 +112,13 @@ class InstallerTests(unittest.TestCase):
     def deploy(self, bootstrap=False):
         return m.Deployment(self.root, self.artifact, CHOICES.copy(), bootstrap, self.tools)
 
+    def test_fly_candidate_rejects_legacy_local_apply(self):
+        deployment = self.deploy()
+        (self.artifact / 'infrastructure/fly.tf').write_text('# Fly candidate\n')
+        with self.assertRaisesRegex(m.InstallError, 'approved configure/release workflow'):
+            deployment.init()
+        self.assertEqual(self.tools.calls, [])
+
     def reviewed(self, bootstrap=False):
         d = self.deploy(bootstrap)
         operation = d.plan({}, False, bootstrap)
