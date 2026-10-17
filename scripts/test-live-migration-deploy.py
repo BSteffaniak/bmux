@@ -31,6 +31,50 @@ class MigrationDeployTests(DEPLOY.DeployTests):
         self.env['TEST_PLAN_SEQUENCE'] = json.dumps([approved, retire, retire, app, remaining])
         return approved
 
+    def test_plan_failure_reports_operation_and_redacted_provider_diagnostic(self):
+        self.configure_migration()
+        self.tool('tofu', '''import json,os,sys
+args=sys.argv[1:]
+if args[0]=='version':
+ print('{"terraform_version":"1.10.9"}')
+elif args[0]=='state':
+ print(os.environ.get('TEST_MANAGED',''))
+elif args[0]=='plan':
+ print(json.dumps({'diagnostic': {'severity': 'error', 'summary': 'Provider rejected request',
+       'detail': 'HTTP 403 private-secret private-cf-token'}}))
+ sys.exit(1)
+''')
+        result, effects = self.run_deploy('check-migration')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Deployment operation failed: tofu plan', result.stderr)
+        self.assertIn('Provider rejected request', result.stderr)
+        self.assertIn('HTTP 403', result.stderr)
+        self.assertNotIn('private-cf-token', result.stderr)
+        self.assertNotIn('state migration-begin', effects)
+
+    def test_check_wrapper_uses_only_infrastructure_and_never_applies(self):
+        self.configure_migration()
+        output = self.root / 'infrastructure-check'
+        result = DEPLOY.subprocess.run(
+            [DEPLOY.shutil.which('bash'), str(ROOT / 'scripts/check-live-infrastructure.sh'), str(output)],
+            env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        effects = self.log.read_text()
+        self.assertIn('tofu plan', effects)
+        self.assertNotIn('tofu apply', effects)
+        self.assertNotIn('state migration-begin', effects)
+        self.assertNotIn('Approval digest:', result.stdout)
+        self.assertFalse((output / 'relay/image.oci.tar').exists())
+
+    def test_fast_infrastructure_check_never_applies_or_emits_approval(self):
+        self.configure_migration()
+        result, effects = self.run_deploy('check-migration')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Authenticated infrastructure plan succeeded', result.stdout)
+        self.assertNotIn('Approval digest:', result.stdout)
+        for forbidden in ('tofu apply', 'image ', 'state archive', 'state migration-begin'):
+            self.assertNotIn(forbidden, effects)
+
     def test_preview_no_mutations_or_archives_or_registry_upload(self):
         self.configure_migration()
         result, effects = self.run_deploy('preview-migration')

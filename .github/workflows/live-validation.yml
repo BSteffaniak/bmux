@@ -52,6 +52,7 @@ jobs:
           python3 scripts/test-live-fly.py
           python3 scripts/test-live-plan-policy.py
           python3 scripts/test-live-deploy.py
+          python3 scripts/test-live-deploy-diagnostics.py
           python3 scripts/test-live-install.py
           python3 scripts/test-live-state.py
           python3 scripts/test-archive-live-state.py

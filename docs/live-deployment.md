@@ -41,6 +41,13 @@ Live Validation and ordinary releases still run the complete acceptance suite.
 This deliberately accepts unverified runtime risk during the cutover; verify a
 real stream immediately afterward.
 
+Migration runs first perform an authenticated, read-only infrastructure plan
+before compiling backend or site candidates. This check uses a synthetic image
+reference only for planning; it never uploads an image, emits an approval digest,
+or applies a plan. Failed OpenTofu commands identify the operation and report
+bounded, redacted structured errors, not raw provider logs. The later preview
+still binds approval to the actual built candidate.
+
 The workflow builds same-revision backend/site candidates and runs the selected
 validation, then shows a read-only migration preview before approval. Review its
 resource identities/actions, downtime and paid resources. Approval is bound to

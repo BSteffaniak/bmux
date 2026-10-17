@@ -87,7 +87,8 @@ class MigrationWorkflowTests(unittest.TestCase):
         self.assertIn('!inputs.configure && !inputs.retire_worker', site)
         self.assertNotIn('inputs.migrate', site)
         self.assertIn('!inputs.configure && !inputs.retire_worker', build)
-        self.assertNotIn('inputs.migrate', build)
+        self.assertIn('needs: [infrastructure-check]', build)
+        self.assertIn("needs.infrastructure-check.result == 'success'", build)
         for path in ('packages/docs-site/**', 'packages/web-renderer/**', 'scripts/build-site-artifact.sh',
                      'docs/**', 'README.md'):
             self.assertIn(path, self.release.split('  workflow_dispatch:', 1)[0])
@@ -153,6 +154,19 @@ class MigrationWorkflowTests(unittest.TestCase):
             self.assertIn("needs.validation.result == 'success'", job(self.release, name))
         self.assertIn('environment: production-approval', job(self.release, 'approve'))
         self.assertIn('migration_digest', job(self.release, 'preview'))
+
+    def test_infrastructure_failures_precede_expensive_builds(self):
+        check = job(self.release, 'infrastructure-check')
+        self.assertIn('scripts/check-live-infrastructure.sh', check)
+        self.assertNotIn('needs:', check)
+        self.assertNotIn('cargo ', check)
+        self.assertIn('environment: Production', check)
+        self.assertIn('bmux-production-infrastructure', check)
+        for name in ('build', 'site-build'):
+            source = job(self.release, name)
+            self.assertIn('needs: [infrastructure-check]', source)
+            self.assertIn('!cancelled()', source)
+            self.assertIn("!inputs.migrate || needs.infrastructure-check.result == 'success'", source)
 
     def test_every_workflow_shell_block_parses(self):
         for name in ('live-promote.yml', 'docs-deploy.yml', 'live-validation.yml', 'configure-production-infra.yml'):

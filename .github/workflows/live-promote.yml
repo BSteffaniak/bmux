@@ -76,7 +76,40 @@ on:
 permissions:
   contents: read
 jobs:
+  infrastructure-check:
+    if: inputs.migrate && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: Production
+    concurrency:
+      group: bmux-production-infrastructure
+      cancel-in-progress: false
+    env:
+      LIVE_STATE_REGION: auto
+      R2_STATE_ACCESS_KEY_ID: ${{ secrets.R2_STATE_ACCESS_KEY_ID }}
+      R2_STATE_SECRET_ACCESS_KEY: ${{ secrets.R2_STATE_SECRET_ACCESS_KEY }}
+      TOFU_STATE_ENCRYPTION_PASSPHRASE: ${{ secrets.TOFU_STATE_ENCRYPTION_PASSPHRASE }}
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
+      LIVE_FLY_ORG: ${{ vars.LIVE_FLY_ORG }}
+      LIVE_FLY_REGION: ${{ vars.LIVE_FLY_REGION }}
+      LIVE_METRICS_KEY_SHA256: ${{ secrets.LIVE_METRICS_KEY_SHA256 }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      LIVE_HOSTNAME: ${{ secrets.LIVE_HOSTNAME }}
+      LIVE_PAGES_PROJECT: ${{ secrets.LIVE_PAGES_PROJECT }}
+      LIVE_PUBLISHER_KEY_SHA256: ${{ secrets.LIVE_PUBLISHER_KEY_SHA256 }}
+      LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f
+        with: {tofu_version: '1.10.9', tofu_wrapper: false}
+      - name: Check authenticated infrastructure before expensive builds (no apply)
+        run: bash scripts/check-live-infrastructure.sh "$RUNNER_TEMP/live-infrastructure-check"
   build:
+    needs: [infrastructure-check]
+    if: ${{ !cancelled() && (!inputs.migrate || needs.infrastructure-check.result == 'success') }}
     permissions:
       contents: read
     runs-on: ubuntu-24.04
@@ -114,7 +147,10 @@ jobs:
     permissions:
       contents: read
   site-build:
-    if: (!inputs.configure && !inputs.retire_worker) && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    needs: [infrastructure-check]
+    if: >-
+      !cancelled() && (!inputs.migrate || needs.infrastructure-check.result == 'success') &&
+      (!inputs.configure && !inputs.retire_worker) && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
     permissions:
       contents: read
     runs-on: ubuntu-24.04

@@ -7,9 +7,9 @@ ENVIRONMENT="${1:?Usage: live-deploy.sh production ARTIFACT_DIRECTORY [configure
 [[ "$ENVIRONMENT" == staging || "$ENVIRONMENT" == production ]] || exit 2
 ARTIFACT="$(cd "${2:?Artifact directory required}" && pwd)"
 MODE="${3:-release}"
-[[ "$MODE" == release || "$MODE" == configure || "$MODE" == retire-worker || "$MODE" == preview-migration || "$MODE" == migrate ]] || exit 2
+[[ "$MODE" == release || "$MODE" == configure || "$MODE" == retire-worker || "$MODE" == preview-migration || "$MODE" == check-migration || "$MODE" == migrate ]] || exit 2
 MIGRATION=false
-if [[ "$MODE" == preview-migration || "$MODE" == migrate ]]; then
+if [[ "$MODE" == preview-migration || "$MODE" == check-migration || "$MODE" == migrate ]]; then
   MIGRATION=true
   MIGRATION_PHASE=preflight
   migration_failure() {
@@ -88,7 +88,8 @@ export TF_VAR_relay_image="$LIVE_RELAY_IMAGE"
 cd "$ARTIFACT/infrastructure"
 run_private() {
   if ! "$@" > "$WORK/deploy.log" 2>&1; then
-    echo 'Deployment operation failed; provider output suppressed. Inspect protected state before retry.' >&2
+    echo "Deployment operation failed: $1 ${2:-}. Sanitized diagnostics:" >&2
+    python3 "$ROOT/scripts/live-deploy-diagnostics.py" "$WORK/deploy.log"
     return 1
   fi
 }
@@ -98,7 +99,7 @@ if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
   ADMISSION_ARGS=(--admission-file "$WORK/admission.json")
 fi
 python3 "$ROOT/scripts/archive-live-state.py" check "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"
-run_private tofu init -input=false -lockfile=readonly -backend-config="$WORK/backend.json"
+run_private tofu init -json -input=false -lockfile=readonly -backend-config="$WORK/backend.json"
 if [[ "$MODE" == configure || "$MIGRATION" == true ]]; then
   if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
     # Only the verified admission path may have no state. Recheck the remote
@@ -137,7 +138,7 @@ if [[ "$MODE" == retire-worker ]]; then POLICY_ARGS+=(--retire-worker); fi
 # skopeo --preserve-digests rejects any registry rewrite of image identity.
 apply_plan() {
   if [[ "${MIGRATION_SAVED_RETIRE:-false}" != true ]]; then
-    run_private tofu plan -input=false -lock-timeout=5m "$@" -out="$WORK/plan"
+    run_private tofu plan -json -input=false -lock-timeout=5m "$@" -out="$WORK/plan"
   fi
   if ! tofu show -json "$WORK/plan" > "$WORK/plan.json" 2> "$WORK/deploy.log"; then
     echo 'Plan inspection failed; provider output suppressed' >&2; exit 1
@@ -163,9 +164,13 @@ apply_plan() {
 if [[ "$MIGRATION" == true ]]; then
   # Preview the entire cutover, before any resource effect. Approval binds full
   # private resource values but publishes only fixed addresses/actions + digest.
-  run_private tofu plan -input=false -lock-timeout=5m -out="$WORK/plan"
+  run_private tofu plan -json -input=false -lock-timeout=5m -out="$WORK/plan"
   if ! tofu show -json "$WORK/plan" > "$WORK/approved-plan.json" 2> "$WORK/deploy.log"; then
     echo 'Migration preview failed; private diagnostics suppressed' >&2; exit 1
+  fi
+  if [[ "$MODE" == check-migration ]]; then
+    echo 'Authenticated infrastructure plan succeeded; no resource changes applied.'
+    exit 0
   fi
   if [[ "$MODE" == preview-migration ]]; then
     python3 "$ROOT/scripts/live-migration-plan.py" "$WORK/approved-plan.json" --state "$WORK/migration-source.json" --artifact "$ARTIFACT"
@@ -178,7 +183,7 @@ if [[ "$MIGRATION" == true ]]; then
   # Prepare the exact retirement saved plan before beginning. Its state serial
   # must be the approved serial; apply never replans after the durable fence.
   MIGRATION_STAGE=retire
-  run_private tofu plan -input=false -lock-timeout=5m -destroy -target=cloudflare_workers_route.live -target=cloudflare_workers_deployment.live -target=cloudflare_worker_version.live -target=cloudflare_worker.live -out="$WORK/plan"
+  run_private tofu plan -json -input=false -lock-timeout=5m -destroy -target=cloudflare_workers_route.live -target=cloudflare_workers_deployment.live -target=cloudflare_worker_version.live -target=cloudflare_worker.live -out="$WORK/plan"
   if ! tofu show -json "$WORK/plan" > "$WORK/plan.json" 2> "$WORK/deploy.log"; then exit 1; fi
   python3 "$ROOT/scripts/live-migration-plan.py" "$WORK/plan.json" --approved-plan "$WORK/approved-plan.json" --stage retire
   MIGRATION_SAVED_RETIRE=true
