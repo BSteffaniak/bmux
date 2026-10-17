@@ -79,6 +79,25 @@ elif args[0]=='plan':
         for forbidden in ('tofu apply', 'image ', 'state archive', 'state migration-begin'):
             self.assertNotIn(forbidden, effects)
 
+    def test_cutover_preserves_existing_retention_without_weakening_policy(self):
+        self.configure_migration()
+        self.tool('tofu', '''import json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+if args[0]=='version': print('{"terraform_version":"1.10.9"}')
+elif args[0]=='state': print(os.environ.get('TEST_MANAGED',''))
+elif args[0]=='show': print(os.environ['TEST_PLAN'])
+else:
+ override=json.loads(Path('migration-retention_override.tf.json').read_text())
+ assert override == {'resource': {kind: {'state': {'lifecycle': {'ignore_changes': ['rules']}}}
+                     for kind in ('cloudflare_r2_bucket_lock','cloudflare_r2_bucket_lifecycle')}}
+ with open(os.environ['TEST_EFFECTS'],'a') as f: f.write('tofu '+args[0]+'\\n')
+''')
+        result, effects = self.run_deploy('check-migration')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('tofu plan', effects)
+        self.assertFalse((self.artifact / 'infrastructure/migration-retention_override.tf.json').exists())
+
     def test_fast_infrastructure_check_never_applies_or_emits_approval(self):
         self.configure_migration()
         result, effects = self.run_deploy('check-migration')

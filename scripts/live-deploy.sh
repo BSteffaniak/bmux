@@ -74,8 +74,10 @@ PY
 WORK="$(mktemp -d)"
 chmod 700 "$WORK"
 IMPORT_FILE="$ARTIFACT/infrastructure/approved-imports.tf.json"
+PRESERVE_FILE="$ARTIFACT/infrastructure/migration-retention_override.tf.json"
+[[ ! -e "$PRESERVE_FILE" && ! -L "$PRESERVE_FILE" ]] || { echo 'Unexpected migration override in immutable candidate' >&2; exit 2; }
 [[ ! -e "$IMPORT_FILE" && ! -L "$IMPORT_FILE" ]] || { echo 'Unexpected import file in immutable candidate' >&2; exit 2; }
-trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/approved-plan.json" "$WORK/migration-receipt.json" "$WORK/migration-source.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$WORK/registry-auth.json" "$IMPORT_FILE"' EXIT
+trap 'rm -f "$WORK/backend.json" "$WORK/plan" "$WORK/plan.json" "$WORK/approved-plan.json" "$WORK/migration-receipt.json" "$WORK/migration-source.json" "$WORK/managed.json" "$WORK/imports.json" "$WORK/state-check.json" "$WORK/archive-before.json" "$WORK/archive-after.json" "$WORK/deploy.log" "$WORK/registry-auth.json" "$IMPORT_FILE" "$PRESERVE_FILE"' EXIT
 export TF_DATA_DIR="$WORK/tofu"
 python3 "$ROOT/scripts/live-state.py" --environment "$ENVIRONMENT" --output "$WORK/backend.json"
 export TF_VAR_environment="$ENVIRONMENT" TF_VAR_account_id="$CLOUDFLARE_ACCOUNT_ID"
@@ -86,6 +88,18 @@ export TF_VAR_fly_app_name="$LIVE_FLY_APP" TF_VAR_fly_org="$LIVE_FLY_ORG"
 export TF_VAR_fly_region="${LIVE_FLY_REGION:-iad}" TF_VAR_relay_hostname="${LIVE_RELAY_HOSTNAME:-live.bmux.dev}"
 export TF_VAR_relay_image="$LIVE_RELAY_IMAGE"
 cd "$ARTIFACT/infrastructure"
+if [[ "$MIGRATION" == true ]]; then
+  # Cutover does not reconcile unrelated state-history retention. Keep installed
+  # rules unchanged in check, preview and every apply phase. Configure still
+  # manages these rules normally; policy continues rejecting other mutations.
+  python3 - "$PRESERVE_FILE" <<'PY'
+import json, sys
+from pathlib import Path
+resources = {kind: {'state': {'lifecycle': {'ignore_changes': ['rules']}}}
+             for kind in ('cloudflare_r2_bucket_lock', 'cloudflare_r2_bucket_lifecycle')}
+Path(sys.argv[1]).write_text(json.dumps({'resource': resources}))
+PY
+fi
 run_private() {
   if ! "$@" > "$WORK/deploy.log" 2>&1; then
     echo "Deployment operation failed: $1 ${2:-}. Sanitized diagnostics:" >&2
