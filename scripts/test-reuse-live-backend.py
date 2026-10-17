@@ -58,6 +58,26 @@ class ReuseTests(unittest.TestCase):
             digest, name = line.split('  ', 1)
             self.assertEqual(hashlib.sha256((self.output / name).read_bytes()).hexdigest(), digest)
 
+    def test_reuses_site_without_backend_or_infrastructure_payload(self):
+        for name in ('site/index.html', 'viewer/manifest.json'):
+            path = self.source / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text('original site bytes')
+        (self.source / 'tools/package-link.json').symlink_to('package.json')
+        inventory = ''.join(hashlib.sha256(p.read_bytes()).hexdigest() + '  ./' + p.relative_to(self.source).as_posix() + '\n'
+                            for p in self.source.rglob('*') if p.is_file() and not p.is_symlink() and p.name != 'SHA256SUMS')
+        (self.source / 'SHA256SUMS').write_text(inventory)
+        self.pack()
+        (self.download / 'live-candidate.tar.gz').rename(self.download / 'site-candidate.tar.gz')
+        checksum = (self.download / 'live-candidate.tar.gz.sha256').read_text().replace('live-candidate', 'site-candidate')
+        (self.download / 'site-candidate.tar.gz.sha256').write_text(checksum)
+        with patch.object(subprocess, 'check_output', side_effect=['', 'a' * 40 + '\n']):
+            MODULE.reuse(self.download, self.output, self.repo, 'site')
+        self.assertEqual((self.output / 'site/index.html').read_text(), 'original site bytes')
+        self.assertTrue((self.output / 'SITE_SOURCE.json').exists())
+        self.assertFalse((self.output / 'relay').exists())
+        self.assertFalse((self.output / 'infrastructure').exists())
+
     def test_rejects_archive_tampering(self):
         with (self.download / 'live-candidate.tar.gz').open('ab') as stream:
             stream.write(b'tampered')

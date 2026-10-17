@@ -179,6 +179,15 @@ class MigrationWorkflowTests(unittest.TestCase):
         self.assertIn('test "$MIGRATE" = true', build)
         self.assertEqual(self.release.count('      reuse_backend:\n'), 2)
 
+    def test_site_reuse_skips_compilation_and_preserves_provenance(self):
+        site = job(self.release, 'site-build')
+        self.assertIn('actions: read', site)
+        self.assertIn('run-id: 39048863096', site)
+        self.assertIn('site-candidate-e84e1b69a4f59e8174e5a4ac8aa7af18f207d480', site)
+        self.assertIn('if: inputs.reuse_backend && inputs.migrate', site)
+        self.assertIn('"$RUNNER_TEMP/site-candidate" site', site)
+        self.assertIn('if: ${{ !inputs.reuse_backend }}', site)
+
     def test_every_workflow_shell_block_parses(self):
         for name in ('live-promote.yml', 'docs-deploy.yml', 'live-validation.yml', 'configure-production-infra.yml'):
             lines = workflow(name).splitlines()

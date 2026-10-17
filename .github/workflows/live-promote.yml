@@ -183,18 +183,39 @@ jobs:
       (!inputs.configure && !inputs.retire_worker) && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
     permissions:
       contents: read
+      actions: read
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0}
+      - name: Validate temporary site reuse scope
+        if: inputs.reuse_backend
+        env:
+          MIGRATE: ${{ inputs.migrate || false }}
+        run: test "$MIGRATE" = true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: inputs.reuse_backend && inputs.migrate
+        with:
+          github-token: ${{ github.token }}
+          run-id: 39048863096
+          name: site-candidate-e84e1b69a4f59e8174e5a4ac8aa7af18f207d480
+          path: ${{ runner.temp }}/site-source
+      - name: Repackage pinned site without compilation
+        if: inputs.reuse_backend && inputs.migrate
+        run: python3 scripts/reuse-live-backend.py "$RUNNER_TEMP/site-source" "$RUNNER_TEMP/site-candidate" site
       - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd
+        if: ${{ !inputs.reuse_backend }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        if: ${{ !inputs.reuse_backend }}
         with: {node-version: '22.16.0'}
       - name: Build same-revision complete site without deployment secrets
+        if: ${{ !inputs.reuse_backend }}
         env:
           BMUX_LIVE_ENDPOINT_ORIGIN: https://live.bmux.dev
+        run: bash scripts/dev.sh bash scripts/build-site-artifact.sh "$RUNNER_TEMP/site-candidate"
+      - name: Package site candidate
         run: |
-          bash scripts/dev.sh bash scripts/build-site-artifact.sh "$RUNNER_TEMP/site-candidate"
           test "$(cat "$RUNNER_TEMP/site-candidate/REVISION")" = "$GITHUB_SHA"
           tar -C "$RUNNER_TEMP/site-candidate" -czf "$RUNNER_TEMP/site-candidate.tar.gz" .
           cd "$RUNNER_TEMP"

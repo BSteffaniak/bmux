@@ -48,7 +48,10 @@ and full source inventory are verified; product/dependency changes since that
 build reject reuse. Current infrastructure is packaged with the original image
 and native binary, and `BACKEND_SOURCE.json` records their original revision and
 archive hash. The image remains digest-pinned and is published only during the
-approved deployment. Site builds are unchanged. Reuse is opt-in, migration-only,
+approved deployment. The same option now reuses the site/viewer artifact from
+that run, with `SITE_SOURCE.json` recording its original provenance. Site source
+and build-script changes reject reuse. Both jobs still package/upload candidates
+but skip compilation. Reuse is opt-in, migration-only,
 and depends on that run's artifact retention; ordinary releases still rebuild.
 
 Migration runs first perform an authenticated, read-only infrastructure plan
