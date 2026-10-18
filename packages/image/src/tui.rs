@@ -844,6 +844,73 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn fractional_letterbox_keeps_identical_raster_when_overlay_clips() {
+        let pixels = image::RgbaImage::from_pixel(20, 20, image::Rgba([90, 120, 150, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let mut placed = placement(
+            "fractional",
+            Rect::new(2, 2, 12, 7),
+            Rect::new(0, 0, 80, 24),
+            0,
+        );
+        placed.fit = bmux_tui::image::ImageFit::Contain;
+        placed.payload = ImagePayload::Png {
+            bytes: bytes.into_inner(),
+            width: 20,
+            height: 20,
+        };
+        let caps = HostImageCapabilities {
+            kitty_graphics: true,
+            cell_pixel_width: 9,
+            cell_pixel_height: 19,
+            ..Default::default()
+        };
+        let mut compositor = TuiImageCompositor::new();
+        let config = ImageConfig::default();
+        let mut baseline = None;
+        for clip in [
+            Rect::new(0, 0, 80, 24),
+            Rect::new(2, 2, 6, 7),
+            Rect::new(0, 0, 80, 24),
+        ] {
+            placed.clip = clip;
+            let mut scene = ImageScene::default();
+            scene.reconcile(&[ImageContribution::Present(placed.clone())]);
+            compositor
+                .render(
+                    &mut Vec::new(),
+                    &scene,
+                    PaneRect {
+                        x: 0,
+                        y: 0,
+                        w: 80,
+                        h: 24,
+                    },
+                    &caps,
+                    &config,
+                )
+                .unwrap();
+            let fitted = compositor
+                .fitted
+                .get(&placed.key)
+                .expect("sub-cell fit must always use the pixel-centered raster");
+            let data = &fitted.1.payload.pixels.as_ref().unwrap().data;
+            if let Some(expected) = &baseline {
+                assert_eq!(
+                    data, expected,
+                    "clipping must reuse identical positioned pixels"
+                );
+            } else {
+                baseline = Some(data.clone());
+            }
+        }
+    }
+
     #[cfg(all(feature = "kitty", feature = "sixel", feature = "iterm2"))]
     #[test]
     fn contain_renders_real_deck_pngs_across_protocols() {
@@ -903,11 +970,8 @@ mod tests {
                     )
                     .unwrap();
                 assert!(!output.is_empty());
-                let id = if kitty_graphics {
-                    assert!(
-                        compositor.fitted.is_empty(),
-                        "native containment must not rasterize"
-                    );
+                let native = kitty_graphics && compositor.fitted.is_empty();
+                let id = if native {
                     assert!(String::from_utf8_lossy(&output).contains("f=100"));
                     assert!(
                         output.len() < bytes.len() * 2 + 4096,
@@ -973,12 +1037,18 @@ mod tests {
                     )
                     .unwrap();
                 if kitty_graphics {
-                    assert_eq!(compositor.sources.values().next().unwrap().2.id, id);
+                    if native {
+                        assert_eq!(compositor.sources.values().next().unwrap().2.id, id);
+                    }
                     assert!(
                         !String::from_utf8_lossy(&returned).contains("a=t"),
                         "return must only place retained upload"
                     );
-                    assert_eq!(compositor.work_counts(), (1, 0, 0));
+                    if native {
+                        assert_eq!(compositor.work_counts(), (1, 0, 0));
+                    } else {
+                        assert_eq!(compositor.fitted.values().next().unwrap().1.id, id);
+                    }
                 } else {
                     assert_eq!(compositor.fitted.values().next().unwrap().1.id, id);
                 }

@@ -69,6 +69,22 @@ impl KittyHostState {
         let bounds = placement
             .allocation
             .unwrap_or_else(|| placement.destination.into());
+        let (cw, ch) = caps.fitting_cell_size();
+        let fit = placement.pixel_rect(f64::from(cw), f64::from(ch));
+        // Native PNG placement centers at cell boundaries, whereas the fitted
+        // raster centers in pixels. Use the raster for sub-cell letterboxing
+        // even before clipping, so opening an overlay cannot move the image.
+        if [
+            fit.x / f64::from(cw),
+            fit.y / f64::from(ch),
+            fit.width / f64::from(cw),
+            fit.height / f64::from(ch),
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite() || (value - value.round()).abs() > 0.000001)
+        {
+            return Ok(false);
+        }
         if bounds.x < 0 || bounds.y < 0 {
             return self.contain_png_cropped(out, image, placement, caps, clip);
         }
