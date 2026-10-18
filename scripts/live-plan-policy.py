@@ -60,17 +60,53 @@ def validate(plan, configure=False):
     return True
 
 
+def public_change_summary(plan):
+    """Bounded inventory from fixed vocabulary only, never provider values.
+
+    A generic "configure first" message is insufficient to review a configure
+    operation. Report all changed known addresses/actions, not the first blocker;
+    unknown addresses and malformed changes remain anonymous and fail closed.
+    """
+    labels = set()
+    resources = plan.get('resource_changes', []) if isinstance(plan, dict) else []
+    if not isinstance(resources, list):
+        return ''
+    for resource in resources:
+        if not isinstance(resource, dict):
+            labels.add('unrecognized resource: unsupported action')
+            continue
+        change = resource.get('change', {})
+        change = change if isinstance(change, dict) else {}
+        actions = change.get('actions')
+        if actions in (['no-op'], ['read']):
+            continue
+        # Select the canonical constant, not any raw string from the plan.
+        address = next((known for known in CONFIGURE_RESOURCES
+                        if known == resource.get('address')), 'unrecognized resource')
+        action = next((label for allowed, label in (
+            (['create'], 'create'), (['update'], 'update'), (['delete'], 'delete'),
+            (['create', 'delete'], 'replace'), (['delete', 'create'], 'replace'))
+            if actions == allowed), 'unsupported action')
+        labels.add(f'{address}: {action}')
+    # Vocabulary is finite; output stays bounded even for hostile input arrays.
+    return '\n'.join('  ' + label for label in sorted(labels))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('plan', type=Path)
     parser.add_argument('--configure', action='store_true')
     args = parser.parse_args()
+    plan = None
     try:
-        validate(json.loads(args.plan.read_text()), args.configure)
+        plan = json.loads(args.plan.read_text())
+        validate(plan, args.configure)
     except PolicyRejection as exc:
-        # Only deliberately authored policy messages are public. Parsing errors,
-        # resource addresses, attribute names and provider values stay private.
-        parser.exit(2, f'Infrastructure plan rejected: {exc}. Plan values suppressed.\n')
+        # Only deliberately authored policy messages and fixed inventory labels
+        # are public. Never print raw addresses, attribute names, or values.
+        summary = public_change_summary(plan)
+        detail = f'\nChanged resources (configuration values suppressed):\n{summary}\n' if summary else ''
+        parser.exit(2, f'Infrastructure plan rejected: {exc}. Plan values suppressed.\n{detail}')
     except (OSError, ValueError, TypeError, AttributeError):
         parser.exit(2, 'Infrastructure plan rejected; invalid or unreadable plan. Plan values suppressed.\n')
 

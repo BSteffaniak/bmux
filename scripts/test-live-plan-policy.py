@@ -79,6 +79,47 @@ class PolicyTests(unittest.TestCase):
             self.assertIn('invalid or unreadable plan', result.stderr)
             self.assertNotIn(secret, result.stdout + result.stderr)
 
+    def test_drift_inventory_reports_all_known_changes_without_values(self):
+        secret = 'PRIVATE_PROVIDER_VALUE_DO_NOT_LOG'
+        candidate = {'resource_changes': [
+            *plan('cloudflare_dns_record.relay_acme', ['update'],
+                  before={'content': secret}, after={'content': 'different'})['resource_changes'],
+            *plan('cloudflare_pages_domain.live', ['create'])['resource_changes'],
+            *plan('fly_machine.live', ['update'], before={'image': secret},
+                  after={'image': 'new'})['resource_changes'],
+            *plan(secret + '\\n::error::injected', ['delete'])['resource_changes'],
+            *plan('cloudflare_r2_bucket.state', ['no-op'])['resource_changes'],
+        ]}
+        summary = m.public_change_summary(candidate)
+        self.assertIn('cloudflare_dns_record.relay_acme: update', summary)
+        self.assertIn('cloudflare_pages_domain.live: create', summary)
+        self.assertIn('fly_machine.live: update', summary)
+        self.assertIn('unrecognized resource: delete', summary)
+        self.assertNotIn('cloudflare_r2_bucket.state', summary)
+        self.assertNotIn(secret, summary)
+        self.assertNotIn('::error::', summary)
+        self.assertNotIn('content', summary)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'plan.json'
+            path.write_text(json.dumps(candidate))
+            result = subprocess.run([sys.executable, str(Path(m.__file__)), str(path)],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('configure first', result.stderr)
+        self.assertIn(summary, result.stderr)
+        self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_drift_inventory_is_bounded_fixed_vocabulary_and_handles_malformed_input(self):
+        for candidate in (None, [], {'resource_changes': 'private'}):
+            self.assertEqual(m.public_change_summary(candidate), '')
+        candidate = {'resource_changes': [None, {'address': 'private', 'change': 'private'},
+                     {'address': 'private', 'change': {'actions': ['private']}}] * 1000}
+        self.assertEqual(m.public_change_summary(candidate),
+                         '  unrecognized resource: unsupported action')
+        for actions in (['create', 'delete'], ['delete', 'create']):
+            self.assertEqual(m.public_change_summary(plan('fly_machine.live', actions)),
+                             '  fly_machine.live: replace')
+
     def test_no_release_create_or_replacement(self):
         for actions in [['create'], ['delete'], ['delete', 'create'], ['create', 'delete']]:
             with self.assertRaises(ValueError): m.validate(plan('fly_machine.live', actions))
