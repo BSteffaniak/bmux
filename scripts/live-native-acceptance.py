@@ -63,10 +63,25 @@ def wait(label, fn, seconds=25):
     raise AssertionError(label + ' timed out')
 
 
+def browser_ready(child, port_file):
+    code = child.poll()
+    if code is not None:
+        raise AssertionError(f'isolated browser exited before readiness (code {code})')
+    return port_file.exists()
+
+
+def browser_environment(env, directory):
+    # Chromium creates a Unix singleton socket beneath TMPDIR. Runner/Nix temp
+    # prefixes can exceed sockaddr_un's path limit; use an owned short directory,
+    # never the user's browser profile or ambient temporary directory.
+    return dict(env, TMPDIR=str(directory))
+
+
 class Harness:
     def __init__(self, args, root):
         self.args, self.root = args, root
         self.children, self.terminals, self.logs = [], [], []
+        self.browser_temp = None
         self.env = {k: v for k, v in os.environ.items() if k in ('PATH', 'LANG', 'LC_ALL', 'TZ')}
         for name in ('home', 'config', 'runtime', 'data', 'state', 'logs', 'cache', 'tmp'):
             (root / name).mkdir(mode=0o700)
@@ -111,10 +126,10 @@ class Harness:
         require(not check or result.returncode == 0, 'native command rejected: ' + args[0])
         return result
 
-    def spawn(self, argv):
+    def spawn(self, argv, *, env=None):
         log = open(self.root / ('child-' + str(len(self.children)) + '.log'), 'wb')
         self.logs.append(log)
-        child = subprocess.Popen(argv, env=self.env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+        child = subprocess.Popen(argv, env=self.env if env is None else env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                  start_new_session=True)
         self.children.append(child)
         return child
@@ -162,13 +177,15 @@ class Harness:
 
     def browser(self):
         self.stage = 'browser-launch'
+        self.browser_temp = tempfile.TemporaryDirectory(prefix='bmux-cdp-', dir='/tmp')
         child = self.spawn([str(self.args.browser), '--headless', '--no-sandbox', '--disable-gpu',
             '--disable-background-networking', '--no-first-run', '--no-default-browser-check',
             '--no-proxy-server', '--ignore-certificate-errors', '--host-resolver-rules=' + self.stack.chrome_rules,
             '--remote-debugging-port=0', '--remote-allow-origins=*',
-            '--user-data-dir=' + str(self.root / 'browser-profile'), 'about:blank'])
+            '--user-data-dir=' + str(self.root / 'browser-profile'), 'about:blank'],
+            env=browser_environment(self.env, self.browser_temp.name))
         port_file = self.root / 'browser-profile/DevToolsActivePort'
-        wait('isolated browser', lambda: port_file.exists() and child.poll() is None)
+        wait('isolated browser', lambda: browser_ready(child, port_file))
         port = port_file.read_text().splitlines()[0]
         with urllib.request.urlopen('http://127.0.0.1:' + port + '/json/list', timeout=5) as response:
             targets = json.load(response)
@@ -536,6 +553,8 @@ class Harness:
                     child.wait(timeout=5)
         for log in self.logs:
             log.close()
+        if self.browser_temp is not None:
+            self.browser_temp.cleanup()
 
 
 def main():

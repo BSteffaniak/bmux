@@ -104,7 +104,6 @@ No browser or physical-terminal rehearsal, provider requests, or plugin deployme
 acceptance is claimed. Architecture guardrails passed in the full suite; no core
 or plugin-API code was changed by this gallery work.
 
-
 ## Rehearsal still needed
 
 Check the 53-slide route at the intended audience size, especially the tables and code. Flip quickly through the 24-slide component gallery. Run the actual demos and inspect their results. Capture real product screenshots if adding opening visuals; do not substitute an architecture diagram or a mock terminal for a product screenshot.
