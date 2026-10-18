@@ -112,13 +112,9 @@ prove visual rendering, historical error-free operation or volume durability.
 `live-smoke.yml` remains the public smoke workflow. Private `/metrics` requires
 its separate bearer credential; monitoring is not provisioned by deployment.
 
-## Cutover retirement evidence
+## Deployment verification
 
-GitHub run `39069908459` on 2026-10-17 recorded successful backend recovery,
-backend health HTTP 200 and `{"status":"completed"}`. Its later site step
-published Pages but failed a manifest smoke check. Ordinary run `39069891105`
-failed native acceptance at isolated browser startup and skipped production.
-These are historical observations, not proof that the edited pipeline has been
-applied successfully. Keep release validation enabled and verify the next
-approved ordinary deployment; do not call a public health check an end-to-end
-release validation.
+Protected configuration run `39168519882` completed backend deployment and public
+read-only smoke successfully. Configuration mode intentionally skips the static
+site publisher. Verify the next approved ordinary backend-plus-site release;
+backend health alone does not establish end-to-end browser rendering.
