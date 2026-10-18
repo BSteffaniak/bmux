@@ -28,7 +28,8 @@ export function validateStatus(value) {
 export async function mountLiveViewer({ container, status, apiBase = '/', assetBase,
   viewerFactory = mountCanvasViewer, WebSocketImpl = globalThis.WebSocket,
   requestFrame = callback => requestAnimationFrame(callback), cancelFrame = id => cancelAnimationFrame(id),
-  setTimer = setTimeout, clearTimer = clearTimeout, maxFps = 60, autoStart = true }) {
+  setTimer = setTimeout, clearTimer = clearTimeout, now = () => performance.now(),
+  maxFps = 60, autoStart = true }) {
   if (!Number.isFinite(maxFps) || maxFps <= 0 || maxFps > 60) throw new Error('invalid max FPS');
   const viewer = await viewerFactory({ container, assetBase });
   const url = new URL('/v1/viewer/ws', new URL(apiBase, container.ownerDocument.baseURI));
@@ -59,11 +60,14 @@ export async function mountLiveViewer({ container, status, apiBase = '/', assetB
   }
   function schedule() {
     if (disposed || busy || !pending || raf !== undefined || frameTimer !== undefined) return;
-    raf = requestFrame(async now => {
+    raf = requestFrame(async () => {
       raf = undefined;
       if (!pending || disposed) return;
-      const wait = 1000 / maxFps - (now - lastPaint);
-      if (wait > 0.01) {
+      // RAF timestamps describe the animation timeline, not when an async
+      // decoder actually admitted its canvas. Pace against the last completion
+      // using one monotonic clock so a slow paint cannot compress the next gap.
+      const wait = 1000 / maxFps - (now() - lastPaint);
+      if (wait > 0) {
         frameTimer = setTimer(() => { frameTimer = undefined; schedule(); }, wait);
         return;
       }
@@ -79,7 +83,7 @@ export async function mountLiveViewer({ container, status, apiBase = '/', assetB
         revision(identity.revision);
         send({ type: 'ack', generation: identity.generation, revision: identity.revision }, frame.socket);
         repairing = false;
-        lastPaint = now;
+        lastPaint = now();
         count('frames');
         status.textContent = 'Live · read-only';
       } catch {

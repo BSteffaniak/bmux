@@ -6,7 +6,7 @@ const epoch = '11111111-1111-4111-8111-111111111111';
 const bytes = () => new Uint8Array([66, 77, 87, 80, 4, 0]).buffer;
 async function fixture(options = {}) {
   const frames = new Map(), timers = new Map(), sockets = [];
-  let id = 0, paints = 0, clears = 0, identity;
+  let id = 0, paints = 0, clears = 0, identity, clock = 0;
   class Socket {
     constructor(url) { this.url = url; this.readyState = 1; this.sent = []; sockets.push(this); }
     send(value) { this.sent.push(JSON.parse(value)); }
@@ -21,6 +21,7 @@ async function fixture(options = {}) {
     async present(data, current) {
       paints++;
       if (options.present) await options.present();
+      if (options.paintDuration) clock += options.paintDuration(paints);
       if (!current()) return false;
       identity = { generation: 'scene', revision: String(paints) };
       return true;
@@ -34,10 +35,10 @@ async function fixture(options = {}) {
     requestFrame: callback => { frames.set(++id, callback); return id; },
     cancelFrame: key => frames.delete(key),
     setTimer: (callback, delay) => { timers.set(++id, { callback, delay }); return id; },
-    clearTimer: key => timers.delete(key), ...options,
+    clearTimer: key => timers.delete(key), now: () => clock, ...options,
   });
   return { handle, sockets, frames, timers, get paints() { return paints; }, get clears() { return clears; },
-    async raf(now) { const work = [...frames.values()]; frames.clear(); await Promise.all(work.map(fn => fn(now))); },
+    async raf(now, actual = now) { clock = actual; const work = [...frames.values()]; frames.clear(); await Promise.all(work.map(fn => fn(now))); },
     timer() { const [key, timer] = [...timers.entries()].sort((a, b) => a[1].delay - b[1].delay)[0]; timers.delete(key); timer.callback(); },
   };
 }
@@ -63,6 +64,29 @@ test('FPS cap waits only while dirty, then returns to idle', async () => {
   const f = await fixture({ maxFps: 30 }); const s = f.sockets[0]; s.state(); s.frame(); await f.raf(0);
   s.frame(); await f.raf(1); assert.equal(f.paints, 1); assert.equal(f.timers.size, 2);
   f.timer(); await f.raf(34); assert.equal(f.paints, 2); assert.equal(f.timers.size, 1);
+  f.handle.dispose();
+});
+test('slow asynchronous paint cannot compress the next admission interval', async () => {
+  const f = await fixture({ paintDuration: paint => paint === 1 ? 100 : 0 });
+  const s = f.sockets[0]; s.state(); s.frame(); await f.raf(0);
+  assert.equal(s.sent.length, 1); // First admission occurs at 100, not RAF timestamp 0.
+  s.frame(); await f.raf(100);
+  assert.equal(f.paints, 1, 'must wait after completion, not after RAF start');
+  assert.equal(s.sent.length, 1, 'pending frame must not ACK before admission');
+  f.timer(); await f.raf(116);
+  assert.equal(f.paints, 1, 'early timer/RAF must not bypass the 60 FPS ceiling');
+  f.timer(); await f.raf(117);
+  assert.equal(f.paints, 2); assert.equal(s.sent.length, 2);
+  assert.equal(f.timers.size, 1); // Lease only: no idle frame timer.
+  f.handle.dispose();
+});
+test('RAF timeline timestamps cannot stand in for admission wall time', async () => {
+  const f = await fixture(); const s = f.sockets[0]; s.state(); s.frame();
+  await f.raf(0, 100); // Main-thread work delayed this RAF callback by 100ms.
+  s.frame(); await f.raf(117, 117);
+  assert.equal(f.paints, 2);
+  s.frame(); await f.raf(134, 130);
+  assert.equal(f.paints, 2, 'admissions must be separated even when RAF timestamps are not');
   f.handle.dispose();
 });
 test('uncredited burst disconnects instead of silently dropping a delta', async () => {

@@ -140,7 +140,10 @@ def main():
             for patch in burst: last_ack = stack.publish(patch)
             wait(lambda: cdp.evaluate('__proof.acks.at(-1)?.revision') == last_ack['revision'])
             admitted = cdp.evaluate('__proof.acks.slice(' + str(start_ack) + ')')
-            assert admitted and all(b['time'] - a['time'] >= 15 for a, b in zip(admitted, admitted[1:])), 'browser exceeded 60 FPS'
+            assert admitted, 'burst produced no admitted browser frames'
+            gaps = [b['time'] - a['time'] for a, b in zip(admitted, admitted[1:])]
+            assert all(gap >= 15 for gap in gaps), (
+                f'browser exceeded 60 FPS: {len(admitted)} admissions, minimum gap {min(gaps):.3f} ms')
             evidence['burst_admitted'] = len(admitted)
             evidence['cases'].append('burst-bounded-60FPS-latest-baseline-coherent-real-decoder')
             stack.control('pause'); wait(hidden); time.sleep(.3); assert hidden()
