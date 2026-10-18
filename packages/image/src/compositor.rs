@@ -70,14 +70,14 @@ impl KittyHostState {
             .allocation
             .unwrap_or_else(|| placement.destination.into());
         if bounds.x < 0 || bounds.y < 0 {
-            return Ok(false);
+            return self.contain_png_cropped(out, image, placement, caps, clip);
         }
         let (Ok(x), Ok(y)) = (u16::try_from(bounds.x), u16::try_from(bounds.y)) else {
             return Ok(false);
         };
         let allocation = Rect::new(x, y, bounds.width, bounds.height);
         if allocation.intersection(clip) != allocation {
-            return Ok(false);
+            return self.contain_png_cropped(out, image, placement, caps, clip);
         }
         let Some(pixels) = image
             .payload
@@ -128,6 +128,139 @@ impl KittyHostState {
             self,
         )?;
         Ok(true)
+    }
+
+    #[cfg(feature = "kitty")]
+    fn contain_png_cropped(
+        &mut self,
+        out: &mut impl Write,
+        image: &PaneImage,
+        placement: &bmux_tui::image::ImagePlacement,
+        caps: &HostImageCapabilities,
+        clip: bmux_tui::geometry::Rect,
+    ) -> std::io::Result<bool> {
+        let Some(pixels) = image
+            .payload
+            .pixels
+            .as_ref()
+            .filter(|p| p.format == crate::model::PixelFormat::Png)
+        else {
+            return Ok(false);
+        };
+        let (cw, ch) = caps.fitting_cell_size();
+        let fit = placement.pixel_rect(f64::from(cw), f64::from(ch));
+        let visible = placement.destination.intersection(clip);
+        let left = fit.x.max(f64::from(visible.x) * f64::from(cw));
+        let top = fit.y.max(f64::from(visible.y) * f64::from(ch));
+        let right = (fit.x + fit.width).min(f64::from(visible.right()) * f64::from(cw));
+        let bottom = (fit.y + fit.height).min(f64::from(visible.bottom()) * f64::from(ch));
+        if right <= left || bottom <= top {
+            return Ok(true);
+        }
+        // Kitty's source crop and cell extent are integral. Only take this path
+        // when all boundaries are exactly representable, never stretch a rounded crop.
+        let values = [
+            left / f64::from(cw),
+            top / f64::from(ch),
+            (right - left) / f64::from(cw),
+            (bottom - top) / f64::from(ch),
+            (left - fit.x) * f64::from(pixels.width) / fit.width,
+            (top - fit.y) * f64::from(pixels.height) / fit.height,
+            (right - left) * f64::from(pixels.width) / fit.width,
+            (bottom - top) * f64::from(pixels.height) / fit.height,
+        ];
+        let mut geometry = Vec::with_capacity(8);
+        for value in values {
+            if !value.is_finite()
+                || value < 0.0
+                || value > f64::from(u32::MAX)
+                || (value - value.round()).abs() > 0.000001
+            {
+                return Ok(false);
+            }
+            // Parsing avoids lossy float casts; the exact-integral check above is
+            // also the correctness gate for terminal-side aspect-preserving fitting.
+            geometry.push(
+                format!("{value:.0}")
+                    .parse::<u32>()
+                    .expect("bounded integer"),
+            );
+        }
+        let (Ok(x), Ok(y), Ok(cols), Ok(rows)) = (
+            u16::try_from(geometry[0]),
+            u16::try_from(geometry[1]),
+            u16::try_from(geometry[2]),
+            u16::try_from(geometry[3]),
+        ) else {
+            return Ok(false);
+        };
+        let host = upload_kitty_data(
+            out,
+            image,
+            crate::model::KittyFormat::Png,
+            &pixels.data,
+            pixels.width,
+            pixels.height,
+            self,
+        )?;
+        write!(out, "\x1b[{};{}H", y + 1, x + 1)?;
+        let crop = crate::model::KittySourceRect {
+            x: geometry[4],
+            y: geometry[5],
+            width: geometry[6],
+            height: geometry[7],
+        };
+        self.place_cropped(out, host, (x, y), (cols, rows), Some(crop))?;
+        Ok(true)
+    }
+
+    /// Place a retained, allocation-sized raster with an exact output-pixel crop.
+    /// No resampling is needed: every cell boundary maps to an integer raster pixel.
+    #[cfg(feature = "kitty")]
+    pub(crate) fn contained_raster(
+        &mut self,
+        out: &mut impl Write,
+        image: &PaneImage,
+        placement: &bmux_tui::image::ImagePlacement,
+        caps: &HostImageCapabilities,
+        clip: bmux_tui::geometry::Rect,
+    ) -> std::io::Result<()> {
+        let visible = placement.destination.intersection(clip);
+        if visible.is_empty() {
+            return Ok(());
+        }
+        let bounds = placement
+            .allocation
+            .unwrap_or_else(|| placement.destination.into());
+        let (cw, ch) = caps.fitting_cell_size();
+        let pixels = image.payload.pixels.as_ref().expect("contained raster");
+        let source_x = u32::try_from(i64::from(visible.x) - i64::from(bounds.x))
+            .expect("validated allocation")
+            * u32::from(cw);
+        let source_y = u32::try_from(i64::from(visible.y) - i64::from(bounds.y))
+            .expect("validated allocation")
+            * u32::from(ch);
+        let crop = crate::model::KittySourceRect {
+            x: source_x,
+            y: source_y,
+            width: u32::from(visible.width) * u32::from(cw),
+            height: u32::from(visible.height) * u32::from(ch),
+        };
+        // Adapter-owned fitted images retain optional lossless PNG wire bytes
+        // alongside RGBA pixels so cropping and non-Kitty fallback stay identical.
+        let (format, data) = image.payload.raw.as_ref().map_or(
+            (crate::model::KittyFormat::Rgba, pixels.data.as_slice()),
+            |png| (crate::model::KittyFormat::Png, png.as_slice()),
+        );
+        let host = upload_kitty_data(out, image, format, data, pixels.width, pixels.height, self)?;
+        write!(out, "\x1b[{};{}H", visible.y + 1, visible.x + 1)?;
+        self.place_cropped(
+            out,
+            host,
+            (visible.x, visible.y),
+            (visible.width, visible.height),
+            Some(crop),
+        )
     }
 
     /// Hide all compositor-owned Kitty placements while retaining reusable content.
@@ -265,6 +398,20 @@ impl KittyHostState {
         cols: u16,
         rows: u16,
     ) -> std::io::Result<()> {
+        self.place_cropped(out, host, (x, y), (cols, rows), None)
+    }
+
+    #[cfg(feature = "kitty")]
+    fn place_cropped(
+        &mut self,
+        out: &mut impl Write,
+        host: u32,
+        position: (u16, u16),
+        size: (u16, u16),
+        crop: Option<crate::model::KittySourceRect>,
+    ) -> std::io::Result<()> {
+        let (x, y) = position;
+        let (cols, rows) = size;
         let key = (host, x, y);
         if self.seen_placements.len() >= 1024 && !self.seen_placements.contains(&key) {
             return Err(std::io::Error::other(
@@ -295,10 +442,17 @@ impl KittyHostState {
             self.next_placement_id
         };
         self.seen_placements.insert(key);
+        // Kitty places relative to the current terminal cursor; the cache key
+        // alone does not position output. Apply this for cached and cropped
+        // placements too, after any upload/deletion commands.
+        write!(out, "\x1b[{};{}H", u32::from(y) + 1, u32::from(x) + 1)?;
         out.write_all(b"\x1b_")?;
-        out.write_all(&crate::codec::kitty::encode_place_with_z_and_cells(
-            host, id, 0, cols, rows,
-        ))?;
+        let command = if let Some(crop) = crop {
+            crate::codec::kitty::encode_place_with_crop(host, id, cols, rows, crop)
+        } else {
+            crate::codec::kitty::encode_place_with_z_and_cells(host, id, 0, cols, rows)
+        };
+        out.write_all(&command)?;
         out.write_all(b"\x1b\\")
     }
 
@@ -800,6 +954,27 @@ fn emit_kitty_data(
     y: u16,
     state: &mut KittyHostState,
 ) -> std::io::Result<()> {
+    let host_id = upload_kitty_data(out, image, format, data, width, height, state)?;
+    state.place(
+        out,
+        host_id,
+        x,
+        y,
+        image.cell_size.cols,
+        image.cell_size.rows,
+    )
+}
+
+#[cfg(feature = "kitty")]
+fn upload_kitty_data(
+    out: &mut impl Write,
+    image: &PaneImage,
+    format: crate::model::KittyFormat,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    state: &mut KittyHostState,
+) -> std::io::Result<u32> {
     let cost = data.len().max(
         usize::try_from(
             u64::from(width)
@@ -830,14 +1005,7 @@ fn emit_kitty_data(
             out.write_all(b"\x1b\\")?;
         }
     }
-    state.place(
-        out,
-        host_id,
-        x,
-        y,
-        image.cell_size.cols,
-        image.cell_size.rows,
-    )
+    Ok(host_id)
 }
 
 #[cfg(feature = "iterm2")]

@@ -7,6 +7,23 @@ use crate::model::{
     ImagePosition, KittyCommand, KittyDeleteSpecifier, KittyFormat, KittyPlacement, KittySourceRect,
 };
 
+/// Encode a placement with an integral source-pixel crop. Position remains
+/// cursor-owned; cell dimensions describe the cropped output, not the full image.
+#[must_use]
+pub fn encode_place_with_crop(
+    image_id: u32,
+    placement_id: u32,
+    cols: u16,
+    rows: u16,
+    crop: KittySourceRect,
+) -> Vec<u8> {
+    format!(
+        "Ga=p,i={image_id},p={placement_id},z=0,c={cols},r={rows},q=2,x={},y={},w={},h={}",
+        crop.x, crop.y, crop.width, crop.height
+    )
+    .into_bytes()
+}
+
 /// Parse a kitty graphics APC body (bytes after `G`, before ST).
 ///
 /// The body format is: `key=value,key=value,...;base64-payload`
@@ -354,6 +371,32 @@ mod tests {
         let delete_placement = String::from_utf8(encode_delete_placement(42, 43))
             .expect("kitty delete placement command should be utf8");
         assert_eq!(delete_placement, "Ga=d,d=i,i=42,p=43,q=2");
+    }
+
+    #[test]
+    fn crop_placement_round_trips_source_and_output_geometry() {
+        let crop = KittySourceRect {
+            x: 7,
+            y: 11,
+            width: 120,
+            height: 80,
+        };
+        let encoded = encode_place_with_crop(42, 9, 12, 4, crop);
+        let position = ImagePosition { row: 3, col: 5 };
+        let Some(KittyCommand::Place(placement)) = parse_command(&encoded, position) else {
+            panic!("expected placement");
+        };
+        assert_eq!((placement.image_id, placement.placement_id), (42, 9));
+        assert_eq!(
+            (placement.cell_size.cols, placement.cell_size.rows),
+            (12, 4)
+        );
+        assert_eq!(placement.position, position);
+        let decoded = placement.source_rect.unwrap();
+        assert_eq!(
+            (decoded.x, decoded.y, decoded.width, decoded.height),
+            (7, 11, 120, 80)
+        );
     }
 
     #[test]

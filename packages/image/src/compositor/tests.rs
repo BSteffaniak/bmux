@@ -46,6 +46,44 @@ fn kitty() -> HostImageCapabilities {
 }
 #[cfg(feature = "kitty")]
 #[test]
+fn kitty_placements_position_cursor_for_nonzero_cached_and_cropped_output() {
+    let mut state = KittyHostState::default();
+    state.begin_frame();
+    let mut output = Vec::new();
+    state.place(&mut output, 42, 17, 9, 4, 2).unwrap();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.starts_with("\x1b[10;18H\x1b_Ga=p,"), "{output:?}");
+
+    // Cached placements must not depend on the cursor left by text painting.
+    state.begin_frame();
+    let mut output = b"\x1b[1;1H".to_vec();
+    state.place(&mut output, 42, 17, 9, 4, 2).unwrap();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("\x1b[10;18H\x1b_Ga=p,"), "{output:?}");
+    assert!(!output.contains("a=t"));
+
+    let mut output = Vec::new();
+    state
+        .place_cropped(
+            &mut output,
+            43,
+            (23, 11),
+            (3, 2),
+            Some(crate::model::KittySourceRect {
+                x: 8,
+                y: 16,
+                width: 24,
+                height: 32,
+            }),
+        )
+        .unwrap();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.starts_with("\x1b[12;24H\x1b_Ga=p,"), "{output:?}");
+    assert!(output.contains("x=8,y=16,w=24,h=32"), "{output:?}");
+}
+
+#[cfg(feature = "kitty")]
+#[test]
 fn compositor_hide_reveal_roundtrips_through_nested_registry() {
     use crate::codec::kitty::parse_command;
     use crate::model::{ImageEvent, ImagePosition};
