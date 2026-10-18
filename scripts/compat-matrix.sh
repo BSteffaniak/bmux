@@ -20,7 +20,7 @@ Usage: ./scripts/compat-matrix.sh [--scenario fish|vim|fzf|less|all]
 Options:
   --binary <path>    Explicit coordinator-built binary (absolute regular file; skips build)
   --scenario <name>   Run a single scenario (fish, vim, fzf, less) or all (default)
-  --timeout-secs <n>  Per-case marker wait timeout in seconds (default: $BMUX_COMPAT_CASE_TIMEOUT_SECS or 12)
+  --timeout-secs <n>  Hard per-case PTY deadline in seconds (default: $BMUX_COMPAT_CASE_TIMEOUT_SECS or 12)
   -h, --help          Show this help message
 
 Examples:
@@ -221,23 +221,6 @@ doctor_trace_json() {
   "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE" terminal doctor --json --trace --trace-limit "$TRACE_LIMIT"
 }
 
-emit_quit_when_marker_or_timeout() {
-  local marker_file="$1"
-  local timeout_secs="$2"
-  local timeout_file="$3"
-  local start_secs="$SECONDS"
-
-  while [[ ! -f "$marker_file" ]]; do
-    if (( SECONDS - start_secs >= timeout_secs )); then
-      : >"$timeout_file"
-      break
-    fi
-    sleep 0.1
-  done
-
-  printf '\001d'
-}
-
 event_index() {
   local trace_json_file="$1"
   local name="$2"
@@ -339,14 +322,12 @@ run_case() {
   local vim_output_file="$WORK_DIR/${scenario}.vim.out"
   local fzf_output_file="$WORK_DIR/${scenario}.fzf.out"
   local less_input_file="$WORK_DIR/${scenario}.less.input"
-  local timeout_file="$WORK_DIR/${scenario}-${profile_name}.timeout"
 
   wrapper="$(make_shell_wrapper "$scenario" "$shell_bin")"
   write_config "$pane_term" "$wrapper"
 
   rm -f "$flow_ok_file" "$vim_output_file" "$fzf_output_file" "$less_input_file" \
     "$WORK_DIR/fzf.stderr" "$WORK_DIR/fzf.status"
-  rm -f "$timeout_file"
 
   "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE" server stop >/dev/null 2>&1 || true
   rm -rf "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME/bmux"
@@ -355,20 +336,14 @@ run_case() {
   local status="PASS"
   local notes="ok"
 
-  local -a pty_command=(script -q "$log_file" "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE")
-  if [[ "$(uname -s)" != "Darwin" ]]; then
-    local binary_command
-    printf -v binary_command '%q ' "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE"
-    pty_command=(script -q -e -c "$binary_command" "$log_file")
-  fi
-  if ! "${pty_command[@]}" < <(emit_quit_when_marker_or_timeout "$flow_ok_file" "$CASE_TIMEOUT_SECS" "$timeout_file") >"$WORK_DIR/${scenario}-${profile_name}.attach.log" 2>&1; then
+  echo "compat: $scenario / $profile_name (deadline ${CASE_TIMEOUT_SECS}s)"
+  if ! python3 "$ROOT_DIR/scripts/compat-pty.py" \
+    --marker "$flow_ok_file" --transcript "$log_file" --timeout "$CASE_TIMEOUT_SECS" \
+    -- "$BMUX_BIN" --runtime default --target local --config "$CONFIG_FILE" \
+    >"$WORK_DIR/${scenario}-${profile_name}.attach.log" 2>&1; then
     status="FAIL"
-    notes="bmux command failed"
-  fi
-
-  if [[ "$status" == "PASS" && -f "$timeout_file" ]]; then
-    status="FAIL"
-    notes="flow_marker_timeout"
+    notes="bmux command failed or PTY deadline exceeded"
+    cat "$WORK_DIR/${scenario}-${profile_name}.attach.log" >&2
   fi
 
   if [[ "$status" == "PASS" ]]; then
