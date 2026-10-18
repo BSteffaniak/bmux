@@ -15,11 +15,15 @@ CONFIGURE_RESOURCES = RELEASE_RESOURCES | {
 }
 
 
+class PolicyRejection(ValueError):
+    """A fixed, public policy reason; never include provider-controlled values."""
+
+
 def validate(plan, configure=False):
     if not isinstance(plan, dict) or not isinstance(plan.get('resource_changes', []), list):
-        raise ValueError('Invalid infrastructure plan')
+        raise PolicyRejection('Invalid infrastructure plan')
     if plan.get('errored') or plan.get('complete') is False or plan.get('deferred_changes'):
-        raise ValueError('Incomplete infrastructure plan')
+        raise PolicyRejection('Incomplete infrastructure plan')
     for resource in plan.get('resource_changes', []):
         address = resource.get('address')
         change = resource.get('change', {})
@@ -27,32 +31,32 @@ def validate(plan, configure=False):
         if not isinstance(address, str) or actions not in (
                 ['no-op'], ['read'], ['create'], ['update'], ['delete'],
                 ['create', 'delete'], ['delete', 'create']):
-            raise ValueError('Unsupported infrastructure action')
+            raise PolicyRejection('Unsupported infrastructure action')
         if (change.get('importing') and not configure) or resource.get('deposed'):
-            raise ValueError('Unexpected import or deposed resource')
+            raise PolicyRejection('Unexpected import or deposed resource')
         if address in ('cloudflare_worker.live', 'cloudflare_worker_version.live',
                        'cloudflare_workers_deployment.live', 'cloudflare_workers_route.live'):
-            raise ValueError('Legacy Worker ownership requires separate reviewed recovery')
+            raise PolicyRejection('Legacy Worker ownership requires separate reviewed recovery')
         if actions in (['no-op'], ['read']):
             continue
         if address not in CONFIGURE_RESOURCES or 'delete' in actions:
-            raise ValueError('Unexpected resource or destructive change requires separate review')
+            raise PolicyRejection('Unexpected resource or destructive change requires separate review')
         if configure:
             continue
         if address not in RELEASE_RESOURCES or actions != ['update'] or change.get('importing'):
-            raise ValueError('Infrastructure setup or drift detected; configure first')
+            raise PolicyRejection('Infrastructure setup or drift detected; configure first')
         # Ordinary releases may change the immutable image only, not authority,
         # ports, region, guest size, environment, mounts or machine ownership.
         before, after = change.get('before'), change.get('after')
         if not isinstance(before, dict) or not isinstance(after, dict):
-            raise ValueError('Missing machine configuration')
+            raise PolicyRejection('Missing machine configuration')
         unknown = change.get('after_unknown', {})
         if any(value for key, value in unknown.items() if key not in ('id', 'instance_id', 'private_ip', 'state')):
-            raise ValueError('Unknown machine configuration')
+            raise PolicyRejection('Unknown machine configuration')
         ignored = {'image', 'id', 'instance_id', 'private_ip', 'state'}
         if {k: v for k, v in before.items() if k not in ignored} != {
                 k: v for k, v in after.items() if k not in ignored}:
-            raise ValueError('Machine infrastructure drift detected')
+            raise PolicyRejection('Machine infrastructure drift detected')
     return True
 
 
@@ -63,8 +67,12 @@ def main():
     args = parser.parse_args()
     try:
         validate(json.loads(args.plan.read_text()), args.configure)
+    except PolicyRejection as exc:
+        # Only deliberately authored policy messages are public. Parsing errors,
+        # resource addresses, attribute names and provider values stay private.
+        parser.exit(2, f'Infrastructure plan rejected: {exc}. Plan values suppressed.\n')
     except (OSError, ValueError, TypeError, AttributeError):
-        parser.exit(2, 'Infrastructure plan rejected; review separate configuration. Plan values suppressed.\n')
+        parser.exit(2, 'Infrastructure plan rejected; invalid or unreadable plan. Plan values suppressed.\n')
 
 
 if __name__ == '__main__':

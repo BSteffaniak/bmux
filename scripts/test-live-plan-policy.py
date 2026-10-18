@@ -2,6 +2,10 @@
 """Offline policy regressions for the Fly-only end state."""
 import importlib.util
 from pathlib import Path
+import json
+import subprocess
+import sys
+import tempfile
 import unittest
 
 spec = importlib.util.spec_from_file_location('policy', Path(__file__).with_name('live-plan-policy.py'))
@@ -43,6 +47,37 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.validate(candidate)
         self.assertTrue(m.validate(candidate, configure=True))
+
+    def test_cli_reports_only_fixed_policy_reason(self):
+        secret = 'PRIVATE_PROVIDER_VALUE_DO_NOT_LOG'
+        candidates = [
+            (plan('fly_machine.live', ['update'],
+                  before={'image': 'old', 'env': {'token': secret}},
+                  after={'image': 'new', 'env': {'token': 'changed'}}),
+             'Machine infrastructure drift detected'),
+            (plan(secret, ['create']), 'Unexpected resource or destructive change'),
+        ]
+        for candidate, reason in candidates:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'plan.json'
+                path.write_text(json.dumps(candidate))
+                result = subprocess.run([sys.executable, str(Path(m.__file__)), str(path)],
+                                        capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(reason, result.stderr)
+            self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_cli_never_prints_parser_errors_or_plan_contents(self):
+        secret = 'PRIVATE_PROVIDER_VALUE_DO_NOT_LOG'
+        for content in ('{"' + secret + '":', '{"resource_changes": ["' + secret + '"]}'):
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'plan.json'
+                path.write_text(content)
+                result = subprocess.run([sys.executable, str(Path(m.__file__)), str(path)],
+                                        capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('invalid or unreadable plan', result.stderr)
+            self.assertNotIn(secret, result.stdout + result.stderr)
 
     def test_no_release_create_or_replacement(self):
         for actions in [['create'], ['delete'], ['delete', 'create'], ['create', 'delete']]:
