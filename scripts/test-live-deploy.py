@@ -41,7 +41,11 @@ class DeployTests(unittest.TestCase):
                         LIVE_PUBLISHER_KEY_SHA256='c' * 64, R2_STATE_ACCESS_KEY_ID='private-access', R2_STATE_SECRET_ACCESS_KEY='private-secret', TOFU_STATE_ENCRYPTION_PASSPHRASE='private-secret',
                         LIVE_STATE_BUCKET='bmux-live-production', LIVE_STATE_REGION='auto',
                         AWS_ACCESS_KEY_ID='private-access', AWS_SECRET_ACCESS_KEY='private-secret',
-                        AWS_SESSION_TOKEN='private-session')
+                        AWS_SESSION_TOKEN='private-session',
+                        GITHUB_REPOSITORY='owner/repo', GITHUB_SHA='a'*40,
+                        GITHUB_RUN_ID='100', GITHUB_RUN_ATTEMPT='1',
+                        GITHUB_OUTPUT=str(self.root / 'output'),
+                        GITHUB_STEP_SUMMARY=str(self.root / 'summary'))
         for key in ('LIVE_STATE_ACCESS_KEY_ID', 'LIVE_STATE_SECRET_ACCESS_KEY', 'LIVE_REVIEWED_IMPORTS',
                     'LIVE_APPROVE_IMPORT'):
             self.env.pop(key, None)
@@ -135,6 +139,38 @@ done
         self.assertIn('tofu plan', effects)
         for forbidden in ('state archive', 'image ', 'tofu apply', 'public smoke'):
             self.assertNotIn(forbidden, effects)
+
+    def test_approved_infrastructure_matches_preview_before_any_production_write(self):
+        self.env['TEST_PLAN'] = json.dumps({'resource_changes': [{
+            'address': 'cloudflare_r2_bucket_lifecycle.state', 'change': {
+                'actions': ['update'], 'before': {'rules': ['old']}, 'after': {'rules': ['new']}}}]})
+        result, effects = self.run_deploy('preview')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for forbidden in ('state archive', 'image ', 'tofu apply', 'imports checked'):
+            self.assertNotIn(forbidden, effects)
+        self.env['LIVE_APPROVED_PLAN'] = (self.root / 'output').read_text().strip().split('=')[1]
+        self.log.unlink()
+        result, effects = self.run_deploy('approved')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(effects.index('tofu plan'), effects.index('state archive'))
+        self.assertLess(effects.index('state archive'), effects.index('image copy'))
+        self.assertLess(effects.index('image copy'), effects.index('tofu apply'))
+        self.assertNotIn('imports checked', effects)
+
+    def test_missing_or_changed_approval_blocks_all_production_writes(self):
+        result, _ = self.run_deploy('preview')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = (self.root / 'output').read_text().strip().split('=')[1]
+        for approved in ('', receipt):
+            self.log.unlink(missing_ok=True)
+            self.env['LIVE_APPROVED_PLAN'] = approved
+            self.env['TEST_PLAN'] = json.dumps({'resource_changes': [{
+                'address': 'cloudflare_dns_record.live', 'change': {'actions': ['update']}}]})
+            result, effects = self.run_deploy('approved')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('new preview and approval', result.stderr)
+            for forbidden in ('state archive', 'image ', 'tofu apply', 'imports checked'):
+                self.assertNotIn(forbidden, effects)
 
     def test_incomplete_cutover_blocks_release_before_plan_and_archive(self):
         self.env['TEST_FAIL'] = 'release-check'

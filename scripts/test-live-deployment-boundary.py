@@ -45,6 +45,22 @@ class DeploymentBoundaryTests(unittest.TestCase):
                          'scripts/live-deploy.sh'):
             self.assertIn(required, source)
 
+    def test_master_pushes_have_no_path_filter_and_apply_consumes_preview_receipt(self):
+        release = (ROOT / '.github/workflows/live-promote.yml').read_text()
+        push = release.split('  push:\n', 1)[1].split('  workflow_dispatch:', 1)[0]
+        self.assertIn('branches: [master]', push)
+        self.assertNotIn('paths', push)
+        self.assertNotIn('\n  push:', (ROOT / '.github/workflows/docs-deploy.yml').read_text())
+        self.assertNotIn('\n  push:', (ROOT / '.github/workflows/live-validation.yml').read_text())
+        self.assertIn('  workflow_call:', (ROOT / '.github/workflows/live-validation.yml').read_text())
+        self.assertIn('plan_receipt: ${{ steps.preview.outputs.plan_receipt }}', release)
+        self.assertIn('LIVE_APPROVED_PLAN: ${{ needs.preview.outputs.plan_receipt }}', release)
+        self.assertIn('needs: [build, approve, validation, preview]', release)
+        self.assertIn('mode=approved', release)
+        preview = release.split('  preview:\n', 1)[1].split('  approve:\n', 1)[0]
+        self.assertNotIn('tofu apply', preview)
+        self.assertNotIn('--configure', preview)
+
     def test_steady_state_release_keeps_preview_and_acceptance_gates(self):
         release = (ROOT / '.github/workflows/live-promote.yml').read_text()
         validation = (ROOT / '.github/workflows/live-validation.yml').read_text()
@@ -93,7 +109,7 @@ class DeploymentBoundaryTests(unittest.TestCase):
         self.assertNotIn('bmux_docs_site', backend)
         release = (ROOT / '.github/workflows/live-promote.yml').read_text()
         self.assertIn('  push:', release)
-        self.assertIn('packages/docs-site/**', release)
+        self.assertNotIn('    paths:', release.split('  push:\n', 1)[1].split('  workflow_dispatch:', 1)[0])
 
     def test_site_builder_packages_complete_site_without_backend_tools(self):
         with tempfile.TemporaryDirectory() as directory:

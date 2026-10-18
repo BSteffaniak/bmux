@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 import json
+import os
+from unittest.mock import patch
 import subprocess
 import sys
 import tempfile
@@ -119,6 +121,76 @@ class PolicyTests(unittest.TestCase):
         for actions in (['create', 'delete'], ['delete', 'create']):
             self.assertEqual(m.public_change_summary(plan('fly_machine.live', actions)),
                              '  fly_machine.live: replace')
+
+    def test_reviewed_infrastructure_allows_known_nondestructive_changes_only(self):
+        for address in m.CONFIGURE_RESOURCES:
+            for actions in (['create'], ['update']):
+                self.assertTrue(m.validate(plan(address, actions), infrastructure=True))
+            for actions in (['delete'], ['create', 'delete'], ['delete', 'create']):
+                with self.assertRaises(ValueError):
+                    m.validate(plan(address, actions), infrastructure=True)
+        for candidate in (plan('unknown.resource', ['create']),
+                          plan('fly_app.live', ['no-op'], importing={'id': 'private'}),
+                          plan('fly_app.live', ['create'], importing={'id': 'private'})):
+            with self.assertRaises(ValueError):
+                m.validate(candidate, infrastructure=True)
+
+    def test_preview_receipt_and_summary_bind_apply_to_exact_private_plan(self):
+        secret = 'private-secret-never-publish'
+        context = dict(TOFU_STATE_ENCRYPTION_PASSPHRASE=secret, GITHUB_REPOSITORY='owner/repo',
+                       GITHUB_RUN_ID='10', GITHUB_RUN_ATTEMPT='1', GITHUB_SHA='a'*40)
+        candidate = plan('cloudflare_r2_bucket_lifecycle.state', ['update'],
+                         before={'rules': [secret]}, after={'rules': ['new-private-policy']})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'plan.json'; source.write_text(json.dumps(candidate))
+            output = root / 'output'; summary = root / 'summary'
+            env = dict(os.environ, **context, GITHUB_OUTPUT=str(output), GITHUB_STEP_SUMMARY=str(summary))
+            command = [sys.executable, str(Path(m.__file__)), str(source), '--infrastructure', '--review']
+            result = subprocess.run([*command, 'preview'], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            receipt = output.read_text().strip().removeprefix('plan_receipt=')
+            self.assertRegex(receipt, '^[0-9a-f]{64}$')
+            self.assertIn('cloudflare_r2_bucket_lifecycle.state: update', summary.read_text())
+            self.assertNotIn(secret, output.read_text() + summary.read_text() + result.stdout + result.stderr)
+            env['LIVE_APPROVED_PLAN'] = receipt
+            result = subprocess.run([*command, 'apply'], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for change in ('plan', 'candidate', 'attempt', 'missing'):
+                changed_env = dict(env)
+                if change == 'plan':
+                    altered = json.loads(json.dumps(candidate))
+                    altered['resource_changes'][0]['change']['after'] = {'rules': ['another-policy']}
+                    source.write_text(json.dumps(altered))
+                else:
+                    source.write_text(json.dumps(candidate))
+                    if change == 'candidate': changed_env['GITHUB_SHA'] = 'b'*40
+                    if change == 'attempt': changed_env['GITHUB_RUN_ATTEMPT'] = '2'
+                    if change == 'missing': changed_env.pop('LIVE_APPROVED_PLAN')
+                result = subprocess.run([*command, 'apply'], env=changed_env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('new preview and approval', result.stderr)
+                self.assertNotIn(secret, result.stdout + result.stderr)
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, 'Missing approval receipt context'):
+                m.plan_receipt(candidate)
+
+    def test_receipt_is_stable_for_json_key_order_but_binds_unknowns_and_configuration(self):
+        context = dict(TOFU_STATE_ENCRYPTION_PASSPHRASE='private', GITHUB_REPOSITORY='owner/repo',
+                       GITHUB_RUN_ID='10', GITHUB_RUN_ATTEMPT='1', GITHUB_SHA='a'*40)
+        original = plan('fly_machine.live', ['update'], before={'image': 'old'},
+                        after={'image': 'new'}, after_unknown={'instance_id': True})
+        original['timestamp'] = 'preview-time'
+        with patch.dict(os.environ, context, clear=True):
+            receipt = m.plan_receipt(original)
+            reordered = json.loads(json.dumps(original, sort_keys=True))
+            reordered['timestamp'] = 'apply-time'
+            self.assertEqual(receipt, m.plan_receipt(reordered))
+            for field in ('variables', 'configuration', 'planned_values', 'output_changes'):
+                changed = dict(original, **{field: {'private': 'changed'}})
+                self.assertNotEqual(receipt, m.plan_receipt(changed))
+            reordered['resource_changes'][0]['change']['after_unknown'] = {'region': True}
+            self.assertNotEqual(receipt, m.plan_receipt(reordered))
 
     def test_no_release_create_or_replacement(self):
         for actions in [['create'], ['delete'], ['delete', 'create'], ['create', 'delete']]:

@@ -6,43 +6,12 @@ on:
         description: 'Use the verified same-run same-SHA prebuilt site artifact'
         type: boolean
         default: false
-  push:
-    branches: [master]
-    paths:
-      - '.github/workflows/docs-deploy.yml'
-      - 'packages/docs-site/**'
-      - 'packages/web-renderer/**'
-      - 'packages/presenter/**'
-      - 'packages/presenter-runtime/**'
-      - 'packages/scene-protocol/**'
-      - 'packages/scene-protocol-render/**'
-      - 'packages/snapshot-protocol/**'
-      - 'packages/tui/**'
-      - 'packages/cli-schema/**'
-      - 'packages/config/**'
-      - 'packages/config-doc/**'
-      - 'packages/config-doc-derive/**'
-      - 'scripts/build-site-artifact.sh'
-      - 'scripts/build-web-renderer.sh'
-      - 'scripts/presenter-adapter.js'
-      - 'infra/live-terraform/tools/package*.json'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'flake.lock'
-      - 'docs/**'
-      - 'README.md'
-      - 'TESTING.md'
-      - 'packages/cli/README.md'
-      - 'packages/plugin/README.md'
-      - 'examples/native-plugin/README.md'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  # Push remains a secret-free candidate build, not an automatic publisher.
-  # Backend release publishing is ordered after backend health by the caller;
-  # Every successful ordinary backend release also calls this publisher with
-  # its same-run candidate. Explicit dispatch remains available for site repair.
+  # Push releases build the site once in the parent release workflow.
+  # Explicit dispatch remains available for independently approved site repair.
   build:
     if: ${{ !inputs.publish_candidate }}
     runs-on: ubuntu-24.04

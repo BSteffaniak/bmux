@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Fail closed on infrastructure drift; ordinary image releases and explicit non-destructive configuration."""
+"""Fail closed on unreviewed, destructive or unknown infrastructure changes."""
 import argparse
+import hashlib
+import hmac
 import json
+import os
+import re
 from pathlib import Path
 
 RELEASE_RESOURCES = {'fly_machine.live'}
@@ -19,7 +23,7 @@ class PolicyRejection(ValueError):
     """A fixed, public policy reason; never include provider-controlled values."""
 
 
-def validate(plan, configure=False):
+def validate(plan, configure=False, infrastructure=False):
     if not isinstance(plan, dict) or not isinstance(plan.get('resource_changes', []), list):
         raise PolicyRejection('Invalid infrastructure plan')
     if plan.get('errored') or plan.get('complete') is False or plan.get('deferred_changes'):
@@ -41,7 +45,7 @@ def validate(plan, configure=False):
             continue
         if address not in CONFIGURE_RESOURCES or 'delete' in actions:
             raise PolicyRejection('Unexpected resource or destructive change requires separate review')
-        if configure:
+        if configure or infrastructure:
             continue
         if address not in RELEASE_RESOURCES or actions != ['update'] or change.get('importing'):
             raise PolicyRejection('Infrastructure setup or drift detected; configure first')
@@ -92,22 +96,54 @@ def public_change_summary(plan):
     return '\n'.join('  ' + label for label in sorted(labels))
 
 
+def plan_receipt(plan):
+    """Bind review to exact proposed changes, candidate and workflow activation.
+
+    A keyed digest lets a public job output attest private plan values without
+    exposing them or enabling offline guesses of low-entropy configuration.
+    """
+    key = os.environ.get('TOFU_STATE_ENCRYPTION_PASSPHRASE', '')
+    context = {name: os.environ.get(name, '') for name in
+               ('GITHUB_REPOSITORY', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_SHA')}
+    if not key or not all(context.values()):
+        raise PolicyRejection('Missing approval receipt context')
+    payload = {'context': context, 'plan': {name: plan.get(name) for name in
+               ('resource_changes', 'output_changes', 'variables', 'planned_values', 'configuration')}}
+    encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    return hmac.new(key.encode(), b'bmux-reviewed-plan-v1\0' + encoded, hashlib.sha256).hexdigest()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('plan', type=Path)
     parser.add_argument('--configure', action='store_true')
+    parser.add_argument('--infrastructure', action='store_true', help='Known non-destructive changes, no imports')
+    parser.add_argument('--review', choices=('preview', 'apply'))
     args = parser.parse_args()
     plan = None
     try:
         plan = json.loads(args.plan.read_text())
-        validate(plan, args.configure)
+        validate(plan, args.configure, args.infrastructure)
+        if args.review:
+            receipt = plan_receipt(plan)
+            if args.review == 'apply':
+                expected = os.environ.get('LIVE_APPROVED_PLAN', '')
+                if not re.fullmatch('[0-9a-f]{64}', expected) or not hmac.compare_digest(expected, receipt):
+                    raise PolicyRejection('Plan changed after preview; a new preview and approval are required')
+            else:
+                with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                    output.write(f'plan_receipt={receipt}\n')
+                summary = public_change_summary(plan) or '  No resource changes'
+                with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+                    output.write('## Production deployment preview\n\nKnown non-destructive changes; '
+                                 'imports, deletes and replacements are blocked.\n\n```text\n' + summary + '\n```\n')
     except PolicyRejection as exc:
         # Only deliberately authored policy messages and fixed inventory labels
         # are public. Never print raw addresses, attribute names, or values.
         summary = public_change_summary(plan)
         detail = f'\nChanged resources (configuration values suppressed):\n{summary}\n' if summary else ''
         parser.exit(2, f'Infrastructure plan rejected: {exc}. Plan values suppressed.\n{detail}')
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
         parser.exit(2, 'Infrastructure plan rejected; invalid or unreadable plan. Plan values suppressed.\n')
 
 

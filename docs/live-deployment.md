@@ -13,18 +13,33 @@ infrastructure-state authorities. Do not delete or reset those records.
 
 ## Normal releases
 
-`live-promote.yml` builds the backend candidate and complete site candidate from
-the same revision without deployment credentials. `live-validation.yml` runs
-independent offline and runtime acceptance checks; there is no migration bypass.
-The release then previews the ordinary image-only infrastructure plan, obtains
-`production-approval`, deploys the backend, checks backend health, and invokes the
-sole Pages publisher with the same-run, same-SHA site candidate.
+Every push to `master` triggers `live-promote.yml`, with no path exclusions.
+All changes are conservatively treated as relevant, including shared dependencies,
+CLI code, scripts and infrastructure; there is no fragile dependency allowlist.
+It builds the backend candidate and complete site candidate from the same revision
+without deployment credentials. `live-validation.yml` runs independent offline
+and runtime acceptance checks; there is no migration bypass. Pushes do not start
+additional standalone site-build or live-validation runs: the release calls those
+workflows once. Pull requests retain independent live validation.
+The release then previews known non-destructive infrastructure changes, publishes
+a secret-safe resource/action summary, obtains `production-approval`, deploys the
+backend, checks backend health, and invokes the sole Pages publisher with the
+same-run, same-SHA site candidate. The site publisher retains its approval gate.
 
-The approved apply replans under the normal OpenTofu lock and revalidates the
-image-only policy; the preview is not an authorization to apply arbitrary drift.
-Only the relay image may change during an ordinary release. Creation, deletion,
-replacement, imports and changes to guest size, environment, mounts, ports or
-region require separate reviewed configuration. Unexpected drift stops release.
+The approved apply replans under the normal OpenTofu lock and verifies a keyed
+receipt of the previewed configuration and proposed changes, bound to the workflow
+run, attempt and revision. A changed plan fails before image upload, state archive
+writes or infrastructure apply; obtain a new preview and approval rather than
+silently approving different changes. The saved plan's state version is checked
+again by OpenTofu at apply. Raw plans and private configuration are never uploaded;
+only the opaque receipt and fixed-vocabulary summary leave the preview job.
+
+Known resource creation and updates (including relay image, size, environment and
+R2 lifecycle policy) can now follow the ordinary approval path. Deletion,
+replacement, unknown resources and imports remain blocked. First installation,
+explicit resource adoption and interrupted-state recovery still require separate
+reviewed operations. A deployment approval is not permission to destroy resources
+or replay a migration.
 
 Each candidate is inventory verified; archive checksums and revision must match
 before deployment. Image transfer preserves the OCI digest. Deployment never

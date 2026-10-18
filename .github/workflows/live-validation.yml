@@ -3,18 +3,6 @@ name: Live Validation
 on:
   pull_request:
     branches: [master]
-  push:
-    branches: [master]
-    paths:
-      - '.github/workflows/live-*.yml'
-      - '.github/workflows/docs-deploy.yml'
-      - '.github/workflows/configure-production-infra.yml'
-      - 'scripts/**'
-      - 'infra/live-*/**'
-      - 'packages/live-relay/**'
-      - 'packages/web-renderer/**'
-      - 'packages/docs-site/**'
-      - 'flake.*'
   workflow_call:
   workflow_dispatch:
 

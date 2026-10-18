@@ -3,11 +3,11 @@
 set -euo pipefail
 umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENVIRONMENT="${1:?Usage: live-deploy.sh production ARTIFACT_DIRECTORY [release|preview|check|configure]}"
+ENVIRONMENT="${1:?Usage: live-deploy.sh production ARTIFACT_DIRECTORY [release|preview|check|configure|approved]}"
 [[ "$ENVIRONMENT" == staging || "$ENVIRONMENT" == production ]] || exit 2
 ARTIFACT="$(cd "${2:?Artifact directory required}" && pwd)"
 MODE="${3:-release}"
-[[ "$MODE" == release || "$MODE" == preview || "$MODE" == check || "$MODE" == configure ]] || exit 2
+[[ "$MODE" == release || "$MODE" == preview || "$MODE" == check || "$MODE" == configure || "$MODE" == approved ]] || exit 2
 BOOTSTRAP_COMPLETION=''
 if [[ $# -gt 3 ]]; then
   [[ $# == 5 && "$MODE" == configure && "$4" == --bootstrap-completion ]] || { echo 'Bootstrap completion is only supported for explicit first configure' >&2; exit 2; }
@@ -113,13 +113,17 @@ if [[ "$MODE" != configure || -z "$BOOTSTRAP_COMPLETION" ]]; then
     exit 0
   fi
 fi
-if [[ "$MODE" != preview ]]; then
+if [[ "$MODE" != preview && "$MODE" != approved ]]; then
   python3 "$ROOT/scripts/archive-live-state.py" archive "${ADMISSION_ARGS[@]}" > "$WORK/archive-before.json"
 fi
 POLICY_ARGS=()
 [[ "$MODE" != configure ]] || POLICY_ARGS+=(--configure)
+if [[ "$MODE" == preview || "$MODE" == approved ]]; then
+  POLICY_ARGS+=(--infrastructure)
+  if [[ "$MODE" == preview ]]; then POLICY_ARGS+=(--review preview); else POLICY_ARGS+=(--review apply); fi
+fi
 # Publish the inventory-verified prebuilt OCI image only after policy accepts
-# the exact saved plan. Credentials remain in a private, transient auth file.
+# the exact saved plan and, in approved mode, matches its reviewed receipt. Credentials remain in a private, transient auth file.
 # skopeo --preserve-digests rejects any registry rewrite of image identity.
 apply_plan() {
   run_private tofu plan -json -input=false -lock-timeout=5m "$@" -out="$WORK/plan"
@@ -128,8 +132,12 @@ apply_plan() {
   fi
   python3 "$ROOT/scripts/live-plan-policy.py" "$WORK/plan.json" "${POLICY_ARGS[@]}"
   if [[ "$MODE" == preview ]]; then
-    echo 'Release plan accepted: only an immutable relay image update is permitted.'
+    echo 'Release plan accepted: known non-destructive infrastructure changes and prebuilt image reviewed.'
     exit 0
+  fi
+  if [[ "$MODE" == approved ]]; then
+    # No production writes, including archive/image upload, before receipt check.
+    python3 "$ROOT/scripts/archive-live-state.py" archive > "$WORK/archive-before.json"
   fi
   if [[ -n "$BOOTSTRAP_COMPLETION" ]]; then
     python3 "$ROOT/scripts/archive-live-state.py" begin "${ADMISSION_ARGS[@]}" > "$WORK/state-check.json"

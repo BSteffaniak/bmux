@@ -19,45 +19,6 @@ on:
         default: false
   push:
     branches: [master]
-    paths:
-      - '.github/workflows/live-promote.yml'
-      - '.github/workflows/docs-deploy.yml'
-      - '.github/workflows/live-validation.yml'
-      - 'packages/docs-site/**'
-      - 'packages/web-renderer/**'
-      - 'packages/presenter/**'
-      - 'packages/presenter-runtime/**'
-      - 'packages/scene-protocol/**'
-      - 'packages/scene-protocol-render/**'
-      - 'packages/snapshot-protocol/**'
-      - 'packages/tui/**'
-      - 'packages/cli-schema/**'
-      - 'packages/config/**'
-      - 'packages/config-doc/**'
-      - 'packages/config-doc-derive/**'
-      - 'scripts/build-site-artifact.sh'
-      - 'scripts/build-web-renderer.sh'
-      - 'scripts/presenter-adapter.js'
-      - 'docs/**'
-      - 'README.md'
-      - 'TESTING.md'
-      - 'packages/cli/README.md'
-      - 'packages/plugin/README.md'
-      - 'examples/native-plugin/README.md'
-      - 'packages/live-relay/**'
-      - 'infra/live-terraform/**'
-      - 'scripts/smoke-live-broadcast.py'
-      - 'scripts/build-live-artifact.sh'
-      - 'scripts/live-deploy.sh'
-      - 'scripts/live-plan-policy.py'
-      - 'scripts/archive-live-state.py'
-      - 'scripts/configure-live-imports.py'
-      - 'scripts/live-install.py'
-      - 'plugins/broadcast-plugin/**'
-      - 'plugins/broadcast-plugin-api/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'flake.lock'
   workflow_dispatch:
   pull_request:
     paths: ['infra/live-**', 'scripts/*live*', '.github/workflows/live-*.yml']
@@ -133,6 +94,8 @@ jobs:
           retention-days: 14
           if-no-files-found: error
   preview:
+    outputs:
+      plan_receipt: ${{ steps.preview.outputs.plan_receipt }}
     needs: [build, validation, site-build]
     if: >-
       always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
@@ -161,7 +124,8 @@ jobs:
         with:
           name: live-candidate-${{ github.sha }}
           path: ${{ runner.temp }}/live-download
-      - name: Preview the immutable image-only release (no writes)
+      - name: Preview non-destructive production changes (no writes)
+        id: preview
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
@@ -193,7 +157,7 @@ jobs:
     steps:
       - run: echo 'Approved immutable BMUX production release'
   production:
-    needs: [build, approve, validation]
+    needs: [build, approve, validation, preview]
     if: >-
       always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
       github.repository == 'BSteffaniak/bmux' && needs.build.result == 'success' && needs.approve.result == 'success' &&
@@ -239,6 +203,7 @@ jobs:
           LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
           LIVE_BOOTSTRAP_COMPLETION: ${{ inputs.bootstrap_completion || '' }}
           LIVE_BOOTSTRAP_COMPLETION_SHA256: ${{ inputs.bootstrap_completion_sha256 || '' }}
+          LIVE_APPROVED_PLAN: ${{ needs.preview.outputs.plan_receipt }}
           LIVE_CONFIGURE: ${{ inputs.configure || false }}
           LIVE_REVIEWED_IMPORTS: ${{ inputs.reviewed_imports || '{}' }}
           LIVE_APPROVE_IMPORT: ${{ inputs.approve_import || false }}
@@ -248,7 +213,7 @@ jobs:
           mkdir "$RUNNER_TEMP/live-candidate"
           tar -xzf live-candidate.tar.gz -C "$RUNNER_TEMP/live-candidate"
           test "$(cat "$RUNNER_TEMP/live-candidate/REVISION")" = "$GITHUB_SHA"
-          mode=release
+          mode=approved
           if [[ "$LIVE_CONFIGURE" == true ]]; then mode=configure; fi
           bootstrap_args=()
           if [[ -n "$LIVE_BOOTSTRAP_COMPLETION$LIVE_BOOTSTRAP_COMPLETION_SHA256" ]]; then
