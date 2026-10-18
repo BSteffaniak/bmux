@@ -22,6 +22,19 @@ class DeploymentBoundaryTests(unittest.TestCase):
                          'plugin rebuild --all-workspace-plugins'):
             self.assertIn(required, source)
 
+    def test_configure_caller_grants_nested_read_permissions_without_write_authority(self):
+        caller = (ROOT / '.github/workflows/configure-production-infra.yml').read_text()
+        permissions = caller.split('\npermissions:\n', 1)[1].split('\njobs:', 1)[0]
+        granted = dict(re.findall(r'^  ([a-z-]+): (read|write|none)\b', permissions, re.MULTILINE))
+        self.assertEqual(granted, {'contents': 'read', 'actions': 'read'})
+        for name in ('live-promote.yml', 'live-validation.yml', 'docs-deploy.yml'):
+            nested = (ROOT / '.github/workflows' / name).read_text()
+            for scope, access in re.findall(r'^ +([a-z-]+): (read|write|none)\b', nested, re.MULTILINE):
+                if access != 'none':
+                    self.assertEqual(granted.get(scope), access, f'{name}: {scope}')
+        self.assertIn('configure: true', caller)
+        self.assertIn('approve_import: ${{ inputs.approve_import }}', caller)
+
     def test_release_workflow_does_not_run_validation(self):
         source = (ROOT / '.github/workflows/live-promote.yml').read_text()
         for forbidden in ('scripts/test-', 'cargo clippy', 'cargo nextest', 'Offline infrastructure validation',

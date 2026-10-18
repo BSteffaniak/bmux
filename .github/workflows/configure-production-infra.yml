@@ -24,6 +24,7 @@ on:
         default: false
 permissions:
   contents: read
+  actions: read # Required by the reusable candidate builder's artifact inspection.
 jobs:
   configure:
     if: github.ref == 'refs/heads/master'
