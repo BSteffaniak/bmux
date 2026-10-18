@@ -2,11 +2,6 @@ name: Configure Production Infrastructure
 on:
   workflow_dispatch:
     inputs:
-      retire_worker:
-        description: 'Delete only former managed Worker resources; separate approved downtime run before Fly configure'
-        required: false
-        type: boolean
-        default: false
       bootstrap_completion:
         description: 'First configure only: exact public new-bucket completion JSON; leave empty for existing state'
         required: false
@@ -35,7 +30,6 @@ jobs:
     uses: ./.github/workflows/live-promote.yml
     with:
       configure: true
-      retire_worker: ${{ inputs.retire_worker }}
       bootstrap_completion: ${{ inputs.bootstrap_completion }}
       bootstrap_completion_sha256: ${{ inputs.bootstrap_completion_sha256 }}
       reviewed_imports: ${{ inputs.reviewed_imports }}

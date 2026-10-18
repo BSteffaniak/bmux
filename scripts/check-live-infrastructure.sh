@@ -11,4 +11,4 @@ cp "$ROOT"/infra/live-terraform/*.tf "$ROOT/infra/live-terraform/.terraform.lock
 printf 'registry.fly.io/%s@sha256:%064d\n' "${LIVE_FLY_APP:?}" 0 > "$OUTPUT/relay/IMAGE"
 git -C "$ROOT" rev-parse HEAD > "$OUTPUT/REVISION"
 (cd "$OUTPUT" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
-bash "$ROOT/scripts/live-deploy.sh" production "$OUTPUT" check-migration
+bash "$ROOT/scripts/live-deploy.sh" production "$OUTPUT" check

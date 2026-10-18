@@ -128,6 +128,27 @@ done
         self.assertIn('public smoke', effects)
         self.assertNotIn('imports checked', effects)
 
+    def test_preview_has_no_remote_writes_uploads_or_apply(self):
+        result, effects = self.run_deploy('preview')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('state release-check', effects)
+        self.assertIn('tofu plan', effects)
+        for forbidden in ('state archive', 'image ', 'tofu apply', 'public smoke'):
+            self.assertNotIn(forbidden, effects)
+
+    def test_incomplete_cutover_blocks_release_before_plan_and_archive(self):
+        self.env['TEST_FAIL'] = 'release-check'
+        result, effects = self.run_deploy()
+        self.assertNotEqual(result.returncode, 0)
+        for forbidden in ('tofu plan', 'state archive', 'image ', 'tofu apply'):
+            self.assertNotIn(forbidden, effects)
+
+    def test_removed_cutover_modes_fail_before_effects(self):
+        for mode in ('migrate', 'preview-migration', 'recover', 'preview-recovery', 'retire-worker'):
+            result, effects = self.run_deploy(mode)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(effects, '')
+
     def test_release_blocks_infrastructure_creation_before_apply(self):
         self.env['TEST_PLAN'] = json.dumps({'resource_changes': [
             {'address': 'cloudflare_pages_project.live', 'change': {'actions': ['create']}}]})

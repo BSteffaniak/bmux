@@ -32,6 +32,22 @@ class DeploymentBoundaryTests(unittest.TestCase):
                          'scripts/live-deploy.sh'):
             self.assertIn(required, source)
 
+    def test_steady_state_release_keeps_preview_and_acceptance_gates(self):
+        release = (ROOT / '.github/workflows/live-promote.yml').read_text()
+        validation = (ROOT / '.github/workflows/live-validation.yml').read_text()
+        for obsolete in ('reuse_backend', 'inputs.migrate', 'retire_worker',
+                         'migration-summary', 'skip_acceptance', '39048863096'):
+            self.assertNotIn(obsolete, release + validation)
+        self.assertIn('needs.preview.result == \'success\'', release)
+        self.assertIn('needs.validation.result == \'success\'', release)
+        preview = release.split('  preview:\n')[1].split('  approve:\n')[0]
+        self.assertIn('live-candidate/REVISION', preview)
+        self.assertIn('live-candidate" preview', preview)
+        self.assertNotIn('skopeo', preview)
+        for name in ('live-inspect.yml', 'live-recover.yml', 'live-recovery-task.yml',
+                     'live-repair-app.yml'):
+            self.assertFalse((ROOT / '.github/workflows' / name).exists())
+
     def test_reusable_validation_has_no_deploy_authority(self):
         release = (ROOT / '.github/workflows/live-promote.yml').read_text()
         validation = release.split('  validation:\n', 1)[1].split('  site-build:\n', 1)[0]

@@ -2,8 +2,8 @@ name: Deploy Docs Site
 on:
   workflow_call:
     inputs:
-      reuse_candidate:
-        description: 'Use the verified same-run same-SHA migration site artifact'
+      publish_candidate:
+        description: 'Use the verified same-run same-SHA prebuilt site artifact'
         type: boolean
         default: false
   push:
@@ -40,11 +40,11 @@ permissions:
   contents: read
 jobs:
   # Push remains a secret-free candidate build, not an automatic publisher.
-  # First-cutover publishing is ordered after backend migration by the caller;
+  # Backend release publishing is ordered after backend health by the caller;
   # Every successful ordinary backend release also calls this publisher with
   # its same-run candidate. Explicit dispatch remains available for site repair.
   build:
-    if: ${{ !inputs.reuse_candidate }}
+    if: ${{ !inputs.publish_candidate }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -70,9 +70,9 @@ jobs:
           if-no-files-found: error
   approve:
     if: >-
-      always() && (github.event_name != 'push' || inputs.reuse_candidate) && github.ref == 'refs/heads/master' &&
+      always() && (github.event_name != 'push' || inputs.publish_candidate) && github.ref == 'refs/heads/master' &&
       github.repository == 'BSteffaniak/bmux' &&
-      ((inputs.reuse_candidate && needs.build.result == 'skipped') || (!inputs.reuse_candidate && needs.build.result == 'success'))
+      ((inputs.publish_candidate && needs.build.result == 'skipped') || (!inputs.publish_candidate && needs.build.result == 'success'))
     needs: build
     runs-on: ubuntu-24.04
     environment: production-approval
@@ -80,9 +80,9 @@ jobs:
       - run: echo 'Approved immutable BMUX static site'
   deploy:
     if: >-
-      always() && (github.event_name != 'push' || inputs.reuse_candidate) && github.ref == 'refs/heads/master' &&
+      always() && (github.event_name != 'push' || inputs.publish_candidate) && github.ref == 'refs/heads/master' &&
       github.repository == 'BSteffaniak/bmux' && needs.approve.result == 'success' &&
-      ((inputs.reuse_candidate && needs.build.result == 'skipped') || (!inputs.reuse_candidate && needs.build.result == 'success'))
+      ((inputs.publish_candidate && needs.build.result == 'skipped') || (!inputs.publish_candidate && needs.build.result == 'success'))
     needs: [build, approve]
     environment: Production
     concurrency:

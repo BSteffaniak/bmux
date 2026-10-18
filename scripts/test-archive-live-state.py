@@ -68,6 +68,27 @@ class ArchiveTests(unittest.TestCase):
         self.store = Memory()
         self.addCleanup(self.store.temp.cleanup)
 
+    def test_release_check_preserves_completed_fence_and_rejects_incomplete(self):
+        store = self.store
+        store.objects[store.key] = BODY
+        self.assertIn('sha256', store.release_check())
+        marker = {'schema': 1, 'operation': '12345678-1234-1234-1234-123456789abc',
+                  'migration_digest': 'a' * 64, 'source_sha256': 'b' * 64,
+                  'phase': 'applying'}
+        store.objects[store.migration_key()] = json.dumps(marker).encode()
+        with self.assertRaises(m.StateError):
+            store.release_check()
+        marker.update(phase='completed', applying_etag='"' + 'c' * 64 + '"')
+        store.objects[store.migration_key()] = json.dumps(marker).encode()
+        before = dict(store.objects)
+        store.release_check()
+        self.assertEqual(store.objects, before)
+        self.assertFalse(any(op in ('put-object', 'delete-object') for op, _ in store.calls))
+        marker['schema'] = 99
+        store.objects[store.migration_key()] = json.dumps(marker).encode()
+        with self.assertRaises(m.StateError):
+            store.release_check()
+
     def test_envelope_rejects_plaintext_corrupt_unknown(self):
         self.assertEqual(m.encrypted(BODY), BODY)
         for value in (b'{}', b'bad', BODY.replace(b'v0', b'v1'),

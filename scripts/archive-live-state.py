@@ -4,25 +4,8 @@
 Restore uses conditional PUT and a temporary OpenTofu-compatible lock. The lock
 cooperates with OpenTofu; it is not a transaction with unrelated S3 writers.
 
-One-shot migration interface (production R2 authority only):
-  migration-check
-      Read-only stable unlocked encrypted-state identity: {state_etag, sha256}.
-      Any migration marker blocks planning, including a completed marker.
-  migration-begin --migration-digest <64 lowercase hex> --source-sha256 <64 lowercase hex>
-      Caller archives and compares the original planning hash before beginning.
-      Capture stdout to a private absolute migration-receipt.json (mode 0600).
-      Receipt fields: schema, key, authority, etag, operation, migration_digest,
-      source_sha256, binding. This is a control receipt, never infrastructure state.
-  migration-complete --migration-receipt <private absolute path>
-      Conditional applying -> completed; exact original receipt retries return
-      the same {status: completed, operation, migration_digest} without mutation.
-
-The public migration/<canonical-key>.json marker is only a replay fence. The
-canonical encrypted state remains the sole infrastructure authority. Applying
-or ambiguous failures require reviewed recovery, never automated resume,
-delete, reset, or write retries. Completed migrations use regular releases,
-not this one-shot operation. A lost begin receipt requires reviewed recovery;
-a lost completion acknowledgement may be checked with the original receipt.
+Completed cutover markers remain durable replay fences. Release checks read them
+but never reset or mutate them. Archive/restore retain canonical encrypted state.
 """
 import argparse
 import base64
@@ -77,10 +60,6 @@ def migration_object(pairs):
             raise MigrationError('migration_record_invalid')
         result[key] = value
     return result
-
-
-def migration_binding(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
 def bounded_run(args, env, cwd=None, timeout=120, limit=32 * 1024 * 1024):
@@ -447,19 +426,6 @@ class Store:
             save_private(admission, dict(schema=1, marker=marker, etag=value['etag']), replace=True)
         return {'initial_operation': value['marker']['receipt']['operation']}
 
-    def migration_authority(self):
-        # This control record is never an OpenTofu state or bootstrap admission.
-        expected_endpoint = 'https://' + os.environ.get('CLOUDFLARE_ACCOUNT_ID', '') + '.r2.cloudflarestorage.com'
-        if (os.environ.get('LIVE_ENVIRONMENT') != 'production'
-                or self.key != 'bmux/live/production/terraform.tfstate'
-                or self.config.get('key') != self.key
-                or self.config.get('bucket') != os.environ.get('LIVE_STATE_BUCKET')
-                or self.config.get('endpoint') != expected_endpoint
-                or not re.fullmatch(r'https://[a-f0-9]{32}\.r2\.cloudflarestorage\.com', expected_endpoint)
-                or self.config.get('region') != 'auto' or self.config.get('use_lockfile') is not True):
-            raise MigrationError('migration_authority_rejected')
-        return migration_binding({k: self.config[k] for k in ('bucket', 'endpoint', 'key', 'region', 'use_lockfile')})
-
     def migration_key(self):
         return 'migration/' + self.key + '.json'
 
@@ -491,94 +457,17 @@ class Store:
             raise MigrationError('migration_marker_invalid')
         return marker, etag
 
-    def migration_blocked(self, marker, digest=None, source=None):
-        value, _ = marker
-        if digest is not None and (value['migration_digest'] != digest or value['source_sha256'] != source):
-            raise MigrationError('migration_identity_conflict')
-        raise MigrationError('migration_existing_' + value['phase'])
-
-    def migration_state(self):
+    def release_check(self):
         self.unlocked()
         body, etag = self.get(self.key)
-        if not migration_etag(etag):
-            raise MigrationError('migration_state_invalid')
-        again, _ = self.get(self.key, etag)
+        marker = self.migration_marker()
+        if marker and marker[0]['phase'] != 'completed':
+            raise StateError('Incomplete cutover requires reviewed state recovery')
         self.unlocked()
-        if again != body:
-            raise MigrationError('migration_state_changed')
+        self.get(self.key, etag)
+        if self.migration_marker() != marker:
+            raise StateError('Cutover fence changed during inspection')
         return {'state_etag': etag, 'sha256': hashlib.sha256(body).hexdigest()}
-
-    def migration_check(self):
-        self.migration_authority()
-        marker = self.migration_marker()
-        if marker is not None:
-            self.migration_blocked(marker)
-        result = self.migration_state()
-        # Detect a concurrent begin during the stable encrypted-state reads.
-        marker = self.migration_marker()
-        if marker is not None:
-            self.migration_blocked(marker)
-        return result
-
-    def migration_begin(self, digest, source):
-        authority = self.migration_authority()
-        if not migration_hash(digest) or not migration_hash(source):
-            raise MigrationError('migration_identity_invalid')
-        marker = self.migration_marker()
-        if marker is not None:
-            self.migration_blocked(marker, digest, source)
-        current = self.migration_state()
-        if current['sha256'] != source:
-            raise MigrationError('migration_source_changed')
-        marker = self.migration_marker()
-        if marker is not None:
-            self.migration_blocked(marker, digest, source)
-        value = dict(schema=1, operation=str(uuid.uuid4()), migration_digest=digest,
-                     source_sha256=source, phase='applying')
-        # No retry, delete, or cleanup: an unacknowledged write fences recovery.
-        response = self.put(self.migration_key(), json.dumps(value, sort_keys=True).encode(), '--if-none-match', '*')
-        etag = response.get('ETag')
-        if not migration_etag(etag):
-            raise MigrationError('migration_write_ambiguous')
-        if self.migration_marker() != (value, etag):
-            raise MigrationError('migration_write_ambiguous')
-        receipt = dict(schema=1, key=self.migration_key(), authority=authority, etag=etag,
-                       operation=value['operation'], migration_digest=digest, source_sha256=source)
-        receipt['binding'] = migration_binding(receipt)
-        return receipt
-
-    def migration_complete(self, path):
-        authority = self.migration_authority()
-        if not path.is_absolute():
-            raise MigrationError('migration_receipt_invalid')
-        receipt = read_private(path, object_pairs_hook=migration_object)
-        fields = {'schema', 'key', 'authority', 'etag', 'operation', 'migration_digest', 'source_sha256', 'binding'}
-        if (not isinstance(receipt, dict) or set(receipt) != fields
-                or type(receipt.get('schema')) is not int or receipt['schema'] != 1
-                or receipt['key'] != self.migration_key() or receipt['authority'] != authority
-                or not migration_etag(receipt['etag']) or not migration_hash(receipt['migration_digest'])
-                or not migration_hash(receipt['source_sha256'])
-                or receipt['binding'] != migration_binding({k: v for k, v in receipt.items() if k != 'binding'})):
-            raise MigrationError('migration_receipt_invalid')
-        remote = self.migration_marker()
-        if remote is None:
-            raise MigrationError('migration_receipt_conflict')
-        marker, etag = remote
-        expected = dict(schema=1, operation=receipt['operation'], migration_digest=receipt['migration_digest'],
-                        source_sha256=receipt['source_sha256'], phase='applying')
-        completed = dict(expected, phase='completed', applying_etag=receipt['etag'])
-        # Validate original receipt identity BEFORE accepting a completed retry.
-        if marker == completed:
-            self.migration_state()
-            return {'status': 'completed', 'operation': marker['operation'], 'migration_digest': marker['migration_digest']}
-        if marker != expected or etag != receipt['etag']:
-            raise MigrationError('migration_receipt_conflict')
-        self.migration_state()  # Encrypted current authority, never saved plaintext.
-        response = self.put(self.migration_key(), json.dumps(completed, sort_keys=True).encode(), '--if-match', etag)
-        new_etag = response.get('ETag')
-        if not migration_etag(new_etag) or self.migration_marker() != (completed, new_etag):
-            raise MigrationError('migration_write_ambiguous')
-        return {'status': 'completed', 'operation': marker['operation'], 'migration_digest': marker['migration_digest']}
 
     def archive(self):
         self.unlocked()
@@ -619,10 +508,7 @@ class Store:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=('check', 'archive', 'list', 'restore', 'admit', 'begin',
-                                         'migration-check', 'migration-begin', 'migration-complete'))
-    parser.add_argument('--migration-digest')
-    parser.add_argument('--source-sha256')
-    parser.add_argument('--migration-receipt', type=Path)
+                                         'release-check'))
     parser.add_argument('--bootstrap-completion', type=Path)
     parser.add_argument('--admission-file', type=Path)
     parser.add_argument('--archive-key')
@@ -635,21 +521,11 @@ def main():
         parser.error('Admission requires --bootstrap-completion and --admission-file')
     if args.action == 'begin' and not args.admission_file:
         parser.error('First apply requires --admission-file')
-    if args.action == 'migration-begin' and not all((args.migration_digest, args.source_sha256)):
-        parser.error('Migration begin requires --migration-digest and --source-sha256')
-    if args.action == 'migration-complete' and not args.migration_receipt:
-        parser.error('Migration complete requires --migration-receipt')
-    if args.action.startswith('migration-') and (args.admission_file or args.bootstrap_completion):
-        parser.error('Migration never accepts bootstrap admission')
     os.umask(0o077)
     store = Store()
     try:
-        if args.action == 'migration-check':
-            result = store.migration_check()
-        elif args.action == 'migration-begin':
-            result = store.migration_begin(args.migration_digest, args.source_sha256)
-        elif args.action == 'migration-complete':
-            result = store.migration_complete(args.migration_receipt)
+        if args.action == 'release-check':
+            result = store.release_check()
         elif args.action == 'admit':
             result = store.admit(args.bootstrap_completion, args.admission_file)
         elif args.action == 'begin':
@@ -678,9 +554,5 @@ if __name__ == '__main__':
     try:
         main()
     except (StateError, OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired, urllib.error.URLError) as error:
-        if len(sys.argv) > 1 and sys.argv[1].startswith('migration-'):
-            status = error.status if isinstance(error, MigrationError) else 'migration_rejected'
-            print(json.dumps({'status': status, 'recovery': 'Stop; reviewed recovery required. Completed migrations use regular releases. Never delete or reset the fence automatically.'}), file=sys.stderr)
-        else:
-            print('R2 encrypted state operation rejected; check selected authority, encryption and exact ETags; provider output suppressed', file=sys.stderr)
+        print('R2 encrypted state operation rejected; check selected authority, encryption and exact ETags; provider output suppressed', file=sys.stderr)
         sys.exit(2)

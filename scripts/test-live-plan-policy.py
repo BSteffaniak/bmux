@@ -27,13 +27,22 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError): m.validate(plan(address, ['delete']), configure=True)
         with self.assertRaises(ValueError): m.validate(plan('other.resource', ['create']), configure=True)
 
-    def test_worker_retirement_separate_and_bounded(self):
-        for address in m.WORKER_RESOURCES:
-            with self.assertRaises(ValueError): m.validate(plan(address, ['delete']), configure=True)
-            self.assertTrue(m.validate(plan(address, ['delete']), configure=True, retire_worker=True))
-        for address in ['cloudflare_r2_bucket.state', 'fly_volume.authority', 'cloudflare_pages_project.live']:
-            with self.assertRaises(ValueError): m.validate(plan(address, ['delete']), configure=True, retire_worker=True)
-        with self.assertRaises(ValueError): m.validate({}, retire_worker=True)
+    def test_legacy_worker_mutations_are_never_admitted(self):
+        for address in ('cloudflare_worker.live', 'cloudflare_worker_version.live',
+                        'cloudflare_workers_deployment.live', 'cloudflare_workers_route.live'):
+            for actions in (['no-op'], ['create'], ['update'], ['delete']):
+                for configure in (False, True):
+                    with self.assertRaises(ValueError):
+                        m.validate(plan(address, actions), configure=configure)
+
+    def test_unknown_plan_and_imports_fail_closed(self):
+        for extra in ({'errored': True}, {'complete': False}, {'deferred_changes': [{}]}):
+            with self.assertRaises(ValueError):
+                m.validate(dict(resource_changes=[], **extra))
+        candidate = plan('fly_machine.live', ['no-op'], importing={'id': 'unexpected'})
+        with self.assertRaises(ValueError):
+            m.validate(candidate)
+        self.assertTrue(m.validate(candidate, configure=True))
 
     def test_no_release_create_or_replacement(self):
         for actions in [['create'], ['delete'], ['delete', 'create'], ['create', 'delete']]:

@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""Fail closed on infrastructure drift; explicit, bounded Worker retirement only."""
+"""Fail closed on infrastructure drift; ordinary image releases and explicit non-destructive configuration."""
 import argparse
 import json
 from pathlib import Path
 
-WORKER_RESOURCES = {
-    'cloudflare_worker.live',
-    'cloudflare_worker_version.live',
-    'cloudflare_workers_deployment.live',
-    'cloudflare_workers_route.live',
-}
 RELEASE_RESOURCES = {'fly_machine.live'}
 CONFIGURE_RESOURCES = RELEASE_RESOURCES | {
     'fly_app.live', 'fly_volume.authority', 'fly_ip.v4', 'fly_ip.v6',
@@ -21,11 +15,11 @@ CONFIGURE_RESOURCES = RELEASE_RESOURCES | {
 }
 
 
-def validate(plan, configure=False, retire_worker=False):
-    if retire_worker and not configure:
-        raise ValueError('Worker retirement is configure-only')
+def validate(plan, configure=False):
     if not isinstance(plan, dict) or not isinstance(plan.get('resource_changes', []), list):
         raise ValueError('Invalid infrastructure plan')
+    if plan.get('errored') or plan.get('complete') is False or plan.get('deferred_changes'):
+        raise ValueError('Incomplete infrastructure plan')
     for resource in plan.get('resource_changes', []):
         address = resource.get('address')
         change = resource.get('change', {})
@@ -34,11 +28,12 @@ def validate(plan, configure=False, retire_worker=False):
                 ['no-op'], ['read'], ['create'], ['update'], ['delete'],
                 ['create', 'delete'], ['delete', 'create']):
             raise ValueError('Unsupported infrastructure action')
+        if (change.get('importing') and not configure) or resource.get('deposed'):
+            raise ValueError('Unexpected import or deposed resource')
+        if address in ('cloudflare_worker.live', 'cloudflare_worker_version.live',
+                       'cloudflare_workers_deployment.live', 'cloudflare_workers_route.live'):
+            raise ValueError('Legacy Worker ownership requires separate reviewed recovery')
         if actions in (['no-op'], ['read']):
-            continue
-        if retire_worker:
-            if address not in WORKER_RESOURCES or actions != ['delete'] or change.get('importing'):
-                raise ValueError('Retirement may delete only the four former managed Worker resources')
             continue
         if address not in CONFIGURE_RESOURCES or 'delete' in actions:
             raise ValueError('Unexpected resource or destructive change requires separate review')
@@ -65,12 +60,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('plan', type=Path)
     parser.add_argument('--configure', action='store_true')
-    parser.add_argument('--retire-worker', action='store_true')
     args = parser.parse_args()
     try:
-        validate(json.loads(args.plan.read_text()), args.configure, args.retire_worker)
+        validate(json.loads(args.plan.read_text()), args.configure)
     except (OSError, ValueError, TypeError, AttributeError):
-        parser.exit(2, 'Infrastructure plan rejected; review separate configuration or retirement. Plan values suppressed.\n')
+        parser.exit(2, 'Infrastructure plan rejected; review separate configuration. Plan values suppressed.\n')
 
 
 if __name__ == '__main__':

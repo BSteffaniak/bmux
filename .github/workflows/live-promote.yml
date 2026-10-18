@@ -2,17 +2,7 @@ name: Live production release
 on:
   workflow_call:
     inputs:
-      reuse_backend:
-        description: 'Temporary migration: reuse backend image/native bundle from run 39048863096'
-        type: boolean
-        default: false
-      migrate:
-        type: boolean
-        default: false
       configure:
-        type: boolean
-        default: false
-      retire_worker:
         type: boolean
         default: false
       bootstrap_completion:
@@ -56,7 +46,6 @@ on:
       - 'examples/native-plugin/README.md'
       - 'packages/live-relay/**'
       - 'infra/live-terraform/**'
-      - 'scripts/live-migration-plan.py'
       - 'scripts/smoke-live-broadcast.py'
       - 'scripts/build-live-artifact.sh'
       - 'scripts/live-deploy.sh'
@@ -70,54 +59,13 @@ on:
       - 'Cargo.lock'
       - 'flake.lock'
   workflow_dispatch:
-    inputs:
-      reuse_backend:
-        description: 'Temporary migration: reuse backend image/native bundle from run 39048863096'
-        type: boolean
-        default: false
-      migrate:
-        description: 'Preview and approve the one-way Worker to Fly migration'
-        type: boolean
-        default: false
   pull_request:
     paths: ['infra/live-**', 'scripts/*live*', '.github/workflows/live-*.yml']
 permissions:
   contents: read
 jobs:
-  infrastructure-check:
-    if: inputs.migrate && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    environment: Production
-    concurrency:
-      group: bmux-production-infrastructure
-      cancel-in-progress: false
-    env:
-      LIVE_STATE_REGION: auto
-      R2_STATE_ACCESS_KEY_ID: ${{ secrets.R2_STATE_ACCESS_KEY_ID }}
-      R2_STATE_SECRET_ACCESS_KEY: ${{ secrets.R2_STATE_SECRET_ACCESS_KEY }}
-      TOFU_STATE_ENCRYPTION_PASSPHRASE: ${{ secrets.TOFU_STATE_ENCRYPTION_PASSPHRASE }}
-      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-      LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
-      LIVE_FLY_ORG: ${{ vars.LIVE_FLY_ORG }}
-      LIVE_FLY_REGION: ${{ vars.LIVE_FLY_REGION }}
-      LIVE_METRICS_KEY_SHA256: ${{ secrets.LIVE_METRICS_KEY_SHA256 }}
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
-      LIVE_HOSTNAME: ${{ secrets.LIVE_HOSTNAME }}
-      LIVE_PAGES_PROJECT: ${{ secrets.LIVE_PAGES_PROJECT }}
-      LIVE_PUBLISHER_KEY_SHA256: ${{ secrets.LIVE_PUBLISHER_KEY_SHA256 }}
-      LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f
-        with: {tofu_version: '1.10.9', tofu_wrapper: false}
-      - name: Check authenticated infrastructure before expensive builds (no apply)
-        run: bash scripts/check-live-infrastructure.sh "$RUNNER_TEMP/live-infrastructure-check"
   build:
-    needs: [infrastructure-check]
-    if: ${{ !cancelled() && (!inputs.migrate || needs.infrastructure-check.result == 'success') }}
+    if: github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
     permissions:
       contents: read
       actions: read
@@ -126,31 +74,12 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with: {fetch-depth: 0}
-      - name: Validate temporary reuse scope
-        if: inputs.reuse_backend
-        env:
-          MIGRATE: ${{ inputs.migrate || false }}
-        run: test "$MIGRATE" = true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        if: inputs.reuse_backend && inputs.migrate
-        with:
-          github-token: ${{ github.token }}
-          run-id: 39048863096
-          name: live-candidate-e84e1b69a4f59e8174e5a4ac8aa7af18f207d480
-          path: ${{ runner.temp }}/backend-source
-      - name: Repackage pinned backend with current infrastructure
-        if: inputs.reuse_backend && inputs.migrate
-        run: python3 scripts/reuse-live-backend.py "$RUNNER_TEMP/backend-source" "$RUNNER_TEMP/live-candidate"
       - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd # v31.9.1
-        if: ${{ !inputs.reuse_backend }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: ${{ !inputs.reuse_backend }}
         with: {node-version: '22.16.0'}
       - name: Select OCI-capable isolated BuildKit builder
-        if: ${{ !inputs.reuse_backend }}
         run: docker buildx create --use --driver docker-container
       - name: Build one immutable candidate without deployment secrets
-        if: ${{ !inputs.reuse_backend }}
         env:
           LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
         run: bash scripts/dev.sh bash scripts/build-live-artifact.sh "$RUNNER_TEMP/live-candidate"
@@ -170,17 +99,10 @@ jobs:
   validation:
     if: github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
     uses: ./.github/workflows/live-validation.yml
-    with:
-      # Explicit one-time migration prioritizes recovery. Standalone CI and
-      # ordinary releases retain the complete runtime acceptance suite.
-      skip_acceptance: ${{ inputs.migrate || false }}
     permissions:
       contents: read
   site-build:
-    needs: [infrastructure-check]
-    if: >-
-      !cancelled() && (!inputs.migrate || needs.infrastructure-check.result == 'success') &&
-      (!inputs.configure && !inputs.retire_worker) && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    if: ${{ !inputs.configure && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux' }}
     permissions:
       contents: read
       actions: read
@@ -189,28 +111,10 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with: {fetch-depth: 0}
-      - name: Validate temporary site reuse scope
-        if: inputs.reuse_backend
-        env:
-          MIGRATE: ${{ inputs.migrate || false }}
-        run: test "$MIGRATE" = true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        if: inputs.reuse_backend && inputs.migrate
-        with:
-          github-token: ${{ github.token }}
-          run-id: 39048863096
-          name: site-candidate-e84e1b69a4f59e8174e5a4ac8aa7af18f207d480
-          path: ${{ runner.temp }}/site-source
-      - name: Repackage pinned site without compilation
-        if: inputs.reuse_backend && inputs.migrate
-        run: python3 scripts/reuse-live-backend.py "$RUNNER_TEMP/site-source" "$RUNNER_TEMP/site-candidate" site
       - uses: cachix/install-nix-action@2126ae7fc54c9df00dd18f7f18754393182c73cd
-        if: ${{ !inputs.reuse_backend }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        if: ${{ !inputs.reuse_backend }}
         with: {node-version: '22.16.0'}
       - name: Build same-revision complete site without deployment secrets
-        if: ${{ !inputs.reuse_backend }}
         env:
           BMUX_LIVE_ENDPOINT_ORIGIN: https://live.bmux.dev
         run: bash scripts/dev.sh bash scripts/build-site-artifact.sh "$RUNNER_TEMP/site-candidate"
@@ -229,10 +133,11 @@ jobs:
           retention-days: 14
           if-no-files-found: error
   preview:
-    if: inputs.migrate && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
-    needs: [build, site-build, validation]
-    # Production credentials are required for authenticated read-only canonical
-    # state/plan inspection. The explicit production-approval job follows this.
+    needs: [build, validation, site-build]
+    if: >-
+      always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
+      github.repository == 'BSteffaniak/bmux' && needs.build.result == 'success' && !inputs.configure &&
+      needs.validation.result == 'success' && needs.site-build.result == 'success'
     environment: Production
     concurrency:
       group: bmux-production-infrastructure
@@ -241,8 +146,6 @@ jobs:
       contents: read
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    outputs:
-      migration_digest: ${{ steps.preview.outputs.migration_digest }}
     env:
       LIVE_STATE_REGION: auto
       R2_STATE_ACCESS_KEY_ID: ${{ secrets.R2_STATE_ACCESS_KEY_ID }}
@@ -258,8 +161,7 @@ jobs:
         with:
           name: live-candidate-${{ github.sha }}
           path: ${{ runner.temp }}/live-download
-      - name: Preview canonical migration (no apply, push, import or bootstrap)
-        id: preview
+      - name: Preview the immutable image-only release (no writes)
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           LIVE_FLY_APP: ${{ vars.LIVE_FLY_APP }}
@@ -273,42 +175,29 @@ jobs:
           LIVE_PAGES_PROJECT: ${{ secrets.LIVE_PAGES_PROJECT }}
           LIVE_PUBLISHER_KEY_SHA256: ${{ secrets.LIVE_PUBLISHER_KEY_SHA256 }}
           LIVE_STATE_BUCKET: ${{ secrets.LIVE_STATE_BUCKET }}
-          LIVE_CONFIGURE: ${{ inputs.configure || false }}
-          LIVE_RETIRE_REQUESTED: ${{ inputs.retire_worker || false }}
-          LIVE_BOOTSTRAP_COMPLETION: ${{ inputs.bootstrap_completion || '' }}
-          LIVE_BOOTSTRAP_COMPLETION_SHA256: ${{ inputs.bootstrap_completion_sha256 || '' }}
-          LIVE_REVIEWED_IMPORTS: ${{ inputs.reviewed_imports || '{}' }}
-          LIVE_APPROVE_IMPORT: ${{ inputs.approve_import || false }}
         run: |
-          set -euo pipefail
-          test "$LIVE_CONFIGURE" = false
-          test "$LIVE_RETIRE_REQUESTED" = false
-          test -z "$LIVE_BOOTSTRAP_COMPLETION$LIVE_BOOTSTRAP_COMPLETION_SHA256"
-          test "$LIVE_REVIEWED_IMPORTS" = '{}'
-          test "$LIVE_APPROVE_IMPORT" = false
           cd "$RUNNER_TEMP/live-download"
           sha256sum -c live-candidate.tar.gz.sha256
           mkdir "$RUNNER_TEMP/live-candidate"
           tar -xzf live-candidate.tar.gz -C "$RUNNER_TEMP/live-candidate"
           test "$(cat "$RUNNER_TEMP/live-candidate/REVISION")" = "$GITHUB_SHA"
-          bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" production "$RUNNER_TEMP/live-candidate" preview-migration
+          bash "$GITHUB_WORKSPACE/scripts/live-deploy.sh" production "$RUNNER_TEMP/live-candidate" preview
   approve:
     if: >-
       always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
       github.repository == 'BSteffaniak/bmux' && needs.build.result == 'success' && needs.validation.result == 'success' &&
-      ((inputs.configure || inputs.retire_worker) || needs.site-build.result == 'success') &&
-      (!inputs.migrate || needs.preview.result == 'success')
-    needs: [build, preview, validation, site-build]
+      (inputs.configure || (needs.site-build.result == 'success' && needs.preview.result == 'success'))
+    needs: [build, validation, site-build, preview]
     runs-on: ubuntu-24.04
     environment: production-approval
     steps:
       - run: echo 'Approved immutable BMUX production release'
   production:
-    needs: [build, approve, preview, validation]
+    needs: [build, approve, validation]
     if: >-
       always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/master' &&
       github.repository == 'BSteffaniak/bmux' && needs.build.result == 'success' && needs.approve.result == 'success' &&
-      needs.validation.result == 'success' && (!inputs.migrate || needs.preview.result == 'success')
+      needs.validation.result == 'success'
     environment: Production
     concurrency:
       group: bmux-production-infrastructure
@@ -341,10 +230,6 @@ jobs:
           LIVE_FLY_ORG: ${{ vars.LIVE_FLY_ORG }}
           LIVE_FLY_REGION: ${{ vars.LIVE_FLY_REGION }}
           LIVE_METRICS_KEY_SHA256: ${{ secrets.LIVE_METRICS_KEY_SHA256 }}
-          LIVE_RETIRE_WORKER: ${{ (inputs.retire_worker || inputs.migrate) && 'retire-bmux-live-worker' || '' }}
-          LIVE_MIGRATE: ${{ inputs.migrate || false }}
-          LIVE_MIGRATION_DIGEST: ${{ needs.preview.outputs.migration_digest }}
-          LIVE_RETIRE_REQUESTED: ${{ inputs.retire_worker }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
@@ -365,18 +250,6 @@ jobs:
           test "$(cat "$RUNNER_TEMP/live-candidate/REVISION")" = "$GITHUB_SHA"
           mode=release
           if [[ "$LIVE_CONFIGURE" == true ]]; then mode=configure; fi
-          if [[ "$LIVE_RETIRE_REQUESTED" == true ]]; then
-            test "$mode" = configure
-            mode=retire-worker
-          fi
-          if [[ "$LIVE_MIGRATE" == true ]]; then
-            test "$mode" = release
-            test -z "$LIVE_BOOTSTRAP_COMPLETION$LIVE_BOOTSTRAP_COMPLETION_SHA256"
-            test "$LIVE_REVIEWED_IMPORTS" = '{}'
-            test "$LIVE_APPROVE_IMPORT" = false
-            [[ "$LIVE_MIGRATION_DIGEST" =~ ^[a-f0-9]{64}$ ]]
-            mode=migrate
-          fi
           bootstrap_args=()
           if [[ -n "$LIVE_BOOTSTRAP_COMPLETION$LIVE_BOOTSTRAP_COMPLETION_SHA256" ]]; then
             test "$mode" = configure
@@ -405,28 +278,9 @@ jobs:
     needs: [production, site-build]
     if: >-
       always() && needs.production.result == 'success' && needs.site-build.result == 'success' &&
-      (!inputs.configure && !inputs.retire_worker) && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+      !inputs.configure && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
     # No caller lock; only the reusable publisher owns the Pages lock.
     uses: ./.github/workflows/docs-deploy.yml
     with:
-      reuse_candidate: true
+      publish_candidate: true
     secrets: inherit
-  migration-summary:
-    needs: [production, site]
-    if: inputs.migrate && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - name: Public read-only backend and site smoke
-        run: |
-          set -euo pipefail
-          # Fixed public endpoints; this job receives no deployment credentials.
-          python3 scripts/smoke-live-broadcast.py --url https://bmux.dev --relay-url https://live.bmux.dev
-          {
-            echo '### Migration public smoke'
-            echo "Revision: $GITHUB_SHA"
-            echo 'Backend and complete site public read-only smoke passed.'
-            echo 'This is not proof of a live interactive native/browser broadcast.'
-            echo 'A partial migration failure must be inspected; do not automatically retry.'
-          } >> "$GITHUB_STEP_SUMMARY"

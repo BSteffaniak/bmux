@@ -4,7 +4,7 @@ Live is opt-in, output-only publication of one explicitly selected authoritative
 retained presentation. Local rendering remains independent. The audience cannot
 type, navigate, resize the source, or access private controller state. See the
 [Rust streaming protocol](live-stream-protocol.md) and
-[Fly deployment and migration](live-deployment.md).
+[Fly deployment and recovery](live-deployment.md).
 
 ## Native control interface
 
@@ -127,6 +127,6 @@ tofu -chdir=infra/live-terraform fmt -check
 tofu -chdir=infra/live-terraform validate
 ```
 
-Approval, credentials, immutable image publication, former Worker retirement and
+Approval, credentials, immutable image publication and
 canonical encrypted R2 state recovery remain separate operator workflows. See
 the deployment document before any production action.

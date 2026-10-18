@@ -16,11 +16,6 @@ on:
       - 'packages/docs-site/**'
       - 'flake.*'
   workflow_call:
-    inputs:
-      skip_acceptance:
-        description: 'Emergency migration only: retain offline safety checks without runtime acceptance'
-        type: boolean
-        default: false
   workflow_dispatch:
 
 permissions:
@@ -49,7 +44,6 @@ jobs:
           python3 scripts/test-live-state-provision.py
           python3 scripts/test-live-imports.py
           python3 scripts/test-live-build-artifact.py
-          python3 scripts/test-reuse-live-backend.py
           python3 scripts/test-live-fly.py
           python3 scripts/test-live-plan-policy.py
           python3 scripts/test-live-deploy.py
@@ -58,17 +52,10 @@ jobs:
           python3 scripts/test-live-state.py
           python3 scripts/test-archive-live-state.py
           python3 scripts/test-live-smoke.py
-          python3 scripts/test-live-migration-workflow.py
-          python3 scripts/test-live-migration-plan.py
-          python3 scripts/test-live-migration-deploy.py
-          python3 scripts/test-live-migration-fence.py
-          python3 scripts/test-live-migration-recovery.py
-          python3 scripts/test-inspect-live-migration.py
           python3 scripts/test-live-guided-setup.py
           python3 scripts/test-live-deployment-boundary.py
           # Rust relay tests belong to workspace validation, not the retired runtime.
   acceptance:
-    if: ${{ !inputs.skip_acceptance }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
