@@ -25,8 +25,42 @@ on:
 permissions:
   contents: read
 jobs:
+  changes:
+    name: Check release relevance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      relevant: ${{ steps.select.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {fetch-depth: 0}
+      - name: Analyze affected packages with Clippier
+        id: affected
+        uses: MoosicBox/MoosicBox/.github/actions/clippier@da5e373bf68f141a8689b3b51fb9d8a07062d3e6
+        with:
+          clippier-version: da5e373bf68f141a8689b3b51fb9d8a07062d3e6
+          command: affected-packages
+          workspace-path: .
+          git-strategy: auto
+      - name: Check non-package inputs over Clippier's selected range
+        id: inputs
+        env:
+          BASE: ${{ steps.affected.outputs.git-base }}
+          HEAD: ${{ steps.affected.outputs.git-head }}
+        run: bash scripts/live-release-changes.sh inputs
+      - name: Select release artifact roots
+        id: select
+        env:
+          FORCE: ${{ steps.inputs.outputs.force }}
+          ANALYZE: ${{ steps.inputs.outputs.analyze }}
+          CLIPPIER_RESULT: ${{ steps.affected.outputs.raw-output }}
+        run: bash scripts/live-release-changes.sh result
   build:
-    if: github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true' && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
     permissions:
       contents: read
       actions: read
@@ -58,12 +92,14 @@ jobs:
           retention-days: 14
           if-no-files-found: error
   validation:
-    if: github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true' && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux'
     uses: ./.github/workflows/live-validation.yml
     permissions:
       contents: read
   site-build:
-    if: ${{ !inputs.configure && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.relevant == 'true' && !inputs.configure && github.ref == 'refs/heads/master' && github.repository == 'BSteffaniak/bmux' }}
     permissions:
       contents: read
       actions: read

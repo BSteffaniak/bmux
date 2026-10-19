@@ -132,6 +132,9 @@ jobs:
           summary-show-jobs-details: true
           summary-include-seed: true
 
+      - name: Test release relevance guards with Clippier
+        run: PATH="$GITHUB_WORKSPACE/target/release:$PATH" bash scripts/test-live-release-changes.sh
+
   cargo-deny:
     name: Cargo Deny
     runs-on: ubuntu-latest

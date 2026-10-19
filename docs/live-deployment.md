@@ -13,11 +13,20 @@ infrastructure-state authorities. Do not delete or reset those records.
 
 ## Normal releases
 
-Every push to `master` triggers `live-promote.yml`, with no path exclusions.
-All changes are conservatively treated as relevant, including shared dependencies,
-CLI code, scripts and infrastructure; there is no fragile dependency allowlist.
-It builds the backend candidate and complete site candidate from the same revision
-without deployment credentials. `live-validation.yml` runs independent offline
+Every push to `master` starts a release relevance check, not a product build.
+Clippier's pinned `affected-packages` action automatically selects the Git range
+and follows shared workspace dependencies; the non-package gate consumes that
+same selected range instead of independently choosing push SHAs.
+Only changes affecting the native CLI, bundled plugins, relay, docs site or web
+renderer proceed to the release jobs. Unrelated packages, examples and internal
+development docs skip builds, acceptance, infrastructure preview and approvals.
+A small shell gate additionally covers non-Cargo inputs: infrastructure, release
+workflows/scripts, toolchain and manifest changes, README and published docs from
+the site registry. Manual/configure requests and missing history run explicitly;
+failed or malformed package analysis blocks the workflow rather than skipping it.
+
+Relevant runs build the backend candidate and complete site candidate from the
+same revision without deployment credentials. `live-validation.yml` runs independent offline
 and runtime acceptance checks; there is no migration bypass. Pushes do not start
 additional standalone site-build or live-validation runs: the release calls those
 workflows once. Pull requests retain independent live validation.
