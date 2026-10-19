@@ -46,6 +46,27 @@ hashes alone are not an authenticity signature. No Python installer is shipped.
 
 ## Bterm bundles
 
+Inside the development shell, build and launch natively with one command:
+
+```sh
+cargo xtask bterm run
+```
+
+This detects the compiler host and Cargo target directory, incrementally builds
+both binaries, stages and verifies a fresh bundle, and launches it directly so
+errors remain visible. Repeat runs replace the previous development bundle
+(including stale files); failed staging leaves the old bundle intact. Concurrent
+runs are rejected while a window is open. The bundle lives under Cargo's target
+directory at `bterm-run/<host>/Bterm.app` on macOS (`Bterm` on Linux). Persistent
+state lives separately under `${XDG_STATE_HOME:-$HOME/.local/state}/bterm-dev/`,
+keyed by the canonical checkout path; rebuilding or cleaning Cargo artifacts
+never replaces it. Socket paths are length-checked before launch. Closing the
+window detaches without stopping that runtime. An
+incompatible existing runtime is reported, not silently replaced or redirected.
+Windows native execution is not currently supported by this command.
+
+Low-level packaging operations (staging requires a new destination):
+
 ```sh
 cargo xtask bterm stage --target TARGET --artifact-dir DIR --destination ABSENT_DIR
 cargo xtask bterm verify --target TARGET --root EXECUTABLE_DIRECTORY
