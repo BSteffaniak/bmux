@@ -42,6 +42,8 @@ pub struct KittyHostState {
     #[cfg(feature = "kitty")]
     content_bytes: std::collections::HashMap<u64, usize>,
     frame_seen: std::collections::HashSet<u64>,
+    // Retained resources needed later in this frame, before their paint turn.
+    frame_protected: std::collections::HashSet<u64>,
     repair_ids: std::collections::BTreeSet<u32>,
     allocated_ids: std::collections::BTreeSet<u32>,
     #[cfg(feature = "kitty")]
@@ -298,9 +300,18 @@ impl KittyHostState {
     /// Start one complete host frame (all panes), on a cloned candidate state.
     pub fn begin_frame(&mut self) {
         self.frame_seen.clear();
+        self.frame_protected.clear();
         self.allocated_ids.clear();
         #[cfg(feature = "kitty")]
         self.seen_placements.clear();
+    }
+
+    /// Protect an already resident resource before ordered painting begins.
+    /// This does not count as a placement or allocate host content.
+    pub(crate) fn protect_retained(&mut self, id: u64) {
+        if self.transmitted.contains_key(&id) {
+            self.frame_protected.insert(id);
+        }
     }
 
     /// Invalidate uncertain host output without advancing committed scene state.
@@ -339,7 +350,9 @@ impl KittyHostState {
             let mut inactive: Vec<_> = self
                 .transmitted
                 .iter()
-                .filter(|(id, _)| !self.frame_seen.contains(id))
+                .filter(|(id, _)| {
+                    !self.frame_seen.contains(id) && !self.frame_protected.contains(id)
+                })
                 .map(|(id, host)| (*id, *host))
                 .collect();
             inactive.sort_unstable();
@@ -486,7 +499,9 @@ impl KittyHostState {
         let mut inactive: Vec<_> = self
             .transmitted
             .keys()
-            .filter(|key| **key != id && !self.frame_seen.contains(key))
+            .filter(|key| {
+                **key != id && !self.frame_seen.contains(key) && !self.frame_protected.contains(key)
+            })
             .copied()
             .collect();
         inactive.sort_unstable();
@@ -517,6 +532,11 @@ impl KittyHostState {
         if cost > LIMIT || retained > LIMIT - cost {
             return Err(std::io::Error::other(
                 "kitty retained content byte budget exceeded",
+            ));
+        }
+        if !self.transmitted.contains_key(&id) && self.transmitted.len() >= 128 {
+            return Err(std::io::Error::other(
+                "kitty retained content entry budget exceeded",
             ));
         }
         self.content_bytes.insert(id, cost);

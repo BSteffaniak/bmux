@@ -27,6 +27,54 @@ fn image() -> PaneImage {
     }
 }
 
+#[cfg(feature = "kitty")]
+#[test]
+fn declared_working_set_preserves_late_hot_resource_under_pressure() {
+    let mut state = KittyHostState::default();
+    // Resource 1 is hot but painted late; resource 2 is cold. Fill the budget
+    // over separate frames, as navigation would, without exceeding a frame.
+    for id in 1..=128 {
+        state.begin_frame();
+        state.reserve_content(&mut Vec::new(), id, 32).unwrap();
+        state.get_or_allocate(id).unwrap();
+    }
+    let hot_host = state.transmitted[&1];
+    let cold_host = state.transmitted[&2];
+    state.begin_frame();
+    state.protect_retained(1);
+    let mut output = Vec::new();
+    state.reserve_content(&mut output, 129, 32).unwrap();
+    state.get_or_allocate(129).unwrap();
+    assert_eq!(state.transmitted.len(), 128);
+    assert_eq!(state.transmitted[&1], hot_host);
+    assert!(!state.transmitted.contains_key(&2));
+    assert!(String::from_utf8_lossy(&output).contains(&format!("d=I,i={cold_host}")));
+    state.reserve_content(&mut output, 1, 32).unwrap();
+    assert_eq!(state.get_or_allocate(1).unwrap(), (hot_host, false));
+    assert!(!String::from_utf8_lossy(&output).contains("a=t"));
+}
+
+#[cfg(feature = "kitty")]
+#[test]
+fn declared_full_working_set_rejects_overcapacity_without_eviction() {
+    let mut state = KittyHostState::default();
+    for id in 1..=128 {
+        state.begin_frame();
+        state.reserve_content(&mut Vec::new(), id, 32).unwrap();
+        state.get_or_allocate(id).unwrap();
+    }
+    state.begin_frame();
+    for id in 1..=128 {
+        state.protect_retained(id);
+    }
+    let mut output = Vec::new();
+    assert!(state.reserve_content(&mut output, 129, 32).is_err());
+    assert!(output.is_empty());
+    assert_eq!(state.transmitted.len(), 128);
+    assert_eq!(state.content_bytes.len(), 128);
+    assert!(!state.content_bytes.contains_key(&129));
+}
+
 fn pane() -> PaneRect {
     PaneRect {
         x: 0,

@@ -1,6 +1,6 @@
 //! Adapter from protocol-neutral TUI image scenes into BMUX image compositing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 
 use bmux_tui::image::{ImageKey, ImagePayload as TuiImagePayload, ImagePixelFormat};
@@ -56,8 +56,15 @@ impl From<std::io::Error> for TuiImageError {
 }
 
 type RetainedSource = (Arc<TuiImagePayload>, usize, Arc<PaneImage>);
-type ContainSignature = (u64, bmux_tui::geometry::Rect, (u16, u16), u16, u16);
-type RasterSignature = (u64, u16, u16, u16, u16);
+type ContainSignature = (
+    u64,
+    bmux_tui::geometry::Rect,
+    (u16, u16),
+    u16,
+    u16,
+    bmux_tui::image::ImageFit,
+);
+type RasterSignature = (u64, u16, u16, u16, u16, bmux_tui::image::ImageFit);
 
 /// BMUX-owned adapter that assigns image IDs, validates payloads, clips
 /// placements, and delegates host protocol selection to the compositor.
@@ -65,6 +72,8 @@ type RasterSignature = (u64, u16, u16, u16, u16);
 pub struct TuiImageCompositor {
     next_id: u64,
     sources: BTreeMap<ImageKey, RetainedSource>,
+    // Access order, not caller key order: shared hot images survive page changes.
+    source_order: VecDeque<ImageKey>,
     fitted: BTreeMap<ImageKey, (ContainSignature, Arc<PaneImage>)>,
     // Full allocation pixels survive changes to screen position and visible crop.
     rasters: BTreeMap<ImageKey, (RasterSignature, Arc<ImagePayload>)>,
@@ -177,6 +186,24 @@ impl TuiImageCompositor {
             .select_protocol(out, host_caps.preferred_protocol())?;
         let terminal_clip =
             bmux_tui::geometry::Rect::new(terminal.x, terminal.y, terminal.w, terminal.h);
+        // Scene order is not residency priority. Protect warm sources and fitted
+        // representations before an early new upload can evict a later image.
+        for placement in scene.placements() {
+            if clipped_destination(placement.destination, placement.clip, terminal_clip).is_none() {
+                continue;
+            }
+            if let Some((payload, limit, source)) = self.sources.get(&placement.key)
+                && **payload == placement.payload
+                && *limit == config.max_image_bytes
+            {
+                self.kitty_state.protect_retained(source.id);
+                if let Some((_, fitted)) = self.fitted.get(&placement.key) {
+                    self.kitty_state.protect_retained(fitted.id);
+                }
+                self.source_order.retain(|key| key != &placement.key);
+                self.source_order.push_back(placement.key.clone());
+            }
+        }
         for placement in scene.placements() {
             if placement
                 .allocation
@@ -232,6 +259,8 @@ impl TuiImageCompositor {
                     ),
                 );
             }
+            self.source_order.retain(|key| key != &placement.key);
+            self.source_order.push_back(placement.key.clone());
             let source = Arc::clone(&self.sources.get(&placement.key).expect("retained source").2);
             #[cfg(feature = "kitty")]
             if placement.fit == bmux_tui::image::ImageFit::Contain
@@ -248,8 +277,9 @@ impl TuiImageCompositor {
                 continue;
             }
             #[cfg(feature = "kitty")]
-            if placement.fit == bmux_tui::image::ImageFit::Contain
-                && host_caps.preferred_protocol() == Some(ImageProtocol::KittyGraphics)
+            if host_caps.preferred_protocol() == Some(ImageProtocol::KittyGraphics)
+                && (placement.fit == bmux_tui::image::ImageFit::Contain
+                    || placement.allocation.is_some())
             {
                 let bounds = placement
                     .allocation
@@ -269,7 +299,9 @@ impl TuiImageCompositor {
                 self.trim_sources();
                 continue;
             }
-            let image = if placement.fit == bmux_tui::image::ImageFit::Contain {
+            let image = if placement.fit == bmux_tui::image::ImageFit::Contain
+                || placement.allocation.is_some()
+            {
                 self.contained_image(placement, &source, host_caps, config)?
             } else {
                 self.fitted.remove(&placement.key);
@@ -311,13 +343,27 @@ impl TuiImageCompositor {
             .unwrap_or_else(|| placement.destination.into());
         let relative = relative_destination(placement);
         let (cw, ch) = caps.fitting_cell_size();
-        let signature = (source.id, relative, (bounds.width, bounds.height), cw, ch);
+        let signature = (
+            source.id,
+            relative,
+            (bounds.width, bounds.height),
+            cw,
+            ch,
+            placement.fit,
+        );
         if let Some((previous, fitted)) = self.fitted.get(&placement.key)
             && *previous == signature
         {
             return Ok(Arc::clone(fitted));
         }
-        let raster_signature = (source.id, bounds.width, bounds.height, cw, ch);
+        let raster_signature = (
+            source.id,
+            bounds.width,
+            bounds.height,
+            cw,
+            ch,
+            placement.fit,
+        );
         if self
             .rasters
             .get(&placement.key)
@@ -396,7 +442,11 @@ impl TuiImageCompositor {
                     .sum::<usize>()
                 > 64 * 1024 * 1024
         {
-            self.sources.pop_first();
+            let key = self
+                .source_order
+                .pop_front()
+                .expect("retained source order");
+            self.sources.remove(&key);
             self.rasters.retain(|key, _| self.sources.contains_key(key));
             self.fitted.retain(|key, _| self.sources.contains_key(key));
         }
@@ -413,6 +463,7 @@ impl TuiImageCompositor {
     pub fn clear(&mut self) {
         self.reset_pending = true;
         self.sources.clear();
+        self.source_order.clear();
         self.fitted.clear();
         self.rasters.clear();
     }
@@ -794,6 +845,304 @@ mod tests {
     use crate::compositor::PaneRect;
     use crate::config::ImageConfig;
     use crate::host_caps::HostImageCapabilities;
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn contain_predeclares_late_sources_and_fitted_rasters_before_upload() {
+        for fitted in [false, true] {
+            let caps = HostImageCapabilities {
+                kitty_graphics: true,
+                cell_pixel_width: 1,
+                cell_pixel_height: 1,
+                ..Default::default()
+            };
+            let terminal = PaneRect {
+                x: 0,
+                y: 0,
+                w: 80,
+                h: 40,
+            };
+            let config = ImageConfig::default();
+            let mut compositor = TuiImageCompositor::new();
+            let mut scene = ImageScene::default();
+            let mut hot = placement(
+                "z-hot",
+                Rect::new(0, 0, if fitted { 9 } else { 8 }, 4),
+                Rect::new(0, 0, 80, 40),
+                0,
+            );
+            hot.fit = bmux_tui::image::ImageFit::Contain;
+            hot.payload = transition_png();
+            // Make the hot image the oldest host ID, despite its late scene key.
+            scene.reconcile(&[ImageContribution::Present(hot.clone())]);
+            compositor
+                .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+                .unwrap();
+            let hot_id = if fitted {
+                compositor.fitted[&hot.key].1.id
+            } else {
+                compositor.sources[&hot.key].2.id
+            };
+            let hot_host = compositor.kitty_state.transmitted[&hot_id];
+            let mut all = vec![ImageContribution::Present(hot.clone())];
+            for index in 0..127 {
+                let mut cold = hot.clone();
+                cold.key = ImageKey::new(format!("b-cold-{index:03}"));
+                all.push(ImageContribution::Present(cold));
+            }
+            scene.reconcile(&all);
+            compositor
+                .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+                .unwrap();
+            assert_eq!(compositor.kitty_state.transmitted.len(), 128);
+            let before = compositor.work_counts();
+            let mut new = hot.clone();
+            new.key = ImageKey::new("a-new");
+            scene.reconcile(&[
+                ImageContribution::Present(new),
+                ImageContribution::Present(hot),
+            ]);
+            let mut output = Vec::new();
+            compositor
+                .render(&mut output, &scene, terminal, &caps, &config)
+                .unwrap();
+            assert_eq!(compositor.kitty_state.transmitted[&hot_id], hot_host);
+            assert_eq!(compositor.work_counts().0, before.0 + 1);
+            assert_eq!(String::from_utf8_lossy(&output).matches("a=t").count(), 1);
+            assert_eq!(compositor.kitty_state.transmitted.len(), 128);
+        }
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn contain_hot_sources_survive_page_cache_pressure() {
+        let caps = kitty_caps();
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 40,
+        };
+        let config = ImageConfig::default();
+        let mut compositor = TuiImageCompositor::new();
+        let mut scene = ImageScene::default();
+        let mut hot = placement("a-hot", Rect::new(0, 0, 8, 4), Rect::new(0, 0, 80, 40), 7);
+        hot.fit = bmux_tui::image::ImageFit::Contain;
+        hot.payload = transition_png();
+        for page in 0..140 {
+            let mut cold = hot.clone();
+            cold.key = ImageKey::new(format!("z-page-{page:03}"));
+            cold.destination.y = 8;
+            scene.reconcile(&[
+                ImageContribution::Present(hot.clone()),
+                ImageContribution::Present(cold),
+            ]);
+            compositor
+                .render(&mut Vec::new(), &scene, terminal, &caps, &config)
+                .unwrap();
+        }
+        let before = compositor.work_counts();
+        let mut output = Vec::new();
+        compositor
+            .render(&mut output, &scene, terminal, &caps, &config)
+            .unwrap();
+        eprintln!(
+            "warm cache pressure validations: {} -> {}; output bytes: {}",
+            before.0,
+            compositor.work_counts().0,
+            output.len()
+        );
+        assert_eq!(
+            compositor.work_counts(),
+            before,
+            "warm sources must not be revalidated after visiting >128 resources"
+        );
+        assert!(!String::from_utf8_lossy(&output).contains("a=t"));
+        assert!(compositor.sources.len() <= 128);
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn retained_allocation_scroll_preserves_fit_pixels_and_upload() {
+        // Cover is represented by the adapter's pre-cropped payload + Stretch.
+        for fit in [
+            bmux_tui::image::ImageFit::Contain,
+            bmux_tui::image::ImageFit::Stretch,
+        ] {
+            let caps = HostImageCapabilities {
+                kitty_graphics: true,
+                cell_pixel_width: 1,
+                cell_pixel_height: 1,
+                ..Default::default()
+            };
+            let terminal = PaneRect {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 20,
+            };
+            let config = ImageConfig::default();
+            let mut compositor = TuiImageCompositor::new();
+            let mut scene = ImageScene::default();
+            let mut placed = placement(
+                "retained",
+                Rect::new(0, 0, 7, 5),
+                Rect::new(0, 0, 20, 20),
+                0,
+            );
+            placed.payload = transition_png();
+            placed.fit = fit;
+            let mut uploaded = std::collections::BTreeMap::new();
+            let mut source_id = None;
+            for offset in [0, 1, 2, 1, 0] {
+                placed.allocation = Some(bmux_tui::image::ImageBounds {
+                    x: 0,
+                    y: -offset,
+                    width: 7,
+                    height: 5,
+                });
+                placed.destination.height = 5 - u16::try_from(offset).unwrap();
+                scene.reconcile(&[ImageContribution::Present(placed.clone())]);
+                let mut output = Vec::new();
+                compositor
+                    .render(&mut output, &scene, terminal, &caps, &config)
+                    .unwrap();
+                let commands = String::from_utf8(output).unwrap();
+                let placements = displayable_kitty_placements(&commands, &mut uploaded);
+                assert_eq!(placements.len(), 1);
+                let full = &compositor.fitted[&placed.key].1;
+                if let Some(id) = source_id {
+                    assert_eq!(full.id, id);
+                    assert!(!commands.contains("a=t"));
+                }
+                source_id = Some(full.id);
+                let crop = placements[0].source_rect.unwrap();
+                let pixels = full.payload.pixels.as_ref().unwrap();
+                let full =
+                    image::RgbaImage::from_raw(pixels.width, pixels.height, pixels.data.clone())
+                        .unwrap();
+                let actual =
+                    image::imageops::crop_imm(&full, crop.x, crop.y, crop.width, crop.height)
+                        .to_image();
+                let source = &compositor.sources[&placed.key].2;
+                let expected =
+                    super::contain_payload(&placed, &source.payload, &caps, &config).unwrap();
+                assert_eq!(
+                    actual.as_raw(),
+                    &expected.pixels.unwrap().data,
+                    "fit={fit:?}, offset={offset}"
+                );
+            }
+            assert_eq!(uploaded.len(), 1);
+        }
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn contain_stable_fragment_keys_reuse_sources_across_scroll() {
+        let caps = kitty_caps();
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 40,
+        };
+        let mut compositor = TuiImageCompositor::new();
+        let mut scene = ImageScene::default();
+        let mut before = None;
+        for y in [10, 9, 8, 9, 10] {
+            let mut parts = Vec::new();
+            for (ordinal, x) in [0, 4].into_iter().enumerate() {
+                let mut part = placement(
+                    &format!("image/fragment-{ordinal}"),
+                    Rect::new(x, y, 3, 3),
+                    Rect::new(0, 0, 80, 40),
+                    0,
+                );
+                part.payload = transition_png();
+                part.fit = bmux_tui::image::ImageFit::Contain;
+                part.allocation = Some(bmux_tui::image::ImageBounds {
+                    x: 0,
+                    y: i32::from(y),
+                    width: 8,
+                    height: 4,
+                });
+                parts.push(ImageContribution::Present(part));
+            }
+            scene.reconcile(&parts);
+            let mut output = Vec::new();
+            compositor
+                .render(
+                    &mut output,
+                    &scene,
+                    terminal,
+                    &caps,
+                    &ImageConfig::default(),
+                )
+                .unwrap();
+            if let Some(counts) = before {
+                assert_eq!(compositor.work_counts(), counts);
+                assert!(!String::from_utf8_lossy(&output).contains("a=t"));
+            }
+            before = Some(compositor.work_counts());
+        }
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn contain_native_raster_alignment_transition_reuses_both_resources() {
+        let caps = HostImageCapabilities {
+            kitty_graphics: true,
+            cell_pixel_width: 1,
+            cell_pixel_height: 1,
+            ..Default::default()
+        };
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 20,
+        };
+        let mut compositor = TuiImageCompositor::new();
+        let mut scene = ImageScene::default();
+        let mut uploaded = std::collections::BTreeMap::new();
+        let mut placed = placement(
+            "alignment",
+            Rect::new(0, 0, 8, 4),
+            Rect::new(0, 0, 20, 20),
+            0,
+        );
+        placed.fit = bmux_tui::image::ImageFit::Contain;
+        placed.payload = transition_png();
+        // 8x4 is native; 9x4 has a half-cell letterbox and needs a raster.
+        for (index, width) in [8, 9, 8, 9, 8].into_iter().enumerate() {
+            placed.destination.width = width;
+            scene.reconcile(&[ImageContribution::Present(placed.clone())]);
+            let mut output = Vec::new();
+            compositor
+                .render(
+                    &mut output,
+                    &scene,
+                    terminal,
+                    &caps,
+                    &ImageConfig::default(),
+                )
+                .unwrap();
+            let commands = String::from_utf8(output).unwrap();
+            assert_eq!(
+                displayable_kitty_placements(&commands, &mut uploaded).len(),
+                1
+            );
+            if index > 1 {
+                assert!(!commands.contains("a=t"));
+            }
+        }
+        assert_eq!(
+            uploaded.len(),
+            2,
+            "alignment transition uploads at most one source and one fitted raster"
+        );
+    }
 
     #[test]
     fn contain_letterboxes_and_crops_without_refitting() {
@@ -1368,6 +1717,7 @@ mod tests {
                     std::sync::Arc::clone(&source),
                 ),
             );
+            compositor.source_order.push_back(placed.key.clone());
             compositor
                 .contained_image(&placed, &source, &caps, &config)
                 .unwrap();

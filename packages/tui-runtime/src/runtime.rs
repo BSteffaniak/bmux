@@ -274,6 +274,7 @@ pub struct Runtime<P: Program, R> {
     commands: CommandScheduler<P::Message>,
     subscriptions: SubscriptionScheduler<P::Message>,
     last_presented: Option<Instant>,
+    next_ready_source: u8,
     next_application_source: u8,
     exiting: bool,
 }
@@ -343,6 +344,7 @@ where
                 commands,
                 subscriptions,
                 last_presented: None,
+                next_ready_source: 0,
                 next_application_source: 0,
                 exiting: false,
             },
@@ -390,28 +392,28 @@ where
 
             tokio::select! {
                 biased;
-                terminal = self.terminal_rx.recv() => {
+                terminal = self.terminal_rx.recv(), if !self.exiting => {
                     if let Some(event) = terminal
                         && let Err(error) = self.apply_event(RuntimeEvent::Terminal(event))
                     {
                         return Err(self.program_error(error).await);
                     }
                 }
-                reliable = self.reliable_rx.recv() => {
+                reliable = self.reliable_rx.recv(), if !self.exiting => {
                     if let Some(message) = reliable
                         && let Err(error) = self.apply_event(RuntimeEvent::Message(message))
                     {
                         return Err(self.program_error(error).await);
                     }
                 }
-                completion = self.commands.next_completion(), if !self.commands.is_empty() => {
+                completion = self.commands.next_completion(), if !self.exiting && !self.commands.is_empty() => {
                     if let Some(message) = completion.and_then(|completion| completion.message)
                         && let Err(error) = self.apply_event(RuntimeEvent::Message(message))
                     {
                         return Err(self.program_error(error).await);
                     }
                 }
-                subscription = self.subscription_rx.recv() => {
+                subscription = self.subscription_rx.recv(), if !self.exiting => {
                     if let Some(message) = subscription
                         && let Err(error) = self.apply_event(RuntimeEvent::Message(message))
                     {
@@ -431,36 +433,11 @@ where
         let started = Instant::now();
         let mut processed = 0_usize;
         let mut did_work = false;
-        while processed < self.config.messages_per_turn
+        while !self.exiting
+            && processed < self.config.messages_per_turn
             && started.elapsed() < self.config.processing_time_per_turn
         {
-            if let Ok(event) = self.terminal_rx.try_recv() {
-                observe_receive(&self.terminal_rx, &self.stats, true);
-                with_stats(&self.stats, |stats| {
-                    stats.terminal_processed = stats.terminal_processed.saturating_add(1);
-                });
-                self.apply_event(RuntimeEvent::Terminal(event))?;
-            } else if let Some((_key, event)) = self.terminal_latest_rx.try_recv() {
-                with_stats(&self.stats, |stats| {
-                    stats.terminal_processed = stats.terminal_processed.saturating_add(1);
-                });
-                self.apply_event(RuntimeEvent::Terminal(event))?;
-            } else if let Some(timer) = self.take_due_timer(Instant::now()) {
-                with_stats(&self.stats, |stats| {
-                    stats.timers_delivered = stats.timers_delivered.saturating_add(1);
-                });
-                self.apply_event(RuntimeEvent::Timer(timer))?;
-            } else if let Some(message) = self.try_next_application_message() {
-                self.apply_event(RuntimeEvent::Message(message))?;
-            } else if let Some(completion) = self.commands.try_next_completion() {
-                if let Some(message) = completion.message {
-                    self.apply_event(RuntimeEvent::Message(message))?;
-                }
-            } else if let Ok(message) = self.subscription_rx.try_recv() {
-                let depth = self.subscription_rx.max_capacity() - self.subscription_rx.capacity();
-                with_stats(&self.stats, |stats| stats.subscription_depth = depth);
-                self.apply_event(RuntimeEvent::Message(message))?;
-            } else {
+            if !self.process_next_ready()? {
                 break;
             }
             processed = processed.saturating_add(1);
@@ -479,6 +456,67 @@ where
         }
         self.subscriptions.try_next_completion();
         Ok(did_work)
+    }
+
+    fn process_next_ready(&mut self) -> Result<bool, P::Error> {
+        // Rotate after each serviced source, not after each turn: even a one-message
+        // budget must make progress across floods. Each FIFO is still consumed in order.
+        const SOURCES: u8 = 6;
+        for offset in 0..SOURCES {
+            let source = (self.next_ready_source + offset) % SOURCES;
+            if self.process_ready_source(source)? {
+                self.next_ready_source = (source + 1) % SOURCES;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn process_ready_source(&mut self, source: u8) -> Result<bool, P::Error> {
+        let event = match source {
+            0 => self.terminal_rx.try_recv().ok().map(|event| {
+                observe_receive(&self.terminal_rx, &self.stats, true);
+                with_stats(&self.stats, |stats| {
+                    stats.terminal_processed = stats.terminal_processed.saturating_add(1);
+                });
+                RuntimeEvent::Terminal(event)
+            }),
+            1 => self.terminal_latest_rx.try_recv().map(|(_key, event)| {
+                with_stats(&self.stats, |stats| {
+                    stats.terminal_processed = stats.terminal_processed.saturating_add(1);
+                });
+                RuntimeEvent::Terminal(event)
+            }),
+            2 => self.take_due_timer(Instant::now()).map(|timer| {
+                with_stats(&self.stats, |stats| {
+                    stats.timers_delivered = stats.timers_delivered.saturating_add(1);
+                });
+                RuntimeEvent::Timer(timer)
+            }),
+            3 => self
+                .try_next_application_message()
+                .map(RuntimeEvent::Message),
+            4 => {
+                let Some(completion) = self.commands.try_next_completion() else {
+                    return Ok(false);
+                };
+                if let Some(message) = completion.message {
+                    self.apply_event(RuntimeEvent::Message(message))?;
+                }
+                // A completed command without a message still consumes a service slot.
+                return Ok(true);
+            }
+            _ => self.subscription_rx.try_recv().ok().map(|message| {
+                let depth = self.subscription_rx.max_capacity() - self.subscription_rx.capacity();
+                with_stats(&self.stats, |stats| stats.subscription_depth = depth);
+                RuntimeEvent::Message(message)
+            }),
+        };
+        let Some(event) = event else {
+            return Ok(false);
+        };
+        self.apply_event(event)?;
+        Ok(true)
     }
 
     fn try_next_application_message(&mut self) -> Option<P::Message> {
@@ -653,7 +691,11 @@ where
 
     fn next_deadline(&self) -> Option<Instant> {
         let state = lock_unpoisoned(&self.control.state);
-        let timer = state.timers.values().min().copied();
+        let timer = if self.exiting {
+            None
+        } else {
+            state.timers.values().min().copied()
+        };
         let presentation = if state.dirty {
             Some(
                 state
@@ -713,5 +755,213 @@ where
                 stats: stats_snapshot(&self.stats),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod fairness_tests {
+    use std::convert::Infallible;
+
+    use bmux_tui::event::{MouseEvent, MouseEventKind};
+    use bmux_tui::geometry::{Point, Size};
+
+    use super::*;
+    use crate::{Command, HeadlessPresenter, Subscription, SubscriptionKey};
+
+    #[derive(Default)]
+    struct OrderedProgram {
+        events: Vec<RuntimeEvent<u64>>,
+        movement: i32,
+        paused: bool,
+        barriers: Vec<i32>,
+    }
+
+    impl Program for OrderedProgram {
+        type Message = u64;
+        type Error = Infallible;
+
+        fn update(&mut self, event: RuntimeEvent<u64>) -> Result<Update<u64>, Infallible> {
+            let mut update = Update::none();
+            match &event {
+                RuntimeEvent::Terminal(Event::Mouse(mouse)) if !self.paused => match mouse.kind {
+                    MouseEventKind::ScrollDown => self.movement += 1,
+                    MouseEventKind::ScrollUp => self.movement -= 1,
+                    _ => {}
+                },
+                RuntimeEvent::Terminal(Event::User(tag)) if tag == "pause" => {
+                    self.barriers.push(self.movement);
+                    self.paused = !self.paused;
+                }
+                RuntimeEvent::Terminal(Event::User(tag)) if tag == "quit" => {
+                    self.barriers.push(self.movement);
+                    update = Update::exit();
+                }
+                _ => {}
+            }
+            self.events.push(event);
+            Ok(update)
+        }
+    }
+
+    fn wheel(kind: MouseEventKind) -> Event {
+        Event::Mouse(MouseEvent::new(kind, Point::new(2, 3)))
+    }
+
+    fn one_message_config() -> RuntimeConfig {
+        RuntimeConfig {
+            messages_per_turn: 1,
+            frame_interval: Some(Duration::from_hours(1)),
+            processing_time_per_turn: Duration::from_mins(1),
+            terminal_capacity: 16,
+            ..RuntimeConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn continuous_terminal_input_services_every_ready_source_within_bounded_turns() {
+        let (mut runtime, handle) = Runtime::new(
+            OrderedProgram::default(),
+            HeadlessPresenter::default(),
+            one_message_config(),
+        );
+        // Explicit completion handshakes make readiness independent of wall-clock timing.
+        let (command_ready, command_done) = tokio::sync::oneshot::channel();
+        runtime.commands.schedule(Command::concurrent(async move {
+            command_ready.send(()).expect("test receiver remains open");
+            Some(30)
+        }));
+        let (subscription_ready, subscription_done) = tokio::sync::oneshot::channel();
+        runtime.subscriptions.replace(Subscription::new(
+            SubscriptionKey::new("resource"),
+            |sender| async move {
+                sender.send(40).await.expect("runtime remains open");
+                subscription_ready
+                    .send(())
+                    .expect("test receiver remains open");
+            },
+        ));
+        command_done.await.expect("command completed");
+        subscription_done.await.expect("resource completion queued");
+        handle.try_send(10).expect("reliable capacity");
+        handle
+            .send_latest(MessageKey::new("progress"), 20)
+            .expect("latest capacity");
+        handle.schedule_timer(TimerId::new("due"), Instant::now());
+        for _ in 0..16 {
+            handle
+                .try_send_terminal(wheel(MouseEventKind::ScrollDown))
+                .expect("terminal capacity");
+        }
+        for _ in 0..12 {
+            handle
+                .send_latest_terminal(Event::Resize(Size::new(80, 24)))
+                .expect("resize capacity");
+            assert!(runtime.process_ready_turn().expect("infallible update"));
+            // Refill immediately, without letting the terminal FIFO become empty.
+            while handle
+                .try_send_terminal(wheel(MouseEventKind::ScrollDown))
+                .is_ok()
+            {}
+        }
+        for expected in [10, 20, 30, 40] {
+            assert!(
+                runtime.program.events.iter().any(|event| {
+                    matches!(event, RuntimeEvent::Message(value) if *value == expected)
+                }),
+                "message {expected} starved behind continuous input"
+            );
+        }
+        assert!(runtime.program.events.iter().any(|event| {
+            matches!(event, RuntimeEvent::Timer(timer) if timer.as_str() == "due")
+        }));
+        assert!(
+            runtime
+                .program
+                .events
+                .iter()
+                .any(|event| { matches!(event, RuntimeEvent::Terminal(Event::Resize(_))) })
+        );
+        assert!(runtime.program.movement > 0);
+        assert_eq!(runtime.terminal_rx.len(), 16);
+        assert_eq!(handle.stats().terminal_high_water, 16);
+        runtime.close().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_fifo_preserves_movement_pause_and_quit_barriers_during_floods() {
+        let (mut runtime, handle) = Runtime::new(
+            OrderedProgram::default(),
+            HeadlessPresenter::default(),
+            one_message_config(),
+        );
+        let input = [
+            wheel(MouseEventKind::ScrollDown),
+            wheel(MouseEventKind::ScrollDown),
+            Event::User("pause".into()),
+            wheel(MouseEventKind::ScrollDown),
+            Event::User("pause".into()),
+            wheel(MouseEventKind::ScrollUp),
+            Event::User("quit".into()),
+            wheel(MouseEventKind::ScrollDown),
+        ];
+        for event in &input {
+            handle
+                .try_send_terminal(event.clone())
+                .expect("terminal capacity");
+        }
+        // Keep both application message classes and timers continuously ready.
+        for turn in 0..48 {
+            handle
+                .try_send(turn)
+                .expect("bounded test flood fits reliable capacity");
+            handle
+                .send_latest(MessageKey::new("progress"), turn)
+                .expect("latest capacity");
+            handle.schedule_timer(TimerId::new("due"), Instant::now());
+            assert!(runtime.process_ready_turn().expect("infallible update"));
+            if runtime.exiting {
+                break;
+            }
+        }
+        assert!(
+            runtime.exiting,
+            "quit must not starve behind other ready sources"
+        );
+        let terminal: Vec<_> = runtime
+            .program
+            .events
+            .iter()
+            .filter_map(|event| {
+                if let RuntimeEvent::Terminal(event) = event {
+                    Some(event.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(terminal, input[..7]);
+        assert_eq!(runtime.program.barriers, [2, 2, 1]);
+        assert_eq!(runtime.program.movement, 1);
+        assert_eq!(
+            runtime.terminal_rx.len(),
+            1,
+            "post-quit input remains unconsumed"
+        );
+        // Waiting for the final cadence-limited frame must not cross the exit barrier
+        // or busy-spin on a timer that the exited program will no longer consume.
+        let last = Instant::now();
+        runtime.last_presented = Some(last);
+        assert!(!runtime.presentation_due());
+        assert!(
+            !runtime
+                .process_ready_turn()
+                .expect("exited program is not updated")
+        );
+        assert_eq!(
+            runtime.next_deadline(),
+            Some(last + runtime.config.frame_interval.expect("cadence"))
+        );
+        assert_eq!(runtime.terminal_rx.len(), 1);
+        runtime.close().await;
     }
 }
