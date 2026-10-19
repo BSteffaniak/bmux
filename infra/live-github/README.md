@@ -25,6 +25,7 @@ remains outside Terraform so reusable credentials never enter this root's state.
    job to finish successfully.
 5. Delete `.github/workflows/migrate-live-github.yml`,
    `scripts/migrate-live-github.mjs`, `scripts/check-live-github-migration.mjs`,
+   `scripts/live-github-plan-diagnostics.mjs`,
    and `scripts/test-live-github-migration.mjs`. Remove its test command from
    `live-validation.yml`. Delete the admin secret and revoke the token.
 

@@ -39,10 +39,11 @@ jobs:
           source scripts/live-github-init.sh
           mkdir "$RUNNER_TEMP/github-migration"
           node scripts/migrate-live-github.mjs "$RUNNER_TEMP/github-migration/adoption.tfvars.json"
-          tofu -chdir=infra/live-github plan -input=false -lock-timeout=5m \
+          tofu -chdir=infra/live-github plan -json -input=false -lock-timeout=5m \
             -var-file="$RUNNER_TEMP/github-migration/adoption.tfvars.json" \
             -out="$RUNNER_TEMP/github-migration/approved.tfplan" > "$RUNNER_TEMP/github-plan.log" 2>&1 || {
-              echo 'Plan failed; no apply attempted. Inspect provider access and canonical backend; do not reset state.'; exit 1;
+              node scripts/live-github-plan-diagnostics.mjs "$RUNNER_TEMP/github-plan.log"
+              exit 1;
             }
           tofu -chdir=infra/live-github show -json "$RUNNER_TEMP/github-migration/approved.tfplan" |
             node scripts/check-live-github-migration.mjs

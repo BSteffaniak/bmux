@@ -140,6 +140,31 @@ process.exit(Number(process.env.TOFU_EXIT));
   }
 });
 
+test('plan diagnostics classify errors without leaking provider prose or credentials', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'bmux-github-diagnostics-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const log = join(dir, 'plan.jsonl');
+  const credential = 'private-fixture-token-never-log';
+  writeFileSync(log, [
+    'not json ' + credential,
+    JSON.stringify({ diagnostic: { severity: 'error', summary: 'Invalid index',
+      detail: credential, range: { filename: 'main.tf', start: { line: 12 }, snippet: credential } } }),
+    JSON.stringify({ diagnostic: { severity: 'error', summary: '403 Forbidden', detail: credential } }),
+    JSON.stringify({ diagnostic: { severity: 'error', summary: credential, detail: credential } }),
+    JSON.stringify({ diagnostic: { severity: 'warning', summary: credential } }),
+  ].join('\n'));
+  const result = spawnSync(process.execPath, ['scripts/live-github-plan-diagnostics.mjs', log], {
+    cwd: root, encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stderr.includes('invalid index'));
+  assert.ok(result.stderr.includes('permission denied'));
+  assert.ok(result.stderr.includes('Source: main.tf:12'));
+  assert.ok(result.stderr.includes('diagnostics: 3'));
+  assert.ok(!result.stderr.includes(credential));
+  assert.equal(result.stdout, '');
+});
+
 test('workflow keeps one gate, encrypted durable state and exact same-run plan binding', () => {
   const workflow = readFileSync(join(root, '.github/workflows/migrate-live-github.yml'), 'utf8');
   assert.equal((workflow.match(/environment: production-approval/g) ?? []).length, 1);
