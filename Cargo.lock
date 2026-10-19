@@ -2158,6 +2158,7 @@ dependencies = [
 name = "bmux_decoration_plugin_api"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_codec",
  "bmux_ipc",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
@@ -2171,6 +2172,7 @@ dependencies = [
 name = "bmux_decoration_plugin_renderer"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_decoration_plugin",
  "bmux_plugin",
  "bmux_scene_protocol",
  "bmux_scene_protocol_render",
@@ -2739,6 +2741,7 @@ name = "bmux_plugin_schema"
 version = "0.0.1-alpha.4"
 dependencies = [
  "serde",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
 ]
 
@@ -2765,6 +2768,7 @@ dependencies = [
  "bmux_ipc",
  "bmux_perf_telemetry",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema",
  "serde",
  "serde_json",
  "switchy",
@@ -3205,8 +3209,10 @@ name = "bmux_tab_bar_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_attach_view_protocol",
+ "bmux_ipc",
  "bmux_keyboard 0.0.1-alpha.4",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "bmux_tabs_plugin_api",

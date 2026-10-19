@@ -210,11 +210,12 @@ impl BmuxClient {
             protocol
                 .capabilities
                 .iter()
-                .any(|capability| capability == bmux_ipc::CAPABILITY_SERVICE_CONTRACT_V1)
+                .any(|capability| capability == bmux_ipc::CAPABILITY_SERVICE_CONTRACT_V2)
         }) {
-            return Err(ClientError::UnexpectedResponse(
-                "peer does not support checked BPDL service contracts",
-            ));
+            return Err(ClientError::ServerError {
+                code: ErrorCode::ServiceIncompatible,
+                message: "peer does not support checked BPDL v2 service contracts".into(),
+            });
         }
         self.checked_service_contracts = true;
         Ok(())
@@ -733,18 +734,39 @@ fn validate_service_representation(required: bool, request: &Request) -> Result<
         return Ok(());
     }
     match request {
-        Request::InvokeService { payload, .. }
-            if !bmux_plugin_sdk::service_contract::is_checked(payload) =>
-        {
-            Err(ClientError::UnexpectedResponse(
-                "guarded service call requires a generated checked BPDL payload",
-            ))
+        Request::InvokeService {
+            interface_id,
+            payload,
+            ..
+        } => validate_checked_payload(interface_id, payload),
+        Request::InvokeServicePipeline { pipeline } => {
+            for step in &pipeline.steps {
+                match &step.payload {
+                    bmux_ipc::ServicePipelinePayload::Encoded { payload } => {
+                        validate_checked_payload(&step.interface_id, payload)?;
+                    }
+                    bmux_ipc::ServicePipelinePayload::JsonTemplate { .. } => {
+                        return Err(ClientError::ServerError {
+                            code: ErrorCode::UnsupportedRepresentation,
+                            message: "checked pipelines require invocation-bound encoded steps"
+                                .into(),
+                        });
+                    }
+                }
+            }
+            Ok(())
         }
-        Request::InvokeServicePipeline { .. } => Err(ClientError::UnexpectedResponse(
-            "service pipelines do not support checked BPDL invocation yet",
-        )),
         _ => Ok(()),
     }
+}
+
+fn validate_checked_payload(interface_id: &str, payload: &[u8]) -> Result<()> {
+    bmux_plugin_sdk::service_contract::interface_id_for(interface_id, payload)
+        .map(|_| ())
+        .map_err(|error| ClientError::ServerError {
+            code: ErrorCode::UnsupportedRepresentation,
+            message: error.to_string(),
+        })
 }
 
 impl TypedDispatchClient for BmuxClient {
@@ -1819,10 +1841,54 @@ mod tests {
         assert!(super::validate_service_representation(true, &raw).is_err());
         let mut checked = raw;
         if let bmux_ipc::Request::InvokeService { payload, .. } = &mut checked {
-            *payload = bmux_plugin_sdk::service_contract::encode(b"contract", b"request").unwrap();
+            *payload = bmux_plugin_sdk::service_contract::encode("state/v1", &[7; 32], b"request")
+                .unwrap();
         }
         assert!(super::validate_service_representation(true, &checked).is_ok());
         assert!(super::validate_service_representation(true, &bmux_ipc::Request::Ping).is_ok());
+    }
+
+    #[test]
+    fn checked_pipeline_admits_encoded_steps_and_rejects_raw_templates_and_route_mismatch() {
+        let payload =
+            bmux_plugin_sdk::service_contract::encode("state/v1", &[7; 32], b"request").unwrap();
+        let mut pipeline = bmux_ipc::ServicePipelineRequest {
+            inputs: std::collections::BTreeMap::new(),
+            steps: vec![bmux_ipc::ServicePipelineStep {
+                capability: "example.read".into(),
+                kind: bmux_ipc::InvokeServiceKind::Query,
+                interface_id: "state/v1".into(),
+                operation: "get".into(),
+                payload: bmux_ipc::ServicePipelinePayload::Encoded { payload },
+            }],
+        };
+        let validate = |pipeline: &bmux_ipc::ServicePipelineRequest| {
+            super::validate_service_representation(
+                true,
+                &bmux_ipc::Request::InvokeServicePipeline {
+                    pipeline: pipeline.clone(),
+                },
+            )
+        };
+        assert!(validate(&pipeline).is_ok());
+        pipeline.steps[0].interface_id = "other/v1".into();
+        assert!(validate(&pipeline).is_err());
+        pipeline.steps[0].interface_id = "state/v1".into();
+        pipeline.steps[0].payload = bmux_ipc::ServicePipelinePayload::Encoded {
+            payload: b"raw".to_vec(),
+        };
+        assert!(validate(&pipeline).is_err());
+        pipeline.steps[0].payload = bmux_ipc::ServicePipelinePayload::JsonTemplate {
+            value: serde_json::json!({}),
+            field_order: None,
+        };
+        assert!(matches!(
+            validate(&pipeline),
+            Err(super::ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::UnsupportedRepresentation,
+                ..
+            })
+        ));
     }
 
     fn temp_dir() -> TempDir {
@@ -1910,6 +1976,35 @@ mod tests {
         ));
         drop(stream);
         assert_eq!(pool.counts(), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn replacement_connection_requires_v2_again_and_streaming_preserves_checked_mode() {
+        let make_client = |capability: &str| {
+            let (stream, _peer) = tokio::io::duplex(8192);
+            BmuxClient {
+                stream: ClientStream::Bridge(ErasedIpcStream::new(Box::new(stream))),
+                timeout: Duration::from_millis(500),
+                next_request_id: 1,
+                principal_id: Uuid::new_v4(),
+                negotiated_protocol: Some(bmux_ipc::NegotiatedProtocol {
+                    wire_epoch: 1,
+                    revision: 1,
+                    capabilities: vec![capability.to_string()],
+                }),
+                checked_service_contracts: false,
+            }
+        };
+        let mut initial = make_client(bmux_ipc::CAPABILITY_SERVICE_CONTRACT_V2);
+        initial.require_service_contracts().unwrap();
+        let streaming = StreamingBmuxClient::from_client(initial).unwrap();
+        assert!(bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(&streaming));
+        let mut replacement = make_client("core.service_contract.v1");
+        assert!(replacement.require_service_contracts().is_err());
+        assert!(!bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(&replacement));
+        let mut replacement = make_client(bmux_ipc::CAPABILITY_SERVICE_CONTRACT_V2);
+        replacement.require_service_contracts().unwrap();
+        assert!(bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(&replacement));
     }
 
     #[tokio::test]

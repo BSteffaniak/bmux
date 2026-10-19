@@ -66,7 +66,7 @@ lease. Poll at least every two seconds and unregister when the producer stops.
 Expired registrations can be explicitly replaced; polling cannot revive them.
 
 `register` and `poll` return `SourceState { refresh: u64, selected: bool }`.
-When selected, submit a self-contained full inline `BMWP\x03` frame with
+When selected, submit a self-contained full inline `BMWP\x05` frame with
 `publish(source_id, refresh, frame)`. Frames are limited to 8 MiB and must come
 from accepted retained audience output, never speaker notes or reconstructed
 terminal state. Within a refresh, source revisions increase monotonically.

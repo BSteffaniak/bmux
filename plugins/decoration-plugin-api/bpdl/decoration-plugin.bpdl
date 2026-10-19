@@ -375,3 +375,38 @@ interface decoration-events {
 
     events decoration-event;
 }
+
+// Checked v2 only. The generated operation envelope replaces the historical
+// unmodeled, bare attach event payload. The host-local input model is not wire.
+@capability(DECORATION_WRITE)
+@interface-version(2)
+interface decoration-input-hooks {
+    record input-rect { x: u16, y: u16, w: u16, h: u16 }
+    record input-modifiers {
+        shift: bool, alt: bool, control: bool, super-key: bool,
+        hyper: bool, meta: bool,
+    }
+    record input-pane-context {
+        pane-id: uuid, surface-id: uuid, rect: input-rect,
+        content-rect: input-rect, focused: bool,
+    }
+    record input-event {
+        hook-id: string, event-kind: string, phase: string,
+        button: string?, key: string?, col: u16?, row: u16?,
+        wheel-delta: i16, modifiers: input-modifiers,
+        focused-pane: input-pane-context?, hovered-pane: input-pane-context?,
+    }
+    record input-endpoint {
+        capability: string, interface-id: string, operation: string,
+    }
+    record input-service-invocation {
+        endpoint: input-endpoint, response-endpoint: input-endpoint?, payload: bytes,
+    }
+    record input-result {
+        consumed: bool, preserve-focus: bool, capture-pointer: bool,
+        capture-keyboard: list<string>, release-capture: bool,
+        preserve-capture-across-revisions: bool, dirty: bool,
+        status-message: string?, service-invocation: input-service-invocation?,
+    }
+    command handle-input(event: input-event) -> input-result;
+}

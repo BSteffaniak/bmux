@@ -70,8 +70,8 @@ pub const CURRENT_PROTOCOL_REVISION: u32 = 1;
 pub const MIN_SUPPORTED_PROTOCOL_REVISION: u32 = 1;
 
 pub const CORE_CAPABILITY_CONTROL: &str = "core.control";
-/// Explicit opt-in support for invocation-bound exact BPDL service contracts.
-pub const CAPABILITY_SERVICE_CONTRACT_V1: &str = "core.service_contract.v1";
+/// Explicit opt-in support for invocation-bound interface-scoped BPDL service contracts.
+pub const CAPABILITY_SERVICE_CONTRACT_V2: &str = "core.service_contract.v2";
 
 pub const CORE_CAPABILITY_SERVICE_INVOCATION: &str = "core.service_invocation";
 pub const CORE_CAPABILITY_EVENT_STREAM: &str = "core.event_stream";
@@ -160,7 +160,7 @@ pub enum IncompatibilityReason {
 pub fn default_supported_capabilities() -> Vec<String> {
     #[allow(unused_mut)]
     let mut caps = vec![
-        CAPABILITY_SERVICE_CONTRACT_V1.to_string(),
+        CAPABILITY_SERVICE_CONTRACT_V2.to_string(),
         CORE_CAPABILITY_CONTROL.to_string(),
         CORE_CAPABILITY_SERVICE_INVOCATION.to_string(),
         CORE_CAPABILITY_EVENT_STREAM.to_string(),
@@ -527,6 +527,11 @@ pub enum ErrorCode {
     VersionMismatch,
     Timeout,
     Internal,
+    // Append-only: positional IPC encoding uses these discriminant indices.
+    /// The selected invocation framing is not supported by this endpoint.
+    UnsupportedRepresentation,
+    /// A provider exists, but cannot accept the selected service contract.
+    ServiceIncompatible,
 }
 
 /// Error details returned over IPC.
@@ -700,6 +705,24 @@ mod tests {
     #[test]
     fn protocol_version_defaults_to_current() {
         assert_eq!(ProtocolVersion::default(), ProtocolVersion::current());
+    }
+
+    #[test]
+    fn legacy_error_code_positional_bytes_are_unchanged() {
+        // Positional enums encode only their original discriminant varint.
+        for (code, bytes) in [
+            (ErrorCode::NotFound, [0]),
+            (ErrorCode::AlreadyExists, [1]),
+            (ErrorCode::InvalidRequest, [2]),
+            (ErrorCode::VersionMismatch, [3]),
+            (ErrorCode::Timeout, [4]),
+            (ErrorCode::Internal, [5]),
+        ] {
+            assert_eq!(encode(&code).unwrap(), bytes);
+            assert_eq!(decode::<ErrorCode>(&bytes).unwrap(), code);
+        }
+        assert_eq!(encode(&ErrorCode::UnsupportedRepresentation).unwrap(), [6]);
+        assert_eq!(encode(&ErrorCode::ServiceIncompatible).unwrap(), [7]);
     }
 
     #[test]

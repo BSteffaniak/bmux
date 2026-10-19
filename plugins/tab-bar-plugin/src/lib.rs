@@ -3,6 +3,21 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
+mod contract {
+    bmux_plugin_schema_macros::schema! {
+        source: "bpdl/tab-bar-plugin.bpdl",
+        imports: {
+            workspaces: {
+                source: "../workspaces-plugin-api/bpdl/workspaces-plugin.bpdl",
+                crate_path: ::bmux_workspaces_plugin_api,
+            },
+        },
+    }
+}
+
+/// Generated versioned contract for server-side presentation workflows.
+pub use contract::presentation_actions;
+
 mod group_actions;
 mod live_indicator;
 mod menu;
@@ -400,7 +415,7 @@ fn state() -> &'static CompanionHandle {
 pub struct TabBarPlugin;
 
 impl RustPlugin for TabBarPlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
+    type Contract = contract::Contract;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         let settings = Settings::parse(context.settings.as_ref())?;
@@ -418,30 +433,13 @@ impl RustPlugin for TabBarPlugin {
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
-            "presentation-input", "rename-workspace" => |req: workspaces_commands::client::RenameWorkspaceRequest, ctx| {
-                let mut client = ServiceCallerDispatchClient::new(ctx);
-                block_on_typed_dispatch(workspaces_commands::client::rename_workspace(
-                    &mut client, req.selector, req.name,
-                ))
-                .map_err(|error| ServiceResponse::error("rename_unavailable", error.to_string()))?
-                .map_err(|error| ServiceResponse::error("rename_failed", format!("{error:?}")))
-            },
-            "presentation-input", "close-workspace" => |req: workspaces_commands::client::KillWorkspaceRequest, ctx| {
-                let mut client = ServiceCallerDispatchClient::new(ctx);
-                block_on_typed_dispatch(workspaces_commands::client::kill_workspace(&mut client, req.selector))
-                    .map_err(|error| ServiceResponse::error("close_unavailable", error.to_string()))?
-                    .map_err(|error| ServiceResponse::error("close_failed", format!("{error:?}")))
-            },
-            "presentation-input", "move-selection" => |req: menu::MoveSelectionRequest, ctx| {
+            "presentation-actions/v2", "move-selection" => |req: contract::presentation_actions::client::MoveSelectionRequest, ctx| {
                 group_actions::execute(req, ctx)
             },
-            "presentation-input", "list-destinations" => |(): (), ctx| {
+            "presentation-actions/v2", "list-destinations" => |(): (), ctx| {
                 let mut client = ServiceCallerDispatchClient::new(ctx);
                 block_on_typed_dispatch(workspaces_state::client::list_workspaces(&mut client))
                     .map_err(|error| ServiceResponse::error("workspaces_unavailable", error.to_string()))
-            },
-            "presentation-input", "handle-input" => |event: AttachInputEvent, ctx| {
-                Ok::<_, ServiceResponse>(handle_input(ctx, &event))
             },
         })
     }
@@ -1577,16 +1575,24 @@ fn projection_interaction_without_marker(
     }
 }
 
-fn command_invocation<Request: serde::Serialize>(
-    endpoint: bmux_plugin::AttachInputEndpoint,
-    request: &Request,
+fn command_invocation<Endpoint: TypedServiceEndpoint>(
+    request: &Endpoint::Request,
 ) -> Option<AttachInputServiceInvocation> {
-    // This local gesture owns the move_tab interaction and emits the
-    // generated endpoint request for generic attach-side dispatch.
+    let payload = bmux_plugin_sdk::encode_service_message(request).ok()?;
+    let payload = bmux_plugin_sdk::service_contract::encode(
+        Endpoint::INTERFACE_ID.as_str(),
+        Endpoint::SERVICE_CONTRACT,
+        &payload,
+    )
+    .ok()?;
     Some(AttachInputServiceInvocation {
         response_endpoint: None,
-        endpoint,
-        payload: bmux_plugin_sdk::encode_service_message(request).ok()?,
+        endpoint: bmux_plugin::AttachInputEndpoint {
+            capability: Endpoint::CAPABILITY.to_string(),
+            interface_id: Endpoint::INTERFACE_ID.to_string(),
+            operation: Endpoint::OPERATION.to_string(),
+        },
+        payload,
     })
 }
 
@@ -1724,15 +1730,7 @@ fn update_drag_local(
                             projection::DropSide::Before => tabs_commands::TabMovePlacement::Before,
                             projection::DropSide::After => tabs_commands::TabMovePlacement::After,
                         };
-                        command_invocation(
-                            bmux_plugin::AttachInputEndpoint {
-                                capability: tabs_commands::client::MoveTabEndpoint::CAPABILITY
-                                    .to_string(),
-                                interface_id: tabs_commands::client::MoveTabEndpoint::INTERFACE_ID
-                                    .to_string(),
-                                operation: tabs_commands::client::MoveTabEndpoint::OPERATION
-                                    .to_string(),
-                            },
+                        command_invocation::<tabs_commands::client::MoveTabEndpoint>(
                             &tabs_commands::client::MoveTabRequest {
                                 source,
                                 target,
@@ -1741,14 +1739,7 @@ fn update_drag_local(
                         )
                     })
             } else {
-                command_invocation(
-                    bmux_plugin::AttachInputEndpoint {
-                        capability: tabs_commands::client::SwitchTabEndpoint::CAPABILITY
-                            .to_string(),
-                        interface_id: tabs_commands::client::SwitchTabEndpoint::INTERFACE_ID
-                            .to_string(),
-                        operation: tabs_commands::client::SwitchTabEndpoint::OPERATION.to_string(),
-                    },
+                command_invocation::<tabs_commands::client::SwitchTabEndpoint>(
                     &tabs_commands::client::SwitchTabRequest {
                         target: source.to_string(),
                     },
@@ -1769,68 +1760,6 @@ fn update_drag_local(
 fn republish_companion(companion: &mut CompanionState) -> bool {
     companion.revision = companion.revision.saturating_add(1).max(1);
     publish_companion(companion).is_ok()
-}
-
-fn update_editor(
-    context: &NativeServiceContext,
-    event: &AttachInputEvent,
-) -> Option<AttachInputResult> {
-    if event.event_kind != "key" || !matches!(event.phase.as_str(), "press" | "repeat") {
-        return None;
-    }
-    let mut guard = state().lock().ok()?;
-    let companion = guard.as_mut()?;
-    let editing = companion.editing_tab_id?;
-    let key = event.key.as_deref()?;
-    match key {
-        "esc" => {
-            cancel_rename(companion);
-        }
-        "enter" => {
-            let name = companion.edit_buffer.text().trim().to_string();
-            if name.is_empty() {
-                return Some(AttachInputResult {
-                    consumed: true,
-                    status_message: Some("tab name must not be empty".to_string()),
-                    ..AttachInputResult::default()
-                });
-            }
-            companion.editing_tab_id = None;
-            companion.edit_buffer.clear();
-            drop(guard);
-            let mut client = ServiceCallerDispatchClient::new(context);
-            return Some(
-                match block_on_typed_dispatch(tabs_commands::client::rename_tab_by_id(
-                    &mut client,
-                    editing,
-                    name,
-                )) {
-                    Ok(Ok(_)) => AttachInputResult {
-                        consumed: true,
-                        dirty: true,
-                        ..AttachInputResult::default()
-                    },
-                    Ok(Err(error)) => AttachInputResult {
-                        consumed: true,
-                        status_message: Some(format!("tab rename failed: {error:?}")),
-                        ..AttachInputResult::default()
-                    },
-                    Err(error) => AttachInputResult {
-                        consumed: true,
-                        status_message: Some(format!("tab rename unavailable: {error}")),
-                        ..AttachInputResult::default()
-                    },
-                },
-            );
-        }
-        value => rename_input::key(&mut companion.edit_buffer, value, event.modifiers),
-    }
-    let dirty = republish_companion(companion);
-    Some(AttachInputResult {
-        consumed: true,
-        dirty,
-        ..AttachInputResult::default()
-    })
 }
 
 fn begin_rename(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
@@ -1863,12 +1792,7 @@ fn begin_rename(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
 }
 
 fn rename_tab_invocation(tab_id: Uuid, name: String) -> Option<AttachInputServiceInvocation> {
-    command_invocation(
-        bmux_plugin::AttachInputEndpoint {
-            capability: tabs_commands::client::RenameTabByIdEndpoint::CAPABILITY.to_string(),
-            interface_id: tabs_commands::client::RenameTabByIdEndpoint::INTERFACE_ID.to_string(),
-            operation: tabs_commands::client::RenameTabByIdEndpoint::OPERATION.to_string(),
-        },
+    command_invocation::<tabs_commands::client::RenameTabByIdEndpoint>(
         &tabs_commands::client::RenameTabByIdRequest { id: tab_id, name },
     )
 }
@@ -2108,28 +2032,94 @@ fn handle_local_input(
     None
 }
 
-fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
-    if let Some(result) = update_editor(context, event) {
-        return result;
-    }
-    if begin_rename(state(), event) {
-        return AttachInputResult {
-            consumed: true,
-            capture_keyboard: vec!["enter".to_string(), "esc".to_string()],
-            dirty: true,
-            ..AttachInputResult::default()
-        };
-    }
-    if event.event_kind != "pointer" {
-        return AttachInputResult::default();
-    }
-    AttachInputResult::default()
-}
-
 bmux_plugin_sdk::export_plugin!(TabBarPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
+fn decode_action_payload<T: serde::de::DeserializeOwned>(
+    invocation: &AttachInputServiceInvocation,
+) -> Result<T, Box<bmux_plugin_sdk::PluginError>> {
+    let contract = match invocation.endpoint.interface_id.as_str() {
+        id if id == tabs_commands::INTERFACE_ID.as_str() => tabs_commands::SERVICE_CONTRACT,
+        id if id == workspaces_commands::INTERFACE_ID.as_str() => {
+            workspaces_commands::SERVICE_CONTRACT
+        }
+        id if id == contract::presentation_actions::INTERFACE_ID.as_str() => {
+            contract::presentation_actions::SERVICE_CONTRACT
+        }
+        _ => panic!("unexpected test action interface"),
+    };
+    let payload = bmux_plugin_sdk::service_contract::decode_for(
+        &invocation.endpoint.interface_id,
+        contract,
+        &invocation.payload,
+    )?;
+    bmux_plugin_sdk::decode_service_message(payload).map_err(Box::new)
+}
+
+#[cfg(test)]
 mod tests {
+    use bmux_plugin_sdk::PluginContract;
+    #[test]
+    fn retained_actions_bind_generated_request_and_interface_before_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let request = tabs_commands::client::SwitchTabRequest {
+            target: "target".into(),
+        };
+        let invocation =
+            command_invocation::<tabs_commands::client::SwitchTabEndpoint>(&request).unwrap();
+        assert_eq!(
+            invocation.endpoint.interface_id,
+            tabs_commands::INTERFACE_ID.as_str()
+        );
+        let effects = AtomicUsize::new(0);
+        let dispatch = |payload: &[u8]| -> Result<(), Box<bmux_plugin_sdk::PluginError>> {
+            let payload = bmux_plugin_sdk::service_contract::decode_for(
+                tabs_commands::INTERFACE_ID.as_str(),
+                tabs_commands::SERVICE_CONTRACT,
+                payload,
+            )?;
+            let decoded: tabs_commands::client::SwitchTabRequest =
+                bmux_plugin_sdk::decode_service_message(payload)?;
+            assert_eq!(decoded.target, "target");
+            effects.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let raw = bmux_plugin_sdk::encode_service_message(&request).unwrap();
+        assert!(dispatch(&raw).is_err());
+        let mismatched = bmux_plugin_sdk::service_contract::encode(
+            tabs_commands::INTERFACE_ID.as_str(),
+            &[0; 32],
+            &raw,
+        )
+        .unwrap();
+        assert!(dispatch(&mismatched).is_err());
+        let wrong_interface = bmux_plugin_sdk::service_contract::encode(
+            "old-actions/v1",
+            tabs_commands::SERVICE_CONTRACT,
+            &raw,
+        )
+        .unwrap();
+        assert!(dispatch(&wrong_interface).is_err());
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        dispatch(&invocation.payload).unwrap();
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        let rename = workspace_rename::invocation(Uuid::nil(), "new name".into()).unwrap();
+        assert_eq!(
+            rename.endpoint.interface_id,
+            workspaces_commands::INTERFACE_ID.as_str()
+        );
+        let decoded: workspaces_commands::client::RenameWorkspaceRequest =
+            decode_action_payload(&rename).unwrap();
+        assert_eq!(decoded.name, "new name");
+        assert!(<TabBarPlugin as RustPlugin>::Contract::service_contract_for(
+            "presentation-actions/v2",
+        ).is_some());
+        assert!(
+            <TabBarPlugin as RustPlugin>::Contract::service_contract_for("presentation-input",)
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn attach_companion_republishes_indicator_without_local_input() {
         use bmux_presentation_state::{PresentationFactRegistry, PresentationFactSnapshot};
@@ -2557,7 +2547,7 @@ mod tests {
                 tabs_commands::client::SwitchTabEndpoint::OPERATION.to_string()
             );
             let request: tabs_commands::client::SwitchTabRequest =
-                bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
+                decode_action_payload(&invocation).unwrap();
             assert_eq!(request.target, Uuid::from_u128(target).to_string());
         }
         assert!(
@@ -3036,8 +3026,7 @@ mod tests {
         let submitted = handle_local_input(state(), &event).unwrap();
         assert!(submitted.release_capture);
         let request: workspaces_commands::client::RenameWorkspaceRequest =
-            bmux_plugin_sdk::decode_service_message(&submitted.service_invocation.unwrap().payload)
-                .unwrap();
+            decode_action_payload(&submitted.service_invocation.unwrap()).unwrap();
         assert_eq!(request.selector.id, Some(Uuid::nil()));
         assert_eq!(request.name, "界");
         // The catalog, not the submitted edit, remains label authority.

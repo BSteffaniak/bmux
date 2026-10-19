@@ -178,7 +178,7 @@ fn truncation_unknown_version_and_trailing_bytes_fail() {
     for end in 0..bytes.len() {
         assert!(decode_binary(&bytes[..end], None).is_err());
     }
-    for version in [bmux_web_renderer::BINARY_WIRE_VERSION + 1, 2, 3] {
+    for version in [bmux_web_renderer::BINARY_WIRE_VERSION + 1, 0, 1, 2, 3, 4] {
         let mut corrupt = bytes.clone();
         corrupt[4] = version;
         assert!(decode_binary(&corrupt, None).is_err());
@@ -188,7 +188,89 @@ fn truncation_unknown_version_and_trailing_bytes_fail() {
     assert!(decode_binary(&corrupt, None).is_err());
 }
 
-// Test-only frozen v1 shapes let malformed indices/topology be constructed
+#[test]
+fn binary_v5_admission_rejects_v4_full_and_delta_before_metadata_decode() {
+    let base = frame(4, 2, 1);
+    let next = frame(4, 2, 2);
+    assert_eq!(bmux_web_renderer::BINARY_WIRE_VERSION, 5);
+    for bytes in [
+        encode_binary(&next).unwrap(),
+        encode_delta(&next, &base).unwrap(),
+    ] {
+        assert_eq!(&bytes[..5], b"BMWP\x05");
+        assert_eq!(decode_binary(&bytes, Some(&base)).unwrap(), next);
+        assert_eq!(
+            decode_binary_with_resources(&bytes, Some(&base), &[]).unwrap(),
+            next
+        );
+        assert!(resource_requirements(&bytes).is_ok());
+        // The envelope is unchanged from v4; its positional metadata is not.
+        // Even an otherwise valid payload must not be interpreted under v4.
+        let mut legacy = bytes;
+        legacy[4] = 4;
+        assert!(matches!(
+            decode_binary(&legacy, Some(&base)),
+            Err(bmux_web_renderer::DecodeError::Version)
+        ));
+        assert!(matches!(
+            decode_binary_with_resources(&legacy, Some(&base), &[]),
+            Err(bmux_web_renderer::DecodeError::Version)
+        ));
+        assert!(matches!(
+            resource_requirements(&legacy),
+            Err(bmux_web_renderer::DecodeError::Version)
+        ));
+    }
+    // Version rejection must precede positional parsing, including old/truncated metadata.
+    assert!(matches!(
+        decode_binary(b"BMWP\x04", None),
+        Err(bmux_web_renderer::DecodeError::Version)
+    ));
+}
+
+#[test]
+fn semantic_accessibility_roundtrips_full_and_delta() {
+    use bmux_tui::semantic::{SemanticAccessibility, SemanticAction, SemanticRegion};
+
+    let make_frame = |revision, label: &str| {
+        let state = PresentationState::new(Rect::new(0, 0, 12, 3));
+        let prepared = state
+            .prepare(Damage::Full, |cx| {
+                cx.push_semantic(SemanticRegion::new("plain", Rect::new(0, 0, 2, 1), "text"));
+                let mut region = SemanticRegion::new("action", Rect::new(0, 1, 2, 1), "button");
+                region.accessibility = Some(SemanticAccessibility {
+                    label: Some(label.to_owned()),
+                    description: Some("Visible action".to_owned()),
+                    text: Some("界e\u{301}".to_owned()),
+                    focused: true,
+                    selected: Some(false),
+                    actions: vec![SemanticAction::Focus, SemanticAction::Activate],
+                    ..SemanticAccessibility::default()
+                });
+                cx.push_semantic(region);
+                cx.push_semantic(SemanticRegion::new("after", Rect::new(0, 2, 2, 1), "text"));
+            })
+            .unwrap();
+        BrowserFrame::from_prepared_in_generation("semantics", revision, &prepared).unwrap()
+    };
+    let base = make_frame(1, "First");
+    let next = make_frame(2, "Updated");
+    for frame in [&base, &next] {
+        let bytes = encode_binary(frame).unwrap();
+        assert_eq!(&bytes[..5], b"BMWP\x05");
+        assert_eq!(&decode_binary(&bytes, None).unwrap(), frame);
+    }
+    let delta = encode_delta(&next, &base).unwrap();
+    assert_eq!(decode_binary(&delta, Some(&base)).unwrap(), next);
+    // Unchanged semantic metadata is inherited from the admitted base as well.
+    let inherited = mutate(&next, |value| value["revision"] = 3.into());
+    assert_eq!(
+        decode_binary(&encode_delta(&inherited, &next).unwrap(), Some(&next)).unwrap(),
+        inherited
+    );
+}
+
+// Test-only frozen envelope shapes let malformed indices/topology be constructed
 // without exposing transport internals as runtime API.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TestMessage {

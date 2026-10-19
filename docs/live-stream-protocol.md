@@ -1,8 +1,13 @@
 # Live stream protocol v1
 
 The Rust `bmux-live-relay` executable is a single-channel, persistent WebSocket
-relay. It carries the existing **BMWP version 4** presentation protocol from
+relay. It carries the existing **BMWP version 5** presentation protocol from
 `packages/web-renderer/src/wire.rs`; it does not define another scene model.
+This is a coordinated binary upgrade: v5 adds the positional
+`SemanticRegion.accessibility` option, including its explicit absent value. JSON
+remains v3. Native/WASM consumers, relay negotiation (`bmwp-5`), and immutable
+viewer assets must upgrade together; binary v1–v4 frames are rejected before
+metadata decoding. Authentication, fencing, and service interfaces are unchanged.
 All connections use TLS at the Fly edge. Internal listener: `0.0.0.0:8080`.
 No query parameters, channel IDs, cookies, or subprotocol negotiation are used.
 
@@ -57,7 +62,7 @@ persistence unavailable: 503. Authority is checked again at every admitted frame
 ## Publisher WebSocket
 
 `GET /v1/publisher/ws` uses all three headers above. Exactly one publisher socket
-is admitted. Each binary WS message is exactly one unchanged BMWP v4 full or
+is admitted. Each binary WS message is exactly one unchanged BMWP v5 full or
 delta message. Full snapshots embed all needed immutable image resources; deltas
 embed only new resources and inherit unchanged resources from their exact base.
 The relay validates against resources from that retained base and forwards original
@@ -107,7 +112,7 @@ even if WS remains connected. Pong and binary frames never extend this display
 lease. A zero duration hides output immediately. Use a monotonic browser timer.
 This bounds stale visibility independently of a stalled socket.
  On epoch/fence change the viewer
-must clear its old baseline. While live the first binary message is a BMWP v4
+must clear its old baseline. While live the first binary message is a BMWP v5
 full snapshot. After successfully decoding/applying each binary message send:
 
 ```json
@@ -205,7 +210,7 @@ Encoded repair snapshots exceeding the hard 8 MiB bound disconnect the viewer
 rather than silently skipping a baseline. Metrics include accepted frames,
 repairs, uploaded/delivered wire bytes, and current viewer count.
 
-`GET /health` returns HTTP 200 JSON `{"status":"ok","renderer":"bmwp-4"}`.
+`GET /health` returns HTTP 200 JSON `{"status":"ok","renderer":"bmwp-5"}`.
 The renderer identity derives from the shared `BINARY_WIRE_VERSION` constant. `GET /metrics` requires
 `Authorization: Bearer <metrics key>` against `METRICS_KEY_SHA256`; it returns
 Prometheus text without identities, keys or rendered content. Do not expose its

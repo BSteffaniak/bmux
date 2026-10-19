@@ -85,6 +85,35 @@ fn pause_stop_expiry_fence_and_clear_baselines() {
     assert!(relay.authority.epoch.is_none());
 }
 #[test]
+fn old_binary_versions_cannot_replace_admitted_v5_baseline() {
+    let dir = Scratch::new();
+    let mut relay = Relay::open(dir.path(), 1000).unwrap();
+    relay.start(Uuid::new_v4(), 1000).unwrap();
+    let first = frame(1);
+    let second = frame(2);
+    let snapshot = encode_binary(&first).unwrap();
+    assert_eq!(&snapshot[..5], b"BMWP\x05");
+    relay.ingest(snapshot.into(), true).unwrap();
+    let epoch = relay.authority.epoch;
+    for bytes in [
+        encode_binary(&second).unwrap(),
+        encode_delta(&second, &first).unwrap(),
+    ] {
+        for version in 1..=4 {
+            let mut legacy = bytes.clone();
+            legacy[4] = version;
+            assert!(relay.ingest(legacy.into(), false).is_err());
+            assert_eq!(relay.delivery.as_ref().unwrap().frame.as_ref(), &first);
+            assert_eq!(relay.authority.epoch, epoch);
+        }
+    }
+    relay
+        .ingest(encode_delta(&second, &first).unwrap().into(), false)
+        .unwrap();
+    assert_eq!(relay.delivery.as_ref().unwrap().frame.as_ref(), &second);
+}
+
+#[test]
 fn malformed_gap_and_oversize_do_not_replace_baseline() {
     let dir = Scratch::new();
     let mut relay = Relay::open(dir.path(), 1000).unwrap();

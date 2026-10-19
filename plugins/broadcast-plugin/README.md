@@ -125,7 +125,7 @@ output is handed off; private notes and controls are not audience content.
 
 ## Delivery guarantees
 
-The controller keeps one latest pending full inline BMWP4 repair, limited to
+The controller keeps one latest pending full inline BMWP5 repair, limited to
 8 MiB. WebSocket upload execution is serialized with pause/stop, and local gate
 changes invalidate pending and in-flight uploads. Only matching ACKs advance the
 publisher delta baseline. New connections and repair requests send a standalone

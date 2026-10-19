@@ -1577,6 +1577,16 @@ struct ActiveAppearanceForScopeRequest {
 /// Server-side state forwarders only propagate future state changes to
 /// streaming clients; a new attach must seed its local process event bus by
 /// querying the plugin-owned state surface once.
+const fn optional_appearance_absent(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::NotFound,
+            ..
+        }
+    )
+}
+
 async fn typed_active_runtime_appearance_attach(
     client: &mut StreamingBmuxClient,
 ) -> std::result::Result<RuntimeAppearance, ClientError> {
@@ -1628,11 +1638,15 @@ where
     let payload = if checked {
         #[cfg(feature = "bundled-plugin-theme")]
         {
-            bmux_plugin_sdk::service_contract::encode(bmux_theme_plugin::SERVICE_CONTRACT, &payload)
-                .map_err(|error| ClientError::ServerError {
-                    code: bmux_ipc::ErrorCode::Internal,
-                    message: format!("checking theme request: {error}"),
-                })?
+            bmux_plugin_sdk::service_contract::encode(
+                "theme-state",
+                bmux_theme_plugin::SERVICE_CONTRACT,
+                &payload,
+            )
+            .map_err(|error| ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("checking theme request: {error}"),
+            })?
         }
         #[cfg(not(feature = "bundled-plugin-theme"))]
         return Err(ClientError::UnexpectedResponse(
@@ -1660,9 +1674,18 @@ where
     } else {
         &response_bytes
     };
-    bmux_codec::from_positional_bytes(response_bytes).map_err(|error| ClientError::ServerError {
-        code: bmux_ipc::ErrorCode::Internal,
-        message: format!("decoding {operation} response: {error}"),
+    decode_runtime_appearance_response(operation, response_bytes)
+}
+
+fn decode_runtime_appearance_response(
+    operation: &str,
+    response_bytes: &[u8],
+) -> std::result::Result<RuntimeAppearance, ClientError> {
+    bmux_plugin_sdk::decode_service_message(response_bytes).map_err(|error| {
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("decoding {operation} response: {error}"),
+        }
     })
 }
 
@@ -1714,11 +1737,15 @@ where
     })?;
     let checked = bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(client);
     let payload = if checked {
-        bmux_plugin_sdk::service_contract::encode(bmux_tabs_plugin_api::SERVICE_CONTRACT, &payload)
-            .map_err(|error| ClientError::ServerError {
-                code: bmux_ipc::ErrorCode::Internal,
-                message: format!("encoding checked {operation}: {error}"),
-            })?
+        bmux_plugin_sdk::service_contract::encode(
+            "tabs-commands",
+            bmux_tabs_plugin_api::tabs_commands::SERVICE_CONTRACT,
+            &payload,
+        )
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("encoding checked {operation}: {error}"),
+        })?
     } else {
         payload
     };
@@ -4498,11 +4525,12 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
             runtime_appearance = appearance.clone();
             let _ = presentation_events.publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
         }
-        Err(error) => {
+        Err(error) if optional_appearance_absent(&error) => {
             tracing::debug!(%error, "theme plugin active-appearance query unavailable on attach startup");
             let _ = presentation_events
                 .publish_state(&RUNTIME_APPEARANCE_STATE_KIND, runtime_appearance.clone());
         }
+        Err(error) => return Err(map_attach_client_error(error)),
     }
     if let Ok(cwd) = std::env::current_dir()
         && let Some(cwd_text) = cwd.to_str()
@@ -4513,9 +4541,10 @@ async fn run_session_attach_with_host<T: AttachHost + ?Sized>(
                 let _ =
                     presentation_events.publish_state(&RUNTIME_APPEARANCE_STATE_KIND, appearance);
             }
-            Err(error) => {
+            Err(error) if optional_appearance_absent(&error) => {
                 tracing::debug!(%error, cwd = %cwd.display(), "cwd-scoped runtime appearance unavailable on attach startup");
             }
+            Err(error) => return Err(map_attach_client_error(error)),
         }
     }
 
@@ -6818,6 +6847,7 @@ fn build_attach_plugin_command_pipeline(
     plugin_id: &str,
     command_name: &str,
     args: &[String],
+    checked: bool,
 ) -> std::result::Result<bmux_ipc::ServicePipelineRequest, ClientError> {
     let request = bmux_plugin_sdk::PluginCliCommandRequest::new(
         plugin_id.to_string(),
@@ -6830,6 +6860,19 @@ fn build_attach_plugin_command_pipeline(
             message: format!("encoding plugin command pipeline request: {error}"),
         }
     })?;
+    let command_payload = if checked {
+        bmux_plugin_sdk::service_contract::encode(
+            bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1,
+            bmux_plugin_sdk::cli_bridge::cli_command::SERVICE_CONTRACT,
+            &command_payload,
+        )
+        .map_err(|error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::ServiceIncompatible,
+            message: error.to_string(),
+        })?
+    } else {
+        command_payload
+    };
     Ok(bmux_ipc::ServicePipelineRequest {
         inputs: BTreeMap::new(),
         steps: vec![bmux_ipc::ServicePipelineStep {
@@ -6864,6 +6907,12 @@ fn decode_attach_plugin_command_pipeline_results(
                 message: format!("decoding plugin command pipeline response: {error}"),
             }
         })?;
+    if command_response.protocol_version != bmux_plugin_sdk::CORE_CLI_BRIDGE_PROTOCOL_V1 {
+        return Err(ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::ServiceIncompatible,
+            message: "unsupported CLI argv response protocol version".into(),
+        });
+    }
     Ok(AttachPluginCommandPipelineExecution {
         status: command_response.exit_code,
         outcome: PluginCommandOutcome {
@@ -6883,8 +6932,19 @@ async fn run_attach_plugin_command_pipeline(
     args: &[String],
 ) -> std::result::Result<AttachPluginCommandPipelineExecution, ClientError> {
     let started_at = Instant::now();
-    let pipeline = build_attach_plugin_command_pipeline(plugin_id, command_name, args)?;
-    let results = client.invoke_service_pipeline_raw(pipeline).await?;
+    let checked = bmux_plugin_sdk::TypedDispatchClient::requires_service_contracts(client);
+    let pipeline = build_attach_plugin_command_pipeline(plugin_id, command_name, args, checked)?;
+    let mut results = client.invoke_service_pipeline_raw(pipeline).await?;
+    if checked {
+        for result in &mut results {
+            result.payload = bmux_plugin_sdk::service_contract::decode_response(&result.payload)
+                .map_err(|error| ClientError::ServerError {
+                    code: bmux_ipc::ErrorCode::ServiceIncompatible,
+                    message: error.to_string(),
+                })?
+                .to_vec();
+        }
+    }
     let execution =
         decode_attach_plugin_command_pipeline_results(plugin_id, command_name, &results)?;
     emit_attach_phase_timing(&serde_json::json!({
@@ -13675,27 +13735,13 @@ async fn invoke_plugin_surface_pointer_event(
     let result = if let Some(result) = view_state.presentation_input.invoke(&endpoint, &input) {
         result
     } else {
-        let payload = bmux_plugin_sdk::encode_service_message(&input).map_err(|error| {
-            ClientError::ServerError {
-                code: bmux_ipc::ErrorCode::Internal,
-                message: format!("encoding plugin surface pointer event: {error}"),
-            }
-        })?;
-        let response = client
-            .invoke_service_raw(
-                endpoint.capability,
-                InvokeServiceKind::Command,
-                endpoint.interface_id,
-                endpoint.operation,
-                payload,
-            )
-            .await?;
-        bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&response).map_err(
-            |error| ClientError::ServerError {
-                code: bmux_ipc::ErrorCode::Internal,
-                message: format!("decoding plugin surface pointer result: {error}"),
-            },
-        )?
+        invoke_remote_input(
+            client,
+            &view_state.presentation_extensions,
+            &endpoint,
+            &input,
+        )
+        .await?
     };
     if result.consumed && !result.preserve_focus {
         update_plugin_surface_focus(
@@ -13948,27 +13994,13 @@ async fn try_handle_plugin_surface_key(
     let result = if let Some(result) = view_state.presentation_input.invoke(&endpoint, &input) {
         result
     } else {
-        let payload = bmux_plugin_sdk::encode_service_message(&input).map_err(|error| {
-            ClientError::ServerError {
-                code: bmux_ipc::ErrorCode::Internal,
-                message: format!("encoding plugin surface keyboard event: {error}"),
-            }
-        })?;
-        let response = client
-            .invoke_service_raw(
-                endpoint.capability,
-                InvokeServiceKind::Command,
-                endpoint.interface_id,
-                endpoint.operation,
-                payload,
-            )
-            .await?;
-        bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&response).map_err(
-            |error| ClientError::ServerError {
-                code: bmux_ipc::ErrorCode::Internal,
-                message: format!("decoding plugin surface keyboard result: {error}"),
-            },
-        )?
+        invoke_remote_input(
+            client,
+            &view_state.presentation_extensions,
+            &endpoint,
+            &input,
+        )
+        .await?
     };
     if result.release_capture {
         let _ = view_state.plugin_focus.clear();
@@ -13992,6 +14024,22 @@ async fn try_handle_plugin_surface_key(
     Ok(result.consumed)
 }
 
+fn decode_surface_action_response(
+    request: &[u8],
+    response: Vec<u8>,
+) -> std::result::Result<Vec<u8>, ClientError> {
+    if bmux_plugin_sdk::service_contract::is_checked(request) {
+        bmux_plugin_sdk::service_contract::decode_response(&response)
+            .map(<[u8]>::to_vec)
+            .map_err(|error| ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::ServiceIncompatible,
+                message: error.to_string(),
+            })
+    } else {
+        Ok(response)
+    }
+}
+
 async fn execute_surface_action(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -14006,7 +14054,8 @@ async fn execute_surface_action(
             invocation.endpoint.operation.clone(),
             invocation.payload.clone(),
         )
-        .await;
+        .await
+        .and_then(|payload| decode_surface_action_response(&invocation.payload, payload));
     if let (Ok(payload), Some(endpoint)) = (&outcome, &invocation.response_endpoint)
         && let Some(result) = view_state.presentation_input.response(endpoint, payload)
     {
@@ -14052,32 +14101,55 @@ fn attach_input_hooks(view_state: &AttachViewState) -> Vec<AttachInputHook> {
     hooks
 }
 
-async fn invoke_attach_input_hook(
+async fn invoke_remote_input(
     client: &mut StreamingBmuxClient,
-    hook: &AttachInputHook,
-    event: AttachInputEvent,
+    extensions: &bmux_plugin::RenderExtensionRegistry,
+    endpoint: &bmux_plugin::AttachInputEndpoint,
+    event: &AttachInputEvent,
 ) -> std::result::Result<AttachInputResult, ClientError> {
-    let payload = bmux_plugin_sdk::encode_service_message(&event).map_err(|error| {
-        ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("encoding attach input hook event: {error}"),
-        }
-    })?;
+    let codec = extensions
+        .input_codec(endpoint)
+        .ok_or_else(|| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::UnsupportedRepresentation,
+            message: "input endpoint has no owning-plugin wire codec".into(),
+        })?;
+    let payload = codec
+        .encode_event(event)
+        .map_err(|message| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::ServiceIncompatible,
+            message,
+        })?;
+    // A registered codec is not permission to downgrade the representation.
+    bmux_plugin_sdk::service_contract::interface_id_for(&endpoint.interface_id, &payload).map_err(
+        |error| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::UnsupportedRepresentation,
+            message: error.to_string(),
+        },
+    )?;
     let response = client
         .invoke_service_raw(
-            hook.endpoint.capability.clone(),
+            endpoint.capability.clone(),
             InvokeServiceKind::Command,
-            hook.endpoint.interface_id.clone(),
-            hook.endpoint.operation.clone(),
+            endpoint.interface_id.clone(),
+            endpoint.operation.clone(),
             payload,
         )
         .await?;
-    bmux_plugin_sdk::decode_service_message::<AttachInputResult>(&response).map_err(|error| {
-        ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::Internal,
-            message: format!("decoding attach input hook result: {error}"),
-        }
-    })
+    codec
+        .decode_result(&response)
+        .map_err(|message| ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::ServiceIncompatible,
+            message,
+        })
+}
+
+async fn invoke_attach_input_hook(
+    client: &mut StreamingBmuxClient,
+    extensions: &bmux_plugin::RenderExtensionRegistry,
+    hook: &AttachInputHook,
+    event: AttachInputEvent,
+) -> std::result::Result<AttachInputResult, ClientError> {
+    invoke_remote_input(client, extensions, &hook.endpoint, &event).await
 }
 
 fn apply_attach_input_result(
@@ -14324,7 +14396,14 @@ async fn try_handle_captured_attach_input_hook_mouse(
             mouse_event.row,
         ),
     };
-    let result = match invoke_attach_input_hook(client, &capture.hook, event).await {
+    let result = match invoke_attach_input_hook(
+        client,
+        &view_state.presentation_extensions,
+        &capture.hook,
+        event,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(error) => {
             if phase == "up" {
@@ -14375,7 +14454,9 @@ async fn try_handle_uncaptured_attach_input_hook_mouse(
             focused_pane: focused.clone(),
             hovered_pane: hovered.clone(),
         };
-        let result = invoke_attach_input_hook(client, &hook, event).await?;
+        let result =
+            invoke_attach_input_hook(client, &view_state.presentation_extensions, &hook, event)
+                .await?;
         if result.capture_pointer {
             view_state.mouse.prepare_pointer_owner_acquisition();
         }
@@ -14439,7 +14520,9 @@ async fn try_handle_attach_input_hook_key(
             focused_pane: focused.clone(),
             hovered_pane: None,
         };
-        let result = invoke_attach_input_hook(client, &hook, event).await?;
+        let result =
+            invoke_attach_input_hook(client, &view_state.presentation_extensions, &hook, event)
+                .await?;
         apply_attach_input_result(view_state, hook, &result);
         if result.consumed || !result.capture_keyboard.is_empty() || result.release_capture {
             return Ok(true);
@@ -16876,6 +16959,32 @@ mod tests {
     }
 
     #[cfg(feature = "bundled-plugin-tab-bar")]
+    fn assert_checked_switch_tab_request(request: bmux_ipc::Request) {
+        use bmux_tabs_plugin_api::tabs_commands::client::{SwitchTabEndpoint, SwitchTabRequest};
+        let bmux_ipc::Request::InvokeService {
+            capability,
+            interface_id,
+            operation,
+            payload,
+            ..
+        } = request
+        else {
+            panic!("expected service")
+        };
+        assert_eq!(capability, SwitchTabEndpoint::CAPABILITY.as_str());
+        assert_eq!(interface_id, SwitchTabEndpoint::INTERFACE_ID.as_str());
+        assert_eq!(operation, SwitchTabEndpoint::OPERATION.as_str());
+        let payload = bmux_plugin_sdk::service_contract::decode_for(
+            &interface_id,
+            bmux_tabs_plugin_api::tabs_commands::SERVICE_CONTRACT,
+            &payload,
+        )
+        .unwrap();
+        let request: SwitchTabRequest = bmux_plugin_sdk::decode_service_message(payload).unwrap();
+        assert_eq!(request.target, uuid::Uuid::from_u128(42).to_string());
+    }
+
+    #[cfg(feature = "bundled-plugin-tab-bar")]
     #[tokio::test]
     async fn surface_action_uses_framed_service_transport() {
         use bmux_ipc::transport::ErasedIpcStream;
@@ -16898,25 +17007,7 @@ mod tests {
                         },
                     })
                 } else {
-                    use bmux_tabs_plugin_api::tabs_commands::client::{
-                        SwitchTabEndpoint, SwitchTabRequest,
-                    };
-                    let bmux_ipc::Request::InvokeService {
-                        capability,
-                        interface_id,
-                        operation,
-                        payload,
-                        ..
-                    } = request
-                    else {
-                        panic!("expected service")
-                    };
-                    assert_eq!(capability, SwitchTabEndpoint::CAPABILITY.as_str());
-                    assert_eq!(interface_id, SwitchTabEndpoint::INTERFACE_ID.as_str());
-                    assert_eq!(operation, SwitchTabEndpoint::OPERATION.as_str());
-                    let request: SwitchTabRequest =
-                        bmux_plugin_sdk::decode_service_message(&payload).unwrap();
-                    assert_eq!(request.target, uuid::Uuid::from_u128(42).to_string());
+                    assert_checked_switch_tab_request(request);
                     if step == 1 {
                         Response::Err(bmux_ipc::ErrorResponse {
                             code: bmux_ipc::ErrorCode::Internal,
@@ -16924,7 +17015,7 @@ mod tests {
                         })
                     } else {
                         Response::Ok(ResponsePayload::ServiceInvoked {
-                            payload: Vec::new(),
+                            payload: bmux_plugin_sdk::service_contract::encode_response(&[]),
                         })
                     }
                 };
@@ -20703,12 +20794,210 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn attach_local_input_codec_is_resolved_before_remote_transport() {
+        struct LocalCodec;
+        impl bmux_plugin::render::AttachInputCodec for LocalCodec {
+            fn endpoint(&self) -> bmux_plugin::AttachInputEndpoint {
+                bmux_plugin::AttachInputEndpoint {
+                    capability: "test.local".into(),
+                    interface_id: "local-input/v2".into(),
+                    operation: "handle".into(),
+                }
+            }
+            fn encode_event(&self, _: &AttachInputEvent) -> std::result::Result<Vec<u8>, String> {
+                Err("attach-local codec reached".into())
+            }
+            fn decode_result(&self, _: &[u8]) -> std::result::Result<AttachInputResult, String> {
+                unreachable!()
+            }
+        }
+        struct LocalExtension;
+        impl AttachRenderExtension for LocalExtension {
+            fn name(&self) -> &'static str {
+                "test.local-codec"
+            }
+            fn render_surface(
+                &self,
+                _: &mut dyn Write,
+                _: Uuid,
+                _: &ExtensionRect,
+                _: &RenderDamage,
+            ) -> io::Result<bool> {
+                Ok(false)
+            }
+            fn input_codec(
+                &self,
+                endpoint: &bmux_plugin::AttachInputEndpoint,
+            ) -> Option<Arc<dyn bmux_plugin::render::AttachInputCodec>> {
+                use bmux_plugin::render::AttachInputCodec;
+                (endpoint == &LocalCodec.endpoint())
+                    .then(|| Arc::new(LocalCodec) as Arc<dyn AttachInputCodec>)
+            }
+        }
+        use bmux_plugin::render::AttachInputCodec;
+        let registry = bmux_plugin::RenderExtensionRegistry::new();
+        registry.register(Arc::new(LocalExtension));
+        let mut client = disconnected_focus_test_client().await;
+        let event = AttachInputEvent {
+            hook_id: "local".into(),
+            event_kind: "key".into(),
+            phase: "press".into(),
+            button: None,
+            key: Some("x".into()),
+            col: None,
+            row: None,
+            wheel_delta: 0,
+            modifiers: AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        assert!(
+            matches!(invoke_remote_input(&mut client, &registry, &LocalCodec.endpoint(), &event).await,
+            Err(ClientError::ServerError { code: bmux_ipc::ErrorCode::ServiceIncompatible, message }) if message == "attach-local codec reached")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_remote_input_codec_is_explicitly_unsupported_before_transport() {
+        let mut client = disconnected_focus_test_client().await;
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "example.input".into(),
+            interface_id: "unsupported-input/v1".into(),
+            operation: "handle".into(),
+        };
+        let event = AttachInputEvent {
+            hook_id: "unknown".into(),
+            event_kind: "key".into(),
+            phase: "press".into(),
+            button: None,
+            key: Some("x".into()),
+            col: None,
+            row: None,
+            wheel_delta: 0,
+            modifiers: AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        assert!(matches!(
+            invoke_remote_input(
+                &mut client,
+                &bmux_plugin::RenderExtensionRegistry::new(),
+                &endpoint,
+                &event
+            )
+            .await,
+            Err(ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::UnsupportedRepresentation,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn surface_action_response_acceptance_tracks_request_representation() {
+        let request =
+            bmux_plugin_sdk::service_contract::encode("action/v1", &[1; 32], b"request").unwrap();
+        let accepted = bmux_plugin_sdk::service_contract::encode_response(b"result");
+        assert_eq!(
+            decode_surface_action_response(&request, accepted.clone()).unwrap(),
+            b"result"
+        );
+        assert!(decode_surface_action_response(&request, b"raw".to_vec()).is_err());
+        // Legacy responses are opaque, even if their bytes resemble an acceptance marker.
+        assert_eq!(
+            decode_surface_action_response(b"legacy request", accepted.clone()).unwrap(),
+            accepted
+        );
+    }
+
+    #[test]
+    fn appearance_startup_accepts_canonical_typed_and_explicit_legacy_positional_payloads() {
+        let appearance = RuntimeAppearance::default();
+        for bytes in [
+            bmux_plugin_sdk::encode_service_message(&appearance).unwrap(),
+            bmux_codec::to_positional_vec(&appearance).unwrap(),
+        ] {
+            let decoded = decode_runtime_appearance_response("active-appearance", &bytes).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap(),
+                serde_json::to_value(&appearance).unwrap()
+            );
+        }
+        assert!(decode_runtime_appearance_response("active-appearance", b"invalid").is_err());
+    }
+
+    #[test]
+    fn appearance_fallback_only_accepts_structured_absence() {
+        assert!(optional_appearance_absent(&ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::NotFound,
+            message: "no provider".into(),
+        }));
+        for code in [
+            bmux_ipc::ErrorCode::ServiceIncompatible,
+            bmux_ipc::ErrorCode::UnsupportedRepresentation,
+            bmux_ipc::ErrorCode::Internal,
+            bmux_ipc::ErrorCode::InvalidRequest,
+        ] {
+            assert!(!optional_appearance_absent(&ClientError::ServerError {
+                code,
+                message: "NotFound is only text here".into(),
+            }));
+        }
+        assert!(!optional_appearance_absent(&ClientError::Timeout(
+            Duration::from_secs(1)
+        )));
+        assert!(!optional_appearance_absent(
+            &ClientError::UnexpectedResponse("missing evidence")
+        ));
+    }
+
+    #[test]
+    fn checked_argv_pipeline_uses_one_generated_versioned_transport() {
+        let pipeline = build_attach_plugin_command_pipeline(
+            "example.plugin",
+            "arbitrary-command",
+            &["--arg".into()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(pipeline.steps.len(), 1);
+        let step = &pipeline.steps[0];
+        assert_eq!(
+            step.interface_id,
+            bmux_plugin_sdk::cli_bridge::cli_command::INTERFACE_ID.as_str()
+        );
+        let bmux_ipc::ServicePipelinePayload::Encoded { payload } = &step.payload else {
+            panic!("argv pipelines must not use unbound JSON templates");
+        };
+        let bytes = bmux_plugin_sdk::service_contract::decode_for(
+            &step.interface_id,
+            bmux_plugin_sdk::cli_bridge::cli_command::SERVICE_CONTRACT,
+            payload,
+        )
+        .unwrap();
+        let request: bmux_plugin_sdk::cli_bridge::cli_command::client::RunPluginRequest =
+            bmux_plugin_sdk::decode_service_message(bytes).unwrap();
+        assert_eq!(
+            request.protocol_version,
+            bmux_plugin_sdk::CORE_CLI_BRIDGE_PROTOCOL_V1
+        );
+        assert_eq!(request.plugin_id, "example.plugin");
+        assert_eq!(request.command_name, "arbitrary-command");
+        assert_eq!(request.arguments, vec!["--arg"]);
+        assert!(
+            bmux_plugin_sdk::service_contract::decode_for(&step.interface_id, &[0; 32], payload)
+                .is_err()
+        );
+    }
+
     #[test]
     fn attach_plugin_command_pipeline_is_generic_command_step() {
         let pipeline = build_attach_plugin_command_pipeline(
             "example.plugin",
             "do-thing",
             &["arg".to_string()],
+            false,
         )
         .expect("pipeline should build");
 

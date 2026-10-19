@@ -12,6 +12,9 @@
 #![allow(clippy::module_name_repetitions)]
 
 mod engine;
+mod input;
+
+pub use input::input_codec;
 pub mod glyphs;
 pub mod scripting;
 
@@ -1612,7 +1615,7 @@ fn empty_surface_for(state: &State, pane_id: Uuid) -> SurfaceDecoration {
 
 /// Identifier the decoration plugin attributes to its own generic hooks.
 const DECORATION_PLUGIN_ID: &str = "bmux.decoration";
-const DECORATION_INPUT_INTERFACE_ID: &str = "decoration-input-hooks";
+const DECORATION_INPUT_INTERFACE_ID: &str = "decoration-input-hooks/v2";
 const DECORATION_INPUT_OPERATION: &str = "handle-input";
 const DECORATION_VISUAL_PROJECTION_KIND: &str = "bmux.decoration/visual-projection";
 
@@ -3160,7 +3163,8 @@ impl RustPlugin for DecorationPlugin {
                 }));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
-            "decoration-input-hooks", "handle-input" => |req: AttachInputEvent, _ctx| {
+            "decoration-input-hooks/v2", "handle-input" => |req: bmux_decoration_plugin_api::decoration_input_hooks::client::HandleInputRequest, _ctx| {
+                let req = input::event_from_wire(req.event);
                 let result = match send_attach_input_soft(&state, req.clone(), INPUT_HOOK_SOFT_WAIT) {
                     SoftInputReply::Replied(result) => result,
                     SoftInputReply::Deferred => {
@@ -3190,7 +3194,7 @@ impl RustPlugin for DecorationPlugin {
                     }
                     SoftInputReply::Unavailable => AttachInputResult::default(),
                 };
-                Ok::<_, bmux_plugin_sdk::ServiceResponse>(result)
+                Ok::<_, bmux_plugin_sdk::ServiceResponse>(input::result_to_wire(result))
             },
         })
     }

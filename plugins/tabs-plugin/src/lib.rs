@@ -6757,6 +6757,18 @@ mod tests {
                     else {
                         panic!("expected invocation")
                     };
+                    // Mirror the checked export boundary: resolve the actual
+                    // provider contract and accept it before decoding or effects.
+                    let contract = <<TabsPlugin as RustPlugin>::Contract as
+                        bmux_plugin_sdk::PluginContract>::service_contract_for(&interface_id)
+                        .expect("tabs provider declares the routed interface");
+                    let payload = bmux_plugin_sdk::service_contract::decode_for(
+                        &interface_id,
+                        contract,
+                        &payload,
+                    )
+                    .expect("provider must accept the action contract before invocation")
+                    .to_vec();
                     let response = TabsPlugin::default().invoke_service(service_test_context(
                         &interface_id,
                         &operation,
@@ -6766,7 +6778,9 @@ mod tests {
                     ));
                     assert!(response.error.is_none(), "{:?}", response.error);
                     ResponsePayload::ServiceInvoked {
-                        payload: response.payload,
+                        payload: bmux_plugin_sdk::service_contract::encode_response(
+                            &response.payload,
+                        ),
                     }
                 };
                 stream
@@ -6845,12 +6859,25 @@ mod tests {
             for (target, expected_id) in [("alpha", alpha), ("beta", beta)] {
                 let response = dispatch_tab_over_transport(
                     if expected_id == alpha {
-                        encode_service_message(&SwitchTabArgs { target: target.into() }).unwrap()
+                        let request = encode_service_message(
+                            &bmux_tabs_plugin_api::tabs_commands::client::SwitchTabRequest {
+                                target: target.into(),
+                            },
+                        )
+                        .unwrap();
+                        bmux_plugin_sdk::service_contract::encode(
+                            bmux_tabs_plugin_api::tabs_commands::INTERFACE_ID.as_str(),
+                            bmux_tabs_plugin_api::tabs_commands::SERVICE_CONTRACT,
+                            &request,
+                        )
+                        .unwrap()
                     } else {
                         installed_switch_request(&resources, expected_id)
                     },
                 ).await;
-                let result: Result<TabAck, TabError> = decode_service_message(&response).unwrap();
+                let accepted = bmux_plugin_sdk::service_contract::decode_response(&response)
+                    .expect("checked action response carries provider acceptance");
+                let result: Result<TabAck, TabError> = decode_service_message(accepted).unwrap();
                 assert_eq!(result.unwrap().id, Some(expected_id.to_string()));
                 let (catalog, _) = events
                     .subscribe_state::<bmux_tabs_plugin_api::tabs_list::TabListSnapshot>(

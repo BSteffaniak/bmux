@@ -535,7 +535,7 @@ mod tests {
                     let request: output::client::PublishRequest =
                         bmux_plugin_sdk::decode_service_message(&payload).unwrap();
                     assert_eq!(request.refresh, self.refresh);
-                    assert_eq!(request.frame, b"BMWP\x03");
+                    assert_eq!(request.frame, b"BMWP\x05");
                     Ok(bmux_plugin_sdk::encode_service_message(&true).unwrap())
                 }
                 "unregister" => Ok(bmux_plugin_sdk::encode_service_message(&true).unwrap()),
@@ -574,7 +574,7 @@ mod tests {
                 &mut client,
                 source.clone(),
                 state.refresh,
-                b"BMWP\x03".to_vec()
+                b"BMWP\x05".to_vec()
             )
             .await
             .unwrap()

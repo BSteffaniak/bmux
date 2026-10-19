@@ -27,8 +27,15 @@ toml = { workspace = true, features = ["parse"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["serde", "std"] }
 
+[build-dependencies]
+bmux_plugin_schema = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[package.metadata.cargo-machete]
+# Used by build.rs to compile bpdl/cli-bridge.bpdl; machete misses this build dependency.
+ignored = ["bmux_plugin_schema"]
 
 [features]
 default = []

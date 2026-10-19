@@ -1,0 +1,19 @@
+// One argv transport; command arguments are interpreted only by the existing executor.
+plugin bmux.cli-bridge version 1;
+capability COMMANDS = bmux.commands;
+@capability(COMMANDS)
+@interface-version(1)
+interface cli-command {
+    record core-cli-command-response {
+        protocol-version: u16,
+        exit-code: i32,
+        error: string?,
+    }
+    record plugin-cli-command-response {
+        protocol-version: u16,
+        exit-code: i32,
+        error: string?,
+    }
+    command run_path(protocol-version: u16, command-path: list<string>, arguments: list<string>) -> core-cli-command-response;
+    command run_plugin(protocol-version: u16, plugin-id: string, command-name: string, arguments: list<string>) -> plugin-cli-command-response;
+}

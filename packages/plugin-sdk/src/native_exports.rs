@@ -1,3 +1,4 @@
+mod replay;
 mod service_read;
 use crate::{
     NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
@@ -185,6 +186,9 @@ const SERVICE_STATUS_INVALID_ARGUMENT: i32 = 2;
 const SERVICE_STATUS_DECODE_FAILED: i32 = 3;
 const SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 const SERVICE_STATUS_ENCODE_FAILED: i32 = 5;
+// Checked-export ABI: generated provider evidence was rejected before execution.
+// Distinct from status 3 (malformed envelope/context decoding).
+const SERVICE_STATUS_CONTRACT_REJECTED: i32 = 6;
 const SERVICE_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
 
 // ── Plugin trait ─────────────────────────────────────────────────────────────
@@ -800,9 +804,19 @@ fn checked_context<C: crate::PluginContract>(
 ) -> crate::Result<(NativeServiceContext, bool)> {
     let checked = crate::service_contract::is_checked(&context.request.payload);
     if checked {
+        let interface = crate::service_contract::interface_id(&context.request.payload)?;
+        if interface != context.request.service.interface_id {
+            return Err(crate::PluginError::ServiceProtocol {
+                details: "checked interface does not match routed service".into(),
+            });
+        }
+        let expected = C::service_contract_for(interface).ok_or_else(|| {
+            crate::PluginError::ServiceProtocol {
+                details: "provider has no generated contract for checked interface".into(),
+            }
+        })?;
         context.request.payload =
-            crate::service_contract::decode(C::service_contract(), &context.request.payload)?
-                .to_vec();
+            crate::service_contract::decode(expected, &context.request.payload)?.to_vec();
     }
     Ok((context, checked))
 }
@@ -812,6 +826,25 @@ fn checked_response(mut response: ServiceResponse, checked: bool) -> ServiceResp
         response.payload = crate::service_contract::encode_response(&response.payload);
     }
     response
+}
+
+// Native retry supports the canonical current envelope in typed-stable or
+// positional encoding. Pre-invocation-ID migration frames are not retryable:
+// the general decoder synthesizes a new identity every time they are decoded.
+// Require a canonical round trip with the explicit ID instead of guessing one.
+fn decode_retryable_request(
+    input: &[u8],
+) -> crate::Result<(crate::PluginInvocationId, u64, NativeServiceContext)> {
+    let decoded = decode_service_envelope_with_invocation_id(input, ServiceEnvelopeKind::Request)?;
+    let envelope: crate::ServiceEnvelope = crate::decode_service_message(input)?;
+    let explicit_identity = crate::encode_service_message(&envelope)? == input
+        || bmux_codec::to_positional_vec(&envelope).is_ok_and(|encoded| encoded == input);
+    if !explicit_identity || decoded.0 != envelope.invocation_id {
+        return Err(crate::PluginError::ServiceProtocol {
+            details: "native service retry requires an explicit stable invocation ID".into(),
+        });
+    }
+    Ok(decoded)
 }
 
 pub fn invoke_service_concurrent_export<P: ConcurrentRustPlugin>(
@@ -827,24 +860,32 @@ pub fn invoke_service_concurrent_export<P: ConcurrentRustPlugin>(
     }
 
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let Ok((invocation_id, request_id, context)) = decode_service_envelope_with_invocation_id::<
-        NativeServiceContext,
-    >(input, ServiceEnvelopeKind::Request) else {
+    let Ok((invocation_id, request_id, context)) = decode_retryable_request(input) else {
         return SERVICE_STATUS_DECODE_FAILED;
     };
-    let Ok((context, checked)) = checked_context::<P::Contract>(context) else {
-        return SERVICE_STATUS_DECODE_FAILED;
+    let replay_id = invocation_id.clone();
+    let encoded =
+        replay::global().invoke::<P>(Arc::as_ptr(instance).addr(), 0, replay_id, input, || {
+            let Ok((context, checked)) = checked_context::<P::Contract>(context) else {
+                return Err(SERVICE_STATUS_CONTRACT_REJECTED);
+            };
+            let response = instance.invoke_service_concurrent(context);
+            let response = checked_response(response, checked);
+            let Ok(encoded) = encode_service_envelope_with_invocation_id(
+                invocation_id,
+                request_id,
+                ServiceEnvelopeKind::Response,
+                &response,
+            ) else {
+                return Err(SERVICE_STATUS_ENCODE_FAILED);
+            };
+            Ok(encoded)
+        });
+    let encoded = match encoded {
+        Ok(encoded) => encoded,
+        Err(status) => return status,
     };
-    let response = instance.invoke_service_concurrent(context);
-    let response = checked_response(response, checked);
-    let Ok(encoded) = encode_service_envelope_with_invocation_id(
-        invocation_id,
-        request_id,
-        ServiceEnvelopeKind::Response,
-        &response,
-    ) else {
-        return SERVICE_STATUS_ENCODE_FAILED;
-    };
+
     unsafe {
         *output_len = encoded.len();
     }
@@ -871,23 +912,35 @@ pub fn invoke_streaming_service_concurrent_export<P: ConcurrentRustPlugin>(
     }
 
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let Ok((invocation_id, request_id, service)) = decode_service_envelope_with_invocation_id::<
-        NativeServiceContext,
-    >(input, ServiceEnvelopeKind::Request) else {
+    let Ok((invocation_id, request_id, service)) = decode_retryable_request(input) else {
         return SERVICE_STATUS_DECODE_FAILED;
     };
-    let response = instance.invoke_streaming_service_concurrent(NativeStreamingServiceContext {
-        service,
-        events: crate::ServiceEventSinkHandle::noop(),
-    });
-    let Ok(encoded) = encode_service_envelope_with_invocation_id(
-        invocation_id,
-        request_id,
-        ServiceEnvelopeKind::Response,
-        &response,
-    ) else {
-        return SERVICE_STATUS_ENCODE_FAILED;
+    if crate::service_contract::is_checked(&service.request.payload) {
+        return SERVICE_STATUS_DECODE_FAILED;
+    }
+    let replay_id = invocation_id.clone();
+    let encoded =
+        replay::global().invoke::<P>(Arc::as_ptr(instance).addr(), 1, replay_id, input, || {
+            let response =
+                instance.invoke_streaming_service_concurrent(NativeStreamingServiceContext {
+                    service,
+                    events: crate::ServiceEventSinkHandle::noop(),
+                });
+            let Ok(encoded) = encode_service_envelope_with_invocation_id(
+                invocation_id,
+                request_id,
+                ServiceEnvelopeKind::Response,
+                &response,
+            ) else {
+                return Err(SERVICE_STATUS_ENCODE_FAILED);
+            };
+            Ok(encoded)
+        });
+    let encoded = match encoded {
+        Ok(encoded) => encoded,
+        Err(status) => return status,
     };
+
     unsafe {
         *output_len = encoded.len();
     }
@@ -951,58 +1004,70 @@ pub fn invoke_service_export<P: RustPlugin>(
     }
 
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let Ok((invocation_id, request_id, context)) = decode_service_envelope_with_invocation_id::<
-        NativeServiceContext,
-    >(input, ServiceEnvelopeKind::Request) else {
+    let Ok((invocation_id, request_id, context)) = decode_retryable_request(input) else {
         return SERVICE_STATUS_DECODE_FAILED;
     };
+    let replay_id = invocation_id.clone();
+    let encoded = replay::global().invoke::<P>(
+        std::ptr::from_ref(instance).addr(),
+        0,
+        replay_id,
+        input,
+        || {
+            let Ok((context, checked)) = checked_context::<P::Contract>(context) else {
+                return Err(SERVICE_STATUS_CONTRACT_REJECTED);
+            };
+            let plugin_id = context.plugin_id.clone();
+            let interface_id = context.request.service.interface_id.clone();
+            let operation = context.request.operation.clone();
+            let lock_started = Instant::now();
+            let Ok(response) = service_read::with_service_read(instance, |plugin| {
+                let lock_wait = lock_started.elapsed();
+                if lock_wait > PLUGIN_LOCK_LATENCY_BUDGET {
+                    tracing::warn!(
+                        request_id,
+                        plugin_id = plugin_id.as_str(),
+                        interface_id = interface_id.as_str(),
+                        operation = operation.as_str(),
+                        wait_us = lock_wait.as_micros(),
+                        "plugin service read lock wait exceeded latency budget"
+                    );
+                }
 
-    let Ok((context, checked)) = checked_context::<P::Contract>(context) else {
-        return SERVICE_STATUS_DECODE_FAILED;
-    };
-    let plugin_id = context.plugin_id.clone();
-    let interface_id = context.request.service.interface_id.clone();
-    let operation = context.request.operation.clone();
-    let lock_started = Instant::now();
-    let Ok(response) = service_read::with_service_read(instance, |plugin| {
-        let lock_wait = lock_started.elapsed();
-        if lock_wait > PLUGIN_LOCK_LATENCY_BUDGET {
-            tracing::warn!(
+                let call_started = Instant::now();
+                let response = plugin.invoke_service(context);
+                let lock_hold = call_started.elapsed();
+                if lock_hold > PLUGIN_LOCK_LATENCY_BUDGET {
+                    tracing::warn!(
+                        request_id,
+                        plugin_id = plugin_id.as_str(),
+                        interface_id = interface_id.as_str(),
+                        operation = operation.as_str(),
+                        hold_us = lock_hold.as_micros(),
+                        "plugin service read lock hold exceeded latency budget"
+                    );
+                }
+                response
+            }) else {
+                return Err(SERVICE_STATUS_PLUGIN_UNAVAILABLE);
+            };
+            let response = checked_response(response, checked);
+
+            let Ok(encoded) = encode_service_envelope_with_invocation_id(
+                invocation_id,
                 request_id,
-                plugin_id = plugin_id.as_str(),
-                interface_id = interface_id.as_str(),
-                operation = operation.as_str(),
-                wait_us = lock_wait.as_micros(),
-                "plugin service read lock wait exceeded latency budget"
-            );
-        }
+                ServiceEnvelopeKind::Response,
+                &response,
+            ) else {
+                return Err(SERVICE_STATUS_ENCODE_FAILED);
+            };
 
-        let call_started = Instant::now();
-        let response = plugin.invoke_service(context);
-        let lock_hold = call_started.elapsed();
-        if lock_hold > PLUGIN_LOCK_LATENCY_BUDGET {
-            tracing::warn!(
-                request_id,
-                plugin_id = plugin_id.as_str(),
-                interface_id = interface_id.as_str(),
-                operation = operation.as_str(),
-                hold_us = lock_hold.as_micros(),
-                "plugin service read lock hold exceeded latency budget"
-            );
-        }
-        response
-    }) else {
-        return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
-    };
-    let response = checked_response(response, checked);
-
-    let Ok(encoded) = encode_service_envelope_with_invocation_id(
-        invocation_id,
-        request_id,
-        ServiceEnvelopeKind::Response,
-        &response,
-    ) else {
-        return SERVICE_STATUS_ENCODE_FAILED;
+            Ok(encoded)
+        },
+    );
+    let encoded = match encoded {
+        Ok(encoded) => encoded,
+        Err(status) => return status,
     };
 
     unsafe {
@@ -1035,29 +1100,44 @@ pub fn invoke_streaming_service_export<P: RustPlugin>(
     }
 
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let Ok((invocation_id, request_id, service)) = decode_service_envelope_with_invocation_id::<
-        NativeServiceContext,
-    >(input, ServiceEnvelopeKind::Request) else {
+    let Ok((invocation_id, request_id, service)) = decode_retryable_request(input) else {
         return SERVICE_STATUS_DECODE_FAILED;
     };
+    if crate::service_contract::is_checked(&service.request.payload) {
+        return SERVICE_STATUS_DECODE_FAILED;
+    }
+    let replay_id = invocation_id.clone();
+    let encoded = replay::global().invoke::<P>(
+        std::ptr::from_ref(instance).addr(),
+        1,
+        replay_id,
+        input,
+        || {
+            let context = NativeStreamingServiceContext {
+                service,
+                events: crate::ServiceEventSinkHandle::noop(),
+            };
+            let Ok(response) = service_read::with_service_read(instance, |plugin| {
+                plugin.invoke_streaming_service(context)
+            }) else {
+                return Err(SERVICE_STATUS_PLUGIN_UNAVAILABLE);
+            };
 
-    let context = NativeStreamingServiceContext {
-        service,
-        events: crate::ServiceEventSinkHandle::noop(),
-    };
-    let Ok(response) = service_read::with_service_read(instance, |plugin| {
-        plugin.invoke_streaming_service(context)
-    }) else {
-        return SERVICE_STATUS_PLUGIN_UNAVAILABLE;
-    };
+            let Ok(encoded) = encode_service_envelope_with_invocation_id(
+                invocation_id,
+                request_id,
+                ServiceEnvelopeKind::Response,
+                &response,
+            ) else {
+                return Err(SERVICE_STATUS_ENCODE_FAILED);
+            };
 
-    let Ok(encoded) = encode_service_envelope_with_invocation_id(
-        invocation_id,
-        request_id,
-        ServiceEnvelopeKind::Response,
-        &response,
-    ) else {
-        return SERVICE_STATUS_ENCODE_FAILED;
+            Ok(encoded)
+        },
+    );
+    let encoded = match encoded {
+        Ok(encoded) => encoded,
+        Err(status) => return status,
     };
 
     unsafe {
@@ -1131,8 +1211,8 @@ mod concurrent_tests {
     struct TestServiceContract;
 
     impl crate::PluginContract for TestServiceContract {
-        fn service_contract() -> &'static [u8] {
-            b"test-exact-service-v1"
+        fn service_contract_for(interface_id: &str) -> Option<&'static [u8]> {
+            (interface_id == "test-service").then_some(&[7; 32])
         }
         fn service_declarations() -> crate::Result<Vec<crate::PluginService>> {
             Ok(Vec::new())
@@ -1248,6 +1328,133 @@ mod concurrent_tests {
         }
     }
 
+    #[derive(Default)]
+    struct MutatingPlugin(AtomicUsize);
+
+    impl MutatingPlugin {
+        fn mutate(&self) -> ServiceResponse {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(std::time::Duration::from_millis(5));
+            ServiceResponse::ok(vec![42; 17_000])
+        }
+    }
+
+    impl super::RustPlugin for MutatingPlugin {
+        type Contract = crate::NoPluginContract;
+        fn invoke_service(&self, _context: NativeServiceContext) -> ServiceResponse {
+            self.mutate()
+        }
+    }
+
+    impl ConcurrentRustPlugin for MutatingPlugin {
+        type Contract = crate::NoPluginContract;
+        fn invoke_service_concurrent(&self, _context: NativeServiceContext) -> ServiceResponse {
+            self.mutate()
+        }
+    }
+
+    fn assert_growth_replays_once(
+        call: impl Fn(&[u8], &mut [u8], &mut usize) -> i32 + Sync,
+        count: impl Fn() -> usize,
+    ) {
+        let invocation = PluginInvocationId::new();
+        let request = encode_service_envelope_with_invocation_id(
+            invocation.clone(),
+            9,
+            ServiceEnvelopeKind::Request,
+            &service_context(vec![1]),
+        )
+        .unwrap();
+        let mut size = 0;
+        assert_eq!(
+            call(&request, &mut [0; 1], &mut size),
+            super::SERVICE_STATUS_BUFFER_TOO_SMALL
+        );
+        assert!(size > 17_000);
+        // All simultaneous retries must receive the originally encoded outcome.
+        let barrier = Barrier::new(8);
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let mut output = vec![0; size];
+                    let mut len = 0;
+                    assert_eq!(
+                        call(&request, &mut output, &mut len),
+                        super::SERVICE_STATUS_OK
+                    );
+                    let (id, request_id, response): (_, _, ServiceResponse) =
+                        decode_service_envelope_with_invocation_id(
+                            &output[..len],
+                            ServiceEnvelopeKind::Response,
+                        )
+                        .unwrap();
+                    assert_eq!(id, invocation);
+                    assert_eq!(request_id, 9);
+                    assert_eq!(response.payload, vec![42; 17_000]);
+                });
+            }
+        });
+        let conflicting = encode_service_envelope_with_invocation_id(
+            invocation,
+            9,
+            ServiceEnvelopeKind::Request,
+            &service_context(vec![2]),
+        )
+        .unwrap();
+        assert_eq!(
+            call(&conflicting, &mut [], &mut 0),
+            super::SERVICE_STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(count(), 1);
+    }
+
+    #[test]
+    fn oversized_mutating_responses_are_retained_by_both_export_models() {
+        for streaming in [false, true] {
+            let plugin: &'static std::sync::RwLock<MutatingPlugin> =
+                Box::leak(Box::new(std::sync::RwLock::new(MutatingPlugin::default())));
+            let export = if streaming {
+                super::invoke_streaming_service_export::<MutatingPlugin>
+            } else {
+                super::invoke_service_export::<MutatingPlugin>
+            };
+            assert_growth_replays_once(
+                |input, output, len| {
+                    export(
+                        plugin,
+                        input.as_ptr(),
+                        input.len(),
+                        output.as_mut_ptr(),
+                        output.len(),
+                        len,
+                    )
+                },
+                || plugin.read().unwrap().0.load(Ordering::SeqCst),
+            );
+            let plugin: &'static Arc<MutatingPlugin> =
+                Box::leak(Box::new(Arc::new(MutatingPlugin::default())));
+            let export = if streaming {
+                super::invoke_streaming_service_concurrent_export::<MutatingPlugin>
+            } else {
+                super::invoke_service_concurrent_export::<MutatingPlugin>
+            };
+            assert_growth_replays_once(
+                |input, output, len| {
+                    export(
+                        plugin,
+                        input.as_ptr(),
+                        input.len(),
+                        output.as_mut_ptr(),
+                        output.len(),
+                        len,
+                    )
+                },
+                || plugin.0.load(Ordering::SeqCst),
+            );
+        }
+    }
+
     #[test]
     fn concurrent_plugin_handles_parallel_calls() {
         let plugin = Arc::new(TestConcurrentPlugin::default());
@@ -1301,15 +1508,202 @@ mod concurrent_tests {
     }
 
     #[test]
+    fn native_export_accepts_existing_large_request_transport() {
+        let instance: &'static Arc<MutatingPlugin> =
+            Box::leak(Box::new(Arc::new(MutatingPlugin::default())));
+        let input = encode_service_envelope_with_invocation_id(
+            PluginInvocationId::new(),
+            9,
+            ServiceEnvelopeKind::Request,
+            &service_context(vec![42; 2 * 1024 * 1024]),
+        )
+        .unwrap();
+        assert!(input.len() > 1024 * 1024);
+        let mut output = vec![0; 32 * 1024];
+        for _ in 0..2 {
+            let mut len = 0;
+            assert_eq!(
+                super::invoke_service_concurrent_export(
+                    instance,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &raw mut len,
+                ),
+                super::SERVICE_STATUS_OK
+            );
+            assert!(len > 17_000);
+        }
+        assert_eq!(instance.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_replay_identity_is_the_provider_not_the_arc_wrapper() {
+        let first: &'static Arc<MutatingPlugin> =
+            Box::leak(Box::new(Arc::new(MutatingPlugin::default())));
+        let alias: &'static Arc<MutatingPlugin> = Box::leak(Box::new(Arc::clone(first)));
+        let input = encode_service_envelope_with_invocation_id(
+            PluginInvocationId::new(),
+            9,
+            ServiceEnvelopeKind::Request,
+            &service_context(vec![]),
+        )
+        .unwrap();
+        let mut len = 0;
+        for instance in [first, alias] {
+            assert_eq!(
+                super::invoke_service_concurrent_export(
+                    instance,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    0,
+                    &raw mut len,
+                ),
+                super::SERVICE_STATUS_BUFFER_TOO_SMALL
+            );
+        }
+        assert_eq!(first.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_retry_requires_stable_envelope_identity() {
+        #[derive(serde::Serialize)]
+        struct PreInvocationEnvelope {
+            version: crate::ServiceProtocolVersion,
+            request_id: u64,
+            kind: ServiceEnvelopeKind,
+            #[serde(with = "bmux_codec::serde_bytes_vec")]
+            payload: Vec<u8>,
+        }
+        let old = PreInvocationEnvelope {
+            version: crate::ServiceProtocolVersion::current(),
+            request_id: 1,
+            kind: ServiceEnvelopeKind::Request,
+            payload: crate::encode_service_message(&service_context(vec![])).unwrap(),
+        };
+        for bytes in [
+            crate::encode_service_message(&old).unwrap(),
+            bmux_codec::to_positional_vec(&old).unwrap(),
+        ] {
+            assert!(super::decode_retryable_request(&bytes).is_err());
+        }
+        let current = crate::ServiceEnvelope::with_invocation_id(
+            PluginInvocationId::new(),
+            old.request_id,
+            old.kind,
+            old.payload,
+        );
+        for bytes in [
+            crate::encode_service_message(&current).unwrap(),
+            bmux_codec::to_positional_vec(&current).unwrap(),
+        ] {
+            assert_eq!(
+                super::decode_retryable_request(&bytes).unwrap().0,
+                current.invocation_id
+            );
+        }
+    }
+
+    #[test]
+    fn checked_interface_is_bound_to_route_before_contract_lookup() {
+        struct UnexpectedLookup;
+        impl crate::PluginContract for UnexpectedLookup {
+            fn service_contract_for(_: &str) -> Option<&'static [u8]> {
+                panic!("routed interface mismatch must reject before lookup")
+            }
+            fn service_declarations() -> crate::Result<Vec<crate::PluginService>> {
+                Ok(Vec::new())
+            }
+        }
+        let mismatched = service_context(
+            crate::service_contract::encode("other-service", &[7; 32], b"request").unwrap(),
+        );
+        assert!(super::checked_context::<UnexpectedLookup>(mismatched).is_err());
+        let unknown = service_context(
+            crate::service_contract::encode("test-service", &[7; 32], b"request").unwrap(),
+        );
+        assert!(super::checked_context::<crate::NoPluginContract>(unknown).is_err());
+    }
+
+    impl super::RustPlugin for TestConcurrentPlugin {
+        type Contract = TestServiceContract;
+        fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+            self.invoke_service_concurrent(context)
+        }
+    }
+
+    #[test]
+    fn contract_rejection_is_distinct_from_decode_failure_for_both_models() {
+        let mutable: &'static std::sync::RwLock<TestConcurrentPlugin> = Box::leak(Box::new(
+            std::sync::RwLock::new(TestConcurrentPlugin::default()),
+        ));
+        let concurrent: &'static Arc<TestConcurrentPlugin> =
+            Box::leak(Box::new(Arc::new(TestConcurrentPlugin::default())));
+        let request = encode_service_envelope_with_invocation_id(
+            PluginInvocationId::new(),
+            9,
+            ServiceEnvelopeKind::Request,
+            &service_context(
+                crate::service_contract::encode("test-service", &[8; 32], b"request").unwrap(),
+            ),
+        )
+        .unwrap();
+        let call = |input: &[u8], concurrent_model: bool| {
+            let mut len = 0;
+            if concurrent_model {
+                super::invoke_service_concurrent_export(
+                    concurrent,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    0,
+                    &raw mut len,
+                )
+            } else {
+                super::invoke_service_export(
+                    mutable,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    0,
+                    &raw mut len,
+                )
+            }
+        };
+        for concurrent_model in [false, true] {
+            // The provider has this interface, but the digest is incompatible.
+            for _ in 0..2 {
+                assert_eq!(
+                    call(&request, concurrent_model),
+                    super::SERVICE_STATUS_CONTRACT_REJECTED
+                );
+            }
+            assert_eq!(
+                call(b"invalid envelope", concurrent_model),
+                super::SERVICE_STATUS_DECODE_FAILED
+            );
+        }
+        assert_eq!(
+            mutable
+                .read()
+                .unwrap()
+                .max_active_calls
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(concurrent.max_active_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn checked_export_rejects_mismatch_before_provider_execution() {
         let plugin: &'static Arc<TestConcurrentPlugin> =
             Box::leak(Box::new(Arc::new(TestConcurrentPlugin::default())));
-        for (contract, accepted) in [
-            (b"wrong-contract".as_slice(), false),
-            (b"test-exact-service-v1".as_slice(), true),
-        ] {
-            let context =
-                service_context(crate::service_contract::encode(contract, b"request").unwrap());
+        for (contract, accepted) in [(&[8; 32][..], false), (&[7; 32][..], true)] {
+            let context = service_context(
+                crate::service_contract::encode("test-service", contract, b"request").unwrap(),
+            );
             let input = encode_service_envelope_with_invocation_id(
                 PluginInvocationId::new(),
                 9,
@@ -1341,7 +1735,7 @@ mod concurrent_tests {
                 );
                 assert_eq!(plugin.max_active_calls.load(Ordering::SeqCst), 1);
             } else {
-                assert_eq!(status, super::SERVICE_STATUS_DECODE_FAILED);
+                assert_eq!(status, super::SERVICE_STATUS_CONTRACT_REJECTED);
                 assert_eq!(plugin.max_active_calls.load(Ordering::SeqCst), 0);
             }
         }

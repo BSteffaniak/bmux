@@ -11,6 +11,24 @@ fn paths(root: &tempfile::TempDir) -> ConfigPaths {
 }
 
 #[test]
+fn clean_release_is_not_extended_by_an_inherited_open_description() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = paths(&root);
+    let first = StartupOwnership::acquire(&paths).unwrap();
+    // try_clone shares the same open file description as a descriptor inherited
+    // by fork, without racing another thread or relying on exec timing.
+    let inherited = first.claim_file.lock().unwrap().try_clone().unwrap();
+    assert!(StartupOwnership::acquire(&paths).is_err());
+    drop(first);
+    let replacement = StartupOwnership::acquire(&paths).unwrap();
+    drop(inherited);
+    // Closing the old description must not unlock the replacement's claim.
+    assert!(StartupOwnership::acquire(&paths).is_err());
+    drop(replacement);
+    assert!(StartupOwnership::acquire(&paths).is_ok());
+}
+
+#[test]
 fn lifetime_exclusion_includes_before_readiness_and_releases_on_exit() {
     let root = tempfile::tempdir().unwrap();
     let paths = paths(&root);
@@ -42,16 +60,47 @@ fn simultaneous_server_starts_have_one_lifetime_owner() {
 }
 
 #[cfg(unix)]
+#[test]
+fn clean_stop_socket_owner_fixture() {
+    let Some(root) = std::env::var_os("BMUX_CLEAN_STOP_FIXTURE_ROOT") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let paths = ConfigPaths::new(
+        root.join("config"),
+        root.join("runtime"),
+        root.join("data"),
+        root.join("state"),
+    );
+    let claim = StartupOwnership::acquire(&paths).unwrap();
+    let socket = std::os::unix::net::UnixListener::bind(paths.server_socket()).unwrap();
+    claim.record_bound_endpoint().unwrap();
+    drop(socket);
+    drop(claim);
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn clean_stop_then_restart_reclaims_only_recorded_socket() {
     let root = tempfile::tempdir().unwrap();
     let paths = paths(&root);
-    let first = StartupOwnership::acquire(&paths).unwrap();
-    first.prepare_endpoint().await.unwrap();
-    let socket = tokio::net::UnixListener::bind(paths.server_socket()).unwrap();
-    first.record_bound_endpoint().unwrap();
-    drop(socket);
-    drop(first);
+    // The listener must never exist in the parallel test runner: unrelated
+    // concurrent forks can inherit it until exec, correctly making it look live.
+    // An isolated owner has no sibling threads forking; waiting for exit is the
+    // deterministic close fence, not a refusal retry or relaxed ownership check.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "runtime::startup_ownership::tests::clean_stop_socket_owner_fixture",
+            "--nocapture",
+        ])
+        .env("BMUX_CLEAN_STOP_FIXTURE_ROOT", root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "socket owner fixture failed: {output:?}"
+    );
     let second = StartupOwnership::acquire(&paths).unwrap();
     second.prepare_endpoint().await.unwrap();
     assert!(!paths.server_socket().exists());

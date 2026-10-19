@@ -24,12 +24,32 @@ const CLAIM_NAME: &str = "server-lifetime.lock";
 
 pub(super) struct StartupOwnership {
     claim_file: Mutex<File>,
+    owner_process: u32,
     #[cfg(unix)]
     socket: PathBuf,
     #[cfg(unix)]
     recorded: Mutex<bool>,
     #[cfg(windows)]
     pipe_name: String,
+}
+
+impl Drop for StartupOwnership {
+    fn drop(&mut self) {
+        if std::process::id() != self.owner_process {
+            return;
+        }
+        // flock belongs to the open file description, which a concurrent fork
+        // can briefly inherit even with CLOEXEC. Release explicitly when this
+        // owner ends, rather than waiting for every inherited descriptor to close.
+        // No claim is ever handed to a child as ownership authority.
+        let file = self
+            .claim_file
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(error) = file.unlock() {
+            tracing::warn!(%error, "failed releasing runtime lifetime claim");
+        }
+    }
 }
 
 impl StartupOwnership {
@@ -74,6 +94,7 @@ impl StartupOwnership {
         }
         Ok(Self {
             claim_file: Mutex::new(file),
+            owner_process: std::process::id(),
             #[cfg(unix)]
             socket: paths.server_socket(),
             #[cfg(unix)]

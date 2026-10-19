@@ -151,7 +151,7 @@ class Harness:
 
     def frame(self):
         state, body = self.stack.snapshot()
-        require(state['state'] == 'live' and body and body.startswith(b'BMWP\x04'), 'complete BMWP4 audience frame missing')
+        require(state['state'] == 'live' and body and body.startswith(b'BMWP\x05'), 'complete BMWP5 audience frame missing')
         return body, {}
 
     def inspect(self, expected, absent):

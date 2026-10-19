@@ -86,16 +86,10 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
     let non_eq_types = non_eq_type_set(schema);
     let module_counts = interface_module_counts(schema);
     out.push_str("// AUTO-GENERATED FROM BPDL. DO NOT EDIT BY HAND.\n\n");
-    out.push_str("use serde::{Deserialize, Serialize};\n\n");
-    let contract = crate::canonical::service_contract(schema, imports);
-    let _ = writeln!(
-        out,
-        "/// Exact BPDL v1 wire contract including imported definitions.\npub const SERVICE_CONTRACT: &[u8] = &{contract:?};\n"
-    );
     emit_capabilities(&schema.capabilities, &mut out);
     for iface in &schema.interfaces {
         emit_interface(
-            &schema.plugin.plugin_id,
+            schema,
             iface,
             module_counts.get(iface.name.as_str()).copied().unwrap_or(0) > 1,
             imports,
@@ -217,7 +211,7 @@ fn emit_capabilities(capabilities: &[CapabilityDecl], out: &mut String) {
 }
 
 fn emit_interface(
-    plugin_id: &str,
+    schema: &Schema,
     iface: &Interface,
     duplicate_name: bool,
     imports: &ImportMap,
@@ -225,9 +219,14 @@ fn emit_interface(
     non_eq_types: &NonEqTypeSet,
     out: &mut String,
 ) {
+    let plugin_id = &schema.plugin.plugin_id;
     let module_name = interface_module_name(iface, duplicate_name);
     let _ = writeln!(out, "pub mod {module_name} {{");
-    out.push_str("    use super::*;\n\n");
+    let contract = crate::canonical::interface_contract(schema, iface, imports);
+    let _ = writeln!(
+        out,
+        "    /// SHA-256 of canonical interface wire contract v2.\n    pub const SERVICE_CONTRACT: &[u8] = &{contract:?};\n"
+    );
 
     for item in &iface.items {
         match item {
@@ -262,9 +261,11 @@ fn emit_record(
 ) {
     let name = pascal_case(&r.name);
     if non_eq_types.contains(&r.name) {
-        out.push_str("    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n");
+        out.push_str(
+            "    #[derive(Debug, Clone, PartialEq, ::serde::Serialize, ::serde::Deserialize)]\n",
+        );
     } else {
-        out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n");
+        out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]\n");
     }
     let _ = writeln!(out, "    pub struct {name} {{");
     for f in &r.fields {
@@ -312,9 +313,11 @@ fn emit_variant(
 ) {
     let name = pascal_case(&v.name);
     if non_eq_types.contains(&v.name) {
-        out.push_str("    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]\n");
+        out.push_str(
+            "    #[derive(Debug, Clone, PartialEq, ::serde::Serialize, ::serde::Deserialize)]\n",
+        );
     } else {
-        out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]\n");
+        out.push_str("    #[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]\n");
     }
     // External (default) tagging. Internally-tagged variants
     // (`#[serde(tag = ...)]`) require `deserialize_any`, which the
@@ -363,7 +366,7 @@ fn emit_variant_case(
 
 fn emit_enum(e: &EnumDef, out: &mut String) {
     let name = pascal_case(&e.name);
-    out.push_str("    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]\n");
+    out.push_str("    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]\n");
     out.push_str("    #[serde(rename_all = \"snake_case\")]\n");
     let _ = writeln!(out, "    pub enum {name} {{");
     for c in &e.cases {
@@ -397,7 +400,14 @@ fn emit_schema_service_declarations(schema: &Schema, out: &mut String) {
     out.push_str("/// Type-level BPDL contract for this plugin API crate.\n");
     out.push_str("pub struct Contract;\n\n");
     out.push_str("impl ::bmux_plugin_sdk::PluginContract for Contract {\n");
-    out.push_str("    fn service_contract() -> &'static [u8] { SERVICE_CONTRACT }\n");
+    out.push_str("    fn service_contract_for(interface_id: &str) -> Option<&'static [u8]> {\n");
+    for module in &modules {
+        let _ = writeln!(
+            out,
+            "        if interface_id == {module}::INTERFACE_ID.as_str() {{ return Some({module}::SERVICE_CONTRACT); }}"
+        );
+    }
+    out.push_str("        None\n    }\n");
     out.push_str("    fn service_declarations() -> ::bmux_plugin_sdk::Result<Vec<::bmux_plugin_sdk::PluginService>> {\n");
     out.push_str("        service_declarations()\n");
     out.push_str("    }\n");
@@ -432,7 +442,7 @@ fn emit_interface_service_descriptor(iface: &Interface, out: &mut String) {
     };
     let _ = writeln!(
         out,
-        "    /// BPDL-generated service descriptor for this interface.\n    pub const SERVICE_DESCRIPTOR: ::bmux_plugin_sdk::ServiceInterfaceDescriptor = ::bmux_plugin_sdk::ServiceInterfaceDescriptor {{\n        capability: super::capabilities::{capability},\n        kind: ::bmux_plugin_sdk::ServiceKind::{kind},\n        interface_id: INTERFACE_ID,\n        contract: super::SERVICE_CONTRACT,\n    }};\n"
+        "    /// BPDL-generated service descriptor for this interface.\n    pub const SERVICE_DESCRIPTOR: ::bmux_plugin_sdk::ServiceInterfaceDescriptor = ::bmux_plugin_sdk::ServiceInterfaceDescriptor {{\n        capability: super::capabilities::{capability},\n        kind: ::bmux_plugin_sdk::ServiceKind::{kind},\n        interface_id: INTERFACE_ID,\n        contract: SERVICE_CONTRACT,\n    }};\n"
     );
     out.push_str(
         "    /// Convert this BPDL interface descriptor into a plugin service declaration.\n",
@@ -644,7 +654,6 @@ fn emit_transport_client(
 
     out.push_str("    /// Generated transport clients for this interface.\n");
     out.push_str("    pub mod client {\n");
-    out.push_str("        use super::*;\n\n");
     for (op, kind) in operations {
         emit_transport_endpoint(iface, op, kind, capability, imports, own_types, out);
         emit_transport_client_function(op, imports, own_types, out);
@@ -663,9 +672,9 @@ fn emit_transport_endpoint(
 ) {
     let endpoint_name = format!("{}Endpoint", pascal_case(&op.name));
     let request_ty = transport_request_type(op);
-    let returns = rust_type(&op.returns, imports, own_types);
+    let returns = client_rust_type(&op.returns, imports, own_types);
     if let Some(emits) = &op.emits {
-        let event_ty = rust_type(emits, imports, own_types);
+        let event_ty = client_rust_type(emits, imports, own_types);
         let event_sink_name = format!("{}EventSink", pascal_case(&op.name));
         out.push_str("        /// Request-scoped event sink for streaming operation frames.\n");
         let _ = writeln!(
@@ -685,11 +694,11 @@ fn emit_transport_endpoint(
     }
     if !op.params.is_empty() {
         let request_name = request_ty.clone();
-        out.push_str("        #[derive(Debug, Clone, Serialize, Deserialize)]\n");
+        out.push_str("        #[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]\n");
         let _ = writeln!(out, "        pub struct {request_name} {{");
         for param in &op.params {
             let field_name = snake_case(&param.name);
-            let ty = rust_type(&param.ty, imports, own_types);
+            let ty = client_rust_type(&param.ty, imports, own_types);
             if let Some(adapter) = serde_bytes_adapter(&param.ty) {
                 let _ = writeln!(out, "            #[serde(with = \"{adapter}\")]");
             }
@@ -718,9 +727,7 @@ fn emit_transport_endpoint(
         out,
         "            const INTERFACE_ID: ::bmux_plugin_sdk::InterfaceId = super::INTERFACE_ID;"
     );
-    out.push_str(
-        "            const SERVICE_CONTRACT: &'static [u8] = super::super::SERVICE_CONTRACT;\n",
-    );
+    out.push_str("            const SERVICE_CONTRACT: &'static [u8] = super::SERVICE_CONTRACT;\n");
     let _ = writeln!(
         out,
         "            const OPERATION: ::bmux_plugin_sdk::OperationId = super::{};",
@@ -728,7 +735,7 @@ fn emit_transport_endpoint(
     );
     out.push_str("        }\n");
     if let Some(emits) = &op.emits {
-        let event_ty = rust_type(emits, imports, own_types);
+        let event_ty = client_rust_type(emits, imports, own_types);
         let _ = writeln!(
             out,
             "        impl ::bmux_plugin_sdk::StreamingTypedServiceEndpoint for {endpoint_name} {{"
@@ -754,20 +761,20 @@ fn emit_transport_client_function(
             format!(
                 "{}: {}",
                 snake_case(&f.name),
-                rust_type(&f.ty, imports, own_types)
+                client_rust_type(&f.ty, imports, own_types)
             )
         })
         .collect::<Vec<_>>()
         .join(", ");
     let sep = if params.is_empty() { "" } else { ", " };
-    let returns = rust_type(&op.returns, imports, own_types);
+    let returns = client_rust_type(&op.returns, imports, own_types);
     if op.emits.is_some() {
         let _ = writeln!(
             out,
             "        /// Invoke `{}` as a request-scoped streaming operation.",
             op.name
         );
-        out.push_str("        /// The provider may emit zero or more typed event frames before the final response; cancellation and bounded backpressure are carried by the invocation transport.\n");
+        out.push_str("        ///\n        /// The provider may emit zero or more typed event frames before the final response; cancellation and bounded backpressure are carried by the invocation transport.\n\n");
     }
     let request_expr = if op.params.is_empty() {
         "()".to_string()
@@ -785,6 +792,7 @@ fn emit_transport_client_function(
         "        /// Invoke `{}` through a typed dispatch client.",
         op.name
     );
+    out.push_str("        ///\n        /// # Errors\n        ///\n        /// Returns encoding, transport, compatibility, or response-decoding failures.\n");
     if op.params.len() >= 7 {
         out.push_str("        #[allow(clippy::too_many_arguments)]\n");
     }
@@ -841,6 +849,7 @@ fn emit_client_forwarder(
         .collect::<Vec<_>>()
         .join(", ");
     out.push_str("\n        /// Forward to the provider's trait method.\n");
+    out.push_str("        #[must_use]\n");
     if op.params.len() >= 7 {
         out.push_str("        #[allow(clippy::too_many_arguments)]\n");
     }
@@ -919,6 +928,35 @@ fn rust_type(ty: &TypeRef, imports: &ImportMap, own_types: &OwnTypeMap) -> Strin
             )
         }
         TypeRef::Unit => "()".to_string(),
+    }
+}
+
+// Transport functions are nested one module below their interface types.
+fn client_rust_type(ty: &TypeRef, imports: &ImportMap, own_types: &OwnTypeMap) -> String {
+    match ty {
+        TypeRef::Named(name) => format!("super::{}", pascal_case(name)),
+        TypeRef::Qualified { .. } => {
+            let path = rust_type(ty, imports, own_types);
+            path.strip_prefix("super::").map_or_else(
+                || path.clone(),
+                |relative| format!("super::super::{relative}"),
+            )
+        }
+        TypeRef::List(inner) => format!("Vec<{}>", client_rust_type(inner, imports, own_types)),
+        TypeRef::Map(key, value) => format!(
+            "::std::collections::BTreeMap<{}, {}>",
+            client_rust_type(key, imports, own_types),
+            client_rust_type(value, imports, own_types)
+        ),
+        TypeRef::Option(inner) => {
+            format!("Option<{}>", client_rust_type(inner, imports, own_types))
+        }
+        TypeRef::Result(ok, error) => format!(
+            "::std::result::Result<{}, {}>",
+            client_rust_type(ok, imports, own_types),
+            client_rust_type(error, imports, own_types)
+        ),
+        TypeRef::Primitive(_) | TypeRef::Unit => rust_type(ty, imports, own_types),
     }
 }
 
@@ -1027,6 +1065,35 @@ mod tests {
     use crate::compile;
 
     #[test]
+    fn generated_clients_are_explicit_and_document_fallibility() {
+        let schema = compile("plugin p version 1; capability READ = p.read; interface shared { record row { n: u32 } } @capability(READ) interface read { record local { n: u32 } query get(value: local, other: shared.row) -> result<local, string>; }").unwrap();
+        let rust = emit(&schema);
+        assert!(!rust.contains("use super::*"));
+        assert!(!rust.contains("use serde::"));
+        assert!(rust.contains("::serde::Serialize, ::serde::Deserialize"));
+        assert!(rust.contains("pub value: super::Local"));
+        assert!(rust.contains("pub other: super::super::shared::Row"));
+        assert!(rust.contains("type Response = ::std::result::Result<super::Local, String>"));
+        assert!(rust.contains("/// # Errors\n        ///\n        /// Returns encoding, transport, compatibility, or response-decoding failures."));
+        assert!(rust.contains("#[must_use]\n        pub fn new("));
+        assert!(rust.contains("#[must_use]\n        pub fn as_service("));
+        assert!(rust.contains("#[must_use]\n        pub fn get<'a>("));
+    }
+
+    #[test]
+    fn generated_endpoints_and_provider_lookup_use_interface_identity() {
+        let schema = compile("plugin p version 1; capability READ = p.read; @capability(READ) interface first { query get() -> u32; } @capability(READ) interface second { query get() -> string; }").unwrap();
+        let rust = emit(&schema);
+        assert_eq!(rust.matches("pub const SERVICE_CONTRACT: &[u8]").count(), 2);
+        assert!(rust.contains("const SERVICE_CONTRACT: &'static [u8] = super::SERVICE_CONTRACT;"));
+        assert!(rust.contains("interface_id == first::INTERFACE_ID.as_str()"));
+        assert!(rust.contains("return Some(first::SERVICE_CONTRACT)"));
+        assert!(rust.contains("interface_id == second::INTERFACE_ID.as_str()"));
+        assert!(!rust.contains("super::super::SERVICE_CONTRACT"));
+        assert!(!rust.contains("fn service_contract()"));
+    }
+
+    #[test]
     fn emits_record_struct_with_fields() {
         let src = "plugin p version 1;\n\
                    interface my-iface {\n\
@@ -1054,7 +1121,10 @@ mod tests {
                    }";
         let schema = compile(src).expect("valid");
         let rust = emit(&schema);
-        assert!(rust.contains("pub type StartTurnEvent = TurnEvent;"));
+        assert!(rust.contains("pub type StartTurnEvent = super::TurnEvent;"));
+        assert!(rust.contains("type Event = super::TurnEvent;"));
+        assert!(rust.contains("type Response = super::Finish;"));
+        assert!(rust.contains("pub request: super::Start"));
         assert!(rust.contains(
             "impl ::bmux_plugin_sdk::StreamingTypedServiceEndpoint for StartTurnEndpoint"
         ));

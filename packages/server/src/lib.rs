@@ -110,6 +110,30 @@ struct ServiceRegistry {
     checked_handlers: std::collections::BTreeSet<ServiceRoute>,
 }
 
+#[derive(Debug)]
+struct ServiceCompatibilityError(&'static str);
+
+impl std::fmt::Display for ServiceCompatibilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ServiceCompatibilityError {}
+
+fn service_invocation_error_code(error: &anyhow::Error) -> ErrorCode {
+    if error.downcast_ref::<ServiceCompatibilityError>().is_some()
+        || matches!(
+            error.downcast_ref::<bmux_plugin_sdk::PluginError>(),
+            Some(bmux_plugin_sdk::PluginError::ServiceProtocol { .. })
+        )
+    {
+        ErrorCode::ServiceIncompatible
+    } else {
+        ErrorCode::Internal
+    }
+}
+
 impl ServiceRegistry {
     fn dispatch(
         &self,
@@ -118,12 +142,24 @@ impl ServiceRegistry {
         payload: Vec<u8>,
     ) -> Option<ServiceInvokeFuture> {
         let checked = bmux_plugin_sdk::service_contract::is_checked(&payload);
+        if checked
+            && bmux_plugin_sdk::service_contract::interface_id_for(&route.interface_id, &payload)
+                .is_err()
+        {
+            return Some(Box::pin(async {
+                Err(
+                    ServiceCompatibilityError("checked frame does not match routed interface")
+                        .into(),
+                )
+            }));
+        }
         if let Some(handler) = self.handlers.get(route).cloned() {
             if checked && !self.checked_handlers.contains(route) {
                 return Some(Box::pin(async {
-                    Err(anyhow::anyhow!(
-                        "service handler has no checked BPDL contract boundary"
-                    ))
+                    Err(ServiceCompatibilityError(
+                        "service handler has no checked BPDL contract boundary",
+                    )
+                    .into())
                 }));
             }
             return Some(handler(route.clone(), context, payload));
@@ -135,9 +171,10 @@ impl ServiceRegistry {
             && !self.checked_handlers.contains(&wildcard)
         {
             return Some(Box::pin(async {
-                Err(anyhow::anyhow!(
-                    "service handler has no checked BPDL contract boundary"
-                ))
+                Err(ServiceCompatibilityError(
+                    "service handler has no checked BPDL contract boundary",
+                )
+                .into())
             }));
         }
         self.handlers
@@ -230,9 +267,10 @@ async fn invoke_service_output(
         Some(invocation)
     } else {
         if bmux_plugin_sdk::service_contract::is_checked(&payload) {
-            return Err(anyhow::anyhow!(
-                "no checked BPDL provider registered for service route"
-            ));
+            return Err(ServiceCompatibilityError(
+                "no checked BPDL provider registered for service route",
+            )
+            .into());
         }
         let resolver = state
             .service_resolver
@@ -1478,6 +1516,7 @@ async fn handle_connection(
     let client_principal_id: Uuid;
     let mut selected_session: Option<SessionId> = None;
     let mut attached_stream_session: Option<SessionId> = None;
+    let supports_service_contract_v2: bool;
     let negotiated_frame_codec: Option<
         std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>,
     >;
@@ -1498,6 +1537,10 @@ async fn handle_connection(
         let server_contract = ProtocolContract::current(default_supported_capabilities());
         match negotiate_protocol(&contract, &server_contract, CORE_PROTOCOL_CAPABILITIES) {
             Ok(negotiated) => {
+                supports_service_contract_v2 = negotiated
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == bmux_ipc::CAPABILITY_SERVICE_CONTRACT_V2);
                 client_principal_id = principal_id;
                 debug!(
                     "accepted client handshake: {client_name} revision={} caps={}",
@@ -1639,7 +1682,7 @@ async fn handle_connection(
         let request_record_us = 0_u128;
 
         let handle_started = Instant::now();
-        let response = handle_request(
+        let mut response = handle_request(
             &state,
             &shutdown_tx,
             client_id,
@@ -1648,6 +1691,12 @@ async fn handle_connection(
             request,
         )
         .await?;
+        if !supports_service_contract_v2
+            && let Response::Err(error) = &mut response
+            && matches!(error.code, ErrorCode::UnsupportedRepresentation | ErrorCode::ServiceIncompatible)
+        {
+            error.code = ErrorCode::Internal;
+        }
         let handle_us = handle_started.elapsed().as_micros();
         let elapsed_ms = started_at.elapsed().as_millis();
         let (response_record_encode_us, response_record_us) = match &response {
@@ -2322,17 +2371,26 @@ async fn handle_request(
             let resolver_started = std::time::Instant::now();
             let invocation = if let Some(invocation) = dispatch {
                 Some(invocation)
-            } else if bmux_plugin_sdk::service_contract::is_checked(&payload) {
-                // A legacy fallback cannot attest the provider contract and must
-                // never see a checked invocation. Absence remains NotFound below.
-                None
             } else {
                 let resolver = state
                     .service_resolver
                     .lock()
                     .map_err(|_| anyhow::anyhow!("service resolver lock poisoned"))?
                     .clone();
-                resolver.map(|resolver| resolver(route.clone(), payload))
+                if bmux_plugin_sdk::service_contract::is_checked(&payload) {
+                    // A provider exists, but this fallback cannot validate checked
+                    // evidence. Never classify that as optional provider absence.
+                    resolver.map(|_| -> ServiceInvokeFuture {
+                        Box::pin(async {
+                            Err(ServiceCompatibilityError(
+                                "fallback provider has no checked contract boundary",
+                            )
+                            .into())
+                        })
+                    })
+                } else {
+                    resolver.map(|resolver| resolver(route.clone(), payload))
+                }
             };
             let resolver_us = resolver_started.elapsed().as_micros();
 
@@ -2343,7 +2401,7 @@ async fn handle_request(
                         payload: output.payload,
                     }),
                     Err(error) => Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
+                        code: service_invocation_error_code(&error),
                         message: format!("service invocation failed: {error:#}"),
                     }),
                 }
@@ -2434,7 +2492,7 @@ async fn handle_request(
             {
                 Ok(results) => Response::Ok(ResponsePayload::ServicePipelineInvoked { results }),
                 Err(error) => Response::Err(ErrorResponse {
-                    code: ErrorCode::Internal,
+                    code: service_invocation_error_code(&error),
                     message: format!("service pipeline failed: {error:#}"),
                 }),
             }
@@ -3082,6 +3140,112 @@ mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
 
+    #[test]
+    fn service_compatibility_errors_are_structured_not_message_matched() {
+        let incompatible = anyhow::Error::new(ServiceCompatibilityError("provider mismatch"));
+        assert_eq!(
+            service_invocation_error_code(&incompatible),
+            ErrorCode::ServiceIncompatible
+        );
+        let protocol = anyhow::Error::new(bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: "mismatch".into(),
+        });
+        assert_eq!(
+            service_invocation_error_code(&protocol),
+            ErrorCode::ServiceIncompatible
+        );
+        let protocol = protocol.context("native provider invocation");
+        assert_eq!(
+            service_invocation_error_code(&protocol),
+            ErrorCode::ServiceIncompatible
+        );
+        let ordinary_native_failure =
+            anyhow::Error::new(bmux_plugin_sdk::PluginError::NativeServiceInvocation {
+                plugin_id: "example.provider".into(),
+                status: 3,
+            })
+            .context("native provider invocation");
+        assert_eq!(
+            service_invocation_error_code(&ordinary_native_failure),
+            ErrorCode::Internal
+        );
+        let unrelated = anyhow::anyhow!("service compatibility mismatch NotFound");
+        assert_eq!(
+            service_invocation_error_code(&unrelated),
+            ErrorCode::Internal
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_pipeline_validates_actual_provider_before_execution() {
+        let endpoint =
+            IpcEndpoint::unix_socket(std::env::temp_dir().join("bmux-pipeline-contract-test.sock"));
+        let server = BmuxServer::new(endpoint);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = Arc::clone(&calls);
+        server
+            .register_checked_service_handler_with_metadata(
+                "example.write",
+                bmux_ipc::InvokeServiceKind::Command,
+                "example/v1",
+                "execute",
+                move |route, _, payload| {
+                    let calls = Arc::clone(&provider_calls);
+                    async move {
+                        bmux_plugin_sdk::service_contract::decode_for(
+                            &route.interface_id,
+                            &[1; 32],
+                            &payload,
+                        )?;
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(ServiceInvokeOutput::from(
+                            bmux_plugin_sdk::service_contract::encode_response(b"done"),
+                        ))
+                    }
+                },
+            )
+            .unwrap();
+        for (hash, succeeds) in [([2; 32], false), ([1; 32], true)] {
+            let pipeline = ServicePipelineRequest {
+                inputs: BTreeMap::new(),
+                steps: vec![bmux_ipc::ServicePipelineStep {
+                    capability: "example.write".into(),
+                    kind: bmux_ipc::InvokeServiceKind::Command,
+                    interface_id: "example/v1".into(),
+                    operation: "execute".into(),
+                    payload: ServicePipelinePayload::Encoded {
+                        payload: bmux_plugin_sdk::service_contract::encode(
+                            "example/v1",
+                            &hash,
+                            b"request",
+                        )
+                        .unwrap(),
+                    },
+                }],
+            };
+            let outcome = execute_service_pipeline(
+                &server.state,
+                &server.shutdown_tx,
+                ClientId(Uuid::new_v4()),
+                Uuid::new_v4(),
+                pipeline,
+            )
+            .await;
+            assert_eq!(outcome.is_ok(), succeeds);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(succeeds)
+            );
+            if let Ok(results) = outcome {
+                assert_eq!(
+                    bmux_plugin_sdk::service_contract::decode_response(&results[0].payload)
+                        .unwrap(),
+                    b"done"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn checked_handler_admission_is_bound_to_registered_handler() {
         let endpoint =
@@ -3107,7 +3271,8 @@ mod tests {
             interface_id: "state/v1".into(),
             operation: "get".into(),
         };
-        let payload = bmux_plugin_sdk::service_contract::encode(b"contract", b"request").unwrap();
+        let payload =
+            bmux_plugin_sdk::service_contract::encode("state/v1", &[7; 32], b"request").unwrap();
         let result = invoke_service_output(
             &server.state,
             &server.shutdown_tx,

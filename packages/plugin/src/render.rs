@@ -164,6 +164,33 @@ impl ExtensionRect {
     }
 }
 
+/// Owning-plugin codec for a remote input endpoint. Local input support types
+/// are not a service wire contract: implementations use generated BPDL transport.
+pub trait AttachInputCodec: Send + Sync {
+    fn endpoint(&self) -> AttachInputEndpoint;
+
+    /// Encode a checked request using the owning interface's generated identity.
+    ///
+    /// # Errors
+    /// Returns an error when the event cannot be represented by this contract.
+    fn encode_event(&self, event: &AttachInputEvent) -> Result<Vec<u8>, String>;
+
+    /// Decode a response only after checked provider acceptance is verified.
+    ///
+    /// # Errors
+    /// Rejects unsupported response framing or malformed generated results.
+    fn decode_result(&self, payload: &[u8]) -> Result<AttachInputResult, String>;
+}
+
+/// Resolve a wire contract through installed render extensions. Absence is
+/// unsupported, not a fallback to a host-local serialization layout.
+#[must_use]
+pub fn registered_input_codec(endpoint: &AttachInputEndpoint) -> Option<Arc<dyn AttachInputCodec>> {
+    registered_render_extensions()
+        .into_iter()
+        .find_map(|extension| extension.input_codec(endpoint))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct AttachInputEndpoint {
     pub capability: String,
@@ -1765,10 +1792,15 @@ pub trait AttachRenderExtension: Send + Sync {
         None
     }
 
+    /// Owning-plugin codec for a remote input endpoint used by this extension.
+    /// Host-local presentation handlers do not require a wire codec.
+    fn input_codec(&self, _endpoint: &AttachInputEndpoint) -> Option<Arc<dyn AttachInputCodec>> {
+        None
+    }
+
     /// Return coarse input hooks currently owned by this extension.
-    /// Hooks are event subscriptions, not hit-test regions: the host
-    /// applies the cheap filter and the owning plugin/script decides
-    /// whether a specific event is consumed.
+    /// Hooks are subscriptions, not hit-test regions: the host filters cheaply
+    /// and the owning extension decides whether a specific event is consumed.
     fn input_hooks(&self) -> Vec<AttachInputHook> {
         Vec::new()
     }
@@ -1836,6 +1868,14 @@ impl RenderExtensionRegistry {
     #[must_use]
     pub fn snapshot(&self) -> Vec<Arc<dyn AttachRenderExtension>> {
         self.entries.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Resolve an owning plugin's remote-input contract in this registry.
+    #[must_use]
+    pub fn input_codec(&self, endpoint: &AttachInputEndpoint) -> Option<Arc<dyn AttachInputCodec>> {
+        self.snapshot()
+            .into_iter()
+            .find_map(|extension| extension.input_codec(endpoint))
     }
 
     /// Number of registered extensions.

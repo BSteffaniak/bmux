@@ -678,6 +678,14 @@ impl AttachRenderExtension for DecorationRenderExtension {
         Some(extension_rect_from_scene(&surface.content_rect))
     }
 
+    fn input_codec(
+        &self,
+        endpoint: &bmux_plugin::AttachInputEndpoint,
+    ) -> Option<Arc<dyn bmux_plugin::AttachInputCodec>> {
+        let codec = bmux_decoration_plugin::input_codec();
+        (codec.endpoint() == *endpoint).then_some(codec)
+    }
+
     fn input_hooks(&self) -> Vec<AttachInputHook> {
         let Ok(cache) = self.cache.lock() else {
             return Vec::new();
@@ -2484,6 +2492,26 @@ pub fn push_scene(scene: DecorationScene) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_codec_is_resolved_from_owning_attach_registry() {
+        let registry = bmux_plugin::RenderExtensionRegistry::new();
+        let endpoint = bmux_plugin::AttachInputEndpoint {
+            capability: "bmux.decoration.write".into(),
+            interface_id: "decoration-input-hooks/v2".into(),
+            operation: "handle-input".into(),
+        };
+        assert!(registry.input_codec(&endpoint).is_none());
+        registry.register(super::renderer_for_bus(&bmux_plugin::EventBus::new()));
+        let codec = registry
+            .input_codec(&endpoint)
+            .expect("renderer supplies checked codec");
+        assert_eq!(codec.endpoint(), endpoint);
+        assert!(codec.decode_result(b"legacy response").is_err());
+        let mut old = endpoint;
+        old.interface_id = "decoration-input-hooks".into();
+        assert!(registry.input_codec(&old).is_none());
+    }
+
     use super::*;
     use bmux_scene_protocol::scene_protocol::{TerminalCapability, TerminalCapabilityQuery};
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Owned Rust relay / TLS acceptance support and real BMWP4 local smoke (no builds)."""
+"""Owned Rust relay / TLS acceptance support and real BMWP5 local smoke (no builds)."""
 import argparse
 import base64
 import hashlib
@@ -39,7 +39,7 @@ def verify_assets(assets):
     """Verify exactly the immutable format emitted by build-web-renderer.sh."""
     assets = Path(assets)
     manifest = json.loads((assets / 'manifest.json').read_text())
-    assert manifest['schema'] == 1 and manifest['protocol'] == 1 and manifest['renderer'] == 'bmwp-4'
+    assert manifest['schema'] == 1 and manifest['protocol'] == 1 and manifest['renderer'] == 'bmwp-5'
     expected = ['canvas-viewer.js', 'live-viewer.js', 'live-page.js', 'bmux_web_renderer.js', 'bmux_web_renderer_bg.wasm']
     assert [entry['name'] for entry in manifest['files']] == expected
     digests = []
@@ -159,7 +159,7 @@ class RelayStack:
                     body = response.read(4096)
                     if body in (b'ok', b'ok\n'): return True
                     state = json.loads(body)
-                    return state.get('status') == 'ok' and state.get('renderer') == 'bmwp-4'
+                    return state.get('status') == 'ok' and state.get('renderer') == 'bmwp-5'
             except OSError: return False
         wait(healthy)
         owner = self
@@ -232,11 +232,11 @@ class RelayStack:
         return state
 
     def publish(self, payload):
-        assert payload.startswith(b'BMWP\x04') and len(payload) <= MAX_BYTES
+        assert payload.startswith(b'BMWP\x05') and len(payload) <= MAX_BYTES
         if self.publisher is None: self.publisher = self.ws(True)
         self.publisher.send(payload)
         response = self.publisher.receive()
-        assert response.get('type') == 'ack', 'real relay did not ACK BMWP4'
+        assert response.get('type') == 'ack', 'real relay did not ACK BMWP5'
         return response
 
     def snapshot(self):
@@ -253,7 +253,7 @@ class RelayStack:
                 assert payload.get('type') == 'state' and payload['epoch'] == state['epoch']
                 if payload['state'] != 'live': return payload, None
                 payload = peer.receive()
-            assert payload.startswith(b'BMWP\x04')
+            assert payload.startswith(b'BMWP\x05')
             return state, payload
         finally: peer.close()
 
@@ -281,7 +281,7 @@ def main():
     parser.add_argument('--assets', required=True, type=Path)
     parser.add_argument('--frame', required=True, type=Path)
     args = parser.parse_args()
-    payload = args.frame.read_bytes(); assert payload.startswith(b'BMWP\x04')
+    payload = args.frame.read_bytes(); assert payload.startswith(b'BMWP\x05')
     with tempfile.TemporaryDirectory(prefix='bmux-rust-relay-smoke-') as directory:
         stack = RelayStack(args.relay, Path(directory), args.assets)
         try:
@@ -290,7 +290,7 @@ def main():
             stack.control('pause'); assert stack.snapshot()[1] is None
             stack.control('resume'); stack.publish(payload); assert stack.snapshot()[1] == payload
             stack.control('stop'); assert stack.snapshot()[0]['state'] == 'offline'
-            print(json.dumps({'result': 'PASS', 'protocol': 'BMWP4/WSS', 'revision': ack['revision'],
+            print(json.dumps({'result': 'PASS', 'protocol': 'BMWP5/WSS', 'revision': ack['revision'],
                               'relay_sha256': hashlib.sha256(args.relay.read_bytes()).hexdigest(),
                               'cases': ['rust-relay-real-frame', 'pause-clears', 'resume-full', 'stop-offline']}))
         finally: stack.close()

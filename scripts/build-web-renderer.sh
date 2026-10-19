@@ -79,7 +79,7 @@ for name in sys.argv[3:]:
     data = (root / name).read_bytes()
     files.append({"name": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
 (root / "manifest.json").write_text(json.dumps({"schema": 1, "protocol": 1,
-    "renderer": "bmwp-4", "bundle_sha256": sys.argv[2], "files": files}, indent=2) + "\n")
+    "renderer": "bmwp-5", "bundle_sha256": sys.argv[2], "files": files}, indent=2) + "\n")
 PY
 printf '%s\n' "$VERSION" > "$DOCS_ASSETS/current-version"
 echo "Docs audience bundle: $DOCS_ASSETS/$VERSION"

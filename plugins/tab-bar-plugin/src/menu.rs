@@ -10,7 +10,6 @@ use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceTarget,
 };
 use bmux_plugin::{AttachInputEvent, AttachInputResult, ExtensionRect};
-use bmux_plugin_sdk::TypedServiceEndpoint;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use std::cell::Cell;
@@ -106,12 +105,7 @@ impl Default for MenuInput {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct MoveSelectionRequest {
-    pub action: String,
-    pub tabs: Vec<Uuid>,
-    pub workspace: Uuid,
-}
+pub use super::contract::presentation_actions::client::MoveSelectionRequest;
 
 fn items(companion: &CompanionState) -> Vec<MenuItem> {
     if let Some(destinations) = &companion.menu.destinations {
@@ -421,62 +415,42 @@ fn activate_group(
             } else {
                 "right"
             };
-            result.service_invocation = command_invocation(
-                bmux_plugin::AttachInputEndpoint {
-                    capability: "bmux.tab_bar.input".into(),
-                    interface_id: "presentation-input".into(),
-                    operation: "move-selection".into(),
-                },
-                &MoveSelectionRequest {
-                    action: action.into(),
-                    tabs: companion.menu.group.clone(),
-                    workspace: companion.workspace_id.unwrap_or_default(),
-                },
-            );
+            result.service_invocation = command_invocation::<
+                super::contract::presentation_actions::client::MoveSelectionEndpoint,
+            >(&MoveSelectionRequest {
+                action: action.into(),
+                tabs: companion.menu.group.clone(),
+                workspace: companion.workspace_id.unwrap_or_default(),
+            });
             return;
         }
         if let Some(destinations) = &companion.menu.destinations {
             if index == 1 {
-                result.service_invocation = command_invocation(
-                    bmux_plugin::AttachInputEndpoint {
-                        capability: "bmux.tab_bar.input".into(),
-                        interface_id: "presentation-input".into(),
-                        operation: "move-selection".into(),
-                    },
-                    &MoveSelectionRequest {
-                        action: "new".into(),
-                        tabs: companion.menu.group.clone(),
-                        workspace: Uuid::nil(),
-                    },
-                );
+                result.service_invocation = command_invocation::<
+                    super::contract::presentation_actions::client::MoveSelectionEndpoint,
+                >(&MoveSelectionRequest {
+                    action: "new".into(),
+                    tabs: companion.menu.group.clone(),
+                    workspace: Uuid::nil(),
+                });
                 return;
             }
             if let Some((workspace, _)) = index
                 .checked_sub(2)
                 .and_then(|index| destinations.get(index))
             {
-                result.service_invocation = command_invocation(
-                    bmux_plugin::AttachInputEndpoint {
-                        capability: "bmux.tab_bar.input".into(),
-                        interface_id: "presentation-input".into(),
-                        operation: "move-selection".into(),
-                    },
-                    &MoveSelectionRequest {
-                        action: "move".into(),
-                        tabs: companion.menu.group.clone(),
-                        workspace: *workspace,
-                    },
-                );
+                result.service_invocation = command_invocation::<
+                    super::contract::presentation_actions::client::MoveSelectionEndpoint,
+                >(&MoveSelectionRequest {
+                    action: "move".into(),
+                    tabs: companion.menu.group.clone(),
+                    workspace: *workspace,
+                });
             }
         } else {
-            result.service_invocation = command_invocation(
-                bmux_plugin::AttachInputEndpoint {
-                    capability: "bmux.tab_bar.input".into(),
-                    interface_id: "presentation-input".into(),
-                    operation: "list-destinations".into(),
-                },
-                &(),
-            );
+            result.service_invocation = command_invocation::<
+                super::contract::presentation_actions::client::ListDestinationsEndpoint,
+            >(&());
             if let Some(invocation) = &mut result.service_invocation {
                 invocation.response_endpoint = Some(Box::new(input_endpoint()));
             }
@@ -515,12 +489,9 @@ fn activate_selection(
         }
         if companion.menu.confirming {
             if index == 1 {
-                result.service_invocation = command_invocation(
-                    bmux_plugin::AttachInputEndpoint {
-                        capability: "bmux.tab_bar.input".into(),
-                        interface_id: "presentation-input".into(),
-                        operation: "close-workspace".into(),
-                    },
+                result.service_invocation = command_invocation::<
+                    super::workspaces_commands::client::KillWorkspaceEndpoint,
+                >(
                     &super::workspaces_commands::client::KillWorkspaceRequest {
                         selector: super::workspaces_state::WorkspaceSelector {
                             id: Some(target),
@@ -543,12 +514,7 @@ fn activate_selection(
         return;
     }
     result.service_invocation = match index {
-        0 => command_invocation(
-            bmux_plugin::AttachInputEndpoint {
-                capability: tabs_commands::client::SwitchTabEndpoint::CAPABILITY.to_string(),
-                interface_id: tabs_commands::client::SwitchTabEndpoint::INTERFACE_ID.to_string(),
-                operation: tabs_commands::client::SwitchTabEndpoint::OPERATION.to_string(),
-            },
+        0 => command_invocation::<tabs_commands::client::SwitchTabEndpoint>(
             &tabs_commands::client::SwitchTabRequest {
                 target: target.to_string(),
             },
@@ -564,12 +530,7 @@ fn activate_selection(
             }
             None
         }
-        _ => command_invocation(
-            bmux_plugin::AttachInputEndpoint {
-                capability: tabs_commands::client::KillTabEndpoint::CAPABILITY.to_string(),
-                interface_id: tabs_commands::client::KillTabEndpoint::INTERFACE_ID.to_string(),
-                operation: tabs_commands::client::KillTabEndpoint::OPERATION.to_string(),
-            },
+        _ => command_invocation::<tabs_commands::client::KillTabEndpoint>(
             &tabs_commands::client::KillTabRequest {
                 target: target.to_string(),
                 force_local: false,
@@ -743,11 +704,11 @@ mod tests {
                 let invocation = result.service_invocation.unwrap();
                 if selection == 0 {
                     let request: tabs_commands::client::SwitchTabRequest =
-                        bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
+                        crate::decode_action_payload(&invocation).unwrap();
                     assert_eq!(request.target, Uuid::from_u128(7).to_string());
                 } else {
                     let request: tabs_commands::client::KillTabRequest =
-                        bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
+                        crate::decode_action_payload(&invocation).unwrap();
                     assert_eq!(request.target, Uuid::from_u128(7).to_string());
                     assert!(!request.force_local);
                 }
@@ -941,8 +902,7 @@ mod tests {
         companion.multi_selection.clear();
         activate_selection(&mut companion, &mut result, 2);
         let invocation = result.service_invocation.unwrap();
-        let request: MoveSelectionRequest =
-            bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
+        let request: MoveSelectionRequest = crate::decode_action_payload(&invocation).unwrap();
         assert_eq!(request.tabs, vec![id]);
         assert_eq!(request.workspace, Uuid::from_u128(99));
     }
@@ -985,8 +945,7 @@ mod tests {
         assert_eq!(items(&companion).len(), 2);
         activate_selection(&mut companion, &mut result, 1);
         let request: MoveSelectionRequest =
-            bmux_plugin_sdk::decode_service_message(&result.service_invocation.unwrap().payload)
-                .unwrap();
+            crate::decode_action_payload(&result.service_invocation.unwrap()).unwrap();
         assert_eq!(request.action, "new");
     }
 
@@ -1073,9 +1032,9 @@ mod tests {
         activate_selection(&mut companion, &mut result, 1);
         activate_selection(&mut companion, &mut result, 1);
         let invocation = result.service_invocation.unwrap();
-        assert_eq!(invocation.endpoint.operation, "close-workspace");
+        assert_eq!(invocation.endpoint.operation, "kill-workspace");
         let request: crate::workspaces_commands::client::KillWorkspaceRequest =
-            bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
+            crate::decode_action_payload(&invocation).unwrap();
         assert_eq!(request.selector.id, Some(id));
         assert!(request.selector.name.is_none());
     }

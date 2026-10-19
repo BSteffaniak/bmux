@@ -1567,6 +1567,10 @@ mod tests {
     ) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
+            ensure!(
+                !first.task.is_finished() && !second.task.is_finished(),
+                "attachment exited before rendering {marker}"
+            );
             let a = first.terminal.output_screen_text(size.0, size.1);
             let b = second.terminal.output_screen_text(120, 30);
             if a.contains(marker) && b.contains(marker) {

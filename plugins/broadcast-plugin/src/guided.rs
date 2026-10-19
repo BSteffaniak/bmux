@@ -809,26 +809,27 @@ mod tests {
     #[tokio::test]
     async fn doctor_checks_real_bounded_public_health() {
         use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut bytes = [0; 4096];
-            let count = stream.read(&mut bytes).unwrap();
-            let request = String::from_utf8_lossy(&bytes[..count]);
-            assert!(request.starts_with("GET /health"));
-            assert!(!request.to_lowercase().contains("authorization:"));
-            let body = r#"{"status":"ok","renderer":"bmwp-4"}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-        });
-        connectivity(&format!("http://{address}"), "main")
-            .await
-            .unwrap();
-        server.join().unwrap();
+        for (renderer, compatible) in [("bmwp-5", true), ("bmwp-4", false)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = [0; 4096];
+                let count = stream.read(&mut bytes).unwrap();
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                assert!(request.starts_with("GET /health"));
+                assert!(!request.to_lowercase().contains("authorization:"));
+                let body = format!(r#"{{"status":"ok","renderer":"{renderer}"}}"#);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            });
+            let result = connectivity(&format!("http://{address}"), "main").await;
+            assert_eq!(result.is_ok(), compatible, "{renderer}: {result:?}");
+            server.join().unwrap();
+        }
     }
 }

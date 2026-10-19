@@ -45,7 +45,7 @@ def main():
                 for attempt in range(100):
                     try:
                         with urllib.request.urlopen("http://127.0.0.1:" + port + "/health", timeout=1) as response:
-                            assert json.load(response)["renderer"] == "bmwp-4"
+                            assert json.load(response)["renderer"] == "bmwp-5"
                         break
                     except (OSError, ValueError):
                         if attempt == 99:

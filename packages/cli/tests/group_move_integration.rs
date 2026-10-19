@@ -37,13 +37,6 @@ type TabResult = Result<
     bmux_tabs_plugin_api::tabs_commands::TabAck,
     bmux_tabs_plugin_api::tabs_commands::TabError,
 >;
-#[derive(serde::Serialize)]
-struct GroupRequest {
-    action: String,
-    tabs: Vec<uuid::Uuid>,
-    workspace: uuid::Uuid,
-}
-
 #[tokio::test]
 async fn real_group_move_keeps_server_responsive() {
     let mut server = support::ServerEnv::new("group-move");
@@ -131,27 +124,19 @@ async fn real_group_move_keeps_server_responsive() {
         }
         true
     });
-    let mut result = Ok(Vec::new());
+    let mut result = Ok(());
     for iteration in 0..20 {
-        let bytes = bmux_plugin_sdk::encode_service_message(&GroupRequest {
-            action: "move".into(),
-            tabs: ids.clone(),
-            workspace: if iteration % 2 == 0 {
+        result = bmux_tab_bar_plugin::presentation_actions::client::move_selection(
+            &mut client,
+            "move".into(),
+            ids.clone(),
+            if iteration % 2 == 0 {
                 destination
             } else {
                 source
             },
-        })
-        .unwrap();
-        result = client
-            .invoke_service_raw(
-                "bmux.tab_bar.input",
-                InvokeServiceKind::Command,
-                "presentation-input",
-                "move-selection",
-                bytes,
-            )
-            .await;
+        )
+        .await;
         if result.is_err() {
             break;
         }

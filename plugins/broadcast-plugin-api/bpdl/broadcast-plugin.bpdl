@@ -42,7 +42,7 @@ interface broadcast-control-v1 {
 interface broadcast-output-v1 {
     // Register/poll renew a six-second lease. Poll at least every two seconds.
     // A changed selected refresh requires re-submission of the current committed
-    // complete inline BMWP3 frame, even when the scene revision has not changed.
+    // complete inline BMWP5 frame, even when the scene revision has not changed.
     record source-state { refresh: u64, selected: bool }
     command register(source_id: string) -> source-state;
     command poll(source_id: string) -> source-state;

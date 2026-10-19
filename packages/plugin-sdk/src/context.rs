@@ -470,12 +470,10 @@ pub const PLUGIN_CLI_BRIDGE_MAGIC_V1: &[u8] = b"BMUXPLG1";
 /// Protocol version for `CoreCliCommandRequest`/`CoreCliCommandResponse`.
 pub const CORE_CLI_BRIDGE_PROTOCOL_V1: u16 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CoreCliCommandRequest {
-    pub protocol_version: u16,
-    pub command_path: Vec<String>,
-    pub arguments: Vec<String>,
-}
+pub use crate::cli_bridge::cli_command::client::{
+    RunPathRequest as CoreCliCommandRequest, RunPluginRequest as PluginCliCommandRequest,
+};
+pub use crate::cli_bridge::cli_command::{CoreCliCommandResponse, PluginCliCommandResponse};
 
 impl CoreCliCommandRequest {
     #[must_use]
@@ -488,22 +486,6 @@ impl CoreCliCommandRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CoreCliCommandResponse {
-    pub protocol_version: u16,
-    pub exit_code: i32,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginCliCommandRequest {
-    pub protocol_version: u16,
-    pub plugin_id: String,
-    pub command_name: String,
-    pub arguments: Vec<String>,
-}
-
 impl PluginCliCommandRequest {
     #[must_use]
     pub const fn new(plugin_id: String, command_name: String, arguments: Vec<String>) -> Self {
@@ -514,13 +496,6 @@ impl PluginCliCommandRequest {
             arguments,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginCliCommandResponse {
-    pub protocol_version: u16,
-    pub exit_code: i32,
-    pub error: Option<String>,
 }
 
 impl PluginCliCommandResponse {
@@ -717,7 +692,9 @@ mod tests {
         let decoded_command = decode_host_kernel_bridge_cli_command_payload(&decoded.payload)
             .expect("nested command payload should decode")
             .expect("nested command payload should be recognized");
-        assert_eq!(decoded_command, command);
+        assert_eq!(decoded_command.protocol_version, command.protocol_version);
+        assert_eq!(decoded_command.command_path, command.command_path);
+        assert_eq!(decoded_command.arguments, command.arguments);
     }
 
     #[test]
@@ -731,7 +708,9 @@ mod tests {
         let decoded = decode_host_kernel_bridge_cli_command_payload(&encoded)
             .expect("payload should decode")
             .expect("payload should be recognized");
-        assert_eq!(decoded, request);
+        assert_eq!(decoded.protocol_version, request.protocol_version);
+        assert_eq!(decoded.command_path, request.command_path);
+        assert_eq!(decoded.arguments, request.arguments);
     }
 
     #[test]
@@ -779,7 +758,10 @@ mod tests {
         let decoded = decode_host_kernel_bridge_plugin_command_payload(&encoded)
             .expect("payload should decode")
             .expect("payload should be recognized");
-        assert_eq!(decoded, request);
+        assert_eq!(decoded.protocol_version, request.protocol_version);
+        assert_eq!(decoded.plugin_id, request.plugin_id);
+        assert_eq!(decoded.command_name, request.command_name);
+        assert_eq!(decoded.arguments, request.arguments);
     }
 
     #[test]

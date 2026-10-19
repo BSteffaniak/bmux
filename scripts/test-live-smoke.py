@@ -33,9 +33,9 @@ class SmokeTests(unittest.TestCase):
         routes = {'https://bmux.dev' + base + n: b for n, b in files.items()}
         routes.update({
             'https://bmux.dev/live': f'<script src="{base}live-page.js"></script>'.encode(),
-            'https://live.bmux.dev/health': b'{"status":"ok","renderer":"bmwp-4"}',
+            'https://live.bmux.dev/health': b'{"status":"ok","renderer":"bmwp-5"}',
             'https://bmux.dev' + base + 'manifest.json': json.dumps({
-                'schema': 1, 'protocol': 1, 'renderer': 'bmwp-4',
+                'schema': 1, 'protocol': 1, 'renderer': 'bmwp-5',
                 'bundle_sha256': identity, 'files': entries}).encode(),
         })
         opener = Mock()
@@ -74,14 +74,28 @@ class SmokeTests(unittest.TestCase):
         with patch.object(m.urllib.request, 'build_opener', return_value=opener):
             m.smoke('https://bmux.dev', component='backend')
             self.assertEqual(opener.open.call_count, 1)
-            for payload in ([], None, {}, {'protocol': 1, 'renderer': 'bmwp-4'},
-                            {'status': 'error', 'renderer': 'bmwp-4'},
+            for payload in ([], None, {}, {'protocol': 1, 'renderer': 'bmwp-5'},
+                            {'status': 'error', 'renderer': 'bmwp-5'},
+                            {'status': 'ok', 'renderer': 'bmwp-4'},
                             {'status': 'ok', 'renderer': 'bmwp-3'}, {'status': 'ok'}):
                 with self.subTest(payload=payload):
                     routes['https://live.bmux.dev/health'] = json.dumps(payload).encode()
                     with self.assertRaises(m.SmokeFailure) as caught:
                         m.smoke('https://bmux.dev', component='backend')
                     self.assertEqual(caught.exception.details['code'], 'unsupported_protocol')
+
+    def test_old_asset_renderer_rejected(self):
+        for renderer in ('bmwp-4', 'bmwp-3'):
+            with self.subTest(renderer=renderer):
+                routes, opener, base = self.fixture()
+                url = 'https://bmux.dev' + base + 'manifest.json'
+                manifest = json.loads(routes[url])
+                manifest['renderer'] = renderer
+                routes[url] = json.dumps(manifest).encode()
+                with patch.object(m.urllib.request, 'build_opener', return_value=opener):
+                    with self.assertRaises(m.SmokeFailure) as caught:
+                        m.smoke('https://bmux.dev', component='site')
+                self.assertEqual(caught.exception.details['code'], 'unsupported_asset_manifest')
 
     def test_failure_metadata_redacted(self):
         opener = Mock()

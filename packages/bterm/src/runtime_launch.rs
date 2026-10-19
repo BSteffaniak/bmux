@@ -175,14 +175,25 @@ async fn connect_at_paths(
     Ok(client)
 }
 
+fn runtime_incompatibility(error: &anyhow::Error) -> Option<String> {
+    match error.downcast_ref::<bmux_client::ClientError>()? {
+        bmux_client::ClientError::ProtocolIncompatible { reason } => Some(format!("{reason:?}")),
+        bmux_client::ClientError::ServerError {
+            code:
+                bmux_ipc::ErrorCode::ServiceIncompatible
+                | bmux_ipc::ErrorCode::UnsupportedRepresentation,
+            message,
+        } => Some(message.clone()),
+        _ => None,
+    }
+}
+
 async fn probe_paths(paths: &bmux_config::ConfigPaths, timeout: Duration) -> Result<RuntimeProbe> {
     match connect_at_paths(paths, timeout).await {
         Ok(_) => Ok(RuntimeProbe::Compatible),
         Err(error) => {
-            if let Some(bmux_client::ClientError::ProtocolIncompatible { reason }) =
-                error.downcast_ref::<bmux_client::ClientError>()
-            {
-                return Ok(RuntimeProbe::Incompatible(format!("{reason:?}")));
+            if let Some(reason) = runtime_incompatibility(&error) {
+                return Ok(RuntimeProbe::Incompatible(reason));
             }
             // A held claim means starting only for transport-level unavailability.
             // Authentication/protocol/application failures remain explicit errors.

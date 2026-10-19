@@ -53,6 +53,13 @@ mod process_runtime;
 pub mod prompt;
 mod ready;
 mod service;
+extern crate self as bmux_plugin_sdk;
+
+/// Generated transport contract for the existing versioned argv bridge.
+pub mod cli_bridge {
+    include!(concat!(env!("OUT_DIR"), "/cli_bridge.rs"));
+}
+
 pub mod service_contract;
 mod stateful_plugin;
 pub mod typed_dispatch;

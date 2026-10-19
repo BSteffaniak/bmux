@@ -171,8 +171,12 @@ already belong to the final buffer. Metadata is read-only; no remote input API.
 Image placements default to `Contain`; `Stretch` is explicit opt-in. Placements
 carry the policy and optional signed original
 allocation. Canvas containment uses browser cell pixel metrics before clipping;
-terminal adapters use their own cell metrics. Binary transport is `BMWP\\x04`
-(version 4): rebuild matching browser assets; earlier binary versions are rejected.
+terminal adapters use their own cell metrics. Binary transport is `BMWP\\x05`
+(version 5): rebuild matching browser assets; earlier binary versions are rejected.
+Version 5 adds the positional `SemanticRegion.accessibility` option, including an
+explicit absent value. JSON remains v3 because named optional metadata is compatible.
+Native/WASM consumers, relay renderer negotiation (`bmwp-5`), and immutable viewer
+assets must upgrade together; v4 payloads are never guessed or reinterpreted.
 V4 adds delta-only `Retain { count: u16 }` spans for unchanged physical cells.
 Snapshots cannot retain; zero-length and overflowing spans are rejected. Delta
 image placements reuse immutable resources from the validated base; full repairs

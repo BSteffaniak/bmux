@@ -27,15 +27,13 @@ mod control_contract {
     bmux_plugin_schema_macros::schema! { source: "bpdl/theme-plugin.bpdl" }
 }
 
-/// Exact generated contract for checked theme-state and theme-control-v1 calls.
+/// Generated interface identity for checked `theme-state` calls.
 ///
-/// After negotiating `core.service_contract.v1`, callers using the legacy
-/// `theme-state` transport wrap their existing `encode_service_message` bytes
-/// with `bmux_plugin_sdk::service_contract::encode(SERVICE_CONTRACT, payload)`.
-/// Successful responses must pass `service_contract::decode_response` before
-/// decoding as `bmux_appearance::RuntimeAppearance`. Generated clients do this
-/// automatically. This evidence covers the full nested appearance wire shape.
-pub use control_contract::SERVICE_CONTRACT;
+/// After negotiating `core.service_contract.v2`, callers bind encoded requests
+/// to `theme-state` and this compact interface identity. Successful responses
+/// must pass `service_contract::decode_response` before appearance decoding.
+/// Generated clients perform these steps automatically.
+pub use control_contract::theme_state::SERVICE_CONTRACT;
 
 const STORAGE_SELECTED_APPEARANCE: &str = "selected_theme";
 // Picker values are namespaced separately from catalog names.
@@ -3285,20 +3283,24 @@ mod tests {
         use bmux_plugin_sdk::{PluginContract, PluginInvocationId, ServiceEnvelopeKind};
         let plugin = Box::leak(Box::new(std::sync::RwLock::new(CountedTheme::default())));
         assert_eq!(
-            <<ThemePlugin as RustPlugin>::Contract as PluginContract>::service_contract(),
-            SERVICE_CONTRACT,
+            <<ThemePlugin as RustPlugin>::Contract as PluginContract>::service_contract_for(
+                "theme-state"
+            ),
+            Some(SERVICE_CONTRACT),
         );
         assert!(!SERVICE_CONTRACT.is_empty());
-        assert!(bmux_plugin_sdk::service_contract::encode(&[], b"request").is_err());
+        assert!(bmux_plugin_sdk::service_contract::encode("theme-state", &[], b"request").is_err());
         assert!(bmux_plugin_sdk::service_contract::decode_response(b"legacy response").is_err());
-        for (contract, expected_status, expected_calls) in [
-            (b"incompatible-appearance".as_slice(), 3, 0),
-            (SERVICE_CONTRACT, 0, 1),
-        ] {
+        for (contract, expected_status, expected_calls) in
+            [(&[0_u8; 32][..], 6, 0), (SERVICE_CONTRACT, 0, 1)]
+        {
             let mut context = service_context(None);
-            context.request.payload =
-                bmux_plugin_sdk::service_contract::encode(contract, &context.request.payload)
-                    .unwrap();
+            context.request.payload = bmux_plugin_sdk::service_contract::encode(
+                "theme-state",
+                contract,
+                &context.request.payload,
+            )
+            .unwrap();
             let request = bmux_plugin_sdk::encode_service_envelope_with_invocation_id(
                 PluginInvocationId::new(),
                 1,

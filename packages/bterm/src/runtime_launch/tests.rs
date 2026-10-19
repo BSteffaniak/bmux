@@ -6,6 +6,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn service_incompatibility_is_not_optional_absence_or_starting() {
+    for code in [
+        bmux_ipc::ErrorCode::ServiceIncompatible,
+        bmux_ipc::ErrorCode::UnsupportedRepresentation,
+    ] {
+        let error = anyhow::Error::new(bmux_client::ClientError::ServerError {
+            code,
+            message: "unsupported selected contract".into(),
+        })
+        .context("selected runtime handshake");
+        assert_eq!(
+            runtime_incompatibility(&error).as_deref(),
+            Some("unsupported selected contract")
+        );
+    }
+    for code in [bmux_ipc::ErrorCode::NotFound, bmux_ipc::ErrorCode::Internal] {
+        let error = anyhow::Error::new(bmux_client::ClientError::ServerError {
+            code,
+            message: "ServiceIncompatible is only text".into(),
+        });
+        assert!(runtime_incompatibility(&error).is_none());
+    }
+}
+
 struct Root(PathBuf);
 
 impl Root {

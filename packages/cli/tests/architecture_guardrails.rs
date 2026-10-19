@@ -3326,8 +3326,8 @@ fn presentation_plugins_own_product_projection_and_interaction() {
         .expect("sidebar plugin source");
     for required in [
         "label_template",
-        "move_tab",
-        "rename_tab_by_id",
+        "MoveTabEndpoint",
+        "RenameTabByIdEndpoint",
         "show_compact_facts",
     ] {
         assert!(tab.contains(required), "tab-bar must own {required}");

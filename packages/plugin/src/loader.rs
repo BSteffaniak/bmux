@@ -63,6 +63,8 @@ type NativeInvokeServiceFn =
 
 const NATIVE_SERVICE_STATUS_OK: i32 = 0;
 const NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
+// Checked-export ABI rejection; ordinary decode status 3 is not reinterpreted.
+const NATIVE_SERVICE_STATUS_CONTRACT_REJECTED: i32 = 6;
 const NATIVE_SERVICE_INITIAL_RESPONSE_BYTES: usize = 4096;
 const NATIVE_SERVICE_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const NATIVE_SERVICE_BUFFER_RESIZE_ATTEMPTS: usize = 8;
@@ -85,6 +87,25 @@ impl Default for NativeServiceBufferConfig {
             max_response_bytes: NATIVE_SERVICE_MAX_RESPONSE_BYTES,
             buffer_resize_attempts: NATIVE_SERVICE_BUFFER_RESIZE_ATTEMPTS,
         }
+    }
+}
+
+fn classify_native_service_error(error: PluginError, checked: bool) -> PluginError {
+    if checked
+        && matches!(
+            &error,
+            PluginError::NativeServiceInvocation {
+                status: NATIVE_SERVICE_STATUS_CONTRACT_REJECTED,
+                ..
+            }
+        )
+    {
+        PluginError::ServiceProtocol {
+            details: "checked provider rejected generated interface contract before execution"
+                .into(),
+        }
+    } else {
+        error
     }
 }
 
@@ -2479,7 +2500,11 @@ impl LoadedPlugin {
             PluginBackend::Process(_) => "process",
         };
         let encode_started = Instant::now();
-        let invocation_id = context.cancellation.invocation_id.clone();
+        // Cancellation IDs identify an inherited scope, not an individual call:
+        // nested/sibling operations legitimately share them. Allocate transport
+        // identity once per dispatch, outside the buffer-growth retry loop. Do not
+        // rewrite context cancellation/authority or derive identity from input.
+        let invocation_id = bmux_plugin_sdk::PluginInvocationId::new();
         let payload = encode_service_envelope_with_invocation_id(
             invocation_id.clone(),
             0,
@@ -2568,7 +2593,8 @@ impl LoadedPlugin {
             self.declaration.id.as_str(),
             self.native_service_buffers,
             |output, output_len| call_service(&payload, output, output_len),
-        )?;
+        )
+        .map_err(|error| classify_native_service_error(error, checked))?;
         let call_elapsed = call_started.elapsed();
         let call_us = call_elapsed.as_micros();
         let output_len = output.len();
@@ -3793,6 +3819,186 @@ minimum = "1.0"
         let message = error.to_string();
         assert!(message.contains("test.plugin"));
         assert!(message.contains("command:hello"));
+    }
+
+    #[test]
+    fn native_contract_rejection_classification_requires_checked_call_and_distinct_status() {
+        for (checked, status, incompatible) in [
+            (true, 6, true),
+            (true, 3, false),
+            (false, 6, false),
+            (false, 3, false),
+            (true, 70, false),
+        ] {
+            let error = super::invoke_native_service_resizing_output(
+                "test.plugin",
+                NativeServiceBufferConfig::default(),
+                |_, _| status,
+            )
+            .unwrap_err();
+            let classified = super::classify_native_service_error(error, checked);
+            if incompatible {
+                assert!(matches!(
+                    classified,
+                    bmux_plugin_sdk::PluginError::ServiceProtocol { .. }
+                ));
+            } else {
+                assert!(
+                    matches!(classified, bmux_plugin_sdk::PluginError::NativeServiceInvocation { status: actual, .. } if actual == status)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_and_sibling_calls_share_cancellation_not_replay_identity() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, OnceLock};
+
+        #[derive(Default)]
+        struct ReentrantPlugin {
+            effects: AtomicUsize,
+            calls: AtomicUsize,
+        }
+        static INSTANCE: OnceLock<Arc<ReentrantPlugin>> = OnceLock::new();
+        static LOADED: OnceLock<LoadedPlugin> = OnceLock::new();
+        static SCOPE: OnceLock<bmux_plugin_sdk::PluginInvocationId> = OnceLock::new();
+
+        impl bmux_plugin_sdk::ConcurrentRustPlugin for ReentrantPlugin {
+            type Contract = bmux_plugin_sdk::NoPluginContract;
+            fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+                assert_eq!(&context.cancellation.invocation_id, SCOPE.get().unwrap());
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if context.request.operation == "outer" {
+                    // A nested query then mutation through the SAME provider and
+                    // cancellation scope must not collide with the outer call.
+                    let mut nested = context;
+                    if let Some(depth) = nested
+                        .request
+                        .payload
+                        .first_mut()
+                        .filter(|depth| **depth > 0)
+                    {
+                        *depth -= 1;
+                        return LOADED.get().unwrap().invoke_service(&nested).unwrap();
+                    }
+                    nested.request.operation = "query".into();
+                    assert_eq!(
+                        LOADED
+                            .get()
+                            .unwrap()
+                            .invoke_service(&nested)
+                            .unwrap()
+                            .payload,
+                        vec![0]
+                    );
+                    nested.request.operation = "mutate".into();
+                    assert_eq!(
+                        LOADED
+                            .get()
+                            .unwrap()
+                            .invoke_service(&nested)
+                            .unwrap()
+                            .payload,
+                        vec![42; 17_000]
+                    );
+                    ServiceResponse::ok(vec![42; 17_000])
+                } else if context.request.operation == "mutate" {
+                    self.effects.fetch_add(1, Ordering::SeqCst);
+                    // Forces the loader to retry; effect still occurs just once.
+                    ServiceResponse::ok(vec![42; 17_000])
+                } else {
+                    ServiceResponse::ok(vec![0])
+                }
+            }
+        }
+        fn export(
+            input: *const u8,
+            len: usize,
+            output: *mut u8,
+            capacity: usize,
+            written: *mut usize,
+        ) -> i32 {
+            bmux_plugin_sdk::__private::invoke_service_concurrent_export(
+                INSTANCE.get().unwrap(),
+                input,
+                len,
+                output,
+                capacity,
+                written,
+            )
+        }
+        let instance = INSTANCE.get_or_init(|| Arc::new(ReentrantPlugin::default()));
+        let mut loaded = loaded_static_test_plugin();
+        let PluginBackend::Static(table) = &mut loaded.backend else {
+            panic!("static fixture")
+        };
+        table.invoke_service = export;
+        let loaded = LOADED.get_or_init(|| loaded);
+        let mut context = native_test_service_context(vec![32]);
+        SCOPE
+            .set(context.cancellation.invocation_id.clone())
+            .unwrap();
+        context.request.operation = "outer".into();
+        assert_eq!(
+            loaded.invoke_service(&context).unwrap().payload,
+            vec![42; 17_000]
+        );
+        // A later identical logical operation must execute again rather than
+        // replaying a prior call merely because cancellation metadata is shared.
+        context.request.operation = "mutate".into();
+        for _ in 0..2 {
+            assert_eq!(
+                loaded.invoke_service(&context).unwrap().payload,
+                vec![42; 17_000]
+            );
+        }
+        assert_eq!(instance.effects.load(Ordering::SeqCst), 3);
+        assert_eq!(instance.calls.load(Ordering::SeqCst), 37);
+    }
+
+    #[test]
+    fn sdk_buffer_growth_retains_one_mutation_outcome() {
+        #[derive(Default)]
+        struct Mutation(std::sync::atomic::AtomicUsize);
+        impl bmux_plugin_sdk::ConcurrentRustPlugin for Mutation {
+            type Contract = bmux_plugin_sdk::NoPluginContract;
+            fn invoke_service_concurrent(&self, _: NativeServiceContext) -> ServiceResponse {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ServiceResponse::ok(vec![42; 17_000])
+            }
+        }
+        let instance: &'static std::sync::Arc<Mutation> =
+            Box::leak(Box::new(std::sync::Arc::new(Mutation::default())));
+        let context = native_test_service_context(Vec::new());
+        let input = encode_service_envelope_with_invocation_id(
+            context.cancellation.invocation_id.clone(),
+            0,
+            ServiceEnvelopeKind::Request,
+            &context,
+        )
+        .unwrap();
+        let (output, resizes) = super::invoke_native_service_resizing_output(
+            "test.plugin",
+            NativeServiceBufferConfig::default(),
+            |output, len| {
+                bmux_plugin_sdk::__private::invoke_service_concurrent_export(
+                    instance,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                    len,
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(resizes, 1);
+        let (_, _, response): (_, _, ServiceResponse) =
+            decode_service_envelope_with_invocation_id(&output, ServiceEnvelopeKind::Response)
+                .unwrap();
+        assert_eq!(response.payload, vec![42; 17_000]);
+        assert_eq!(instance.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

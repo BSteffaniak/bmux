@@ -714,7 +714,7 @@ pub(super) fn register_plugin_service_handlers(
         BTreeMap::new();
     let command_connection_info = connection_info.clone();
 
-    server.register_service_handler_with_metadata(
+    server.register_checked_service_handler_with_metadata(
         CORE_CLI_COMMAND_CAPABILITY,
         InvokeServiceKind::Command,
         CORE_CLI_COMMAND_INTERFACE_V1,
@@ -725,7 +725,23 @@ pub(super) fn register_plugin_service_handlers(
             async move {
                 let _kernel_context_guard = enter_service_kernel_context(invoke_context.clone());
                 let _host_kernel_connection_guard = enter_host_kernel_connection(connection);
-                let request: PluginCliCommandRequest = decode_service_message(&payload)?;
+                let checked = bmux_plugin_sdk::service_contract::is_checked(&payload);
+                let payload = if checked {
+                    bmux_plugin_sdk::service_contract::decode_for(
+                        CORE_CLI_COMMAND_INTERFACE_V1,
+                        bmux_plugin_sdk::cli_bridge::cli_command::SERVICE_CONTRACT,
+                        &payload,
+                    )?
+                } else {
+                    &payload
+                };
+                let request: PluginCliCommandRequest = decode_service_message(payload)?;
+                if request.protocol_version != bmux_plugin_sdk::CORE_CLI_BRIDGE_PROTOCOL_V1 {
+                    return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+                        details: "unsupported CLI argv protocol version".into(),
+                    }
+                    .into());
+                }
                 let execution = run_plugin_bridge_command_execution_with_state(
                     &command_state,
                     &request,
@@ -741,8 +757,14 @@ pub(super) fn register_plugin_service_handlers(
                         }),
                     )
                 };
+                let payload = encode_service_message(&response)?;
+                let payload = if checked {
+                    bmux_plugin_sdk::service_contract::encode_response(&payload)
+                } else {
+                    payload
+                };
                 Ok(bmux_server::ServiceInvokeOutput {
-                    payload: encode_service_message(&response)?,
+                    payload,
                     metadata: execution.outcome.metadata,
                 })
             }

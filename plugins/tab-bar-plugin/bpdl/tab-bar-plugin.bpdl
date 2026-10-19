@@ -1,0 +1,10 @@
+// Only server-side presentation workflows; local input is not a service.
+plugin bmux.tab_bar version 1;
+import workspaces = bmux.workspaces;
+capability INPUT = bmux.tab_bar.input;
+@capability(INPUT)
+@interface-version(2)
+interface presentation-actions {
+    command move-selection(action: string, tabs: list<uuid>, workspace: uuid) -> unit;
+    command list-destinations() -> list<workspaces.workspace-summary>;
+}

@@ -91,7 +91,7 @@ def smoke(url, component='all', report=None, relay_url='https://live.bmux.dev'):
             raise SmokeFailure('invalid_json', safe_endpoint(path)) from None
     if component != 'site':
         data = get_json('/health', 4096)
-        if not isinstance(data, dict) or data.get('status') != 'ok' or data.get('renderer') != 'bmwp-4':
+        if not isinstance(data, dict) or data.get('status') != 'ok' or data.get('renderer') != 'bmwp-5':
             raise SmokeFailure('unsupported_protocol', '/health')
     if component == 'backend':
         return
@@ -102,7 +102,7 @@ def smoke(url, component='all', report=None, relay_url='https://live.bmux.dev'):
     base = next(iter(parser.bases))
     manifest = get_json(base + 'manifest.json', 8192)
     if (manifest.get('schema') != 1 or manifest.get('protocol') != 1 or
-            manifest.get('renderer') != 'bmwp-4' or manifest.get('bundle_sha256') != base.split('/')[2]):
+            manifest.get('renderer') != 'bmwp-5' or manifest.get('bundle_sha256') != base.split('/')[2]):
         raise SmokeFailure('unsupported_asset_manifest', base + 'manifest.json')
     required = {'live-page.js', 'live-viewer.js', 'canvas-viewer.js',
                 'bmux_web_renderer.js', 'bmux_web_renderer_bg.wasm'}

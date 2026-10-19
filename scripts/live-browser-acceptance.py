@@ -54,7 +54,7 @@ def main():
     args = parser.parse_args()
     site = args.site.resolve(); version = (site / 'live-assets/current-version').read_text().strip()
     assets = site / 'live-assets' / version
-    frame = args.fixture.read_bytes(); assert frame.startswith(b'BMWP\x04')
+    frame = args.fixture.read_bytes(); assert frame.startswith(b'BMWP\x05')
     module_path = f'/live-assets/{version}/live-page.js'
     pages = list(site.rglob('*.html')); assert pages
     for page in pages:
@@ -63,7 +63,7 @@ def main():
     LOCAL.verify_assets(assets)
     timer = subprocess.run([str(args.wire_tool.resolve()), '--timer'], input=frame, capture_output=True, check=True, timeout=5).stdout
     delta = subprocess.run([str(args.wire_tool.resolve()), '--delta', str(args.fixture.resolve())], input=timer, capture_output=True, check=True, timeout=5).stdout
-    assert delta.startswith(b'BMWP\x04') and len(delta) < 256 and len(delta) < len(frame) / 10, 'one digit must be a tiny patch'
+    assert delta.startswith(b'BMWP\x05') and len(delta) < 256 and len(delta) < len(frame) / 10, 'one digit must be a tiny patch'
     evidence = {'cases': [], 'relay_sha256': hashlib.sha256(args.relay.read_bytes()).hexdigest(), 'delta_bytes': len(delta), 'full_bytes': len(frame)}
     if args.evidence: args.evidence.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='bmux-live-browser-') as directory:

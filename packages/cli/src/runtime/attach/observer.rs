@@ -331,54 +331,7 @@ impl AttachObserverPublisher {
         let Some(revision) = self.revision.checked_add(1) else {
             anyhow::bail!("attach presentation revision exhausted");
         };
-        let surfaces = graph
-            .ordered_surfaces()
-            .into_iter()
-            .map(|surface| {
-                let rect = Rect::new(
-                    surface.rect.x,
-                    surface.rect.y,
-                    surface.rect.w,
-                    surface.rect.h,
-                );
-                let clip = surface
-                    .paint_rect()
-                    .map_or(Rect::new(0, 0, 0, 0), |r| Rect::new(r.x, r.y, r.w, r.h));
-                AttachSurfaceProvenance {
-                    retained_id: surface.id,
-                    owner_plugin_id: surface
-                        .owner
-                        .as_ref()
-                        .map(|owner| owner.owner_plugin_id.clone()),
-                    owner_local_id: surface.owner.as_ref().map(|owner| owner.local_id.clone()),
-                    revision: surface.revision,
-                    rect,
-                    clip,
-                    selection_available: surface
-                        .metadata
-                        .as_ref()
-                        .is_some_and(|metadata| metadata.selection.is_some()),
-                    semantics_available: surface
-                        .metadata
-                        .as_ref()
-                        .is_some_and(|metadata| metadata.semantics.is_some()),
-                    layer: surface.layer,
-                    z: surface.z,
-                    stream_end: match &surface.payload {
-                        bmux_attach_pipeline::RetainedSurfacePayload::Content { content_id } => {
-                            stream_ends.get(content_id).copied().flatten()
-                        }
-                        _ => None,
-                    },
-                    content_id: match &surface.payload {
-                        bmux_attach_pipeline::RetainedSurfacePayload::Content { content_id } => {
-                            Some(*content_id)
-                        }
-                        _ => None,
-                    },
-                }
-            })
-            .collect();
+        let surfaces = surface_provenance(graph, stream_ends);
         if let Some((viewport_generation, delivery)) = &mut self.prepared_delivery {
             use bmux_frontend_runtime::presentation::{
                 PreparedDelivery, PresentationAuthority, PresentationIdentity,
@@ -441,6 +394,60 @@ impl AttachObserverPublisher {
         self.report_rejection(None);
         Ok(())
     }
+}
+
+fn surface_provenance(
+    graph: &RetainedCompositor,
+    stream_ends: &std::collections::BTreeMap<Uuid, Option<u64>>,
+) -> Vec<AttachSurfaceProvenance> {
+    graph
+        .ordered_surfaces()
+        .into_iter()
+        .map(|surface| {
+            let rect = Rect::new(
+                surface.rect.x,
+                surface.rect.y,
+                surface.rect.w,
+                surface.rect.h,
+            );
+            let clip = surface
+                .paint_rect()
+                .map_or(Rect::new(0, 0, 0, 0), |r| Rect::new(r.x, r.y, r.w, r.h));
+            AttachSurfaceProvenance {
+                retained_id: surface.id,
+                owner_plugin_id: surface
+                    .owner
+                    .as_ref()
+                    .map(|owner| owner.owner_plugin_id.clone()),
+                owner_local_id: surface.owner.as_ref().map(|owner| owner.local_id.clone()),
+                revision: surface.revision,
+                rect,
+                clip,
+                selection_available: surface
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.selection.is_some()),
+                semantics_available: surface
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.semantics.is_some()),
+                layer: surface.layer,
+                z: surface.z,
+                stream_end: match &surface.payload {
+                    bmux_attach_pipeline::RetainedSurfacePayload::Content { content_id } => {
+                        stream_ends.get(content_id).copied().flatten()
+                    }
+                    _ => None,
+                },
+                content_id: match &surface.payload {
+                    bmux_attach_pipeline::RetainedSurfacePayload::Content { content_id } => {
+                        Some(*content_id)
+                    }
+                    _ => None,
+                },
+            }
+        })
+        .collect()
 }
 
 /// A rejected complete browser frame, not a transport/process failure.

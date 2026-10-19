@@ -223,7 +223,7 @@ flags (for example `--managed --presenter-credential FILE --public-read`). A
 managed broadcast source keeps the caller running until Ctrl-C; the persistent
 broadcast controller lives in the server plugin, not this caller process.
 
-Only the shared compositor's audience projection enters full inline BMWP3
+Only the shared compositor's audience projection enters full inline BMWP5
 frames: private notes, speaker controls, and unrevealed material are excluded.
 The output task retains only the latest frame, polls the source lease every
 second, and republishes unchanged slides after controller refresh. It fences

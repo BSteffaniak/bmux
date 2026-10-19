@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_codec                = { workspace = true }
 bmux_ipc                  = { workspace = true }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
@@ -22,6 +23,7 @@ uuid                      = { workspace = true, features = ["serde", "std"] }
 serde_json = { workspace = true }
 
 [package.metadata.cargo-machete]
+# `bmux_codec` supplies generated BPDL byte-buffer serde adapters.
 # `serde` is consumed by code generated from the BPDL schema via the
 # `bmux_plugin_schema_macros::schema!` proc macro; cargo-machete cannot
 # see into proc-macro-generated source.
@@ -29,11 +31,18 @@ serde_json = { workspace = true }
 # identifiers and generated transport clients.
 # `bmux_scene_protocol` is referenced by generated qualified type paths
 # for the imported `scene.decoration-scene` return of `scene-snapshot`.
-ignored = ["serde", "bmux_plugin_sdk", "bmux_ipc", "bmux_scene_protocol"]
+ignored = [
+    "bmux_codec",
+    "serde",
+    "bmux_plugin_sdk",
+    "bmux_ipc",
+    "bmux_scene_protocol",
+]
 
 [features]
 default = []
 fail-on-warnings = [
+    "bmux_codec/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_plugin_schema_macros/fail-on-warnings",

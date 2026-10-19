@@ -35,7 +35,7 @@ pub struct ServiceInterfaceDescriptor {
     pub capability: CapabilityId,
     pub kind: ServiceKind,
     pub interface_id: InterfaceId,
-    /// Exact canonical generated contract; empty means unavailable evidence.
+    /// Canonical interface SHA-256 identity (32 bytes); empty means unavailable evidence.
     pub contract: &'static [u8],
 }
 
@@ -45,10 +45,11 @@ pub struct ServiceInterfaceDescriptor {
 /// `RustPlugin::Contract`. Hosts then derive generated services from that type,
 /// so providers do not manually list BPDL services in manifests or plugin impls.
 pub trait PluginContract {
-    /// Exact generated BPDL contract. Empty means evidence is unavailable.
+    /// Resolve one interface against this actual provider's generated contract.
+    /// Unknown interfaces have no evidence and must not dispatch checked calls.
     #[must_use]
-    fn service_contract() -> &'static [u8] {
-        &[]
+    fn service_contract_for(_interface_id: &str) -> Option<&'static [u8]> {
+        None
     }
 
     /// Return service declarations generated from the plugin contract.

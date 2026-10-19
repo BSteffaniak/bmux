@@ -21,5 +21,5 @@ version_req = ">=0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.tab_bar.input"
-interface_id = "presentation-input"
+interface_id = "presentation-actions/v2"
 kind         = "command"

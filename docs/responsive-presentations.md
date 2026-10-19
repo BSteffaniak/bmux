@@ -114,7 +114,7 @@ or diagnostic fallback is accepted.
 
 ## Metadata and interaction scope
 
-Browser frames use JSON wire version 3 and binary `BMWP\x03`. The HTTP
+Browser frames use JSON wire version 3 and binary `BMWP\x05`. The HTTP
 `/presentation?version=1` and `/document?version=1` negotiation remains version 1.
 Rebuild matching native and WASM consumers together; older frame schemas are
 rejected rather than interpreted with guessed metadata semantics.

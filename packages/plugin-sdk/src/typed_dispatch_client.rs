@@ -201,12 +201,11 @@ where
         })?;
     let checked = client.requires_service_contracts();
     let payload = if checked {
-        crate::service_contract::encode(E::SERVICE_CONTRACT, &payload).map_err(|err| {
-            TypedServiceClientError::Encode {
+        crate::service_contract::encode(E::INTERFACE_ID.as_str(), E::SERVICE_CONTRACT, &payload)
+            .map_err(|err| TypedServiceClientError::Encode {
                 op: operation.to_string(),
                 details: err.to_string(),
-            }
-        })?
+            })?
     } else {
         payload
     };
@@ -336,7 +335,7 @@ mod tests {
         const KIND: InvokeServiceKind = InvokeServiceKind::Query;
         const INTERFACE_ID: InterfaceId = InterfaceId::from_static("state/v1");
         const OPERATION: OperationId = OperationId::from_static("get");
-        const SERVICE_CONTRACT: &'static [u8] = b"exact-contract-v1";
+        const SERVICE_CONTRACT: &'static [u8] = &[7; 32];
     }
 
     struct CheckedDispatch;
@@ -354,9 +353,12 @@ mod tests {
             _operation: &str,
             payload: Vec<u8>,
         ) -> TypedDispatchClientResult<Vec<u8>> {
-            let request =
-                crate::service_contract::decode(CheckedEndpoint::SERVICE_CONTRACT, &payload)
-                    .unwrap();
+            let request = crate::service_contract::decode_for(
+                CheckedEndpoint::INTERFACE_ID.as_str(),
+                CheckedEndpoint::SERVICE_CONTRACT,
+                &payload,
+            )
+            .unwrap();
             let number: u32 = crate::decode_service_message(request).unwrap();
             Ok(crate::service_contract::encode_response(
                 &crate::encode_service_message(&(number + 1)).unwrap(),

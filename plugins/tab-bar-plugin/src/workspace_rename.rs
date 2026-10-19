@@ -4,13 +4,7 @@ use super::{
 };
 
 pub fn invocation(id: Uuid, name: String) -> Option<super::AttachInputServiceInvocation> {
-    command_invocation(
-        // Keep typed result interpretation in the plugin, not generic attach dispatch.
-        bmux_plugin::AttachInputEndpoint {
-            capability: "bmux.tab_bar.input".to_string(),
-            interface_id: "presentation-input".to_string(),
-            operation: "rename-workspace".to_string(),
-        },
+    command_invocation::<workspaces_commands::client::RenameWorkspaceEndpoint>(
         &workspaces_commands::client::RenameWorkspaceRequest {
             selector: workspaces_state::WorkspaceSelector {
                 id: Some(id),
@@ -108,7 +102,7 @@ mod tests {
         assert!(companion.edit_buffer.selection().is_some());
         let invocation = invocation(id, "renamed".to_string()).unwrap();
         let request: workspaces_commands::client::RenameWorkspaceRequest =
-            bmux_plugin_sdk::decode_service_message(&invocation.payload).unwrap();
+            crate::decode_action_payload(&invocation).unwrap();
         assert_eq!(request.selector.id, Some(id));
         assert_eq!(request.name, "renamed");
     }

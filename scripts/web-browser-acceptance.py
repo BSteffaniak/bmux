@@ -835,8 +835,8 @@ class Harness:
                 return value and value["width"] == 1200 and value["height"] == 1200
             wait_for("large binary viewport", sized_frame)
             status, body = http(self.origin, "/presentation?version=1", self.token)
-            require(status == 200 and body.startswith(b"BMWP\x04"),
-                    "large binary source must use BMWP wire v3")
+            require(status == 200 and body.startswith(b"BMWP\x05"),
+                    "large binary source must use BMWP wire v5")
             converter = self.args.binary.parent / "examples" / "wire_frame"
             result = subprocess.run([str(converter), "--dense"], input=body, capture_output=True, timeout=15)
             require(result.returncode == 0, "dense conformance encoding failed")
