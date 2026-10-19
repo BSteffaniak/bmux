@@ -235,16 +235,31 @@ impl BrowserBackend for CanvasBackend {
         }
         staging_context.save();
         staging_context.begin_path();
-        for (index, changed) in dirty.iter().enumerate() {
-            if *changed {
-                staging_context.rect(
-                    f64::from(u16::try_from(index % usize::from(area.width)).map_err(error)?)
-                        * self.cell_width,
-                    f64::from(u16::try_from(index / usize::from(area.width)).map_err(error)?)
-                        * self.cell_height,
-                    self.cell_width,
-                    self.cell_height,
-                );
+        // A full repaint needs one clip, not a path containing every physical
+        // cell. Large cell-wise clip paths can render transparent on accelerated
+        // Canvas backends (reproduced with headed Linux Edge). For deltas merge
+        // adjacent cells into row spans, preserving the exact damage union.
+        if previous.is_none() {
+            staging_context.rect(0.0, 0.0, f64::from(width), f64::from(height));
+        } else if area.width != 0 {
+            for (row, cells) in dirty.chunks(usize::from(area.width)).enumerate() {
+                let mut column = 0;
+                while column < cells.len() {
+                    if !cells[column] {
+                        column += 1;
+                        continue;
+                    }
+                    let start = column;
+                    while column < cells.len() && cells[column] {
+                        column += 1;
+                    }
+                    staging_context.rect(
+                        f64::from(u16::try_from(start).map_err(error)?) * self.cell_width,
+                        f64::from(u16::try_from(row).map_err(error)?) * self.cell_height,
+                        f64::from(u16::try_from(column - start).map_err(error)?) * self.cell_width,
+                        self.cell_height,
+                    );
+                }
             }
         }
         staging_context.clip();

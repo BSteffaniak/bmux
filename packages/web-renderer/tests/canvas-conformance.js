@@ -16,9 +16,26 @@ export async function canvasConformance(CanvasRenderer, canvasId, first, second,
   };
   ImageBitmap.prototype.close = function () { live.delete(this); return close.call(this); };
   let freed = false;
+  const prototype = CanvasRenderingContext2D.prototype;
+  const begin = prototype.beginPath, rect = prototype.rect, clip = prototype.clip;
+  const rectangles = new WeakMap();
+  let largestClip = 0;
+  prototype.beginPath = function (...args) {
+    rectangles.set(this, 0);
+    return begin.apply(this, args);
+  };
+  prototype.rect = function (...args) {
+    rectangles.set(this, (rectangles.get(this) ?? 0) + 1);
+    return rect.apply(this, args);
+  };
+  prototype.clip = function (...args) {
+    largestClip = Math.max(largestClip, rectangles.get(this) ?? 0);
+    return clip.apply(this, args);
+  };
   const renderer = new CanvasRenderer(canvasId, 10, 20);
   try {
     await renderer.present_json(JSON.stringify(first));
+    assert(largestClip === 1, 'full snapshot must use a single clip rectangle, not one per cell');
     assert(live.size > 0, 'first fixture must contain decoded images');
     const metadata = renderer.metadata_json();
     const imageCount = live.size;
@@ -64,6 +81,9 @@ export async function canvasConformance(CanvasRenderer, canvasId, first, second,
     assert(live.size === 0, 'Drop leaked ImageBitmaps');
   } finally {
     if (!freed) renderer.free();
+    prototype.beginPath = begin;
+    prototype.rect = rect;
+    prototype.clip = clip;
     window.createImageBitmap = create;
     ImageBitmap.prototype.close = close;
   }

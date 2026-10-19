@@ -135,6 +135,74 @@ impl Fixture {
     }
 }
 #[tokio::test]
+async fn late_viewer_receives_complete_current_frame_after_deltas() {
+    let fixture = Fixture::new().await;
+    let mut publisher = fixture.publisher().await;
+    let make = |revision, text: &str| {
+        let mut value = serde_json::to_value(frame(revision)).unwrap();
+        for (index, ch) in text.chars().enumerate() {
+            value["buffer"]["cells"][index]["symbol"] = ch.to_string().into();
+        }
+        value["image_scene"] = serde_json::json!({"active": {
+            "image": {"key":"image", "payload":{"Pixels":{"bytes":vec![123_u8; 4096],
+                "width":32,"height":32,"format":"Rgba8"}},
+                "destination":{"x":0,"y":0,"width":1,"height":1},
+                "clip":{"x":0,"y":0,"width":8,"height":2}, "lifecycle":"Persistent"}
+        }});
+        serde_json::from_value::<BrowserFrame>(value).unwrap()
+    };
+    let first = make(1, "ABCDEFGHretained");
+    let second = make(2, "ABcDEFGHretained");
+    let third = make(3, "ABcDEFGHretainEd");
+    for bytes in [
+        encode_binary(&first).unwrap(),
+        encode_delta(&second, &first).unwrap(),
+        encode_delta(&third, &second).unwrap(),
+    ] {
+        publisher
+            .send(ClientMessage::Binary(bytes.into()))
+            .await
+            .unwrap();
+        assert!(
+            message(&mut publisher)
+                .await
+                .into_text()
+                .unwrap()
+                .contains("ack")
+        );
+    }
+    let mut viewer = fixture.viewer().await;
+    let received = decode_binary(&binary(&mut viewer).await, None).unwrap();
+    assert_eq!(received.buffer(), third.buffer());
+    assert_eq!(received.image_scene(), third.image_scene());
+    assert_eq!(received.revision(), 3);
+    ack(&mut viewer, 3).await;
+    let fourth = make(4, "ABcDEFGHretainED");
+    publisher
+        .send(ClientMessage::Binary(
+            encode_delta(&fourth, &third).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        message(&mut publisher)
+            .await
+            .into_text()
+            .unwrap()
+            .contains("ack")
+    );
+    let received = decode_binary(&binary(&mut viewer).await, Some(&received)).unwrap();
+    assert_eq!(received.buffer(), fourth.buffer());
+    assert_eq!(received.image_scene(), fourth.image_scene());
+    viewer.close(None).await.unwrap();
+    let mut reconnected = fixture.viewer().await;
+    let repaired = decode_binary(&binary(&mut reconnected).await, None).unwrap();
+    assert_eq!(repaired.buffer(), fourth.buffer());
+    assert_eq!(repaired.image_scene(), fourth.image_scene());
+    assert_eq!(repaired.revision(), fourth.revision());
+}
+
+#[tokio::test]
 async fn real_ws_full_delta_ack_and_slow_viewer_snapshot_repair() {
     let fixture = Fixture::new().await;
     let mut viewer = fixture.viewer().await;
