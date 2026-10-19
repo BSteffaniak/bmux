@@ -24,6 +24,8 @@ for page in Path(sys.argv[1]).rglob('*.html'):
                         'content="bmux terminal multiplexer documentation and live broadcasts"')
     page.write_text(text)
 PY
+# Exact content-addressed URLs get immutable caching; HTML keeps Pages defaults.
+node scripts/site-cache-headers.mjs "$OUTPUT/site"
 mkdir "$OUTPUT/tools"
 cp infra/live-terraform/tools/package*.json "$OUTPUT/tools/"
 (cd "$OUTPUT/tools" && npm ci --ignore-scripts --no-audit --no-fund)

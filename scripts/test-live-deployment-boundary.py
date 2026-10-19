@@ -137,6 +137,9 @@ class DeploymentBoundaryTests(unittest.TestCase):
                          'tools/node_modules/wrangler/bin/wrangler.js'):
                 self.assertTrue((output / name).is_file(), name)
             html = (output / 'site/index.html').read_text()
+            self.assertTrue((output / 'site/_headers').is_file())
+            # The mocked generator emits no hashed assets: no immutable rules.
+            self.assertNotIn('Cache-Control:', (output / 'site/_headers').read_text())
             self.assertIn('<title>bmux — Live broadcasts and documentation</title>', html)
             self.assertNotIn('MoosicBox', html)
             self.assertFalse((output / 'relay').exists())
