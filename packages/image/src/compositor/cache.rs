@@ -16,7 +16,6 @@ struct Source {
 
 #[derive(Clone, Debug)]
 pub(super) struct Fragment {
-    pub id: u64,
     source: Arc<PaneImage>,
     protocol: ImageProtocol,
     crop: Rect,
@@ -30,7 +29,6 @@ pub(super) struct Fragment {
 pub(super) struct Cache {
     sources: Vec<Source>,
     fragments: Vec<Fragment>,
-    next_id: u64,
     pub decodes: usize,
     pub preparations: usize,
 }
@@ -134,10 +132,6 @@ impl Cache {
         pixels: Arc<PixelBuffer>,
         encoded: Vec<u8>,
     ) -> Fragment {
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("fragment ID space exhausted");
         let source = self
             .sources
             .iter()
@@ -149,7 +143,6 @@ impl Cache {
                 |source| Arc::clone(&source.payload),
             );
         let fragment = Fragment {
-            id: u64::MAX - self.next_id,
             source,
             protocol: image.protocol,
             crop,

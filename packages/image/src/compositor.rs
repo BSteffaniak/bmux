@@ -7,6 +7,8 @@
 
 mod cache;
 pub(crate) mod clipping;
+#[cfg(feature = "kitty")]
+mod residency;
 #[cfg(all(test, any(feature = "kitty", feature = "sixel")))]
 mod tests;
 use std::io::Write;
@@ -33,7 +35,11 @@ pub struct PaneRect {
 #[derive(Clone, Debug, Default)]
 pub struct KittyHostState {
     /// Maps bmux-internal image ID → host-side kitty image ID.
+    /// Retained owner hints are bounded independently from content residency.
     pub transmitted: std::collections::HashMap<u64, u32>,
+    // Canonical resources have their own accounting; public owner hints must
+    // never determine content identity or cause duplicate resource deletion.
+    pub(super) resources: std::collections::HashMap<u64, u32>,
     /// Next host-side kitty image ID to allocate.
     #[cfg(feature = "kitty")]
     next_host_id: u32,
@@ -41,15 +47,17 @@ pub struct KittyHostState {
     protocol: Option<crate::model::ImageProtocol>,
     #[cfg(feature = "kitty")]
     content_bytes: std::collections::HashMap<u64, usize>,
+    #[cfg(feature = "kitty")]
+    residency: residency::Residency,
     frame_seen: std::collections::HashSet<u64>,
     // Retained resources needed later in this frame, before their paint turn.
     frame_protected: std::collections::HashSet<u64>,
     repair_ids: std::collections::BTreeSet<u32>,
     allocated_ids: std::collections::BTreeSet<u32>,
     #[cfg(feature = "kitty")]
-    placements: std::collections::BTreeMap<(u32, u16, u16), u32>,
+    placements: std::collections::BTreeMap<(u32, u16, u16, u64), u32>,
     #[cfg(feature = "kitty")]
-    seen_placements: std::collections::BTreeSet<(u32, u16, u16)>,
+    seen_placements: std::collections::BTreeSet<(u32, u16, u16, u64)>,
     #[cfg(feature = "kitty")]
     next_placement_id: u32,
 }
@@ -228,7 +236,7 @@ impl KittyHostState {
             width: geometry[6],
             height: geometry[7],
         };
-        self.place_cropped(out, host, (x, y), (cols, rows), Some(crop))?;
+        self.place_cropped(out, (host, image.id), (x, y), (cols, rows), Some(crop))?;
         Ok(true)
     }
 
@@ -274,7 +282,7 @@ impl KittyHostState {
         write!(out, "\x1b[{};{}H", visible.y + 1, visible.x + 1)?;
         self.place_cropped(
             out,
-            host,
+            (host, image.id),
             (visible.x, visible.y),
             (visible.width, visible.height),
             Some(crop),
@@ -285,7 +293,7 @@ impl KittyHostState {
     /// The caller must commit this candidate only after output and flush succeed.
     pub fn clear_placements(&mut self, out: &mut impl Write) -> std::io::Result<()> {
         #[cfg(feature = "kitty")]
-        for host_id in self.transmitted.values() {
+        for host_id in self.resources.values() {
             out.write_all(b"\x1b_")?;
             out.write_all(&crate::codec::kitty::encode_delete_image(*host_id))?;
             out.write_all(b"\x1b\\")?;
@@ -309,7 +317,9 @@ impl KittyHostState {
     /// Protect an already resident resource before ordered painting begins.
     /// This does not count as a placement or allocate host content.
     pub(crate) fn protect_retained(&mut self, id: u64) {
-        if self.transmitted.contains_key(&id) {
+        #[cfg(feature = "kitty")]
+        let id = self.residency.resolve(id);
+        if self.resources.contains_key(&id) {
             self.frame_protected.insert(id);
         }
     }
@@ -317,9 +327,9 @@ impl KittyHostState {
     /// Invalidate uncertain host output without advancing committed scene state.
     /// Supply the candidate that may have partially reached the terminal.
     pub fn invalidate_after_failed_output(&mut self, candidate: &Self) {
-        self.repair_ids.extend(self.transmitted.values().copied());
+        self.repair_ids.extend(self.resources.values().copied());
         self.repair_ids
-            .extend(candidate.transmitted.values().copied());
+            .extend(candidate.resources.values().copied());
         self.repair_ids
             .extend(candidate.allocated_ids.iter().copied());
         self.repair_ids.extend(candidate.repair_ids.iter().copied());
@@ -348,7 +358,7 @@ impl KittyHostState {
                 self.placements.remove(&key);
             }
             let mut inactive: Vec<_> = self
-                .transmitted
+                .resources
                 .iter()
                 .filter(|(id, _)| {
                     !self.frame_seen.contains(id) && !self.frame_protected.contains(id)
@@ -357,14 +367,16 @@ impl KittyHostState {
                 .collect();
             inactive.sort_unstable();
             for (id, host) in inactive {
-                if self.transmitted.len() <= 128
+                if self.resources.len() <= 128
                     && self.content_bytes.values().sum::<usize>() <= 64 * 1024 * 1024
                 {
                     break;
                 }
                 write!(out, "\x1b_Ga=d,d=I,i={host},q=2\x1b\\")?;
-                self.transmitted.remove(&id);
+                self.resources.remove(&id);
+                self.transmitted.retain(|_, value| *value != host);
                 self.content_bytes.remove(&id);
+                self.residency.remove(id);
             }
         }
         self.cache.trim();
@@ -378,8 +390,13 @@ impl KittyHostState {
                 write!(out, "\x1b_Ga=d,d=I,i={id},q=2\x1b\\")?;
             }
             self.transmitted.clear();
+            self.resources.clear();
             self.content_bytes.clear();
+            self.residency.clear();
             self.placements.clear();
+            self.seen_placements.clear();
+            self.frame_seen.clear();
+            self.frame_protected.clear();
         }
         #[cfg(not(feature = "kitty"))]
         let _ = out;
@@ -390,7 +407,7 @@ impl KittyHostState {
     /// Release every owned host resource, including retained invisible content.
     /// Perform on a candidate and commit only after flush succeeds.
     pub fn reset(&mut self, out: &mut impl Write) -> std::io::Result<()> {
-        self.repair_ids.extend(self.transmitted.values().copied());
+        self.repair_ids.extend(self.resources.values().copied());
         self.emit_repair(out)?;
         self.cache.clear();
         Ok(())
@@ -421,7 +438,7 @@ impl KittyHostState {
     fn place(
         &mut self,
         out: &mut impl Write,
-        host: u32,
+        host: (u32, u64),
         x: u16,
         y: u16,
         cols: u16,
@@ -434,14 +451,15 @@ impl KittyHostState {
     fn place_cropped(
         &mut self,
         out: &mut impl Write,
-        host: u32,
+        host: (u32, u64),
         position: (u16, u16),
         size: (u16, u16),
         crop: Option<crate::model::KittySourceRect>,
     ) -> std::io::Result<()> {
         let (x, y) = position;
         let (cols, rows) = size;
-        let key = (host, x, y);
+        let (host, owner) = host;
+        let key = (host, x, y, owner);
         if self.seen_placements.len() >= 1024 && !self.seen_placements.contains(&key) {
             return Err(std::io::Error::other(
                 "kitty frame placement budget exceeded",
@@ -454,7 +472,9 @@ impl KittyHostState {
                 .placements
                 .iter()
                 .find(|(existing, _)| {
-                    existing.0 == host && !self.seen_placements.contains(existing)
+                    existing.0 == host
+                        && existing.3 == owner
+                        && !self.seen_placements.contains(existing)
                 })
                 .map(|(key, id)| (*key, *id));
             if let Some((old_key, old_id)) = index {
@@ -497,7 +517,7 @@ impl KittyHostState {
             return Err(std::io::Error::other("kitty content exceeds byte budget"));
         }
         let mut inactive: Vec<_> = self
-            .transmitted
+            .resources
             .keys()
             .filter(|key| {
                 **key != id && !self.frame_seen.contains(key) && !self.frame_protected.contains(key)
@@ -513,14 +533,16 @@ impl KittyHostState {
                 .sum::<usize>()
                 .saturating_sub(old_cost);
             if bytes <= LIMIT - cost
-                && (self.transmitted.contains_key(&id) || self.transmitted.len() < 128)
+                && (self.resources.contains_key(&id) || self.resources.len() < 128)
             {
                 break;
             }
-            let host = self.transmitted[&stale];
+            let host = self.resources[&stale];
             write!(out, "\x1b_Ga=d,d=I,i={host},q=2\x1b\\")?;
-            self.transmitted.remove(&stale);
+            self.resources.remove(&stale);
+            self.transmitted.retain(|_, value| *value != host);
             self.content_bytes.remove(&stale);
+            self.residency.remove(stale);
             self.placements.retain(|key, _| key.0 != host);
             self.seen_placements.retain(|key| key.0 != host);
         }
@@ -534,7 +556,7 @@ impl KittyHostState {
                 "kitty retained content byte budget exceeded",
             ));
         }
-        if !self.transmitted.contains_key(&id) && self.transmitted.len() >= 128 {
+        if !self.resources.contains_key(&id) && self.resources.len() >= 128 {
             return Err(std::io::Error::other(
                 "kitty retained content entry budget exceeded",
             ));
@@ -550,7 +572,7 @@ impl KittyHostState {
             return Err(std::io::Error::other("kitty frame content budget exceeded"));
         }
         self.frame_seen.insert(bmux_image_id);
-        if let Some(&host_id) = self.transmitted.get(&bmux_image_id) {
+        if let Some(&host_id) = self.resources.get(&bmux_image_id) {
             Ok((host_id, false)) // Already transmitted.
         } else {
             self.next_host_id = self
@@ -559,6 +581,7 @@ impl KittyHostState {
                 .ok_or_else(|| std::io::Error::other("kitty image ID space exhausted"))?;
             let host_id = self.next_host_id;
             self.allocated_ids.insert(host_id);
+            self.resources.insert(bmux_image_id, host_id);
             self.transmitted.insert(bmux_image_id, host_id);
             Ok((host_id, true)) // Newly allocated, needs transmission.
         }
@@ -740,7 +763,9 @@ pub(crate) fn render_image_clipped(
         };
         if caps.preferred_protocol() == Some(crate::model::ImageProtocol::KittyGraphics) {
             let fragment = PaneImage {
-                id: prepared.id,
+                // Preparation may be shared across equal payloads. Placement
+                // ownership must still come from the caller, not the cache entry.
+                id: image.id,
                 payload: crate::model::ImagePayload::default(),
                 cell_size: crate::model::ImageCellSize {
                     cols: visible.width,
@@ -993,7 +1018,7 @@ fn emit_kitty_data(
     let host_id = upload_kitty_data(out, image, format, data, width, height, state)?;
     state.place(
         out,
-        host_id,
+        (host_id, image.id),
         x,
         y,
         image.cell_size.cols,
@@ -1011,18 +1036,42 @@ fn upload_kitty_data(
     height: u32,
     state: &mut KittyHostState,
 ) -> std::io::Result<u32> {
-    let cost = data.len().max(
-        usize::try_from(
-            u64::from(width)
-                .saturating_mul(u64::from(height))
-                .saturating_mul(4),
+    state.emit_repair(out)?;
+    // Content identity never supplies placement identity. In particular two
+    // owners at the same cell still need two independent host placements.
+    let hash = residency::Residency::fingerprint(format, width, height, data);
+    let existing = state.residency.find(hash, format, width, height, data);
+    let content_id = if let Some(id) = existing {
+        id
+    } else if state.resources.contains_key(&image.id) {
+        // An owner may replace its bytes while the old resource is still live.
+        // At most 128 resident contents: one of these 129 IDs is free,
+        // regardless of the caller's identifier range or replacement history.
+        (0..=128)
+            .find(|id| !state.resources.contains_key(id))
+            .expect("bounded residency has a free content ID")
+    } else {
+        image.id
+    };
+    // Charge the owned collision-check copy as well as the conservative host
+    // raster/wire cost. Equality storage is not an extra unaccounted 64 MiB.
+    let cost = data
+        .len()
+        .max(
+            usize::try_from(
+                u64::from(width)
+                    .saturating_mul(u64::from(height))
+                    .saturating_mul(4),
+            )
+            .unwrap_or(usize::MAX),
         )
-        .unwrap_or(usize::MAX),
-    );
+        .saturating_add(data.len());
+    // These sets contain canonical IDs, not owner hints. Alias eviction or
+    // rebinding cannot remove an already seen/protected resource.
     let frame_bytes = state
         .frame_seen
         .iter()
-        .filter(|id| **id != image.id)
+        .filter(|id| **id != content_id)
         .map(|id| state.content_bytes.get(id).copied().unwrap_or(0))
         .sum::<usize>();
     if cost > 64 * 1024 * 1024 || frame_bytes > 64 * 1024 * 1024 - cost {
@@ -1030,8 +1079,8 @@ fn upload_kitty_data(
             "kitty visible content byte budget exceeded",
         ));
     }
-    state.reserve_content(out, image.id, cost)?;
-    let (host_id, transmit) = state.get_or_allocate(image.id)?;
+    state.reserve_content(out, content_id, cost)?;
+    let (host_id, transmit) = state.get_or_allocate(content_id)?;
     if transmit {
         for chunk in
             crate::codec::kitty::encode_transmit_chunks(host_id, format, data, width, height)
@@ -1041,6 +1090,16 @@ fn upload_kitty_data(
             out.write_all(b"\x1b\\")?;
         }
     }
+    if existing.is_none() {
+        state
+            .residency
+            .insert(content_id, hash, format, width, height, data);
+    }
+    state.residency.alias(image.id, content_id);
+    state
+        .transmitted
+        .retain(|owner, _| state.residency.has_owner(*owner));
+    state.transmitted.insert(image.id, host_id);
     Ok(host_id)
 }
 

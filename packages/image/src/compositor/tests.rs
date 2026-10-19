@@ -75,6 +75,381 @@ fn declared_full_working_set_rejects_overcapacity_without_eviction() {
     assert!(!state.content_bytes.contains_key(&129));
 }
 
+#[cfg(feature = "kitty")]
+#[test]
+fn equal_content_keeps_overlapping_placement_owners_independent() {
+    let mut state = KittyHostState::default();
+    let first = image();
+    let mut second = first.clone();
+    second.id = 2;
+    let output = frame(&mut state, &[first.clone(), second.clone()], &[], &kitty());
+    let output = String::from_utf8(output).unwrap();
+    assert_eq!(output.matches("a=t").count(), 1);
+    assert_eq!(output.matches("a=p").count(), 2);
+    assert_eq!(state.resources.len(), 1);
+    assert_eq!(state.transmitted.len(), 2);
+    assert_eq!(state.placements.len(), 2);
+    let host = *state.resources.values().next().unwrap();
+    let first_placement = state.placements[&(host, 0, 0, first.id)];
+    let second_placement = state.placements[&(host, 0, 0, second.id)];
+    assert_ne!(first_placement, second_placement);
+
+    let output = String::from_utf8(frame(&mut state, &[second.clone()], &[], &kitty())).unwrap();
+    assert!(!output.contains("a=t"));
+    assert!(output.contains(&format!("a=d,d=i,i={host},p={first_placement}")));
+    assert!(!output.contains(&format!("a=d,d=i,i={host},p={second_placement}")));
+    assert_eq!(state.placements.len(), 1);
+    assert_eq!(state.placements[&(host, 0, 0, second.id)], second_placement);
+
+    second.payload.pixels.as_mut().unwrap().data[0] = 255;
+    let output = String::from_utf8(frame(&mut state, &[first, second], &[], &kitty())).unwrap();
+    assert_eq!(output.matches("a=t").count(), 1);
+    assert_eq!(output.matches("a=p").count(), 2);
+    assert_eq!(state.resources.len(), 2);
+    assert_eq!(state.transmitted.len(), 2);
+    assert_eq!(state.placements.len(), 2);
+}
+
+#[cfg(feature = "kitty")]
+#[test]
+fn deduplicated_residency_evicts_content_and_rebuilds_without_stale_aliases() {
+    use crate::model::KittyFormat;
+    let mut state = KittyHostState::default();
+    let mut source = image();
+    let mut first_host = 0;
+    for value in 0..129_u16 {
+        source.id = u64::from(value) + 1;
+        state.begin_frame();
+        let host = upload_kitty_data(
+            &mut Vec::new(),
+            &source,
+            KittyFormat::Rgba,
+            &value.to_le_bytes(),
+            1,
+            1,
+            &mut state,
+        )
+        .unwrap();
+        if value == 0 {
+            first_host = host;
+        }
+        state.finish_frame(&mut Vec::new()).unwrap();
+        assert!(state.resources.len() <= 128);
+        assert!(state.content_bytes.len() <= 128);
+    }
+    source.id = 999;
+    state.begin_frame();
+    let mut output = Vec::new();
+    let host = upload_kitty_data(
+        &mut output,
+        &source,
+        KittyFormat::Rgba,
+        &0_u16.to_le_bytes(),
+        1,
+        1,
+        &mut state,
+    )
+    .unwrap();
+    assert_ne!(host, first_host);
+    assert_eq!(String::from_utf8(output).unwrap().matches("a=t").count(), 1);
+    state.reset(&mut Vec::new()).unwrap();
+    assert!(state.resources.is_empty());
+    assert!(state.transmitted.is_empty());
+    let hash = residency::Residency::fingerprint(KittyFormat::Rgba, 1, 1, &0_u16.to_le_bytes());
+    assert!(
+        state
+            .residency
+            .find(hash, KittyFormat::Rgba, 1, 1, &0_u16.to_le_bytes())
+            .is_none()
+    );
+}
+
+#[cfg(feature = "kitty")]
+#[test]
+fn alias_protection_keeps_late_shared_content_under_pressure() {
+    use crate::model::KittyFormat;
+    let mut state = KittyHostState::default();
+    let mut source = image();
+    state.begin_frame();
+    let hot = upload_kitty_data(
+        &mut Vec::new(),
+        &source,
+        KittyFormat::Rgba,
+        &[0],
+        1,
+        1,
+        &mut state,
+    )
+    .unwrap();
+    source.id = 999;
+    let alias = upload_kitty_data(
+        &mut Vec::new(),
+        &source,
+        KittyFormat::Rgba,
+        &[0],
+        1,
+        1,
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(hot, alias);
+    for value in 1..128_u8 {
+        state.begin_frame();
+        source.id = u64::from(value) + 1;
+        upload_kitty_data(
+            &mut Vec::new(),
+            &source,
+            KittyFormat::Rgba,
+            &[value],
+            1,
+            1,
+            &mut state,
+        )
+        .unwrap();
+    }
+    state.begin_frame();
+    state.protect_retained(999);
+    source.id = 1000;
+    let mut output = Vec::new();
+    upload_kitty_data(
+        &mut output,
+        &source,
+        KittyFormat::Rgba,
+        &[255],
+        1,
+        1,
+        &mut state,
+    )
+    .unwrap();
+    assert!(state.resources.values().any(|host| *host == hot));
+    source.id = 999;
+    output.clear();
+    let reused = upload_kitty_data(
+        &mut output,
+        &source,
+        KittyFormat::Rgba,
+        &[0],
+        1,
+        1,
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(reused, hot);
+    assert!(output.is_empty());
+    assert_eq!(state.resources.len(), 128);
+}
+
+#[cfg(feature = "kitty")]
+#[test]
+fn alias_churn_preserves_canonical_seen_and_predeclared_protection() {
+    use crate::model::KittyFormat;
+    let mut state = KittyHostState::default();
+    let mut source = image();
+    for value in 0..128_u8 {
+        state.begin_frame();
+        source.id = u64::from(value) + 1;
+        upload_kitty_data(
+            &mut Vec::new(),
+            &source,
+            KittyFormat::Rgba,
+            &[value],
+            1,
+            1,
+            &mut state,
+        )
+        .unwrap();
+    }
+    let hot = state.transmitted[&1];
+    state.begin_frame();
+    state.protect_retained(1);
+    assert!(state.frame_protected.contains(&1));
+    for owner in 1000..2025 {
+        source.id = owner;
+        let reused = upload_kitty_data(
+            &mut Vec::new(),
+            &source,
+            KittyFormat::Rgba,
+            &[1],
+            1,
+            1,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(reused, state.resources[&2]);
+        assert!(state.frame_protected.contains(&1));
+        assert!(state.frame_seen.contains(&2));
+    }
+    // Owner 1 is no longer a bounded alias hint, but the frame declaration is
+    // already canonical and cannot be undone by alias eviction.
+    assert!(!state.residency.has_owner(1));
+    source.id = 3000;
+    let mut output = Vec::new();
+    upload_kitty_data(
+        &mut output,
+        &source,
+        KittyFormat::Rgba,
+        &[255],
+        1,
+        1,
+        &mut state,
+    )
+    .unwrap();
+    assert_eq!(state.resources[&1], hot);
+    assert!(state.resources.contains_key(&2));
+    assert_eq!(state.resources.len(), 128);
+    assert_eq!(state.frame_seen.len(), 2);
+    assert_eq!(state.residency.retained_bytes(), 128);
+    // Each one-byte equality buffer plus conservative 4-byte raster cost.
+    assert_eq!(state.content_bytes.values().sum::<usize>(), 128 * 5);
+}
+
+#[cfg(feature = "kitty")]
+#[test]
+fn equality_storage_is_charged_before_upload_or_allocation() {
+    let mut state = KittyHostState::default();
+    let mut output = Vec::new();
+    // The conservative raster alone fills 64 MiB; even a one-byte equality
+    // copy cannot be admitted on top. No equality allocation or upload occurs.
+    assert!(
+        upload_kitty_data(
+            &mut output,
+            &image(),
+            crate::model::KittyFormat::Png,
+            &[0],
+            4096,
+            4096,
+            &mut state,
+        )
+        .is_err()
+    );
+    assert!(output.is_empty());
+    assert!(state.resources.is_empty());
+    assert!(state.content_bytes.is_empty());
+    assert_eq!(state.residency.retained_bytes(), 0);
+}
+
+#[cfg(feature = "kitty")]
+#[test]
+fn same_owner_replacement_does_not_retarget_an_earlier_placement() {
+    use crate::model::KittyFormat;
+    let mut state = KittyHostState::default();
+    let source = image();
+    state.begin_frame();
+    let old = upload_kitty_data(
+        &mut Vec::new(),
+        &source,
+        KittyFormat::Rgba,
+        &[0; 4],
+        1,
+        1,
+        &mut state,
+    )
+    .unwrap();
+    state
+        .place(&mut Vec::new(), (old, source.id), 0, 0, 1, 1)
+        .unwrap();
+    let old_placement = state.placements[&(old, 0, 0, source.id)];
+    let mut output = Vec::new();
+    let new = upload_kitty_data(
+        &mut output,
+        &source,
+        KittyFormat::Rgba,
+        &[1; 4],
+        1,
+        1,
+        &mut state,
+    )
+    .unwrap();
+    state
+        .place(&mut output, (new, source.id), 0, 0, 1, 1)
+        .unwrap();
+    state.finish_frame(&mut output).unwrap();
+    assert_ne!(old, new);
+    assert_eq!(state.placements[&(old, 0, 0, source.id)], old_placement);
+    assert!(state.placements.contains_key(&(new, 0, 0, source.id)));
+    assert_eq!(state.frame_seen.len(), 2);
+    assert_eq!(state.residency.retained_bytes(), 8);
+    assert_eq!(state.content_bytes.values().sum::<usize>(), 16);
+    let output = String::from_utf8(output).unwrap();
+    assert!(!output.contains("a=d"));
+}
+
+#[cfg(feature = "kitty")]
+#[test]
+fn content_identity_checks_dimensions_and_format_and_repairs_failed_candidate() {
+    use crate::model::KittyFormat;
+    let mut committed = KittyHostState::default();
+    let source = image();
+    let data = [0; 16];
+    committed.begin_frame();
+    let first = upload_kitty_data(
+        &mut Vec::new(),
+        &source,
+        KittyFormat::Rgba,
+        &data,
+        2,
+        2,
+        &mut committed,
+    )
+    .unwrap();
+    let mut candidate = committed.clone();
+    let mut output = Vec::new();
+    let changed_dimensions = upload_kitty_data(
+        &mut output,
+        &source,
+        KittyFormat::Rgba,
+        &data,
+        1,
+        4,
+        &mut candidate,
+    )
+    .unwrap();
+    let changed_format = upload_kitty_data(
+        &mut output,
+        &source,
+        KittyFormat::Rgb,
+        &data,
+        2,
+        2,
+        &mut candidate,
+    )
+    .unwrap();
+    assert_ne!(first, changed_dimensions);
+    assert_ne!(first, changed_format);
+    assert_ne!(changed_dimensions, changed_format);
+    // Model a flush failure: the candidate has seen bytes but is not committed.
+    assert_eq!(committed.transmitted.len(), 1);
+    committed.invalidate_after_failed_output(&candidate);
+    let mut retry = Vec::new();
+    committed.begin_frame();
+    let repaired = upload_kitty_data(
+        &mut retry,
+        &source,
+        KittyFormat::Rgba,
+        &data,
+        2,
+        2,
+        &mut committed,
+    )
+    .unwrap();
+    assert_ne!(repaired, first);
+    let retry = String::from_utf8(retry).unwrap();
+    assert!(retry.find("d=I").unwrap() < retry.find("a=t").unwrap());
+    assert_eq!(committed.transmitted.len(), 1);
+    let mut warm = Vec::new();
+    upload_kitty_data(
+        &mut warm,
+        &source,
+        KittyFormat::Rgba,
+        &data,
+        2,
+        2,
+        &mut committed,
+    )
+    .unwrap();
+    assert!(warm.is_empty());
+}
+
 fn pane() -> PaneRect {
     PaneRect {
         x: 0,
@@ -98,14 +473,14 @@ fn kitty_placements_position_cursor_for_nonzero_cached_and_cropped_output() {
     let mut state = KittyHostState::default();
     state.begin_frame();
     let mut output = Vec::new();
-    state.place(&mut output, 42, 17, 9, 4, 2).unwrap();
+    state.place(&mut output, (42, 42), 17, 9, 4, 2).unwrap();
     let output = String::from_utf8(output).unwrap();
     assert!(output.starts_with("\x1b[10;18H\x1b_Ga=p,"), "{output:?}");
 
     // Cached placements must not depend on the cursor left by text painting.
     state.begin_frame();
     let mut output = b"\x1b[1;1H".to_vec();
-    state.place(&mut output, 42, 17, 9, 4, 2).unwrap();
+    state.place(&mut output, (42, 42), 17, 9, 4, 2).unwrap();
     let output = String::from_utf8(output).unwrap();
     assert!(output.contains("\x1b[10;18H\x1b_Ga=p,"), "{output:?}");
     assert!(!output.contains("a=t"));
@@ -114,7 +489,7 @@ fn kitty_placements_position_cursor_for_nonzero_cached_and_cropped_output() {
     state
         .place_cropped(
             &mut output,
-            43,
+            (43, 43),
             (23, 11),
             (3, 2),
             Some(crate::model::KittySourceRect {

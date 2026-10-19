@@ -118,7 +118,7 @@ fn sixel_palette_fixture_roundtrip_partial_bands() {
 
 #[cfg(feature = "kitty")]
 #[test]
-fn retained_attach_identity_avoids_upload_until_new_id() {
+fn retained_attach_content_reuses_new_owner_and_uploads_changed_bytes() {
     use bmux_image::HostImageCapabilities;
     use bmux_image::compositor::{KittyHostState, PaneRect, render_pane_images};
     use bmux_image::config::ImageDecodeMode;
@@ -151,7 +151,10 @@ fn retained_attach_identity_avoids_upload_until_new_id() {
         h: 24,
     };
     let mut state = KittyHostState::default();
-    for (id, col, expected_uploads) in [(7, 2, 1), (7, 2, 0), (7, 3, 0), (8, 3, 1)] {
+    for (id, col, expected_uploads) in [(7, 2, 1), (7, 2, 0), (7, 3, 0), (8, 3, 0), (8, 4, 1)] {
+        if col == 4 {
+            image.payload.pixels.as_mut().unwrap().data[0] ^= 255;
+        }
         image.id = id;
         image.position.col = col;
         let mut out = Vec::new();

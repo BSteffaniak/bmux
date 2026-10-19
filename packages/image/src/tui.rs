@@ -848,6 +848,145 @@ mod tests {
 
     #[cfg(feature = "kitty")]
     #[test]
+    fn placement_keys_share_content_not_geometry_or_lifetime() {
+        let caps = HostImageCapabilities {
+            kitty_graphics: true,
+            cell_pixel_width: 1,
+            cell_pixel_height: 1,
+            ..Default::default()
+        };
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 20,
+        };
+        let config = ImageConfig::default();
+        let mut compositor = TuiImageCompositor::new();
+        let mut scene = ImageScene::default();
+        let mut first = placement("first", Rect::new(3, 2, 8, 4), Rect::new(0, 0, 40, 20), 37);
+        first.allocation = Some(first.destination.into());
+        let mut second = first.clone();
+        second.key = ImageKey::new("second");
+        second.clip = Rect::new(3, 2, 4, 2);
+        scene.reconcile(&[
+            ImageContribution::Present(first.clone()),
+            ImageContribution::Present(second.clone()),
+        ]);
+        let mut output = Vec::new();
+        compositor
+            .render(&mut output, &scene, terminal, &caps, &config)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("a=t").count(), 1);
+        assert_eq!(output.matches("a=p").count(), 2);
+        assert_eq!(output.matches("\x1b[3;4H").count(), 4);
+        assert!(output.contains("x=0,y=0,w=8,h=4"));
+        assert!(output.contains("x=0,y=0,w=4,h=2"));
+        assert_eq!(compositor.kitty_state.resources.len(), 1);
+
+        scene.reconcile(&[ImageContribution::Present(second)]);
+        let mut output = Vec::new();
+        compositor
+            .render(&mut output, &scene, terminal, &caps, &config)
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("a=t"));
+        assert_eq!(output.matches("a=p").count(), 1);
+        assert_eq!(output.matches("a=d,d=i").count(), 1);
+        assert!(!output.contains("a=d,d=I"));
+        assert!(output.contains("x=0,y=0,w=4,h=2"));
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn deduplicated_candidate_write_and_flush_failures_do_not_commit() {
+        struct FailAfter(usize);
+        impl std::io::Write for FailAfter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::other("injected partial output"));
+                }
+                let written = self.0.min(bytes.len());
+                self.0 -= written;
+                Ok(written)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected flush failure"))
+            }
+        }
+        let caps = kitty_caps();
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 20,
+        };
+        let config = ImageConfig::default();
+        let mut committed = TuiImageCompositor::new();
+        let mut scene = ImageScene::default();
+        scene.reconcile(&[
+            ImageContribution::Present(placement(
+                "first",
+                Rect::new(0, 0, 8, 4),
+                Rect::new(0, 0, 40, 20),
+                91,
+            )),
+            ImageContribution::Present(placement(
+                "second",
+                Rect::new(0, 0, 8, 4),
+                Rect::new(0, 0, 40, 20),
+                91,
+            )),
+        ]);
+        assert!(
+            committed
+                .render(&mut FailAfter(20), &scene, terminal, &caps, &config)
+                .is_err()
+        );
+        assert!(committed.sources.is_empty());
+        assert!(committed.kitty_state.resources.is_empty());
+        // Outer presentation owners stage successful writes until flush succeeds.
+        let mut candidate = committed.clone();
+        let mut bytes = Vec::new();
+        candidate
+            .render(&mut bytes, &scene, terminal, &caps, &config)
+            .unwrap();
+        assert!(std::io::Write::flush(&mut FailAfter(0)).is_err());
+        committed.invalidate_after_failed_output(&candidate);
+        assert!(committed.kitty_state.resources.is_empty());
+        assert!(committed.sources.is_empty());
+        let mut retry = Vec::new();
+        committed
+            .render(&mut retry, &scene, terminal, &caps, &config)
+            .unwrap();
+        let retry = String::from_utf8(retry).unwrap();
+        assert!(retry.find("d=I").unwrap() < retry.find("a=t").unwrap());
+        assert_eq!(retry.matches("a=t").count(), 1);
+        assert_eq!(retry.matches("a=p").count(), 2);
+        assert_eq!(committed.kitty_state.resources.len(), 1);
+    }
+
+    #[cfg(feature = "kitty")]
+    fn distinct_pressure_png(value: u8) -> ImagePayload {
+        use image::ImageEncoder;
+        let mut bytes = Vec::new();
+        let mut pixels = vec![value; 8 * 4 * 4];
+        for alpha in pixels.iter_mut().skip(3).step_by(4) {
+            *alpha = 255;
+        }
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&pixels, 8, 4, image::ColorType::Rgba8.into())
+            .unwrap();
+        ImagePayload::Png {
+            bytes,
+            width: 8,
+            height: 4,
+        }
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
     fn contain_predeclares_late_sources_and_fitted_rasters_before_upload() {
         for fitted in [false, true] {
             let caps = HostImageCapabilities {
@@ -888,6 +1027,9 @@ mod tests {
             for index in 0..127 {
                 let mut cold = hot.clone();
                 cold.key = ImageKey::new(format!("b-cold-{index:03}"));
+                // Residency pressure requires distinct content, not aliases of
+                // the hot PNG (equal payloads now deliberately share a resource).
+                cold.payload = distinct_pressure_png(u8::try_from(index).unwrap());
                 all.push(ImageContribution::Present(cold));
             }
             scene.reconcile(&all);
@@ -898,6 +1040,7 @@ mod tests {
             let before = compositor.work_counts();
             let mut new = hot.clone();
             new.key = ImageKey::new("a-new");
+            new.payload = distinct_pressure_png(200);
             scene.reconcile(&[
                 ImageContribution::Present(new),
                 ImageContribution::Present(hot),
