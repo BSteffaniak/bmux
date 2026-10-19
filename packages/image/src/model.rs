@@ -30,7 +30,8 @@ pub enum PixelFormat {
 }
 
 /// A decoded pixel buffer, independent of any terminal protocol.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(all(test, feature = "kitty")), derive(Clone))]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PixelBuffer {
     pub width: u32,
     pub height: u32,
@@ -44,13 +45,84 @@ pub struct PixelBuffer {
 // ---------------------------------------------------------------------------
 
 /// How the image data is represented in transit / storage.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(all(test, feature = "kitty")), derive(Clone))]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImagePayload {
     /// Original protocol bytes (sixel DCS body, kitty APC body, iTerm2 OSC
     /// body).  Present in client-decode and passthrough modes.
     pub raw: Option<Vec<u8>>,
     /// Decoded pixel buffer.  Present in server-decode mode.
     pub pixels: Option<PixelBuffer>,
+}
+
+// Test-only operation accounting: thread-local so parallel tests cannot affect
+// each other. Production keeps the derived Clone implementations unchanged.
+#[cfg(all(test, feature = "kitty"))]
+pub(crate) mod test_work {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Counts {
+        pub hash_bytes: usize,
+        // Operand bytes presented to exact equality, not a claim about libc's
+        // short-circuiting implementation or elapsed time.
+        pub equality_bytes: usize,
+        pub clone_bytes: usize,
+        pub payload_clones: usize,
+    }
+
+    thread_local! {
+        static COUNTS: Cell<Counts> = const { Cell::new(Counts {
+            hash_bytes: 0,
+            equality_bytes: 0,
+            clone_bytes: 0,
+            payload_clones: 0,
+        }) };
+    }
+
+    pub fn update(operation: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|counts| {
+            let mut value = counts.get();
+            operation(&mut value);
+            counts.set(value);
+        });
+    }
+
+    pub fn take() -> Counts {
+        COUNTS.with(|counts| counts.replace(Counts::default()))
+    }
+}
+
+#[cfg(all(test, feature = "kitty"))]
+impl Clone for PixelBuffer {
+    fn clone(&self) -> Self {
+        test_work::update(|counts| {
+            counts.clone_bytes += self.data.len();
+            counts.payload_clones += 1;
+        });
+        Self {
+            width: self.width,
+            height: self.height,
+            format: self.format,
+            data: self.data.clone(),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "kitty"))]
+impl Clone for ImagePayload {
+    fn clone(&self) -> Self {
+        if let Some(raw) = &self.raw {
+            test_work::update(|counts| {
+                counts.clone_bytes += raw.len();
+                counts.payload_clones += 1;
+            });
+        }
+        Self {
+            raw: self.raw.clone(),
+            pixels: self.pixels.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

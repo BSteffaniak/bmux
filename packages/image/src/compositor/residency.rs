@@ -25,6 +25,8 @@ pub(super) struct Residency {
 
 impl Residency {
     pub fn fingerprint(format: KittyFormat, width: u32, height: u32, bytes: &[u8]) -> u64 {
+        #[cfg(test)]
+        crate::model::test_work::update(|counts| counts.hash_bytes += bytes.len());
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         // KittyFormat intentionally needs no new public trait implementations.
         std::mem::discriminant(&format).hash(&mut hash);
@@ -44,10 +46,11 @@ impl Residency {
     ) -> Option<u64> {
         self.index.get(&hash)?.iter().copied().find(|id| {
             let content = &self.entries[id];
-            content.format == format
-                && content.width == width
-                && content.height == height
-                && &*content.bytes == bytes
+            content.format == format && content.width == width && content.height == height && {
+                #[cfg(test)]
+                crate::model::test_work::update(|counts| counts.equality_bytes += bytes.len());
+                &*content.bytes == bytes
+            }
         })
     }
 

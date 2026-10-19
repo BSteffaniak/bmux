@@ -137,22 +137,19 @@ impl KittyHostState {
         };
         let x = x + allocation.width.saturating_sub(footprint_width) / 2;
         let y = y + allocation.height.saturating_sub(footprint_height) / 2;
-        let fragment = PaneImage {
-            cell_size: crate::model::ImageCellSize { cols, rows },
-            ..image.clone()
-        };
         write!(out, "\x1b[{};{}H", y + 1, x + 1)?;
-        emit_kitty_data(
+        // Only placement dimensions differ. Borrow the original image for
+        // content identity instead of cloning its owned PNG/raw payload.
+        let host = upload_kitty_data(
             out,
-            &fragment,
+            image,
             crate::model::KittyFormat::Png,
             &pixels.data,
             pixels.width,
             pixels.height,
-            x,
-            y,
             self,
         )?;
+        self.place(out, (host, image.id), x, y, cols, rows)?;
         Ok(true)
     }
 

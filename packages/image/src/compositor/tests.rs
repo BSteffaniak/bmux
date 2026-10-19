@@ -780,6 +780,134 @@ fn validated_png_is_preserved_only_for_full_source() {
 }
 
 #[cfg(feature = "kitty")]
+fn native_png_work_source(side: u32) -> PaneImage {
+    use image::ImageEncoder;
+    // Incompressible, deterministic valid PNG for payload-size-dependent work.
+    let mut random = 1_u32;
+    let rgba: Vec<u8> = (0..side * side)
+        .flat_map(|_| {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            random.to_le_bytes()
+        })
+        .collect();
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(&rgba, side, side, image::ColorType::Rgba8.into())
+        .unwrap();
+    let mut source = image();
+    source.id = 71;
+    source.position = ImagePosition { row: 17, col: 19 };
+    source.pixel_size = ImagePixelSize {
+        width: side,
+        height: side,
+    };
+    source.payload = ImagePayload {
+        raw: Some(vec![9; 37]),
+        pixels: Some(PixelBuffer {
+            width: side,
+            height: side,
+            format: PixelFormat::Png,
+            data: png,
+        }),
+    };
+    source
+}
+
+#[cfg(feature = "kitty")]
+#[test]
+fn native_png_warm_placement_scans_content_without_cloning_payload() {
+    use bmux_tui::geometry::Rect;
+    use bmux_tui::image::{ImageFit, ImageKey, ImageLifecycle, ImagePlacement};
+
+    for side in [16_u32, 512] {
+        let source = native_png_work_source(side);
+        let original = source.clone();
+        let pixels = source.payload.pixels.as_ref().unwrap();
+        let placement = ImagePlacement {
+            key: ImageKey::new("native-png-work"),
+            payload: bmux_tui::image::ImagePayload::Png {
+                bytes: pixels.data.clone(),
+                width: side,
+                height: side,
+            },
+            destination: Rect::new(3, 5, 32, 40),
+            allocation: None,
+            clip: Rect::new(0, 0, 100, 100),
+            fit: ImageFit::Contain,
+            lifecycle: ImageLifecycle::Frame,
+        };
+        let mut state = KittyHostState::default();
+        state.begin_frame();
+        assert!(
+            state
+                .contain_png(
+                    &mut Vec::new(),
+                    &source,
+                    &placement,
+                    &kitty(),
+                    placement.clip
+                )
+                .unwrap()
+        );
+        state.finish_frame(&mut Vec::new()).unwrap();
+        let host = state.transmitted[&source.id];
+        let retained = state.residency.retained_bytes();
+        let mut reference = state.clone();
+        reference.begin_frame();
+        crate::model::test_work::take();
+        // Reproduce the old clone-and-override operation and wire output. All
+        // source metadata survives except the intended fitted cell dimensions.
+        let fragment = PaneImage {
+            cell_size: ImageCellSize { cols: 32, rows: 0 },
+            ..source.clone()
+        };
+        let mut expected = b"\x1b[10;4H".to_vec();
+        emit_kitty_data(
+            &mut expected,
+            &fragment,
+            crate::model::KittyFormat::Png,
+            &pixels.data,
+            side,
+            side,
+            3,
+            9,
+            &mut reference,
+        )
+        .unwrap();
+        reference.finish_frame(&mut expected).unwrap();
+        let old_work = crate::model::test_work::take();
+        assert_eq!(old_work.clone_bytes, pixels.data.len() + 37);
+        assert_eq!(old_work.payload_clones, 2);
+
+        for _ in 0..3 {
+            state.begin_frame();
+            crate::model::test_work::take();
+            let mut output = Vec::new();
+            assert!(
+                state
+                    .contain_png(&mut output, &source, &placement, &kitty(), placement.clip)
+                    .unwrap()
+            );
+            state.finish_frame(&mut output).unwrap();
+            let work = crate::model::test_work::take();
+            assert_eq!(work.clone_bytes, 0);
+            assert_eq!(work.payload_clones, 0);
+            // Deliberately document remaining canonical scans. No speculative
+            // owner/pointer identity shortcut replaces collision-proof equality.
+            assert_eq!(work.hash_bytes, pixels.data.len());
+            assert_eq!(work.equality_bytes, pixels.data.len());
+            assert_eq!(output, expected);
+            assert!(!String::from_utf8_lossy(&output).contains("a=t"));
+            assert_eq!(state.transmitted[&source.id], host);
+            assert_eq!(state.residency.retained_bytes(), retained);
+            assert_eq!(source, original);
+        }
+    }
+}
+
+#[cfg(feature = "kitty")]
 #[test]
 #[ignore = "opt-in image composition workload; reports work, no wall-clock gates"]
 fn benchmark_repeated_clipped_composition() {
