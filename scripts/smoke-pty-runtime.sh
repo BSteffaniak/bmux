@@ -156,7 +156,9 @@ run_keybind_case() {
 }
 
 cd "$ROOT_DIR"
-cargo build -q -p bmux_cli
+# Static plugins resolve declared auxiliary executables beside the host binary.
+# A CLI-only build can appear to work locally while failing on a clean runner.
+cargo build -q --locked -p bmux_cli -p bmux_pane_runtime_plugin --bins
 BMUX_SMOKE_BINARY="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/bmux"
 
 run_case /bin/sh

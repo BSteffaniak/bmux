@@ -13,6 +13,16 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class DeploymentBoundaryTests(unittest.TestCase):
+    def test_runtime_smoke_builds_static_plugin_auxiliary_executables(self):
+        # Clean CI has no helper left by cargo test/plugin rebuild. Both entry
+        # points must build it beside bmux before attempting a real terminal.
+        for name in ('smoke-pty-runtime.sh', 'compat-matrix.sh'):
+            source = (ROOT / 'scripts' / name).read_text()
+            self.assertIn('cargo build -q --locked -p bmux_cli '
+                          '-p bmux_pane_runtime_plugin --bins', source)
+        matrix = (ROOT / 'scripts/compat-matrix.sh').read_text()
+        self.assertIn('if [[ "$EXPLICIT_BINARY" == "0" ]] && ! cargo build', matrix)
+
     def test_candidate_builder_contains_no_test_or_lint_suites(self):
         source = (ROOT / 'scripts/build-live-artifact.sh').read_text()
         for command in (r'cargo\s+(?:clippy|nextest|machete|test|check)\b', r'npm\s+test\b',
