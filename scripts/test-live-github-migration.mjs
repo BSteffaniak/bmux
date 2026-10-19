@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -101,6 +101,45 @@ test('plan guard rejects creates, deletes, replacement, variables drift and inco
   assert.notEqual(check(value).status, 0);
   assert.notEqual(check({ ...plan(), deferred_changes: [{}] }).status, 0);
 });
+test('initializer passes a JSON-suffixed backend and cleans up on success and failure', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'bmux-github-init-test-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  // Capture the backend while it exists, without invoking a provider or R2.
+  writeFileSync(join(dir, 'tofu'), `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const backend = args.find(arg => arg.startsWith('-backend-config=')).slice('-backend-config='.length);
+fs.writeFileSync(process.env.CAPTURE, JSON.stringify({ args, backend,
+  config: JSON.parse(fs.readFileSync(backend, 'utf8')),
+  mode: fs.statSync(backend).mode & 0o777 }));
+process.exit(Number(process.env.TOFU_EXIT));
+`, { mode: 0o700 });
+  for (const exit of [0, 1]) {
+    const capture = join(dir, `capture-${exit}.json`);
+    const result = spawnSync('bash', ['scripts/live-github-init.sh'], {
+      cwd: root, encoding: 'utf8', env: { ...process.env,
+        PATH: `${dir}:${process.env.PATH}`, TMPDIR: dir, CAPTURE: capture, TOFU_EXIT: String(exit),
+        CLOUDFLARE_ACCOUNT_ID: 'a'.repeat(32), LIVE_STATE_BUCKET: 'offline-test-state',
+        R2_STATE_ACCESS_KEY_ID: 'offline-key', R2_STATE_SECRET_ACCESS_KEY: 'offline-secret',
+        TOFU_STATE_ENCRYPTION_PASSPHRASE: 'offline-test-only-passphrase',
+      },
+    });
+    assert.equal(result.status, exit, result.stderr);
+    const { args, backend, config, mode } = JSON.parse(readFileSync(capture));
+    assert.ok(backend.endsWith('.tfbackend.json'));
+    assert.ok(args.includes('init'));
+    assert.ok(args.includes('-lockfile=readonly'));
+    assert.equal(config.key, 'bmux/github/production/terraform.tfstate');
+    assert.equal(config.endpoint, `https://${'a'.repeat(32)}.r2.cloudflarestorage.com`);
+    assert.equal(config.bucket, 'offline-test-state');
+    assert.equal(config.use_lockfile, true);
+    assert.equal(mode, 0o600);
+    assert.ok(!existsSync(backend));
+    assert.ok(!existsSync(join(backend, '..')));
+    assert.ok(!JSON.stringify(config).includes('offline-secret'));
+  }
+});
+
 test('workflow keeps one gate, encrypted durable state and exact same-run plan binding', () => {
   const workflow = readFileSync(join(root, '.github/workflows/migrate-live-github.yml'), 'utf8');
   assert.equal((workflow.match(/environment: production-approval/g) ?? []).length, 1);

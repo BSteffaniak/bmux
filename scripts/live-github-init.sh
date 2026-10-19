@@ -10,8 +10,10 @@ export AWS_SECRET_ACCESS_KEY="$R2_STATE_SECRET_ACCESS_KEY"
 export AWS_EC2_METADATA_DISABLED=true
 export TF_VAR_state_encryption_passphrase="$TOFU_STATE_ENCRYPTION_PASSPHRASE"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BACKEND="$(mktemp)"
-trap 'rm -f "$BACKEND"' EXIT
+# OpenTofu selects JSON parsing from the backend file's .json suffix.
+BACKEND_DIR="$(mktemp -d)"
+BACKEND="$BACKEND_DIR/backend.tfbackend.json"
+trap 'rm -f "$BACKEND"; rmdir "$BACKEND_DIR"' EXIT
 node - "$BACKEND" <<'JS'
 const fs = require('node:fs');
 const { CLOUDFLARE_ACCOUNT_ID: account, LIVE_STATE_BUCKET: bucket } = process.env;
