@@ -112,6 +112,7 @@ pub fn stage(workspace: &Path, source: &Path, destination: &Path, target: &str) 
             });
         }
     }
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     if inventory.target != target {
         return Err(error("companion inventory target mismatch"));
     }

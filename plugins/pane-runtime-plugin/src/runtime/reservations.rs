@@ -44,6 +44,7 @@ pub(crate) fn reserve(
     options: ProgramOptions,
     authorize: impl Fn(uuid::Uuid) -> Result<(), RecoveryError>,
 ) -> Result<LaunchReservation, RecoveryError> {
+    crate::readiness::check_admission().map_err(failed)?;
     with_store(|store| store.reserve(mutation, options, authorize))
 }
 pub(crate) fn launch(

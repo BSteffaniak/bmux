@@ -23,6 +23,7 @@ bmux_frontend_runtime = { workspace = true }
 bmux_ipc = { workspace = true }
 bmux_native_platform = { workspace = true }
 bmux_native_renderer = { workspace = true }
+bmux_pane_runtime_plugin_api = { workspace = true }
 clap = { workspace = true, features = [
     "derive",
     "std",

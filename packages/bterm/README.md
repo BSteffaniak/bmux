@@ -11,6 +11,12 @@ BMUX companion and a complete persistent root, never a runtime-name fallback.
 Window closure detaches; it does not stop the companion or its executions.
 Failures are printed to stderr and return a failing process status.
 
+Readiness is checked through the pane-runtime plugin before attachment. Managed
+recovery is bounded to one graceful restart, only for an exact owned unhealthy
+activation whose execution authority accepts a safety fence. Active or retained
+executions, unknown ownership, and legacy daemons without the readiness contract
+are preserved with a diagnostic. See [reconciliation](../../docs/bterm-reconciliation.md).
+
 Managed startup re-verifies the companion bundle, then serializes endpoint
 probing and readiness under a persistent ownership-file lock. Only definitive
 absence permits launch; incompatible peers and uncertain transport or

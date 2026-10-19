@@ -353,8 +353,30 @@ interface pane-runtime-spawn-commands-v1 {
 }
 
 
+// Reconciliation is owned by the execution plugin, not the generic host.
+@capability(PANE_RUNTIME_WRITE)
+interface pane-runtime-readiness-v1 {
+    // Captured at activation, not inferred from files under a running process.
+    record runtime-readiness {
+        instance: uuid,
+        process_id: u32,
+        executable_sha256: string?,
+        runtime_dir: string,
+        config_dir: string,
+        data_dir: string,
+        state_dir: string,
+        helper_ready: bool,
+        helper_error: string?,
+        restart_blocker: string?,
+        fenced: bool,
+    }
+    command runtime-readiness() -> runtime-readiness;
+    command fence-unhealthy(instance: uuid) -> result<runtime-readiness, string>;
+}
+
 @capability(PANE_RUNTIME_READ)
 interface pane-runtime-state {
+
     record pane-summary {
         id: uuid,
         name: string?,

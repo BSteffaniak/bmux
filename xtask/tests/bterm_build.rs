@@ -45,7 +45,7 @@ fn build_only_replaces_bundle_without_launching_or_requiring_runtime_environment
     }
     let launched = temp.path().join("launched");
     let bundle = artifacts.join("bterm-run").join(target).join("Bterm.app");
-    let root = bundle.join("Contents/MacOS");
+    let mut root = std::path::PathBuf::new();
     for iteration in 0..2 {
         let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .args(["bterm", "build", "--workspace"])
@@ -70,6 +70,12 @@ fn build_only_replaces_bundle_without_launching_or_requiring_runtime_environment
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let reference: serde_json::Value = serde_json::from_slice(
+            &fs::read(bundle.parent().unwrap().join("latest.json")).unwrap(),
+        )
+        .unwrap();
+        root =
+            std::path::PathBuf::from(reference["bundle"].as_str().unwrap()).join("Contents/MacOS");
         assert!(!launched.exists());
         assert!(root.join("bterm-bundle.json").is_file());
         assert!(root.join("bmux-pane-execution-supervisor").is_file());
@@ -81,7 +87,7 @@ fn build_only_replaces_bundle_without_launching_or_requiring_runtime_environment
         ));
         assert!(!root.join("obsolete").exists());
         if iteration == 0 {
-            fs::write(root.join("obsolete"), "stale").unwrap();
+            // Preserve old generation bytes; new inputs must publish a new generation.
             executable(
                 &source.join("bterm"),
                 "#!/bin/sh\n# rebuilt version\nexit 92\n",

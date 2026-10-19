@@ -61,11 +61,14 @@ cargo xtask bterm run
 Both commands detect the compiler host and Cargo target directory, incrementally
 build both binaries, and stage and verify a fresh bundle. `build` prints its
 location and stops: it neither resolves runtime state nor executes either binary.
-`run` then launches it directly so errors remain visible. Repeat runs replace the
-previous development bundle
-(including stale files); failed staging leaves the old bundle intact. Concurrent
-runs are rejected while a window is open. The bundle lives under Cargo's target
-directory at `bterm-run/<host>/Bterm.app` on macOS (`Bterm` on Linux). Persistent
+`run` then launches it directly so errors remain visible. Bundles are immutable:
+identical inputs reuse a verified generation; changed inputs publish a new one at
+`bterm-run/<host>/bundles/<manifest-sha256>/Bterm.app` on macOS (`Bterm` on Linux).
+`bterm-run/<host>/latest.json` is an atomically updated informational reference.
+Older generations (including pre-generation legacy bundles) are retained so live
+daemons and supervisors never lose their artifact paths. Corrupt generations
+are rejected, never overwritten. Concurrent builds/runs serialize publication;
+publication locks are released before launching a window. Persistent
 state lives separately under `${XDG_STATE_HOME:-$HOME/.local/state}/bterm-dev/`,
 keyed by the canonical checkout path; rebuilding or cleaning Cargo artifacts
 never replaces it. Socket paths are length-checked before launch. Closing the

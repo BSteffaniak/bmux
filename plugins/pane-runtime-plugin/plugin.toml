@@ -66,6 +66,11 @@ interface_id = "pane-runtime-execution-v4"
 kind         = "command"
 
 [[services]]
+capability   = "bmux.pane_runtime.write"
+interface_id = "pane-runtime-readiness-v1"
+kind         = "command"
+
+[[services]]
 capability   = "bmux.pane_runtime.read"
 interface_id = "pane-runtime-state"
 kind         = "query"

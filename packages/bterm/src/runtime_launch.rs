@@ -1,7 +1,8 @@
 //! Exclusive, compatibility-aware companion startup.
 //!
 //! Resolution and compatibility policy belong to the caller. This module never
-//! discovers executables, selects roots, removes endpoints, or stops a runtime.
+//! discovers executables, selects roots, or removes endpoints. Recovery may stop
+//! only an exact owned activation fenced by its execution authority as safe.
 //! A successful launch outlives the window; timeout does not authorize killing it.
 
 use std::collections::BTreeMap;
@@ -72,9 +73,26 @@ pub async fn connect_selection(
     let timeout = Duration::from_secs(5);
     match selection {
         RuntimeSelection::External { .. } => {
-            return connect_at_paths(&paths, timeout)
+            let mut client = connect_at_paths(&paths, timeout)
                 .await
-                .context("attach to explicit external runtime");
+                .context("attach to explicit external runtime")?;
+            let readiness = tokio::time::timeout(
+                timeout,
+                bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::runtime_readiness(
+                    &mut client,
+                ),
+            )
+            .await
+            .context("external runtime readiness timed out")??;
+            anyhow::ensure!(
+                readiness.helper_ready && !readiness.fenced,
+                "external runtime is not ready: {}; attach-only selection never repairs a runtime",
+                readiness
+                    .helper_error
+                    .as_deref()
+                    .unwrap_or("runtime is fenced")
+            );
+            return Ok(client);
         }
         RuntimeSelection::Managed { companion, .. } => {
             // Reverify immediately before launch admission rather than trusting an
@@ -122,12 +140,143 @@ pub async fn connect_selection(
         timeout: Duration::from_secs(20),
         poll_interval: Duration::from_millis(25),
     };
-    ensure_runtime(&spec, || probe_paths(&paths, timeout)).await?;
-    // Keep the real client after readiness, rechecking negotiation if the runtime
-    // changed between the readiness probe and this final connection.
-    connect_at_paths(&paths, timeout)
+    // One reconciler per persistent runtime, independent of build directories.
+    let reconcile_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(roots.runtime_dir.join("companion-reconcile.lock"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match reconcile_lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await
+            }
+            Err(error) => bail!("runtime reconciliation lock unavailable: {error}"),
+        }
+    }
+    let mut repaired = false;
+    loop {
+        let outcome = ensure_runtime(&spec, || probe_paths(&paths, timeout)).await?;
+        let mut client = connect_at_paths(&paths, timeout)
+            .await
+            .context("connect selected companion for readiness")?;
+        let readiness = tokio::time::timeout(
+            timeout,
+            bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::runtime_readiness(
+                &mut client,
+            ),
+        )
         .await
-        .context("connect ready selected companion")
+        .context("runtime readiness timed out")?
+        .context("runtime lacks authoritative readiness; preserved without restart")?;
+        let receipt_path = roots.runtime_dir.join("companion-activation.json");
+        let receipt = serde_json::json!({
+            "schema_version": 1, "instance": readiness.instance,
+            "executable_sha256": readiness.executable_sha256,
+        });
+        let owned = if matches!(outcome, RuntimeLaunchOutcome::Started { pid } if pid == readiness.process_id)
+            && readiness.executable_sha256.as_deref() == Some(companion.sha256.as_str())
+        {
+            let temporary = roots.runtime_dir.join("companion-activation.next");
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary)?;
+            use std::io::Write as _;
+            file.write_all(&serde_json::to_vec(&receipt)?)?;
+            file.sync_all()?;
+            std::fs::rename(temporary, &receipt_path)?;
+            true
+        } else {
+            match std::fs::read(&receipt_path) {
+                Ok(bytes) => {
+                    serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .context("corrupt managed activation receipt")?
+                        == receipt
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let identity = tokio::time::timeout(timeout, client.whoami_principal())
+            .await
+            .context("runtime identity timed out")??;
+        let roots_match = readiness.runtime_dir == roots.runtime_dir.to_string_lossy()
+            && readiness.config_dir == roots.config_dir.to_string_lossy()
+            && readiness.data_dir == roots.data_dir.to_string_lossy()
+            && readiness.state_dir == roots.state_dir.to_string_lossy();
+        let observation = if readiness.executable_sha256.is_none() {
+            crate::reconciliation::Observation::Unknown(
+                "runtime executable identity is unavailable".into(),
+            )
+        } else if !roots_match {
+            crate::reconciliation::Observation::Unknown("runtime reported different roots".into())
+        } else if readiness.helper_ready && !readiness.fenced {
+            crate::reconciliation::Observation::Ready
+        } else {
+            crate::reconciliation::Observation::Unhealthy {
+                owned: owned && identity.principal_id == identity.server_control_principal_id,
+                restart_blocker: readiness.restart_blocker.clone(),
+            }
+        };
+        match crate::reconciliation::plan(observation, repaired) {
+            crate::reconciliation::Action::Attach => return Ok(client),
+            crate::reconciliation::Action::FenceAndRestart => {
+                let fence = tokio::time::timeout(timeout,
+                    bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::fence_unhealthy(&mut client, readiness.instance)
+                ).await.context("runtime fencing timed out")??.map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    fence.instance == readiness.instance && fence.fenced && !fence.helper_ready,
+                    "runtime did not acknowledge exact-instance recovery fence"
+                );
+                // Recheck the same connection's authoritative incarnation immediately before shutdown.
+                let current = tokio::time::timeout(timeout,
+                    bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::runtime_readiness(&mut client)
+                ).await.context("fenced runtime readiness timed out")??;
+                anyhow::ensure!(
+                    current.instance == fence.instance && current.fenced,
+                    "runtime incarnation changed after fencing"
+                );
+                let stopped = tokio::time::timeout(
+                    timeout,
+                    client.request_raw(bmux_ipc::Request::ServerStop),
+                )
+                .await
+                .context("graceful recovery stop request timed out")??;
+                anyhow::ensure!(
+                    matches!(
+                        stopped,
+                        bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ServerStopping)
+                    ),
+                    "runtime did not acknowledge graceful shutdown"
+                );
+                drop(client);
+                repaired = true;
+                let stop_deadline = Instant::now() + timeout;
+                loop {
+                    if matches!(probe_paths(&paths, timeout).await?, RuntimeProbe::Absent) {
+                        break;
+                    }
+                    anyhow::ensure!(
+                        Instant::now() < stop_deadline,
+                        "graceful recovery shutdown timed out; no replacement launched"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+            action => bail!(
+                "runtime is not ready: {}; reconciliation: {action:?}; runtime preserved",
+                readiness
+                    .helper_error
+                    .as_deref()
+                    .unwrap_or("execution readiness unavailable")
+            ),
+        }
+    }
 }
 
 async fn connect_at_paths(
@@ -346,13 +495,21 @@ where
         .checked_add(spec.timeout)
         .context("invalid startup timeout")?;
     loop {
-        match probe_until(deadline, probe()).await? {
-            RuntimeProbe::Compatible => return Ok(RuntimeLaunchOutcome::AlreadyRunning),
+        let observed = match probe_until(deadline, probe()).await? {
+            RuntimeProbe::Compatible => crate::reconciliation::Observation::Ready,
             RuntimeProbe::Incompatible(reason) => {
-                bail!("selected runtime is incompatible: {reason}")
+                crate::reconciliation::Observation::Unknown(reason)
             }
-            RuntimeProbe::Starting => pause(spec, deadline).await?,
-            RuntimeProbe::Absent => break,
+            RuntimeProbe::Starting => crate::reconciliation::Observation::Starting,
+            RuntimeProbe::Absent => crate::reconciliation::Observation::Absent,
+        };
+        match crate::reconciliation::plan(observed, false) {
+            crate::reconciliation::Action::Attach => {
+                return Ok(RuntimeLaunchOutcome::AlreadyRunning);
+            }
+            crate::reconciliation::Action::Wait => pause(spec, deadline).await?,
+            crate::reconciliation::Action::Start => break,
+            action => bail!("selected runtime is incompatible: {action:?}"),
         }
     }
     let ownership = OpenOptions::new()

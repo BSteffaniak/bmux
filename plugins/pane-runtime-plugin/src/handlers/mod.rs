@@ -125,6 +125,12 @@ pub fn route(context: NativeServiceContext) -> ServiceResponse {
         "pane-runtime-spawn-v1", "observe-directory" => |req: bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::client::ObserveDirectoryRequest, ctx| {
             Ok::<_, ServiceResponse>(spawn::authorize_read(ctx, req.source.session_id).and_then(|()| crate::runtime::observe_spawn_directory(&req.source)))
         },
+        "pane-runtime-readiness-v1", "runtime-readiness" => |_req: (), _ctx| {
+            crate::readiness::snapshot().map_err(|reason| ServiceResponse::error("readiness_unavailable", reason))
+        },
+        "pane-runtime-readiness-v1", "fence-unhealthy" => |req: bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::FenceUnhealthyRequest, _ctx| {
+            Ok::<_, ServiceResponse>(crate::readiness::fence(req.instance))
+        },
         // pane-runtime-state queries.
         "pane-runtime-state", "pane-padding" => |req: padding::PanePaddingArgs, _ctx| {
             Ok::<_, ServiceResponse>(padding::get(&req))

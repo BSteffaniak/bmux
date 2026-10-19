@@ -207,6 +207,7 @@ impl SupervisorControl {
     ) -> anyhow::Result<(Self, portable_pty::CommandBuilder)> {
         #[cfg(test)]
         install_test_artifact()?;
+        crate::readiness::check_admission()?;
         let version = protocol::VERSION;
         let installation = INSTALLATION
             .get_or_init(|| Mutex::new(None))

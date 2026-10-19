@@ -24,6 +24,7 @@ pub mod observation;
 mod padding;
 mod padding_api;
 mod private_input;
+mod readiness;
 mod runtime;
 mod snapshot;
 mod snapshot_v1_migration;
@@ -74,6 +75,7 @@ impl RustPlugin for PaneRuntimePlugin {
         context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
         application_resurrection::activate(&context);
+        readiness::activate(&context);
         runtime::supervisor::activate(&context);
         runtime::reservations::activate(&context);
         // Register the focus-state channel so subscribers (e.g.
